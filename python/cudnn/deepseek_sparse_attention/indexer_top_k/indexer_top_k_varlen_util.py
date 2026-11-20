@@ -338,6 +338,7 @@ class IndexerTopKKernelVarlen:
     @cute.jit
     def sort_selected_indices(
         self,
+        row_start,
         length,
         s_indices,
         scan_scratch,
@@ -362,7 +363,7 @@ class IndexerTopKKernelVarlen:
             self.cta_sync(s_cta_mbarrier, sync_phase)
 
             for i in range(tidx, valid_k, self.num_threads_per_cta):
-                index = cutlass.Uint32(s_indices[i])
+                index = cutlass.Uint32(s_indices[i]) - cutlass.Uint32(row_start)
                 word = cutlass.Int32(index >> cutlass.Uint32(5))
                 bit = cutlass.Uint32(1) << (index & cutlass.Uint32(31))
                 cute.arch.atomic_or(
@@ -390,7 +391,7 @@ class IndexerTopKKernelVarlen:
                 slot = output_base + prefix - count
                 for bit_idx in cutlass.range_constexpr(32):
                     if bits & (cutlass.Uint32(1) << bit_idx):
-                        s_indices[slot] = self.index_type(word * cutlass.Int32(32) + bit_idx)
+                        s_indices[slot] = self.index_type(row_start + word * cutlass.Int32(32) + bit_idx)
                         slot += 1
                 output_base += total
                 word_base += self.num_threads_per_cta
@@ -724,17 +725,13 @@ class IndexerTopKKernelVarlen:
             for i in range(tidx, self.top_k, self.num_threads_per_cta):
                 # TODO: add multi-cta version support here.
                 if i < length:
-                    if cutlass.const_expr(self.enable_multi_cta):
-                        dst[i] = i + row_start
-                    elif cutlass.const_expr(self.merge_blocks):
-                        dst[i] = indices[i]
+                    col = row_start + i
+                    if cutlass.const_expr(self.merge_blocks):
+                        dst[i] = indices[col]
                     else:
-                        dst[i] = i
+                        dst[i] = col
                     if cutlass.const_expr(self.return_val):
-                        if cutlass.const_expr(self.enable_multi_cta):
-                            dst_values[i] = score[i + row_start]
-                        else:
-                            dst_values[i] = score[i]
+                        dst_values[i] = score[col]
                 else:
                     dst[i] = -1
                     if cutlass.const_expr(self.return_val):
@@ -1240,6 +1237,7 @@ class IndexerTopKKernelVarlen:
 
             if cutlass.const_expr(self.deterministic):
                 self.sort_selected_indices(
+                    row_start,
                     length,
                     s_indices,
                     s_histogram,

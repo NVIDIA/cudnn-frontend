@@ -1047,3 +1047,99 @@ def test_DSA_indexer_top_k_deterministic_k2048_short_rows_and_graph_replay():
             assert torch.all(torch.isneginf(values[row, valid:]))
     finally:
         graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("return_val,deterministic,tie_break", [(False, False, 1), (True, False, 2), (True, True, 0), (False, True, 2)])
+def test_indexer_top_k_starts(dtype, return_val, deterministic, tie_break):
+    """Compare original column ids and values with a per-interval oracle, including cutoff ties."""
+    dsa = _import_dsa()
+    width, k = 2053, 33
+    starts_list = [1900, 1970, 5, 7, 2030, width]
+    ends_list = [2003, 39, width]
+    next_n = 2
+    starts = torch.tensor(starts_list, dtype=torch.int32, device="cuda").repeat_interleave(2)[::2]
+    ends = torch.tensor(ends_list, dtype=torch.int32, device="cuda")
+    scores = (torch.arange(width, device="cuda") % 11).to(dtype).repeat(len(starts_list), 1)
+    expected = []
+    for r, start in enumerate(starts_list):
+        end = ends_list[r // next_n] - next_n + r % next_n + 1
+        scores[r, :start] = torch.inf
+        scores[r, end:] = torch.inf
+        cols = torch.arange(start, max(start, end), device="cuda")
+        if tie_break == 2:
+            cols = cols.flip(0)
+        chosen = cols[scores[r, cols].argsort(descending=True, stable=True)[:k]]
+        expected.append(chosen.sort().values)
+
+    result = dsa.indexer_top_k_wrapper(scores, ends, k, next_n, return_val, tie_break=tie_break, deterministic=deterministic, starts=starts)
+    for r, cols in enumerate(expected):
+        n = cols.numel()
+        ids = result["indices"][r, :n].long()
+        torch.testing.assert_close(ids if deterministic else ids.sort().values, cols)
+        assert (result["indices"][r, n:] == -1).all()
+        if return_val:
+            torch.testing.assert_close(result["values"][r, :n], scores[r, ids])
+            assert result["values"][r, n:].isneginf().all()
+    if not return_val:
+        assert result["values"] is None
+
+
+@pytest.mark.L0
+def test_indexer_top_k_starts_graph_replay():
+    """Replay a prepared plan with changed lower bounds at the captured address."""
+    dsa = _import_dsa()
+    width, k = 1024, 32
+    scores = -torch.arange(width, device="cuda", dtype=torch.float32).repeat(2, 1)
+    ends = torch.full((2,), width, device="cuda", dtype=torch.int32)
+    starts = torch.zeros_like(ends)
+    op = dsa.IndexerTopK(scores, ends, k, deterministic=True, has_starts=True)
+    op.check_support()
+    op.compile()
+    ids, values, workspace = _allocate_outputs(op, scores)
+    outputs = dict(out_indices=ids, out_values=values, workspace=workspace)
+    with pytest.raises(ValueError, match="starts"):
+        op.execute(scores, ends, **outputs)
+    with pytest.raises(ValueError, match="overlaps starts"):
+        op.execute(scores, ends, starts=ids.flatten()[:2], **outputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op.execute(scores, ends, starts=starts, **outputs)
+    for bounds in ((977, 1019), (width, 51), (977, 1019)):
+        starts.copy_(torch.tensor(bounds, dtype=starts.dtype, device="cuda"))
+        ids.fill_(-7)
+        values.fill_(torch.nan)
+        graph.replay()
+        cols = starts[:, None] + torch.arange(k, device="cuda", dtype=torch.int32)
+        expected = torch.where(cols < width, cols, -1)
+        torch.testing.assert_close(ids, expected)
+        torch.testing.assert_close(values, torch.where(cols < width, -cols.float(), -torch.inf))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_indexer_top_k_starts_batch_invariance_and_compile_cache(monkeypatch, dtype):
+    """Runtime lower bounds and row regrouping reuse one bounded specialization."""
+    from unittest.mock import Mock
+
+    from cudnn.deepseek_sparse_attention.indexer_top_k import indexer_top_k_decode_varlen as kernel
+    from cudnn.deepseek_sparse_attention.indexer_top_k import api
+
+    monkeypatch.setattr(kernel, "_compile_cache", {})
+    monkeypatch.setattr(api, "_cache_of_IndexerTopKObjects", {})
+    compile_spy = Mock(wraps=kernel.cute.compile)
+    monkeypatch.setattr(kernel.cute, "compile", compile_spy)
+
+    scores = (torch.arange(2053, device="cuda") % 7).to(dtype).repeat(3, 1)
+    ends = torch.tensor([2048, 137, 27], dtype=torch.int32, device="cuda")
+    starts = torch.tensor([1931, 7, 33], dtype=torch.int32, device="cuda")
+    kwargs = dict(top_k=32, deterministic=True)
+    original = api.indexer_top_k_wrapper(scores, ends, starts=starts, **kwargs)
+    for order in ([2, 0, 0], [1]):
+        result = api.indexer_top_k_wrapper(scores[order], ends[order], starts=starts[order], **kwargs)
+        for key in ("indices", "values"):
+            assert torch.equal(result[key].view(torch.uint8), original[key][order].view(torch.uint8))
+    assert compile_spy.call_count == 1
+    api.indexer_top_k_wrapper(scores, ends, **kwargs)
+    assert compile_spy.call_count == 2
