@@ -368,10 +368,10 @@ def sum_OdO(
             idx_d_step = self.sum_OdO_num_threads_d
             acc = 0.0
             for idx_d in cutlass.range(idx_d_start, O.shape[1] // self.sum_OdO_elem_per_load, idx_d_step):
-                # Widen before the product: an FP16 O * dO overflows (256 * 256 > 65504).
-                O_frag = O_bhq[None, idx_d].load().to(self.acc_dtype)
-                dO_frag = dO_bhq[None, idx_d].load().to(self.acc_dtype)
+                O_frag = O_bhq[None, idx_d].load()
+                dO_frag = dO_bhq[None, idx_d].load()
                 prod_frag = O_frag * dO_frag
+                prod_frag = prod_frag.to(self.acc_dtype)
                 acc += prod_frag.reduce(cute.ReductionOp.ADD, 0.0, reduction_profile=0)
 
             acc = cute.arch.warp_reduction_sum(acc, threads_in_group=self.sum_OdO_num_threads_d)
