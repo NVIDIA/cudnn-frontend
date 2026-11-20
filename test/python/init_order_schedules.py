@@ -12,14 +12,17 @@ that work is still queued.  What every such case must do, or it shows nothing:
 * take its side stream from :func:`side_stream`: ``torch.cuda.Stream()`` is one of a small pool of streams handed out in
   turn, so a "new" stream can be one the case already uses.  For the same reason a capture runs on a stream of the case's
   own (``torch.cuda.graph(graph, stream=...)``; the context's default is one stream shared by every capture of the process).
-  A stream that is to be destroyed is made with the driver (:func:`recycled_handle`): torch's own are never destroyed;
+  A stream that is to be destroyed is made with the driver (:func:`recycled_handle`): torch's own are never destroyed --
+  and the schedule that destroys it runs in a process of its own (:func:`own_process`): torch keeps what a stream allocated
+  under that stream's raw handle;
 * give the side stream's allocator pool the blocks the entry will allocate (:func:`pooled`), so no allocation synchronizes
   the schedule away;
 * warm torch's own kernels the parked stream will run (:func:`warm_fills`): they are loaded at their first use, and that
   first launch waits like an entry's;
 * query the marker :func:`park` returns behind its call: still pending = the call overlapped the parked work and did not
   wait on the host;
-* run inside the ``settled_records`` fixture: the cases of every entry share the device's records.
+* run inside the ``settled_records`` fixture: the cases of every entry share the device's records (a schedule in a
+  process of its own is settled there).
 
 The HOST stand-ins (:func:`stand_ins`, :func:`host_allocations`) replace what the ordering touches -- events, streams, the
 driver's capture-mode exchange and capture status, the device context -- and keep ONE log of their calls; :func:`on_device`
@@ -27,7 +30,14 @@ gives an entry built for a stand-in device its operands.
 
 Not a test module (no ``test_`` prefix): imported by name from the suites (``test/python`` is on their path)."""
 
+import importlib
+import json
+import os
+import subprocess
+import sys
+import traceback
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +46,9 @@ import torch
 from cudnn.frost import capture, init_order
 
 DELAY = 1_000_000_000  # cycles of the delay kernel: long enough that the case's calls overlap the parked work
+OUTCOME = "SCHEDULE OUTCOME:"  # the last line a schedule's own process prints, in front of ``passed`` or ``skipped: <reason>``
+_OWN_PROCESS = False  # True in the process :func:`own_process` starts for a schedule
+REHEARSALS = 4  # pairs :func:`recycled_handle` tries, at most, for one whose next stream overlaps the destroyed stream's work
 
 
 def side_stream(dev, *others):
@@ -73,36 +86,142 @@ def pooled(dev, make_blocks, stream=None):
     return stream
 
 
+def own_process(schedule, *args, timeout=300):
+    """Run ``schedule(*args)`` -- a function at the top of a test module, ``args`` plain values -- in a NEW interpreter and
+    bring its outcome back: return when it passed, skip with its reason when it skipped, fail with everything the process
+    printed otherwise (an assertion, the deadline, a signal).  For a schedule that DESTROYS a stream torch allocated under
+    (:func:`recycled_handle`).  torch keeps the memory a stream allocated under that stream's RAW HANDLE and synchronizes
+    the handle when it returns the memory to the driver (``torch.cuda.empty_cache()``, which the suite's memory gate calls
+    behind every case): once the last stream of the handle is destroyed that call reads a handle no stream has -- an error
+    at the teardown of every later case, or the end of the process.  Keeping the last stream alive covers the schedule
+    whose next stream gets the handle; it cannot cover the one whose next stream gets ANOTHER handle: the buffers
+    allocated under the destroyed handle are alive then, and nothing in the process can give that handle a stream again.
+    So the whole schedule runs where no later case runs: the new process ends with the schedule, without the interpreter's
+    shutdown, and the process of the suite never holds memory under that handle.
+
+    The new process has the caller's ``sys.path`` (pytest's changes are not inherited) and must import the caller's
+    ``cudnn``; the device's records are settled there behind a schedule that passed.  ``timeout`` (seconds) is the budget
+    of the schedule's imports, compiles and launches: the new process dumps its stacks and ends itself shortly before it.
+    A trip on a launch is a hang of that launch -- audit its waits; never a larger number."""
+    import cudnn
+
+    code = (
+        "import faulthandler, json, sys\n"
+        f"faulthandler.dump_traceback_later({0.9 * timeout!r}, exit=True)\n"
+        "path, package, module, function, args = json.loads(sys.argv[1])\n"
+        "sys.path[:] = path\n"
+        "import init_order_schedules\n"
+        "init_order_schedules._run_schedule(package, module, function, args)\n"
+    )
+    spec = json.dumps([sys.path, cudnn.__file__, schedule.__module__, schedule.__name__, args])
+
+    def failed(how, out, err):
+        out, err = (s.decode("utf-8", errors="replace") if isinstance(s, bytes) else (s or "") for s in (out, err))  # a timeout carries bytes
+        report = f"the schedule {schedule.__name__}{args!r} {how} in its own process\n--- its output ---\n{out}\n--- its errors and stacks ---\n{err}"
+        pytest.fail(report, pytrace=False)
+
+    try:
+        ran = subprocess.run([sys.executable, "-u", "-c", code, spec], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as late:
+        failed(f"did not end within {timeout} s", late.stdout, late.stderr)
+    last = ran.stdout.rstrip().rsplit("\n", 1)[-1]
+    if ran.returncode == 0 and last == f"{OUTCOME} passed":
+        return
+    if ran.returncode == 0 and last.startswith(f"{OUTCOME} skipped: "):
+        pytest.skip(last[len(f"{OUTCOME} skipped: ") :])
+    failed(f"ended with exit code {ran.returncode}", ran.stdout, ran.stderr)
+
+
+def _run_schedule(package, module, function, args):
+    """The process :func:`own_process` starts: the schedule, the device's records settled behind it, its outcome as the last
+    line of the output, and the end of the process WITHOUT the interpreter's shutdown (nothing of torch runs behind a
+    destroyed stream handle).  Exit code 0 for a schedule that passed or skipped, 1 with the traceback for any other end."""
+    global _OWN_PROCESS
+    code = 1
+    try:
+        import cudnn
+
+        assert Path(cudnn.__file__).resolve() == Path(package).resolve(), f"the schedule's process imported {cudnn.__file__}, the suite {package}"
+        _OWN_PROCESS = True
+        getattr(importlib.import_module(module), function)(*args)
+        _settle("by the schedule")
+        print(f"{OUTCOME} passed")
+        code = 0
+    except pytest.skip.Exception as skipped:
+        print(f"{OUTCOME} skipped: {skipped.msg}")
+        code = 0
+    except BaseException:  # noqa: BLE001  (reported: the traceback is what the case fails with)
+        traceback.print_exc()
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+
+
 @contextmanager
 def recycled_handle(dev):
-    """``(first, successor)``: a stream of the case's own, made with the driver so that it can be DESTROYED, and a function
-    that destroys it -- the work it has queued still runs -- and returns the stream the driver makes NEXT, which has been
-    observed to get the destroyed stream's raw handle (the case skips when it does not: the schedule shows nothing then)."""
+    """``(first, successor)``: a stream of the schedule's own, made with the driver so that it can be DESTROYED, and a
+    function that destroys it -- the work it has queued still runs -- and returns the stream the driver makes NEXT.  The
+    schedule shows something only when that stream got the destroyed stream's raw handle AND its work overlaps what the
+    destroyed stream still has queued.  Both have been observed; so has a FIRST such pair of a process whose next stream
+    ran its work behind the destroyed stream's (the driver then orders a launch on it by itself), with the pairs behind it
+    overlapping.  So pairs are rehearsed here, with a delay and a fill of torch's own, until one overlaps; ``successor()``
+    reads both conditions for the schedule's pair and skips when one does not hold.
+
+    ONLY IN A PROCESS OF ITS OWN (:func:`own_process` says why); anywhere else it is refused before a stream is made.  No
+    other stream is destroyed here: the last stream of a handle stays alive for as long as torch can hold memory under the
+    handle -- until the process ends."""
+    if not _OWN_PROCESS:
+        raise RuntimeError("recycled_handle destroys a stream torch allocated under: run the schedule in a process of its own (own_process)")
     drv = pytest.importorskip("cuda.bindings.driver")
-    raw = []
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("torch.cuda._sleep is unavailable")
+    made = []  # (the driver's stream, torch's view of it), the newest last
+    probe = torch.empty(16, dtype=torch.uint8, device=dev).fill_(0)  # on the caller's stream: the fill is warm for the pairs
 
     def make():
         with torch.cuda.device(dev):
             err, handle = drv.cuStreamCreate(drv.CUstream_flags.CU_STREAM_NON_BLOCKING)
         assert int(err) == 0, f"cuStreamCreate failed: {err}"
-        raw.append(handle)
-        return torch.cuda.ExternalStream(int(handle), device=dev)
+        made.append((handle, torch.cuda.ExternalStream(int(handle), device=dev)))
+        return made[-1][1]
 
-    def successor():
-        gone = raw.pop()
-        handle = int(gone)
+    def replace():
+        """The newest stream destroyed and the next one made: ``(stream, overlaps)``.  ``stream`` is None when the driver gave
+        it another raw handle; ``overlaps``: a fill on it completed while the destroyed stream's work was still pending."""
+        gone, old = made.pop()
+        last = torch.cuda.Event()
+        last.record(old)  # behind everything the stream has queued
         assert int(drv.cuStreamDestroy(gone)[0]) == 0  # returns at once; the stream's queued work is not cancelled
         stream = make()
-        if stream.cuda_stream != handle:
+        if stream.cuda_stream != old.cuda_stream:
+            return None, False
+        with torch.cuda.stream(stream):
+            probe.fill_(1)
+            mine = torch.cuda.Event()
+            mine.record(stream)
+        while not mine.query() and not last.query():  # ends with the destroyed stream's work at the latest
+            pass
+        return stream, not last.query()
+
+    def successor():
+        stream, overlaps = replace()
+        if stream is None:
             pytest.skip("the driver gave the new stream another raw handle: the schedule shows nothing")
+        if not overlaps:
+            pytest.skip("the driver ran the new stream's work behind the destroyed stream's: the schedule shows nothing")
         return stream
 
+    for _ in range(REHEARSALS):
+        with torch.cuda.stream(make()):
+            torch.cuda._sleep(DELAY // 8)
+        if replace()[1]:
+            break
+    torch.cuda.synchronize(dev)
     try:
         yield make(), successor
     finally:
-        torch.cuda.synchronize(dev)
-        for handle in raw:
-            drv.cuStreamDestroy(handle)
+        torch.cuda.synchronize(dev)  # the queued work is done; the streams in ``made`` are left to the end of the process
 
 
 @contextmanager

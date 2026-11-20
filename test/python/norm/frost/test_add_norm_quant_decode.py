@@ -77,6 +77,7 @@ from init_order_schedules import (  # noqa: E402, F401  (settled_records is a fi
     DELAY,
     deterministic_fill,
     host_allocations,
+    own_process,
     park,
     pooled,
     previous_owner,
@@ -2428,11 +2429,8 @@ def test_first_cuda_call_of_a_new_host_thread_is_ordered_behind_a_recorded_set(s
     _assert_same(got, want, f"the first call of a new host thread, the set {state}")
 
 
-@pytest.mark.usefixtures("settled_records")
-def test_new_stream_given_the_raw_handle_of_a_destroyed_allocating_stream_waits_for_the_pending_initialization():
-    """A raw handle does not name a stream for good.  ``compile(rows)`` on a stream of the caller's own behind a delay; that
-    stream is destroyed while the work is queued (the work still runs) and the caller's NEXT stream gets its handle from the
-    driver: the call on that one is ordered behind the set's zero-fill like a call on any other stream."""
+def _reused_handle_schedule():
+    """The schedule of the case below; it destroys a stream the entry allocated on, so it runs through ``own_process``."""
     dev = _device_or_skip()
     rows = 7
     k, ops, want = _warm_entry_and_reference(dev, rows, 147)
@@ -2441,6 +2439,104 @@ def test_new_stream_given_the_raw_handle_of_a_destroyed_allocating_stream_waits_
         with torch.cuda.stream(successor()):
             got = _overlapping(k, ops, pending)
     _assert_same(got, want, "entry-owned outputs initialized on a destroyed stream, written on the stream that got its handle")
+
+
+def test_new_stream_given_the_raw_handle_of_a_destroyed_allocating_stream_waits_for_the_pending_initialization():
+    """A raw handle does not name a stream for good.  ``compile(rows)`` on a stream of the caller's own behind a delay; that
+    stream is destroyed while the work is queued (the work still runs) and the caller's NEXT stream gets its handle from the
+    driver: the call on that one is ordered behind the set's zero-fill like a call on any other stream.  In a process of its
+    own: torch keeps the entry's buffers under the destroyed stream's handle."""
+    _device_or_skip()
+    own_process(_reused_handle_schedule)
+
+
+DESTROYED_STREAM_PATHS = ("the next stream gets the handle", "the next stream gets another handle", "an assertion fails behind the destroy")
+
+
+def _stream_handles(dev):
+    """The raw stream handles torch's allocator names on ``dev``: every segment it holds is kept under the handle of the
+    stream that allocated it, and that handle is synchronized when the segment's memory goes back to the driver."""
+    return {segment["stream"] for segment in torch.cuda.memory_snapshot() if segment["device"] == dev.index}
+
+
+def _destroyed_stream_schedule(path):
+    """What the schedule above does to torch, without an entry: an allocation with its fill queued behind a delay on a stream
+    made with the driver, that stream destroyed while the work is pending, and the next stream.  ``path``: the next stream
+    gets the handle; it gets ANOTHER one (forced: a stream made between the destroy and the next create takes the handle)
+    and ``recycled_handle`` skips, the allocation still alive under the destroyed stream's handle; an assertion fails
+    behind the destroy.  The next stream's fill overlaps the destroyed stream's pending work: the late zero-fill lands on
+    top of it.  Where the block ends normally the handle still has a stream, so torch can return what it holds under it."""
+    dev = torch.device("cuda", torch.cuda.current_device())
+    drv = pytest.importorskip("cuda.bindings.driver")
+    warm_fills(dev, U8)
+    held = []
+    with recycled_handle(dev) as (first, successor):
+        handle = first.cuda_stream
+        pending = park(first, lambda: held.append(torch.zeros(7, HIDDEN, dtype=U8, device=dev)))
+        assert handle in _stream_handles(dev), "torch does not keep the allocation under the raw handle of the stream it was made on"
+        if path == DESTROYED_STREAM_PATHS[1]:
+            destroy = drv.cuStreamDestroy
+
+            def destroy_and_take_the_handle(stream):
+                result = destroy(stream)
+                with torch.cuda.device(dev):
+                    held.append(drv.cuStreamCreate(drv.CUstream_flags.CU_STREAM_NON_BLOCKING))
+                return result
+
+            drv.cuStreamDestroy = destroy_and_take_the_handle  # for the rest of this process: it ends with the schedule
+        stream = successor()
+        if path == DESTROYED_STREAM_PATHS[1]:
+            pytest.skip("the driver gave the next stream the destroyed stream's handle although a stream was made in between")
+        assert stream.cuda_stream == handle and not pending.query(), "the next stream has the handle while the destroyed stream's work is pending"
+        with torch.cuda.stream(stream):
+            held[0].fill_(1)
+        assert path != DESTROYED_STREAM_PATHS[2], "the schedule's own failure, behind the destroy"
+    torch.cuda.synchronize(dev)
+    assert bool((held[0] == 0).all()), "the next stream's fill did not overlap the destroyed stream's pending zero-fill"
+    held.clear()
+    torch.cuda.empty_cache()
+    assert handle not in _stream_handles(dev), "torch did not return the memory it held under the handle"
+
+
+@pytest.mark.parametrize("path", DESTROYED_STREAM_PATHS)
+def test_schedule_that_destroys_a_stream_leaves_the_suites_process_nothing_under_the_streams_handle(path, monkeypatch):
+    """What ``own_process`` and ``recycled_handle`` hold, on any CUDA device (whatever its compute capability; the driver
+    binding and torch's delay kernel are needed, no kernel of an entry is launched).  A schedule that destroys a stream
+    torch allocated under runs in a process of its own on each of its paths -- it passes, ``recycled_handle`` skips it
+    because the next stream got another handle, an assertion fails in it -- and its outcome comes back as the case's.
+    Behind each, THIS process names no stream handle it did not name before, synchronizes and empties its cache; and
+    ``recycled_handle`` is refused here before a stream is made."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    drv = pytest.importorskip("cuda.bindings.driver")
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("torch.cuda._sleep is unavailable")
+    dev = torch.device("cuda", torch.cuda.current_device())
+    mine = torch.zeros(16, dtype=U8, device=dev)  # this process holds device memory under a stream of its own
+    named = _stream_handles(dev)
+    if path == DESTROYED_STREAM_PATHS[0]:
+        own_process(_destroyed_stream_schedule, path)
+    elif path == DESTROYED_STREAM_PATHS[1]:
+        with pytest.raises(pytest.skip.Exception) as skipped:
+            own_process(_destroyed_stream_schedule, path)
+        if "another raw handle" not in str(skipped.value):
+            pytest.skip(str(skipped.value))  # the path cannot be forced with this driver
+    else:
+        with pytest.raises(pytest.fail.Exception, match="the schedule's own failure, behind the destroy"):
+            own_process(_destroyed_stream_schedule, path)
+
+    def no_stream(*args, **kwargs):
+        raise AssertionError("a stream was made for recycled_handle in the suite's process")
+
+    monkeypatch.setattr(drv, "cuStreamCreate", no_stream)
+    with pytest.raises(RuntimeError, match="in a process of its own"):
+        with recycled_handle(dev):
+            pass
+    monkeypatch.undo()
+    assert _stream_handles(dev) <= named, "the suite's process holds memory under a stream handle it did not hold before"
+    torch.cuda.synchronize(dev)
+    torch.cuda.empty_cache()
+    assert bool((mine == 0).all())
 
 
 @pytest.mark.usefixtures("settled_records")
