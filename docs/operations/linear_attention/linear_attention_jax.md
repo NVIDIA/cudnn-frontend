@@ -174,12 +174,11 @@ Mamba-2 A, D, and `dt_bias`. Their fixed-shape replay is deterministic, but
 changing batch shape or order can change the association of FP32 sums and
 their result bytes, even when only one sequence has nonzero cotangents.
 
-The original SM103 adapter passed FP16/BF16 numerical and raw-byte replay
-checks, per-sequence batch checks, and strict BF16 golden comparisons. The
-bindings now share native FROST scheduling and workspace binding. Refer to the
-measurement record for results on that path.
+The bindings passed FP16/BF16 numerical, byte replay, and per-sequence batch
+checks on SM100 and SM103. The existing SM103 BF16 goldens still match after
+the switch to native launch binding.
 See the [determinism support page](/operations/determinism) and the
-[measurement record on GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#jax-linear-attention--partial-qualification-2026-11-12-utc)
+[measurement record on GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#jax-linear-attention-native-launch-binding)
 for the measured scope, numerical limitations, and unmeasured configurations.
 
 These bindings cover the four recurrent forward/backward operations. Summary

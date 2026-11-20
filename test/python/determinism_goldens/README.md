@@ -2436,6 +2436,38 @@ long-sequence dispatch, optional state, state-only gradients, and exact native
 Torch output/gradient parity. The 56-case record above describes the initial
 qualification; this follow-up reran those six Mamba-2 cases.
 
+### JAX linear attention native launch binding
+
+On 2026-11-20 UTC, the port at `c8d24160` (base `a013ab37`) used the native
+FROST launch binding on B200 (SM100) and B300 SXM6 AC (SM103), driver
+615.71.10, JAX/JAXlib 0.9.1, CuTeDSL 4.8.1 with its CUDA 13.4 compiler,
+PyTorch 2.12.1+cu130, and cuDNN 9.20. The 2,051-token BF16 cases assert chain dispatch in both
+directions. Short packed cases change the sequence offsets under the same
+jitted function.
+
+| Job | Selection from `test/python/linear_attention/jax` | Pytest result |
+| --- | --- | --- |
+| B300 `6229423` | `bf16-packed` numerical cases, contract and placement suites | 14 passed |
+| B300 `6229517` | Numerical suite excluding `bf16-packed`, full determinism suite with `CUDNN_DETERMINISM_GOLDENS` set | 50 passed, 1 failed, 1 skipped |
+| B200 `6229516` | Numerical, determinism, contract and placement suites, excluding `test_golden` | 60 passed, 1 failed, 1 skipped |
+| B300 `6229846`, B200 `6229845` | `test_forward_and_jitted_gradients[bf16-default-chain-mamba2]` and `test_mamba2_matches_torch_chain` at `fd8f2762` | 2 passed on each GPU |
+
+The initial Mamba-2 chain check applied a 4% bound to `dA` and measured a
+4.97185% FP64 error on both GPUs. The exact same 2,051-token case matched
+native Torch byte for byte. The reruns use the native
+`test_la.py::test_bwd_params` 5% FP64 bound for the per-head `dA` reduction,
+with unchanged bounds on other gradients and independent references retained.
+The strict B300 run matched all four existing BF16 goldens without recording.
+The B200 run checked byte replay, per-sequence batch invariance and scheduling
+boundaries with no architecture-specific golden. Both broad jobs skipped the
+two-device test because Slurm assigned one GPU. CUDA 12, real mixed-architecture
+or multiprocess execution, refilled-stage warm stress, and dedicated tail and ragged route checks remain
+unqualified. The prior nanobind shutdown diagnostics remain observable.
+
+To reproduce the selections, use `python -m pytest --confcutdir=linear_attention/jax
+-o addopts= -m L0` from `test/python`, with
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` in the determinism jobs.
+
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
 
 Twenty-six SM100/SM107 forward templates now release the unchanged service
