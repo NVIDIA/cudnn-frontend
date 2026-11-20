@@ -2270,7 +2270,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
                 while is_valid_tile:
                     k_tile_cnt = tile_info[3]
-                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         pair_barrier = sfb_pair_barrier_base + sf_consumer_state.index
                         cute.arch.mbarrier_wait(sfb_load_barrier_base + sf_consumer_state.index, sf_consumer_state.phase)
                         self.interleave_sfb_in_place(sSFB, sf_consumer_state.index, lane_idx)
