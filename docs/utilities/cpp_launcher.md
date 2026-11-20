@@ -162,7 +162,10 @@ them. Every call of a `cpp_launched` function runs the function, then records it
 replays the recording on copies of the arguments at other addresses. The replay has
 to return, and leave in its arguments, bit for bit what the call did, or the call
 raises. New tensors are zero-filled in this mode so bytes no kernel writes compare
-equal. A call inside a CUDA graph capture is not checked. At exit the process prints
+equal. A call inside a CUDA graph capture is not checked. Memory the function
+reaches only through addresses stored in an argument (a tensor of per-expert
+pointers) is not copied, so a function that accumulates there does it twice in
+this mode. At exit the process prints
 how many calls matched and why others were not recorded. Run a `cpp_launched` API's tests in this mode: it is how a launch the recording
 misses, or a result that does not follow from the arguments, shows up.
 

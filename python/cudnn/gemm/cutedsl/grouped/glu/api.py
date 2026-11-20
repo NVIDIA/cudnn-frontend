@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 import math
 
 from ..backend_utils import (
+    LAUNCHER_ENV,
     GroupedGemmBackend,
     backend_cache_key,
     block_scaled_sfd_tensors,
@@ -44,6 +45,7 @@ import cutlass
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.cpp_launcher import cpp_launched
 from cudnn.tensor_adapter import (
     cuda_is_available,
     detect_framework,
@@ -1269,6 +1271,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
     )
 
 
+@cpp_launched(env=LAUNCHER_ENV, stream="current_stream")
 def grouped_gemm_glu_wrapper_sm100(
     a_tensor: torch.Tensor,
     sfa_tensor: Optional[torch.Tensor],
