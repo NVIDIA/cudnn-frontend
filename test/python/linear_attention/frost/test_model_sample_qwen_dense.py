@@ -57,7 +57,13 @@ then by the checks of every run.  The L0 cell is its default run, loaded by path
 streams held; it launches two forms no other L0 cell launches -- the fused verify step and the fused decode step on token
 0 of a state of six tokens per sequence, both in the form of the default stack -- and records what their first launches
 took.  The L1 cell is the same run on the stack ``fe-entries`` in a fresh interpreter: its kernel check holds whole steps,
-the lookups of the drafter's passes and the verify plan's rows."""
+the lookups of the drafter's passes and the verify plan's rows.
+
+The paged-cache cell runs no script: no provider row asks for the paged attention cache of a state yet
+(``state.PagedKvCache``), so no run builds one.  A small program in a fresh interpreter runs the two reference chains of an
+attention layer on a plain cache and on a paged one at the published widths, across the first page boundary, and holds
+the bytes of the two against each other, the pool against index arithmetic of its own, the state's cos / sin table against
+the chain's function on the device, and the kernels the chains launch on the pool to their families."""
 
 import importlib.util
 import os
@@ -447,10 +453,11 @@ raise SystemExit(0 if passed else 1)
 """
 
 
-def _program(program, tag, key, what, **fields):
+def _program(program, tag, key, what, unobserved="RAN fe-entries stack (kernels not observed: ", **fields):
     """A small program that drives the helper layer in a fresh interpreter (``program``, formatted with ``fields``): the
     run's lines.  ``tag`` starts its own lines (``[verify]``), ``key`` names the run in the routing record, ``what`` in a
-    failure.  Skips where the plan declines the GPU; fails where a check failed or standard output is not empty."""
+    failure.  Skips where the plan declines the GPU; fails where a check failed or standard output is not empty.
+    ``unobserved``: how the program's last line begins, behind its tag, where its kernels could not be observed."""
     import cudnn
 
     if not torch.cuda.is_available():  # decided here, before a child is started
@@ -477,7 +484,7 @@ def _program(program, tag, key, what, **fields):
     if verdict.startswith(f"{tag} SKIP"):
         assert " FAIL" not in out, out[-6000:]  # a skip never covers a failed check
         pytest.skip(verdict)
-    held = verdict == f"{tag} PASS" or verdict.startswith(f"{tag} RAN fe-entries stack (kernels not observed: ")
+    held = verdict == f"{tag} PASS" or verdict.startswith(f"{tag} {unobserved}")
     assert done.returncode == 0 and held and " FAIL" not in out, out[-8000:]
     return out
 
@@ -559,6 +566,175 @@ def test_a_verify_step_of_four_sequences_runs_each_sequence_alone_with_its_token
     _verify_asserts(out, 4, 6)
     assert "batch invariance  one sequence alone vs among 4 (step t: sequence t mod 4)" in out
     assert "linear_attention.step equal (gated)" not in out, "the entry states no batch invariance: nothing is gated on it"
+
+
+PAGED_PROGRAM = """
+import faulthandler, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import census, timing
+from model_samples.providers import AttentionParams, torch_ref
+from model_samples.qwen_dense import QwenDense
+from model_samples.state import DecodeState
+
+PAGE, SEQUENCES, FIRST, LAST = 64, 2, 60, 68  # the traced steps: positions 60 to 68, across the first page boundary
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+def same(a, b):
+    return a.shape == b.shape and a.dtype == b.dtype and torch.equal(a.contiguous().view(torch.int16), b.contiguous().view(torch.int16))
+
+
+failed = []
+
+
+def hold(name, held, text):
+    say(f"  {{name:<10}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+device = torch.device("cuda:0")
+model = QwenDense.reduced()  # the published widths: 24 query heads, 4 key / value heads of 256, a rotary part of 64
+g, shapes, kinds = model.geometry, model.state_shapes(), ("full_attention",)
+heads, width, capacity, pages = g.attn_kv_heads, g.attn_head_dim, LAST + 4, 2
+generator = torch.Generator().manual_seed(0)
+
+
+def draw(*shape, scale=1.0):
+    return (scale * torch.randn(*shape, generator=generator)).to(torch.bfloat16).to(device)
+
+
+params = AttentionParams(g.attn_heads, heads, width, g.rotary_dim, g.rope_theta, draw(width, scale=0.02), draw(width, scale=0.02))
+rows = [draw(SEQUENCES, g.in_projection("full_attention")[0]) for _ in range(capacity)]  # an in-projection's row of every sequence, per position
+
+
+def step(cache, position, tokens=1):
+    # the two reference chains of an attention layer on one cache: the preparation writes the position, the core reads up to it
+    if tokens > 1:
+        row = torch.stack(rows[position : position + tokens], dim=1).flatten(0, 1)  # sequence by sequence
+        q, gate = torch_ref.attention_prepare_tokens(row, cache, position, tokens, params, g.norm_eps, torch.float64)
+        return q, gate, torch_ref.attention_tokens(q, cache, position, tokens, torch.float64)
+    q, gate = torch_ref.attention_prepare(rows[position], cache, position, params, g.norm_eps, torch.float64)
+    return q, gate, torch_ref.attention(q, cache, position, torch.float64)
+
+
+plain = DecodeState(kinds, SEQUENCES, capacity, shapes, device)
+paged = DecodeState(kinds, SEQUENCES, capacity, shapes, device, page=PAGE)
+flat, cache, table = plain.layers[0], paged.layers[0], paged.table
+say(f"[paged] {{model_samples.check_environment().header()}}")
+say(f"[paged] the attention preparation and the attention core of the reference chain on a paged cache: {{SEQUENCES}} sequences, pool "
+    f"{{list(cache.pool.shape)}}, positions 0 to {{LAST}}, the steps at {{FIRST}} to {{LAST}} under the profiler")
+equal = sum(all(same(a, b) for a, b in zip(step(cache, position), step(flat, position))) for position in range(FIRST))
+theirs = [step(flat, position) for position in range(FIRST, LAST + 1)]
+mine, launches = [], []
+
+
+def traced(index):
+    mine.append(step(cache, FIRST + index))
+    mine[-1][2][0, :4].tolist()  # the host read that ends a step
+
+
+trace, missing = timing.trace_steps(traced, LAST + 1 - FIRST, device, records=launches)
+equal += sum(all(same(a, b) for a, b in zip(own, other)) for own, other in zip(mine, theirs))
+hold("outputs", equal == LAST + 1, f"queries, gates and attention outputs of {{equal}} of {{LAST + 1}} steps are the bytes of the same step on the plain cache")
+# the pool, read by arithmetic written here: position p of sequence i is row p % 64 of page i * pages + p // 64, keys then values
+rows_equal = behind = 0
+for sequence in range(SEQUENCES):
+    for position in range(pages * PAGE):
+        row = cache.pool[sequence * pages + position // PAGE, :, position % PAGE]
+        if position <= LAST:
+            rows_equal += int(same(row[:, :width], flat.k[sequence, :, position]) and same(row[:, width:], flat.v[sequence, :, position]))
+        else:
+            behind += int(bool(row.any()))
+hold("pool", rows_equal == SEQUENCES * (LAST + 1) and behind == 0,
+     f"{{rows_equal}} of {{SEQUENCES * (LAST + 1)}} rows of the pool hold the plain cache's key and value row of their position; {{behind}} of the "
+     f"{{SEQUENCES * (pages * PAGE - LAST - 1)}} rows behind position {{LAST}} hold anything")
+reads = 0
+for count in (1, 63, 64, 65, LAST + 1):
+    for dtype in (torch.bfloat16, torch.float64):
+        k = torch.stack([cache.pool[sequence * pages + p // PAGE, :, p % PAGE, :width] for sequence in range(SEQUENCES) for p in range(count)])
+        v = torch.stack([cache.pool[sequence * pages + p // PAGE, :, p % PAGE, width:] for sequence in range(SEQUENCES) for p in range(count)])
+        k, v = (t.view(SEQUENCES, count, heads, width).transpose(1, 2).to(dtype) for t in (k, v))
+        reads += int(torch.equal(cache.keys(count, dtype), k) and torch.equal(cache.values(count, dtype), v))
+hold("accessors", reads == 10, f"keys and values of the first 1, 63, 64, 65 and {{LAST + 1}} positions, in bf16 and in fp64: {{reads}} of 10 reads are the pool's rows")
+chain = torch.stack([torch.cat(torch_ref.rope_cos_sin(position, g.rotary_dim, g.rope_theta, device)) for position in range(capacity)])
+hold("cos / sin", same(table.cos_sin, chain), f"the table's row of each of {{capacity}} positions is what the chain forms for that position on this device, bit for bit")
+# a step of three tokens per sequence across the boundary: positions 62 to 64, on states of that layout
+several = [DecodeState(kinds, SEQUENCES, capacity, shapes, device, tokens=3, **layout) for layout in ({{}}, {{"page": PAGE}})]
+for position in range(62):
+    for state in several:
+        step(state.decode_layers[0], position)
+pair = [step(state.layers[0], 62, tokens=3) for state in several]
+_, positions, slots = several[1].layers[0].at(62)
+tables = positions.tolist() == [[62, 63, 64] * SEQUENCES] * 3 and slots.tolist() == [s * pages * PAGE + p for s in range(SEQUENCES) for p in (62, 63, 64)]
+hold("verify", all(same(a, b) for a, b in zip(*pair)) and tables,
+     "a step of 3 tokens per sequence at positions 62 to 64: the plain cache's bytes; its table rows name those positions and their slots")
+ids = {{}}
+for record in launches:
+    ids[census.canonical(record)] = ids.get(census.canonical(record), 0) + 1
+unnamed = sorted({{record.name[:80] for record in launches if not census.canonical(record)}})
+if not launches:
+    say(f"  kernels    not observed: {{missing}}")
+else:
+    counted = ", ".join(f"{{name or 'NO ID'}} {{count}}" for name, count in sorted(ids.items()))
+    gathers, nameless = ids.get("embedding_gather", 0), ids.get("", 0)
+    foreign = sum(count for name, count in ids.items() if name not in ("pytorch", "cublas", "copy", "embedding_gather", ""))
+    hold("kernels", gathers == nameless == foreign == 0,
+         f"{{len(launches)}} records of {{LAST + 1 - FIRST}} steps on the pool: {{counted}}; {{gathers}} with the id of a step's embedding lookup, "
+         f"{{nameless}} unnamed{{'' if not unnamed else ' (' + '; '.join(unnamed) + ')'}}, {{foreign}} with an id outside the chains' families")
+if failed:
+    say("[paged] FAIL")
+elif not launches:
+    say(f"[paged] RAN (kernels not observed: {{missing}})")
+else:
+    say("[paged] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.L0
+def test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_launch_no_gather():
+    """The paged attention cache of a state (``state.PagedKvCache``) under the two reference chains of an attention layer,
+    on the device, at the published widths and two sequences -- no provider row asks for that layout yet, so no run of a
+    script builds it.  A small program in a fresh interpreter runs the attention preparation and the attention core at
+    positions 0 to 68 on a plain cache and on a paged one, the steps at 60 to 68 of the paged one under the profiler:
+
+    * the queries, gates and attention outputs of every step are the plain cache's bytes;
+    * the pool, read by index arithmetic written in the program, holds the plain cache's key and value row of every
+      position, and the accessors return those rows;
+    * the cos / sin table of the state is, row for row, what the chain forms for that position on this device;
+    * a step of three tokens per sequence across positions 62 to 64 gives the plain cache's bytes;
+    * no kernel the chains launch on the pool has the id of a step's embedding lookup, and none is unnamed: a gather
+      through an index tensor would be counted as the embedding's launch by the kernel check of every stack.
+
+    Any CUDA GPU serves it: the chains are PyTorch's.  Where the profiler's records cannot be had the last line says so,
+    and the kernels are uncovered there, not verified."""
+    out = _program(
+        PAGED_PROGRAM,
+        "[paged]",
+        "model sample: the reference chains on a paged attention cache",
+        "run on a paged cache",
+        unobserved="RAN (kernels not observed: ",
+    )
+    lines = out.splitlines()
+    assert any(line.startswith("[paged] ") and line.endswith("positions 0 to 68, the steps at 60 to 68 under the profiler") for line in lines)
+    for name in ("outputs", "pool", "accessors", "cos / sin", "verify"):
+        (line,) = [line for line in lines if line.startswith(f"  {name} ")]
+        assert line.endswith("    PASS"), line
+    assert "queries, gates and attention outputs of 69 of 69 steps" in out and "138 of 138 rows of the pool" in out and "0 of the 118 rows behind" in out
+    observed = [line for line in lines if line.startswith("  kernels ")]
+    none = "; 0 with the id of a step's embedding lookup, 0 unnamed, 0 with an id outside the chains' families    PASS"  # the line states its counts
+    assert len(observed) == 1 and (observed[0].endswith(none) or observed[0].startswith("  kernels    not observed: ")), observed
+    frost_routing.measured("model sample: the reference chains on a paged attention cache, the kernels of the traced steps", observed[0].strip())
 
 
 def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):

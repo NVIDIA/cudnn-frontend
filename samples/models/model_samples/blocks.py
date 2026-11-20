@@ -218,6 +218,7 @@ class BySite:
 
     stored_weights = False  # asked of the parts: each reads its weight in its own form
     stored_layout = None
+    cache_page = None  # asked of the parts too: the session collects the page of the attention cache over every part of its plans
     batch_note = ""
 
     def __init__(self, name: str, parts: Sequence[tuple]):
