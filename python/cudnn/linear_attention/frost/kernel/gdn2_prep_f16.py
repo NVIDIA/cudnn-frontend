@@ -333,6 +333,9 @@ def compute_warp_group(
             steep_scan_ptr,
             steep_last_ptr,
         )
+        # FP32 exchange stores reuse the raw gate tile with a different lane permutation.
+        if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
+            nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         for row_off in cutlass.range_constexpr(store_rows):
             if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
                 row = store_row_base + cutlass.Int32(row_off)
