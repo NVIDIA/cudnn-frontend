@@ -638,8 +638,8 @@ and reduction order. No BF16/TF32 state operands, prefix inverse, global
 scratch, host length read, additional launch or execute-time compile is added.
 This is shared preprocessing, not the experimental block triangular solve.
 
-Rebased on `develop@5887e729f`. The complete summary suite passed **62 tests,
-0 failures, 0 skips** on H20-3e with Torch 2.9.1+cu128, CUDA 12.8 and cuDNN
+Rebased on `develop@5887e729f`. The complete summary suite passed all 62 tests
+with no skips on H20-3e with Torch 2.9.1+cu128, CUDA 12.8 and cuDNN
 91002 (3.57 s). The previously committed FP32 goldens passed unchanged, with
 recording disabled. The two physical wide-stride cases used an actual BF16
 token pitch of `2**32 + 128` elements and poisoned wrapped addresses. These
@@ -683,9 +683,10 @@ python -m pytest linear_attention/hopper/test_kda_summary_sm90.py -m L0 -q -s \
 Use `--tool memcheck --error-exitcode 77` for the corresponding memory check.
 
 Self-review found a nonnull zero-length `DeviceView` was incorrectly rejected
-as aliasing a live output. The new regression failed in both directions before
-the guard fix, then passed. A Torch empty view alone did not expose this because
-its exported address was normalized; the detector uses a real `DeviceView`.
+as aliasing a live output. The new regression reproduced the rejection in both
+directions before the guard fix, then passed. A Torch empty view alone did not
+expose this because its exported address was normalized; the detector uses a
+real `DeviceView`.
 
 The committed harness `benchmark/linear_attention/benchmark_sm90_summary.py`
 times the public graph plan and optionally a frozen direct FP32 kernel from
@@ -787,7 +788,7 @@ python -m pytest linear_attention/hopper/test_kda_sm90_cuda.py -m L0 -q -s \
 
 The new V-independence regression was observed RED on the unmodified base:
 no SM90 summary plan was available. During development, direct FP32 `exp(g)`
-factors still failed the unchanged 64-span FP64 tolerance under weak decay;
+factors still exceeded the unchanged 64-span FP64 tolerance under weak decay;
 using `expm1(g)` with FMA in that regime made both directions pass.
 
 For context, the following measurements use `make_case((T,), heads=8)`
@@ -8540,7 +8541,7 @@ evidence, not CI thresholds.
 A same-day follow-up based on `5999e502a8061280edb8595a835b22ced74f24de`
 compiled the unseeded reverse-only seed to register zero and removed the
 caller-workspace final-state row. The controlled RED ran the new exact-workspace
-assertion against the unchanged source and failed at 786,432 versus 393,216
+assertion against the unchanged source and reported 786,432 instead of 393,216
 bytes; the candidate passed that test. On the same H20-3e software stack with
 driver API 13000, the new runtime golden is
 `27cb37748161a3d5/kda_summary_scan_sm90_bwd_bf16.json`. Its input and output
