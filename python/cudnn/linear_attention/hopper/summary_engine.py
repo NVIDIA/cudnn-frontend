@@ -254,6 +254,11 @@ class KdaSummaryHopperScanPlan(KdaSummaryHopperPlan):
 
         if not self.seqs:
             return
+        for name, (_, strides) in x.items():
+            shape, _ = self.geometry[name]
+            runtime_strides = strides[-len(shape) :]
+            if not marshal.packed(shape, runtime_strides):
+                raise ValueError(f"{self.plan_name}: {name} requires packed row-major runtime strides, got {runtime_strides}")
         Workspace.over(variant_pack, self.workspace_bytes, self.plan_name, align=256)
         if type(ctx.workspace) is not int:
             Workspace(ctx.workspace, self.workspace_bytes, self.plan_name, align=256, device=self.device)
@@ -308,6 +313,10 @@ class KdaSummaryHopperScanEngine(KdaSummaryHopperCudaEngine):
             raise NotImplementedError(f"{self.name}: requires batch_invariant=True")
         if facts.cu_dtype != cudnn.data_type.INT32:
             raise NotImplementedError(f"{self.name}: requires int32 cu_seqlens")
+        if facts.n_seq and facts.h_o > 65535:
+            raise NotImplementedError(f"{self.name}: prep grid.y exceeds CUDA's 65535 limit")
+        if facts.n_seq * facts.h_o > 65535:
+            raise NotImplementedError(f"{self.name}: scan grid.y exceeds CUDA's 65535 limit")
         for tensor_name, tensor in {**node.inputs, **node.outputs}.items():
             if not marshal.packed(tensor.dim, tensor.stride):
                 raise NotImplementedError(f"{self.name}: {tensor_name} must be packed row-major")

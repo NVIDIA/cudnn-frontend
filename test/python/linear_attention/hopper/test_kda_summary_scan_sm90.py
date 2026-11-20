@@ -268,6 +268,96 @@ def test_short_workspace_rejects_before_output_write(cudnn_handle):
         cudnn.set_stream(cudnn_handle, saved_stream)
 
 
+@pytest.mark.parametrize("port", ["q", "d_initial_state"])
+def test_rebound_nonpacked_runtime_layout_rejects_before_launch(port, cudnn_handle, monkeypatch):
+    """The packed-only scan validates current bindings, not only declarations."""
+    from cudnn.linear_attention.hopper import cuda_bwd_host
+
+    case = fp32.make_case((17,), heads=2)
+    graph, tensors, bindings, output = build_graph(case)
+    if port == "q":
+        storage = torch.empty((17, 2, 256), dtype=torch.bfloat16, device="cuda")
+        rebound = storage[..., :128]
+        rebound.copy_(case["q"])
+        bindings[tensors["q"]] = rebound
+    else:
+        storage = torch.empty((1, 2, 128, 256), dtype=torch.float32, device="cuda")
+        output = storage[..., :128]
+        bindings[tensors["d_initial_state"]] = output
+
+    output.fill_(123)
+    workspace = torch.full((graph.get_workspace_size(),), 0xA5, dtype=torch.uint8, device="cuda")
+    before = workspace.clone()
+
+    def no_launch(*args, **kwargs):
+        raise AssertionError("nonpacked runtime binding reached CUDA")
+
+    monkeypatch.setattr(cuda_bwd_host, "launch", no_launch)
+    saved_stream = cudnn.get_stream(cudnn_handle)
+    try:
+        cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+        with pytest.raises(ValueError, match=rf"{port}.*packed row-major"):
+            graph.execute(bindings, workspace, handle=cudnn_handle)
+    finally:
+        cudnn.set_stream(cudnn_handle, saved_stream)
+
+    assert (output == 123).all()
+    assert torch.equal(workspace, before)
+
+
+def _scan_descriptor_graph(seqs, heads):
+    from cudnn.linear_attention.ops.kda import build_kda_summary_bwd_graph
+
+    graph, _ = build_kda_summary_bwd_graph(
+        1,
+        seqs,
+        heads,
+        heads,
+        heads,
+        heads,
+        128,
+        128,
+        cudnn.data_type.BFLOAT16,
+        cudnn.data_type.FLOAT,
+        cudnn.data_type.FLOAT,
+        None,
+        cudnn.data_type.INT32,
+        128**-0.5,
+        False,
+        True,
+        False,
+        False,
+        False,
+        None,
+        "log",
+        output_transition=False,
+    )
+    return graph
+
+
+@pytest.mark.parametrize(
+    "seqs,heads,reason",
+    [
+        (1, 65536, "prep grid.y"),
+        (8192, 8, "scan grid.y"),
+    ],
+)
+def test_scan_contract_rejects_unlaunchable_grid_y(monkeypatch, seqs, heads, reason):
+    from cudnn.linear_attention.hopper.summary_engine import KdaSummaryHopperCudaEngine, KdaSummaryHopperScanEngine
+
+    monkeypatch.setattr(KdaSummaryHopperCudaEngine, "check_support", lambda self, graph: None)
+    with pytest.raises(NotImplementedError, match=reason):
+        KdaSummaryHopperScanEngine().check_support(_scan_descriptor_graph(seqs, heads))
+
+
+@pytest.mark.parametrize("seqs,heads", [(1, 65535), (8191, 8)])
+def test_scan_contract_accepts_grid_y_boundary(monkeypatch, seqs, heads):
+    from cudnn.linear_attention.hopper.summary_engine import KdaSummaryHopperCudaEngine, KdaSummaryHopperScanEngine
+
+    monkeypatch.setattr(KdaSummaryHopperCudaEngine, "check_support", lambda self, graph: None)
+    KdaSummaryHopperScanEngine().check_support(_scan_descriptor_graph(seqs, heads))
+
+
 @pytest.mark.parametrize(
     "option, reason",
     [
