@@ -85,7 +85,7 @@ class FrostSdpaFwdEngine(BaseEngine):
             facts, reason = analyze_for(self._spec, graph, knobs)
         except ValueError:
             return self.behavior_notes
-        if reason is None and self._spec.supports_stats_stride_override(facts):
+        if reason is None and self._spec.supports_stats_stride_override(facts, knobs):
             return self.behavior_notes + (behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE,)
         return self.behavior_notes
 

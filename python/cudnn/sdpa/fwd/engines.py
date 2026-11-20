@@ -3115,7 +3115,7 @@ class EngineSpec:
     # The implementation binds a runtime packed HN Stats head stride.
     packed_hn_stats_override: bool = False
 
-    def supports_stats_stride_override(self, facts: "ga.SdpaGraphFacts") -> bool:
+    def supports_stats_stride_override(self, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> bool:
         """Plan-time contract of the prepared half THD HN binder, after admission.
 
         This describes changing a packed head stride within the declared override
@@ -3134,7 +3134,10 @@ class EngineSpec:
         stride = stats.get_stride()
         if ga.thd_stats_packing(stride[1], stride[2], facts.h_q) != "head_major":
             return False
-        if _thd_decode_leg(self.capabilities, facts):
+        # Only the single-CTA split decode/combine can bind ragged Q through
+        # the dense launch. The same Q=1 paged graph can select THD prefill.
+        split = _decode_tile_split_kv(knobs)
+        if (split is None or (split > 1 and knobs.cga in (None, 1))) and _thd_decode_leg(self.capabilities, facts):
             return False
         return bool(getattr(cudnn._pybind_module._SdpaThdBinder, "supports_stats_stride_override", False))
 
@@ -5759,7 +5762,9 @@ def lower_dsl_prefill(
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch, PreparedThdLaunch
 
         if facts.thd and getattr(api, "_thd_spec", None) is not None:
-            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding, stats_stride_override=spec.supports_stats_stride_override(facts))
+            # The selected adapter has built a THD launch. Its concrete LSE
+            # layout and quantization determine whether the binder can rebind.
+            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding, stats_stride_override=spec.packed_hn_stats_override and facts.shape_overrides)
         elif getattr(api, "_dense_spec", None) is not None:
             # Dense plans, and the decode tile's ragged-Q leg (a dense split
             # launch whose Q / O / Stats rows come from the bound ragged offsets).

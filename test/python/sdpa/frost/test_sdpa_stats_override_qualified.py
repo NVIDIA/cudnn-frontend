@@ -16,9 +16,9 @@ pytestmark = pytest.mark.L0
 NOTE = cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE
 
 
-def _graph(case, dtype, layout, *, overrides=True, kv_dtype=None):
+def _graph(case, dtype, layout, *, overrides=True, kv_dtype=None, qmax=16):
     _, owner, dq, dv, m, n, cga, split, pack, warp, paged = case
-    b, h, hk, qmax, kv, page = 2, 8, 2, 16, 128, 16
+    b, h, hk, kv, page = 2, 8, 2, 128, 16
     g = cudnn.pygraph(
         io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=overrides
     )
@@ -139,13 +139,20 @@ def test_mixed_kv_stride_rebind_and_retained_capture(arch, dtype, kv_dtype, monk
     _check_stride_lifecycle(case, dtype, "HN", monkeypatch, kv_dtype=kv_dtype)
 
 
-def _check_stride_lifecycle(case, dtype, layout, monkeypatch, kv_dtype=None):
+@pytest.mark.parametrize("arch,cga", [(100, 2), (103, 2), (107, 1), (107, 2)])
+def test_one_query_paged_prefill_uses_thd_stats_binding(arch, cga, monkeypatch):
+    owner = "sm107_d128_multi_q" if arch == 107 else "sm100_d128_multi_q"
+    case = (arch, owner, 128, 128, 128, 128, cga, 1, 0, 0, True)
+    _check_stride_lifecycle(case, torch.bfloat16, "HN", monkeypatch, qmax=1)
+
+
+def _check_stride_lifecycle(case, dtype, layout, monkeypatch, kv_dtype=None, qmax=16):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (case[0] // 10, case[0] % 10):
         pytest.skip("requires this implementation's target architecture")
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     kv_dt = {torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3, torch.float8_e5m2: cudnn.data_type.FP8_E5M2}.get(kv_dtype)
-    graph, refs = _graph(case, dt, layout, kv_dtype=kv_dt)
+    graph, refs = _graph(case, dt, layout, kv_dtype=kv_dt, qmax=qmax)
     expected_notes = layout == "HN"
     assert (NOTE in graph.get_behavior_notes()) == expected_notes
     assert graph.get_behavior_notes() == graph.get_behavior_notes_for_plan_at_index(graph._plan_index)
@@ -155,13 +162,14 @@ def _check_stride_lifecycle(case, dtype, layout, monkeypatch, kv_dtype=None):
     generator = torch.Generator(device="cuda").manual_seed(723)
     retained = []
     try:
-        for lengths in ([16, 9], [9, 13], [15, 16]):
+        batches = ([1, 1], [0, 1], [1, 0]) if qmax == 1 else ([16, 9], [9, 13], [15, 16])
+        for lengths in batches:
             bufs, reference, storage = _buffers(case, dtype, lengths, layout, generator, kv_dtype=kv_dtype)
-            total, qmax = sum(lengths), max(lengths)
+            total, live_qmax = sum(lengths), max(lengths)
             kwargs = dict(
                 override_uids=[refs["stats"].get_uid()],
-                override_shapes=[[2, 8, qmax, 1]],
-                override_strides=[[8 * total, total, 1, 1] if layout == "HN" else [8 * qmax, 1, 8, 1]],
+                override_shapes=[[2, 8, live_qmax, 1]],
+                override_strides=[[8 * total, total, 1, 1] if layout == "HN" else [8 * live_qmax, 1, 8, 1]],
             )
             vp = {refs[name]: value for name, value in bufs.items()}
             graph.execute(vp, workspace, **kwargs)
@@ -177,7 +185,7 @@ def _check_stride_lifecycle(case, dtype, layout, monkeypatch, kv_dtype=None):
             torch.cuda.synchronize()
             _check(case, bufs, reference, storage, lengths, layout)
             assert graph._compiled_plans[graph._plan_index]._prepared is prepared
-        other, _ = _graph(case, dt, layout, overrides=False, kv_dtype=kv_dt)
+        other, _ = _graph(case, dt, layout, overrides=False, kv_dtype=kv_dt, qmax=qmax)
         assert NOTE not in other.get_behavior_notes()
         assert (NOTE in graph.get_behavior_notes()) == expected_notes
         for capture, bufs, reference, storage, lengths, _, _ in reversed(retained):

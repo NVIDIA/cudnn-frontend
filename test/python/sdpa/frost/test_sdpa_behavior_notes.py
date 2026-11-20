@@ -142,6 +142,19 @@ def test_new_swap_ab_does_not_inherit_lookahead_notes():
     assert NOTE not in _notes("sdpa_fwd_sm100_d256_swap_ab", f)
 
 
+def test_paged_q1_note_follows_selected_binder():
+    offset = SimpleNamespace(get_data_type=lambda: cudnn.data_type.INT32)
+    tensor = SimpleNamespace(ragged_offset=offset, get_stride=lambda: (1024, 128, 1024, 1), get_ragged_offset_multiplier=lambda: 1)
+    facts = _facts(s_q=1, q_t=tensor, o_t=tensor, has_paged_kv=True)
+    facts.stats_t.ragged_offset = offset
+    facts.stats_t.get_ragged_offset_multiplier = lambda: 1
+    prefill = SPECS["sdpa_fwd_sm100_d128_multi_q"]
+    decode = SPECS["sdpa_fwd_sm100_d128_single_q"]
+    assert engines._thd_decode_leg(prefill.capabilities, facts)
+    assert prefill.supports_stats_stride_override(facts, engines.SdpaFwdKnobs(cga=2, split_kv=1))
+    assert not decode.supports_stats_stride_override(facts, engines.SdpaFwdKnobs(cga=1, split_kv=2))
+
+
 def test_ineligible_knobs_and_sibling_plans_do_not_leak_notes():
     f = _facts(d_qk=256, d_v=256)
     good = engines.SdpaFwdKnobs(tile_m=128, cga=2)
