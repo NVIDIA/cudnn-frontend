@@ -28,12 +28,12 @@ def _round_kernel(x: cute.Tensor, output: cute.Tensor, numel: cutlass.Int64):
         (output.iterator.raw_ptr() + offset).store(round_tf32(value), alignment=16)
 
 
+_round_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 class RoundInputLaunch:
     """Launch explicit input rounding into the caller's FP32 workspace."""
 
     @cute.jit
     def __call__(self, x: cute.Tensor, output: cute.Tensor, numel: cutlass.Int64, stream: driver.CUstream):
         _round_kernel(x, output, numel).launch(grid=((numel + 1023) // 1024, 1, 1), block=(256, 1, 1), stream=stream)
-
-
-_round_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

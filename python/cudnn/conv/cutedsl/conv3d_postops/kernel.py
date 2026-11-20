@@ -1330,6 +1330,9 @@ def _conv3d_postops_kernel(
             prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=_cta_group)
 
 
+_conv3d_postops_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 def _coordinate_divisor(value, wide_index: bool):
     """Build a fast 32-bit divisor on the host, or preserve a wide divisor."""
     return value if wide_index else cute.fast_divmod_create_divisor(value)
@@ -1529,6 +1532,3 @@ def _make_tensor_maps(
         swizzle=cuda.TensorMapSwizzle.s128b if cfg.precision != "bf16" else cuda.TensorMapSwizzle.s64b,
     )
     return tma_a_desc, tma_b_desc, tma_c_desc
-
-
-_conv3d_postops_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
