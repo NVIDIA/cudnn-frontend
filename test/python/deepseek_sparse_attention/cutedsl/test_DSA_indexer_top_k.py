@@ -1104,17 +1104,20 @@ def test_indexer_top_k_starts_graph_replay():
     with pytest.raises(ValueError, match="overlaps starts"):
         op.execute(scores, ends, starts=ids.flatten()[:2], **outputs)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        op.execute(scores, ends, starts=starts, **outputs)
-    for bounds in ((977, 1019), (width, 51), (977, 1019)):
-        starts.copy_(torch.tensor(bounds, dtype=starts.dtype, device="cuda"))
-        ids.fill_(-7)
-        values.fill_(torch.nan)
-        graph.replay()
-        cols = starts[:, None] + torch.arange(k, device="cuda", dtype=torch.int32)
-        expected = torch.where(cols < width, cols, -1)
-        torch.testing.assert_close(ids, expected)
-        torch.testing.assert_close(values, torch.where(cols < width, -cols.float(), -torch.inf))
+    try:
+        with torch.cuda.graph(graph):
+            op.execute(scores, ends, starts=starts, **outputs)
+        for bounds in ((977, 1019), (width, 51), (977, 1019)):
+            starts.copy_(torch.tensor(bounds, dtype=starts.dtype, device="cuda"))
+            ids.fill_(-7)
+            values.fill_(torch.nan)
+            graph.replay()
+            cols = starts[:, None] + torch.arange(k, device="cuda", dtype=torch.int32)
+            expected = torch.where(cols < width, cols, -1)
+            torch.testing.assert_close(ids, expected)
+            torch.testing.assert_close(values, torch.where(cols < width, -cols.float(), -torch.inf))
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0
