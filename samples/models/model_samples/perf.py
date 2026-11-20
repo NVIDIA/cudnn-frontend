@@ -30,9 +30,12 @@ of the ids, the prompt's decode steps and the first host read.  Everything else 
 ``DEFINITIONS`` holds the one definition of every statistic; the file carries each beside its number.
 
 **The GPU side** comes from the launch records of the traced request and never from a timed one.  GPU busy of a step is
-the union of the intervals of its kernel and copy records (``timing.step_facts``); the step less GPU busy and less the
-loop's own host time is its launch overhead (``step_split``), printed as a term of the ``step`` line only where it is
-larger than GPU busy, which is taken under the profiler and is an upper bound.  The per-kernel table (``kernel_table``)
+the union of the intervals of its kernel and copy records (``timing.step_facts``).  What a timed step leaves beside GPU
+busy of the traced step at the same position and beside its own host time is formed step by step, before anything is
+aggregated; the mean of it is the run's launch overhead (``step_split``), which adds up with the means of the same
+steps: step = GPU busy + launch overhead + host.  It is an estimate -- a timed step has no GPU-side record, and GPU busy
+is the traced request's, taken under the profiler, and is an upper bound -- printed as a term of the ``step`` line, and
+called an estimate there, only where it is larger than the mean GPU busy.  The per-kernel table (``kernel_table``)
 gives every row the time its launches add to the GPU's timeline (``added_ms``): a row is a block, found by its place in
 the wiring by the kernel check's own walk (``census.Row``), and the blocks on fallback rows that no exact kernel
 separates are one row.  A row says what serves it (``_row_kind``): the row of a block a library serves carries the
@@ -69,7 +72,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import census, tie_out
 from .timing import now, step_facts
 
-SCHEMA = "model-sample-performance/2"
+SCHEMA = "model-sample-performance/3"
 WIDTH = 110  # of the screen: no line is wider
 ORIENTATION, CONTROLLED = "orientation", "controlled"
 PASS, FAIL, NOT_OBSERVED = census.PASS, census.FAIL, census.NOT_OBSERVED
@@ -79,6 +82,8 @@ UNOBSERVED = "this version does not observe the GPU"
 NOT_COMPUTED = "the timed requests did not compute the checked request's tokens"
 CLOCK = "time.perf_counter, one process"  # of every statistic that is taken from stamps
 NOT_THE_PLAN = "the kernels of the traced steps are not the plan's"
+#: what launch overhead is wherever it is printed or stored, and why: the file's ``label`` and the line under the equation
+ESTIMATE = "an estimate (GPU busy is the traced request's and an upper bound)"
 LABEL = 58  # of the per-kernel table: the widest name of a row
 #: what the per-kernel table of a step launched from Python says of itself
 FROM_PYTHON = "launched from Python: not the time of a kernel inside a captured sequence"
@@ -160,10 +165,13 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
     "launch_overhead": (
         "ms",
         (
-            "step - GPU busy - host: time inside a step in which the GPU waited for the next launch, or the host for the read. Printed as a term of the step "
-            "only where it is larger than GPU busy; otherwise the line says that launch overhead and host are not resolved by this method, because GPU busy is "
-            "taken under the profiler and is an upper bound. The file holds the remainder as computed, which can be negative, and the launch overhead per "
-            "block call."
+            "Per timed step at a traced position: step - GPU busy of the traced step at the same position - host, formed step by step before anything is "
+            "aggregated; of a run the mean over those steps. With the means of the step, of GPU busy and of host over the same steps, which this file holds, "
+            "it adds up: step = GPU busy + launch overhead + host. It stands for time inside a step in which the GPU waited for the next launch, or the host "
+            "for the read, and it is an estimate, not a measurement: a timed step has no GPU-side record, and GPU busy is the traced request's, taken under "
+            "the profiler, and is an upper bound. Printed as a term of the step, and called an estimate there, only where it is larger than the mean GPU busy; "
+            "otherwise the line says that launch overhead and host are not resolved by this method. The file holds the remainder as computed, which can be "
+            "negative, the count, the median, the extremes and the percentiles of the per-step remainders, and the launch overhead per block call."
         ),
         None,
     ),
@@ -216,8 +224,9 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
     "kernel_time_per_step": (
         "ms",
         (
-            "Of a row: per traced step the sum of the row's added times, the median over the steps; its share is that over GPU busy. Within one step the "
-            "added times of all records sum exactly to that step's GPU busy."
+            "Of a row: per traced step the sum of the row's added times, the median over the steps; its share is that over the median GPU busy. Within one "
+            "step the added times of all records sum exactly to that step's GPU busy. The medians of the rows need not sum to the median GPU busy, nor their "
+            "shares to the whole of it: the file also holds each row's mean, and the means sum to the mean GPU busy."
         ),
         "The same shares as in a per-kernel analysis of a traced serving step.",
     ),
@@ -344,17 +353,31 @@ def summary(samples: Sequence[float]) -> dict:
     }
 
 
-def step_split(step_ms: float, host_ms: float, busy_ms: Optional[float], untraced_ms: float = 0.0, traced_ms: float = 0.0) -> dict:
-    """What the ``step`` line takes a step apart into, from the step and the loop's host time at the traced positions and
-    GPU busy of the traced steps (``None``: not measured).  ``remainder_ms`` = step - GPU busy - host, as computed: GPU
-    busy is taken under the profiler and is an upper bound, so the remainder can be negative.  ``resolved``: whether
-    launch overhead is printed as a term of the step -- only where the remainder is larger than GPU busy.  ``stretch``:
+def step_split(
+    steps: Sequence[Sequence[float]], hosts: Sequence[Sequence[float]], busy: Optional[Sequence[float]], untraced_ms: float = 0.0, traced_ms: float = 0.0
+) -> dict:
+    """What the ``step`` line takes a step apart into.  ``steps`` and ``hosts``: per timed request its token-to-token
+    intervals and the loop's host times at the traced positions, in ms; ``busy``: GPU busy of the traced request's step
+    at each of those positions (``None``: not measured).  ``remainders``: per timed step what it leaves beside GPU busy
+    of the traced step at the same position and beside its own host time -- formed step by step, before anything is
+    aggregated: the median step, the median GPU busy and the median host time need not be the same step's, so their
+    difference can be a remainder that no step has.  ``remainder_ms``: the mean of them, as computed; with the means of
+    the same steps it adds up, step = GPU busy + remainder + host, to the rounding of a double.  It is an estimate: a
+    timed step has no GPU-side record, and GPU busy is taken under the profiler and is an upper bound, so the remainder
+    can be negative.  ``term``: whether launch overhead is printed as a term of the step -- only where the remainder is
+    larger than the mean GPU busy; that decides what is printed, never that the remainder was measured.  ``stretch``:
     the time from a step's first launch to its ids on the host in the traced request (``traced_ms``) over the same in
-    the timed requests (``untraced_ms``), minus 1; ``None`` where it cannot be formed."""
-    if busy_ms is None:
-        return {"remainder_ms": None, "resolved": False, "stretch": None}
-    remainder = step_ms - busy_ms - host_ms
-    return {"remainder_ms": remainder, "resolved": remainder > busy_ms, "stretch": traced_ms / untraced_ms - 1 if untraced_ms > 0 else None}
+    the timed requests (``untraced_ms``), minus 1; ``None`` where it cannot be formed.  ``ValueError`` where a timed
+    request does not hold exactly the traced positions: nothing is paired by cutting a list short."""
+    if busy is None:
+        return {"remainder_ms": None, "term": False, "stretch": None, "remainders": []}
+    lengths = sorted({len(of) for of in (*steps, *hosts)})
+    if lengths != [len(busy)] or len(steps) != len(hosts):
+        raise ValueError(f"GPU busy of {len(busy)} traced steps cannot be paired with the steps of the timed requests at the traced positions ({lengths})")
+    remainders = [step - at - host for of, own in zip(steps, hosts) for step, at, host in zip(of, busy, own)]
+    remainder = statistics.fmean(remainders)
+    stretch = traced_ms / untraced_ms - 1 if untraced_ms > 0 else None
+    return {"remainder_ms": remainder, "term": remainder > statistics.fmean(busy), "stretch": stretch, "remainders": remainders}
 
 
 def added_ms(step: Sequence[census.Launch]) -> List[float]:
@@ -659,7 +682,7 @@ def screen(data: dict, unwritten: str = "") -> List[str]:
     if overhead["value"] is not None:  # a term of the step: what it is, from the run's own figures
         per_call = overhead["host_time_per_block_call_us"]
         each = "" if per_call is None else f" = {per_call:.0f} us per block call"
-        share = f"{prefix}launch overhead {overhead['value'] / stats['step']['value'] * 100:.0f} % of a step{each}"
+        share = f"{prefix}launch overhead (an estimate) {overhead['value'] / stats['step']['mean'] * 100:.0f} % of the mean step{each}"
         lines += _wrapped("note", f"{share}: time in this sample's call path from Python, not kernel time")
     lines += [""] + _kernel_lines(data["per_kernel"], prefix)
     if unwritten:
@@ -670,23 +693,28 @@ def screen(data: dict, unwritten: str = "") -> List[str]:
 
 def _step_lines(stats: dict, traced: dict, prefix: str) -> List[str]:
     """The ``step`` line in its three forms.  GPU busy not measured: the step, the positions it was taken at and why.
-    Measured: the step taken apart, ``step = GPU busy + launch overhead + host``, only where launch overhead is larger
-    than GPU busy; otherwise the step, GPU busy as the upper bound it is, and that the rest is not resolved.  Under
-    both a line with the traced steps, their positions and by how much tracing lengthened a step."""
-    value, busy, overhead = f"{prefix}{stats['step']['value']:.3f}  ms", stats["gpu_busy"]["value"], stats["launch_overhead"]["value"]
+    Measured: the step -- the median -- and its mean taken apart, ``mean = GPU busy + launch overhead + host``, every
+    term the mean over the same steps, only where launch overhead is larger than the mean GPU busy, and under it the
+    line that calls launch overhead an estimate; otherwise the step, its mean beside the mean GPU busy as the upper
+    bound it is, and that the rest is not resolved.  Under both a line with the traced steps, their positions, their
+    median GPU busy -- what the shares of the per-kernel table are taken of -- and by how much tracing lengthened a
+    step."""
+    value, busy, overhead = f"{prefix}{stats['step']['value']:.3f}  ms", stats["gpu_busy"]["value"], stats["launch_overhead"]
     one, first, last = traced["steps"] == 1, traced["first_position"], traced["last_position"]
     if busy is None:
         at = f"at the traced position, {first}" if one else f"at the {traced['steps']} traced positions, {first} to {last}"
         return _wrapped("step", f"{value} {at if traced['steps'] else 'over every timed step'}; GPU busy not measured ({traced['gpu_busy_reason']})")
-    if overhead is not None:
-        lines = _wrapped("step", f"{value} = GPU busy {busy:.3f} + launch overhead {overhead:.3f} + host {stats['host']['value']:.3f}")
+    mean, of_gpu = stats["step"]["mean"], stats["gpu_busy"]["mean"]  # with the remainder and the mean host time: the means of the same steps
+    if overhead["value"] is not None:
+        equation = f"mean {mean:.3f} = GPU busy {of_gpu:.3f} + launch overhead {overhead['value']:.3f} + host {stats['host']['mean']:.3f}"
+        lines = _packed("step", [value, equation], joint="; ", hang=";") + _wrapped("", f"launch overhead: {overhead['label']}")
     else:
-        bound = f"GPU busy {busy:.3f} ms in a traced request (an upper bound: tracing lengthens kernels)"
-        lines = _packed("step", [f"{value} (not traced)", bound, "launch overhead and host together: not resolved by this method"])
+        bound = f"mean GPU busy {of_gpu:.3f} ms in a traced request (an upper bound: tracing lengthens kernels)"
+        lines = _packed("step", [f"{value} (not traced), mean {mean:.3f}", bound, "launch overhead and host together: not resolved by this method"])
     stretch = stats["tracing_stretch"]["value"]
     lengthens = "the stretch of tracing was not formed" if stretch is None else f"tracing lengthens a step by {stretch:.1f} %"
     steps = f"the traced step, position {first}" if one else f"{traced['steps']} traced steps, positions {first} to {last}"
-    return lines + _packed("", [f"(GPU busy from {steps}", f"{lengthens})"], joint="; ", hang=";")
+    return lines + _packed("", [f"(GPU busy from {steps}", f"median {busy:.3f} ms", f"{lengthens})"], joint="; ", hang=";")
 
 
 def _kernel_lines(table: dict, prefix: str) -> List[str]:
@@ -756,8 +784,10 @@ def _statistics(
 ) -> dict:
     """The entries of the file's ``statistics`` section, each with its definition and its serving counterpart.  ``covered``:
     the traced positions, the first so many steps of every timed request (0: none was observed, and the step is taken
-    over every timed step).  ``busy``: GPU busy of every traced step, in ms, with the traced request (``traced``) and
-    the block calls of a step (``calls``); empty where it was not measured, and ``unmeasured`` says why."""
+    over every timed step).  ``busy``: GPU busy of every traced step, in ms, one per traced position -- each is set
+    against the step of every timed request at the same position (``step_split``) -- with the traced request
+    (``traced``) and the block calls of a step (``calls``); empty where it was not measured, and ``unmeasured`` says
+    why."""
 
     def entry(key: str, **values) -> dict:
         unit, definition, counterpart = DEFINITIONS[key]
@@ -787,19 +817,22 @@ def _statistics(
     samples["host"] = [host for request in timed for host in request.host_ms()[:last]]
     for key, of in samples.items():
         stats[key].update(summary(of), value=stats[key].get("value", statistics.median(of)))
-    # the GPU side of the step, from the traced request: GPU busy, what is left of the step beside it and the loop's host time, tracing's stretch
+    # the GPU side of the step, from the traced request: GPU busy, what every timed step leaves beside it at its own position, tracing's stretch
     measured = bool(busy) and traced is not None
     untraced = statistics.median([inside for request in timed for inside in request.in_step_ms()[:last]])
     under = statistics.median(traced.in_step_ms()[:last]) if measured else 0.0
-    split = step_split(stats["step"]["value"], stats["host"]["value"], statistics.median(busy) if measured else None, untraced, under)
+    at = [(request.intervals_ms()[:last], request.host_ms()[:last]) for request in timed]  # per timed request: its steps at the traced positions
+    split = step_split([steps for steps, _ in at], [hosts for _, hosts in at], busy if measured else None, untraced, under)
     missing = f"GPU busy not measured ({unmeasured})"
     stats["gpu_busy"] = entry("gpu_busy", value=statistics.median(busy) if measured else None, reason=None if measured else missing, **summary(busy))
     stats["launch_overhead"] = entry(
         "launch_overhead",
-        value=split["remainder_ms"] if split["resolved"] else None,
-        reason=None if split["resolved"] else ("not resolved by this method: the remainder is not larger than GPU busy" if measured else missing),
+        value=split["remainder_ms"] if split["term"] else None,
+        reason=None if split["term"] else ("not resolved by this method: the remainder is not larger than the mean GPU busy" if measured else missing),
+        label=ESTIMATE if measured else None,
         remainder_ms=split["remainder_ms"],
         host_time_per_block_call_us=split["remainder_ms"] * 1e3 / calls if measured and calls else None,
+        **summary(split["remainders"]),
     )
     formed = split["stretch"] is not None
     reason = None if formed else ("not formed: the timed requests spend no time in a step" if measured else missing)

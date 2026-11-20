@@ -553,7 +553,8 @@ def test_no_profiler_before_the_last_timed_request(monkeypatch, tmp_path):
     assert (few.data["traced"]["steps"], few.data["traced"]["first_position"], few.data["traced"]["last_position"]) == (3, 5, 7)
     assert few.passed and few.data["statistics"]["step"]["n"] == 2 * 3, "the kernel check holds on both passes; the step is taken at those positions"
     at = lines.index(_line(lines, "step "))
-    assert lines[at + 3].startswith("                      (GPU busy from 3 traced steps, positions 5 to 7; tracing lengthens a step by "), lines[at : at + 4]
+    under = [line.strip() for line in lines[at + 1 : at + 6]]
+    assert any(line.startswith("(GPU busy from 3 traced steps, positions 5 to 7; median ") for line in under), lines[at : at + 6]
     one, lines, events, _ = _mode(monkeypatch, tmp_path / "one", budget=1)  # a budget below one step: the sizing step is the traced request
     assert one.data["traced"]["steps"] == 1 and events.count("profiler") == 1 and one.passed
     _says("area", "The first profiler pass of the process starts behind the last timed request: the traced request feeds its prompt untraced")
@@ -835,16 +836,21 @@ def _checkpoint_form(**changes):
     return _gpu_side(data)
 
 
-def _gpu_side(data, busy=80.0, overhead=280.0, host=40.0, stretch=5.0, why=""):
-    """The GPU side of a report's data, set: GPU busy in ms (``None``: not measured, and ``why``), launch overhead where it
-    is a term of the step (``None``: not resolved), the loop's host time, tracing's stretch in percent.  The defaults
-    are made up for the form -- round parts of a step of 400 ms, the time per block call that of 700 calls -- and are
-    no run's."""
-    stats = data["statistics"]
-    stats["gpu_busy"].update(value=busy, reason=None if busy is not None else f"GPU busy not measured ({why})")
-    stats["host"]["value"] = host
-    stats["launch_overhead"].update(value=overhead, remainder_ms=None if busy is None else stats["step"]["value"] - busy - host)
-    stats["launch_overhead"]["host_time_per_block_call_us"] = None if overhead is None else overhead * 1e3 / 700
+def _gpu_side(data, busy=80.0, term=True, host=40.0, stretch=5.0, why="", mean=410.0):
+    """The GPU side of a report's data, set: the median GPU busy in ms (``None``: not measured, and ``why``), whether
+    launch overhead is a term of the step, the loop's median host time, tracing's stretch in percent and the mean
+    step.  The means of GPU busy and of host are set 2 ms and 1 ms above their medians, and the remainder is what they
+    leave of the mean step: the terms add up, as a run's do.  The defaults are made up for the form -- the parts of a
+    mean step of 410 ms beside a median of 400, the time per block call that of 700 calls -- and are no run's."""
+    from model_samples import perf
+
+    stats, measured = data["statistics"], busy is not None
+    remainder = mean - (busy + 2.0) - (host + 1.0) if measured else None
+    stats["step"]["mean"] = mean
+    stats["gpu_busy"].update(value=busy, mean=busy + 2.0 if measured else None, reason=None if measured else f"GPU busy not measured ({why})")
+    stats["host"].update(value=host, mean=host + 1.0)
+    stats["launch_overhead"].update(value=remainder if term and measured else None, remainder_ms=remainder, label=perf.ESTIMATE if measured else None)
+    stats["launch_overhead"]["host_time_per_block_call_us"] = remainder * 1e3 / 700 if measured else None
     stats["tracing_stretch"]["value"] = None if busy is None else stretch
     data["traced"].update(gpu_busy_ms=busy, gpu_busy_reason=why or None)
     if busy is None:
@@ -903,17 +909,17 @@ def test_the_step_line_says_what_was_not_measured():
     from model_samples import perf
 
     cut = "the launch records could not be cut into the traced steps"
-    lines = perf.screen(_gpu_side(_checkpoint_form(), busy=None, overhead=None, why=cut))
+    lines = perf.screen(_gpu_side(_checkpoint_form(), busy=None, why=cut))
     at = lines.index(_line(lines, "step  "))
     said = lines[at] + " " + lines[at + 1].strip()
     assert said == f"step                  400.000  ms at the 51 traced positions, 58 to 108; GPU busy not measured ({cut})"
     assert _line(lines, "time to first token   ").endswith(" ms for a 58-token prompt (58 decode steps: this sample has no prefill kernel)")
     assert not any("launch overhead" in line or line.startswith(("note ", "per kernel, per step (")) for line in lines)
     _says("area", "Where the traced steps could not be observed the line says `GPU busy not measured`, with the reason, and no table is printed")
-    one = perf.screen(_gpu_side(_checkpoint_form(traced={"steps": 1, "last_position": 58}), busy=None, overhead=None, why=cut))
+    one = perf.screen(_gpu_side(_checkpoint_form(traced={"steps": 1, "last_position": 58}), busy=None, why=cut))
     assert _line(one, "step  ").startswith("step                  400.000  ms at the traced position, 58; GPU busy not measured (the launch records ")
     why = "the profiler's trace could not be exported (No space left on device)"
-    unmeasured = perf.screen(_gpu_side(_checkpoint_form(traced={"steps": 0}), busy=None, overhead=None, why=why))
+    unmeasured = perf.screen(_gpu_side(_checkpoint_form(traced={"steps": 0}), busy=None, why=why))
     at = unmeasured.index("step                  400.000  ms over every timed step; GPU busy not measured (the profiler's trace could not")
     assert unmeasured[at + 1] == "                      be exported (No space left on device))"
     table = unmeasured.index("per kernel, per step  not printed: the kernels of the traced steps were not observed (the profiler's trace")
@@ -956,8 +962,9 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
         _checkpoint_form(kernels=target),
         _checkpoint_form(kernels={**target, "stated": False, "not_stated": "kernel identity: not stated for this run (" + "no recorded section " * 6 + ")"}),
         _checkpoint_form(traced={"steps": 256, "first_position": 123456, "last_position": 123711}),
-        _gpu_side(_checkpoint_form(traced={"steps": 256, "first_position": 123456, "last_position": 123711}), busy=123456.789, overhead=None),
-        _gpu_side(_checkpoint_form(traced={"steps": 0}), busy=None, overhead=None, why=long_reason),
+        _gpu_side(_checkpoint_form(traced={"steps": 256, "first_position": 123456, "last_position": 123711}), busy=123456.789, term=False, mean=234567.891),
+        _gpu_side(_checkpoint_form(traced={"steps": 256, "first_position": 123456, "last_position": 123711}), busy=123456.789, host=1234.567, mean=987654.321),
+        _gpu_side(_checkpoint_form(traced={"steps": 0}), busy=None, why=long_reason),
         _checkpoint_form(per_kernel={"us_per_launch_printed": True, "rows": [dict(_wide_row(), label="x" * perf.LABEL), _wide_row()]}),
         _checkpoint_form(per_kernel={"rows": [_wide_row()], "reason": None}),
         _checkpoint_form(per_kernel={"rows": None, "reason": perf.NOT_THE_PLAN}),
@@ -1011,7 +1018,7 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     assert data == json.loads(json.dumps(outcome.data)) and outcome.unwritten == ""
     sections = "schema kind written_utc report_file record model environment observation kernels protocol checks statistics raw traced per_kernel memory"
     sections += " startup text_path"
-    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/2" and data["kind"] == "run"
+    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/3" and data["kind"] == "run"
     assert "fingerprints" not in data and "report_text" not in data, "of later versions"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", data["written_utc"]) and data["report_file"] == "report.json"
     assert str(tmp_path) not in text and os.sep + "home" + os.sep not in text and str(MODELS) not in text, "a file is named by its own name"
@@ -1092,10 +1099,33 @@ def _schema_1(data):
     return older
 
 
+def _schema_2(data):
+    """The report file of the same run as the mode wrote it while launch overhead was the median step less the median GPU
+    busy less the median host time, schema ``model-sample-performance/2``: the sections and the statistics of this
+    version, and a ``launch_overhead`` of seven entries -- no label, no count, median, mean, extremes or percentiles
+    of per-step remainders -- whose remainder is the difference of the three medians, under the definition that said
+    so.  The same field names as this version's, and other numbers behind them."""
+    import copy
+
+    older = copy.deepcopy(data)
+    older["schema"] = "model-sample-performance/2"
+    stats = older["statistics"]
+    overhead, busy = stats["launch_overhead"], stats["gpu_busy"]["value"]
+    for key in ("label", "n", "median", "mean", "minimum", "maximum", "p90", "p99"):
+        overhead.pop(key, None)
+    remainder = None if busy is None else stats["step"]["value"] - busy - stats["host"]["value"]
+    term = remainder is not None and remainder > busy
+    overhead.update(value=remainder if term else None, remainder_ms=remainder)
+    overhead["host_time_per_block_call_us"] = None if remainder is None else remainder * 1e3 / len(_tiny_model().wiring())
+    overhead["definition"] = "step - GPU busy - host: time inside a step in which the GPU waited for the next launch, or the host for the read."
+    return older
+
+
 def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_path):
     """The report file names its schema in its first field, and the screen is rendered from the data of a file of that
     schema alone.  Handed a file of another schema -- the file of the same run as the mode wrote it before it took the
-    GPU side of a step, read back from disk; a file of this version's own shape under the next name and under a name of
+    GPU side of a step, read back from disk; the file as it was while launch overhead came from three medians, whose
+    every field name this version reads; a file of this version's own shape under the next name and under a name of
     something else; a file that names no schema; something that is no report file -- ``perf.screen`` renders nothing and
     says so in one sentence that names both schemas: a ``ValueError``, never the ``KeyError`` of an entry the other
     schema does not have."""
@@ -1103,11 +1133,11 @@ def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_pa
 
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)
     data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
-    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/2"
+    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/3"
     _says("area", f"The file's first field names its schema, `{perf.SCHEMA}`.")
     assert perf.screen(data) == perf.screen(outcome.data) and perf.screen(data)[0] in lines, "a file of this schema is rendered: the screen of its run"
     _says("area", "The screen is rendered from the data of a file of this schema (`screen` in `model_samples/perf.py`);")
-    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/2'"
+    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/3'"
 
     def refused(file):
         with pytest.raises(ValueError) as said:  # a KeyError is not one: it would pass through and fail the test
@@ -1123,6 +1153,17 @@ def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_pa
     assert read == older and "per_kernel" not in read and "gpu_busy" not in read["statistics"], "what the screen of this version would look for"
     assert refused(read) == refusal.format("'model-sample-performance/1'")
     assert refused(read).count("model-sample-performance/") == 2 and "\n" not in refused(read), "one sentence, both names"
+    # the file that took launch overhead from three medians: every section, every statistic and every field name this version reads is
+    # there, and the numbers behind three of them are others -- it is refused by its name, not rendered under this version's
+    second = _schema_2(data)
+    assert (len(second), len(second["statistics"]), list(second)) == (18, 16, list(data)) and perf.write_report(str(tmp_path / "second.json"), second) == ""
+    was, now = second["statistics"]["launch_overhead"], data["statistics"]["launch_overhead"]
+    assert set(now) - set(was) == {"label", "n", "median", "mean", "minimum", "maximum", "p90", "p99"} and not set(was) - set(now)
+    assert refused(json.loads((tmp_path / "second.json").read_text(encoding="utf-8"))) == refusal.format("'model-sample-performance/2'")
+    form = _checkpoint_form()  # made-up parts: a median step of 400 ms with medians of 80 and 40 beside it, a mean step of 410 with means of 82 and 41
+    was, now = _schema_2(form)["statistics"]["launch_overhead"], form["statistics"]["launch_overhead"]
+    assert (was["remainder_ms"], was["value"]) == (280.0, 280.0) and (now["remainder_ms"], now["value"]) == (287.0, 287.0), "one field name, two numbers"
+    assert refused(_schema_2(form)) == refusal.format("'model-sample-performance/2'") and perf.screen(form)
     # a name this version does not know, on a file of this version's own shape: the name decides, and nothing is rendered
     later = f"model-sample-performance/{int(perf.SCHEMA.rsplit('/', 1)[1]) + 1}"
     for name in (later, perf.SCHEMA + "0", "kernel-census/2", "model-sample-performance", 2):
@@ -1444,18 +1485,22 @@ def test_added_time_partitions_the_union():
 
 
 def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
-    """step = the median interval at the traced positions; host = from a read to the next launch; the remainder = step -
-    GPU busy - host.  Launch overhead is a term of the ``step`` line only where the remainder is larger than GPU busy;
-    otherwise the line gives GPU busy as an upper bound and says that the rest is not resolved.  The file holds the
-    remainder as computed, also where it is negative.  The stretch of tracing is the traced request's time in a step
-    over the timed requests' at the same positions, minus 1."""
+    """step = the median interval at the traced positions; host = from a read to the next launch.  The remainder of a
+    timed step = the step - GPU busy of the traced step at the same position - host; of a run the mean of them, which
+    adds up with the means of the same steps.  Launch overhead is a term of the ``step`` line only where the remainder
+    is larger than GPU busy, and is called an estimate there; otherwise the line gives the mean GPU busy as an upper
+    bound and says that the rest is not resolved.  The file holds the remainder as computed, also where it is negative.
+    The stretch of tracing is the traced request's time in a step over the timed requests' at the same positions,
+    minus 1."""
     from model_samples import perf
 
-    assert perf.step_split(10.0, 1.0, 2.0, 9.0, 9.9) == {"remainder_ms": 7.0, "resolved": True, "stretch": pytest.approx(0.1)}
-    assert perf.step_split(10.0, 1.0, 6.0)["remainder_ms"] == 3.0 and not perf.step_split(10.0, 1.0, 6.0)["resolved"], "GPU busy is the larger part"
-    assert perf.step_split(10.0, 1.0, 4.5)["remainder_ms"] == 4.5 and not perf.step_split(10.0, 1.0, 4.5)["resolved"], "equal is not larger"
-    assert perf.step_split(10.0, 1.0, 11.0) == {"remainder_ms": -2.0, "resolved": False, "stretch": None}, "an upper bound can pass the untraced step"
-    assert perf.step_split(10.0, 1.0, None) == {"remainder_ms": None, "resolved": False, "stretch": None}
+    alike = ([[10.0] * 3], [[1.0] * 3])  # one timed request: three steps of 10 ms, 1 ms of each the loop's host time
+    assert perf.step_split(*alike, [2.0] * 3, 9.0, 9.9) == {"remainder_ms": 7.0, "term": True, "stretch": pytest.approx(0.1), "remainders": [7.0] * 3}
+    assert perf.step_split(*alike, [6.0] * 3)["remainder_ms"] == 3.0 and not perf.step_split(*alike, [6.0] * 3)["term"], "GPU busy is the larger part"
+    assert perf.step_split(*alike, [4.5] * 3)["remainder_ms"] == 4.5 and not perf.step_split(*alike, [4.5] * 3)["term"], "equal is not larger"
+    passed = {"remainder_ms": -2.0, "term": False, "stretch": None, "remainders": [-2.0] * 3}
+    assert perf.step_split(*alike, [11.0] * 3) == passed, "an upper bound can pass the untraced step"
+    assert perf.step_split(*alike, None) == {"remainder_ms": None, "term": False, "stretch": None, "remainders": []}
     # ten-millisecond steps, each launched 1 ms behind the read before it; the last step of each request is longer and not traced
     timed = [_request(0.0, [0.010, 0.020, 0.030, 0.090]), _request(0.0, [0.010, 0.020, 0.030, 0.090])]
     traced = _request(0.0, [0.0109, 0.0218, 0.0327], kind="traced", launches=[0.001, 0.0119, 0.0228])  # in a step: 9.9 ms against 9
@@ -1464,7 +1509,12 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
     assert stats["step"]["value"] == pytest.approx(10.0) and stats["host"]["value"] == pytest.approx(1.0)
     assert stats["gpu_busy"]["value"] == 2.0 and (stats["gpu_busy"]["n"], stats["gpu_busy"]["maximum"]) == (3, 2.5), "the median over the traced steps"
     overhead = stats["launch_overhead"]
-    assert overhead["value"] == overhead["remainder_ms"] == pytest.approx(7.0) and overhead["host_time_per_block_call_us"] == pytest.approx(200.0)
+    assert overhead["value"] == overhead["remainder_ms"] == overhead["mean"] == pytest.approx(41 / 6), "the mean of 7, 6.5 and 7 ms, in both timed requests"
+    assert (overhead["n"], overhead["median"], overhead["minimum"]) == (6, pytest.approx(7.0), pytest.approx(6.5)), "every timed step at a traced position"
+    assert overhead["host_time_per_block_call_us"] == pytest.approx(41 / 6 * 1e3 / 35) and overhead["label"] == perf.ESTIMATE
+    assert stats["step"]["mean"] == pytest.approx(
+        stats["gpu_busy"]["mean"] + overhead["remainder_ms"] + stats["host"]["mean"], rel=1e-12
+    ), "10 = 13/6 + 41/6 + 1"
     assert stats["tracing_stretch"]["value"] == pytest.approx(10.0) and stats["tracing_stretch"]["clock"] == perf.CLOCK
     slow = _request(0.0, [0.010, 0.070, 0.130, 0.190], launches=[0.001, 0.011, 0.071, 0.131])  # in a step: 9 ms, then 59 ms three times
     longer = _request(0.0, [0.0109, 0.0518], kind="traced", launches=[0.001, 0.0119])  # in a step: 9.9 ms at the traced position, 39.9 ms behind it
@@ -1480,52 +1530,202 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
     _defines("tracing_stretch", "The median time from a step's first launch to its ids on the host in the traced request,")
     upper = perf._statistics(timed, 3, 1, "", busy=[11.0, 11.0, 11.0], traced=traced, calls=35)["launch_overhead"]
     assert upper["value"] is None and upper["remainder_ms"] == pytest.approx(-2.0) and upper["host_time_per_block_call_us"] < 0
-    assert upper["reason"] == "not resolved by this method: the remainder is not larger than GPU busy"
+    assert upper["reason"] == "not resolved by this method: the remainder is not larger than the mean GPU busy" and upper["label"] == perf.ESTIMATE
     unseen = perf._statistics(timed, 0, 1, "", unmeasured="this PyTorch build records no kernel activity")
     assert unseen["gpu_busy"]["reason"] == unseen["launch_overhead"]["reason"] == "GPU busy not measured (this PyTorch build records no kernel activity)"
     assert unseen["tracing_stretch"]["reason"] == unseen["gpu_busy"]["reason"] and unseen["gpu_busy"]["n"] == 0
+    assert (unseen["launch_overhead"]["remainder_ms"], unseen["launch_overhead"]["label"], unseen["launch_overhead"]["n"]) == (None, None, 0)
     instant = _request(1.0, [1.010, 1.020], launches=[1.010, 1.020])  # each step's ids are on the host at the stamp of its launch
     still = perf._statistics([instant], 2, 1, "", busy=[1.0, 1.0], traced=traced)["tracing_stretch"]
     assert still["value"] is None and still["reason"] == "not formed: the timed requests spend no time in a step"
-    _defines("launch_overhead", "step - GPU busy - host", "Printed as a term of the step only where it is larger than GPU busy;")
-    _defines("launch_overhead", "The file holds the remainder as computed, which can be negative, and the launch overhead per block call.")
+    _defines("launch_overhead", "Printed as a term of the step, and called an estimate there, only where it is larger than the mean GPU busy;")
+    _defines("launch_overhead", "otherwise the line says that launch overhead and host are not resolved by this method.")
+    _defines("launch_overhead", "The file holds the remainder as computed, which can be negative, the count, the median, the extremes and the percentiles of")
+    _defines("launch_overhead", "the per-step remainders, and the launch overhead per block call.")
     _defines("tracing_stretch", "in the traced request, divided by the same in the timed requests at the same positions, minus 1.")
-    _defines("launch_overhead", "time inside a step in which the GPU waited for the next launch, or the host for the read.")
-    _defines("launch_overhead", "because GPU busy is taken under the profiler and is an upper bound.")
+    _defines("launch_overhead", "It stands for time inside a step in which the GPU waited for the next launch, or the host for the read,")
     _corresponds("launch_overhead")
     _corresponds("tracing_stretch")
     _says("area", "(the remainder as computed is in the file).")
-    _says("area", "A line under it says how many steps were traced, at which positions, and by how much tracing lengthened a step.")
-    # form A: the equation, its second line and the note
+    _says("area", "A line under it says how many steps were traced, at which positions, their median GPU busy, and by how much tracing lengthened a step.")
+    # form A: the step, its mean taken apart, the line that calls launch overhead an estimate, the traced steps and the note
     lines = perf.screen(_checkpoint_form())
-    at = lines.index("step                  400.000  ms = GPU busy 80.000 + launch overhead 280.000 + host 40.000")
-    assert lines[at + 1] == "                      (GPU busy from 51 traced steps, positions 58 to 108; tracing lengthens a step by 5.0 %)"
-    note = lines.index("note                  launch overhead 70 % of a step = 400 us per block call: time in this sample's call path")
-    assert lines[note + 1] == "                      from Python, not kernel time" and lines.index(_line(lines, "memory  ")) < note and lines[note + 2] == ""
-    _says("area", "and what it is -- time in this sample's call path from Python, not kernel time |")
-    one = perf.screen(_checkpoint_form(traced={"steps": 1, "last_position": 58}))
-    assert "                      (GPU busy from the traced step, position 58; tracing lengthens a step by 5.0 %)" in one
-    # form B: GPU busy is not the smaller part -- the step, GPU busy as the upper bound it is, and no term for the rest; no note
-    bound = perf.screen(_gpu_side(_checkpoint_form(), busy=240.0, overhead=None))
-    at = bound.index("step                  400.000  ms (not traced)")
-    assert bound[at + 1 : at + 4] == [
-        "                      GPU busy 240.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
-        "                      launch overhead and host together: not resolved by this method",
-        "                      (GPU busy from 51 traced steps, positions 58 to 108; tracing lengthens a step by 5.0 %)",
+    at = lines.index("step                  400.000  ms; mean 410.000 = GPU busy 82.000 + launch overhead 287.000 + host 41.000")
+    assert lines[at + 1 : at + 4] == [
+        "                      launch overhead: an estimate (GPU busy is the traced request's and an upper bound)",
+        "                      (GPU busy from 51 traced steps, positions 58 to 108; median 80.000 ms;",
+        "                      tracing lengthens a step by 5.0 %)",
     ]
-    assert not any(line.startswith("note ") or "launch overhead 120" in line for line in bound), "the remainder is in the file, not on the screen"
-    unformed = perf.screen(_gpu_side(_checkpoint_form(), stretch=None))
-    at = unformed.index("                      (GPU busy from 51 traced steps, positions 58 to 108;")  # wider than a line: it breaks at the separator
-    assert unformed[at + 1] == "                      the stretch of tracing was not formed)"
-    reduced = perf.screen(_gpu_side(_data(), busy=1.0, overhead=9.0))
-    assert _line(reduced, "note   ").startswith("note                  reduced model: launch overhead ") and " ms = GPU busy 1.000 + " in _line(
-        reduced, "step  "
+    assert 410.0 == 82.0 + 287.0 + 41.0 and lines[at + 1].endswith(perf.ESTIMATE), "the terms of the line add up, and the label is the file's"
+    note = lines.index("note                  launch overhead (an estimate) 70 % of the mean step = 410 us per block call: time in")
+    assert lines[note + 1] == "                      this sample's call path from Python, not kernel time" and lines.index(_line(lines, "memory  ")) < note
+    assert lines[note + 2] == "" and round(287.0 / 410.0 * 100) == 70, "the remainder over the mean step, the step the equation takes apart"
+    _says("area", "its share of the mean step and the time per block call, named as the estimate it is,")
+    _says("area", "and what it stands for -- time in this sample's call path from Python, not kernel time |")
+    one = perf.screen(_checkpoint_form(traced={"steps": 1, "last_position": 58}))
+    assert "                      (GPU busy from the traced step, position 58; median 80.000 ms;" in one
+    # form B: GPU busy is not the smaller part -- the step and its mean, the mean GPU busy as the upper bound it is, no term for the rest; no note
+    bound = perf.screen(_gpu_side(_checkpoint_form(), busy=240.0, term=False))
+    at = bound.index("step                  400.000  ms (not traced), mean 410.000")
+    assert bound[at + 1 : at + 5] == [
+        "                      mean GPU busy 242.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
+        "                      launch overhead and host together: not resolved by this method",
+        "                      (GPU busy from 51 traced steps, positions 58 to 108; median 240.000 ms;",
+        "                      tracing lengthens a step by 5.0 %)",
+    ]
+    assert not any(
+        line.startswith("note ") or "launch overhead 127" in line or "estimate" in line for line in bound
+    ), "the remainder is in the file, not on the screen"
+    assert (
+        bound[at + 5].startswith("with draft tokens ")
+        and _gpu_side(_checkpoint_form(), busy=240.0, term=False)["statistics"]["launch_overhead"]["remainder_ms"] == 127.0
     )
-    _says("area", "*Launch overhead*: the part of a step in which the GPU waited for the next launch, or the host for the read:")
-    _says("area", "the step less GPU busy and less the loop's own host time.")
-    _says("area", "launch overhead = step - GPU busy - host. Launch overhead is printed as a term only where it is larger than GPU busy;")
-    _says("area", "otherwise the line gives GPU busy as the upper bound it is and says that launch overhead and host are not resolved by this method")
-    _says("area", "| `note` | while launch overhead is a term of the step: its share of the step and the time per block call, and what it is --")
+    unformed = perf.screen(_gpu_side(_checkpoint_form(), stretch=None))
+    at = unformed.index(
+        "                      (GPU busy from 51 traced steps, positions 58 to 108; median 80.000 ms;"
+    )  # wider than a line: it breaks at a separator
+    assert unformed[at + 1] == "                      the stretch of tracing was not formed)"
+    reduced = perf.screen(_gpu_side(_data(), busy=1.0, host=1.0, mean=14.0))
+    assert _line(reduced, "note   ").startswith("note                  reduced model: launch overhead (an estimate) 64 % of the mean step = ")
+    at = reduced.index(_line(reduced, "step  "))  # the prefix of a reduced model makes the line wider than the screen: it breaks behind the step
+    assert reduced[at].startswith("step                  reduced model: ") and reduced[at].endswith("  ms;")
+    assert reduced[at + 1] == "                      mean 14.000 = GPU busy 3.000 + launch overhead 9.000 + host 2.000"
+    _says("area", "*Launch overhead*: the part of a step in which the GPU waited for the next launch, or the host for the read.")
+    _says("area", "It is an estimate: a timed step less GPU busy of the traced step at the same position and less the loop's own host time.")
+    _says("area", "It is printed as a term only where it is larger than the mean GPU busy;")
+    _says("area", "otherwise the line gives the mean GPU busy as the upper bound it is and says that launch overhead and host are not resolved by this method")
+    _says("area", "| `note` | while launch overhead is a term of the step:")
+
+
+def _stepped(hosts, insides, kind="timed"):
+    """A request from constructed parts, in ms: per forced step the loop's host time behind the read before it, then the
+    time from the step's first launch call to its ids on the host.  The request and its first token are at 0."""
+    from model_samples import perf
+
+    made, read = perf.Request(kind), 0.0
+    for host, inside in zip(hosts, insides):
+        made.t_launch.append(read + host / 1e3)
+        read = made.t_launch[-1] + inside / 1e3
+        made.t_token.append(read)
+    made.ids = [[7]] * (len(made.t_token) + 1)
+    return made
+
+
+def test_the_remainder_is_formed_step_by_step_before_it_is_aggregated():
+    """Launch overhead is what a timed step leaves beside GPU busy of the traced step at the SAME position and beside its
+    own host time, formed step by step and averaged afterwards -- never the median step less the median GPU busy less
+    the median host time: three medians of three lists need not be one step's, and their difference can be a time
+    that no step has.  Steps that leave nothing report nothing, and the line then has the form without the term; every
+    term the line prints is the mean over the same steps, so the terms add up; and the remainder is called an estimate
+    wherever it is stored or printed.  Every number of this test is constructed, none is a run's."""
+    from model_samples import perf
+
+    def terms(stats):
+        return stats["step"]["mean"], stats["gpu_busy"]["mean"], stats["launch_overhead"]["remainder_ms"], stats["host"]["mean"]
+
+    def run(timed, busy, covered, traced=None, calls=0):
+        stats = perf._statistics(timed, covered, 1, "", busy=busy, traced=traced or _stepped([1.0] * covered, [1.0] * covered, "traced"), calls=calls)
+        step, gpu, left, host = terms(stats)
+        assert step == pytest.approx(gpu + left + host, rel=1e-12, abs=1e-12), "in every case of this test: the mean step is the sum of its three terms"
+        return stats, stats["launch_overhead"], perf._step_lines(stats, {"steps": covered, "first_position": 0, "last_position": covered - 1}, "")
+
+    def of_medians(stats):  # what the three medians would say: the subtraction this test keeps out
+        return stats["step"]["value"] - stats["gpu_busy"]["value"] - stats["host"]["value"]
+
+    # three steps, each exactly its host time and its GPU busy: the long host time and the long GPU busy are different steps'
+    hosts, busy = [100.0, 1.0, 1.0], [1.0, 1.0, 100.0]
+    timed = _stepped(hosts, busy)
+    assert timed.intervals_ms() == pytest.approx([101.0, 2.0, 101.0]) and timed.host_ms() == pytest.approx(hosts) and timed.in_step_ms() == pytest.approx(busy)
+    stats, overhead, lines = run([timed], busy, 3, _stepped(hosts, busy, "traced"), calls=1)
+    assert overhead["remainder_ms"] == pytest.approx(0.0, abs=1e-9) and overhead["value"] is None, "no step leaves a remainder: not 101 - 1 - 1 = 99 ms"
+    assert of_medians(stats) == pytest.approx(99.0), "the three medians are those of three different steps"
+    assert (overhead["n"], overhead["median"]) == (3, pytest.approx(0.0, abs=1e-9)) and max(abs(overhead["minimum"]), abs(overhead["maximum"])) < 1e-9
+    assert overhead["reason"] == "not resolved by this method: the remainder is not larger than the mean GPU busy" and overhead["label"] == perf.ESTIMATE
+    assert overhead["host_time_per_block_call_us"] == pytest.approx(0.0, abs=1e-6) and terms(stats) == pytest.approx((68.0, 34.0, 0.0, 34.0), abs=1e-9)
+    assert lines == [
+        "step                  101.000  ms (not traced), mean 68.000",
+        "                      mean GPU busy 34.000 ms in a traced request (an upper bound: tracing lengthens kernels)",
+        "                      launch overhead and host together: not resolved by this method",
+        "                      (GPU busy from 3 traced steps, positions 0 to 2; median 1.000 ms;",
+        "                      tracing lengthens a step by 0.0 %)",
+    ], "the form without the term, and the two means side by side: half of the mean step is GPU busy, not a hundredth of the median one"
+    # the three candidates apart: one step of three leaves 6 ms, and another one has the long GPU busy
+    stats, overhead, lines = run([_stepped([1.0, 1.0, 1.0], [8.0, 2.0, 20.0])], [2.0, 2.0, 20.0], 3)
+    assert stats["step"]["value"] == pytest.approx(9.0) and of_medians(stats) == pytest.approx(6.0), "9 - 2 - 1: a term of the line, by the three medians"
+    assert overhead["median"] == pytest.approx(0.0, abs=1e-9), "the median of the per-step remainders: most steps leave nothing"
+    assert overhead["remainder_ms"] == pytest.approx(2.0) and overhead["value"] is None, "their mean, 2 ms beside a mean GPU busy of 8: not a term"
+    assert terms(stats) == pytest.approx((11.0, 8.0, 2.0, 1.0)) and lines[0] == "step                  9.000  ms (not traced), mean 11.000"
+    # skewed host times: one step waits 28 ms for its launch and leaves 16 ms beside its GPU busy -- the medians see neither
+    skewed = _stepped([1.0, 1.0, 28.0], [5.0, 5.0, 20.0])
+    stats, overhead, lines = run([skewed], [4.0, 4.0, 4.0], 3, calls=12)
+    assert stats["step"]["value"] == pytest.approx(6.0) and of_medians(stats) == pytest.approx(1.0), "6 - 4 - 1: not a term, by the three medians"
+    assert overhead["median"] == pytest.approx(1.0) and overhead["value"] == overhead["remainder_ms"] == pytest.approx(6.0), "the mean of 1, 1 and 16 ms"
+    assert terms(stats) == pytest.approx((20.0, 4.0, 6.0, 10.0)) and overhead["host_time_per_block_call_us"] == pytest.approx(500.0)
+    assert lines[:2] == [
+        "step                  6.000  ms; mean 20.000 = GPU busy 4.000 + launch overhead 6.000 + host 10.000",
+        "                      launch overhead: an estimate (GPU busy is the traced request's and an upper bound)",
+    ]
+    mean, gpu, launch, host = (float(number) for number in re.findall(r"(?:mean|GPU busy|launch overhead|host) (\d+\.\d{3})", lines[0]))
+    assert mean == pytest.approx(gpu + launch + host, abs=0.002), "the printed terms relate as the line says, to the rounding of three decimals"
+    # the form is chosen on the means as well: a remainder of 5 ms beside GPU busy of 2, 2 and 20 ms -- above their median, below their mean
+    stats, overhead, lines = run([_stepped([1.0] * 3, [7.0, 7.0, 25.0])], [2.0, 2.0, 20.0], 3)
+    assert overhead["remainder_ms"] == pytest.approx(5.0) and overhead["value"] is None and stats["gpu_busy"]["value"] == 2.0, "5 is not larger than 8"
+    assert lines[1] == "                      mean GPU busy 8.000 ms in a traced request (an upper bound: tracing lengthens kernels)"
+    # a traced request that is not the timed ones: two positions of four, its own stamps under the profiler; two timed requests that differ
+    first, second = _stepped([1.0, 1.0, 50.0, 50.0], [9.0, 9.0, 500.0, 500.0]), _stepped([2.0, 2.0, 70.0, 70.0], [12.0, 12.0, 900.0, 900.0])
+    under = _stepped([1.5, 1.5], [11.55, 11.55], "traced")
+    stats, overhead, lines = run([first, second], [4.0, 6.0], 2, under, calls=11)
+    assert (overhead["n"], overhead["minimum"], overhead["maximum"]) == (4, pytest.approx(3.0), pytest.approx(8.0)), "9 - 4, 9 - 6, 12 - 4, 12 - 6"
+    assert overhead["value"] == pytest.approx(5.5) and overhead["host_time_per_block_call_us"] == pytest.approx(500.0)
+    assert terms(stats) == pytest.approx((12.0, 5.0, 5.5, 1.5)), "the means of the four steps at the two traced positions"
+    assert stats["step"]["maximum"] == pytest.approx(14.0), "the steps behind the traced positions are in no term"
+    assert stats["tracing_stretch"]["value"] == pytest.approx(10.0), "the traced request's own stamps: in the stretch (11.55 over 10.5 ms) ..."
+    other = run([first, second], [4.0, 6.0], 2, _stepped([30.0, 30.0], [40.0, 80.0], "traced"))[0]
+    assert terms(other) == terms(stats), "... and in no term of the equation: its GPU busy is, position by position"
+    moved = run([_stepped([1.0, 1.0], [9.0, 20.0]), _stepped([1.0, 1.0], [9.0, 20.0])], [4.0, 15.0], 2)[1]
+    apart = run([_stepped([1.0, 1.0], [9.0, 20.0]), _stepped([1.0, 1.0], [9.0, 20.0])], [15.0, 4.0], 2)[1]
+    assert (moved["minimum"], moved["maximum"]) == (pytest.approx(5.0), pytest.approx(5.0)), "GPU busy against the step at its own position: 9 - 4 and 20 - 15"
+    assert (apart["minimum"], apart["maximum"]) == (pytest.approx(-6.0), pytest.approx(16.0)) and apart["remainder_ms"] == pytest.approx(5.0)
+    # the edges: one step; steps that are all alike; a bound that passes the step; lists that cannot be set against each other
+    stats, overhead, lines = run([_stepped([1.0], [9.0])], [2.0], 1, _stepped([1.0], [9.0], "traced"))
+    assert (overhead["n"], overhead["value"]) == (1, pytest.approx(7.0)) and terms(stats) == pytest.approx((10.0, 2.0, 7.0, 1.0))
+    assert lines[0] == "step                  10.000  ms; mean 10.000 = GPU busy 2.000 + launch overhead 7.000 + host 1.000"
+    assert lines[2:] == [
+        "                      (GPU busy from the traced step, position 0; median 2.000 ms;",
+        "                      tracing lengthens a step by 0.0 %)",
+    ]
+    stats, overhead, lines = run([_stepped([1.0] * 3, [9.0] * 3)] * 2, [2.0] * 3, 3)
+    assert overhead["value"] == pytest.approx(7.0) == pytest.approx(of_medians(stats)), "steps that are alike: the medians are one step's"
+    assert overhead["n"] == 6 and overhead["minimum"] == pytest.approx(overhead["maximum"])
+    stats, overhead, lines = run([_stepped([1.0] * 3, [9.0] * 3)], [11.0, 12.0, 13.0], 3)
+    assert overhead["value"] is None and overhead["remainder_ms"] == pytest.approx(-3.0) and overhead["maximum"] == pytest.approx(-2.0), "stored as computed"
+    assert terms(stats) == pytest.approx((10.0, 12.0, -3.0, 1.0)), "the terms add up where the remainder is negative too"
+    assert lines[0] == "step                  10.000  ms (not traced), mean 10.000" and not any("estimate" in line for line in lines)
+    unequal = ([[10.0, 10.0]], [[1.0, 1.0]], [2.0]), ([[10.0]], [[1.0]], [2.0, 2.0]), ([[10.0], [10.0, 10.0]], [[1.0], [1.0, 1.0]], [2.0])
+    for steps, hosts, busy in (*unequal, ([[10.0], [10.0]], [[1.0]], [2.0])):  # the last: the host times of one request for the steps of two
+        with pytest.raises(ValueError, match="cannot be paired with the steps of the timed requests at the traced positions"):
+            perf.step_split(steps, hosts, busy)
+    with pytest.raises(ValueError, match="GPU busy of 3 traced steps cannot be paired"):
+        run([_stepped([1.0] * 4, [9.0] * 4)], [2.0] * 3, 2)  # GPU busy of three steps for two traced positions
+    with pytest.raises(ValueError, match="GPU busy of 3 traced steps cannot be paired"):
+        run([_stepped([1.0], [9.0])], [2.0] * 3, 3)  # a timed request that does not reach the traced positions
+    _defines("launch_overhead", "Per timed step at a traced position: step - GPU busy of the traced step at the same position - host,")
+    _defines("launch_overhead", "formed step by step before anything is aggregated; of a run the mean over those steps.")
+    _defines("launch_overhead", "With the means of the step, of GPU busy and of host over the same steps, which this file holds, it adds up:")
+    _defines("launch_overhead", "it adds up: step = GPU busy + launch overhead + host.")
+    _defines("launch_overhead", "it is an estimate, not a measurement: a timed step has no GPU-side record, and GPU busy is the traced request's,")
+    _defines("launch_overhead", "taken under the profiler, and is an upper bound.")
+    _says("area", "launch overhead = step - GPU busy - host, formed for every timed step with GPU busy of the traced step at the same position,")
+    _says("area", "before anything is aggregated, and of a run the mean over those steps.")
+    _says("area", "The line gives the step's mean beside its median and takes the mean apart, `mean = GPU busy + launch overhead + host`:")
+    _says("area", "every term is the mean over the same steps, so the terms add up, which the medians of three lists do not.")
+    _says("area", "Launch overhead is an estimate, and the line under the equation says so:")
+    _says("area", "a timed step has no GPU-side record, and GPU busy is the traced request's and an upper bound.")
+    _says("guide", "A figure that sets one against the other -- launch overhead, a step less its GPU busy and its host time -- is formed step by step,")
+    _says("guide", "at the same position, before anything is aggregated: the medians of three lists need not be one step's,")
+    _says("guide", "and their difference can be a time no step has.")
+    _says("guide", "Where its terms are printed as a sum they are the means over the same steps, so that a reader can add them up,")
+    _says("guide", "and it is called an estimate: the two sides are two requests.")
 
 
 def test_rows_by_wiring_position_not_by_name(monkeypatch):
@@ -1791,6 +1991,7 @@ def test_shares_sum_to_gpu_busy(monkeypatch, tmp_path):
         80.0
     ), "a sum of medians is not the median of the sums: the screen's shares need not reach 100 %"
     assert (rows[3]["kernels_per_step"], rows[3]["copies_per_step"]) == (1, 1), "of the median step, not of the first one (2 kernels, 2 copies)"
+    assert all(row["share_percent"] == pytest.approx(row["ms_per_step"] / sorted(busy)[1] * 100) for row in rows), "a row's median over the MEDIAN GPU busy"
     shown = perf._kernel_lines(perf.kernel_table(traced, busy), "")
     assert shown[6] == f"  {'fallback: f':<58}{2:>9}{'--':>11}{0.009:>9.3f}{'20.0 %':>9}", "the median over the steps (0.0086 ms), not their mean (0.0115 ms)"
     # a run: the same tie-out on what the file holds
@@ -1799,10 +2000,14 @@ def test_shares_sum_to_gpu_busy(monkeypatch, tmp_path):
     assert sum(means) == pytest.approx(sum(of_steps) / len(of_steps), rel=1e-12) and data["traced"]["gpu_busy_ms"] == data["statistics"]["gpu_busy"]["value"]
     assert sum(row["launches_per_step"] for row in data["per_kernel"]["rows"]) == data["traced"]["records_of_the_sizing_step"]
     _says("area", "The added times of a step partition the union, so the rows sum to GPU busy")
-    _defines("kernel_time_per_step", "per traced step the sum of the row's added times, the median over the steps; its share is that over GPU busy.")
+    _defines("kernel_time_per_step", "per traced step the sum of the row's added times, the median over the steps; its share is that over the median GPU busy.")
+    _defines("kernel_time_per_step", "The medians of the rows need not sum to the median GPU busy, nor their shares to the whole of it:")
+    _defines("kernel_time_per_step", "the file also holds each row's mean, and the means sum to the mean GPU busy.")
     _corresponds("kernel_time_per_step", "The same shares as in a per-kernel analysis of a traced serving step.")
-    _says("area", "`ms/step` and its share of GPU busy: the row's added times of a step, the median over the traced steps.")
-    _says("area", "(the medians up to the difference between a median of sums and a sum of medians; the means in the file to the rounding of a double).")
+    _says("area", "`ms/step` and its share of GPU busy: the row's added times of a step, the median over the traced steps,")
+    _says("area", "and that median over the median GPU busy, which the line under the `step` line gives.")
+    _says("area", "(the medians, and with them the shares, up to the difference between a median of sums and a sum of medians;")
+    _says("area", "the means in the file to the rounding of a double).")
 
 
 def test_undeclared_record_prints_no_table(monkeypatch, tmp_path):
@@ -1935,16 +2140,23 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     exact = [row for row in data["per_kernel"]["rows"] if row["relation"] == "exact"]
     assert [(row["launches_per_step"], row["planned_launches_per_step"]) for row in exact] == [(1, 1), (1, 1)], "as the kernel check counted them"
     assert all(row["us_per_launch_added"] == pytest.approx(0.4375) and row["us_per_launch_recorded"] == 0.4375 for row in data["per_kernel"]["rows"])
-    step = lines.index(_line(lines, "step  "))
-    assert " ms = GPU busy 0.017 + launch overhead " in lines[step] and lines[step + 1].startswith(
-        "                      (GPU busy from 6 traced steps, positions 5 to 10; "
-    )
-    assert (
-        _line(lines, "note   ").startswith("note                  reduced model: launch overhead ") and data["statistics"]["launch_overhead"]["value"] > 0.017
-    )
-    overhead, calls = data["statistics"]["launch_overhead"], len(_tiny_model().wiring())
+    step, stats = lines.index(_line(lines, "step  ")), data["statistics"]
+    said = " ".join(line.strip() for line in lines[step : step + 5])
+    assert " ms; mean " in said and " = GPU busy 0.017 + launch overhead " in said, "the mean of the step taken apart"
+    assert f" launch overhead: {perf.ESTIMATE} (GPU busy from 6 traced steps, positions 5 to 10; median 0.017 ms; tracing lengthens a step by " in said
+    overhead, calls = stats["launch_overhead"], len(_tiny_model().wiring())
+    assert overhead["value"] == overhead["remainder_ms"] == overhead["mean"] > 0.017 and overhead["label"] == perf.ESTIMATE
+    assert overhead["n"] == stats["step"]["n"] == stats["host"]["n"] == 2 * 6, "every timed step at a traced position: two requests of six"
+    assert stats["step"]["mean"] == pytest.approx(
+        stats["gpu_busy"]["mean"] + overhead["remainder_ms"] + stats["host"]["mean"], rel=1e-9
+    ), "a run's terms add up"
+    printed = [float(number) for number in re.findall(r"(?:mean|GPU busy|launch overhead|host) (\d+\.\d{3})", said.split(" launch overhead: ")[0])]
+    assert len(printed) == 4 and printed[0] == pytest.approx(sum(printed[1:]), abs=0.002), "and so do the four numbers the line prints, to their rounding"
     assert overhead["host_time_per_block_call_us"] == pytest.approx(overhead["remainder_ms"] * 1e3 / calls), "per block call of a step: the model's wiring"
-    assert f" % of a step = {overhead['host_time_per_block_call_us']:.0f} us per block call: " in _line(lines, "note   "), "the figure of the note line"
+    note = lines.index(_line(lines, "note   "))
+    noted = _flat(" ".join(lines[note : note + 2]))
+    assert noted.startswith(f"note reduced model: launch overhead (an estimate) {overhead['value'] / stats['step']['mean'] * 100:.0f} % of the mean step = ")
+    assert f" % of the mean step = {overhead['host_time_per_block_call_us']:.0f} us per block call: " in noted, "the figure of the note line"
     assert (
         data["statistics"]["gpu_busy"]["value"] == pytest.approx(39 * 0.0004375)
         and data["traced"]["tracing_stretch_percent"] == data["statistics"]["tracing_stretch"]["value"]
@@ -1963,7 +2175,8 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     # what the GPU cell of the area holds of the table, and the tests of this module that the README's row names
     cells = (MODELS.parents[1] / "test" / "python" / "linear_attention" / "frost" / "test_model_sample_qwen_dense.py").read_text(encoding="utf-8")
     cell = cells.split("def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(", 1)[1].split("@pytest.mark.L1", 1)[0]
-    for held in ('"the rows hold every record of a step"', 'row["launches_per_step"] == row["planned_launches_per_step"]', '"the rows partition GPU busy"'):
+    kept = ('"the rows hold every record of a step"', 'row["launches_per_step"] == row["planned_launches_per_step"]', '"the rows partition GPU busy"')
+    for held in (*kept, '"the terms of the step add up"', '"every timed step at a traced position"'):
         assert held in cell, held
     _says("area", "and in it the per-kernel table of real launches -- the rows hold every record of a step, an exact row its planned launches,")
     _says("area", "and the rows' mean time per step sums to the mean GPU busy")
@@ -1977,6 +2190,7 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     named = "added_time_partitions_the_union step_equation_only_where_the_remainder_exceeds_gpu_busy rows_by_wiring_position_not_by_name"
     named += " adjacent_fallback_blocks_share_a_row shares_sum_to_gpu_busy undeclared_record_prints_no_table whole_microsecond_stamps_print_no_us_per_launch"
     assert all(callable(globals()[f"test_{name}"]) for name in [*named.split(), "table_of_a_python_step_carries_its_line", "dump_census_schema_2"])
+    assert callable(test_the_remainder_is_formed_step_by_step_before_it_is_aggregated), "the step taken apart: its second test"
     assert perf.screen(json.loads(json.dumps(data))) == lines[lines.index("cuDNN Frontend model sample: decode performance report") :][: len(perf.screen(data))]
     _says("area", "The table says of itself what it is: its second line says that it is launched from Python:")
     _says("area", "a kernel's time there is not its time inside a captured sequence.")

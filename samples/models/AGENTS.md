@@ -123,7 +123,11 @@ does not hold is printed as not known and ignored, so a new name for one of them
     trace -- are reported as a missing trace, in a sentence that names no path; an error of a step under it propagates.
     The token-to-token interval and the rate come from the host clock of requests that are not traced; GPU busy and
     the device time of a kernel come from kernel activity records of a traced request at the same positions, behind
-    the last timed request. The two are never taken from one pass, and a report says which is which. A row of the
+    the last timed request. The two are never taken from one pass, and a report says which is which. A figure that
+    sets one against the other -- launch overhead, a step less its GPU busy and its host time -- is formed step by
+    step, at the same position, before anything is aggregated: the medians of three lists need not be one step's, and
+    their difference can be a time no step has. Where its terms are printed as a sum they are the means over the same
+    steps, so that a reader can add them up, and it is called an estimate: the two sides are two requests. A row of the
     per-kernel table is found by its place in the wiring, never by a kernel's name, and a traced pass whose kernel
     check does not hold prints no table. The row of a block a library serves names the library's entry, as the plan
     does, never the block alone and never a fallback; what a block launches beside a kernel of its own is the row of
