@@ -1082,3 +1082,35 @@ the stored weights (`providers/flashinfer_calls.py`). What building these rows s
   had no library row. With the rows it made the library's first use without the line rule 5 asks for, its help text
   stated the memory of the other row set, and the runs its README dated on `native` were that row set's. When the rows
   of a stack change, every script of the family is run on that stack again, and what it says of the stack is read.
+
+## What the attention preparation's row taught
+
+The attention preparation is the first block on an entry that writes a cache: `cudnn.AttentionPrepareDecode` writes the
+key and the value row of every row of a step into a pool of pages. What building the row showed:
+
+- A kernel that writes a cache decides the cache's layout, and the layout belongs to the state, not to the block. The
+  adapter names the page it needs (`cache_page`), the session builds one state in that layout, and every other block
+  reaches the cache through its accessors -- views and host integers alone. An accessor that gathered through an index
+  tensor would put a launch between two rows that are judged one by one, and the kernel check would name it.
+- What tells a kernel where a row goes is a table the state builds once: its positions, its slots, its cos / sin rows.
+  A judge that read the same tables would agree with a table that is one row late. The judge forms the rows of the
+  pool from host integers, and the twin forms its cosines from the position it is handed: a slot table and a position
+  table shifted by one row, an exchanged rotary half and an accessor that exchanges two pages each failed a run.
+- The twin of an entry is the twin of the entry's own suite, statement by statement, and the band is the contract on
+  the entry's page. Where the page states the kernel against an evaluation in fp64, the twin evaluates in fp64 whatever
+  precision the run's reference accumulates in: a twin in another precision is held to a contract nobody stated.
+- A stand-in entry that computes the twin's own arithmetic shows nothing about a band. The stand-in of the host tests
+  runs a kernel-like fp32 chain, so that some elements are another byte than the twin's and every one is inside; each
+  defect is then placed alone -- an element two units off, a gate bit, a value bit, a key row at the neighbouring
+  slot, a written row no position names, a NaN.
+- The adapter passes every field of the row's form as an argument and leaves none to the entry's default, and a row
+  without a field is refused by name: a default can move with the entry, and the form would still read as the target.
+- A form is compared by value where a census file and a table meet: a list in the file and a tuple in the table are
+  the same sections. And a width the kernel bakes into its name is a width of the row: a checkpoint with another
+  rotary section stays on the reference chain, and its run states no kernel identity.
+- The first use builds the entry before it allocates anything, and its scratch pool is one page: a typed decline of
+  the installation costs no memory, and a decline of the adapter's operands is an error in the entry's own words.
+- A row that changes the layout of a state changes what a run holds: a pool is whole pages, so a memory sentence can
+  move by a tenth of a GiB where a host test pinned it, and a dated run keeps the figure of its own layout.
+- A row a stack gains moves every table that follows the plan without a change of its code: the per-kernel table of
+  the performance mode showed the two attention blocks as one fallback row, and shows an exact row and a fallback row.

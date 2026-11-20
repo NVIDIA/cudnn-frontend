@@ -85,6 +85,23 @@ kernel's layout (``weights.TiledBlockScaledTensor``): a consumer on a fallback r
 kernel accumulates in fp32 over the whole input width and rounds three times, so the adapter names its twin: the
 reference pair of the block evaluated in fp64 with the entry's error bound.
 
+``fe.attention_prepare_decode`` calls ``cudnn.AttentionPrepareDecode``, the preparation of an attention layer's operands for
+the rows of a step in one launch (``docs/operations/attention/attention_prepare_decode.md``): the RMSNorm of every query
+and key head row, the rotation of its rotary part by the row's position, the gate rows copied beside the queries, and the
+keys and values written into the layer's cache -- a POOL OF PAGES, at the slot of each row.  The adapter says which
+layout it needs (``cache_page``), and a session whose plan has this row builds its state that way
+(``state.PagedKvCache``).  A call converts nothing: the entry reads four views of the in-projection's row, the layer's two
+norm weights as the loader holds them, the cos / sin table and the position and slot rows of the step -- taken from the
+cache it is handed (``cache.at(position)``) and from nowhere else, so the position reaches the kernel as device memory
+that was built with the state -- and writes the two halves of the cache's pool and two output buffers of the call's own.
+The row's form is the whole statement of the kernel -- the position form with its sections, the page, the two integer
+dtypes, the two launch knobs -- and the adapter refuses a row that leaves one of them out; the norm's epsilon is the
+model's and a compile key of the entry, so an entry instance is one (device, geometry, epsilon, form).  The kernel
+normalises in fp32 and rounds a rotated value once where the reference chain rounds it three times, so the adapter names
+its twin: the preparation at the kernel's rounding points.  Its first use has two steps: the build, which is handed
+nothing of this adapter's (a typed decline there is the entry's answer about the installation), and one call on scratch
+operands, where the entry imports the contract of the paged pools and launches its kernel once.
+
 A provider row says in which form its entry is called (``row.form``: fields of the entry's own form, under the entry's names).
 An adapter passes exactly those to the entry and nothing else that fixes the kernel, so the row is the whole statement;
 ``launch_facts`` hands the kernel check the entry's own answers for a row count -- the symbols of the kernels it compiled, its
@@ -118,7 +135,7 @@ from __future__ import annotations
 import re
 
 from ..census import Facts, Kernel
-from ..state import RecurrentSlots, TokenSlots
+from ..state import PagedKvCache, RecurrentSlots, TokenSlots
 from ..weights import BLOCK, TILE_COLUMNS, TILE_ROWS, BlockScaledTensor, InterleavedBlockScaledTensor, ScaledTensor, TiledBlockScaledTensor, tile_scales
 from . import BlockBase, GdnParams, split_qkvz
 
@@ -136,6 +153,10 @@ SOURCE_FILES = (
     "attention_gate/frost/gate_quant_decode.py",
     "attention_gate/frost/kernel/gate_quant_decode_config.py",
     "attention_gate/frost/kernel/gate_quant_decode_f16.py",
+    "attention_prepare/frost/prepare_decode.py",
+    "attention_prepare/frost/kernel/prepare_decode_config.py",
+    "attention_prepare/frost/kernel/prepare_decode_f16.py",
+    "gated_attention_block/cache_write_contract.py",  # the contract of the paged pools, which a call of the attention preparation runs
     "norm/frost/add_norm_quant_decode.py",
     "norm/frost/kernel/add_norm_quant_decode_config.py",
     "norm/frost/kernel/add_norm_quant_decode_f16.py",
@@ -177,6 +198,17 @@ PROJECTION_REQUIRED = ("SPLIT_K", "MMA_M", "STAGES", *PROJECTION_GEOMETRY)
 SWIGLU_CONFIG_FIELDS = ("TOKEN_TILE", "PREWAIT_STAGES", "L2_EVICT_FIRST", "MAX_CLUSTERS")
 SWIGLU_ARGUMENTS = {"PDL": "pdl"}
 SWIGLU_REQUIRED = (*SWIGLU_CONFIG_FIELDS, *SWIGLU_ARGUMENTS)
+#: a field of the form of ``cudnn.AttentionPrepareDecode`` a provider row names -> the constructor argument that sets it.  A row
+#: names every one of them: the entry has no default for the first five, and its two launch knobs are stated, never left
+PREPARE_ARGUMENTS = {
+    "POSITIONS": "positions",
+    "SECTION": "mrope_section",
+    "PAGE_SIZE": "page_size",
+    "POSITION_DTYPE": "position_dtype",
+    "SLOT_DTYPE": "slot_dtype",
+    "PDL": "pdl",
+    "PDL_RELEASE": "pdl_release",
+}
 #: the entry's three launch facts: what the kernel check reads
 LAUNCH_FACTS = ("kernel_symbols_for", "form_for", "launch_shape_for")
 #: the first cuDNN Frontend version that carries the entries of this module, and the CuTe DSL floor their pages state
@@ -664,6 +696,164 @@ class GdnVerifyFusedBlock(EntryBlock):
         except NotImplementedError as error:
             raise RuntimeError(f"cudnn.GdnVerifyFused declined the operands of this step: {error}") from error
         return ScaledTensor(out.view(torch.uint8).view(rows, -1), params.out_scale_value)
+
+
+class AttentionPrepareDecodeBlock(EntryBlock):
+    """``cudnn.AttentionPrepareDecode``: per row of a step ``q_out = rot(n(q, q_weight))``, the gate rows copied, and ``rot(n(k,
+    k_weight))`` and the value row written into the two halves of the cache's pool at the row's slot -- ``n`` the RMSNorm of
+    a head row rounded once to bf16, ``rot`` the rotation of its rotary part by the row's position; one launch per
+    attention layer and step, in the form the row names."""
+
+    name = "AttentionPrepareDecode"
+    what = "the attention preparation decode step"
+    kernels = (Kernel("attention_prepare", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per attention layer and step
+    per_row = (0, 1)
+    state_args = (1,)  # the layer's cache: the kernel writes the keys and values of the step's rows into its pool
+    cache_page = 64  # the positions of a page of the pool this adapter hands its entry: the session builds its state in that layout
+    _twin = None
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass, or a form that leaves one
+        of them to the entry, is a wrong table."""
+        form = dict(self.row.form)
+        unknown = [name for name in form if name not in PREPARE_ARGUMENTS]
+        missing = [name for name in PREPARE_ARGUMENTS if name not in form]
+        if unknown or missing:
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {', '.join(missing)}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form {what}; this adapter passes {', '.join(PREPARE_ARGUMENTS)} to cudnn.AttentionPrepareDecode, "
+                "and never leaves one of them to the entry's own default"
+            )
+        return {PREPARE_ARGUMENTS[name]: value for name, value in form.items()}
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if self.facts.total_bytes and "device" in self.options:
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)  # the first use follows the memory sentence
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: on compute capability 10.7 the entry's page asks for a CuTe DSL whose compiler is CUDA 13.4
+        or later (the CUDA 12 flavour lists the target and cannot assemble it)."""
+        if super()._unmet():
+            return True
+        if tuple(self.facts.cc) != (10, 7):
+            return False
+        from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound
+
+        return (int(CUDA_VERSION.major), int(CUDA_VERSION.minor)) < (13, 4)
+
+    def _build(self, device, site: str = ""):  # one form per row: the call site is not read
+        import torch
+
+        device, g, eps = torch.device(device), self.model.geometry, self.model.norm_eps
+        widths = (g.attn_heads, g.attn_kv_heads, g.attn_head_dim, g.rotary_dim)
+        key = ("attention_prepare_decode", str(device), widths, eps, tuple(self.row.form))
+        if key not in _ENTRIES:
+            arguments = self._arguments()
+            cudnn = self._cudnn()
+            from cudnn.attention_prepare import AttentionPrepareGeometry
+
+            try:
+                _ENTRIES[key] = cudnn.AttentionPrepareDecode(device, AttentionPrepareGeometry(*widths), eps, **arguments)
+            except (NotImplementedError, TypeError, ValueError) as error:  # the entry declines the widths or the form the table hands it
+                raise ValueError(f"the provider table is wrong: {self.entry} declines the geometry or the form of the row of {self.row.key}: {error}") from None
+        return _ENTRIES[key]
+
+    def twin(self, reference):
+        """The reference block this adapter is compared with: the preparation at the kernel's rounding points, in the position
+        form of the row."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.AttentionPrepareRounded(reference.row, self.model, self.facts, self.options)
+            self._twin.order = dict(self.row.form)["POSITIONS"]
+        return self._twin
+
+    def _operands(self, qkv, q_weight, k_weight, cos_sin, positions, k_pool, v_pool, slots) -> tuple:
+        """The entry's operands for the rows ``qkv`` ``[rows, 2 heads x D + 2 key / value heads x D]`` of an in-projection --
+        per query head its row and its gate row side by side, then the key rows, then the value rows: four VIEWS of
+        them, nothing copied -- and the outputs of this call, which are its own: never the entry's pair, which its next
+        call of that row count overwrites.  A row of one position row is handed the first of the table's three."""
+        import torch
+
+        g = self.model.geometry
+        rows, H, HK, D = int(qkv.shape[0]), g.attn_heads, g.attn_kv_heads, g.attn_head_dim
+        pairs = qkv[:, : 2 * H * D].view(rows, H, 2 * D)
+        k = qkv[:, 2 * H * D : (2 * H + HK) * D].view(rows, HK, D)
+        v = qkv[:, (2 * H + HK) * D :].view(rows, HK, D)
+        if dict(self.row.form)["POSITIONS"] != "3d":
+            positions = positions[0]
+        q_out = torch.empty((rows, H, D), dtype=torch.bfloat16, device=qkv.device)
+        gate_out = torch.empty((rows, H, D), dtype=torch.bfloat16, device=qkv.device)
+        return (pairs[..., :D], pairs[..., D:], k, v, q_weight, k_weight, cos_sin, positions, k_pool, v_pool, slots, q_out, gate_out)
+
+    def _scratch(self, sequences: int, tokens: int):
+        """``(entry, operands)`` on scratch tensors of the run's row count: rows of zeros, a pool of ONE page, the table of one
+        position.  Row ``n`` has slot ``n``: the rows past the page name no row of the pool, and write none."""
+        import torch
+
+        g, device = self.model.geometry, torch.device(self.options.get("device", "cuda"))
+        rows, bf16 = sequences * tokens, dict(dtype=torch.bfloat16, device=device)
+        qkv = torch.zeros((rows, 2 * g.attn_out + 2 * g.attn_kv_heads * g.attn_head_dim), **bf16)
+        weight = torch.zeros(g.attn_head_dim, **bf16)
+        pool = torch.zeros((1, g.attn_kv_heads, self.cache_page, 2 * g.attn_head_dim), **bf16)
+        cos_sin = torch.zeros((1, g.rotary_dim), **bf16)
+        positions = torch.zeros((3, rows), dtype=torch.int64, device=device)
+        slots = torch.arange(rows, dtype=torch.int64, device=device)
+        halves = (pool[..., : g.attn_head_dim], pool[..., g.attn_head_dim :])
+        return self._build(device), self._operands(qkv, weight, weight, cos_sin, positions, *halves, slots)
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device, in two steps.  The entry's build is handed nothing of this
+        adapter's -- its compile key is its construction -- so every typed decline of it is the entry's answer about the
+        installation and passes through as it is: a ``NotImplementedError``, the SKIP in the entry's own words.  Then ONE
+        call on scratch operands of the run's row count: the entry imports the contract of the paged pools and launches
+        its kernel there, not in the first step.  A decline of that call is of the operands this adapter built -- a
+        ``ValueError``, an ERROR -- unless it was raised from an ``ImportError``: what the call needs of the installation
+        could not be imported, which is the installation's again."""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        self._build(self.options["device"]).compile()  # handed nothing: a decline is the entry's own sentence, before an operand is made
+        entry, operands = self._scratch(sequences, tokens)
+        try:
+            entry(*operands)
+        except NotImplementedError as error:
+            if isinstance(error.__cause__, ImportError):
+                raise
+            raise ValueError(f"{self.entry} declined the operands this adapter built for its first use: {error}") from None
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{self.entry} declined the operands this adapter built for its first use: {error}") from None
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        entry, operands = self._scratch(sequences, tokens)
+        try:
+            entry.compile()  # built while the run was planned (``first_use``): the entry finds its kernel
+            entry(*operands)  # a launch of the compiled kernel at the run's row count, before the first step
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    def __call__(self, qkv, cache, position, params):
+        if not isinstance(cache, PagedKvCache) or cache.page != self.cache_page:
+            has = f"pages of {cache.page} positions" if isinstance(cache, PagedKvCache) else type(cache).__name__
+            raise ValueError(
+                f"cudnn.AttentionPrepareDecode writes an attention cache that is a pool of pages of {self.cache_page} positions; this block is handed {has}: "
+                "the session's state was built for another plan"
+            )
+        entry, rows = self._build(qkv.device), int(qkv.shape[0])
+        self._served = (entry, rows)  # what the call log of a traced step reads back (``serving``)
+        cos_sin, positions, slots = cache.at(position)  # the position reaches the kernel as rows of the state's tables, through the cache alone
+        operands = self._operands(qkv, params.q_norm, params.k_norm, cos_sin, positions, cache.k_pool, cache.v_pool, slots)
+        try:
+            entry(*operands)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.AttentionPrepareDecode declined the operands of this step: {error}") from error
+        q_out, gate_out = operands[-2:]
+        return q_out, gate_out.view(rows, -1)  # the tensors the entry wrote: the gates as the rows the gate block reads
 
 
 class AttentionGateQuantDecodeBlock(EntryBlock):
