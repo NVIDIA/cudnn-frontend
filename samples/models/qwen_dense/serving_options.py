@@ -135,6 +135,58 @@ NEUTRAL = {
 }
 
 
+#: The speculative configuration of a serving engine: the JSON object that asks an engine to draft tokens.  A key of it selects
+#: what is launched, so none is printed and ignored: a key is read, accepted at the value that changes nothing, or refused.
+#: The object ``02_speculative_decode.py`` runs when it is given none:
+SPECULATIVE_DEFAULT = '{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}'
+#: the keys the object is read for, each with what is accepted and why nothing else is; all three must be named
+SPECULATIVE_READ = {
+    "method": (("mtp",), "the drafter is the checkpoint's own, the method mtp; no other method is served"),
+    "num_speculative_tokens": ((), "it is the number of tokens a step drafts: a whole number from 1"),
+    "use_local_argmax_reduction": ((True,), "the draft token is the largest of the listed rows of the head; without it an engine launches another set"),
+}
+#: keys that are accepted at the value at which they change nothing, and at ``null``, each with the reason for another value
+SPECULATIVE_NEUTRAL = {
+    "rejection_sample_method": (("standard",), "a drafted token is kept while it equals the greedy token in front of it: nothing is drawn"),
+    "draft_sample_method": (("greedy",), "the drafter proposes the token of its largest logit"),
+    "enable_adaptive_verification": ((False,), "every step verifies every token it drafted"),
+    "disable_padded_drafter_batch": ((False,), "one request: there is no batch of drafts to pad"),
+    "parallel_drafting": ((False,), "the drafter's passes run one after the other, each on the proposal of the pass before"),
+    "use_heterogeneous_vocab": ((False,), "the drafter proposes ids of the model's own vocabulary"),
+}
+_OWN_DRAFTER = "the drafter is the checkpoint's own, loaded as its loader loads it"
+_ACCEPTANCE = "the tokens a step keeps are decided by the greedy comparison: an acceptance that is drawn, scheduled or loosened is not served"
+_ONE_PROCESS = "one process on one GPU, launched from Python"
+_ROWS = "which kernel serves a block is a row of the table a run prints (--stack, --provider)"
+_OTHER_METHOD = "it is an option of another speculative method, or of a cache keyed by content, which a sample does not have"
+_FLY = ("fly_window_size", "fly_entropy_threshold", "fly_entropy_top_k")  # of a rejection sample method that is not served
+#: every other key of a speculative configuration this module knows, each with the reason it is refused whatever its value
+SPECULATIVE_REFUSED = {
+    **dict.fromkeys(("model", "quantization", "revision", "code_revision", "draft_load_config", "draft_lm_head_quantization"), _OWN_DRAFTER),
+    "index_share_for_mtp_iteration": "it overrides a field of the drafter's own configuration: the drafter runs as its checkpoint describes it",
+    "max_model_len": "the drafter has no context length of its own: its cache has the positions of the model's (--max-model-len)",
+    **dict.fromkeys(("synthetic_acceptance_rates", "synthetic_acceptance_length", *_FLY), _ACCEPTANCE),
+    "num_speculative_tokens_per_batch_size": "one request: the number of drafted tokens is one number (num_speculative_tokens)",
+    **dict.fromkeys(("enforce_eager", "tensor_parallel_size", "draft_tensor_parallel_size"), _ONE_PROCESS),
+    **dict.fromkeys(("moe_backend", "attention_backend", "kv_cache_dtype"), _ROWS),
+    **dict.fromkeys(
+        (
+            "disable_eagle_block_drop",
+            "disable_lookahead_block_hashes",
+            "prompt_lookup_max",
+            "prompt_lookup_min",
+            "suffix_decoding_max_tree_depth",
+            "suffix_decoding_max_cached_requests",
+            "suffix_decoding_max_spec_factor",
+            "suffix_decoding_min_token_prob",
+            "dspark_draft_topk",
+            "xpress_topc",
+        ),
+        _OTHER_METHOD,
+    ),
+}
+
+
 def _text_io():
     """The text module of the helper layer, imported where a request is read and not with this module: a sample imports
     ``cudnn`` before PyTorch, and the helper layer imports PyTorch."""
@@ -356,6 +408,68 @@ def first_token_line(prompts: Sequence[tuple]) -> str:
         "first token: a prompt goes through the decode step, one step per prompt token (no stack of this sample has a prefill kernel): "
         f"{counts}. No text is written until then; the first token line of the report has the time"
     )
+
+
+def parse_speculative_config(text: str, shown: str) -> tuple:
+    """The speculative configuration of a serving engine, as the JSON text of its object: ``(drafted tokens of a step, the
+    line a run prints for it)``.  Every key is answered by the three tables above: the keys of ``SPECULATIVE_READ`` must be
+    named and are held to what is accepted; a key of ``SPECULATIVE_NEUTRAL`` is accepted at its value and at ``null``,
+    which is the key left out; a key of ``SPECULATIVE_REFUSED`` is refused whatever it holds, with its reason; any other
+    key is refused by its name.  Each refusal is a ``ValueError`` that starts with ``shown``.  The line holds the names
+    of the keys and the values the tables know, never what somebody else wrote into the object."""
+    try:
+        config = json.loads(text)
+    except ValueError as error:
+        raise ValueError(f"{shown}: not JSON ({error})") from None
+    if not isinstance(config, dict):
+        raise ValueError(f"{shown}: {_show(config, 40)} is not a JSON object; a speculative configuration is one, with its keys")
+    for name in config:  # a key no table holds, whatever it holds: a name that is mistyped is not taken for a key left out
+        if name not in SPECULATIVE_READ and name not in SPECULATIVE_NEUTRAL and name not in SPECULATIVE_REFUSED:
+            raise ValueError(
+                f"{shown}: {_show(name, 64)} is not a key this sample holds: a key of a speculative configuration selects what is launched, "
+                "so none is ignored. Leave the key out"
+            )
+    config = {name: value for name, value in config.items() if value is not None}  # null is the key left out
+    read, neutral = [], []
+    for name, (values, reason) in SPECULATIVE_READ.items():
+        accepted = ", ".join(_show(known) for known in values) or "a whole number from 1"
+        if name not in config:
+            raise ValueError(f'{shown}: "{name}" is not named: {reason}. Accepted: {accepted}')
+        value = config[name]
+        if not (any(_same(value, known) for known in values) if values else type(value) is int and value >= 1):
+            raise ValueError(f'{shown}: "{name}": {_show(value, 40)} is not served: {reason}. Accepted: {accepted}')
+        read.append(f"{name} {_show(value)}")
+    for name, value in config.items():
+        if name in SPECULATIVE_READ:
+            continue
+        if name in SPECULATIVE_NEUTRAL:
+            values, reason = SPECULATIVE_NEUTRAL[name]
+            if not any(_same(value, known) for known in values):
+                accepted = ", ".join([_show(known) for known in values] + ["null"])
+                raise ValueError(
+                    f'{shown}: "{name}": {_show(value, 40)} would change what is launched and is not served: {reason}. '
+                    f"Accepted: {accepted}, or the key left out"
+                )
+            neutral.append(f"{name} {_show(value)}")
+        else:  # a refused key: what it holds is somebody's own -- a model's path, a revision -- and is not printed back
+            raise ValueError(f'{shown}: "{name}" is not served: {SPECULATIVE_REFUSED[name]}. Leave the key out')
+    line = f"{shown}: the speculative configuration of a serving engine. Read: " + ", ".join(read) + "."
+    if neutral:
+        line += " At the value that changes nothing: " + ", ".join(neutral) + "."
+    return config["num_speculative_tokens"], line
+
+
+def speculative_line(prompts: Sequence[tuple], draft_tokens: int) -> str:
+    """What a speculative run does before its first new token and in every step behind it, said before anything is loaded: a
+    rule and counts, never a time.  ``prompts``: ``(shown, prompt tokens)`` per request; a run of several names each."""
+    named = len(prompts) > 1
+    each = "; ".join(
+        f"prompt of {tokens:,} tokens{f' ({shown})' if named else ''} = {tokens:,} decode steps and {tokens - 1:,} passes of the drafter "
+        "before the first token"
+        for shown, tokens in prompts
+    )
+    passes = f"{draft_tokens} draft pass{'es' if draft_tokens > 1 else ''}"
+    return f"{each}; then every step is {passes} and one verify step of {draft_tokens + 1} tokens, and keeps 1 to {draft_tokens + 1} of them"
 
 
 def _silence_stdout() -> None:

@@ -10,7 +10,8 @@ that sentence -- unless a check failed before it: a skip never covers a failure.
 standard error, and standard output must stay empty: it is kept for generated text, which a seeded run does not have.
 Each sequence count also reports its
 traced pass (GPU busy, idle and launches per step from kernel activity records, or the reason there are none) and the
-bytes of a step.  The
+bytes of a step.  The performance mode of the same seeded model (``--perf``) runs on both stacks in a fresh interpreter:
+its verdict, its report in the reduced-model form and its report file are held, none of its times.  The
 verdict line, the stack, the versions and the wall time are recorded through ``frost_routing.measured``, so the result -- or
 the skip -- reaches the job log of a passing run.  L0 runs the two-layer model (one linear-attention + one attention layer), L1
 the four-layer one (three + one).
@@ -42,7 +43,16 @@ token, against reference decode steps; its launch against the entry's own facts 
 GPU the census has a section for, against the recorded launch shape.  The out-projection of the linear-attention layer is
 the FP8 projection entry's in such a step where a row of the stack holds the step's rows (compute capability 10.0: 2 to
 16 rows; 10.3 and 10.7: 2 to 32), in the split of that row range, and is judged against the reference multiply under the
-name of its call site; the attention layer's out-projection, and both beyond those rows, are the multiply over a copy."""
+name of its call site; the attention layer's out-projection, and both beyond those rows, are the multiply over a copy.
+
+The speculative cells run ``samples/models/qwen_dense/02_speculative_decode.py``: one request through the prompt's decode
+steps and then steps of speculative decoding -- the seeded drafter's passes on reference blocks, one verify step, one host
+read --, with the drafted tokens of every step scheduled, held line by line against decode steps of the same tokens and
+then by the checks of every run.  The L0 cell is its default run, loaded by path and run in this process, with both
+streams held; it launches two forms no other L0 cell launches -- the fused verify step and the fused decode step on token
+0 of a state of six tokens per sequence, both in the form of the default stack -- and records what their first launches
+took.  The L1 cell is the same run on the stack ``fe-entries`` in a fresh interpreter: its kernel check holds whole steps,
+the lookups of the drafter's passes and the verify plan's rows."""
 
 import importlib.util
 import os
@@ -60,21 +70,33 @@ import frost_routing  # noqa: E402
 
 MODELS = Path(__file__).resolve().parents[4] / "samples" / "models"
 SCRIPT = MODELS / "qwen_dense" / "00_decode.py"
+SPECULATIVE = MODELS / "qwen_dense" / "02_speculative_decode.py"
 
 
-@pytest.fixture()
-def sample(monkeypatch):
-    """The sample script as a module; its ``sys.path`` entry, every ``model_samples`` module and the default it sets for the
+def _loaded(monkeypatch, script):
+    """A sample script as a module; its ``sys.path`` entries, every ``model_samples`` module and the default it sets for the
     profiler's log level leave with the test."""
     monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))
     paths = list(sys.path)
-    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode", SCRIPT)
+    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_" + script.stem, script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     yield module
     sys.path[:] = paths
-    for name in [n for n in sys.modules if n == "model_samples" or n.startswith("model_samples.")]:
+    for name in [n for n in sys.modules if n in ("model_samples", "serving_options") or n.startswith("model_samples.")]:
         del sys.modules[name]
+
+
+@pytest.fixture()
+def sample(monkeypatch):
+    """The plain script, ``00_decode.py``."""
+    yield from _loaded(monkeypatch, SCRIPT)
+
+
+@pytest.fixture()
+def speculative(monkeypatch):
+    """The speculative script, ``02_speculative_decode.py``."""
+    yield from _loaded(monkeypatch, SPECULATIVE)
 
 
 FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2"
@@ -88,8 +110,8 @@ FE_ENTRIES_CC100 = "by provider: cuDNN FE 5 | fallbacks 5 (cuBLAS over copies 3,
 CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles of both sequence counts and the run, far above what they take
 
 
-def _fresh_interpreter(arguments):
-    """The sample script as a user runs it: in a fresh interpreter, which imports the ``cudnn`` package this process imported.
+def _fresh_interpreter(arguments, script=SCRIPT, tag="[00]"):
+    """A sample script as a user runs it: in a fresh interpreter, which imports the ``cudnn`` package this process imported.
     Returns ``(exit code, the run's lines, what the run wrote to standard output)``: a sample writes every line of a run
     to standard error and keeps standard output for generated text.  The child arms its own stack dump before the
     parent's deadline; where the deadline passes, the failure carries what the child had printed."""
@@ -102,15 +124,15 @@ def _fresh_interpreter(arguments):
         f"sys.path.insert(0, {package_root!r})\n"
         "import cudnn\n"
         f"assert cudnn.__file__ == {cudnn.__file__!r}, f'the child imported another cudnn: {{cudnn.__file__}}'\n"
-        f"sys.argv = [{str(SCRIPT)!r}, *{list(arguments)!r}]\n"
-        f"runpy.run_path({str(SCRIPT)!r}, run_name='__main__')\n"
+        f"sys.argv = [{str(script)!r}, *{list(arguments)!r}]\n"
+        f"runpy.run_path({str(script)!r}, run_name='__main__')\n"
     )
     try:
         done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=CHILD_SECONDS)
     except subprocess.TimeoutExpired as late:
         shown = [part.decode(errors="replace") if isinstance(part, bytes) else (part or "") for part in (late.stdout, late.stderr)]
         pytest.fail(f"the sample did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}")
-    if "[00] " not in done.stderr:  # the child never reached the sample's own lines: an import or an environment failure
+    if f"{tag} " not in done.stderr:  # the child never reached the sample's own lines: an import or an environment failure
         pytest.fail(
             f"the sample printed no verdict in a fresh interpreter (exit code {done.returncode})\n--- stdout\n{done.stdout[-3000:]}\n--- stderr\n{done.stderr[-6000:]}"
         )
@@ -246,6 +268,76 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
     frost_routing.measured("model sample qwen_dense 00_decode --stack fe-entries: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries"])
+def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stack, tmp_path):
+    """``--perf`` on the reduced seeded model, on the two stacks the tests of this repository run, in a fresh interpreter
+    (the kernel check reads kernel names from the profiler: the module docstring): the checked request and its reference
+    checks, a warm-up request, two timed requests, the traced request and the kernel check on it.  The run ends in ``[00]
+    PASS`` -- or, where the profiler's records cannot be had, in ``RAN <stack> stack (kernels not observed: ...)`` --
+    prints the report in its reduced-model form (no rate; ``orientation`` with ``reduced model`` among its reasons) on
+    standard error, leaves standard output empty and writes the report file.  No time of it is held against anything."""
+    import json
+
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    report = tmp_path / "report.json"
+    arguments = ["--stack", stack, "--perf", "--perf-steps", "16", "--perf-requests", "2", "--perf-warmup", "4", "--perf-report", str(report)]
+    start = time.perf_counter()
+    code, out, written = _fresh_interpreter(arguments)
+    tagged = [line for line in out.splitlines() if line.startswith("[00] ")]
+    verdict = tagged[-1] if tagged else "no output"
+    frost_routing.measured(f"model sample qwen_dense 00_decode --stack {stack} --perf", f"{verdict}; {time.perf_counter() - start:.0f} s")
+    if verdict.startswith("[00] SKIP"):
+        assert " FAIL" not in out and "[00] ERROR" not in out, out[-6000:]  # a skip never covers a failed check
+        pytest.skip(verdict)
+    unobserved = verdict.startswith(f"[00] RAN {stack} stack (kernels not observed: ")
+    assert code == 0 and (verdict == "[00] PASS" or unobserved) and " FAIL" not in out, out[-8000:]
+    assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
+    lines = out.splitlines()
+    screen = lines[lines.index("cuDNN Frontend model sample: decode performance report") :]
+    screen = screen[: next(index for index, line in enumerate(screen) if line.startswith("[00] "))]  # the report and its text out line
+    assert max(len(line) for line in screen) <= 110, max(screen, key=len)
+    assert any(line.startswith("report file           report.json") for line in screen) and any(line.startswith("text out  ") for line in screen)
+    assert screen[1].startswith("record class          orientation, not a number of record: reduced model; ")
+    assert "decode rate           not printed for a reduced model" in screen and not any("tokens/s" in line for line in screen)
+    assert any(line.startswith("checks      blocks against the reference at positions 0-15, ") and line.endswith(": PASS") for line in screen)
+    said = " ".join(line.strip() for line in screen)
+    assert "timed requests give the checked request's tokens and state: PASS" in said
+    assert ("kernels, traced steps: NOT OBSERVED (" if unobserved else "kernels, traced steps: PASS") in said
+    assert "protocol    warm-up 4 steps | timed 16 steps x 2, end token ignored | launched from Python, not captured" in screen
+    assert any(line.startswith("[00] performance mode: at most ") for line in tagged), "what the mode will run, before the load"
+
+    def refuse(constant):
+        raise AssertionError(f"the report file holds {constant}")
+
+    data = json.loads(report.read_text(encoding="utf-8"), parse_constant=refuse)
+    assert data["schema"] == "model-sample-performance/1" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
+    assert data["protocol"]["stack"] == stack and str(tmp_path) not in report.read_text(encoding="utf-8"), "no path in the file"
+    requests = data["raw"]["requests"]
+    assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced"]
+    assert requests[2]["ids_sha256"] == requests[3]["ids_sha256"] == requests[0]["ids_sha256"], "every timed request: the checked request's ids"
+    assert requests[2]["end_state_sha256"] == requests[3]["end_state_sha256"] == requests[0]["end_state_sha256"], "and its end state, byte for byte"
+    assert data["protocol"]["profiler_first_started"] == (None if unobserved else "behind the last timed request, in the traced request")
+    # the record class: every reason, in the order of the conditions; a stack that declares a target kernel set names its identity
+    identity = "no target kernel set declared" if stack == "fe-cublas" else "kernel identity not claimed on this GPU class"
+    observed = ["kernels not observed"] if unobserved else []
+    reasons = ["reduced model", "fallback rows present", identity, "launched from Python", *observed, "other processes not observed", "clocks not observed"]
+    assert data["record"]["reasons"] == reasons and data["record"]["performance_claim_eligible"] is False
+    assert all(entry["definition"] and entry["unit"] for entry in data["statistics"].values()), "a definition and a unit beside every statistic"
+    memory = data["memory"]  # the peak of the timed part is PyTorch's own, between the settle and the last timed request: inside the process's
+    assert (
+        0 < memory["peak_reserved_gib"] <= memory["process_peak_reserved_gib"] and memory["weights_gib"] + memory["state_gib"] <= memory["peak_allocated_gib"]
+    )
+    kernels = data["kernels"]
+    if not unobserved:
+        assert 1 <= data["traced"]["steps"] <= 16 and requests[4]["ids_sha256"] == requests[0]["ids_sha256"], "the traced request too"
+    if kernels["stated"]:  # a target stack on a GPU the census has a section for: the three numbers add up
+        assert kernels["on_target"] == kernels["code"] + kernels["port"] + kernels["stand_ins"] and kernels["launches"] == 20
+    else:
+        assert (stack == "fe-cublas") == (not kernels["declared"]), "fe-cublas declares no target kernel set; fe-entries does"
+
+
 @pytest.mark.L1
 def test_four_layer_run_passes_its_own_checks(sample, capsys):
     out = _run(sample, capsys, ["--layers", "4"])
@@ -302,42 +394,46 @@ raise SystemExit(0 if passed else 1)
 """
 
 
-def _verify(sequences, tokens):
-    """A decode session and a verify session of ``tokens`` tokens per sequence in a fresh interpreter (``VERIFY_PROGRAM``):
-    the run's lines.  Skips where the plan declines the GPU; fails where a check failed or standard output is not empty."""
+def _program(program, tag, key, what, **fields):
+    """A small program that drives the helper layer in a fresh interpreter (``program``, formatted with ``fields``): the
+    run's lines.  ``tag`` starts its own lines (``[verify]``), ``key`` names the run in the routing record, ``what`` in a
+    failure.  Skips where the plan declines the GPU; fails where a check failed or standard output is not empty."""
     import cudnn
 
     if not torch.cuda.is_available():  # decided here, before a child is started
         pytest.skip("needs a CUDA GPU")
-    program = VERIFY_PROGRAM.format(
+    program = program.format(
         deadline=CHILD_SECONDS - 60,
         package_root=str(Path(cudnn.__file__).resolve().parent.parent),
         cudnn_file=cudnn.__file__,
         models=str(MODELS),
-        sequences=sequences,
-        tokens=tokens,
+        **fields,
     )
     start = time.perf_counter()
     try:
         done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=CHILD_SECONDS)
     except subprocess.TimeoutExpired as late:
         shown = [part.decode(errors="replace") if isinstance(part, bytes) else (part or "") for part in (late.stdout, late.stderr)]
-        pytest.fail(
-            f"the verify run did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}"
-        )
+        pytest.fail(f"the {what} did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}")
     out = done.stderr
-    tagged = [line for line in out.splitlines() if line.startswith("[verify] ")]
+    tagged = [line for line in out.splitlines() if line.startswith(f"{tag} ")]
     verdict = tagged[-1] if tagged else f"no verdict (exit code {done.returncode})"
-    versions = next((line[9:] for line in tagged if line.startswith("[verify] cuDNN Frontend ")), "no environment line")
-    key = f"model sample qwen_dense verify step, {sequences} x {tokens} tokens, stack fe-entries"
+    versions = next((line[len(tag) + 1 :] for line in tagged if line.startswith(f"{tag} cuDNN Frontend ")), "no environment line")
     frost_routing.measured(key, f"{verdict}; {versions}; {time.perf_counter() - start:.0f} s")
     assert done.stdout == "", f"a run of the helper layer writes nothing to standard output; it holds\n{done.stdout[-3000:]}"
-    if verdict.startswith("[verify] SKIP"):
+    if verdict.startswith(f"{tag} SKIP"):
         assert " FAIL" not in out, out[-6000:]  # a skip never covers a failed check
         pytest.skip(verdict)
-    held = verdict == "[verify] PASS" or verdict.startswith("[verify] RAN fe-entries stack (kernels not observed: ")
+    held = verdict == f"{tag} PASS" or verdict.startswith(f"{tag} RAN fe-entries stack (kernels not observed: ")
     assert done.returncode == 0 and held and " FAIL" not in out, out[-8000:]
     return out
+
+
+def _verify(sequences, tokens):
+    """A decode session and a verify session of ``tokens`` tokens per sequence in a fresh interpreter (``VERIFY_PROGRAM``):
+    the run's lines."""
+    key = f"model sample qwen_dense verify step, {sequences} x {tokens} tokens, stack fe-entries"
+    return _program(VERIFY_PROGRAM, "[verify]", key, "verify run", sequences=sequences, tokens=tokens)
 
 
 def _verify_asserts(out, sequences, tokens):
@@ -410,3 +506,146 @@ def test_a_verify_step_of_four_sequences_runs_each_sequence_alone_with_its_token
     _verify_asserts(out, 4, 6)
     assert "batch invariance  one sequence alone vs among 4 (step t: sequence t mod 4)" in out
     assert "linear_attention.step equal (gated)" not in out, "the entry states no batch invariance: nothing is gated on it"
+
+
+def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
+    """Run ``main()`` of the speculative script and hold what every such run prints; with ``sample`` None, run the script in
+    a fresh interpreter instead.  Standard output must stay empty (a seeded run has no language); the verdict is ``[02]
+    PASS`` or, where the kernels were to be checked and the profiler's records could not be had, ``[02] RAN <stack> stack
+    (kernels not observed: ...)`` -- recorded as it is.  A ``SKIP`` skips the cell, unless a check failed before it."""
+    start = time.perf_counter()
+    if sample is None:
+        code, out, written = _fresh_interpreter(arguments, SPECULATIVE, "[02]")
+    else:
+        code = sample.main(arguments)
+        captured = capsys.readouterr()
+        out, written = captured.err, captured.out
+    seconds = time.perf_counter() - start
+    assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
+    lines = out.splitlines()
+    tagged = [line for line in lines if line.startswith("[02] ")]
+    versions = next((line[5:] for line in tagged if line.startswith("[02] cuDNN Frontend ")), "no environment line")
+    device = next((line[5:].split(" | ")[0] for line in tagged if " SMs)" in line), "no device line")
+    verdict = tagged[-1] if tagged else "no output"
+    key = "model sample qwen_dense 02_speculative_decode " + (" ".join(arguments) or "(default)")
+    frost_routing.measured(key, f"{verdict}; stack {stack}; {device}; {versions}; {seconds:.0f} s")
+    if verdict.startswith("[02] SKIP"):
+        assert " FAIL" not in out and "[02] ERROR" not in out, out[-6000:]  # a skip never covers a failed check
+        pytest.skip(verdict)
+    assert code == 0 and (verdict == "[02] PASS" or verdict.startswith(f"[02] RAN {stack} stack (kernels not observed: ")), out[-6000:]
+    assert " FAIL" not in out and "distribution" in versions and "source hash" in versions
+    # before the load: the reductions, the configuration key by key, the seeded list, what a prompt and a step are
+    assert "2 of 64 layers (1 linear-attention + 1 attention)" in lines[0] and lines[0].endswith(" | the drafter runs on reference blocks")
+    assert (
+        "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 positions" in lines[0]
+    )
+    load = next(index for index, line in enumerate(lines) if line.startswith("[02] stage "))
+    before = (
+        '[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, '
+        "use_local_argmax_reduction true.",
+        "[02] draft vocabulary seeded list (seed 0): 3,880 ids of the model's 15,520, in ascending order (3,880 entries listed, none dropped)",
+        "[02] prompt of 26 tokens = 26 decode steps and 25 passes of the drafter before the first token; then every step is 5 draft passes and one "
+        "verify step of 6 tokens, and keeps 1 to 6 of them",
+        "the prompt of this session goes through decode steps, one per prompt token, on these rows:",
+        "the drafter: 18 block calls a pass; the first pass of a step behind a verify step runs at S x T rows, every other pass "
+        "and every pass over the prompt at S rows; every row of this table serves any row count",
+    )
+    assert all(line in lines[:load] for line in before), [line for line in before if line not in lines[:load]]
+    assert "with its drafter, one after the other" in out and out.count("this stack needs about ") == 1, "one memory sentence, the drafter in it"
+    # the report, in front of the comparison: the schedule, no rate, the bytes of a step
+    against = lines.index(
+        "speculative against decode (1 sequence x 6 tokens per sequence, 10 engine steps behind a prompt of 26 tokens; "
+        "tokens kept behind the first: 0, 1, 2, 3, 4, 5, 0, 1, 2, 3; 2 layers)"
+    )
+    report = lines.index("acceptance            scheduled, not measured (reduction): 10 steps; kept 1: 2, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1")
+    assert (
+        report < against and "rate                  not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)" in lines
+    )
+    assert any(
+        line.startswith("first token ") and "each but the first behind one pass of the drafter over the position in front of it" in line for line in lines
+    )
+    assert any(line.startswith("steps (10) ") and line.endswith(" | 110 block calls per step") for line in lines), "five passes of 18 calls and the model's 20"
+    assert any(line.startswith("bytes per step ") and " + drafter 5 x " in line for line in lines[:against])
+    assert any(line.startswith("text out              32 tokens in 10 steps (seeded weights: not language): ") for line in lines[:against])
+    # the comparison with decode steps of the same tokens: every line of it, and the script's own line of the ids
+    for name in ("tokens", "position", "prompt", "recorded", "rejected rows", "drafter cache", "draft proposals", "acceptance", "ids"):
+        (line,) = [line for line in lines if line.startswith(f"  {name} ") and "greedy tokens equal to the reference stack's" not in line]
+        assert line.endswith("    PASS"), line
+    assert "ids and logits of 36 of 36 steps the session recorded of its own run (26 of its prompt, 10 verify steps) are this replay's bytes" in out
+    assert "26 prompt tokens + the kept ones = 57; the session's own run ended there    PASS" in out
+    assert "10 of 10 steps kept the count they were scheduled to keep; every count from 0 to 5 was kept at least once    PASS" in out
+    kept = next(line for line in lines if line.startswith("  kept state  "))
+    assert kept.endswith(("    PASS", "    REPORTED")), kept
+    reported = next(line for line in lines if line.startswith("  bytes  "))
+    assert reported.endswith("    REPORTED") and f"(reported: on stack {stack} the two kinds of step may launch other kernels for a block)" in reported
+    ids = next(line for line in lines if line.startswith("  ids  "))
+    hashes = ids.split("ids hash ")[1].split("    ")[0].split(", plain ")
+    assert hashes[0] == hashes[1] and f"[02] seeded weights: the output is not language; ids hash {hashes[0]}" in lines
+    # the checks of the run: replay with the proposals, the blocks of both kinds of step
+    assert (
+        "checks (1 sequence x 6 tokens per sequence, 10 verify steps; tokens kept behind the first: 0, 1, 2, 3, 4, 5, 0, 1, 2, 3; "
+        "behind a prompt of 26 decode steps)"
+    ) in lines
+    assert "  replay            ids, logits and the drafter's proposals byte-identical on a second run from a fresh state    PASS" in lines
+    judged = [line for line in lines if line.startswith("  blocks  ")]
+    assert len(judged) == 2 and all(line.endswith("    PASS") for line in judged), "the prompt's decode steps and the verify steps, each against the reference"
+    steps = [line for line in lines if line.split()[:1] == ["linear_attention.step"] and "[band: gdn_step]" in line]
+    assert len(steps) == 2 and all(line.endswith("[band: gdn_step]  PASS") and "conv history equal; null slot untouched" in line for line in steps)
+    assert lines[-2] == "[02] the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"
+    return out
+
+
+@pytest.mark.L0
+def test_the_speculative_default_run_passes_its_own_checks(speculative, capsys):
+    """The default run of ``02_speculative_decode.py``, loaded by path, in this process: the stack ``fe-cublas``, both
+    streams held.  It is the only L0 cell that launches the fused verify step and the fused decode step on token 0 of a
+    state of six tokens per sequence in the form of the default stack; what their first launches took is recorded.  The
+    kernels are not checked on this stack unless asked: no kernel line, and no statement about the drafter's kernels."""
+    out = _speculative_run(speculative, capsys, [])
+    lines = out.splitlines()
+    assert "stack fe-cublas, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused " in out and "cudnn.GdnDecodeFused " in out
+    assert "[PDL " not in out, "an entry's form is printed with the kernel table, which this stack prints on request"
+    assert "\n  kernels  " not in out and "kernel identity" not in out, "the default stack declares no target and its kernels are checked on request"
+    stages = next(line for line in lines if line.startswith("[02] the session with the drafter: stage  "))
+    forms = [part.strip() for part in stages.split("stage  ", 1)[1].split(" | ") if part.strip().startswith("compile and first launch linear_attention.step ")]
+    assert [form.rsplit(" ", 2)[0] for form in forms] == [
+        "compile and first launch linear_attention.step (1 row)",
+        "compile and first launch linear_attention.step (6 rows)",
+    ], "the decode step on token 0 of the state of six tokens, then the verify step"
+    # an entry builds its kernel at the plan (its first use) and launches it once at the load: both are recorded with their seconds
+    plan = next(part.strip() for line in lines if line.startswith("[02] stage  ") for part in line.split(" | ") if part.strip().startswith("plan "))
+    frost_routing.measured("model sample qwen_dense 02_speculative_decode (default): the two forms this cell alone launches", "; ".join([plan, *forms]))
+
+
+@pytest.mark.L1
+def test_the_speculative_run_on_the_fe_entries_stack_passes_its_kernel_check(capsys):
+    """The default run of ``02_speculative_decode.py`` on the stack ``fe-entries``, in a fresh interpreter, both streams
+    held: the cuDNN Frontend rows of ``native`` under the verify step and under the prompt's decode steps, the drafter's
+    passes on reference blocks in front of every verify step.  The traced pass holds whole steps behind the replayed
+    prompt, and the kernel check holds them: the lookups of the passes and the verify plan's rows one by one, the
+    chains of the passes by family; under it the run says that the prompt's decode steps were not observed and that it
+    states nothing of the drafter's kernels.  Where the census has a section for the GPU, the verify plan's share of
+    the target kernel set is stated with its split."""
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    out = _speculative_run(None, capsys, ["--stack", "fe-entries"], "fe-entries")
+    lines = out.splitlines()
+    assert "stack fe-entries, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused [PDL True, PDL_RELEASE True, TOKENS 6]" in out
+    assert "cudnn.GdnDecodeFused " in out and "cudnn.GdnDecodeFused [" not in out, "the prompt's decode entry: a row of its plan; no form is printed for it"
+    assert out.count("\nkernels, planned (decided before the load") == 1, "the kernel table of the verify plan"
+    traced = [line for line in lines if line.startswith("traced pass (")]
+    assert not traced or traced[0].endswith(" | behind the prompt's 26 decode steps, replayed untraced")
+    if "kernel identity, as planned: " in out:  # a GPU the census has a section for: the verify plan's share of the target, with its split
+        reached = "13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)"
+        assert f"kernel identity, as planned: {reached}; not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1" in out
+    observed = [line for line in lines if line.startswith("  kernels  ")]
+    assert len(observed) == 1, "the kernel check of the traced steps ran, or said why it could not look"
+    # the kernel check is of the verify steps: beside its verdict the run says what it did not look at, and what it does not state
+    assert "    the prompt's decode steps: 26 replayed in front of the traced window, their kernels not observed (the check is of the verify steps)" in lines
+    assert (
+        "    kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and the output head behind it; "
+        "no section holds a draft pass)"
+    ) in lines
+    frost_routing.measured(
+        "model sample qwen_dense 02_speculative_decode --stack fe-entries: the kernel check", "; ".join(line.split("    ")[-1] for line in observed)
+    )

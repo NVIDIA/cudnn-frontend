@@ -10,12 +10,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 _KERNEL_ROOTS = (
     _REPO_ROOT / "python" / "cudnn" / "QSA",
     _REPO_ROOT / "python" / "cudnn" / "attention_gate",
+    _REPO_ROOT / "python" / "cudnn" / "attention_prepare",
     _REPO_ROOT / "python" / "cudnn" / "conv",
     _REPO_ROOT / "python" / "cudnn" / "gemm",
     _REPO_ROOT / "python" / "cudnn" / "norm",
     _REPO_ROOT / "python" / "cudnn" / "sdpa",
     _REPO_ROOT / "python" / "cudnn" / "engram",
     _REPO_ROOT / "python" / "cudnn" / "rope",
+    _REPO_ROOT / "python" / "cudnn" / "row_quantize",
 )
 
 

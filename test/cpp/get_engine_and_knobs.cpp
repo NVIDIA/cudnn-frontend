@@ -31,6 +31,50 @@ make_matmul_graph(cudnnHandle_t handle) {
 }
 }  // namespace
 
+TEST_CASE("Backend knob vocabulary preserves compiled defaults", "[graph][knobs][knob-vocabulary]") {
+    // Backend 46 can appear as -1 after compilation on a newer runtime even
+    // when these tests and FE were built with older cuDNN headers.
+    auto const public_type  = static_cast<fe::KnobType_t>(33);
+    auto const backend_type = static_cast<cudnnBackendKnobType_t>(46);
+    CHECK(fe::convert_from_backend_knob_type(backend_type) == public_type);
+    cudnnBackendKnobType_t converted = CUDNN_KNOB_TYPE_SWIZZLE;
+    REQUIRE(fe::convert_to_backend_knob_type(public_type, converted) == CUDNN_STATUS_SUCCESS);
+    CHECK(converted == backend_type);
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    nlohmann::json encoded;
+    fe::graph::to_json(encoded, public_type);
+    CHECK(encoded == "FULL_PRECISION_MATH");
+    auto decoded = fe::KnobType_t::NOT_SET;
+    fe::graph::from_json(encoded, decoded);
+    CHECK(decoded == public_type);
+#endif
+    // 63 is unmapped but within the backend enum's representable range; a
+    // larger value would make the negative control itself undefined in C++.
+    CHECK(fe::convert_from_backend_knob_type(static_cast<cudnnBackendKnobType_t>(63)) == fe::KnobType_t::NOT_SET);
+    CHECK(fe::convert_to_backend_knob_type(fe::KnobType_t::SCHED_POLICY, converted) == CUDNN_STATUS_NOT_SUPPORTED);
+}
+
+TEST_CASE("Backend knob vocabulary covers active header types", "[graph][knobs][knob-vocabulary]") {
+    // Deprecation does not mean a knob disappeared from runtime plans.
+    // Cover every declared identity, including legacy convolution knobs.
+    for (int64_t value = 0; value < static_cast<int64_t>(CUDNN_KNOB_TYPE_COUNTS); ++value) {
+        CAPTURE(value);
+        auto const backend_type = static_cast<cudnnBackendKnobType_t>(value);
+        auto const public_type  = fe::convert_from_backend_knob_type(backend_type);
+        REQUIRE(public_type != fe::KnobType_t::NOT_SET);
+        cudnnBackendKnobType_t converted = CUDNN_KNOB_TYPE_SWIZZLE;
+        REQUIRE(fe::convert_to_backend_knob_type(public_type, converted) == CUDNN_STATUS_SUCCESS);
+        CHECK(converted == backend_type);
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        nlohmann::json encoded;
+        fe::graph::to_json(encoded, public_type);
+        auto decoded = fe::KnobType_t::NOT_SET;
+        fe::graph::from_json(encoded, decoded);
+        CHECK(decoded == public_type);
+#endif
+    }
+}
+
 TEST_CASE("get_engine_and_knobs_at_index round-trips via create_execution_plan", "[graph][knobs]") {
     cudnnHandle_t handle;
     cudnnCreate(&handle);

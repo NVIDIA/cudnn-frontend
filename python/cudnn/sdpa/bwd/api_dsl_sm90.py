@@ -15,7 +15,7 @@ SM90_DSL_FLOOR = (4, 8, 0)
 
 
 class SdpaBwdDslSm90(SdpaBwdDsl):
-    """Dense compact-BSHD MHA / GQA / MQA at D64 / D128 on cc 9.0: unmasked or top-left causal, BF16 / FP16.
+    """Dense compact-BSHD MHA / GQA / MQA at D64 / D128 on cc 9.0: unmasked or causal in either alignment, BF16 / FP16.
 
     The key-owner kernel accumulates dK / dV in registers and adds its dQ partials in a fixed per-query-tile turn
     order, so every request, deterministic or not, runs the same bitwise-repeatable chain; the workspace holds the
@@ -116,7 +116,7 @@ class SdpaBwdDslSm90(SdpaBwdDsl):
         require(getattr(binder, "supports_zero_workspace", False), "requires a frontend extension with zero-workspace backward binding support")
         require(not self.thd and not self._thd_ro_spec, "THD / ragged is not supported")
         require(not self.seq_q_lens_present and not self.seq_kv_lens_present, "padding masks are not supported")
-        require(not self.causal_bottom_right, "bottom-right causal is not supported")
+        require(not self.causal_bottom_right or self.is_causal, "bottom-right alignment requires a causal mask")
         require(self.window_size_left is None and self.window_size_right is None, "sliding windows are not supported")
         require(all(d is None for d in (self.sink_desc, self.dsink_desc, self.bias_desc, self.dbias_desc)), "sink / dSink and bias / dBias are not supported")
         require(self.tile_m is None and self.tile_n is None, "the kernel has fixed tile geometry")
@@ -126,6 +126,7 @@ class SdpaBwdDslSm90(SdpaBwdDsl):
             require(desc.device == self.q_desc.device, f"{role} must reside on {self.q_desc.device}")
         b, h, sq, d = self.q_desc.shape
         bk, hk, sk, dk = self.k_desc.shape
+        require(not self.causal_bottom_right or sq <= sk, "unpadded bottom-right causal requires S_q <= S_kv")
         require(d == dk and d in (64, 128), "D_QK and D_V must equal 64 or 128")
         require(b == bk and hk > 0 and h % hk == 0, "Q and KV require equal batch counts and an integral head ratio")
         try:

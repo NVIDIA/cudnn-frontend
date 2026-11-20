@@ -50,11 +50,11 @@ invariance are recorded in `docs/operations/determinism.md`.
 * dense compact-BSHD `Q/K/V/O/dO/dQ/dK/dV`, contiguous FP32 `Stats` of shape `(B, H_q, S_q, 1)`;
 * `D_QK = D_V` in {64, 128}; BF16 or FP16 throughout;
 * MHA, or GQA / MQA with an integral head ratio (the kernel walks the group's query heads);
-* unmasked or top-left causal attention, positive sequence lengths of any size (tail tiles zero-fill, tail stores clip);
+* positive sequence lengths with unmasked or top-left causal attention, or bottom-right causal attention when `S_q <= S_kv`. For bottom-right alignment query `i` sees keys through `i + S_kv - S_q`, including partial tiles;
 * batch and query-head counts of at most 65535;
 * a positive finite `attn_scale`.
 
-Declined by name: packed THD / ragged offsets, padding masks, bottom-right causal, sliding windows,
+Declined by name: packed THD / ragged offsets, padding masks, sliding windows,
 bias / dBias, sinks / dSink, dropout, larger batch or query-head counts, other head dimensions and dtypes.
 
 ## Execution contract

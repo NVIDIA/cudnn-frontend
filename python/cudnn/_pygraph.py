@@ -1122,6 +1122,25 @@ class pygraph:
         facts = self._facts_for(analyzer)
         return {} if facts is None else dict(guard(self, facts))
 
+    def _backend_plan_guard(self):
+        """Bind a family-declared backend-plan guard to this graph and its facts.
+
+        Consulted during enumeration and explicit replay, including backend-resolved default knobs.
+        The delegating sentinel is checked too: it must not restore a refused native configuration.
+        """
+        from functools import partial
+
+        from .engines import manifest
+
+        family = manifest.family_for(self) if self._nodes else None
+        if family is None:
+            return None
+        guard, analyzer = manifest.resolve_backend_plan_guard(family), manifest.resolve_analyzer(family)
+        if guard is None or analyzer is None:
+            return None
+        facts = self._facts_for(analyzer)
+        return None if facts is None else partial(guard, self, facts)
+
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
 
@@ -1461,8 +1480,21 @@ class pygraph:
         for engine in dropped:
             _LOG.info("backend engine %d is not offered for this graph: %s", engine, excluded[engine])
         entries = [e for e in entries if int(e.engine_id) not in excluded]
-        if dropped and not entries:
-            self._backend_declined = cudnn_graph_not_supported(excluded[dropped[0]])
+        plan_guard = self._backend_plan_guard()
+        kept, plan_declines = [], []
+        for entry in entries:
+            reason = None if plan_guard is None else plan_guard(entry.engine_id, entry.knobs)
+            if reason is None:
+                kept.append(entry)
+            else:
+                plan_declines.append(reason)
+                _LOG.info("backend plan (%d, %s) is not offered for this graph: %s", entry.engine_id, entry.knobs, reason)
+        entries = kept
+        if not entries:
+            if dropped:
+                self._backend_declined = cudnn_graph_not_supported(excluded[dropped[0]])
+            elif plan_declines:
+                self._backend_declined = cudnn_graph_not_supported(plan_declines[0])
         import cudnn
 
         asked_oss = any(h == cudnn.heur_mode.OPENSOURCE for h in (self._backend_heuristics or []))
@@ -1470,7 +1502,12 @@ class pygraph:
         # withheld whenever the guard dropped one.
         if dropped and asked_oss:
             _LOG.info("the OPENSOURCE delegating entry is withheld: its fallback list holds excluded engines %s", dropped)
-        if not dropped and (asked_oss or (not entries and self._lowered_graph.get_engine_count())):
+        delegation_reason = None if plan_guard is None else plan_guard(BACKEND_HEURISTIC_ENGINE_ID, None)
+        if plan_declines or delegation_reason is not None:
+            _LOG.info("the backend delegating entry is withheld: %s", delegation_reason or plan_declines[0])
+            if not entries and delegation_reason is not None:
+                self._backend_declined = cudnn_graph_not_supported(delegation_reason)
+        if not dropped and not plan_declines and delegation_reason is None and (asked_oss or (not entries and self._lowered_graph.get_engine_count())):
             # OSS candidates are registered in the backend's CANDIDATE space and
             # never surface as plans, so they cannot be enumerated: one
             # delegating entry, built and run by C++ itself. FIRST, because
@@ -1795,11 +1832,21 @@ class pygraph:
         address it BY INDEX — which is why this returns one."""
         self._refuse_guarded_backend()  # a backend record replayed onto a guarded graph: a decline, not a crash
         reason = self._backend_engine_exclusions().get(int(engine_id))
+        plan_guard = self._backend_plan_guard()
+        if reason is None and plan_guard is not None:
+            reason = plan_guard(engine_id, knobs)
         if reason is not None:
             raise cudnn_graph_not_supported(reason)
         self._lower_backend_graph()  # heuristics would only add plans nobody asked for
         at = self._lowered_graph.get_execution_plan_count()
         self._lowered_graph.create_execution_plan(engine_id, knobs or {})
+        # A partial/empty replay record lets the backend choose missing knobs.
+        # Check that concrete configuration before exposing it as a public plan.
+        if plan_guard is not None:
+            resolved_engine, resolved_knobs = self._lowered_graph.get_engine_and_knobs_at_index(at)
+            reason = plan_guard(resolved_engine, resolved_knobs)
+            if reason is not None:
+                raise cudnn_graph_not_supported(reason)
         self._forward_note_filters()  # an explicitly appended config is filterable too
         return at
 
@@ -1927,6 +1974,14 @@ class pygraph:
             self._prepare_ordered_binding_schema()
             return
         cfg = self._materialize_backend_plan(index)
+        # Custom ranking may inject a concrete record or an opaque delegator.
+        # Recheck at build time, when its resolved native configuration is known.
+        plan_guard = self._backend_plan_guard()
+        if plan_guard is not None:
+            record = (cfg.engine_id, cfg.knobs) if cfg.cpp_index is None else self._lowered_graph.get_engine_and_knobs_at_index(cfg.cpp_index)
+            reason = plan_guard(*record)
+            if reason is not None:
+                raise cudnn_graph_not_supported(reason)
         if cfg.cpp_index is None:  # delegating entry: the backend picks
             self._lower_backend_plan()
             self._lowered_graph.build_plans(*args, **kwargs)

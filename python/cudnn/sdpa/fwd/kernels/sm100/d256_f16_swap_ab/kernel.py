@@ -74,7 +74,18 @@ fp32 O / natural-log LSE partials into the split-major workspace that
 sm100/split_combine.py reduces, and an empty range yields O := 0 / LSE := -inf
 (with a sink, LSE := the sink logit: the row's one live column).
 Nothing reaches the host (python/cudnn/AGENTS.md Rule 3): lengths, page
-tables and the split chunking are all resolved on device. The host uses the
+tables and the split chunking are all resolved on device.
+
+In-launch reduction (``compile(cluster_combine=True)``, the engine's
+``CLUSTER_K_REDUCE`` knob; 2 .. 8 chunks on the 16-column D256 rendering): the
+chunks of one unit are launched as one thread-block cluster ``(1, 1, SPLIT_KV)``.
+Every chunk writes its fp32 partial to the workspace exactly as above; all
+threads of the cluster then pass one ordered cluster barrier and each folds its
+own four-column groups of the unit's rows from the slab with the lean group of
+sm100/split_combine.py (``lean_fold_quad``: the separate pass's own sequence for
+these split counts), storing final O and Stats.  No second launch, no extra
+shared memory, no mbarrier.  Without the keyword the kernel is the two-launch
+form, unchanged. The host uses the
 explicit pointer ABI: extents and Int64 strides are runtime arguments, while
 head dimensions, Stats presence and the paged in-page layout specialize compile().
 
@@ -116,6 +127,7 @@ from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA, compute_kv_loop_bounds
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16
 from cudnn.sdpa.fwd.kernels._common_blackwell import row_max_for_exp2, sdpa_operand_tensors
+from cudnn.sdpa.fwd.kernels.sm100.split_combine import G_LEAN_SMALL as _FOLD_MAX_SPLITS, lean_fold_quad, lean_fold_stats
 
 if CFG.DTYPE_QKV == 2:
     STORAGE_DTYPE = cutlass.BFloat16
@@ -650,6 +662,8 @@ def _softmax_warp_group(
     tok0,
     scale_log2: cutlass.Float32,
     use_pdl: cutlass.Constexpr[bool] = False,
+    # In-launch reduction: this role's code is followed by the reduction, behind the tensor-memory release at its end.
+    reduce_follows: cutlass.Constexpr[bool] = False,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=32 * (SOFTMAX_WARPS + 1))
     tidx = cute.arch.thread_idx()[0]
@@ -826,21 +840,18 @@ def _softmax_warp_group(
     # writes the graph's actual d_v columns only (the tile is an envelope).
     oo = cutlass.make_array_view(o_tensor)
     D_V = cutlass.const_expr(o_tensor.shape[3])
-    # The epilogue runs in two 8-column halves: each half derives its columns' inverse sum / dead / live facts, then
-    # reads that half of O^T back (the x8 tcgen05.ld shape) and stores it.  The 16-wide per-column lists and the x16
-    # O^T readback together were what the 18-warp N_Q = 64 tile spilled at ptxas's 96-register cap; the halves keep
-    # the same arithmetic and the same stores (bitwise).  Each thread stores ONE LSE (the column its key lane names, lane == j), kept
-    # as a per-lane scalar with a liveness bit; the column's token / head are two integer ops on a warp-uniform row
-    # index, recomputed at each store site rather than carried in lists.
-    O_HALF = COLS // 2
+    # Four-column groups keep the 64-column tile within its 96-register cap
+    # with Int64 output indexing. Other tiles retain their existing group size.
+    # Each lane retains one LSE value; output arithmetic is unchanged.
+    O_CHUNK = 4 if N_Q == 64 else COLS // 2
     my_lse = ZERO
     my_lse_live = lane < cutlass.Int32(0)  # False
-    for h in cutlass.range_constexpr(2):
+    for h in cutlass.range_constexpr(COLS // O_CHUNK):
         inv_cols = []
         dead_cols = []
         live_cols = []
-        for jj in cutlass.range_constexpr(O_HALF):
-            j = h * O_HALF + jj
+        for jj in cutlass.range_constexpr(O_CHUNK):
+            j = h * O_CHUNK + jj
             jg = col0 + cutlass.Int32(j)  # the packed Q row this column is
             tok_j = tok0 + jg // G
             head_j = head_idx * G + (jg % G)
@@ -898,17 +909,24 @@ def _softmax_warp_group(
         for blk in cutlass.range_constexpr(O_BLOCKS):
             if cutlass.const_expr(blk * 128 < D_V):
                 d_idx = lane + cutlass.Int32(blk * 128)
-                o_vals = cutlass.Vector.from_elements(tuple(ZERO for _ in range(O_HALF)), cutlass.Float32)
-                if n_tiles > cutlass.Int32(0):
+                o_vals = cutlass.Vector.from_elements(tuple(ZERO for _ in range(O_CHUNK)), cutlass.Float32)
+                o_loaded = n_tiles > cutlass.Int32(0)
+                if cutlass.const_expr(reduce_follows):
+                    # The reduction runs behind this role's tensor-memory release, so the load is issued only where this thread
+                    # stores from it (the store's own range guard): no path carries a loaded register unread across the release.
+                    # The load is warp-collective, so the guard must be one value per warp: the form's head widths are multiples
+                    # of 32 (cluster_combine_supported), and a warp's 32 threads are 32 consecutive columns.
+                    o_loaded = o_loaded & (d_idx < cutlass.Int32(D_V))
+                if o_loaded:
                     # Empty range: O^T TMEM was never written, so the load is skipped
                     # rather than multiplied by 0 (NaN * 0 is NaN).
                     o_vals = nvvm.tcgen05_ld(
-                        "32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk] + h * O_HALF) + col0, cutlass.Float32), num=O_HALF
+                        "32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk] + h * O_CHUNK) + col0, cutlass.Float32), num=O_CHUNK
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 if d_idx < cutlass.Int32(D_V):
-                    for jj in cutlass.range_constexpr(O_HALF):
-                        jg = col0 + cutlass.Int32(h * O_HALF + jj)
+                    for jj in cutlass.range_constexpr(O_CHUNK):
+                        jg = col0 + cutlass.Int32(h * O_CHUNK + jj)
                         val = _select_f32(dead_cols[jj], ZERO, cutlass.Float32(o_vals[jj]) * inv_cols[jj])
                         if live_cols[jj]:
                             # Array slicing uses each coordinate's width for its
@@ -950,6 +968,10 @@ def _kernel(
     # Programmatic dependent launch (the launch attribute is set by the host entry under the same flag): each role waits on the
     # dependent grid right after its own prologue and before its first global read, and the TMA role releases the dependent grid.
     use_pdl: cutlass.Constexpr[bool] = False,
+    # In-launch reduction (compile(cluster_combine=True)): the caller's final O [B, S_q, H_q, d_v] and Stats [B, H_q, S_q]; o_tensor /
+    # lse_tensor are then the split-major partial slabs.  None (None-specialized) is the two-launch form, whose traced code is unchanged.
+    final_o_tensor: Optional[cute.Tensor] = None,
+    final_lse_tensor: Optional[cute.Tensor] = None,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1083,6 +1105,7 @@ def _kernel(
             tok0=tok0,
             scale_log2=scale_softmax_log2,
             use_pdl=use_pdl,
+            reduce_follows=final_o_tensor is not None,
         )
     elif warp_idx == MMA_WARP_ID:
         _mma_warp_group(
@@ -1126,6 +1149,33 @@ def _kernel(
             use_pdl=use_pdl,
         )
 
+    if cutlass.const_expr(final_o_tensor is not None):
+        # In-launch reduction.  Every thread of every chunk of this unit's cluster reaches this point on every path: the three roles
+        # above cover all warps and none returns early (an empty KV range skips loops only; its softmax lanes still wrote the identity
+        # partial).  The ordered cluster barrier publishes each chunk's global partial stores to its peers -- the relaxed arrive does
+        # not -- so nothing below reads a slab cell before the chunk that owns it stored it in THIS launch.
+        nvvm.barrier_cluster_arrive_aligned()
+        nvvm.barrier_cluster_wait_aligned()
+        # The unit's rows x four-column groups are dealt over the cluster's SPLIT_KV x THREADS threads: thread t of chunk s owns the
+        # groups s * THREADS + t + item * SPLIT_KV * THREADS, so every final element has exactly one writer and the order of the
+        # reduction is the split index, whichever chunk finished first.
+        fold_quads = cutlass.const_expr(final_o_tensor.shape[3]) // 4
+        fold_threads = SPLIT_KV * CFG.THREADS_PER_CTA
+        if cutlass.const_expr(final_lse_tensor is not None):
+            final_lse = cutlass.make_array_view(final_lse_tensor)
+        for item in cutlass.range_constexpr((Q_BOX_ROWS * fold_quads + fold_threads - 1) // fold_threads):
+            fold_flat = split_idx * cutlass.Int32(CFG.THREADS_PER_CTA) + tidx + cutlass.Int32(item * fold_threads)
+            fold_row = fold_flat // cutlass.Int32(fold_quads)
+            fold_d0 = (fold_flat % cutlass.Int32(fold_quads)) * cutlass.Int32(4)
+            fold_tok = tok0 + fold_row // cutlass.Int32(HEADS_PER_TILE)
+            fold_head = head_idx * cutlass.Int32(HEADS_PER_TILE) + fold_row % cutlass.Int32(HEADS_PER_TILE)
+            # The rows a chunk stores (the epilogue's live_j): inside the Q box and inside S_q.
+            if (fold_row < cutlass.Int32(Q_BOX_ROWS)) & (fold_tok < seqlen_q):
+                fold_dead, fold_den, fold_max = lean_fold_quad(o_tensor, lse_tensor, final_o_tensor, n_batch, SPLIT_KV, batch_idx, fold_tok, fold_head, fold_d0)
+                if cutlass.const_expr(final_lse_tensor is not None):
+                    if fold_d0 == cutlass.Int32(0):
+                        final_lse[batch_idx, fold_head, fold_tok] = lean_fold_stats(fold_dead, fold_den, fold_max)
+
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -1163,6 +1213,10 @@ def _host(
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool] = False,
+    final_o_ptr: Optional[cute.Pointer] = None,
+    final_lse_ptr: Optional[cute.Pointer] = None,
+    final_o_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64]] = None,
+    final_lse_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64]] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
@@ -1250,6 +1304,14 @@ def _host(
     n_tok_units = (cutlass.Int32(SQ) + cutlass.Int32(Q_BOX_TOKENS - 1)) // cutlass.Int32(Q_BOX_TOKENS)
     grid_shape = ((QH // HEADS_PER_TILE) * n_tok_units, B, SPLIT_KV)
 
+    # In-launch reduction: the caller's final O / Stats in their own strides (the partial slabs stay on o_ptr / lse_ptr).
+    final_o_tensor = None
+    final_lse_tensor = None
+    if cutlass.const_expr(final_o_ptr is not None):
+        final_o_tensor = cute.make_tensor(final_o_ptr, cute.make_layout((B, SQ, QH, d_v), stride=(*final_o_strides, 1)))
+        if cutlass.const_expr(final_lse_ptr is not None):
+            final_lse_tensor = cute.make_tensor(final_lse_ptr, cute.make_layout((B, QH, SQ), stride=final_lse_strides))
+
     kernel_args = (
         tma_q_desc,
         tma_k_desc,
@@ -1264,16 +1326,20 @@ def _host(
         scale_softmax_log2,
         seq_q_lens_addr,
         n_tok_units,
+        final_o_tensor,
+        final_lse_tensor,
     )
 
     # `pdl` is an explicit argument of both helpers (like `hnd`): the DSL refuses a closure capture inside a staged `if`.
     def launch(args, k_table, v_table, hnd, pdl, grid, current_stream):
         # pdl: the programmatic-stream-serialization launch attribute, paired with the kernel's griddepcontrol sites.
-        _kernel(*args, k_table, v_table, hnd, pdl).launch(
+        # The in-launch reduction launches the split axis (grid z) as one thread-block cluster per unit.
+        _kernel(*args[:-2], k_table, v_table, hnd, pdl, *args[-2:]).launch(
             grid=grid,
             block=[CFG.THREADS_PER_CTA, 1, 1],
             stream=current_stream,
             use_pdl=pdl,
+            cluster=(1, 1, SPLIT_KV) if args[-2] is not None else None,
         )
 
     def launch_tables(args, kt, vt, kp, vp, strides, batch, kv_extent, hnd, pdl, grid, current_stream):
@@ -1318,6 +1384,30 @@ def _host(
 
 EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
 LSE_KINDS = ("dense",)  # the decode tile never serves THD
+# The in-launch reduction of this body is the plan's CLUSTER_K_REDUCE knob: an adapter never turns it on by itself.
+CLUSTER_COMBINE_BY_KNOB = True
+
+
+def cluster_combine_supported(d_qk: int, d_v: int) -> bool:
+    """Whether THIS rendering has the in-launch reduction: 2 .. 8 chunks (one portable thread-block cluster, the lean group of the
+    separate pass), the 16-column D256 rendering, O in the Q/K/V half type, a head width of whole warps (a multiple of 32: the
+    four-column groups tile it, and the epilogue's range guard in front of its warp-collective load is uniform per warp), and neither of
+    the folds the separate pass carries instead (a sink, base-2 Stats).  The dense padded-Q trim needs nothing here: a trimmed row's
+    partials are dead in every chunk, which the reduction turns into O = 0 / Stats = -inf.  It selects no split count.  A split
+    rendering's own Stats are natural-log whatever the graph asks (the separate pass applies the base), so this predicate cannot see
+    a base-2 request: the caller's contract (``contract.cluster_reduce_decline``) declines it before compile()."""
+    return bool(
+        2 <= SPLIT_KV <= _FOLD_MAX_SPLITS
+        and N_Q == 16
+        and COLS == 16
+        and CFG.TILE_K == 256
+        and CFG.TILE_O == 256
+        and 0 < d_v <= CFG.TILE_O
+        and d_v % 32 == 0
+        and CFG.DTYPE_O == CFG.DTYPE_QKV
+        and not CFG.HAS_SINK
+        and not CFG.STATS_LOG2
+    )
 
 
 @lru_cache(maxsize=None)
@@ -1328,12 +1418,17 @@ def compile(  # noqa: A001
     lse_kind: str = "dense",
     paged_hnd: bool = False,
     use_pdl: bool = False,
+    cluster_combine: bool = False,
+    has_final_lse: bool = True,
 ) -> Callable:
     """Compile the shared pointer ABI for dense or paged decode. Shapes and strides
     are runtime arguments; head-dim envelopes, Stats presence and pool layout
     are specializations. All stride fakes, including page tables, are Int64.
     ``use_pdl`` (appended; in the key) traces the programmatic-dependent-launch form: the launch attribute plus the per-role
-    ``griddepcontrol`` wait before the first global read and the release after the prologue -- the same math, bitwise."""
+    ``griddepcontrol`` wait before the first global read and the release after the prologue -- the same math, bitwise.
+    ``cluster_combine`` (appended; in the key) traces the in-launch reduction of the split partials (the module docstring); the
+    host entry then takes the final O / Stats pointers and strides after the partial slabs.  ``has_final_lse`` is read with it only:
+    False compiles the final Stats store out (a graph without a Stats output still reduces through the partial Stats)."""
     _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d256 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
@@ -1345,6 +1440,11 @@ def compile(  # noqa: A001
         raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
     if paged_hnd and not PAGED_KV:
         raise ValueError("paged_hnd is a paged-KV specialization")
+    if cluster_combine and (not cluster_combine_supported(d_qk, d_v) or use_pdl or not has_lse):
+        raise ValueError(
+            f"cluster_combine needs 2 .. {_FOLD_MAX_SPLITS} KV chunks on the 16-column D256 rendering with partial Stats, O in the Q/K/V type, "
+            "d_v a multiple of 32, and no sink, base-2 Stats or programmatic dependent launch"
+        )
     gmem = cute.AddressSpace.gmem
 
     def P(dtype, align=16):
@@ -1385,6 +1485,10 @@ def compile(  # noqa: A001
         lse_kind,
         paged_hnd,
         bool(use_pdl),
+        P(STORAGE_DTYPE, 2) if cluster_combine else None,
+        P(cutlass.Float32, 4) if cluster_combine and has_final_lse else None,
+        i64_3,
+        i64_3,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

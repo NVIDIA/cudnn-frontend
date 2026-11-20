@@ -242,7 +242,7 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
 
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
-    assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
+    assert (sm107.sm_lo, sm107.sm_hi) == (107, 109)
     assert sm100.d_shapes == frozenset({(64, 64), (128, 128)})
     assert sm100_envelopes.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
     assert dict(sm107.cgas_by_d_shape)[(64, 64)] == frozenset({1, 2})

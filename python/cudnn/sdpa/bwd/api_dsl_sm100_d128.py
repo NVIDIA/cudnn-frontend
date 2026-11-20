@@ -10,8 +10,10 @@ import torch
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
 from .d128_contract import (
     ACCUMULATION,
+    DENSE_PARTS,
     DENSE_SM_RANGE,
     PAIR,
+    dense_part_admitted,
     pair_split,
     pair_workspace_layout,
     select_implementation,
@@ -224,7 +226,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         require(installed and not cutedsl_too_old(version), f"requires nvidia-cutlass-dsl >= {'.'.join(map(str, CUTEDSL_MIN_VERSION))}; found {version}")
         require(self.q_desc.device.type == "cuda", "Q must reside on CUDA")
         cc = compute_capability(resolve_device(self.q_desc.device))
-        require(DENSE_SM_RANGE[0] <= cc[0] * 10 + cc[1] <= DENSE_SM_RANGE[1], f"requires SM{DENSE_SM_RANGE[0]}-{DENSE_SM_RANGE[1]}; got {cc}")
+        require(dense_part_admitted(cc), f"requires {DENSE_PARTS}; got {cc}")
         arch_error = cutedsl_arch_requirement_error(cc)
         require(arch_error is None, arch_error)
         binder = getattr(_pybind_module, "_SdpaBwdBinder", None)

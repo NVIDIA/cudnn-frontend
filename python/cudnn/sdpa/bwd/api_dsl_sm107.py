@@ -400,9 +400,12 @@ def _sm107_chunks(
     budget: int = _SM107_WS_BUDGET_BYTES,
     batch_chunking: bool = True,
     allow_subgroups: bool = False,
+    launch_batches: Optional[int] = None,
 ):
     """``(b_chunk, qh_chunk)`` for one stage-2 launch: the LARGEST (batch, head) chunk whose dS
-    workspace ``b_chunk * qh_chunk * S_kv * S_q * bpe`` fits ``budget``.
+    workspace ``b_chunk * qh_chunk * S_kv * S_q * bpe`` fits ``budget`` and
+    whose final GEMM's batch/head product fits grid.z. ``launch_batches``
+    supplies THD's sequence count when its storage batch is one.
 
     Divisors, not floors, so no launch has a ragged tail and one artifact serves every
     chunk; the head chunk is a multiple of the GQA group so a chunk's Q heads map onto
@@ -413,19 +416,24 @@ def _sm107_chunks(
     fits the smallest legal chunk is returned and the size is still honest.
     An explicitly eligible dense chain can then divide a single GQA group:
     preserve every existing choice that fits, and shrink below the group only
-    when its one-batch slab already exceeds the budget. One Q head is the
+    when its one-batch slab exceeds the budget or launch limit. One Q head is the
     minimum, so the budget remains a target, not a hard allocation cap.
     """
+    from .chunk_grid import GRID_Z_MAX
+
     per = s_q_pad * s_kv_pad * bpe_ds
     heads = [c for c in range(h_q, 0, -1) if h_q % c == 0 and c % group == 0]
     batches = [c for c in range(b, 0, -1) if b % c == 0] if batch_chunking else [b]
     for bc in batches:
         for hc in heads:
-            if bc * hc * per <= budget:
+            # THD has one storage batch, but its final GEMM grid still uses
+            # the number of sequences. Dense half may split the batch itself.
+            grid_batches = bc if launch_batches is None else launch_batches
+            if grid_batches * hc <= GRID_Z_MAX and bc * hc * per <= budget:
                 return bc, hc
     if allow_subgroups and batch_chunking:
         for hc in range(group - 1, 0, -1):
-            if group % hc == 0 and hc * per <= budget:
+            if group % hc == 0 and hc <= GRID_Z_MAX and hc * per <= budget:
                 return 1, hc
         return 1, 1
     return batches[-1], group
@@ -758,6 +766,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                 self._ds_chunk_bytes_per_elem(),
                 budget=self._ws_budget_bytes(),
                 batch_chunking=False,
+                launch_batches=self.batch_size,
             )
         else:
             self._b_chunk, self._qh_chunk = _sm107_chunks(
@@ -810,6 +819,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
 
         self._check_head_dims()
         self._value_error_if(self.h_kv < 1 or self.h_q % self.h_kv != 0, f"{n}: h_q ({self.h_q}) must be a multiple of h_kv ({self.h_kv})")
+        from .chunk_grid import launch_error
+
+        error = launch_error(self.batch_size, self._gqa_group, thd=self.thd, batch_chunking=self._BATCH_CHUNKING, allow_subgroups=self._allow_head_subgroups())
+        self._value_error_if(error is not None, f"{n}: {error}")
         self._value_error_if(self.dtype not in self._IO_DTYPES, f"{n}: Q/K/V/O/dO dtype {self.dtype} not served")
         self._value_error_if(self.s_q_max < 1 or self.s_k_max < 1, f"{n}: empty sequences are not served (S_q={self.s_q_max}, S_kv={self.s_k_max})")
         self._value_error_if(self.s_q_max == 1, f"{n}: s_q == 1 (decode) is out of scope for the prefill bodies")

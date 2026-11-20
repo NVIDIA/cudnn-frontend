@@ -528,9 +528,11 @@ class GroupedGemmGluHadamardSm100(APIBase):
             bias_cute_fake,
             max_active_clusters,
             fake_stream,
-            cached_linear_offset,
-            cutlass.Float32(self.situ_beta1),
-            cutlass.Float32(self.situ_beta2),
+            # by keyword: __call__ has the Constexpr epilogue_op between stream and linear_offset, so positional
+            # values here bound one slot early (linear_offset -> epilogue_op, situ_beta1 -> linear_offset, ...)
+            linear_offset=cached_linear_offset,
+            situ_beta1=cutlass.Float32(self.situ_beta1),
+            situ_beta2=cutlass.Float32(self.situ_beta2),
             options="--enable-tvm-ffi",
         )
 

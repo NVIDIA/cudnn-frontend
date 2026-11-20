@@ -96,7 +96,9 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
     def _setup_attributes(self) -> None:
         mma_cta_count = 2 if self.use_2cta_instrs else 1
         self.instruction_k = 128 if self.a_dtype.width == 4 else 64
-        mma_inst_tile_k = 4
+        # K=256 per A/B stage for FP4 (2 MMA instructions): more, smaller stages hide the TMA latency better than
+        # K=512 stages on SM107.
+        mma_inst_tile_k = 2 if self.a_dtype.width == 4 else 4
         mma_tiler_k = self.instruction_k * mma_inst_tile_k
 
         valid_quantization = (
@@ -188,6 +190,9 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
             self.sf_vec_size,
             self.smem_capacity,
             self.occupancy,
+            # one output stage: the TMA reduce of a 128x64 subtile overlaps the next subtile's TMEM load, and the
+            # shared memory of a second output stage buys an extra A/B stage instead
+            num_c_stage=1,
         )
         self.num_sched_stages = 2
 

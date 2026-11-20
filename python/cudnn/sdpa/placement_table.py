@@ -159,6 +159,12 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
     dtype = _dtype_name(facts.dtype)
     if dtype is None or _unmeasured(facts) or not facts.h_kv or facts.h_q % facts.h_kv:
         return None
+    if row == "sdpa_bwd_sm89_f16_d64":
+        from cudnn.sdpa.bwd.kernels.sm80.half_contract import D64_TILE
+
+        # The Ada study spans square graphs in this B/H/S range, and the fixed body requires whole tiles.
+        if not (D64_TILE[1] <= facts.s_q == facts.s_kv <= 2048 and facts.s_kv % D64_TILE[1] == 0 and 1 <= facts.b <= 4 and 4 <= facts.h_q <= 16):
+            return None
     if facts.s_q == 1:
         phase = "q1"
     elif facts.s_q <= 4:
@@ -1201,6 +1207,15 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_bwd_sm120", (12, 0), "f16", (64, 64), "prefill", "dense", "window", False, "gqa", True): Entry("always", None, "sm120_bwd_f16_20261107"),
     ("sdpa_bwd_sm120", (12, 0), "f16", (64, 64), "prefill", "dense", "window", False, "mha", False): Entry("always", None, "sm120_bwd_f16_20261107"),
     ("sdpa_bwd_sm120", (12, 0), "f16", (64, 64), "prefill", "dense", "window", False, "mha", True): Entry("always", None, "sm120_bwd_f16_20261107"),
+    # GeForce RTX 4090, cuDNN 9.27.0: 20636 against backend engine 7, plain square full-tile MHA.
+    # Per dtype: six training cases, two frozen holdout cases, graph-replay medians.
+    # The class key restricts the entries to the measured square envelope.
+    ("sdpa_bwd_sm89_f16_d64", (8, 9), "bf16", (64, 64), "prefill", "dense", "none", False, "mha", False): Entry(
+        "always", None, "sm89_bwd_d64_4090_bf16_20261118"
+    ),
+    ("sdpa_bwd_sm89_f16_d64", (8, 9), "f16", (64, 64), "prefill", "dense", "none", False, "mha", False): Entry(
+        "always", None, "sm89_bwd_d64_4090_f16_20261118"
+    ),
     # studies sm80_bwd_square_{bf16,f16}_20261108 (A100, cuDNN 9.27.0; dense BSHD square backward under a bottom-right left window, d64 / d128, MHA / GQA, on and off the tile,
     # 128 train cases per dtype; gen.py --margin 0.05, keeping a class only if it and its tile twin are `always`). bwd.heuristics._measured_lead lifts only square graphs of this row.
     ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "window", False, "gqa", False): Entry("always", None, "sm80_bwd_square_bf16_20261108"),
