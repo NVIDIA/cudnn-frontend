@@ -70,7 +70,8 @@ Both forms reproduce the one record of their path.
 The two files equal, byte for byte, the candidates recorded the day before on
 another device of the class at an earlier head of
 [PR #2780](https://github.com/NVIDIA/cudnn-frontend/pull/2780), before the
-152-SM rows existed; no kernel rendering differs between the two heads.
+152-SM rows existed; no rendering of this engine's kernels differs between the
+two heads.
 Against the records of the same two cases for the 148-SM part (x86-64 host) in
 `c84dd9abaee769b4/` the shapes and dtypes are equal and all ten hashes differ,
 those of the inputs included: the aarch64 host draws other operand bytes, as
