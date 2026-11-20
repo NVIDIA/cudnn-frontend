@@ -12,11 +12,12 @@ bridge in ``_tma_gather4.py``.  The bridge is compile-time optional so the
 audited predicated cp.async path remains available with older DSL wheels.
 
 A CTA runs one query at a time; its twelve warps split the work by role.
-With gather4 the kernel is persistent: CTAs claim queries through cluster
-launch control, and the next query's Q load, first gathers and first QK
-overlap the current query's epilogue.  Q is staged by a regular public 1-CTA
-TMA copy and each 64-token sparse tile is gathered with 2-D TMA gather4 (or,
-one query per CTA, with predicated 128-bit cp.async copies as a fallback).
+With gather4 and FP16/BF16 KV the kernel is persistent: CTAs claim queries
+through cluster launch control, and the next query's Q load, first gathers
+and first QK overlap the current query's epilogue.  Q is staged by a regular
+public 1-CTA TMA copy and each 64-token sparse tile is gathered with 2-D TMA
+gather4 (or, one query per CTA, with predicated 128-bit cp.async copies as a
+fallback).
 QK and the two 256-column PV halves are real 1-SM tcgen05
 MMAs; online-softmax statistics stay in registers while O persists in TMEM
 across sparse tiles.  Keeping validity separate from the zero-filled KV tile
@@ -69,6 +70,8 @@ from ._tcgen05_mma_ws import (
 )
 from ._nvvm_compat import fmax_ftz_nonan
 from ._tma_gather4 import TMA_GATHER4_AVAILABLE, tma_gather4_cta1
+from ._kv_formats import KvFormat
+from ._block_scaled_kv_widen import mxfp8_scale_pair, nvfp4_scale_pair, widen_mxfp8_word, widen_nvfp4_word
 
 
 @cute.jit
@@ -91,6 +94,12 @@ def _initialize_mbarriers(
     num_kv_parts: cutlass.Constexpr[int],
     num_tail_stages: cutlass.Constexpr[int],
     q_tail_arrivals: cutlass.Constexpr[int],
+    kv_ready_count: cutlass.Constexpr[int] = 1,
+    raw_ready_mbar: Optional[cute.Pointer] = None,
+    raw_free_mbar: Optional[cute.Pointer] = None,
+    num_raw_stages: cutlass.Constexpr[int] = 0,
+    raw_free_count: cutlass.Constexpr[int] = 0,
+    pv_half_done_mbar: Optional[cute.Pointer] = None,
 ) -> None:
     """Initialize all CTA barriers without carrying ``SharedStorage`` through a dynamic branch."""
 
@@ -103,7 +112,7 @@ def _initialize_mbarriers(
         for slot in cutlass.range_constexpr(2):
             cute.arch.mbarrier_init(q_s2t_done_mbar + slot, 1)
         for stage_part in cutlass.range_constexpr(num_kv_stages * num_kv_parts):
-            cute.arch.mbarrier_init(kv_ready_mbar + stage_part, 1)
+            cute.arch.mbarrier_init(kv_ready_mbar + stage_part, kv_ready_count)
         for stage in cutlass.range_constexpr(num_kv_stages):
             cute.arch.mbarrier_init(valid_ready_mbar + stage, 1)
             cute.arch.mbarrier_init(valid_free_mbar + stage, 4 * cute.arch.WARP_SIZE)
@@ -117,6 +126,13 @@ def _initialize_mbarriers(
             cute.arch.mbarrier_init(pv_done_mbar + stage, 1)
         for slot in cutlass.range_constexpr(2):
             cute.arch.mbarrier_init(o_writeback_mbar + slot, 1)
+        if const_expr(pv_half_done_mbar is not None):
+            for stage in cutlass.range_constexpr(num_kv_stages):
+                cute.arch.mbarrier_init(pv_half_done_mbar + stage, 1)
+        if const_expr(raw_ready_mbar is not None):
+            for stage in cutlass.range_constexpr(num_raw_stages):
+                cute.arch.mbarrier_init(raw_ready_mbar + stage, 1)
+                cute.arch.mbarrier_init(raw_free_mbar + stage, raw_free_count)
         cute.arch.mbarrier_init_fence()
 
 
@@ -140,6 +156,72 @@ def _ldg_indices_128(indices: cute.Tensor, query_idx: Int32, slot: Int32) -> Tup
     return tuple(Int32(llvm.extractvalue(T.i32(), out, [i])) for i in range(4))
 
 
+@cute.jit
+def _lds_128(addr: Int32) -> Tuple[Int32, ...]:
+    """Load four 32-bit words from the shared-window address ``addr`` (16-byte aligned).
+
+    Volatile, so the load stays behind the stage's ready wait in program order.
+    """
+
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [Int32(addr).ir_value()],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), out, [i])) for i in range(4))
+
+
+@cute.jit
+def _lds_32(addr: Int32) -> Int32:
+    """Load one 32-bit word from the shared-window address ``addr``; volatile as ``_lds_128``."""
+
+    out = llvm.inline_asm(
+        T.i32(),
+        [Int32(addr).ir_value()],
+        "ld.shared.b32 $0, [$1];",
+        "=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out)
+
+
+@cute.jit
+def _lds_64(addr: Int32) -> Tuple[Int32, ...]:
+    """Load two 32-bit words from the shared-window address ``addr`` (8-byte aligned); volatile as ``_lds_128``."""
+
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [Int32(addr).ir_value()],
+        "ld.shared.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), out, [i])) for i in range(2))
+
+
+@cute.jit
+def _sts_128(addr: Int32, w0: Int32, w1: Int32, w2: Int32, w3: Int32) -> None:
+    """Store four 32-bit words to the shared-window address ``addr`` (16-byte aligned)."""
+
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(), Int32(w0).ir_value(), Int32(w1).ir_value(), Int32(w2).ir_value(), Int32(w3).ir_value()],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 class SparseAttentionForwardSm100Head64:
     """Regular sparse-prefill forward specialization for H=64.
 
@@ -147,11 +229,47 @@ class SparseAttentionForwardSm100Head64:
         head_dim: Q/K head dimension; supported values are 512 and 576.
         indexer_topk: Prefix length whose LSE is returned.  Zero disables the
             prefix statistic; the instantiated values are 0/512/1024/2048.
+        kv_format: Packed KV cache format, or ``None`` for a typed FP16/BF16
+            ``kv``.  ``mxfp8_528`` and ``nvfp4_288`` are served at D=512 on
+            the gather4 path with BF16 Q (see "Packed KV" below).
 
     ``indices`` passed to :meth:`__call__` is the physical, wrapper-padded
     ``[Tq, Kp]`` tensor.  ``Kp`` may be any multiple of 64.  ``topk_length``
     is clamped to ``[0, Kp]`` inside the kernel.
+
+    Packed KV.  ``kv`` is the ``Uint8 [Tkv, record_bytes]`` view of the cache
+    rows (16-byte aligned base and row pitch).  The kernel widens every row
+    exactly to the BF16 row the BF16 kernel would gather and runs the
+    unchanged BF16 MMAs, so a packed launch returns the BF16 launch's bytes on
+    the widened pool.  It runs one query per CTA.  Shared memory holds a
+    two-stage BF16 NoPE/V ring (Q aliases stage 1 until it is in TMEM) and a
+    two-stage raw ring.  Warps
+    10-11, idle at D=512, gather a tile's raw rows with gather4 over a 32-bit
+    view of the cache into a raw stage (``raw_ready`` counts the bytes).
+    Warps 4-7 replace the gather producer: eight lanes widen one row, each
+    lane 8 channels of every 64-channel step (one 8- or 4-byte load, native
+    ``cvt.rn.bf16x2`` conversions and a BF16 scale multiply, one 16-byte
+    store into the stage's SW128 layout).  A lane loads and widens its whole
+    share of a tile into registers first and then waits for the BF16 stage,
+    so only the stores follow the MMAs that free it.  Channels 0-255 of all
+    64 rows are stored before channels 256-511, and each part arrives on its
+    ``kv_ready`` barrier (one arrive per warp).  Shared-memory buffers and
+    their release (Rule 11):
+
+    - Raw stage: refilled by TMA.  Released on ``raw_free`` (one arrive per
+      warp) behind ``fence.proxy.async.shared::cta`` after the tile's last
+      load and its conversions: the refill is an async-proxy write, the
+      Rule 11 fence form.
+    - BF16 stage: written by the widening warps, read by the MMAs.  Part 0
+      (V channels 0-255) is reused after ``pv_half_done`` of the tile two
+      before (the first half of its PV MMAs), part 1 after its ``pv_done``.
+
+    Invalid indices are TMA out-of-bounds rows, which read as zero and widen
+    to +0, as the BF16 gather zero-fills them.
     """
+
+    PACKED_KV_FORMATS = ("mxfp8_528", "nvfp4_288")
+    KV_STAGE_BYTES = 64 * 1024
 
     NUM_HEADS = 64
     VALUE_DIM = 512
@@ -182,11 +300,20 @@ class SparseAttentionForwardSm100Head64:
         self,
         head_dim: int,
         indexer_topk: int = 0,
+        kv_format: Optional[KvFormat] = None,
     ):
         if head_dim not in (512, 576):
             raise ValueError(f"head_dim must be 512 or 576, got {head_dim}")
         if indexer_topk not in (0, 512, 1024, 2048):
             raise ValueError(f"indexer_topk must be one of 0/512/1024/2048, got {indexer_topk}")
+        if kv_format is not None:
+            if kv_format.name not in self.PACKED_KV_FORMATS:
+                raise ValueError(f"kv_format must be one of {self.PACKED_KV_FORMATS}, got {kv_format.name!r}")
+            if head_dim != kv_format.head_dim_qk or head_dim != 512:
+                raise ValueError(f"kv_format {kv_format.name!r} needs head_dim 512, got {head_dim}")
+            if not TMA_GATHER4_AVAILABLE:
+                raise ValueError("a packed kv_format needs the gather4 TMA bridge")
+        self.kv_format = kv_format
 
         self.head_dim = head_dim
         self.indexer_topk = indexer_topk
@@ -199,11 +326,27 @@ class SparseAttentionForwardSm100Head64:
         # compatibility cp.async path keeps its proven two-stage allocation
         # and schedule.
         self.num_kv_stages = 3 if self.use_tma_gather4 else 2
-        # The next query's Q and the current query's O borrow two different KV
-        # stages.
-        assert not self.use_tma_gather4 or self.num_kv_stages >= 3, "the persistent gather4 schedule needs at least three KV stages"
         self.num_tail_stages = 1 if self.use_tma_gather4 else self.num_kv_stages
         self.num_kv_parts = 2
+        if kv_format is not None:
+            # Packed rows land in a raw ring of their own and are widened into
+            # a two-stage BF16 NoPE/V ring (the arena holds two BF16 stages
+            # next to the raw ring).  A raw row is ``raw_row_stride`` bytes:
+            # MXFP8 rows are padded to 576 (64 mod 128) and NVFP4 rows keep
+            # 288 (32 mod 128), so the eight lanes that widen a row read
+            # conflict-free with four rows per warp.  The gather box covers the
+            # stride; bytes past a 528-byte record are zero-filled by TMA.
+            self.num_kv_stages = 2
+            self.num_raw_stages = 2
+            self.raw_row_stride = 576 if kv_format.name == "mxfp8_528" else 288
+            self.raw_stage_bytes = self.BLOCK_TOPK * self.raw_row_stride
+            assert self.raw_row_stride >= kv_format.record_bytes and (4 * self.raw_row_stride) % 128 == 0
+        # Gather4 BF16/FP16 KV is persistent; packed KV and the cp.async
+        # fallback run one query per CTA.
+        self.persistent = self.use_tma_gather4 and kv_format is None
+        # The next query's Q and the current query's O borrow two different KV
+        # stages.
+        assert not self.persistent or self.num_kv_stages >= 3, "the persistent gather4 schedule needs at least three KV stages"
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.THREADS_PER_CTA)
         self.gather_sync_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=4 * self.WARP_SIZE)
         self.softmax_sync_barrier = pipeline.NamedBarrier(barrier_id=3, num_threads=4 * self.WARP_SIZE)
@@ -234,8 +377,14 @@ class SparseAttentionForwardSm100Head64:
         self.element_dtype = q.element_type
         if const_expr(self.element_dtype not in (Float16, BFloat16)):
             raise TypeError("head64 sparse attention requires FP16 or BF16 q")
-        if const_expr(kv.element_type is not self.element_dtype or out.element_type is not self.element_dtype):
-            raise TypeError("head64 sparse attention requires matching q, kv, and out dtypes")
+        if const_expr(self.kv_format is None):
+            if const_expr(kv.element_type is not self.element_dtype or out.element_type is not self.element_dtype):
+                raise TypeError("head64 sparse attention requires matching q, kv, and out dtypes")
+        else:
+            if const_expr(self.element_dtype is not BFloat16 or out.element_type is not BFloat16):
+                raise TypeError("packed-KV head64 sparse attention requires BF16 q and out")
+            if const_expr(kv.element_type is not Uint8):
+                raise TypeError("packed-KV head64 sparse attention requires Uint8 kv rows")
         if const_expr(indices.element_type != Int32):
             raise TypeError("indices must have INT32 element type")
         if const_expr(max_logits.element_type != Float32 or lse.element_type != Float32):
@@ -323,31 +472,52 @@ class SparseAttentionForwardSm100Head64:
         p_mma_layout = sm100_utils.make_smem_layout_a(tiled_mma_pv, mma_tiler_pv, self.element_dtype, 1)
         v_mma_layout = sm100_utils.make_smem_layout_b(tiled_mma_pv, mma_tiler_pv, self.element_dtype, 1)
 
-        # Build a compiler-owned 2-D tensor map for gather4: logical (D, Tkv),
-        # a 64x1 16-bit box, and SW128.
-        # The local low-level bridge only supplies the missing gather4 opcode.
-        kv_descriptor_tensor = cute.make_tensor(
-            kv.iterator,
-            cute.make_layout(
-                (self.VALUE_DIM, cute.size(kv.shape[0])),
-                stride=(1, cute.size(kv.shape[1])),
-            ),
-        )
-        kv_descriptor_smem_layout = cute.make_composed_layout(
-            cute.make_swizzle(3, 4, 3),
-            0,
-            cute.make_layout((64, 1), stride=(1, 64)),
-        )
-        tma_atom_kv, _ = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
-            kv_descriptor_tensor,
-            kv_descriptor_smem_layout,
-            (64, 1),
-        )
-        # gather4 covers only the 512-d NoPE/V surface. Copy the D=576 SW64
-        # tail with cp.async because four gathered 64-element boxes
-        # are not laid out like one 64x64 SW64 operand tile.
-        kv_tma_bytes = self.BLOCK_TOPK * self.VALUE_DIM * (self.element_dtype.width // 8)
+        if const_expr(self.kv_format is None):
+            # Build a compiler-owned 2-D tensor map for gather4: logical (D, Tkv),
+            # a 64x1 16-bit box, and SW128.
+            # The local low-level bridge only supplies the missing gather4 opcode.
+            kv_descriptor_tensor = cute.make_tensor(
+                kv.iterator,
+                cute.make_layout(
+                    (self.VALUE_DIM, cute.size(kv.shape[0])),
+                    stride=(1, cute.size(kv.shape[1])),
+                ),
+            )
+            kv_descriptor_smem_layout = cute.make_composed_layout(
+                cute.make_swizzle(3, 4, 3),
+                0,
+                cute.make_layout((64, 1), stride=(1, 64)),
+            )
+            tma_atom_kv, _ = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+                kv_descriptor_tensor,
+                kv_descriptor_smem_layout,
+                (64, 1),
+            )
+            # gather4 covers only the 512-d NoPE/V surface. Copy the D=576 SW64
+            # tail with cp.async because four gathered 64-element boxes
+            # are not laid out like one 64x64 SW64 operand tile.
+            kv_tma_bytes = self.BLOCK_TOPK * self.VALUE_DIM * (self.element_dtype.width // 8)
+        else:
+            # Packed rows: a 2-D map over 32-bit words, logical (record words,
+            # Tkv) with the caller's row pitch, and an unswizzled box of one
+            # raw-row stride, so a gather4 copies four whole records (the
+            # box's bytes past a record are zero-filled).  ``tma_atom_kv`` and
+            # ``kv_tma_bytes`` then describe one raw-stage transaction.
+            raw_pitch_words = cute.assume(kv.layout.stride[0] // 4, divby=4)
+            raw_record_words = cute.size(kv.shape[1]) // 4
+            raw_box_words = self.raw_row_stride // 4
+            raw_descriptor_tensor = cute.make_tensor(
+                cute.recast_ptr(kv.iterator, dtype=Int32),
+                cute.make_layout((raw_record_words, cute.size(kv.shape[0])), stride=(1, raw_pitch_words)),
+            )
+            tma_atom_kv, _ = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+                raw_descriptor_tensor,
+                cute.make_layout((raw_box_words, 1), stride=(1, raw_box_words)),
+                (raw_box_words, 1),
+            )
+            kv_tma_bytes = self.raw_stage_bytes
 
         # Q is physically [Tq, H, D].  Put the two tiled modes first so the
         # public SM100 TMA-A helper can describe one complete [H, D] query
@@ -415,8 +585,10 @@ class SparseAttentionForwardSm100Head64:
         # expression keeps the nested SharedStorage extent code-read-time
         # constant; staged ``if`` assignments are not visible to that type.
         p_exchange_elements = cute.cosize(p_exchange_layout) * (Float32.width // self.element_dtype.width)
+        # Packed KV adds its raw ring after the P exchange.
+        raw_ring_elements = self.num_raw_stages * self.raw_stage_bytes // (self.element_dtype.width // 8) if self.kv_format is not None else 0
         arena_elements = (
-            tail_elements + self.num_kv_stages * kv_nope_elements + p_exchange_elements
+            tail_elements + self.num_kv_stages * kv_nope_elements + p_exchange_elements + raw_ring_elements
             if self.use_tma_gather4
             else q_nope_elements + tail_elements + self.num_kv_stages * (kv_nope_elements + tail_elements)
         )
@@ -438,6 +610,10 @@ class SparseAttentionForwardSm100Head64:
             o_writeback_mbar: cute.struct.MemRange[Int64, 2]
             clc_mbar: cute.struct.MemRange[Int64, 2]
             clc_response: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
+            if const_expr(self.kv_format is not None):
+                raw_ready_mbar: cute.struct.MemRange[Int64, self.num_raw_stages]
+                raw_free_mbar: cute.struct.MemRange[Int64, self.num_raw_stages]
+                pv_half_done_mbar: cute.struct.MemRange[Int64, self.num_kv_stages]
             tmem_holding_buf: Int32
             # Pack all small metadata before the first 1-KiB surface.  It fits
             # in exactly two alignment pages for every specialization, which
@@ -457,8 +633,8 @@ class SparseAttentionForwardSm100Head64:
         assert SharedStorage.size_in_bytes() <= 227 * 1024, f"H64 shared storage is {SharedStorage.size_in_bytes()} bytes"
         self.shared_storage = SharedStorage
 
-        # One CTA per query; with gather4, resident CTAs also claim the queries
-        # of unstarted CTAs (cluster launch control).
+        # One CTA per query; when persistent, resident CTAs also claim the
+        # queries of unstarted CTAs (cluster launch control).
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams((cute.size(q.shape[0]), 1, 1), (1, 1, 1))
         grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
         self.kernel(
@@ -570,6 +746,13 @@ class SparseAttentionForwardSm100Head64:
         o_writeback_mbar_ptr = storage.o_writeback_mbar.data_ptr()
         clc_mbar_ptr = storage.clc_mbar.data_ptr()
         clc_response_ptr = storage.clc_response.data_ptr()
+        raw_ready_mbar_ptr = None
+        raw_free_mbar_ptr = None
+        pv_half_done_mbar_ptr = None
+        if const_expr(self.kv_format is not None):
+            raw_ready_mbar_ptr = storage.raw_ready_mbar.data_ptr()
+            raw_free_mbar_ptr = storage.raw_free_mbar.data_ptr()
+            pv_half_done_mbar_ptr = storage.pv_half_done_mbar.data_ptr()
         s_index_base_ptr = storage.sIndex.data_ptr()
         s_valid_base_ptr = storage.sValid.data_ptr()
         arena_base_ptr = storage.sArena.data_ptr()
@@ -623,6 +806,11 @@ class SparseAttentionForwardSm100Head64:
         sScale = storage.sScale.get_tensor(row_layout)
         p_exchange_arena_offset = tail_elements + self.num_kv_stages * kv_nope_elements if self.use_tma_gather4 else 0
         p_exchange_storage_ptr = arena_base_ptr + Int32(p_exchange_arena_offset)
+        raw_ring_base_ptr = None
+        if const_expr(self.kv_format is not None):
+            # The packed raw ring follows the P exchange (1-KiB aligned: the
+            # exchange is 8 KiB).
+            raw_ring_base_ptr = arena_base_ptr + Int32(p_exchange_arena_offset + cute.cosize(p_exchange_layout) * (Float32.width // self.element_dtype.width))
         # Runtime pointer arithmetic drops CuTe's inferred alignment even
         # though every arena component is 1-KiB aligned.  Restore the 16-byte
         # contract needed by the source-equivalent float4 exchange.
@@ -678,8 +866,15 @@ class SparseAttentionForwardSm100Head64:
             self.num_tail_stages,
             # q_tail_ready arrivals: gather4 copies the D=576 Q tail with warps 10-11.
             2 * self.WARP_SIZE if self.use_tma_gather4 else 4 * self.WARP_SIZE,
+            # Packed KV: each of the four widening warps arrives once per part.
+            1 if self.kv_format is None else 4,
+            raw_ready_mbar_ptr,
+            raw_free_mbar_ptr,
+            self.num_raw_stages if self.kv_format is not None else 0,
+            4,
+            pv_half_done_mbar_ptr,
         )
-        if const_expr(self.use_tma_gather4):
+        if const_expr(self.persistent):
             clc_pipeline = pipeline.PipelineClcFetchAsync.create(
                 barrier_storage=clc_mbar_ptr,
                 num_stages=1,
@@ -720,7 +915,7 @@ class SparseAttentionForwardSm100Head64:
         if warp_idx == Int32(0):
             cpasync.prefetch_descriptor(tma_atom_q)
             cpasync.prefetch_descriptor(tma_atom_o)
-        if warp_idx == Int32(4):
+        if warp_idx == Int32(4 if self.kv_format is None else 10):
             cpasync.prefetch_descriptor(tma_atom_kv)
         rMi = cute.make_rmem_tensor((1,), Float32)
         rLi = cute.make_rmem_tensor((1,), Float32)
@@ -731,14 +926,14 @@ class SparseAttentionForwardSm100Head64:
             # Stage the regular Q tile with an ordinary 1-CTA TMA.  Sparse KV
             # remains on the audited predicated gather path below.
             #
-            # Gather4 stages Q in tile 2's KV stage for a CTA's first query,
-            # else in tile 1's (tile 2's holds the previous O).  That stage's
-            # last reader, PV(tile_base - 2), is done once warp 8 has seen
-            # so_ready(tile_base - 1).
+            # Gather4 stages Q in the last KV stage (tile 2's; tile 1's for
+            # packed KV) for a CTA's first query, else in tile 1's (tile 2's
+            # holds the previous O).  That stage's last reader, PV(tile_base -
+            # 2), is done once warp 8 has seen so_ready(tile_base - 1).
             q_slot = query_count % Int32(2)
             q_slot_phase = (query_count // Int32(2)) % Int32(2)
             if const_expr(self.use_tma_gather4):
-                q_stage_offset = Int32(2) if query_count == Int32(0) else Int32(1)
+                q_stage_offset = Int32(self.num_kv_stages - 1) if query_count == Int32(0) else Int32(1)
                 q_stage = (tile_base + q_stage_offset) % Int32(self.num_kv_stages)
                 q_stage_ptr = sKV_base_ptr + cute.assume(q_stage * Int32(kv_nope_elements), divby=kv_nope_elements)
             else:
@@ -846,64 +1041,97 @@ class SparseAttentionForwardSm100Head64:
             if const_expr(not self.use_tma_gather4):
                 kv_stage_elements = kv_stage_elements + Int32(cute.cosize(kv_tail_layout) if self.head_dim == 576 else 0)
             if const_expr(self.use_tma_gather4):
-                if warp_idx >= Int32(4) and warp_idx < Int32(8):
-                    # Wait for the Q copy and the previous O write-back before
-                    # first writing their stages (after the last tile if never
-                    # reached).  Both are two-deep rings by query parity, so a
-                    # lagging producer cannot be lapped.
-                    o_stage = (tile_base + Int32(self.num_kv_stages - 1)) % Int32(self.num_kv_stages)
-                    o_slot = (query_count + Int32(1)) % Int32(2)
-                    o_slot_phase = ((query_count - Int32(1)) // Int32(2)) % Int32(2)
-                    q_pending = Int32(1)
-                    o_pending = Int32(1) if query_count > Int32(0) else Int32(0)
-                    producer_tile = Int32(0)
-                    while producer_tile < tile_count:
-                        producer_global = tile_base + producer_tile
-                        producer_stage = producer_global % Int32(self.num_kv_stages)
-                        if producer_global >= Int32(self.num_kv_stages):
-                            prior_use = producer_global // Int32(self.num_kv_stages) - Int32(1)
-                            cute.arch.mbarrier_wait(
-                                pv_done_mbar_ptr + producer_stage,
-                                prior_use % Int32(2),
-                            )
-                        if q_pending != Int32(0) and producer_stage == q_stage:
-                            cute.arch.mbarrier_wait(q_s2t_done_mbar_ptr + q_slot, q_slot_phase)
-                            q_pending = Int32(0)
-                        if o_pending != Int32(0) and producer_stage == o_stage:
-                            cute.arch.mbarrier_wait(o_writeback_mbar_ptr + o_slot, o_slot_phase)
-                            o_pending = Int32(0)
-
-                        producer_stage_elem_offset = producer_stage * kv_stage_elements
-                        producer_kv_ptr = sKV_base_ptr + cute.assume(
-                            producer_stage_elem_offset,
-                            divby=self.COPY_ELEMS,
-                        )
-                        logical_tile_is_full = Int32(1)
-                        if const_expr(topk_length is not None):
-                            logical_tile_is_full = cute.arch.make_warp_uniform(Int32((producer_tile + Int32(1)) * Int32(self.BLOCK_TOPK) <= effective_length))
-                        self._gather_kv_tma_direct(
+                if const_expr(self.kv_format is not None):
+                    # Packed KV runs one query per CTA, so tile_base is 0.
+                    if warp_idx >= Int32(10):
+                        self._gather_raw_kv_loop(
                             indices,
                             query_idx,
-                            producer_tile,
+                            tile_count,
                             effective_length,
-                            logical_tile_is_full,
-                            producer_kv_ptr,
+                            raw_ring_base_ptr,
                             tma_atom_kv,
-                            kv_ready_mbar_ptr + producer_stage * Int32(self.num_kv_parts),
                             kv_tma_bytes,
+                            raw_ready_mbar_ptr,
+                            raw_free_mbar_ptr,
                             warp_idx,
                         )
-                        producer_tile = producer_tile + Int32(1)
-                    # Claim here, not at query start: early claims unbalance
-                    # ragged lengths.
-                    if warp_idx == Int32(self.CLC_WARP):
-                        clc_pipeline.producer_acquire(clc_producer_state)
-                        tile_sched.advance_to_next_work(clc_pipeline.producer_get_barrier(clc_producer_state))
-                        clc_producer_state.advance()
-                    if q_pending != Int32(0):
-                        cute.arch.mbarrier_wait(q_s2t_done_mbar_ptr + q_slot, q_slot_phase)
-                    if o_pending != Int32(0):
-                        cute.arch.mbarrier_wait(o_writeback_mbar_ptr + o_slot, o_slot_phase)
+                    if warp_idx >= Int32(4) and warp_idx < Int32(8):
+                        self._widen_raw_kv_loop(
+                            tile_count,
+                            sKV_base_ptr,
+                            raw_ring_base_ptr,
+                            raw_ready_mbar_ptr,
+                            raw_free_mbar_ptr,
+                            kv_ready_mbar_ptr,
+                            pv_done_mbar_ptr,
+                            pv_half_done_mbar_ptr,
+                            q_s2t_done_mbar_ptr + q_slot,
+                            q_slot_phase,
+                            warp_idx,
+                            lane_idx,
+                        )
+                else:
+                    if warp_idx >= Int32(4) and warp_idx < Int32(8):
+                        # Wait for the Q copy and the previous O write-back before
+                        # first writing their stages (after the last tile if never
+                        # reached).  Both are two-deep rings by query parity, so a
+                        # lagging producer cannot be lapped.
+                        o_stage = (tile_base + Int32(self.num_kv_stages - 1)) % Int32(self.num_kv_stages)
+                        o_slot = (query_count + Int32(1)) % Int32(2)
+                        o_slot_phase = ((query_count - Int32(1)) // Int32(2)) % Int32(2)
+                        q_pending = Int32(1)
+                        o_pending = Int32(1) if query_count > Int32(0) else Int32(0)
+                        producer_tile = Int32(0)
+                        while producer_tile < tile_count:
+                            producer_global = tile_base + producer_tile
+                            producer_stage = producer_global % Int32(self.num_kv_stages)
+                            if producer_global >= Int32(self.num_kv_stages):
+                                prior_use = producer_global // Int32(self.num_kv_stages) - Int32(1)
+                                cute.arch.mbarrier_wait(
+                                    pv_done_mbar_ptr + producer_stage,
+                                    prior_use % Int32(2),
+                                )
+                            if q_pending != Int32(0) and producer_stage == q_stage:
+                                cute.arch.mbarrier_wait(q_s2t_done_mbar_ptr + q_slot, q_slot_phase)
+                                q_pending = Int32(0)
+                            if o_pending != Int32(0) and producer_stage == o_stage:
+                                cute.arch.mbarrier_wait(o_writeback_mbar_ptr + o_slot, o_slot_phase)
+                                o_pending = Int32(0)
+
+                            producer_stage_elem_offset = producer_stage * kv_stage_elements
+                            producer_kv_ptr = sKV_base_ptr + cute.assume(
+                                producer_stage_elem_offset,
+                                divby=self.COPY_ELEMS,
+                            )
+                            logical_tile_is_full = Int32(1)
+                            if const_expr(topk_length is not None):
+                                logical_tile_is_full = cute.arch.make_warp_uniform(
+                                    Int32((producer_tile + Int32(1)) * Int32(self.BLOCK_TOPK) <= effective_length)
+                                )
+                            self._gather_kv_tma_direct(
+                                indices,
+                                query_idx,
+                                producer_tile,
+                                effective_length,
+                                logical_tile_is_full,
+                                producer_kv_ptr,
+                                tma_atom_kv,
+                                kv_ready_mbar_ptr + producer_stage * Int32(self.num_kv_parts),
+                                kv_tma_bytes,
+                                warp_idx,
+                            )
+                            producer_tile = producer_tile + Int32(1)
+                        # Claim here, not at query start: early claims unbalance
+                        # ragged lengths.
+                        if warp_idx == Int32(self.CLC_WARP):
+                            clc_pipeline.producer_acquire(clc_producer_state)
+                            tile_sched.advance_to_next_work(clc_pipeline.producer_get_barrier(clc_producer_state))
+                            clc_producer_state.advance()
+                        if q_pending != Int32(0):
+                            cute.arch.mbarrier_wait(q_s2t_done_mbar_ptr + q_slot, q_slot_phase)
+                        if o_pending != Int32(0):
+                            cute.arch.mbarrier_wait(o_writeback_mbar_ptr + o_slot, o_slot_phase)
 
                 # Warp 9 independently publishes the two packed validity words.
                 # Its three-stage ring is released only after every WG0 thread has
@@ -1083,15 +1311,17 @@ class SparseAttentionForwardSm100Head64:
                                 pv_tile,
                                 pv_global,
                                 warp_idx,
+                                None if const_expr(self.kv_format is None) else pv_half_done_mbar_ptr + pv_stage,
                             )
                         issuer_tile = issuer_tile + Int32(1)
 
             scale_log2_e = softmax_scale * Float32(math.log2(math.e))
             tile_idx = Int32(0)
             if const_expr(self.use_tma_gather4):
-                if warp_idx >= Int32(4) and warp_idx < Int32(10):
+                if warp_idx >= Int32(4) and warp_idx < Int32(10 if self.kv_format is None else 12):
                     # WG1, the MMA issuer, and validity producer all finish in
-                    # their independent dynamic loops above.
+                    # their independent dynamic loops above (packed KV: so do the
+                    # raw-row gather warps 10-11).
                     tile_idx = tile_count
             qk_phase = tile_base % Int32(2)
             while tile_idx < tile_count:
@@ -1402,7 +1632,7 @@ class SparseAttentionForwardSm100Head64:
                     tidx,
                     warp_idx,
                 )
-                if const_expr(self.use_tma_gather4):
+                if const_expr(self.persistent):
                     # Every store issuer has drained its reads of the O stage.
                     # Only WG0 reaches this rendezvous, so it is unaligned.
                     prims.barrier_cta_sync(self.softmax_sync_barrier.barrier_id, thread_count=self.softmax_sync_barrier.num_threads)
@@ -1412,7 +1642,7 @@ class SparseAttentionForwardSm100Head64:
 
             tile_base = tile_base + tile_count
             query_count = query_count + Int32(1)
-            if const_expr(self.use_tma_gather4):
+            if const_expr(self.persistent):
                 # Every thread consumes each claim response.
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
@@ -1423,7 +1653,7 @@ class SparseAttentionForwardSm100Head64:
             else:
                 has_query = Int32(0)
 
-        if const_expr(self.use_tma_gather4):
+        if const_expr(self.persistent):
             # Drain the claim pipeline before the CTA exits.
             if warp_idx == Int32(self.CLC_WARP):
                 clc_pipeline.producer_tail(clc_producer_state)
@@ -1524,6 +1754,197 @@ class SparseAttentionForwardSm100Head64:
                                 row2,
                                 row3,
                             )
+
+    @cute.jit
+    def _gather_raw_kv_loop(
+        self,
+        indices: cute.Tensor,
+        query_idx: Int32,
+        tile_count: Int32,
+        effective_length: Int32,
+        raw_ring_base_ptr: cute.Pointer,
+        tma_atom_raw: cute.CopyAtom,
+        raw_stage_bytes: cutlass.Constexpr[int],
+        raw_ready_mbar_ptr: cute.Pointer,
+        raw_free_mbar_ptr: cute.Pointer,
+        warp_idx: Int32,
+    ):
+        """Warps 10-11: gather each tile's 64 raw records into a raw stage.
+
+        A raw stage is refilled once the widening warps have released the
+        tile two before it.  Warp 10 arms ``raw_ready``; each warp issues the
+        gather4s of eight four-row groups.
+        """
+
+        local_warp_idx = warp_idx - Int32(10)
+        elem_bytes = self.element_dtype.width // 8
+        raw_tile = Int32(0)
+        while raw_tile < tile_count:
+            slot = raw_tile % Int32(self.num_raw_stages)
+            if raw_tile >= Int32(self.num_raw_stages):
+                prior_use = raw_tile // Int32(self.num_raw_stages) - Int32(1)
+                cute.arch.mbarrier_wait(raw_free_mbar_ptr + slot, prior_use % Int32(2))
+            if local_warp_idx == Int32(0):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(raw_ready_mbar_ptr + slot, raw_stage_bytes)
+            with cute.arch.elect_one():
+                tile_slot = raw_tile * Int32(self.BLOCK_TOPK)
+                for local_group in cutlass.range_constexpr(self.BLOCK_TOPK // 8):
+                    group = Int32(2 * local_group) + local_warp_idx
+                    row_base = cute.assume(group * Int32(4), divby=4)
+                    row_indices = _ldg_indices_128(indices, query_idx, tile_slot + row_base)
+                    # Slots past the length gather nothing (an out-of-bounds
+                    # row of zeros); invalid indices are out of bounds already.
+                    row_slot = tile_slot + row_base
+                    row0 = Int32(row_indices[0]) if row_slot < effective_length else Int32(-1)
+                    row1 = Int32(row_indices[1]) if row_slot + Int32(1) < effective_length else Int32(-1)
+                    row2 = Int32(row_indices[2]) if row_slot + Int32(2) < effective_length else Int32(-1)
+                    row3 = Int32(row_indices[3]) if row_slot + Int32(3) < effective_length else Int32(-1)
+                    dst_offset = slot * Int32(raw_stage_bytes // elem_bytes) + group * Int32(4 * self.raw_row_stride // elem_bytes)
+                    tma_gather4_cta1(
+                        tma_atom_raw,
+                        raw_ring_base_ptr + cute.assume(dst_offset, divby=64),
+                        raw_ready_mbar_ptr + slot,
+                        Int32(0),
+                        row0,
+                        row1,
+                        row2,
+                        row3,
+                    )
+            raw_tile = raw_tile + Int32(1)
+
+    @cute.jit
+    def _widen_raw_kv_loop(
+        self,
+        tile_count: Int32,
+        sKV_base_ptr: cute.Pointer,
+        raw_ring_base_ptr: cute.Pointer,
+        raw_ready_mbar_ptr: cute.Pointer,
+        raw_free_mbar_ptr: cute.Pointer,
+        kv_ready_mbar_ptr: cute.Pointer,
+        pv_done_mbar_ptr: cute.Pointer,
+        pv_half_done_mbar_ptr: cute.Pointer,
+        q_s2t_done_mbar_ptr: cute.Pointer,
+        q_s2t_done_phase: Int32,
+        warp_idx: Int32,
+        lane_idx: Int32,
+    ):
+        """Warps 4-7: widen each raw tile into a BF16 stage of the SW128 NoPE/V layout.
+
+        Lane ``l`` of the warpgroup belongs to group ``g = l // 8``, which
+        widens rows ``g, g + 16, g + 32, g + 48``; within a row it owns
+        channels ``[64 s + 8 (l % 8), +8)`` of every 64-channel step ``s``.
+        That chunk lands at byte ``s * 8192 + row * 128 + ((l % 8) ^ (row % 8)) * 16``
+        of the stage, the gather4 SW128 layout of the BF16 producer.  A lane
+        holds its widened tile (128 words) in registers until the stage is
+        free; steps 0-3 (channels 0-255) of all rows are stored before
+        steps 4-7.
+        """
+
+        is_mxfp8 = self.kv_format.name == "mxfp8_528"
+        stride = self.raw_row_stride
+        # Record layout (``_kv_formats``): codes, then scales.  One step is 64
+        # channels: 64 E4M3 bytes or 32 E2M1 bytes; a lane reads 8 or 4 of them.
+        step_code_bytes = 64 if is_mxfp8 else 32
+        lane_code_bytes = step_code_bytes // 8
+        scale_base = 512 if is_mxfp8 else 256
+        scale_words = 4 if is_mxfp8 else 8
+        rows_per_group = self.BLOCK_TOPK // 16
+        local_tidx = (warp_idx - Int32(4)) * Int32(self.WARP_SIZE) + lane_idx
+        group = local_tidx // Int32(8)
+        chunk = local_tidx % Int32(8)
+        raw_lane = group * Int32(stride) + chunk * Int32(lane_code_bytes)
+        scale_lane = group * Int32(stride) + Int32(scale_base)
+        out_lane = group * Int32(128) + ((chunk ^ (group % Int32(8))) * Int32(16))
+        # Scales come in pairs, one per two steps: a ``prmt`` picks the two
+        # scale bytes of steps 2k and 2k + 1, one ``cvt`` widens both, and
+        # each step multiplies by its half.  MXFP8: step s uses scale
+        # 2 s + (chunk >= 4), bytes h and 2 + h of word k (h = chunk >= 4).
+        # NVFP4: step s uses scale 4 s + chunk // 2, byte chunk // 2 of word
+        # s, so steps 2k and 2k + 1 read that byte of words 2k and 2k + 1.
+        if const_expr(is_mxfp8):
+            h = chunk // Int32(4)
+            scale_selector = Int32(0x20) + h * Int32(0x11)
+        else:
+            b = chunk // Int32(2)
+            scale_selector = Int32(0x40) + b * Int32(0x11)
+        raw_base_addr = raw_ring_base_ptr.toint()
+        kv_base_addr = sKV_base_ptr.toint()
+        tile = Int32(0)
+        while tile < tile_count:
+            slot = tile % Int32(self.num_raw_stages)
+            stage = tile % Int32(self.num_kv_stages)
+            cute.arch.mbarrier_wait(raw_ready_mbar_ptr + slot, (tile // Int32(self.num_raw_stages)) % Int32(2))
+            raw_addr = raw_base_addr + slot * Int32(self.raw_stage_bytes)
+            # Issue every raw load of the tile first: loads and stores are
+            # ordered as written, so a load behind a store would wait out the
+            # load latency once per step.
+            scales = []
+            codes = []
+            for r in cutlass.range_constexpr(rows_per_group):
+                row_scale_addr = raw_addr + scale_lane + Int32(r * 16 * stride)
+                row_scales = list(_lds_128(row_scale_addr))
+                if const_expr(scale_words == 8):
+                    row_scales += list(_lds_128(row_scale_addr + Int32(16)))
+                scales.append(row_scales)
+                row_raw_addr = raw_addr + raw_lane + Int32(r * 16 * stride)
+                row_codes = []
+                for step in cutlass.range_constexpr(8):
+                    code_addr = row_raw_addr + Int32(step * step_code_bytes)
+                    if const_expr(is_mxfp8):
+                        row_codes.append(_lds_64(code_addr))
+                    else:
+                        row_codes.append(_lds_32(code_addr))
+                codes.append(row_codes)
+            # Widen the whole tile into registers before waiting for the BF16
+            # stage: with two stages the stage frees only after the PV MMA of
+            # the tile two before, so only the stores sit on that chain.
+            widened = []
+            for r in cutlass.range_constexpr(rows_per_group):
+                row_widened = []
+                for pair in cutlass.range_constexpr(4):
+                    if const_expr(is_mxfp8):
+                        scale = mxfp8_scale_pair(scales[r][pair], scale_selector)
+                    else:
+                        scale = nvfp4_scale_pair(scales[r][2 * pair], scales[r][2 * pair + 1], scale_selector)
+                    for half in cutlass.range_constexpr(2):
+                        word = codes[r][2 * pair + half]
+                        if const_expr(is_mxfp8):
+                            row_widened.append(widen_mxfp8_word(word[0], scale, half) + widen_mxfp8_word(word[1], scale, half))
+                        else:
+                            row_widened.append(widen_nvfp4_word(word, scale, half))
+                widened.append(row_widened)
+            # Rule 11, fence form: the raw stage is refilled by TMA (async
+            # proxy); the fence follows this tile's last raw load.
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(raw_free_mbar_ptr + slot)
+            if tile == Int32(self.num_kv_stages - 1):
+                # The last BF16 stage holds Q until it has moved to TMEM.
+                cute.arch.mbarrier_wait(q_s2t_done_mbar_ptr, q_s2t_done_phase)
+            prior_phase = (tile // Int32(self.num_kv_stages) - Int32(1)) % Int32(2)
+            out_addr = kv_base_addr + stage * Int32(self.KV_STAGE_BYTES)
+            for part in cutlass.range_constexpr(self.num_kv_parts):
+                # Part p of the stage is V channels [256 p, 256 p + 256): free
+                # once the PV MMAs of that half (part 0) or of the whole tile
+                # (part 1) two tiles before have completed.
+                if tile >= Int32(self.num_kv_stages):
+                    if const_expr(part == 0):
+                        cute.arch.mbarrier_wait(pv_half_done_mbar_ptr + stage, prior_phase)
+                    else:
+                        cute.arch.mbarrier_wait(pv_done_mbar_ptr + stage, prior_phase)
+                for r in cutlass.range_constexpr(rows_per_group):
+                    row_out_addr = out_addr + out_lane + Int32(r * 16 * 128)
+                    for step in cutlass.range_constexpr(part * 4, part * 4 + 4):
+                        w0, w1, w2, w3 = widened[r][step]
+                        _sts_128(row_out_addr + Int32(step * 8192), w0, w1, w2, w3)
+                # The widened part is read by tcgen05 MMAs (async proxy).
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(kv_ready_mbar_ptr + stage * Int32(self.num_kv_parts) + Int32(part))
+            tile = tile + Int32(1)
 
     @cute.jit
     def _gather_kv_tail_cpasync(
@@ -1954,10 +2375,13 @@ class SparseAttentionForwardSm100Head64:
         tile_idx: Int32,
         global_tile: Int32,
         warp_idx: Int32,
+        pv_half_done_mbar=None,
     ):
         """Accumulate both 64x256 P@V halves into persistent TMEM O.
 
         ``tile_idx`` 0 clears O; ``global_tile``, the CTA's tile count, selects the phase.
+        ``pv_done_mbar`` completes with both halves; ``pv_half_done_mbar``, when
+        given, with the first (V channels 0-255).
         """
 
         if warp_idx == Int32(8):
@@ -2004,6 +2428,9 @@ class SparseAttentionForwardSm100Head64:
                         sV_tile,
                         tile_idx != Int32(0) or k_block != 0,
                     )
+                if const_expr(value_half == 0 and pv_half_done_mbar is not None):
+                    with cute.arch.elect_one():
+                        tcgen05.commit(pv_half_done_mbar)
             with cute.arch.elect_one():
                 tcgen05.commit(pv_done_mbar)
 
