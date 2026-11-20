@@ -979,6 +979,13 @@ per-plan declaration, but integrations should not filter the candidate pool just
 to choose a Stats layout. Consumers of this new enum must require an FE release
 that supplies it.
 
+If direct HN with a changing head stride is mandatory, call
+`graph.select_behavior_notes([cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE])`
+between `create_execution_plans()` and `build_plans()`. This keeps the heuristic
+order among matching plans. The build fails if none qualify. Callers that can
+stage through NH can keep the full candidate list and cache the final plan's
+layout choice when they prepare it.
+
 The note has frontend-only integer value **1000**, in the band starting at
 `FRONTEND_BEHAVIOR_NOTE_BASE`; existing values 0–5 are unchanged. It serializes
 as `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE`. Backend enum conversion rejects it;

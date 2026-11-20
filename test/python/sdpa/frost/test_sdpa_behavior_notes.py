@@ -151,6 +151,7 @@ def test_paged_q1_note_follows_selected_binder():
     prefill = SPECS["sdpa_fwd_sm100_d128_multi_q"]
     decode = SPECS["sdpa_fwd_sm100_d128_single_q"]
     assert engines._thd_decode_leg(prefill.capabilities, facts)
+    assert prefill.supports_stats_stride_override(facts, None)  # the default record lowers unsplit
     assert prefill.supports_stats_stride_override(facts, engines.SdpaFwdKnobs(cga=2, split_kv=1))
     assert not decode.supports_stats_stride_override(facts, engines.SdpaFwdKnobs(cga=1, split_kv=2))
 

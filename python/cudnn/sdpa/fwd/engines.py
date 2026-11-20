@@ -3136,8 +3136,7 @@ class EngineSpec:
             return False
         # Only the single-CTA split decode/combine can bind ragged Q through
         # the dense launch. The same Q=1 paged graph can select THD prefill.
-        split = _decode_tile_split_kv(knobs)
-        if (split is None or (split > 1 and knobs.cga in (None, 1))) and _thd_decode_leg(self.capabilities, facts):
+        if knobs is not None and (knobs.split_kv or 1) > 1 and knobs.cga in (None, 1) and _thd_decode_leg(self.capabilities, facts):
             return False
         return bool(getattr(cudnn._pybind_module._SdpaThdBinder, "supports_stats_stride_override", False))
 
