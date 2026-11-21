@@ -70,7 +70,6 @@ D128_NOT_SERVED = {
     "sink": "attention sinks",
     "window_left": "a sliding window",
     "window_right": "a widened right band",
-    "lengths": "per-batch lengths",
     "pack_gqa": "PackGQA",
 }
 NOT_SERVED = {D128_FLAVOR: D128_NOT_SERVED}
@@ -491,7 +490,7 @@ def d128_graph_decline(facts, *, pack_gqa: bool = False, split_kv: int = 1) -> s
         return why
     if facts.s_q == 1:
         return "s_q == 1 (decode) is outside the SM90 D128 template's scope; the 64 x 64 tile serves it"
-    if facts.causal and facts.bottom_right and facts.s_q > facts.s_kv:
+    if facts.causal and facts.bottom_right and facts.s_q > facts.s_kv and "lengths" not in declared:
         return "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
     return None
 
@@ -642,6 +641,8 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
             paged=params.page_size != 0,
             split_kv=params.split_kv,
         )
+        if params.persistent and (params.seq_q_lens_present or params.seq_kv_lens_present):
+            raise ValueError("SM90 D128 per-batch lengths require one work tile per CTA")
         for feature, label in D128_NOT_SERVED.items():
             if feature in declared:
                 raise ValueError(f"SM90 D128 does not serve {label}; the D512 body (tile 64) serves such declarations")

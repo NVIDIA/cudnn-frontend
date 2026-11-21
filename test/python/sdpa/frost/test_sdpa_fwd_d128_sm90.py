@@ -346,7 +346,6 @@ _DECLINED_AT_D128 = [
     pytest.param(lambda m, d: m._combo_dense(d, torch.float16, 8, 8, d**-0.5, _sink(8), "causal"), _d128_declines("attention sinks"), id="sink"),
     pytest.param(lambda m, d: m._combo_dense(d, torch.float16, 8, 8, d**-0.5, None, "swa"), _d128_declines("a sliding window"), id="sliding-window"),
     pytest.param(lambda m, d: m._combo_dense(d, torch.float16, 8, 8, d**-0.5, None, "band"), _d128_declines("a widened right band"), id="right-band"),
-    pytest.param(lambda m, d: m._combo_dense(d, torch.float16, 8, 8, d**-0.5, None, "padded"), _d128_declines("per-batch lengths"), id="padding-lengths"),
     pytest.param(lambda m, d: m._combo_thd(d, torch.float16, 8, 8, d**-0.5, None, "none"), _d128_declines("THD (ragged) layouts"), id="thd"),
     # A scope decline, not a kernel limit: D128 runs S_q == 1 on the direct route (the b1h2-sq1-skv1 tile case and
     # bottom_right-one_row below); the row keeps the 128 x 128 tile off it because decode is outside the slice #378
@@ -1982,3 +1981,10 @@ def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case
     ptxas = {ln.split()[1]: ln.split()[2] for ln in out if ln.startswith("PTXAS ") and len(ln.split()) == 3}
     if "serialized" in ptxas:
         assert ptxas["rc"] == "0" and ptxas["serialized"] == "0", [ln for ln in out if ln.startswith("PTXAS")]
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_padding_uses_the_dedicated_template(graph_d128):
+    """Invert the former padding decline: the fixed owner must execute this graph."""
+    graph_d128._combo_dense(128, torch.float16, 8, 8, _SCALE, None, "padded")

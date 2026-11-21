@@ -1955,6 +1955,13 @@ Select the stored half/bfloat16 bits after conversion, using the unpacked query
 row when PackGQA is active. `test_sdpa_sm80_padding_nan.py` and the wide SM80
 padding detector poison physical padding and exercise rebinding and replay.
 
+Dense runtime KV lengths also make V padding unread storage. Masking its
+probabilities to zero does not suppress `0 * NaN` in PV. If compute warpgroups
+share one V tile, finish tail clearing and synchronize **all readers** before
+PV; a barrier for each warpgroup separately cannot protect the shared tile.
+`test_sdpa_fwd_d128_sm90_lengths.py` poisons Q/K/V padding and covers both
+single-tile and ring-refill replay, with overlap enabled and disabled.
+
 Prepared split-KV slab offsets must use the same 128-byte carve alignment as
 `scratch_workspace_bytes`; rounding an internal offset to 256 can overrun the
 advertised workspace. Guard the exact allocation on widths/row counts whose

@@ -191,7 +191,6 @@ _NOT_SERVED_GRAPHS = {
     "sink": (dict(has_sink=True), {}),
     "window_left": (dict(causal=True, window_left=16), {}),
     "window_right": (dict(right_band_widening=True, right_bound=4), {}),
-    "lengths": (dict(padded=True), {}),
     "pack_gqa": (dict(h_kv=2), dict(pack_gqa=True)),
 }
 
@@ -342,7 +341,7 @@ def test_tile_knobs_are_judged_per_flavor(d, tile, why):
         pytest.param(128, 512, 256, {}, "unpadded bottom-right S_q > S_kv is not yet supported on SM90", id="d128"),
         pytest.param(128, 256, 512, {}, None, id="d128-s_q-below-s_kv"),
         pytest.param(128, 512, 512, {}, None, id="d128-square"),
-        pytest.param(128, 512, 256, dict(padded=True), "SM90's 128 x 128 tile (the D128 template) does not serve per-batch lengths", id="d128-padded"),
+        pytest.param(128, 512, 256, dict(padded=True), None, id="d128-padded"),
         pytest.param(512, 512, 256, {}, None, id="d512"),
         pytest.param((264, 504), 512, 256, {}, None, id="envelope"),
     ],
@@ -350,7 +349,7 @@ def test_tile_knobs_are_judged_per_flavor(d, tile, why):
 def test_unpadded_bottom_right_above_s_kv_is_declined_at_d128(d, s_q, s_kv, declared, why):
     """The SM90 adapter declines unpadded bottom-right causal with S_q > S_kv at build on every flavor (its pending case;
     the cc 9.0 suite pins that side). On the 128 x 128 tile the shipped row declines it too, with the adapter's message, so
-    no D128 plan is ranked that cannot build; a padded graph meets the lengths decline first. The 64 x 64 tile, at D512,
+    no D128 plan is ranked that cannot build; a padded graph reads runtime lengths. The 64 x 64 tile, at D512,
     its envelope and (128, 128) alike, still ranks it and leaves the decline to the adapter, and on the 128 x 128 tile
     bottom-right with S_q <= S_kv and top-left causal at S_q > S_kv are served."""
     from cudnn.sdpa.fwd import engines
@@ -467,7 +466,7 @@ def test_pick_flavor_without_features_takes_d128_at_exactly_128():
     assert c.FLAVOR_TILES == {c.D512_FLAVOR: (c.TILE_M, c.TILE_N), c.D128_FLAVOR: (128, 128)}
 
 
-@pytest.mark.parametrize("feature", ["thd", "paged", "split_kv", "sink", "window_left", "window_right", "lengths", "pack_gqa"])
+@pytest.mark.parametrize("feature", ["thd", "paged", "split_kv", "sink", "window_left", "window_right", "pack_gqa"])
 def test_pick_flavor_keeps_each_not_served_feature_on_d512(feature):
     """Decided once, up front: a (128, 128) declaration naming a feature D128 does not serve selects
     D512 directly, with or without other features; one D128 serves selects D128."""
@@ -487,7 +486,7 @@ def test_declared_features_spells_each_flag_once():
     assert c.declared_features(window_left=0) == {"window_left"}
     assert c.declared_features(window_right=1) == {"window_right"}
     named = c.declared_features(thd=True, sink=True, window_left=4, window_right=2, lengths=True, pack_gqa=True, paged=True, split_kv=2)
-    assert named == set(c.D128_NOT_SERVED)
+    assert named == set(c.D128_NOT_SERVED) | {"lengths"}
 
 
 def test_d128_refusal_and_the_picker_read_one_table():
@@ -563,12 +562,11 @@ def test_d512_template_params_messages_are_unchanged():
         (dict(has_sink=True), "attention sinks"),
         (dict(window_left=16), "a sliding window"),
         (dict(window_right=4), "a widened right band"),
-        (dict(seq_kv_lens_present=True), "per-batch lengths"),
         (dict(pack_gqa=True, qh_per_kh=2), "PackGQA"),
         (dict(page_size=64, seq_kv_lens_present=True), "paged KV"),
         (dict(split_kv=2), "split-KV"),
     ],
-    ids=["thd", "sink", "swa", "right-band", "lengths", "pack-gqa", "paged", "split"],
+    ids=["thd", "sink", "swa", "right-band", "pack-gqa", "paged", "split"],
 )
 def test_d128_template_params_refuse_what_d512_keeps(over, feature):
     """validate_params(flavor=D128), one case per refusal; each is a specialization D512 accepts."""
@@ -1803,7 +1801,11 @@ def test_d128_causal_walk_records_take_the_natural_order_unless_pinned():
     body = parents[pins[0]].body
     at = body.index(pins[0])
     assert ast.unparse(body[at - 1]) == "causal_sched = sched"
-    assert ast.unparse(body[at - 2]) == "persistent, causal_walk = _sm90_d128_persistence(self.flavor, band['causal'])"
+    assert ast.unparse(body[at - 3]) == "persistent, causal_walk = _sm90_d128_persistence(self.flavor, band['causal'])"
+    length_guard = body[at - 2]
+    assert isinstance(length_guard, ast.If) and not length_guard.orelse
+    assert ast.unparse(length_guard.test) == "self.seq_q_lens_present or self.seq_kv_lens_present"
+    assert [ast.unparse(node) for node in length_guard.body] == ["persistent, causal_walk = (False, 0)"]
     record = body[at + 1]
     assert isinstance(record, ast.Assign) and ast.unparse(record.targets[0]) == "self.params"
     assert [ast.unparse(kw.value) for kw in record.value.keywords if kw.arg == "sched_policy"] == ["sched"]
@@ -1909,3 +1911,14 @@ def test_both_roles_walk_with_the_same_methods():
     for name in ("first_item", "live", "next_item", "work_of"):
         tests = [ast.unparse(n.test) for n in ast.walk(_function(tree, name)) if isinstance(n, ast.If)]
         assert tests[:1] == ["cutlass.const_expr(self.paired_walk)"], (name, tests)
+
+
+@pytest.mark.parametrize("q_lengths", [False, True])
+def test_d128_lengths_require_the_one_tile_pipeline(q_lengths):
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    params = dataclasses.replace(c.TemplateParams(), seq_q_lens_present=q_lengths, seq_kv_lens_present=True, intra_wg_overlap=True)
+    c.validate_params(params, flavor=c.D128_FLAVOR)
+    with pytest.raises(ValueError, match="per-batch lengths require one work tile per CTA"):
+        c.validate_params(dataclasses.replace(params, persistent=True), flavor=c.D128_FLAVOR)
+    assert c.pick_flavor(128, 128, c.FLAVORS, frozenset({"lengths"})) == c.D128_FLAVOR

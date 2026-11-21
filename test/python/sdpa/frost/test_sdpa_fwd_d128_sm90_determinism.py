@@ -7,7 +7,8 @@ The template is ``sm90/d128_f16_multi_q/kernel.py``, the SM90 row's 128 x 128 ti
 the D512 body, and asserts the template that compiled before it trusts a byte.
 
 Direction: forward only (O and Stats). The template has no backward; SM90 D128 backward is not this template's and has
-no case here. The template declines THD, paged KV, split-KV, PackGQA, sinks, windows, per-batch sequence lengths,
+no case here. This suite covers uniform lengths; device lengths have a separate replay suite.
+The template declines THD, paged KV, split-KV, PackGQA, sinks, windows,
 ``s_q == 1`` and unpadded bottom-right ``s_q > s_kv``; those declarations run other kernels and are not covered here.
 Batches are therefore uniform in length; the partial-tile cells use lengths off the 128 tile instead.
 
