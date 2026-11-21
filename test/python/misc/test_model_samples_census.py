@@ -8966,10 +8966,12 @@ def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypa
     the row's form reach the constructor as the entry's own arguments, one instance per (device, geometry, epsilon,
     form).  A call hands the entry four VIEWS of the in-projection's row (nothing copied), the layer's two norm weights,
     the cos / sin table and the position and slot rows of ``cache.at(position)``, the two halves of the cache's pool,
-    and outputs of its own; what it returns are the tensors the entry wrote.  A row that leaves a field of the form
-    out, a cache that is no pool of pages and a decline inside a step are errors.  The first use, while the run is
-    planned: the entry's build, whose every typed decline is the installation's, then one call on scratch operands,
-    whose decline is of the adapter's operands -- unless the installation cannot import what the call needs."""
+    and outputs of its own; what it returns are the tensors the entry wrote.  Handed a second state, it hands its entry
+    that state's pool and table rows: nothing of a call is kept.  A row that leaves a field of the form out, a cache
+    that is no pool of pages and a decline inside a step are errors.  The first use,
+    while the run is planned: the entry's build, whose every typed decline is the installation's, then one call on
+    scratch operands, whose decline is of the adapter's operands -- unless the installation cannot import what the
+    call needs."""
     from dataclasses import replace
 
     import cudnn
@@ -9032,6 +9034,17 @@ def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypa
     call = calls[-1][1]
     assert call["slot_mapping"].tolist() == [3 * 64 + 64] and call["positions"].tolist() == [[64]] * 3 and call["k_pool"].data_ptr() == cache.pool.data_ptr()
     assert call["q"].data_ptr() == base + row_bytes and call["slot_mapping"].data_ptr() == state.table.slots[64].data_ptr() + 8
+    # a second state under the same block, as the checks of a run hand it one: that state's pool and table rows, nothing of the first
+    again = DecodeState(model.geometry.layer_kinds, 3, 130, model.state_shapes(), "cpu", page=64)
+    second_cache = again.layers[model.geometry.layer_kinds.index("full_attention")]
+    assert second_cache.pool.data_ptr() != cache.pool.data_ptr() and not second_cache.pool.any()
+    block(qkv, second_cache, 63, params)
+    call = calls[-1][1]
+    assert call["k_pool"].data_ptr() == second_cache.pool.data_ptr() and call["v_pool"].data_ptr() == second_cache.pool.data_ptr() + 2 * 256, "its pool"
+    assert call["positions"].data_ptr() == again.table.positions[63].data_ptr() and call["slot_mapping"].data_ptr() == again.table.slots[63].data_ptr()
+    assert (
+        call["cos_sin"] is again.table.cos_sin and second_cache.pool[:, :, 63].any() and not second_cache.pool[:, :, :63].any()
+    ), "and its tables: its row 63 written"
     # the form and the instances
     with pytest.raises(ValueError) as wrong:
         fe.AttentionPrepareDecodeBlock(replace(row, form=row.form[:-1]), model, block.facts, block.options).check_support(1, 1)
@@ -9200,9 +9213,10 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
     twin of the entry's own suite, line by line: equal to it bit for bit, and its band's terms are that file's.  It is
     held against a version written out from the operation's definition, row by row.  Its position is the integer the
     step hands it: a state whose tables are shifted leaves its bytes as they were.  The kernel's chain in fp32 is inside
-    the band; outside, each alone and by its own rule: a rotated element and a pass-through element two units off, a
-    gate bit, a value bit, the key rows of two neighbouring slots exchanged, a pool row no position of the call names,
-    and a value that is not finite."""
+    the band; outside, each alone and by its own rule: a rotated element and a pass-through element two units off, of
+    a query row and of a key row the call wrote, a gate bit, a value bit, the key rows of two neighbouring slots
+    exchanged, a pool row no position of the call names, and a value that is not finite.  The epsilon the twin adds is
+    the fp32 value the kernel adds: one searched row, stated here, is another byte with the fp64 value."""
     import math
 
     from cudnn.attention_prepare.frost import prepare_decode
@@ -9239,6 +9253,29 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
     values = torch.tensor([0.0, 1.0, 1.5, -3.0, 2.0**-130, 255.0, 256.0, 1e30], dtype=torch.float64)
     assert torch.equal(torch_ref.bf16_unit(values), suite.unit(values)), "one bf16 unit at a magnitude: the suite's"
     assert torch_ref.bf16_unit(torch.tensor([1.0, 1.99, 2.0], dtype=torch.float64)).tolist() == [2.0**-7, 2.0**-7, 2.0**-6]
+    # the epsilon under the root is the fp32 value of the model's, as the kernel adds it.  The suite's draws are of ordinary magnitude,
+    # where either value gives the same root; a row whose mean of squares is of the epsilon's order tells them apart.  ONE searched
+    # row, stated whole: its first 128 elements are 37 * 2**-18 and its last 128 are 167 * 2**-18, under the weights i / 256 -- with
+    # the fp32 value the bytes are the suite's twin's, with the fp64 value the root is another fp32 value and element 100 another byte
+    small = suite.make_operands(1, seed=5, kind="random")
+    where = small["positions"][0].clone()
+    small["positions"] = where.expand(3, 1).contiguous()
+    small["q"][:] = torch.cat((torch.full((128,), 37 * 2.0**-18), torch.full((128,), 167 * 2.0**-18))).bfloat16()
+    small["q_weight"][:] = (torch.arange(256) / 256).bfloat16()
+    table = small["cos_sin"][where]
+    want, _ = suite.twin_rows(small["q"], small["q_weight"], small["positions"], small["cos_sin"], cfg)
+    got, _ = torch_ref.prepare_rows(small["q"], small["q_weight"], table[:, None, :32], table[:, None, 32:], suite.EPS)
+    assert torch.equal(suite.bits(got), suite.bits(want)), "the searched row: the twin adds the fp32 value of the epsilon, as the suite's twin does"
+    searched, gain = small["q"][0, 0].float(), small["q_weight"].float() + 1.0
+    assert searched.tolist() == [37 * 2.0**-18] * 128 + [167 * 2.0**-18] * 128 and gain.tolist() == [1.0 + i / 256 for i in range(256)], "as stated"
+    mean = sum(element**2 for element in searched.tolist()) / 256  # exact: every square and the sum are whole multiples of 2**-36
+    roots = []
+    for epsilon, moved in ((float(torch.tensor(suite.EPS, dtype=torch.float32)), []), (suite.EPS, [100])):
+        roots.append(torch.tensor(1.0 / math.sqrt(mean + epsilon), dtype=torch.float32))
+        normed = ((searched * roots[-1]) * gain).bfloat16()  # the elements behind the rotary part are the normalised values themselves
+        other = (suite.bits(normed[64:]) != suite.bits(got[0, 0, 64:])).nonzero().flatten()
+        assert (other + 64).tolist() == moved, f"the epsilon {epsilon!r}: the fp32 value gives the twin's bytes, the fp64 value another byte at element 100"
+    assert float(roots[0]) != float(roots[1]), "two epsilons, two roots in fp32"
 
     # one call of the adapter over the kernel's fp32 chain, and of its twin: two sequences x three tokens across a page boundary
     calls = []
@@ -9332,6 +9369,30 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
     assert rotated.outside == 1 - int(
         float(twin.terms.q_band[4, 23, 40]) >= torch_ref.bf16_unit(ref[0][4, 23, 40].double())
     ), "two units: outside unless the band of that element admits them"
+
+    # the key rows are held element by element, as the queries are: ONE key element of a row the call wrote, moved in the twin's own pool
+    def keyed(at, value):  # the verdict on the twin's own outputs and pool with the key element ``at`` = (row of the step, head, element) set to ``value``
+        (row, head, element), paged = at, ref_after.clone().view(2, 3, 4, 64, 512)
+        sequence, token = divmod(row, 3)
+        slot = position + token
+        assert float(paged[sequence, slot // 64, head, slot % 64, element]) == float(twin.terms.k[at]), "the twin's key element of that row of the step"
+        paged[sequence, slot // 64, head, slot % 64, element] = float(value)
+        return judged(q=ref[0], pool=paged.view(6, 4, 64, 512))
+
+    plain_key, rotated_key = (0, 0, 200), (4, 3, 40)
+    assert float(twin.terms.k_band[plain_key]) == 0.0 < float(twin.terms.k_band[rotated_key]) < float(twin.terms.k_band.amax()), "a band per key element"
+    value = twin.terms.k[plain_key].double()
+    one_off = keyed(plain_key, value + torch_ref.bf16_unit(value))
+    assert one_off.ok and one_off.other_value == 1, "a key element that is not rotated one unit off: inside"
+    toward_zero = -2 if float(value) > 0 else 2  # the unit is taken at the larger magnitude: the twin's
+    two_off = keyed(plain_key, value + toward_zero * torch_ref.bf16_unit(value))
+    outside = (two_off.outside, two_off.keys_outside)
+    assert not two_off.ok and outside == (0, 1), "a key element that is not rotated two units off: outside, its band is one unit"
+    for name, at in (("a key element that is not rotated", plain_key), ("a rotated key element", rotated_key)):
+        value = twin.terms.k[at].double()
+        stats = keyed(at, value + 3 * (torch_ref.bf16_unit(value) + twin.terms.k_band[at]))
+        assert not stats.ok and (stats.outside, stats.keys_outside) == (0, 1) and stats.gates_equal and stats.values_equal and stats.state_equal, name
+        assert stats.line().split("; ")[1] == "0 query and 1 key elements outside their band", name
     bit = out[1].clone()
     bit.view(torch.int16)[5, 6143] ^= 1
     stats = judged(gate=bit)
