@@ -1345,7 +1345,7 @@ def test_the_speculative_script_plans_every_kind_of_step_before_its_first_load(m
     capsys.readouterr()
     code, out = run("--speculative-config", eight.replace("8", "64"), "--stack", "reference")  # ... as far as its schedule fits the context
     last = out.splitlines()[-1]
-    assert code == 1 and last.startswith("[02] ERROR the seeded prompt: 26 prompt tokens + 2,082 new tokens (--force-tokens 2082) are 2,108 positions"), last
+    assert code == 1 and last.startswith("[02] ERROR the seeded prompt: ") and "(--force-tokens 2082)" in last and "--max-model-len is 2,051" in last, last
     code, out = run("--speculative-config", eight, "--stack", "reference", "--force-tokens", "37")  # a count that was typed is held, before the plan
     short = "[02] ERROR --force-tokens 37: the seeded run schedules its steps to keep 0 to 8 drafted tokens in turn and needs 38 new tokens to keep every count once"
     assert code == 1 and out.splitlines() == [short]

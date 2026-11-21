@@ -470,19 +470,13 @@ def main(argv=None) -> int:
             if not int(ids.numel()):
                 raise ValueError(f"{request.shown}: the checkpoint's chat template and tokenizer turn it into no token; there is nothing to decode from")
             flag = args.max_new_tokens if args.limit_given else None
-            limit, note = serving_options.new_tokens(request, int(ids.numel()), args.max_model_len, flag, args.force_tokens, args.limit_flag)
+            # a verify step writes a row for every drafted token: the last step of a request writes drafted - 1 rows behind its last new
+            # token, and the limit of new tokens is held against the context length together with them
+            limit, note = serving_options.new_tokens(
+                request, int(ids.numel()), args.max_model_len, flag, args.force_tokens, args.limit_flag, reserve=drafted - 1
+            )
             if note:
                 _say(f"{TAG} {note}")
-            # a verify step writes a row for every drafted token: the last step of a request writes drafted - 1 rows behind its last new token
-            behind = drafted - 1
-            reach, room = int(ids.numel()) + limit + behind, args.max_model_len - int(ids.numel()) - behind
-            if reach > args.max_model_len:
-                fewer = f"ask for at most {room:,} new tokens, or " if room >= 1 else ""
-                raise ValueError(
-                    f"{request.shown}: {int(ids.numel()):,} prompt tokens + {limit:,} new tokens + {behind} position{'s' if behind > 1 else ''} that "
-                    f"the last verify step of {drafted} drafted tokens writes behind them are {reach:,} positions and --max-model-len is "
-                    f"{args.max_model_len:,}; {fewer}raise --max-model-len"
-                )
             sets.append((ids, seconds, StopRule(text.eos_ids, max_new_tokens=limit, force_tokens=args.force_tokens)))
     except ValueError as error:  # a template that refuses its messages or renders them to nothing; a request beyond the context
         _say(f"{TAG} ERROR {error}")

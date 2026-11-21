@@ -1727,8 +1727,7 @@ def test_a_request_beyond_the_context_is_an_error_before_the_load(tmp_path, monk
 def test_both_scripts_hand_the_context_length_to_every_session_they_build(monkeypatch, capsys):
     """``--max-model-len`` is a constant of the run: every session a script builds is handed it (``Session(max_model_len=)``),
     the default and a typed one.  The speculative script builds its sessions for the positions its last verify step
-    writes, which lie behind the last new token: a request whose step would write past the context length is one
-    ``[02] ERROR`` line before anything is planned, and one that just fits reaches the load."""
+    writes, which lie behind the last new token: a request that fills the context with them reaches the load."""
     import serving_options
 
     model_samples = importlib.import_module("model_samples")
@@ -1748,16 +1747,102 @@ def test_both_scripts_hand_the_context_length_to_every_session_they_build(monkey
                 with pytest.raises(AssertionError, match="reached a load"):
                     sample.main(["--stack", "reference", "--max-model-len", str(fits)])
                 assert {session.max_model_len for session in built[-2:]} == {fits} and "ERROR" not in capsys.readouterr().err
-                code = sample.main(["--stack", "reference", "--max-model-len", str(fits - 1)])
-                out, err = capsys.readouterr()
-                last = err.splitlines()[-1]
-                assert code == 1 and out == "" and "served by" not in err and last.startswith("[02] ERROR the seeded prompt: "), err[-600:]
-                assert f"are {fits} positions and --max-model-len is {fits - 1}" in last and last.endswith("or raise --max-model-len"), last
-                (most,) = re.findall(r"ask for at most (\d+) new tokens", last)  # the fix the line names is one that fits, and the largest
-                with pytest.raises(AssertionError, match="reached a load"):
-                    sample.main(["--stack", "reference", "--max-model-len", str(fits - 1), "--force-tokens", most])
-                assert sample.main(["--stack", "reference", "--max-model-len", str(fits - 1), "--force-tokens", str(int(most) + 1)]) == 1
-                capsys.readouterr()
+
+
+def _speculative_script_and_its_sessions(monkeypatch):
+    """``02_speculative_decode.py`` on the CPU, where a load is an ``AssertionError``, and the list that every session a
+    call of its ``main()`` builds is added to."""
+    sample = _sample_on_the_cpu(monkeypatch, loads=False, script="02_speculative_decode.py")
+    model_samples = importlib.import_module("model_samples")
+    through, built = model_samples.Session, []
+    monkeypatch.setattr(model_samples, "Session", lambda model, text, **options: built.append(through(model, text, **options)) or built[-1])
+    return sample, built
+
+
+def _a_request_of_a_drafting_checkpoint(tmp_path):
+    """The arguments of a speculative run on the reference stack with a generated checkpoint that carries a drafter, its
+    draft vocabulary and one prompt."""
+    directory = _checkpoint_directory(tmp_path / "tiny-checkpoint", drafter=True)
+    (tmp_path / "draft_vocab.json").write_text(json.dumps(list(range(0, WORDS + 1, 2))))
+    return ["--model", str(directory), "--stack", "reference", "--draft-vocab", str(tmp_path / "draft_vocab.json"), "--prompt", "w1 w2 w3"]
+
+
+def test_a_speculative_request_that_names_no_limit_is_cut_to_what_fits_with_its_last_verify_step(tmp_path, monkeypatch, capsys):
+    """The last verify step of a speculative run writes a row for every drafted token, all but one of them behind the
+    last new token: the limit of new tokens is held against the context together with those rows.  A request that
+    names no limit, under a context its default limit does not fit, has the default cut to what fits: the run says so
+    in one line and reaches the load with sessions that hold exactly the context length.  The count that line names is
+    the limit: asked for, it fills the context the same way, and one more does not fit."""
+    sample, built = _speculative_script_and_its_sessions(monkeypatch)
+    request = [*_a_request_of_a_drafting_checkpoint(tmp_path), "--max-model-len", "100"]
+    capsys.readouterr()
+    with pytest.raises(AssertionError, match="reached a load"):
+        sample.main(request)
+    err = capsys.readouterr().err
+    assert "ERROR" not in err and len(built) == 2 and {(session.capacity, session.max_model_len) for session in built} == {(100, 100)}
+    (said,) = [line for line in err.splitlines() if "not the default" in line]
+    assert said.startswith("[02] --prompt 1: ") and "verify step" in said and "--max-model-len 100" in said, said
+    (cut,) = re.findall(r"up to (\d+) new tokens", said)
+    built.clear()
+    with pytest.raises(AssertionError, match="reached a load"):
+        sample.main([*request, "--max-tokens", cut])
+    assert {session.capacity for session in built} == {100} and "not the default" not in capsys.readouterr().err
+    assert sample.main([*request, "--max-tokens", str(int(cut) + 1)]) == 1
+
+
+def test_the_count_an_error_line_of_the_speculative_script_names_reaches_the_load_and_one_more_does_not(tmp_path, monkeypatch, capsys):
+    """A limit of new tokens somebody asked for that does not fit the context together with the rows of the last verify
+    step is one ``[02] ERROR`` line before anything is planned.  The count that line names is the largest that fits:
+    asked for, it reaches the load with sessions that hold exactly the context length, and one more is the line again,
+    with the same count.  With a checkpoint (``--max-tokens``) and in the seeded run (``--force-tokens``)."""
+    sample, built = _speculative_script_and_its_sessions(monkeypatch)
+    checkpoint = [*_a_request_of_a_drafting_checkpoint(tmp_path), "--max-model-len", "100"]
+    for arguments, flag in ((checkpoint, "--max-tokens"), (["--stack", "reference", "--max-model-len", "50"], "--force-tokens")):
+        length = int(arguments[-1])
+
+        def refused(asked):
+            capsys.readouterr()
+            code = sample.main([*arguments, flag, str(asked)])
+            out, err = capsys.readouterr()
+            last = err.splitlines()[-1]
+            assert code == 1 and out == "" and "served by" not in err and err.count(" ERROR ") == 1, (flag, asked, err[-600:])
+            assert last.startswith("[02] ERROR ") and f"({flag} {asked})" in last and f"--max-model-len is {length}" in last, last
+            (most,) = re.findall(r"ask for at most (\d+) new tokens", last)
+            (positions,) = re.findall(r"are (\d+) positions", last)
+            return int(most), int(positions), last
+
+        most, positions, line = refused(200)
+        built.clear()
+        with pytest.raises(AssertionError, match="reached a load"):
+            sample.main([*arguments, flag, str(most)])
+        assert "ERROR" not in capsys.readouterr().err, (flag, most)
+        assert len(built) == 2 and {(session.capacity, session.max_model_len) for session in built} == {(length, length)}, (flag, most)
+        assert "verify step" in line and positions == 200 + length - most, line  # the prompt, the tokens asked for and the rows behind them
+        assert refused(most + 1)[:2] == (most, length + 1), (flag, most)
+
+
+def test_a_speculative_request_no_count_fits_for_is_one_error_line_that_names_none(tmp_path, monkeypatch, capsys):
+    """Where the prompt and the rows of the last verify step leave no position for a new token, a request -- one that
+    names no limit and one that names one -- is one ``[02] ERROR`` line before anything is planned.  No line of that
+    run names a count of new tokens, neither to decode nor to ask for; the line says to raise ``--max-model-len``.
+    One position more, and one new token fits."""
+    sample, built = _speculative_script_and_its_sessions(monkeypatch)
+    request = _a_request_of_a_drafting_checkpoint(tmp_path)
+    with pytest.raises(AssertionError, match="reached a load"):
+        sample.main([*request, "--max-tokens", "1"])
+    full = max(session.capacity for session in built) - 1  # the prompt and the rows behind the last new token: a context they fill
+    for limit in ([], ["--max-tokens", "1"]):
+        capsys.readouterr()
+        code = sample.main([*request, "--max-model-len", str(full), *limit])
+        out, err = capsys.readouterr()
+        last = err.splitlines()[-1]
+        assert code == 1 and out == "" and "served by" not in err and err.count(" ERROR ") == 1, (limit, err[-600:])
+        assert last.startswith("[02] ERROR --prompt 1: ") and last.endswith("raise --max-model-len") and "verify step" in last, last
+        assert re.findall(r"\d+ new tokens", err) == [], (limit, err[-600:])
+    built.clear()
+    with pytest.raises(AssertionError, match="reached a load"):
+        sample.main([*request, "--max-model-len", str(full + 1), "--max-tokens", "1"])
+    assert {(session.capacity, session.max_model_len) for session in built} == {(full + 1, full + 1)}
 
 
 def test_the_family_readme_says_of_a_request_what_the_data_and_the_run_say():

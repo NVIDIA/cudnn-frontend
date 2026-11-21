@@ -341,7 +341,13 @@ def read_request(source: str, checkpoint: str = "", stdin=None) -> Request:
 
 
 def new_tokens(
-    request: Request, prompt_tokens: int, max_model_len: int, flag: Optional[int] = None, forced: Optional[int] = None, flag_name: str = "--max-tokens"
+    request: Request,
+    prompt_tokens: int,
+    max_model_len: int,
+    flag: Optional[int] = None,
+    forced: Optional[int] = None,
+    flag_name: str = "--max-tokens",
+    reserve: int = 0,
 ):
     """The limit of new tokens of one request, held against the context length: ``(limit, note)``.
 
@@ -349,7 +355,12 @@ def new_tokens(
     which is the limit of a request that names none; then the default.  A prompt and its new tokens share the context
     (``max_model_len`` positions): a limit somebody asked for that does not fit is a ``ValueError`` before anything is
     loaded, as is a prompt that leaves no room at all, and the default is cut to the room that is left.  ``note`` is ""
-    or the line a run prints when a limit that was given does not apply."""
+    or the line a run prints when a limit that was given does not apply.
+
+    ``reserve`` is the positions a run writes behind its last new token, which share the context too: the last verify
+    step of a speculative run writes a row for every token it drafted, and all but one of those rows lie behind the
+    last new token.  A run that writes none leaves it at 0.  The room is what the prompt and the reserve leave: the
+    limit that is returned, the count an error names and the default's cut all fit the context together with those rows."""
     note = ""
     if forced is not None:
         limit, source = forced, f"--force-tokens {forced}"
@@ -368,20 +379,21 @@ def new_tokens(
         limit, source = flag, f"{flag_name} {flag}"
     else:
         limit, source = MAX_TOKENS, ""
-    room = max_model_len - prompt_tokens
+    held = f" and the rows the last verify step writes behind the last new token ({reserve:,})" if reserve else ""
+    room = max_model_len - prompt_tokens - reserve
     if room < 1:
         raise ValueError(
-            f"{request.shown}: the prompt is {prompt_tokens:,} tokens and --max-model-len is {max_model_len:,}: a prompt and its new tokens share "
+            f"{request.shown}: the prompt is {prompt_tokens:,} tokens and --max-model-len is {max_model_len:,}: a prompt and its new tokens{held} share "
             "the context, and no position is left for a new token; raise --max-model-len"
         )
     if limit > room and source:
         raise ValueError(
-            f"{request.shown}: {prompt_tokens:,} prompt tokens + {limit:,} new tokens ({source}) are {prompt_tokens + limit:,} positions and "
+            f"{request.shown}: {prompt_tokens:,} prompt tokens + {limit:,} new tokens ({source}){held} are {prompt_tokens + limit + reserve:,} positions and "
             f"--max-model-len is {max_model_len:,}; ask for at most {room:,} new tokens, or raise --max-model-len"
         )
     if limit > room:
         note = (
-            f"{request.shown}: up to {room:,} new tokens, not the default {MAX_TOKENS}: {prompt_tokens:,} prompt tokens leave that many positions "
+            f"{request.shown}: up to {room:,} new tokens, not the default {MAX_TOKENS}: {prompt_tokens:,} prompt tokens{held} leave that many positions "
             f"under --max-model-len {max_model_len:,}"
         )
         limit = room
