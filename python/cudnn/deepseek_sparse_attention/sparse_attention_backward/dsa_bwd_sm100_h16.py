@@ -6,6 +6,9 @@ import cuda.bindings.driver as cuda
 import math
 from typing import Tuple, Type, Optional
 
+from cudnn.frost.tile_dsl._release_zero import release_zero
+from ._rank_common_sm100 import _partial_cta_sync
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32, Int64
@@ -664,6 +667,7 @@ class FlashAttentionDSABackwardSm100H16:
                 LSE_smem_layout,
                 sum_OdO_smem_layout,
                 valid_smem_layout,
+                Int32(0),
             ).launch(
                 grid=(q_wave_size, num_head_blocks, problem_shape[3][1]),
                 block=[self.threads_per_cta, 1, 1],
@@ -870,7 +874,9 @@ class FlashAttentionDSABackwardSm100H16:
         LSE_smem_layout: cute.Layout,
         sum_OdO_smem_layout: cute.Layout,
         valid_smem_layout: cute.Layout,
+        release_zero_arg: Int32,
     ):
+        ack_mask = release_zero(release_zero_arg).word
         wave_idx, head_block_idx, batch_idx = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1189,6 +1195,7 @@ class FlashAttentionDSABackwardSm100H16:
                 topk,
                 mma_reduce_dKV_pipeline,
                 token_idx,
+                ack_mask,
             )
             # All T2R reads issued by this warp are complete here (each
             # store_dKV / T2R block fences before its pipeline release);
@@ -1569,7 +1576,7 @@ class FlashAttentionDSABackwardSm100H16:
             # dKV4 from the previous tile occupies the S/dP TMEM region.
             # Wait only when that region is about to be reused by the next S.
             if not is_first_mma:
-                self.t2r_dKV4_done_barrier.arrive_and_wait()
+                _partial_cta_sync(self.t2r_dKV4_done_barrier.barrier_id, self.t2r_dKV4_done_barrier.num_threads)
 
             load_mma_K_pipeline.consumer_wait(load_mma_K_consumer_state)
             mma_compute_S_pipeline.producer_acquire(mma_compute_S_producer_state)
@@ -1616,7 +1623,7 @@ class FlashAttentionDSABackwardSm100H16:
             # generations back (the dKV4 generation), not against the dKV2/dKV3
             # reads of the previous generation.
             if not is_first_mma:
-                self.t2r_dKV23_done_barrier.arrive_and_wait()
+                _partial_cta_sync(self.t2r_dKV23_done_barrier.barrier_id, self.t2r_dKV23_done_barrier.num_threads)
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1811,10 +1818,10 @@ class FlashAttentionDSABackwardSm100H16:
             is_first_mma = False
             tile_index -= 1
 
-        self.t2r_dKV4_done_barrier.arrive_and_wait()
+        _partial_cta_sync(self.t2r_dKV4_done_barrier.barrier_id, self.t2r_dKV4_done_barrier.num_threads)
         # Balance the reduce warps' final t2r_dKV23_done arrive (the
         # in-loop wait is skipped on the first iteration).
-        self.t2r_dKV23_done_barrier.arrive_and_wait()
+        _partial_cta_sync(self.t2r_dKV23_done_barrier.barrier_id, self.t2r_dKV23_done_barrier.num_threads)
 
         mma_compute_dQ_pipeline.producer_commit(mma_compute_dQ_producer_state)
         mma_compute_dQ_producer_state.advance()
@@ -2225,6 +2232,7 @@ class FlashAttentionDSABackwardSm100H16:
         topk: Int32,
         mma_reduce_dKV_pipeline,
         token_idx: Int32,
+        ack_mask: Int32,
     ):
         tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4 = tdKVtdKV
 
@@ -2324,7 +2332,7 @@ class FlashAttentionDSABackwardSm100H16:
             # T2R dKV4, then signal MMA that TMEM is free for dKV2/dKV3
             rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
             cute.arch.fence_view_async_tmem_load()
-            self.t2r_dKV4_done_barrier.arrive_and_wait()
+            self.ack_dKV_reads(self.t2r_dKV4_done_barrier, self.fragment_word_sum(rdKV4), ack_mask)
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
             self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
@@ -2339,21 +2347,40 @@ class FlashAttentionDSABackwardSm100H16:
             # else orders against these reads.
             rdKV2 = self.t2r_dKV_half(tdKVtdKV2, 0)
             cute.arch.fence_view_async_tmem_load()
+            consumed = self.fragment_word_sum(rdKV2)
             self.reduce_dKV_half_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2, 0)
             rdKV2 = self.t2r_dKV_half(tdKVtdKV2, 1)
             cute.arch.fence_view_async_tmem_load()
+            consumed += self.fragment_word_sum(rdKV2)
             self.reduce_dKV_half_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2, 8)
             rdKV3 = self.t2r_dKV_half(tdKVtdKV3, 0)
             cute.arch.fence_view_async_tmem_load()
+            consumed += self.fragment_word_sum(rdKV3)
             self.reduce_dKV_half_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3, 0)
             rdKV3 = self.t2r_dKV_half(tdKVtdKV3, 1)
             cute.arch.fence_view_async_tmem_load()
-            self.t2r_dKV23_done_barrier.arrive_and_wait()
+            consumed += self.fragment_word_sum(rdKV3)
+            self.ack_dKV_reads(self.t2r_dKV23_done_barrier, consumed, ack_mask)
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
             self.reduce_dKV_half_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3, 8)
 
             tile_index -= 1
+
+    @cute.jit
+    def fragment_word_sum(self, fragment: cute.Tensor):
+        words = cute.recast_tensor(fragment, Int32)
+        total = Int32(0)
+        for i in cutlass.range_constexpr(cute.size(words)):
+            total += words[i]
+        return total
+
+    @cute.jit
+    def ack_dKV_reads(self, barrier, consumed: Int32, ack_mask: Int32):
+        # The host passes zero. Keep a machine-level dependency even on lanes that
+        # skip their global atomics because the corresponding Top-K index is invalid.
+        count = Int32(barrier.num_threads) + (consumed & ack_mask)
+        nvvm.barrier_cta_arrive(Int32(barrier.barrier_id).ir_value(), thread_count=count.ir_value(), aligned=False)
 
     @cute.jit
     def t2r_dKV_half(self, tdKVtdKV: cute.Tensor, row_half: int):
