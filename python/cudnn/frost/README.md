@@ -1305,16 +1305,17 @@ block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
     of the entry's table. The test is a WARM launch on another stream than the
     allocation's, with that stream held behind pending work
     (`test/python/init_order_schedules.py`). On the helper today:
-    `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`.
-    Not yet, to follow in a separate change: `GdnDecodeFused`,
-    `GdnVerifyFused`, `SharedExpertDecode` (they allocate: record and order),
+    `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`,
+    `SharedExpertDecode`. Not yet, to follow in a separate change:
+    `GdnDecodeFused`, `GdnVerifyFused` (they allocate: record and order),
     `Fp8ProjectionDecode`, `SwigluFp4Decode` (they own nothing: order), and
-    `RowQuantizeFp4Decode` (an entry object orders the launches into the
-    outputs it allocated itself, with a copy of this ordering kept in the
-    entry; it moves onto the helper). Until then the caller orders (allocates
-    on the stream its calls run on, or orders that stream behind the
-    allocating one) every launch of one of the first five into an entry-owned
-    buffer, its own or another entry's; every launch of `RowQuantizeFp4Decode`
-    into a buffer another entry object allocated; and every launch of any
-    other entry into a buffer `GdnDecodeFused`, `GdnVerifyFused`,
-    `SharedExpertDecode` or `RowQuantizeFp4Decode` allocated.
+    `RowQuantizeFp4Decode` (an entry object orders the launches into the outputs
+    it allocated itself, with a copy of this ordering kept in the entry; it
+    moves onto the helper). Until then the caller orders (allocates on the
+    stream its calls run on, or orders that stream behind the allocating one)
+    every launch of one of `GdnDecodeFused`, `GdnVerifyFused`,
+    `Fp8ProjectionDecode`, `SwigluFp4Decode` into an entry-owned buffer, its own
+    or another entry's; every launch of `RowQuantizeFp4Decode` into a buffer
+    another entry object allocated; and every launch of any other entry into a
+    buffer `GdnDecodeFused`, `GdnVerifyFused` or `RowQuantizeFp4Decode`
+    allocated.
