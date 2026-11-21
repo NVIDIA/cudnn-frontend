@@ -8,8 +8,6 @@ from ..d512_f16_contract import TWO_BY_TWO, explicit_geometry
 PACKED_HN_STATS_OVERRIDE = True
 
 
-def lower(spec, facts, knobs):
-    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, lower_dsl_prefill
-
+def lower(spec, facts, knobs, *, lower_impl, knob_type):
     geometry = explicit_geometry(TWO_BY_TWO, facts)
-    return lower_dsl_prefill(spec, facts, geometry.canonical_knobs(knobs or SdpaFwdKnobs()), selected_kernel=geometry)
+    return lower_impl(spec, facts, geometry.canonical_knobs(knobs or knob_type()), selected_kernel=geometry)

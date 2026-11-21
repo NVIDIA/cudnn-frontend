@@ -3352,6 +3352,13 @@ def _sm100_d192_half_specs():
     )
 
 
+def _resolve_sm100_multi_q_geometry(facts, knobs, *, d_flavor):
+    # Defer policy loading until the fixed engine is lowered.
+    from .heuristics import resolve_sm100_half_multi_q_geometry
+
+    return resolve_sm100_half_multi_q_geometry(facts, knobs, d_flavor=d_flavor)
+
+
 def _sm100_small_half_specs():
     """Independent multi-Q and quadrant bodies; exact widths retain legal envelopes."""
     from .kernels.sm100.d128_f16_multi_q import host as multi_q_host
@@ -3386,7 +3393,13 @@ def _sm100_small_half_specs():
         EngineSpec(
             multi_q.implementation,
             multi_q,
-            partial(multi_q_host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs, selected_shape=_selected_d_shape),
+            partial(
+                multi_q_host.lower,
+                lower_impl=lower_dsl_prefill,
+                knob_type=SdpaFwdKnobs,
+                selected_shape=_selected_d_shape,
+                resolve_geometry=_resolve_sm100_multi_q_geometry,
+            ),
             packed_hn_stats_override=multi_q_host.PACKED_HN_STATS_OVERRIDE,
         ),
         EngineSpec(quadrant.implementation, quadrant, partial(lower_quadrant, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs)),
@@ -3430,8 +3443,18 @@ def _sm100_d512_specs():
     )
     two_by_two = replace(base, implementation=_D512_TWO_BY_TWO, tile_ms=frozenset({64}), cgas=frozenset({2, 4}))
     return (
-        EngineSpec(_D512_ROLE_SPLIT, role_split, role_split_host.lower, packed_hn_stats_override=role_split_host.PACKED_HN_STATS_OVERRIDE),
-        EngineSpec(_D512_TWO_BY_TWO, two_by_two, two_by_two_host.lower, packed_hn_stats_override=two_by_two_host.PACKED_HN_STATS_OVERRIDE),
+        EngineSpec(
+            _D512_ROLE_SPLIT,
+            role_split,
+            partial(role_split_host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=role_split_host.PACKED_HN_STATS_OVERRIDE,
+        ),
+        EngineSpec(
+            _D512_TWO_BY_TWO,
+            two_by_two,
+            partial(two_by_two_host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=two_by_two_host.PACKED_HN_STATS_OVERRIDE,
+        ),
     )
 
 
@@ -3481,7 +3504,12 @@ def _sm100_d256_specs():
         cluster_reduces=frozenset({False, True}),
     )
     return (
-        EngineSpec(_D256_LOOKAHEAD, lookahead, lookahead_host.lower, packed_hn_stats_override=lookahead_host.PACKED_HN_STATS_OVERRIDE),
+        EngineSpec(
+            _D256_LOOKAHEAD,
+            lookahead,
+            partial(lookahead_host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=lookahead_host.PACKED_HN_STATS_OVERRIDE,
+        ),
         EngineSpec(_D256_SWAP_AB, swap_ab, lower_swap_ab),
     )
 
