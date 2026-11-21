@@ -220,7 +220,7 @@ def code_paths(num_sm):
         "chain_group": group_calls(num_sm, **third),
         "chain_beside_group": calls_beside_the_group(num_sm),
         "batch_invariant": [dict(call, batch_invariant=True) for call in in_place],
-        "context_port": [dict(call, context=True) for call in default_call],
+        "context_port": [dict(call, context=True) for call in in_place],
         "expanded_timeline": [dict(call, householders=SUB_TOKENS) for call in in_place],
         "summary_node": [dict(call, summary=True) for call in in_place],
     }
@@ -251,7 +251,7 @@ def test_tuning_moves_only_the_cost_ruled_forward(monkeypatch, fixed_tokens):
     shape = dict(num_seqs=1, heads_out=heads, num_sm=num_sm, total_tokens=tokens, b_t=CHUNK, cadence_tokens=0)
     shared = choose_pieces(**shape, batch_invariant=False, expand_num=1)[0]
     assert shared
-    for form in (dict(in_place=False), dict(context=True, in_place=False), dict(summary=True), dict(householders=SUB_TOKENS)):
+    for form in (dict(in_place=False), dict(context=True), dict(summary=True), dict(householders=SUB_TOKENS)):
         slots = choose_pieces(**shape, batch_invariant=False, expand_num=form.get("householders", 1))[0]
         assert build_plan([tokens], **third, **form).pieces == slots, form
     assert build_plan([tokens], **third, batch_invariant=True).pieces == choose_pieces(**shape, batch_invariant=True, expand_num=1)[0]
@@ -264,7 +264,7 @@ def test_plans_follow_the_chain_rule_at_every_length(monkeypatch, num_sm):
     """The sweep on the SM counts of other GPUs: every code path; every whole chunk from the shared rule's first chain length
     to past the forward's own, for each call form and head count, for two to seven sequences and for the chain tail."""
     third = dict(heads=num_sm // CHAIN_MIN_PIECES, value_heads=num_sm // CHAIN_MIN_PIECES)
-    forms = [dict(), dict(in_place=False), dict(value_dim=WIDTH // 2), dict(batch_invariant=True), dict(context=True, in_place=False)]
+    forms = [dict(), dict(in_place=False), dict(value_dim=WIDTH // 2), dict(batch_invariant=True), dict(context=True)]
     forms += [dict(heads=heads, value_heads=heads) for heads in (1, KEY_HEADS, 2 * KEY_HEADS)]
     calls = [call for path in code_paths(num_sm).values() for call in path]
     starts = [first_chain_length(num_sm, **form) for form in forms] + [first_tail_length(num_sm, **third)]
