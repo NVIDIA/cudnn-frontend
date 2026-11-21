@@ -1,0 +1,471 @@
+{
+  "k_release_is_mma_completion": [
+    [
+      "function make_classic_bars"
+    ]
+  ],
+  "k_release_count": [
+    [
+      "function make_classic_bars"
+    ]
+  ],
+  "k_publication_tracks_tma": [
+    [
+      "function make_classic_bars"
+    ]
+  ],
+  "v_release_is_mma_completion": [
+    [
+      "function make_classic_bars"
+    ]
+  ],
+  "v_release_count": [
+    [
+      "function make_classic_bars"
+    ]
+  ],
+  "v_publication_tracks_tma": [
+    [
+      "function make_classic_bars"
+    ]
+  ],
+  "mma_commit_dispatch": [
+    [
+      "function arrive",
+      "if cutlass.const_expr(self.producer == int(Producer.THREAD)) / orelse",
+      "if cutlass.const_expr(self.producer == int(Producer.TMA_LOAD)) / orelse",
+      "if cutlass.const_expr(self.producer == int(Producer.MMA_COMMIT)) / test"
+    ]
+  ],
+  "k_both_readers_before_release_0": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ]
+  ],
+  "k_release_group_0": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ]
+  ],
+  "k_both_readers_before_release_1": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body"
+    ]
+  ],
+  "k_release_group_1": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body"
+    ]
+  ],
+  "v_all_readers_before_release_old_state.idx": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body",
+      "for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body",
+      "if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2) / body",
+      "for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body",
+      "for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body",
+      "if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2) / body",
+      "for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body"
+    ]
+  ],
+  "v_all_readers_before_release_kv_state.idx": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2) / body",
+      "for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2) / body",
+      "for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK) / body"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ]
+  ],
+  "k_credit_before_fill_0": [
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ],
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "if cutlass.const_expr(MIXED_FP8_KV) / orelse",
+      "if cutlass.const_expr(PAGED_KV) / orelse"
+    ]
+  ],
+  "k_fill_completion_barrier_0": [
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "if cutlass.const_expr(MIXED_FP8_KV) / orelse",
+      "if cutlass.const_expr(PAGED_KV) / orelse"
+    ]
+  ],
+  "k_credit_before_fill_1": [
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body"
+    ],
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body",
+      "if cutlass.const_expr(MIXED_FP8_KV) / orelse",
+      "if cutlass.const_expr(PAGED_KV) / orelse"
+    ]
+  ],
+  "k_fill_completion_barrier_1": [
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body",
+      "if cutlass.const_expr(MIXED_FP8_KV) / orelse",
+      "if cutlass.const_expr(PAGED_KV) / orelse"
+    ]
+  ],
+  "v_credit_before_fill_0": [
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ],
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "if cutlass.const_expr(MIXED_FP8_KV) / orelse",
+      "if cutlass.const_expr(PAGED_KV) / orelse"
+    ]
+  ],
+  "v_fill_completion_barrier_0": [
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "if cutlass.const_expr(MIXED_FP8_KV) / orelse",
+      "if cutlass.const_expr(PAGED_KV) / orelse"
+    ]
+  ],
+  "v_credit_before_fill_1": [
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body"
+    ],
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body",
+      "if cutlass.const_expr(MIXED_FP8_KV) / orelse",
+      "if cutlass.const_expr(PAGED_KV) / orelse"
+    ]
+  ],
+  "v_fill_completion_barrier_1": [
+    [
+      "function _tmaldg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse",
+      "for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1) / body",
+      "if cutlass.const_expr(MIXED_FP8_KV) / orelse",
+      "if cutlass.const_expr(PAGED_KV) / orelse"
+    ]
+  ],
+  "stats_load_completion_before_reuse_credit": [
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(_score_stats) / orelse"
+    ],
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body"
+    ],
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body"
+    ]
+  ],
+  "stats_release_to_mma_group": [
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body"
+    ]
+  ],
+  "stats_credit_before_next_qk_0": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ]
+  ],
+  "stats_wait_generation_0": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ]
+  ],
+  "empty_work_consumes_stats_credit_0": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / body"
+    ]
+  ],
+  "stats_credit_before_next_qk_1": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ],
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ]
+  ],
+  "stats_wait_generation_1": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / orelse"
+    ]
+  ],
+  "empty_work_consumes_stats_credit_1": [
+    [
+      "function _mma_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "if cutlass.const_expr(MAY_BE_EMPTY) and kv_right <= kv_left / body"
+    ]
+  ],
+  "o_tma_read_completion_before_credit": [
+    [
+      "function _tmastg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body"
+    ],
+    [
+      "function _tmastg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(not _FP32_PARTIALS) / body",
+      "if cutlass.const_expr(CFG.THD_VARLEN) / orelse"
+    ],
+    [
+      "function _tmastg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(not _FP32_PARTIALS) / body"
+    ],
+    [
+      "function _tmastg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(not _FP32_PARTIALS) / body"
+    ],
+    [
+      "function _tmastg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body"
+    ]
+  ],
+  "o_drain_all_groups": [
+    [
+      "function _tmastg_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(not _FP32_PARTIALS) / body"
+    ]
+  ],
+  "o_wait_tracks_source_reads": [
+    [
+      "function tma_store_wait"
+    ]
+  ],
+  "o_wait_forwards_group_count": [
+    [
+      "function tma_store_wait"
+    ]
+  ],
+  "o_credit_before_first_overwrite": [
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(_FP32_PARTIALS) / orelse",
+      "for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O_EPI) / body",
+      "if chunk_idx == 0 / body"
+    ],
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(_FP32_PARTIALS) / orelse",
+      "for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O_EPI) / body"
+    ]
+  ],
+  "o_first_chunk_gate": [
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(_FP32_PARTIALS) / orelse",
+      "for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O_EPI) / body",
+      "if chunk_idx == 0 / test"
+    ]
+  ],
+  "o_gate_generation": [
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(_FP32_PARTIALS) / orelse",
+      "for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O_EPI) / body",
+      "if chunk_idx == 0 / body"
+    ]
+  ],
+  "o_proxy_publication": [
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(_FP32_PARTIALS) / orelse",
+      "for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O_EPI) / body"
+    ],
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(_FP32_PARTIALS) / orelse"
+    ],
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body"
+    ]
+  ],
+  "o_proxy_kind": [
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(_FP32_PARTIALS) / orelse"
+    ]
+  ],
+  "o_proxy_scope": [
+    [
+      "function _correction_warp_group",
+      "while is_valid_tile > cutlass.Int32(0) / body",
+      "for qs in cutlass.range_constexpr(CFG.TILES_Q) / body",
+      "if cutlass.const_expr(_FP32_PARTIALS) / orelse"
+    ]
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "profile_id": "f06-sm100-bf16-d128-causal-softmax-step-v1",
+  "evidence_kind": "source_expression_model_only",
+  "specialization": {
+    "compute_capability": "10.0",
+    "dtype": "bf16",
+    "d_qk": 128,
+    "d_v": 128,
+    "tile_n": 128,
+    "cta_mma": 2,
+    "layout": "dense",
+    "mask": "top-left causal",
+    "split_kv": 1,
+    "rescale_threshold": 8.0,
+    "bias": false,
+    "kv_mask": false,
+    "sink": false,
+    "pack_gqa": false,
+    "score_outputs": false,
+    "fused_ldtm_stat": 0,
+    "exp2_mixed_enabled": false,
+    "padded_tail_premask": false
+  },
+  "host_factory_and_dispatch_verified": false,
+  "source_bridge_formally_verified": false,
+  "whole_kernel_determinism": "unverified",
+  "whole_kernel_batch_invariance": "unverified",
+  "bitwise_equivalent_engines": [],
+  "public_numerical_notes_added": [],
+  "remaining_obligations": [
+    "QK/PV operands, MMA mode and issue order",
+    "complete correction and O/LSE epilogue",
+    "memory ownership and synchronization",
+    "compiler contraction, FTZ and primitive semantics",
+    "actual selected-plan eligibility and numerical partition policy"
+  ]
+}
