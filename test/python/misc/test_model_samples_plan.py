@@ -2307,20 +2307,19 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
     blocks ask for no pool of pages is a wrong table."""
     import copy
 
-    import model_samples
-    from model_samples import blocks, providers
+    from model_samples import Session, TextIO, blocks, providers
     from model_samples.qwen_dense import QwenDense
     from model_samples.state import DecodeState
 
     reading = [key for key, factory in providers.factories().items() if getattr(factory, "attended_tables", False)]
     assert providers.BlockBase.attended_tables is False and blocks.BySite.attended_tables is False and reading == []
     tiny = _paged_model()
-    text = model_samples.TextIO.synthetic(tiny.geometry.vocab)
+    text = TextIO.synthetic(tiny.geometry.vocab)
     kinds, shapes = tiny.geometry.layer_kinds, tiny.state_shapes()
     common = dict(sequences=3, stack="reference", device="cpu", capacity=100)
 
     def built(tables, core="torch_ref.attention", **session):
-        made = model_samples.Session(tiny, text, **common, **session)
+        made = Session(tiny, text, **common, **session)
         with _a_block_asks_for_a_page(), _a_block_asks_for_a_page(key=core, tables=tables):
             made.resolve()
         made.reset(fresh=True)
@@ -2338,7 +2337,7 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
     assert tuple(built(True).state.table.blocks.shape) == (4, 4), "a session that names no maximum length: the pages of its capacity"
     # a session that verifies behind its prompt has two plans: a block of either one that reads the tables builds them
     for reads in ("plan", "prefill_plan"):
-        behind = model_samples.Session(tiny, text, draft_tokens=3, max_model_len=2051, **common)
+        behind = Session(tiny, text, draft_tokens=3, max_model_len=2051, **common)
         with _a_block_asks_for_a_page():
             behind.resolve()
         assert behind.plan["attention.core"] is not behind.prefill_plan["attention.core"] and not behind.attended_tables(), reads
@@ -2348,7 +2347,7 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
         assert behind.attended_tables() and tuple(held.lengths.shape) == (97, 4) and tuple(held.first_token().lengths.shape) == (100, 4), reads
         assert behind.state.bytes() == tiny.state_bytes(3, 100, 4, page=PAGE, max_model_len=2051), reads
     # a block whose calls two rows serve by call site names nothing itself: every part of it is asked
-    split = model_samples.Session(tiny, text, max_model_len=2051, **common)
+    split = Session(tiny, text, max_model_len=2051, **common)
     with _a_block_asks_for_a_page():
         plan = split.resolve()
     row, chain = plan.rows["attention.core"], plan["attention.core"]
@@ -2357,7 +2356,7 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
     plan["attention.core"] = blocks.BySite("attention.core", [("a", row, chain), ("b", row, part)])
     assert plan["attention.core"].attended_tables is False and split.attended_tables(), "the part of the call site b reads them"
     # the two tables are tables of a pool of pages: a block that reads them where no block asks for one is a wrong table
-    unpaged = model_samples.Session(tiny, text, **common)
+    unpaged = Session(tiny, text, **common)
     with _a_block_asks_for_a_page(page=None, key="torch_ref.attention", tables=True):
         unpaged.resolve()
     for refused in (unpaged.attended_tables, unpaged.plan_table, unpaged.load):
@@ -2379,12 +2378,12 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
     # the memory sentence: at the published widths and 65,535 sequences the lengths of a state are half a GiB
     model = QwenDense()
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 10**6 * GIB)))
-    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    text = TextIO.synthetic(model.geometry.vocab)
     stated = dict(sequences=65535, stack="reference", device="cuda:0", capacity=2051)
 
     def need(tables, **session):
-        first = model_samples.Session(model, text, **stated, **session)
-        later = model_samples.Session(model, text, share=first, tokens=2, **stated, **session)
+        first = Session(model, text, **stated, **session)
+        later = Session(model, text, share=first, tokens=2, **stated, **session)
         for each in (first, later):
             with _a_block_asks_for_a_page(), _a_block_asks_for_a_page(key="torch_ref.attention", tables=tables):
                 each.resolve()
