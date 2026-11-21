@@ -5,26 +5,37 @@
 
 The shared piece rule (``choose_pieces``) cuts long sequences on few tiles into a chain of pieces.  A GDN forward keeps the
 chain only where ``chain_pays`` against the plan it would run instead: the uncut plan or the split-K table, the value-width
-split for one in-place sequence, and the leftover tiles' own round for the chain tail of a batch above one wave.
-``batch_invariant``, a context port, GDP and the summary node keep the shared rule.
+split for one in-place sequence, and the leftover tiles' own round for the chain tail of a batch above one wave.  A plan
+that does not chain carries the length-rule chain group for the device to take only where some batch of its shape can gain
+from it (``chain_group_pays``).  ``batch_invariant``, a context port, GDP and the summary node keep the shared rule.
 
 The rule tests state properties of ``chain_pays``.  Equal function cannot tell which plan ran and the ops report no plan, so
 the plan tests read the plan object the engine builds for a graph node; they compile and launch nothing.  Every length and
 expectation comes from the package's own rules, so a change of their constants moves these tests with it.  The byte tests
 call the public op: below the chain a sequence has the bytes of its ``batch_invariant`` twin where that twin runs uncut, and
-on both sides of the chain's first length the output and final state match the fp64 recurrence."""
+on both sides of the chain's first length the output and final state match the fp64 recurrence; a batch that no longer
+carries the chain group has the bytes it has with the group carried."""
 
 import pytest
 import torch
 
 from cudnn.linear_attention.frost import gdn_engine
 from cudnn.linear_attention.frost.common import piece_chain
-from cudnn.linear_attention.frost.common.piece_chain import CHAIN_MAX_PIECES, CHAIN_MIN_MEAN_TOKENS, CHAIN_MIN_PIECES, chain_pays, choose_pieces
+from cudnn.linear_attention.frost.common.piece_chain import (
+    CHAIN_MAX_PIECES,
+    CHAIN_MIN_MEAN_TOKENS,
+    CHAIN_MIN_PIECES,
+    LENGTH_RULE_PIECE_TOKENS,
+    chain_group_pays,
+    chain_pays,
+    choose_pieces,
+    ragged_pieces,
+)
 from cudnn.linear_attention.frost.common.tail import choose_tail
 from determinism_utils import assert_bitwise, snapshot
 from linear_attention import test_la as la
 from linear_attention.determinism import check_reference, pack, sequences
-from test_gdn_value_width_split import CHUNK, KEY_HEADS, SM_COUNTS, SUB_TOKENS, VALUE_HEADS, WIDTH, build_plan, plan_scheme
+from test_gdn_value_width_split import CHUNK, KEY_HEADS, SM_COUNTS, SUB_TOKENS, VALUE_HEADS, WIDTH, build_plan, one_row, plan_scheme
 
 SLOTS = range(CHAIN_MIN_PIECES, CHAIN_MAX_PIECES + 1)
 LENGTHS = range(CHUNK, 64 * CHAIN_MIN_MEAN_TOKENS + 1, CHUNK)  # whole chunks, far past every length at which a chain starts
@@ -61,6 +72,22 @@ def test_faster_rival_delays_the_chain():
         assert first_paying(pieces, split=True) >= first_paying(pieces), pieces
 
 
+@pytest.mark.L0
+def test_chain_group_pays_for_long_batches_of_few_sequences():
+    """At every slot count and head count: a batch that carries the chain group carries it with more tokens and with fewer
+    sequences."""
+    tokens = range(LENGTH_RULE_PIECE_TOKENS, 64 * LENGTH_RULE_PIECE_TOKENS + 1, LENGTH_RULE_PIECE_TOKENS // 4)
+    for pieces in SLOTS:
+        for heads in (1, KEY_HEADS, VALUE_HEADS):
+            carried = [
+                [chain_group_pays(pieces=pieces, num_seqs=count, heads_out=heads, total_tokens=total) for total in tokens] for count in (1, 2, 8, 32, 128)
+            ]
+            for row in carried:
+                assert row == sorted(row), (pieces, heads)
+            for fewer, more in zip(carried, carried[1:]):
+                assert all(a or not b for a, b in zip(fewer, more)), (pieces, heads)
+
+
 def first_chain_length(num_sm, *, count=1, **call):
     """The shortest length in whole chunks at which a batch of ``count`` equal sequences chains on ``num_sm`` SMs."""
     return next((tokens for tokens in LENGTHS if plan_scheme(num_sm, [tokens] * count, **call)[0]), None)
@@ -80,11 +107,23 @@ def tail_scheme(num_sm, lengths, *, heads, value_heads, **call):
     if pieces or split or call.get("batch_invariant"):
         return None
     shape = dict(num_seqs=len(lengths), heads_out=max(heads, value_heads), num_sm=num_sm, total_tokens=sum(lengths))
-    tail = choose_tail(**shape, b_t=CHUNK, cadence_tokens=0, expand_num=1, dim_v=call.get("value_dim", WIDTH))
+    tail = choose_tail(**shape, b_t=CHUNK, cadence_tokens=call.get("cadence", 0), expand_num=1, dim_v=call.get("value_dim", WIDTH))
     by_cost = tail is not None and not tail.dv_split and not call.get("context")
     if by_cost and not chain_pays(pieces=tail.pieces, num_seqs=len(lengths), total_tokens=sum(lengths), tail=True):
         return None
     return tail
+
+
+def group_scheme(num_sm, lengths, *, heads, value_heads, **call):
+    """The slots of the chain group the plan of one call carries, by the package's own rules: ``ragged_pieces``' for a plan
+    that neither chains nor is ``batch_invariant``, and for a GDN forward without a context port only where the group pays."""
+    if plan_scheme(num_sm, lengths, heads=heads, value_heads=value_heads, **call)[0] or call.get("batch_invariant"):
+        return 0
+    shape = dict(heads_out=max(heads, value_heads), total_tokens=sum(lengths))
+    slots = ragged_pieces(**shape, num_sm=num_sm)
+    if slots and not call.get("context") and not chain_group_pays(pieces=slots, num_seqs=len(lengths), **shape):
+        return 0
+    return slots
 
 
 def first_tail_length(num_sm, **call):
@@ -104,10 +143,9 @@ def assert_plans_follow_the_rules(monkeypatch, num_sm, calls):
         pieces, split = plan_scheme(num_sm, **call)
         assert (plan.pieces, plan.chain, plan.dv_split) == (pieces, pieces > 0, split), (num_sm, call)
         if not call.get("summary") and call.get("householders", 1) == 1:
-            want = tail_scheme(
-                num_sm, call["lengths"], heads=call.get("heads", KEY_HEADS), value_heads=call.get("value_heads", VALUE_HEADS), **tail_forms(call)
-            )
-            assert plan.tail == want, (num_sm, call)
+            heads = dict(heads=call.get("heads", KEY_HEADS), value_heads=call.get("value_heads", VALUE_HEADS))
+            assert plan.tail == tail_scheme(num_sm, call["lengths"], **heads, **tail_forms(call)), (num_sm, call)
+            assert plan.ragged_pieces == group_scheme(num_sm, call["lengths"], **heads, **tail_forms(call)), (num_sm, call)
 
 
 def tail_forms(call):
@@ -120,11 +158,24 @@ CODE_PATHS = (
     "narrow_value",
     "several_sequences",
     "chain_tail",
+    "chain_group",
     "batch_invariant",
     "context_port",
     "expanded_timeline",
     "summary_node",
 )
+
+
+def group_calls(num_sm, **heads):
+    """Dense batches of sequences half the shared rule's first chain length, on both sides of the batch size from which the
+    shared rule carries the chain group and of the one from which the forward carries it; and two long sequences of few
+    heads, a batch that gains from the group."""
+    tokens, sizes = CHAIN_MIN_MEAN_TOKENS // 2, range(1, 64 * CHAIN_MAX_PIECES)
+    shared = [count for count in sizes if ragged_pieces(heads_out=max(heads.values()), num_sm=num_sm, total_tokens=count * tokens)]
+    carried = [count for count in sizes if group_scheme(num_sm, [tokens] * count, **heads)]
+    edges = {count for found in (shared[:1], carried[:1]) for first in found for count in (first - 1, first) if count > 0}
+    long = CHAIN_MIN_PIECES * LENGTH_RULE_PIECE_TOKENS // 2 + CHUNK
+    return [dict(lengths=[tokens] * count, **heads) for count in sorted(edges)] + [dict(lengths=[long] * 2, heads=1, value_heads=1, cadence=one_row(long))]
 
 
 def code_paths(num_sm):
@@ -142,6 +193,7 @@ def code_paths(num_sm):
         "narrow_value": around_the_first_chain_length(num_sm, value_dim=WIDTH // 2, **third),
         "several_sequences": around_the_first_chain_length(num_sm, count=2, heads=KEY_HEADS, value_heads=KEY_HEADS),
         "chain_tail": [dict(lengths=[tokens] * 4, **third) for tokens in sorted(tail_lengths)],
+        "chain_group": group_calls(num_sm, **third),
         "batch_invariant": [dict(call, batch_invariant=True) for call in in_place],
         "context_port": [dict(call, context=True) for call in default_call],
         "expanded_timeline": [dict(call, householders=SUB_TOKENS) for call in in_place],
@@ -165,6 +217,7 @@ def test_tuning_moves_only_the_cost_ruled_forward(monkeypatch, fixed_tokens):
     node keep the slots of the shared rule; the cost-ruled forward follows the rule's verdict."""
     monkeypatch.setattr(piece_chain, "CHAIN_FIXED_TOKENS", fixed_tokens)
     monkeypatch.setattr(piece_chain, "CHAIN_TAIL_FIXED_TOKENS", fixed_tokens)
+    monkeypatch.setattr(piece_chain, "CHAIN_GROUP_TILE_TOKENS", fixed_tokens)
     num_sm = la.sm_count()
     monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: num_sm)
     tokens, heads = 4 * CHAIN_MIN_MEAN_TOKENS, num_sm // CHAIN_MIN_PIECES
@@ -195,6 +248,12 @@ def test_plans_follow_the_chain_rule_at_every_length(monkeypatch, num_sm):
         calls += [dict(lengths=[tokens], **form) for form in forms]
         calls += [dict(lengths=[tokens] * count, heads=KEY_HEADS, value_heads=heads) for count in (2, 3, 4, 7) for heads in (KEY_HEADS, VALUE_HEADS)]
         calls += [dict(lengths=[tokens] * 4, **third)]
+    for count in range(1, 3 * num_sm // KEY_HEADS):
+        calls += [
+            dict(lengths=[CHAIN_MIN_MEAN_TOKENS // 2] * count, heads=KEY_HEADS, value_heads=heads, **form)
+            for heads in (KEY_HEADS, VALUE_HEADS)
+            for form in (dict(), dict(in_place=False))
+        ]
     assert_plans_follow_the_rules(monkeypatch, num_sm, calls)
 
 
@@ -259,6 +318,25 @@ def test_batch_invariant_bytes_do_not_follow_the_batch_across_the_chain_rule(fro
         at = order.index(0)
         part = {"out": batch["out"][int(cu[at]) : int(cu[at + 1])], "final_state": batch["final_state"][at : at + 1]}
         assert_bitwise(part, alone, f"batch order {order}")
+
+
+@pytest.mark.L0
+def test_batch_without_the_chain_group_writes_the_bytes_it_writes_with_it(frost_engine, monkeypatch):
+    """A dense batch above the tokens from which the shared rule carries the chain group, at a size at which this GPU's
+    forward does not: output and final state match the fp64 recurrence and are bit for bit those of the same call with the
+    group carried, whose five launches find no work."""
+    num_sm, tokens = la.sm_count(), CHAIN_MIN_MEAN_TOKENS // 2
+    heads = dict(heads=KEY_HEADS, value_heads=VALUE_HEADS)
+    count = next((n for n in range(2, 16 * CHAIN_MIN_PIECES) if ragged_pieces(heads_out=VALUE_HEADS, num_sm=num_sm, total_tokens=n * tokens)), None)
+    if count is None or group_scheme(num_sm, [tokens] * count, **heads):
+        pytest.skip(f"a batch of {tokens}-token sequences carries the chain group at every size on {num_sm} SMs")
+    inputs = pack(sequences("gdn", (tokens,) * count, heads=KEY_HEADS, value_heads=VALUE_HEADS, key_dim=WIDTH, value_dim=WIDTH))
+    without = run_forward(inputs, in_place=True)
+    check_reference("gdn", inputs, without, False)
+    la.clear_caches()
+    monkeypatch.setattr(piece_chain, "CHAIN_GROUP_TILE_TOKENS", 0)
+    assert group_scheme(num_sm, [tokens] * count, **heads)
+    assert_bitwise(without, run_forward(inputs, in_place=True), f"{count} x {tokens} tokens, the chain group carried and not carried")
 
 
 @pytest.mark.L1

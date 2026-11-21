@@ -132,11 +132,13 @@ class CompiledGdn:
     each owning half of d_v) or ``chain`` (per-piece H and M from the fused summary, an fp32 state chain seeding every piece,
     the prefill over the pieces as independent sequences).  The chunk factor T comes from the T pass in chain
     plans.  A GDN plan without a context port and without ``batch_invariant`` keeps a chain, whole-batch or tail, only where
-    ``chain_pays`` against the scheme it would run instead."""
+    ``chain_pays`` against the scheme it would run instead, and carries the length-rule chain group only where
+    ``chain_group_pays``."""
 
     def __init__(self, node, kernel_module):
         from .common.piece_chain import (
             DV_SPLIT_TILES,
+            chain_group_pays,
             chain_pays,
             chain_rows_per_cta,
             choose_pieces,
@@ -239,6 +241,8 @@ class CompiledGdn:
         self.ragged_pieces = 0
         if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
             self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
+            if self.ragged_pieces and chain_by_cost and not chain_group_pays(pieces=self.ragged_pieces, num_seqs=B, heads_out=HO, total_tokens=self.q_rows):
+                self.ragged_pieces = 0
         if not self.chain and not self.dv_split and not self.batch_invariant:
             self.tail = choose_tail(
                 num_seqs=B,

@@ -69,6 +69,7 @@ DV_SPLIT_TILES = 2
 CHAIN_PASSES_PCT = 218
 CHAIN_FIXED_TOKENS = 1620
 CHAIN_TAIL_FIXED_TOKENS = 2300
+CHAIN_GROUP_TILE_TOKENS = 7
 DV_SPLIT_CHUNK_PCT = 86
 
 PIECE_TABLE_ALIGN = 256
@@ -157,6 +158,21 @@ def chain_pays(*, pieces, num_seqs, total_tokens, split=False, tail=False) -> bo
     rival_pct = DV_SPLIT_CHUNK_PCT if split else 100
     fixed_tokens = CHAIN_TAIL_FIXED_TOKENS if tail else CHAIN_FIXED_TOKENS
     return int(total_tokens) * (rival_pct * pieces - CHAIN_PASSES_PCT) >= 100 * fixed_tokens * pieces * num_seqs
+
+
+def chain_group_pays(*, pieces, num_seqs, heads_out, total_tokens) -> bool:
+    """Whether a GDN forward plan of ``num_seqs`` sequences and ``total_tokens`` tokens can gain from the length-rule chain
+    group of ``pieces`` slots it would carry (``ragged_pieces``), whatever the sequence lengths.
+
+    The group runs the whole batch when the device hands it over, so beside a chain's own fixed part it pays for every
+    (sequence, head) tile of the batch: the state chain launches CTAs for each and the chain prologue lists each, about
+    ``CHAIN_GROUP_TILE_TOKENS`` tokens of the uncut prefill per tile beyond one sequence's.  It gains the most when one
+    sequence holds every token: the length rule then cuts it into ``min(pieces, ceil(total_tokens / LENGTH_RULE_PIECE_TOKENS))``
+    slots, which advance it at ``CHAIN_PASSES_PCT`` percent of the uncut pace shared by the slots.  Where even that case
+    does not cover the fixed part no batch of the shape gains, and the plan carries no group."""
+    slots = min(int(pieces), -(-int(total_tokens) // LENGTH_RULE_PIECE_TOKENS))
+    fixed_tokens = CHAIN_FIXED_TOKENS + CHAIN_GROUP_TILE_TOKENS * (max(1, int(num_seqs)) - 1) * max(1, int(heads_out))
+    return int(total_tokens) * (100 * slots - CHAIN_PASSES_PCT) >= 100 * fixed_tokens * slots
 
 
 def ragged_pieces(*, heads_out, num_sm, total_tokens):
