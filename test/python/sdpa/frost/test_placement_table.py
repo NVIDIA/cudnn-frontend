@@ -431,7 +431,7 @@ def test_sm80_sm90_decode_shaped_gqa_follows_the_decode_studies(row, cc):
 @pytest.mark.parametrize("s_kv", [131072, 131071], ids=["on_tile", "off_tile"])
 def test_sm80_decode_gaps_follow_their_study(s_kv):
     """Study sm80_decode_gaps_20261117 (A100): MiMo-V2 SWA verify (window + sink) and gemma4 SWA paged d256 MTP / verify lead;
-    ar_dit d128 MHA MTP leads on few tiles; dense d256 single-row decode failed its holdout and has no entry."""
+    ar_dit d128 MHA MTP leads on few tiles; dense d256 single-row decode failed its holdout here and belongs to a later study."""
     row = "sdpa_fwd_prefill_sm80"
     study = "sm80_decode_gaps_20261117"
 
@@ -454,6 +454,33 @@ def test_sm80_decode_gaps_follow_their_study(s_kv):
     qwen = dict(h_q=32, h_kv=2, s_q=1, d_qk=256, d_v=256, causal=False, window_left=None, has_sink=False, has_paged_kv=False, page_size=0, padded=False)
     other = pt.matched_entry(row, f(**qwen))
     assert other is None or other.study != study  # dense d256 single-row decode: failed its holdout
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("off", [0, 1], ids=["on_tile", "off_tile"])
+def test_sm80_dense_d256_single_row_decode_follows_its_study(off):
+    """sm80_dense_d256_q1_v3_pcie_20261121: SM80 dense d256 GQA single-row decode is owned by its study on both tile sides, FROST's lead
+    never shrinks as the cache or the batch grows, and a one-KV-head b 1 decode over a 1k-key cache keeps the backend while a b 128
+    decode over 128k keys leads."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_dense_d256_q1_v3_pcie_20261121"
+
+    def f(b, h_q, h_kv, s_kv):
+        dense = dict(has_paged_kv=False, page_size=0, padded=False)
+        return _facts(b=b, h_q=h_q, h_kv=h_kv, s_q=1, s_kv=s_kv + off, d_qk=256, d_v=256, causal=False, device_cc=(8, 0), **dense)
+
+    heads = ((32, 2), (8, 1), (16, 1), (4, 1), (21, 3), (40, 5), (36, 6))
+    for shape in [(b, h_q, h_kv, s_kv) for b in (1, 3, 8, 128) for h_q, h_kv in heads for s_kv in (1024, 8192, 131072)]:
+        assert pt.matched_entry(row, f(*shape)).study == study, shape
+    for h_q, h_kv in heads:
+        for b in (1, 3, 8):
+            leads = [pt.lookup(row, f(b, h_q, h_kv, s_kv)) for s_kv in (1024, 2048, 4096, 16384, 65536, 131072)]
+            assert leads == sorted(leads), (b, h_q, h_kv, leads)
+        for s_kv in (1024, 2048, 8192):
+            leads = [pt.lookup(row, f(b, h_q, h_kv, s_kv)) for b in (1, 2, 3, 6, 16, 128)]
+            assert leads == sorted(leads), (s_kv, h_q, h_kv, leads)
+    assert pt.lookup(row, f(1, 8, 1, 1024)) is False
+    assert pt.lookup(row, f(128, 32, 2, 131072)) is True
 
 
 @pytest.mark.L0
