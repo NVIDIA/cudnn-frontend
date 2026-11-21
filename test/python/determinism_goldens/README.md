@@ -9097,7 +9097,7 @@ Evidence (logs, XML, provenance, before/after sources and PTX) is under
 ## Simplified sparse attention CI failures — 2026-11-20
 
 Audited all 18 `python/misc/cutedsl:be-*-cutedsl-*` jobs in
-[pipeline 84114932](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/pipelines/84114932),
+pipeline 84114932,
 source `6d739b867aa5ca1006767296a94f6687d9b71786`. The three version columns
 below use cuDNN 9.28.1 / DSL 4.8.0, cuDNN 9.29i / DSL 4.8.0, and
 cuDNN 9.30i / DSL 4.9.0a0, respectively. Results are retained CI evidence,
@@ -9105,12 +9105,12 @@ not reruns of the skip change.
 
 | Lane | 9.28.1 / 4.8.0 | 9.29i / 4.8.0 | 9.30i / 4.9.0a0 |
 | --- | --- | --- | --- |
-| SM80 | [Canceled before start](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000189) | [Canceled before start](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000177) | [Canceled before start](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000201) |
-| SM90 | [4098 passed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000190) | [4098 passed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000179) | [4098 passed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000203) |
-| SM100 | [4 failed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000193) | [4 failed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000181) | [4 failed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000206) |
-| SM103 | [30 failed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000195) | [31 failed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000183) | [30 failed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000209) |
-| SM107 | [Resource-wait timeout](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000196) | [Resource-wait timeout](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000185) | [Resource-wait timeout](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000211) |
-| SM120 | [3 failed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000198) | [18 failed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000187) | [9 failed](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000213) |
+| SM80 | Canceled before start (job 563000189) | Canceled before start (job 563000177) | Canceled before start (job 563000201) |
+| SM90 | 4098 passed (job 563000190) | 4098 passed (job 563000179) | 4098 passed (job 563000203) |
+| SM100 | 4 failed (job 563000193) | 4 failed (job 563000181) | 4 failed (job 563000206) |
+| SM103 | 30 failed (job 563000195) | 31 failed (job 563000183) | 30 failed (job 563000209) |
+| SM107 | Resource-wait timeout (job 563000196) | Resource-wait timeout (job 563000185) | Resource-wait timeout (job 563000211) |
+| SM120 | 3 failed (job 563000198) | 18 failed (job 563000187) | 9 failed (job 563000213) |
 
 ### Failure classification
 
@@ -9134,11 +9134,11 @@ not reruns of the skip change.
   raw-byte failures, including cases whose names contain `deterministic`,
   and remain active. The NSA log identifies SM121 in the middle lane and
   SM120 in the other two; the CI lane tag alone does not identify the GPU.
-- SM107: all three jobs exhaust the one-hour GitLab limit while Slurm reports
+- SM107: all three jobs exhaust the one-hour CI limit while Slurm reports
   `queued and waiting for resources`. No tests ran. SM80 jobs were canceled
   before starting. Neither result establishes a determinism status.
 
-[Job 563000195](https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/jobs/563000195)
+Job 563000195 (job 563000195)
 ran on `theia0118` (NVIDIA GB300, SM103), driver 620.78 (CUDA 13.5).
 Its result was **30 failed, 5719 passed, 1938 skipped, 1 xfailed** in
 1310.01 seconds. All 30 failures were raw-byte mismatches, with no JUnit
