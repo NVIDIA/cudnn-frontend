@@ -581,7 +581,8 @@ class CSACompressorBackward(_CSACompressorBase):
             return
         # Route by ratio, as in the forward.
         if self.ratio == 128:
-            precompile_bwd_r128(self.ratio, self.head_dim, self.coff, self.target_device, deterministic=self.deterministic)
+            if self.total_comp > 0:
+                precompile_bwd_r128(self.ratio, self.head_dim, self.coff, self.target_device, nb_total=self.total_comp, deterministic=self.deterministic)
             run = run_bwd_r128
         else:
             precompile_bwd(

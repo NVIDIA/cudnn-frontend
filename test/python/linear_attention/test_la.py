@@ -34,6 +34,7 @@ import pytest
 torch = pytest.importorskip("torch")
 cudnn = pytest.importorskip("cudnn")
 la_ops = pytest.importorskip("cudnn.linear_attention.ops")
+graph_analyzer = pytest.importorskip("cudnn.linear_attention.graph_analyzer")
 
 import torch.nn.functional as F  # noqa: E402
 import torch.utils.checkpoint  # noqa: E402
@@ -84,9 +85,10 @@ STATE_GRAD_TOL = 6e-2
 L2_NORM_EPS = 1e-6
 
 
-def l2norm_ref(x):
-    """The in-kernel Q/K normalization, ``x * rsqrt(sum(x * x) + L2_NORM_EPS)``."""
-    return x * (x.square().sum(-1, keepdim=True) + L2_NORM_EPS).rsqrt()
+def l2norm_ref(x, eps=L2_NORM_EPS):
+    """The in-kernel Q/K normalization, ``x * rsqrt(sum(x * x) + eps)`` (``L2_NORM_EPS`` unless the op is given a
+    ``qk_l2norm_eps``)."""
+    return x * (x.square().sum(-1, keepdim=True) + eps).rsqrt()
 
 
 HEAD_DIMS = [(64, 64), (64, 128), (128, 64), (128, 128)]  # (K, V) pairs every FROST family serves
@@ -529,13 +531,25 @@ def reference_call(variant, tensors, n=1, **kwargs):
 
 
 def reference(
-    case, *, scale=None, initial_state=None, l2norm=False, cu=None, beta_guard=False, v=None, safe_gate=False, a_log=None, dt_bias=None, use_beta_sigmoid=False
+    case,
+    *,
+    scale=None,
+    initial_state=None,
+    l2norm=False,
+    cu=None,
+    beta_guard=False,
+    v=None,
+    safe_gate=False,
+    a_log=None,
+    dt_bias=None,
+    use_beta_sigmoid=False,
+    l2norm_eps=L2_NORM_EPS,
 ):
     """fp64 reference forward of a case; returns (o, final_state) with V-major states."""
     tensors = dict(case_tensors(case))
     if l2norm:
-        tensors["q"] = l2norm_ref(case.q.float())
-        tensors["k"] = l2norm_ref(case.k.float())
+        tensors["q"] = l2norm_ref(case.q.float(), l2norm_eps)
+        tensors["k"] = l2norm_ref(case.k.float(), l2norm_eps)
     if v is not None:
         tensors["v"] = v
     kwargs = dict(scale=scale, initial_state=initial_state)
@@ -560,8 +574,19 @@ def assert_rms_close(name, out, want, tol):
 
 
 def assert_fwd_parity(
-    backend, case, *, scale=None, use_initial_state=False, state_dtype=torch.float32, l2norm=False, beta_guard=False, seed=SEED + 1, tol_scale=1.0
+    backend,
+    case,
+    *,
+    scale=None,
+    use_initial_state=False,
+    state_dtype=torch.float32,
+    l2norm=False,
+    beta_guard=False,
+    seed=SEED + 1,
+    tol_scale=1.0,
+    qk_l2norm_eps=None,
 ):
+    """``qk_l2norm_eps`` (the families that take it) is handed to the op and normalizes the reference's q/k."""
     set_seed(seed)
     state0 = None
     if use_initial_state:
@@ -569,8 +594,11 @@ def assert_fwd_parity(
     op_kw = dict(scale=scale, initial_state=state0, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
     if beta_guard:
         op_kw["beta_guard"] = True
+    if qk_l2norm_eps is not None:
+        op_kw["qk_l2norm_eps"] = qk_l2norm_eps
     o, fs = run_fwd(backend, case, **op_kw)
-    o_ref, fs_ref = reference(case, scale=scale, initial_state=state0, l2norm=l2norm, beta_guard=beta_guard)
+    l2norm_eps = L2_NORM_EPS if qk_l2norm_eps is None else qk_l2norm_eps
+    o_ref, fs_ref = reference(case, scale=scale, initial_state=state0, l2norm=l2norm, beta_guard=beta_guard, l2norm_eps=l2norm_eps)
     if state0 is not None:
         assert fs.dtype == state_dtype, f"final_state is {fs.dtype}, initial_state is {state_dtype}"
     assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype] * tol_scale)
@@ -901,8 +929,11 @@ def assert_bwd_parity(
     gate_grad_tol=None,
     seed=SEED + 1,
     tol_scale=1.0,
+    qk_l2norm_eps=None,
 ):
+    """``qk_l2norm_eps`` (the families that take it) is handed to the op and normalizes the reference's q/k."""
     variant, tol = case.variant, BWD_TOL[case.dtype] * tol_scale
+    l2norm_eps = L2_NORM_EPS if qk_l2norm_eps is None else qk_l2norm_eps
     tensors = case_tensors(case)
     op_leaves = {name: to_thd(t).detach().clone().requires_grad_(True) for name, t in tensors.items()}
     ref_leaves = {name: t.detach().double().requires_grad_(True) for name, t in tensors.items()}
@@ -918,6 +949,8 @@ def assert_bwd_parity(
         op_kw = dict(scale=scale, initial_state=state0_op, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
         if beta_guard:
             op_kw["beta_guard"] = True
+        if qk_l2norm_eps is not None:
+            op_kw["qk_l2norm_eps"] = qk_l2norm_eps
         o, fs = pinned_op(backend, variant)(*args, **op_kw)
         dO = torch.randn_like(o)
         outputs, grad_outputs = [o], [dO]
@@ -931,7 +964,7 @@ def assert_bwd_parity(
 
     ref_tensors = dict(ref_leaves)
     if l2norm:
-        ref_tensors["q"], ref_tensors["k"] = l2norm_ref(ref_leaves["q"]), l2norm_ref(ref_leaves["k"])
+        ref_tensors["q"], ref_tensors["k"] = l2norm_ref(ref_leaves["q"], l2norm_eps), l2norm_ref(ref_leaves["k"], l2norm_eps)
     ref_kwargs = dict(scale=scale, initial_state=state0_ref)
     if beta_guard:
         ref_kwargs["beta_guard"] = True
@@ -4216,6 +4249,122 @@ def test_gdp_long_bwd_compact_summary(backend, l2norm, n):
     _, _, grads, dO, _ = long_grads(backend, case, **kw)
     _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, dO=dO, **kw)
     assert_long_grads_close(grads, grads_inv)
+
+
+QK_L2NORM_EPSILONS = (1e-3, 1e-10)  # GDP's qk_l2norm_eps: one value above the default 1e-6 and one below it
+
+
+def gdp_small_rows_case(**layout):
+    """A GDP case with half of the q / k rows scaled down to squared norms between about 1e-8 and 1e-10, so that the
+    normalized rows change with the epsilon."""
+    case = make_case("gdp", torch.bfloat16, **layout)
+    for x in (case.q, case.k):
+        x[:, 0::4] *= 1e-4
+        x[:, 1::4] *= 1e-5
+    return case
+
+
+@pytest.mark.parametrize(
+    "eps,l2norm,error",
+    [
+        (None, False, None),
+        (1e-6, False, None),
+        (1e-10, True, None),
+        (1e-10, False, "requires the in-kernel q/k normalization"),
+        (0.0, True, "normal float32"),
+        (-1e-6, True, "normal float32"),
+        (float("nan"), True, "normal float32"),
+        (float("inf"), True, "normal float32"),
+        (1e-39, True, "normal float32"),
+        (True, True, "real number"),
+        ("1e-6", True, "real number"),
+    ],
+)
+def test_gdp_qk_l2norm_eps_rule(eps, l2norm, error):
+    """``qk_l2norm_eps_error`` is the check the graph analyzer and the GDP ops share: the value must be usable in
+    float32, and a custom value needs the in-kernel normalization on."""
+    message = graph_analyzer.qk_l2norm_eps_error(eps, l2norm)
+    if error is None:
+        assert message is None
+    else:
+        assert error in message
+
+
+def test_gdp_qk_l2norm_eps_default_matches_kernels():
+    """The graph analyzer cannot import the kernels' constant, so it keeps a copy; the two must be equal."""
+    pointwise = pytest.importorskip("cudnn.frost.tile_dsl.pointwise")
+    assert graph_analyzer.DEFAULT_QK_L2NORM_EPS == pointwise.L2_NORM_EPS == L2_NORM_EPS
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdp_qk_l2norm_eps_invalid_raises(backend):
+    """The forward and both summaries raise for a ``qk_l2norm_eps`` float32 cannot use, and for a custom one while the
+    in-kernel normalization is off."""
+    case = make_case("gdp", torch.bfloat16, T=64)
+    d_o = to_thd(torch.zeros(case.B, case.T, case.HO, case.V, device="cuda")).to(case.v.dtype)
+    calls = {
+        "gated_delta_product": lambda **kw: run_fwd(backend, case, **kw),
+        "gated_delta_product_summary": lambda **kw: run_summary(case, **kw),
+        "gated_delta_product_summary_bwd": lambda **kw: run_summary_bwd(case, d_o, **kw),
+    }
+    for name, call in calls.items():
+        with pytest.raises(ValueError, match=f"{name}: qk_l2norm_eps must be a finite, positive, normal float32"):
+            call(use_qk_l2norm_in_kernel=True, qk_l2norm_eps=0.0)
+        with pytest.raises(ValueError, match=f"{name}: qk_l2norm_eps=1e-08 requires the in-kernel q/k normalization"):
+            call(qk_l2norm_eps=1e-8)
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("eps", QK_L2NORM_EPSILONS)
+def test_gdp_qk_l2norm_eps_matches_reference(backend, eps):
+    """The forward and every gradient against the fp64 reference on q / k normalized at the same epsilon."""
+    assert_fwd_parity(backend, gdp_small_rows_case(T=256), l2norm=True, qk_l2norm_eps=eps)
+    assert_bwd_parity(backend, gdp_small_rows_case(T=128), l2norm=True, qk_l2norm_eps=eps)
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("length", [256, LONG_T], ids=["short", "long"])
+@pytest.mark.parametrize("eps", QK_L2NORM_EPSILONS)
+def test_gdp_qk_l2norm_eps_matches_host_normalization(backend, eps, length):
+    """With ``use_qk_l2norm_in_kernel`` and ``qk_l2norm_eps`` the ops give what they give without the in-kernel
+    normalization on q / k normalized on the host at the same epsilon: the forward, its gradients back to the raw
+    q / k, and both summaries.  The short and the long sequence run different launch hosts."""
+    case = gdp_small_rows_case(T=length, V=64, lo=0.99)
+    fused = dict(use_qk_l2norm_in_kernel=True, qk_l2norm_eps=eps)
+
+    def host_normalized(x):
+        return l2norm_ref(x.float(), eps).to(x.dtype)
+
+    set_seed(SEED + 71)
+    d_o = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    names = LEAF_NAMES["gdp"]
+    results = []
+    for on_host in (False, True):
+        leaves = dict(zip(names, (t.requires_grad_(True) for t in thd_tensors(case))))
+        inputs = dict(leaves, q=host_normalized(leaves["q"]), k=host_normalized(leaves["k"])) if on_host else leaves
+        with waive_unsupported(backend, "gdp"):
+            o = pinned_op(backend, "gdp")(*inputs.values(), *op_tail(case), **({} if on_host else fused))[0]
+        results.append((o, *torch.autograd.grad(o, list(leaves.values()), d_o)))
+    for name, got, want in zip(("o", *(f"d{name}" for name in names)), *results):
+        assert_rms_close(f"{name}[eps {eps:g}]", got, want.float(), FWD_TOL[case.dtype] if name == "o" else BWD_TOL[case.dtype])
+
+    host_case = case.clone(q=host_normalized(case.q), k=host_normalized(case.k))
+    for name, got, want in zip(("h", "m"), run_summary(case, **fused), run_summary(host_case)):
+        assert_rms_close(f"{name}[eps {eps:g}]", got, want.float(), FWD_TOL[case.dtype])
+    assert_rms_close(f"g[eps {eps:g}]", run_summary_bwd(case, d_o, **fused), run_summary_bwd(host_case, d_o).float(), BWD_TOL[case.dtype])
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdp_qk_l2norm_eps_change_compiles_nothing(backend):
+    """``qk_l2norm_eps`` is a launch argument and not a compile key: after the forward and the backward ran at one
+    epsilon, they run at another on the kernels already compiled, and the result changes."""
+    from cudnn.frost import compiled_cache
+
+    case = gdp_small_rows_case(T=256)
+    o, _, grads, dO, _ = long_grads(backend, case, use_qk_l2norm_in_kernel=True, qk_l2norm_eps=1e-8)
+    with compiled_cache.refuse_compiles():
+        o_other, _, grads_other, _, _ = long_grads(backend, case, dO=dO, use_qk_l2norm_in_kernel=True, qk_l2norm_eps=1e-10)
+    assert not torch.equal(o_other, o) and not torch.equal(grads_other["q"], grads["q"])
 
 
 def token_major_views(case, pad=24):
@@ -8061,16 +8210,21 @@ CP_CONTEXT_VARIANTS = ("gdn", "kda", "gdn2", "gdp")
 CP_CONTEXT_FULL = ("gdn", "gdp")
 
 
+# every variant in three modes, and GDP once more with the q/k l2norm at a ``qk_l2norm_eps`` that changes every row
+CP_CONTEXT_CASES = [(variant, mode) for mode in ("no_checkpoints", "checkpoints", "l2norm") for variant in CP_CONTEXT_VARIANTS]
+CP_CONTEXT_CASES.append(("gdp", "l2norm_eps"))
+
+
 @pytest.mark.L0
-@pytest.mark.parametrize("mode", ["no_checkpoints", "checkpoints", "l2norm"])
-@pytest.mark.parametrize("variant", CP_CONTEXT_VARIANTS)
+@pytest.mark.parametrize("variant,mode", CP_CONTEXT_CASES)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_context_parallel_context(backend, variant, mode):
     """The backward summary's context (``output_context``): one sequence per slab, the summary on the first (only) local
     sequence returns its context beside ``G`` and the transition, and the raw backward given it is BITWISE the raw
     backward without it, without checkpoints, with the forward's checkpoints at the chunk cadence, and with the q/k l2norm
-    fused in the kernels (GDP at d_v = 64; the forward summary's context then feeds the forward the same way)."""
-    l2norm = mode == "l2norm"
+    fused in the kernels (GDP at d_v = 64; the forward summary's context then feeds the forward the same way).  GDP also
+    runs with that normalization at a ``qk_l2norm_eps``, given to all four ops."""
+    l2norm = mode in ("l2norm", "l2norm_eps")
     full = variant in CP_CONTEXT_FULL
     cadence = CP_CADENCE[variant] if mode == "checkpoints" else 0
     V = 64 if (l2norm and variant == "gdp") else 128
@@ -8083,6 +8237,8 @@ def test_context_parallel_context(backend, variant, mode):
     set_seed(SEED + 53)
     dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
     op_kw = dict(use_qk_l2norm_in_kernel=True) if l2norm else {}
+    if mode == "l2norm_eps":
+        op_kw["qk_l2norm_eps"] = 0.1
     with waive_unsupported(backend, variant):
         summaries = [cp_forward_prepare(case, slab_leaves[r], cus[r]) for r in range(slabs)]
     h_all = torch.stack([s[0] for s in summaries])

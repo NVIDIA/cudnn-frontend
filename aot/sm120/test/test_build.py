@@ -54,6 +54,15 @@ class ExportCacheTests(unittest.TestCase):
 
 
 class VariantDomainTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("cudnn") is not None, "requires the FE Python package")
+    def test_current_owners_offer_prefill_and_decode_candidates(self):
+        for cls in build.V.CLASSES:
+            for sq, skv in ((256, 256), (1, 4096)):
+                with self.subTest(cls=cls, sq=sq):
+                    candidates = build._candidates(cls, g=1, sm=48, units=16, sq=sq, skv=skv)
+                    self.assertTrue(candidates)
+                    self.assertTrue(build.V.in_domain(cls, 1, build.V.snap(cls, 1, candidates[0])))
+
     def test_small_query_tiles_use_a_prebuilt_template(self):
         c = build.V.CLASSES[0]
         with patch.object(build.V, "kv_tile", return_value=128):

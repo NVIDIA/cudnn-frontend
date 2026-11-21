@@ -3355,7 +3355,7 @@ saved baseline. The new head-layout, GDP step-count, isolated-loss, and QSA
 mask-replay cases also check an independent reference. A reference pass alone
 does not establish bitwise determinism.
 
-### Linear attention: 28 cases per family, plus four GDP cases
+### Linear attention: 28 cases per family, plus eight GDP cases
 
 The shared implementation is `linear_attention/determinism.py`. Each FROST
 wrapper pins one operation. Except where listed, inputs use BF16, two Q/K/V
@@ -3373,6 +3373,7 @@ heads, K=V=64, and a nonzero FP32 initial state.
 | `test_neighbor_isolation` | L0 | fprop/bprop; fixed 17-token target, changed 65- and 3-token neighbors | 2 |
 | `test_gradient_source` | L0 | bprop with output loss only or final-state loss only | 2 |
 | GDP `test_householder_steps` | L0 | fprop/bprop × 1/2 steps; the other GDP tests use 3 steps | +4 for GDP |
+| GDP `test_qk_l2norm` | L0 | fprop/bprop × the fused q/k normalization at the default epsilon and at `qk_l2norm_eps=1e-10`; lengths 65, 17, 3; rows scaled around both epsilons; reference, four executions, partitions | +4 for GDP |
 
 The three head layouts are `(Q/K heads, V heads, K dimension, V dimension)`:
 `(1, 4, 64, 128)`, `(4, 1, 128, 64)`, and `(2, 2, 128, 128)`.
@@ -9115,3 +9116,128 @@ Run on native cc 10.7 (208 SMs) with Torch 2.12.1+cu130, cuDNN 9.30.0 and
 CuTe DSL 4.8.0a0 (CUDA 13.4 compiler): all cases pass; the warm-stress control
 reproduced the unsafe twin's failure on the same device. No goldens were
 recorded.
+
+## Simplified sparse attention CI failures — 2026-11-20
+
+Audited all 18 `python/misc/cutedsl:be-*-cutedsl-*` jobs in
+pipeline 84114932,
+source `6d739b867aa5ca1006767296a94f6687d9b71786`. The three version columns
+below use cuDNN 9.28.1 / DSL 4.8.0, cuDNN 9.29i / DSL 4.8.0, and
+cuDNN 9.30i / DSL 4.9.0a0, respectively. Results are retained CI evidence,
+not reruns of the skip change.
+
+| Lane | 9.28.1 / 4.8.0 | 9.29i / 4.8.0 | 9.30i / 4.9.0a0 |
+| --- | --- | --- | --- |
+| SM80 | Canceled before start (job 563000189) | Canceled before start (job 563000177) | Canceled before start (job 563000201) |
+| SM90 | 4098 passed (job 563000190) | 4098 passed (job 563000179) | 4098 passed (job 563000203) |
+| SM100 | 4 failed (job 563000193) | 4 failed (job 563000181) | 4 failed (job 563000206) |
+| SM103 | 30 failed (job 563000195) | 31 failed (job 563000183) | 30 failed (job 563000209) |
+| SM107 | Resource-wait timeout (job 563000196) | Resource-wait timeout (job 563000185) | Resource-wait timeout (job 563000211) |
+| SM120 | 3 failed (job 563000198) | 18 failed (job 563000187) | 9 failed (job 563000213) |
+
+### Failure classification
+
+- SM100: each lane has three raw-byte determinism failures (dense KL indexer
+  H96 forward replay, dense KL indexer H16 Torch forward batch invariance,
+  JAX attention H16 forward batch invariance) and one JAX invalid-input
+  `BufferError`: expected CUDA device 0, current device 3. The invalid-input
+  parameters differ by lane (`denominator`, `empty`, `bounds`). That device
+  mismatch is not a determinism failure and remains active.
+- SM103: all 30/31/30 failures are raw-byte replay or batch-invariance
+  mismatches in the three simplified sparse attention determinism suites.
+  The middle lane also fails the PyTorch H96 backward golden's replay check.
+  Across the lanes, the union is 31 failing case IDs. Golden failures occur
+  before golden comparison; golden hashes were not changed.
+- SM120-tagged lanes: all 3/18/9 failures are capability or compilation
+  failures. NSA Top-K requires tcgen05, which is unavailable on SM12.x.
+  CSA backward exceeds the device's 101376-byte shared-memory limit; DSL 4.9
+  also fails to compile six configurations for this reason. The 9.29i lane
+  has 15 paged QSA score failures because deterministic Top-K limits FP32
+  columns to 16384 while those cases request 32768. These are not measured
+  raw-byte failures, including cases whose names contain `deterministic`,
+  and remain active. The NSA log identifies SM121 in the middle lane and
+  SM120 in the other two; the CI lane tag alone does not identify the GPU.
+- SM107: all three jobs exhaust the one-hour CI limit while Slurm reports
+  `queued and waiting for resources`. No tests ran. SM80 jobs were canceled
+  before starting. Neither result establishes a determinism status.
+
+Job 563000195 (job 563000195)
+ran on `theia0118` (NVIDIA GB300, SM103), driver 620.78 (CUDA 13.5).
+Its result was **30 failed, 5719 passed, 1938 skipped, 1 xfailed** in
+1310.01 seconds. All 30 failures were raw-byte mismatches, with no JUnit
+errors: dense KL indexer 4 replay / 7 batch-invariance failures, PyTorch
+attention 5 / 4, and JAX attention 6 / 4. Each case stops at its first
+mismatch; later comparisons are unmeasured. These logs establish the failure
+types, not their kernel or test-setup cause.
+
+### Temporary skip scope
+
+At the user's request, only the measured determinism failures are temporarily
+skipped: three case IDs on SM100 and 31 on SM103. The architecture-specific
+lists are in `simplified_sparse_attention/conftest.py`; the reason starts with
+`skip until fix: known determinism failure`. Other case IDs, GPUs, independent
+correctness suites, and golden files remain active. Remove these skips with
+the fixes and rerun replay, batch invariance, and independent reference checks
+before upgrading support status.
+
+Host validation compares the configured IDs with the union of raw-byte
+failures in all six SM100/SM103 JUnit artifacts. With mocked GPU capabilities,
+the fixture skips exactly 3 IDs on SM100 and 31 on SM103, and none on SM90,
+SM107, or SM120. JAX invalid-input and passing golden controls remain active.
+This is a fixture check, not a GPU test run. The local Python environment has
+no Torch, so the GPU suites and collection were not rerun. Pre-commit and
+`git diff --check` passed. `fern check --warnings` reported no errors; its
+redirect check could not reach FDR (HTTP 403).
+
+## Misc CuTeDSL CI device and capacity fixes — 2026-11-20
+
+Follow-up to pipeline 84114932:
+
+- The JAX invalid-input tests call `jax_inputs` directly. Its first DLPack
+  conversion could initialize XLA after entering a tensor's CUDA device guard,
+  changing the current device before export. Initialize XLA in a separate
+  restoring guard before conversion; exercise direct conversion and execution,
+  including initialization and execution errors.
+- The NSA THD Top-K test now uses the existing tcgen05 capability gate.
+  Paged QSA's FP32 deterministic Top-K capacity gate now covers SM121 as well
+  as SM120, matching the API's architecture check.
+- CSA ratio-128 backward support checks one compressed-row schedule, but
+  compilation previously built both small and default schedules. The unused
+  default could exceed SM12.x shared memory even when the declared shape fit.
+  Compile only the validated shape's schedule; empty plans compile no kernel.
+  Batch-invariance checks apply the existing shared-memory gate separately
+  to each packed backward layout. Unsupported shapes are skipped as unsupported,
+  without claiming byte determinism or extending the supported envelope.
+
+Validation used SM100, driver 610.11, Torch `2.14.0a0+b2c75dd062.nv26.09`,
+CUDA 13.4, cuDNN 92700, JAX 0.11.2, and CuTe DSL 4.8.0, in the
+cuDNN 9.27.0.42 / CUDA 13.4.1 amd64 CI image.
+The test runner prepended `/workspace/python/cudnn` to the installed package's
+search path and loaded the checkout's JAX version constants. Changed Python
+APIs and kernels resolved to `/workspace`; the container retained its installed
+1.28.0 native extension. These checks do not validate a new C++ build or the
+CI backend/DSL combinations. Base source was `fdae16db7dd55dc69ba8da4026bca272177948d5`
+plus this change.
+
+Run from `test/python`, with `CUDNN_TEST_NO_ISOLATION=1`,
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`, and `XLA_PYTHON_CLIENT_PREALLOCATE=false`:
+
+| Selection | Result |
+| --- | --- |
+| Targeted JAX device, NSA capability, QSA column-limit, CSA compilation and packed-layout memory regressions (`-m L0`) | 34 passed |
+| Complete `simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py` (`-m L0`) | 27 passed, 1 skipped in 156.96 s |
+| CSA backward batch-invariance cases and packed-layout memory regression (`-m L0 -k test_batch_invariance`) | 18 passed, 1 xpassed in 10.69 s |
+| CSA ratio-128 replay and CUDA Graph capture (`-m L0 -k 'replay_determinism_r128 or cuda_graph_capture_r128'`) | 2 passed in 2.30 s |
+| CSA ratio-128 schedule envelope (`-m 'L0 or L1' -k r128_envelope_execution`) | 10 passed in 10.55 s |
+| NSA THD noninterference, CSA compile-capacity and shared-memory checks, and CSA batch invariance (earlier bounded run) | 29 passed, 1 xpassed in 11.98 s |
+
+The one JAX skip requires a second visible CUDA device. The known CSA forward
+schedule-boundary xfail happened to pass; it remains a known failure and was
+not removed. The envelope checks retain independent FP32/FP64 references and
+existing replay comparisons. No golden files or numerical tolerances changed.
+
+A negative control restored the previous JAX conversion helper, CSA compile
+method, and paged QSA capacity helper while retaining the new tests: **10 failed,
+10 passed** in 3.52 s. The corrected versions passed the targeted regression run.
+Mocked capability cases cover SM120 and SM121, but no SM12.x GPU or DSL 4.9
+run was available. Those execution scopes remain unverified.

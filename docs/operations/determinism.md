@@ -79,6 +79,7 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified; gate/up unsupported | Unverified for interleaved input; gate/up unsupported |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `gated_delta_product` (GDP) with `use_qk_l2norm_in_kernel`, at the default `qk_l2norm_eps` and at a custom one | fprop, bprop | BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
@@ -91,12 +92,12 @@ arbitrary user callbacks.
 | `SwigluFp4Decode` (block-scaled FP4 gate / up product with SwiGLU for decode rows) | fprop (inference step) | FP4 E2M1 in / out with E4M3 block scales; FP32 accumulate; BF16 intermediate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `AttentionPrepareDecode` (attention preparation decode step) | fprop (inference step) | BF16 in and out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `RowQuantizeFp4Decode` (4-bit block-scaled quantization of decode rows) | fprop (inference step) | BF16 in; FP4 E2M1 codes with E4M3 block scales out | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
-| `simplified_sparse_attention_forward` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
-| `simplified_sparse_attention_forward` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
-| `simplified_sparse_attention_forward_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
-| `simplified_sparse_attention_forward_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
-| `dense_indexer_kl_forward`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Unverified | Unverified |
-| `dense_indexer_kl_forward`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_forward` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Replay only | Unsupported |
+| `simplified_sparse_attention_forward` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
+| `simplified_sparse_attention_forward_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Replay only | Unsupported |
+| `simplified_sparse_attention_forward_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
+| `dense_indexer_kl_forward`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Replay only | Unverified |
+| `dense_indexer_kl_forward`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
@@ -377,6 +378,11 @@ for replay, batch-invariance, and stress-test results.
   Its approved exception covers only the observed one-byte packed forward loss mismatch on SM100.
   Backward uses atomic reductions; dK/dV fail raw-byte replay and batch invariance.
   Numerical agreement does not establish bitwise determinism.
+  SM103 also has backward replay and forward batch-invariance failures in both
+  PyTorch and JAX. Dense KL indexer batch invariance fails with both providers;
+  replay also fails with `use_kf=True`. The temporary skips on SM100/SM103 cover only measured
+  failing case IDs and do not establish determinism. See the
+  [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#simplified-sparse-attention-ci-failures--2026-11-20).
 
 - Canonical grouped GLU: the new branch-order option is distinct from the
   APIs' natural-rank tensor support. The forward suite checks C, both D
@@ -663,6 +669,9 @@ for replay, batch-invariance, and stress-test results.
   batch schedule to the default schedule. Forward is therefore Replay only. Replay and
   committed goldens cover the generic ratio-2, generic ratio-4 overlap, and dedicated
   ratio-128 numerical paths. SM90 and SM107 remain unverified for batch invariance.
+  Ratio-128 backward plans compile only the schedule selected for their declared
+  compressed-row capacity. Each batch layout must fit the device's shared-memory
+  limit; an unsupported layout is a coverage gap, not a determinism failure.
 - `sdpa_mxfp8(causal_exclude_own_block=32)`: no determinism switch. Every plan is repeatable. PackGQA does not change a row's bytes. A split-KV plan adds its per-split partials in a fixed order, so its bytes follow the split count; the heuristics choose that count from the launch grid (on B200 only a single sequence at one or two KV heads splits), so a row keeps its bytes across batches while the plan keeps its split count. The option is forward-only: `sdpa_mxfp8_backward` refuses it, so there is no bprop row. It is served by the SM100/SM103 MXFP8 D128 kernel only; SM90 and SM107 decline it. Rows 0-31 keep no key and return O = 0 and Stats = -inf, which the tests accept as the declared sentinel.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   NVFP4 indexer forward reads packed E2M1 Q/K with non-negative E4M3 block
