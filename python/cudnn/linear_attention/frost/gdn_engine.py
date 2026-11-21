@@ -241,7 +241,8 @@ class CompiledGdn:
         self.ragged_pieces = 0
         if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
             self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
-            if self.ragged_pieces and chain_by_cost and not chain_group_pays(pieces=self.ragged_pieces, num_seqs=B, heads_out=HO, total_tokens=self.q_rows):
+            group = dict(pieces=self.ragged_pieces, num_seqs=B, heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
+            if self.ragged_pieces and chain_by_cost and not chain_group_pays(**group):
                 self.ragged_pieces = 0
         if not self.chain and not self.dv_split and not self.batch_invariant:
             self.tail = choose_tail(

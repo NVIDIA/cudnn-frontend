@@ -74,18 +74,29 @@ def test_faster_rival_delays_the_chain():
 
 @pytest.mark.L0
 def test_chain_group_pays_for_long_batches_of_few_sequences():
-    """At every slot count and head count: a batch that carries the chain group carries it with more tokens and with fewer
-    sequences."""
-    tokens = range(LENGTH_RULE_PIECE_TOKENS, 64 * LENGTH_RULE_PIECE_TOKENS + 1, LENGTH_RULE_PIECE_TOKENS // 4)
+    """At every slot count, head count and SM count: a batch that carries the chain group carries it with fewer sequences and
+    on more SMs, and with more tokens for as long as the length rule cuts them into as many slots."""
+    step, counts = LENGTH_RULE_PIECE_TOKENS // 4, (1, 2, 8, 32, 128)
     for pieces in SLOTS:
+        ends = [slots * LENGTH_RULE_PIECE_TOKENS for slots in range(pieces)] + [64 * LENGTH_RULE_PIECE_TOKENS]
         for heads in (1, KEY_HEADS, VALUE_HEADS):
-            carried = [
-                [chain_group_pays(pieces=pieces, num_seqs=count, heads_out=heads, total_tokens=total) for total in tokens] for count in (1, 2, 8, 32, 128)
-            ]
-            for row in carried:
-                assert row == sorted(row), (pieces, heads)
-            for fewer, more in zip(carried, carried[1:]):
-                assert all(a or not b for a, b in zip(fewer, more)), (pieces, heads)
+            for below, end in zip(ends, ends[1:]):
+                shape = dict(pieces=pieces, heads_out=heads)
+                carried = {
+                    (num_sm, count): [
+                        chain_group_pays(**shape, num_seqs=count, num_sm=num_sm, total_tokens=total) for total in range(below + step, end + 1, step)
+                    ]
+                    for num_sm in SM_COUNTS
+                    for count in counts
+                }
+                for key, row in carried.items():
+                    assert row == sorted(row), (pieces, heads, key)
+                for num_sm in SM_COUNTS:
+                    for fewer, more in zip(counts, counts[1:]):
+                        assert all(a or not b for a, b in zip(carried[num_sm, fewer], carried[num_sm, more])), (pieces, heads, num_sm)
+                for count in counts:
+                    for fewer, more in zip(sorted(SM_COUNTS), sorted(SM_COUNTS)[1:]):
+                        assert all(b or not a for a, b in zip(carried[fewer, count], carried[more, count])), (pieces, heads, count)
 
 
 def first_chain_length(num_sm, *, count=1, **call):
@@ -121,7 +132,7 @@ def group_scheme(num_sm, lengths, *, heads, value_heads, **call):
         return 0
     shape = dict(heads_out=max(heads, value_heads), total_tokens=sum(lengths))
     slots = ragged_pieces(**shape, num_sm=num_sm)
-    if slots and not call.get("context") and not chain_group_pays(pieces=slots, num_seqs=len(lengths), **shape):
+    if slots and not call.get("context") and not chain_group_pays(pieces=slots, num_seqs=len(lengths), num_sm=num_sm, **shape):
         return 0
     return slots
 
