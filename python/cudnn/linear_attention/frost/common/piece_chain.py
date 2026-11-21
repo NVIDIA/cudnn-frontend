@@ -142,14 +142,23 @@ def ragged_pieces(*, heads_out, num_sm, total_tokens):
     return pieces if min(pieces, -(-int(total_tokens) // LENGTH_RULE_PIECE_TOKENS)) >= CHAIN_MIN_PIECES else 0
 
 
-def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks):
+def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks, uncut=False):
     """Whether a plan without pieces and without ``batch_invariant`` runs the d_v split: every (sequence, head) tile as
-    ``DV_SPLIT_TILES`` CTAs, each owning ``dim_v // DV_SPLIT_TILES`` value columns, at the tile counts where the slot budget
-    is exactly ``DV_SPLIT_TILES`` and ``dim_v`` is 128."""
+    ``DV_SPLIT_TILES`` CTAs, each owning ``dim_v // DV_SPLIT_TILES`` value columns, at ``dim_v`` 128.  A plan takes it at the
+    tile counts where the slot budget is exactly ``DV_SPLIT_TILES``.  ``uncut``: the plan runs one item per tile whatever the
+    gates (no split-K table, ``overwrite_initial_state``); with one sequence and no chain group for the device to take
+    (``ragged_pieces``) it then takes the split wherever its ``DV_SPLIT_TILES * heads_out`` CTAs fit in one wave of ``num_sm``,
+    at every length the plan does not chain."""
+    if int(dim_v) != 128:
+        return False
     budget = piece_budget(
         num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
     )
-    return budget == DV_SPLIT_TILES and int(dim_v) == 128
+    if budget == DV_SPLIT_TILES:
+        return True
+    if not uncut or int(num_seqs) != 1 or DV_SPLIT_TILES * max(1, int(heads_out)) > int(num_sm):
+        return False
+    return ragged_pieces(heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens) == 0
 
 
 def piece_capacity(*, num_seqs: int, pieces: int, total_tokens: int, batch_invariant: bool) -> int:

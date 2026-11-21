@@ -226,6 +226,7 @@ class CompiledGdn:
                 b_t=self.b_t,
                 expand_num=self.expand_num,
                 unit_chunks=self.unit_chunks,
+                uncut=self.overwrite_initial_state,
             )
         )
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
@@ -1761,6 +1762,7 @@ class CompiledGdnSummary:
                 b_t=self.b_t,
                 expand_num=self.num_householder,
                 unit_chunks=self.unit_chunks,
+                uncut=self.overwrite_initial_state,
             )
         )
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
