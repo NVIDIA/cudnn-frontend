@@ -19,6 +19,7 @@ and reused across calls.
 """
 
 import logging
+import threading
 from typing import Optional, Dict
 from enum import IntEnum
 
@@ -31,7 +32,7 @@ _logger = logging.getLogger(__name__)
 # Module-level state
 # ---------------------------------------------------------------------------
 
-_cudnn_handles = {}
+_tls = threading.local()
 _graph_cache: Dict[tuple, tuple] = {}
 
 # Dtype mapping (module-level constant)
@@ -83,12 +84,17 @@ class _UIDs(IntEnum):
 
 
 def _get_handle(device: torch.device):
-    """Return a lazily-initialised cuDNN handle with the current CUDA stream."""
-    if device not in _cudnn_handles:
-        _cudnn_handles[device] = cudnn.create_handle()
-    stream = torch.cuda.current_stream(device).cuda_stream
-    cudnn.set_stream(handle=_cudnn_handles[device], stream=stream)
-    return _cudnn_handles[device]
+    """Return this thread's cuDNN handle for ``device`` on the current stream."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    handles = getattr(_tls, "handles", None)
+    if handles is None:
+        handles = _tls.handles = {}
+    handle = handles.get(index)
+    if handle is None:
+        with torch.cuda.device(index):
+            handle = handles[index] = cudnn.create_handle()
+    cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(index).cuda_stream)
+    return handle
 
 
 def _torch_dtype_to_cudnn(dtype: torch.dtype):

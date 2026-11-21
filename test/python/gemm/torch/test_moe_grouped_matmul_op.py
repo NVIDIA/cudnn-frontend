@@ -67,3 +67,65 @@ class TestMoEGroupedMatmul:
         Y_ref = ref_moe_grouped_matmul(token, weight, fto, num_experts)
 
         torch.testing.assert_close(Y_ref, result, atol=0.125, rtol=0.125)
+
+
+@pytest.mark.L0
+def test_handle_cache_is_thread_local_and_pinned_to_the_token_device(monkeypatch):
+    """Each host thread gets its own handle, created on the token's GPU and bound to that thread's stream."""
+    import contextlib
+    import importlib
+    import threading
+    from types import SimpleNamespace
+
+    op = importlib.import_module("cudnn.gemm.ops.moe_grouped_matmul")
+
+    monkeypatch.setattr(op, "_tls", threading.local(), raising=False)
+    monkeypatch.setattr(op, "_cudnn_handles", {}, raising=False)
+    local = threading.local()
+    active = threading.local()
+    lock = threading.Lock()
+    created, bindings, results = [], [], []
+    barrier = threading.Barrier(2)
+
+    @contextlib.contextmanager
+    def device(index):
+        active.index = index
+        try:
+            yield
+        finally:
+            active.index = None
+
+    def create_handle():
+        with lock:
+            handle = (len(created) + 1, getattr(active, "index", None))
+            created.append(handle)
+            return handle
+
+    def set_stream(*, handle, stream):
+        with lock:
+            bindings.append((handle, stream))
+
+    monkeypatch.setattr(op.torch.cuda, "device", device)
+    monkeypatch.setattr(op.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(op.torch.cuda, "current_stream", lambda unused=None: local.stream)
+    monkeypatch.setattr(op.cudnn, "create_handle", create_handle)
+    monkeypatch.setattr(op.cudnn, "set_stream", set_stream)
+
+    def worker(stream):
+        local.stream = SimpleNamespace(cuda_stream=stream)
+        barrier.wait()
+        first = op._get_handle(torch.device("cuda", 1))
+        second = op._get_handle(torch.device("cuda", 1))
+        results.append((stream, first, second))
+
+    threads = [threading.Thread(target=worker, args=(stream,)) for stream in (101, 202)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 2 and all(first is second for _, first, second in results)
+    assert len({first for _, first, _ in results}) == 2, "threads share one re-streamed handle"
+    assert all(index == 1 for _, index in created), f"handles were not created on the token's device: {created}"
+    for stream, handle, _ in results:
+        assert {s for h, s in bindings if h == handle} == {stream}

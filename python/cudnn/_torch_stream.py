@@ -22,6 +22,7 @@ torch is imported lazily: ``python/cudnn`` must import without it.
 
 from __future__ import annotations
 
+import sys
 from contextlib import contextmanager, nullcontext
 from typing import Any, Iterator, Optional
 
@@ -29,6 +30,29 @@ from typing import Any, Iterator, Optional
 DEFAULT_STREAM_HANDLES = frozenset({0, 1})
 
 _RAW_CURRENT: Any = None  # torch._C._cuda_getCurrentRawStream, resolved once
+
+
+_RAW_CURRENT_GETTER: Any = None  # torch's raw current-stream getter, resolved once torch is loaded
+
+
+def caller_stream(device: Optional[int]) -> int:
+    """torch's current stream on CUDA ordinal ``device`` (the current device when None), or 0 when
+    torch is not loaded: the stream a call that names none runs on. Never imports torch."""
+    global _RAW_CURRENT_GETTER
+    getter = _RAW_CURRENT_GETTER
+    if not getter or device is None:
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return 0
+        if device is None:
+            if not torch.cuda.is_available():
+                return 0
+            device = torch.cuda.current_device()
+        if getter is None:
+            getter = _RAW_CURRENT_GETTER = getattr(torch._C, "_cuda_getCurrentRawStream", False)
+        if not getter:
+            return torch.cuda.current_stream(device).cuda_stream
+    return getter(device)
 
 
 def _device_index(torch, device) -> int:

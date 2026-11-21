@@ -20,6 +20,7 @@ Example (pass torch tensors directly):
 """
 
 import atexit
+from contextlib import nullcontext
 import ctypes
 from dataclasses import dataclass
 import logging
@@ -33,6 +34,7 @@ from cudnn import _pybind_module
 
 from ._device import ensure_current_context, execution_context, execution_context_matches
 from ._handle import Handle, to_backend_handle
+from ._torch_stream import caller_stream as _current_stream
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _dlpack_lanes, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
@@ -45,26 +47,42 @@ _LOG = logging.getLogger("cudnn.pygraph")
 # at lowering and cudnnDestroy it from the destructor: a GC-timed backend release
 # that, inside someone else's stream capture, poisons every later launch (Rule 8,
 # #1151). Lend it a process default instead: one per (thread, device) -- cuDNN
-# forbids sharing a handle across threads -- never re-streamed (a fresh handle
-# runs on stream 0, exactly like the owned one did), destroyed at interpreter exit.
+# forbids sharing a handle across threads -- set to the caller's current stream by
+# each execute that names no handle, destroyed at interpreter exit.
 _DEFAULT_HANDLES = threading.local()
 _DEFAULT_HANDLE_REGISTRY: List[Handle] = []
 _DEFAULT_HANDLE_LOCK = threading.Lock()
 
 
-def _default_backend_handle() -> int:
-    from .frost.device import ambient_device
-
-    device = ambient_device()
+def _default_handle(device: int) -> Handle:
     by_device = getattr(_DEFAULT_HANDLES, "by_device", None)
     if by_device is None:
         by_device = _DEFAULT_HANDLES.by_device = {}
     handle = by_device.get(device)
     if handle is None:
-        handle = by_device[device] = cudnn.create_handle()
+        from .frost.device import ambient_device, device_context
+
+        with nullcontext() if ambient_device() == device else device_context(device):
+            handle = by_device[device] = cudnn.create_handle()
         with _DEFAULT_HANDLE_LOCK:
             _DEFAULT_HANDLE_REGISTRY.append(handle)
-    return to_backend_handle(handle)
+    return handle
+
+
+def _default_backend_handle() -> int:
+    from .frost.device import ambient_device
+
+    return to_backend_handle(_default_handle(ambient_device()))
+
+
+def _device_scope(handle: Any):
+    """Scope device facts and JIT builds to ``handle``'s GPU; no scope without a handle."""
+    device = getattr(handle, "device", None)
+    if device is None:
+        return nullcontext()
+    from .frost.device import build_device
+
+    return build_device(device.ordinal)
 
 
 def _destroy_default_handles() -> None:
@@ -330,6 +348,8 @@ class pygraph:
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
         self._compiled_plans: Dict[int, Any] = {}  # plan_index -> CompiledPlan (python plans)
         self._plan_kernel_entries: Dict[int, List[Any]] = {}  # plan_index -> compiled_cache entries its build used (serialize)
+        self._plan_devices: Dict[int, Optional[int]] = {}  # plan_index -> ordinal the python plan was built for
+        self._default_handle_device: Optional[int] = None  # set when the C++ graph was lowered with a default handle
         self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
@@ -1229,9 +1249,9 @@ class pygraph:
         # set of facts describing a graph that can no longer change.
         self._finalize_backend_layout()
         self._freeze()
-        self._attach_facts()
-
-        plans = list(rank(self, self._candidate_engines(), self.backend_plan_entries(), self._backend_heuristics))
+        with self._planning_scope():
+            self._attach_facts()
+            plans = list(rank(self, self._candidate_engines(), self.backend_plan_entries(), self._backend_heuristics))
         # Validate the FINAL router output: every entry must name an engine this
         # graph can actually dispatch to.
         from .engines.engine_ids import is_python_engine
@@ -1258,6 +1278,15 @@ class pygraph:
         self._plans = plans
         self._planning_done = True
         self._plan_index = 0
+
+    def _planning_scope(self):
+        """The graph handle's device scope for planning, unless a caller already scoped one
+        (an execute-supplied handle)."""
+        from .frost.device import build_scope_device
+
+        if self._handle is None or build_scope_device() is not None:
+            return nullcontext()
+        return _device_scope(self._handle)
 
     def _candidate_engines(self) -> List["BaseEngine"]:
         """The python engines this graph may dispatch to: the in-tree manifest
@@ -1649,18 +1678,47 @@ class pygraph:
             return tuple(eng.get_behavior_notes(self, cfg) or ())
         return tuple(getattr(eng, f"{kind}_notes", ()) or ())
 
-    def _resolve_stream(self, handle: Any) -> Any:
-        """Stream for a supplied handle (classic set_stream semantics). A failed
-        query on a SUPPLIED handle is a correctness error and raises — never a
-        silent fall-back to another stream. No handle -> None (kernel wrappers
-        fall back to the default stream)."""
+    def _resolve_stream(self, handle: Any, device: Optional[int] = None) -> int:
+        """The stream every engine launches on: a supplied handle's (classic set_stream
+        semantics; a failed query on it raises, never a silent fall-back), else the caller's
+        current stream on ``device``. Resolved here once so no engine picks its own."""
         if handle is None:
-            return None
+            return _current_stream(device)
         return cudnn.get_stream(handle)
 
     def _build_context(self, handle: Any = None) -> Any:
         h = handle if handle is not None else self._handle
-        return ExecutionContext(handle=h, stream=self._resolve_stream(h))
+        return ExecutionContext(handle=h, stream=self._resolve_stream(h, self._python_plan_device(h)))
+
+    @staticmethod
+    def _python_plan_device(handle: Any) -> Optional[int]:
+        """The ordinal a python plan built now targets: the handle's, else the current device
+        (None without a visible device)."""
+        device = getattr(handle, "device", None)
+        if device is not None:
+            return device.ordinal
+        from .frost.device import current_device
+
+        try:
+            return current_device()
+        except (NotImplementedError, RuntimeError):
+            return None
+
+    def _backend_exec_handle(self, handle: Any) -> Optional[int]:
+        """The backend handle an execute passes to C++, or None to let the lowering handle run.
+
+        With no handle anywhere, the per-thread default handle for the lowering device, set to the
+        caller's current stream (set_stream skips the backend call when the stream is unchanged)."""
+        if handle is not None:
+            return to_backend_handle(handle)
+        device = self._default_handle_device
+        if device is None:
+            return None
+        default = _default_handle(device)
+        stream = _current_stream(device)
+        if default.stream != stream:
+            cudnn.set_stream(default, stream)
+        return default.backend_handle
 
     def _backend_handle_for_lowering(self, cpp_kwargs: Dict[str, Any]) -> Optional[int]:
         """The raw handle the C++ graph is constructed with: the caller's, else the
@@ -1672,7 +1730,10 @@ class pygraph:
             return to_backend_handle(self._handle)
         if cpp_kwargs.get("device_property") is not None:
             return None
-        return _default_backend_handle()
+        from .frost.device import ambient_device
+
+        self._default_handle_device = ambient_device()
+        return to_backend_handle(_default_handle(self._default_handle_device))
 
     def _reset_lowered_state(self) -> None:
         """Drop every artifact of a C++ lowering (graph, tensors, BOG/plan flags,
@@ -1868,7 +1929,8 @@ class pygraph:
 
         eng = self.selected_engine
         if eng is not None:
-            eng.check_support(self)
+            with self._planning_scope():
+                eng.check_support(self)
             return
         if self._plans and self._plans[self._plan_index].cpp_index is None:
             self._materialize_backend_plan(self._plan_index)  # else C++ is asked about a plan it has never seen
@@ -1966,11 +2028,7 @@ class pygraph:
         eng = self._engine_for(cfg)
         if eng is not None:
             if index not in self._compiled_plans:
-                from .frost import compiled_cache
-
-                with compiled_cache.record_entries() as entries:
-                    self._compiled_plans[index] = eng.build_plan(self, cfg, ctx or self._build_context())
-                self._plan_kernel_entries[index] = entries
+                self._compile_python_plan(index, eng, ctx)
             self._prepare_ordered_binding_schema()
             return
         cfg = self._materialize_backend_plan(index)
@@ -1989,6 +2047,24 @@ class pygraph:
             self._lower_backend_plan()
             self._lowered_graph.build_plan_at_index(cfg.cpp_index)
         self._prepare_ordered_binding_schema()
+
+    def _compile_python_plan(self, index: int, eng: Any, ctx: Any = None) -> Any:
+        """JIT-build python plan ``index`` for the GPU of the handle it will run with: every
+        device fact and compile target read during the build follows that handle, not the
+        ambient device."""
+        from .frost import compiled_cache
+
+        handle = ctx.handle if ctx is not None else self._handle
+        with _device_scope(handle):
+            device = self._python_plan_device(handle)
+            if ctx is None:
+                ctx = ExecutionContext(handle=handle, stream=self._resolve_stream(handle, device))
+            with compiled_cache.record_entries() as entries:
+                plan = eng.build_plan(self, self._plans[index], ctx)
+        self._compiled_plans[index] = plan
+        self._plan_kernel_entries[index] = entries
+        self._plan_devices[index] = device
+        return plan
 
     def build(self, heuristics: Optional[List] = None, ctx: Any = None) -> None:
         """Convenience: validate -> build_operation_graph -> create_execution_plans
@@ -2230,11 +2306,11 @@ class pygraph:
     def _execute_native_plan_at_index(self, tensor_dict, workspace, index, handle, *args, tensor_uids=None, **kwargs):
         if tensor_uids is not None:
             pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
-            return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index, pack.workspace_bytes)
+            return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, self._backend_exec_handle(handle) or 0, index, pack.workspace_bytes)
         uid_to_data = self._uid_to_data(tensor_dict)
         var_pack, _ = self._native_var_pack(uid_to_data, None)
         ws_ptr, ws_bytes = self._workspace_extent(workspace)
-        return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, workspace_bytes=ws_bytes, **kwargs)
+        return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, self._backend_exec_handle(handle), *args, workspace_bytes=ws_bytes, **kwargs)
 
     def execute(
         self,
@@ -2263,7 +2339,9 @@ class pygraph:
                        this call's shapes. Integer addresses have unknown capacity
                        and remain the caller's responsibility.
             handle: cuDNN handle; kernels launch on its stream (classic
-                    ``set_stream`` semantics, both python engines and backend)
+                    ``set_stream`` semantics, both python engines and backend).
+                    Without one (here or on the graph) they launch on the
+                    caller's current torch stream, 0 when torch is not loaded
             override_uids/shapes/strides: runtime geometry for the backend or a
                          compatible VariantPack plan; legacy uid-map plans raise
                          rather than ignoring these arguments
@@ -2328,9 +2406,10 @@ class pygraph:
             # otherwise discarded this (a cudnnGetStream round-trip + an
             # ExecutionContext alloc) on every already-built call.
             caller_ctx = self._build_context(handle) if handle is not None else None
-            if not self._planning_done:
-                self.create_execution_plans()
-            self.build(ctx=caller_ctx)
+            with _device_scope(h):
+                if not self._planning_done:
+                    self.create_execution_plans()
+                self.build(ctx=caller_ctx)
 
         if not explicit_index:
             index = self._plan_index
@@ -2344,17 +2423,20 @@ class pygraph:
 
         if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
-            stream = self._resolve_stream(h)
+            if h is not None:
+                stream = self._resolve_stream(h)
+            else:
+                device = self._plan_devices.get(index)
+                stream = self._resolve_stream(None, device if device is not None else self._python_plan_device(None))
             # A JIT engine launches through the driver, which reads the calling
             # thread's context stack; an autograd worker has none. The handle's
             # device decides when the stream names no context.
             if not _context_bound:
-                ensure_current_context(stream, h.device.ordinal if h is not None else None)
+                ensure_current_context(stream if h is not None else None, h.device.ordinal if h is not None else None)
             if index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
-                ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context)
-                self._compiled_plans[index] = eng.build_plan(self, self._plans[index], ctx)
+                self._compile_python_plan(index, eng, ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context))
                 if not explicit_index:
                     self._is_built = True
             plan = self._compiled_plans[index]
@@ -2402,6 +2484,7 @@ class pygraph:
         # selection: they differ once the walk has skipped an entry.
         cfg = self._materialize_backend_plan(index) if self._plans else None
         cpp_index = cfg.cpp_index if cfg is not None else None
+        exec_handle = self._backend_exec_handle(handle)
 
         if ordered:
             schema = self._prepare_ordered_binding_schema()
@@ -2416,7 +2499,7 @@ class pygraph:
                 override_uids,
                 override_shapes,
                 override_strides,
-                to_backend_handle(handle) or 0,
+                exec_handle or 0,
                 -1 if cpp_index is None else cpp_index,
             )
             if result is None:
@@ -2425,7 +2508,7 @@ class pygraph:
             self._lowered_graph._execute_ordered_pack(
                 variant_pack.native,
                 variant_pack.workspace,
-                to_backend_handle(handle) or 0,
+                exec_handle or 0,
                 -1 if cpp_index is None else cpp_index,
                 variant_pack.workspace_bytes,
             )
@@ -2441,7 +2524,7 @@ class pygraph:
                 variant_pack.address,
                 len(variant_pack),
                 variant_pack.workspace,
-                to_backend_handle(handle) or 0,
+                exec_handle or 0,
                 -1 if cpp_index is None else cpp_index,
                 variant_pack.workspace_bytes,
             )
@@ -2450,11 +2533,9 @@ class pygraph:
         var_pack, _ = self._native_var_pack(uid_to_data, None)
         ws_ptr, ws_bytes = self._workspace_extent(workspace)
         if cpp_index is not None:
-            self._lowered_graph._execute_plan_at_index(
-                var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides, ws_bytes
-            )
+            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, exec_handle, override_uids, override_shapes, override_strides, ws_bytes)
             return
-        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides, ws_bytes)
+        self._lowered_graph._execute(var_pack, ws_ptr, exec_handle, override_uids, override_shapes, override_strides, ws_bytes)
 
     def _variant_pack_uids(self) -> Optional[List[int]]:
         """The graph's caller-filled variant_pack, ASCENDING by uid.
