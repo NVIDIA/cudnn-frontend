@@ -355,7 +355,7 @@ def test_every_count_of_a_run_is_planned_before_the_first_load(monkeypatch):
     """The first session plans the sessions that follow it on its weights, and its memory sentence covers the whole run
     against what is free before anything is loaded: a later count can decline only there."""
     import model_samples
-    from model_samples import blocks
+    from model_samples import blocks, loop
     from model_samples.qwen_dense import QwenDense, configs
 
     model = QwenDense.reduced(2)
@@ -370,15 +370,20 @@ def test_every_count_of_a_run_is_planned_before_the_first_load(monkeypatch):
 
     later, table = run(1, 4)
     assert later[0].plan is not None and later[0].plan.sequences == 4, "the later count is planned with the first one"
-    need = model.memory_bytes(1, 58) + model.state_bytes(4, 58) + configs.FIRST_LAUNCH_RESERVE["cc12.x"]
+    # ... and what the checks hold for the three sequences beyond the first of the larger count, with the share of it for PyTorch's pool
+    rows = model.check_row_bytes(4, 58) - model.check_row_bytes(1, 58)
+    need = model.memory_bytes(1, 58) + model.state_bytes(4, 58) + configs.FIRST_LAUNCH_RESERVE["cc12.x"] + rows + int(rows * loop.CHECK_POOL)
     assert need < 7 * GIB, "the copies and the working memory are counted once for the run, the first launch once"
-    assert f"this stack needs about {need / GIB:.1f} GiB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GiB are free" in table
+    checks = f"{rows / GIB:.2f} GiB of it for the checks (what they hold for the sequences beyond the first of a count)"
+    assert f"this stack needs about {need / GIB:.1f} GiB on this GPU for 1 and 4 sequences, one count after the other, {checks}; 8.0 GiB are free" in table
+    assert f"{need / GIB:.1f}" == "6.9" and f"{rows / GIB:.2f}" == "0.14"
     assert "one count after the other" not in run(4)[1], "one count: the sentence of that count"
     with pytest.raises(NotImplementedError, match="serves rows 1-65,535; this run has 70000 sequences"):
         run(1, 70000)
     free[0] = 6 * GIB
     with pytest.raises(
-        NotImplementedError, match=r"needs about 6\.\d GiB on this GPU for 1 and 4 sequences, one count after the other; 6.0 GiB are free: free memory"
+        NotImplementedError,
+        match=r"needs about 6\.9 GiB on this GPU for 1 and 4 sequences, one count after the other, 0\.14 GiB of it for the checks \(.*\); 6.0 GiB are free: free memory",
     ):
         run(1, 4)
 
@@ -431,8 +436,10 @@ def test_the_sample_declines_before_its_first_load_and_checks_the_gpu_before_the
         code == 0 and out.splitlines()[-1] == "[00] SKIP cudnn.GdnDecodeFused serves rows 1-65,535; this run has 70000 sequences x 1 tokens per sequence"
     ), out
     code, out = _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=6 * GIB)
+    checks = "0.14 GiB of it for the checks (what they hold for the sequences beyond the first of a count)"
     skip = (
-        "[00] SKIP stack fe-cublas needs about 6.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 6.0 GiB are free: free memory on this GPU"
+        f"[00] SKIP stack fe-cublas needs about 6.9 GiB on this GPU for 1 and 4 sequences, one count after the other, {checks}; 6.0 GiB are free: "
+        "free memory on this GPU"
     )
     assert code == 0 and out.splitlines()[-1].startswith(skip), out
     code, out = _sample_main(monkeypatch, capsys, ["--provider", "mlp.down=nothing"])
@@ -440,7 +447,7 @@ def test_the_sample_declines_before_its_first_load_and_checks_the_gpu_before_the
     with pytest.raises(AssertionError, match="reached a load"):
         _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=8 * GIB)
     out = capsys.readouterr().err
-    assert "this stack needs about 6.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GiB are free" in out
+    assert f"this stack needs about 6.9 GiB on this GPU for 1 and 4 sequences, one count after the other, {checks}; 8.0 GiB are free" in out
     assert "[00] cuDNN Frontend 1.33.0 (editable checkout, source hash 0123456789ab; distribution 1.33.0)" in out and "SKIP" not in out
 
 
@@ -2167,3 +2174,308 @@ def test_two_layouts_in_one_session_are_a_wrong_table_and_the_memory_sentence_co
         == f"  this stack needs about {both_paged / GIB:.1f} GiB on this GPU for 64 and 64 sequences, one count after the other; 200.0 GiB are free"
     )
     assert f"{flat / GIB:.1f}" != f"{first / GIB:.1f}" != f"{both_paged / GIB:.1f}", "the three sentences state three figures"
+
+
+def _nbytes(tensors) -> int:
+    return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+
+def test_what_the_checks_hold_per_row_term_by_term():
+    """``check_row_terms`` against tensors built here, on the CPU, in the shapes the helper layer builds them -- a record, a
+    state on plain caches, the pool of a linear-attention layer and what the judge of the fused step forms over it -- at
+    one and at several sequences and tokens per sequence; ``check_row_bytes`` as the moments it names; at the widths
+    of the two-layer model the terms of 1,024 sequences to the byte; the second reference where it is the larger moment
+    and where it is not; the attention chain's term where the context is long."""
+    from model_samples.loop import Record
+    from model_samples.qwen_dense import QwenDense
+    from model_samples.state import DecodeState
+
+    tiny = _tiny_model()
+    g = tiny.geometry
+    capacity, steps = 12, 7
+    for sequences, tokens in ((1, 1), (4, 1), (85, 1), (16, 2), (1, 6)):
+        rows = sequences * tokens
+        term = tiny.check_row_terms(sequences, capacity, tokens, steps)
+        record = Record(steps, rows, g.vocab, "cpu")
+        assert term["record"] == _nbytes((record.inputs, record.outputs, record.logits)), "what a session keeps of its steps"
+        state = DecodeState(g.layer_kinds, sequences, capacity, tiny.state_shapes(), "cpu", tokens)  # the reference session's: plain caches
+        assert term["reference"] == state.bytes() == tiny.state_bytes(sequences, capacity, tokens), (sequences, tokens)
+        pool = state.layers[0]
+        assert term["pool"] == _nbytes(pool.tensors()), "one save of the judged layer's pool: the recurrent states and the history"
+        live = pool.state[1:]
+        distance = (live - live).abs()  # as the judge forms them: fp32 over the live slots, one byte per element, four fp64 pools
+        assert term["judge"] == _nbytes((distance, distance <= 0.0)) + 4 * _nbytes((pool.state.double(),)), (sequences, tokens)
+        assert term["chain"] == rows * 3 * _nbytes((pool.state[0].double(),)), "three fp64 pool rows per row of a step"
+        keys = torch.zeros((rows, g.attn_kv_heads, capacity, g.attn_head_dim), dtype=torch.float64)
+        assert term["attention"] == 2 * _nbytes((keys,)), "the keys and the values of every position in fp64"
+        one = 4 * term["record"] + term["reference"] + max(3 * term["pool"] + term["judge"], term["attention"])
+        two = 5 * term["record"] + 2 * term["reference"] + term["chain"]
+        assert tiny.check_row_bytes(sequences, capacity, tokens, steps) == one and tiny.check_row_bytes(sequences, capacity, tokens, steps, 2) == max(one, two)
+        assert tiny.check_row_terms(sequences, capacity, tokens)["record"] == _nbytes((Record(capacity, rows, g.vocab, "cpu").logits,)) + 8 * capacity * rows
+        assert tiny.check_row_terms(sequences, capacity, tokens, 99) == tiny.check_row_terms(sequences, capacity, tokens), "no more steps than positions"
+    # the two-layer model at 1,024 sequences and 58 positions, to the byte: one recurrent state is 48 x 128 x 128 fp32 = 3 MiB, the
+    # history of a sequence 3 x 10,240 bf16, a recorded row 8 bytes of ids and 15,520 bf16 logits
+    wide = QwenDense.reduced(2)
+    term = wide.check_row_terms(1024, 58)
+    slot, history, row = 48 * 128 * 128 * 4, 3 * 10240 * 2, 8 + 2 * 15520
+    assert term["record"] == 58 * 1024 * row == 1_844_002_816
+    assert term["pool"] == 1025 * slot + 1025 * history == 3_287_347_200
+    assert term["judge"] == 1024 * slot + 1024 * slot // 4 + 8 * 1025 * slot == 29_821_501_440
+    assert term["reference"] == wide.state_bytes(1024, 58) == 1025 * slot + 1025 * history + 2 * 1024 * 4 * 58 * 256 * 2
+    assert term["chain"] == 1024 * 6 * slot and term["attention"] == 1024 * 2 * 4 * 58 * 256 * 8
+    held = wide.check_row_bytes(1024, 58)
+    assert held == 4 * 1_844_002_816 + term["reference"] + 3 * 3_287_347_200 + 29_821_501_440 and round(held / GIB, 2) == 47.12
+    assert wide.check_row_bytes(1024, 58, references=2) == held, "the two-layer model: the judge's moment is the larger one with a second reference too"
+    assert held - wide.check_row_bytes(1, 58) == 50_502_809_280, "what the sentence adds at 1,024 sequences: 47.03 GiB"
+    # a long context: the fp64 keys and values of the attention chain pass the saves and the judge's tensors
+    long = wide.check_row_terms(64, 4096)
+    assert long["attention"] > 3 * long["pool"] + long["judge"] > wide.check_row_terms(64, 2048)["attention"]
+    assert wide.check_row_bytes(64, 4096) == 4 * long["record"] + long["reference"] + long["attention"]
+    # the published widths, a checkpoint's run (32 recorded steps, two references): the second reference's moment is the larger one
+    full = QwenDense()
+    term = full.check_row_terms(4, 343, record_steps=32)
+    one = 4 * term["record"] + term["reference"] + 3 * term["pool"] + term["judge"]
+    two = 5 * term["record"] + 2 * term["reference"] + term["chain"]
+    assert two > one and full.check_row_bytes(4, 343, record_steps=32, references=2) == two and full.check_row_bytes(4, 343, record_steps=32) == one
+    # a model without a kind of layer has no term of that kind
+    linear = _paged_model(("linear_attention", "linear_attention")).check_row_terms(3, 40)
+    assert linear["attention"] == 0 and linear["pool"] > 0
+    attention = _paged_model(("full_attention", "full_attention")).check_row_terms(3, 40)
+    assert (attention["pool"], attention["judge"], attention["chain"]) == (0, 0, 0) and attention["attention"] > 0
+
+
+def _judged_with_what_is_alive(sequences, steps=7):
+    """A run of the tiny geometry through stand-in providers and its checks, as ``_checked_run`` makes it, with every recorded
+    step kept; and, taken at the FIRST judged call of the fused linear-attention step, the objects that are alive:
+    ``(session, checks, alive)``."""
+    import gc
+
+    import model_samples
+    from model_samples import blocks, tie_out
+    from model_samples.loop import Record
+    from model_samples.providers import factories, torch_ref
+    from model_samples.state import DecodeState
+
+    class Step(torch_ref.GdnDecodeStep):
+        pass
+
+    class Multiply(torch_ref.Linear):
+        def __call__(self, qx, weight, site=""):
+            return super().__call__(qx, weight)
+
+    class GateUp(torch_ref.GateUp):
+        pass
+
+    def kept():  # by its type, never by ``isinstance``: that asks every object of the process for its class
+        return [each for each in gc.get_objects() if type(each) in (Record, DecodeState, torch.Tensor)]
+
+    gc.collect()
+    earlier = kept()  # what another test of the process left alive is not this run's: held here, so that no address is used again
+    known = {id(each) for each in earlier}
+    stand_ins = {"fe.gdn_decode_fused": Step, "cublas.bf16_dequantized": Multiply, "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": GateUp}
+    model = _tiny_model()
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    session = model_samples.Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, record_steps=steps)
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
+    options = {"reference_precision": "fp64", "device": "cpu"}
+    session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, model=model, options=options, factories=dict(factories(), **stand_ins))
+    session.load()
+    ids = session.prefill([text.encode("ab" + str(s)) for s in range(sequences)])
+    session.read(ids)
+    for _ in range(steps - 3):  # a prompt of three tokens and four steps: seven recorded steps
+        ids = session.step(ids)
+        session.read(ids)
+    alive = {}
+    judge = tie_out.BlockTap._judge
+
+    def watched(stats, out, ref, state, ref_state, layer=0, twin=None):
+        if stats.band == "gdn_step" and not alive:
+            gc.collect()
+            found = [each for each in kept() if id(each) not in known]
+            alive["records"] = [each for each in found if type(each) is Record]
+            alive["states"] = [each for each in found if type(each) is DecodeState]
+            alive["tensors"] = [each for each in found if type(each) is torch.Tensor]
+        return judge(stats, out, ref, state, ref_state, layer, twin)
+
+    tie_out.BlockTap._judge = staticmethod(watched)
+    try:
+        checks = tie_out.run_checks(session, prompt_tokens=3)
+    finally:
+        tie_out.BlockTap._judge = staticmethod(judge)
+    return session, checks, alive
+
+
+@pytest.mark.parametrize("sequences", [2, 5])
+def test_the_count_is_what_is_alive_at_the_judge_of_the_fused_step(sequences):
+    """What the memory sentence rests on, on the thing itself: at the first judged call of the fused linear-attention step
+    inside the checks of a run, the records, the states and the saves that are alive are the ones ``check_row_bytes``
+    counts, and their bytes are its terms -- three records and the clones of a fourth, the checked session's state and
+    the reference's, and three saves of the judged layer's pool.  A change of the checks that keeps a record or a save
+    more, or drops one, fails here, so that the count moves with it.  (What the judge itself forms is alive inside its
+    call alone: no host case sees it, the GPU cell of 85 sequences holds PyTorch's peak to the count.)"""
+    session, checks, alive = _judged_with_what_is_alive(sequences)
+    assert checks.ok and alive, checks.text()
+    model = session.model
+    term = model.check_row_terms(sequences, session.capacity, 1, session.record_steps)
+    # the records: the checked session's new one, the first run's, which the checks keep by a name, and the reference session's
+    held = [(record.inputs, record.outputs, record.logits) for record in alive["records"]]
+    assert len(held) == 3 and all(_nbytes(tensors) == term["record"] for tensors in held), [_nbytes(tensors) for tensors in held]
+    assert len({id(tensors[2]) for tensors in held}) == 3, "three records, not one seen three times"
+    # ... and the clones of the first run's checked steps: tensors of a record's shapes that belong to no record
+    of_a_record = {id(tensor) for tensors in held for tensor in tensors}
+    shapes = {tuple(tensor.shape) for tensor in held[0]}
+    clones = [tensor for tensor in alive["tensors"] if tuple(tensor.shape) in shapes and id(tensor) not in of_a_record]
+    assert len(clones) == 3 and _nbytes(clones) == term["record"], [tuple(tensor.shape) for tensor in clones]
+    # the states: the checked session's own, which the sentence counts as the state, and the reference session's on plain caches
+    assert len(alive["states"]) == 2 and sorted(state.bytes() for state in alive["states"]) == sorted(
+        [session.state.bytes(), term["reference"]]
+    ), "one reference state"
+    # the saves of the judged layer's pool: before the call, after it, and what the twin left
+    pool = session.state.layers[0].tensors()
+    of_a_state = {id(tensor) for state in alive["states"] for layer in state.layers for tensor in layer.tensors()}
+    saves = [tensor for tensor in alive["tensors"] if tuple(tensor.shape) in {tuple(each.shape) for each in pool} and id(tensor) not in of_a_state]
+    assert len(saves) == 3 * len(pool) and _nbytes(saves) == 3 * term["pool"], [tuple(tensor.shape) for tensor in saves]
+    # so what the count holds beyond the judge's own tensors is alive, to the byte
+    assert model.check_row_bytes(sequences, session.capacity, 1, session.record_steps) - term["judge"] == (
+        _nbytes([tensor for tensors in held for tensor in tensors]) + _nbytes(clones) + term["reference"] + _nbytes(saves)
+    )
+
+
+COPY = "the reference's bf16 copy of one weight at a time, where the run keeps none"
+
+
+def _sentences(monkeypatch, model, free=200 * GIB, cc=(10, 0)):
+    """``sentence(stack, *counts)``: the memory sentence of a run of ``model`` on stated device facts, one session per count."""
+    import model_samples
+    from model_samples import blocks
+
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls(cc, "stated device", 148, 0, free)))
+
+    def sentence(stack, *counts, **session):
+        common = dict(stack=stack, device="cuda:0", capacity=58, **session)
+        first = model_samples.Session(model, text, sequences=counts[0], **common)
+        later = [model_samples.Session(model, text, sequences=count, share=first, **common) for count in counts[1:]]
+        return first.plan_table(later).splitlines()[-1].strip()
+
+    return sentence
+
+
+def test_the_memory_sentence_counts_what_the_checks_hold_for_every_sequence_beyond_the_first(monkeypatch):
+    """The sentence of the seeded default request (the two-layer model, 58 positions) on stated facts of compute capability
+    10.0.  One sequence: the sentence it was.  Several: the need holds what the checks of the run hold for every
+    sequence beyond the first -- the family's arithmetic, named as the checks' part -- and a share of that part more
+    for PyTorch's pool (``loop.CHECK_POOL``); a stack that keeps weights on their stored format alone names both parts
+    of the checks.  The reference stack runs no checks and its sentence is the one it was."""
+    from model_samples import loop
+    from model_samples.qwen_dense import QwenDense
+
+    model = QwenDense.reduced(2)
+    sentence = _sentences(monkeypatch, model)
+    assert sentence("fe-entries", 1) == f"this stack needs about 3.5 GiB on this GPU, 0.33 GiB of it for the checks ({COPY}); 200.0 GiB are free"
+    assert sentence("fe-cublas", 1) == "this stack needs about 3.7 GiB on this GPU; 200.0 GiB are free", "one sequence: nothing beyond the first"
+    assert sentence("fe-entries", 85) == (
+        "this stack needs about 9.4 GiB on this GPU, 3.86 GiB of it for the checks (what they hold for the 84 sequences beyond the first); 200.0 GiB are free"
+    )
+    assert sentence("fe-entries", 1024) == (
+        "this stack needs about 72.9 GiB on this GPU, 47.03 GiB of it for the checks (what they hold for the 1023 sequences beyond the first); "
+        "200.0 GiB are free"
+    )
+    assert sentence("fe-entries", 2).endswith(
+        f"0.38 GiB of it for the checks ({COPY}, and what they hold for the 1 sequence beyond the first); 200.0 GiB are free"
+    )
+    # the figure is the need of that count as it was, the family's count beyond the first sequence, and the pool's share of the count
+    rows = model.check_row_bytes(85, 58) - model.check_row_bytes(1, 58)
+    assert round(rows / GIB, 2) == 3.86
+    assert (
+        f"{(model.memory_bytes(85, 58, page=64) + rows + int(rows * loop.CHECK_POOL)) / GIB:.1f}" == "9.4"
+        and f"{model.memory_bytes(85, 58, page=64) / GIB:.1f}" == "4.0"
+    )
+    # the default run, 1 and 4 sequences in one process, on the four stacks
+    several = " for 1 and 4 sequences, one count after the other"
+    beyond = "what they hold for the sequences beyond the first of a count"
+    assert sentence("fe-cublas", 1, 4) == f"this stack needs about 3.9 GiB on this GPU{several}, 0.14 GiB of it for the checks ({beyond}); 200.0 GiB are free"
+    both = f"0.47 GiB of it for the checks ({COPY}, and {beyond})"
+    assert sentence("fe-entries", 1, 4) == f"this stack needs about 3.7 GiB on this GPU{several}, {both}; 200.0 GiB are free"
+    assert sentence("native", 1, 4) == f"this stack needs about 3.4 GiB on this GPU{several}, {both}; 200.0 GiB are free"
+    assert sentence("reference", 1, 4) == f"this stack needs about 3.7 GiB on this GPU{several}; 200.0 GiB are free", "no checks run on the reference stack"
+    assert sentence("reference", 1024) == "this stack needs about 7.0 GiB on this GPU; 200.0 GiB are free", "its state, and nothing of a check"
+
+
+def test_the_rows_part_of_a_run_and_its_clause_in_every_form_of_the_sentence(monkeypatch):
+    """What a run adds for its checks, session by session: of several counts the largest part and of every other session its
+    record; a session that verifies behind its prompt by its rows; nothing for a session of one sequence, with a drafter
+    or without, nothing on the reference stack, and nothing of a family that counts nothing.  And the clause in the three
+    forms of the sentence: the line, the SKIP for too little free memory, the SKIP for a run the GPU cannot hold."""
+    import model_samples
+    from model_samples import blocks, loop
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+
+    model = QwenDense.reduced(2)
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 200 * GIB)))
+
+    def held(sequences, tokens=1, capacity=58, references=1):
+        return model.check_row_bytes(sequences, capacity, tokens, None, references) - model.check_row_bytes(1, capacity, tokens, None, references)
+
+    def record(sequences, tokens=1, capacity=58):
+        return model.check_row_terms(sequences, capacity, tokens)["record"] - model.check_row_terms(1, capacity, tokens)["record"]
+
+    def sessions(*shapes, stack="fe-entries", capacity=58):
+        first = model_samples.Session(model, text, stack=stack, device="cuda:0", capacity=capacity, **shapes[0])
+        return first, [model_samples.Session(model, text, stack=stack, device="cuda:0", capacity=capacity, share=first, **shape) for shape in shapes[1:]]
+
+    first, later = sessions(dict(sequences=9), dict(sequences=4))
+    assert first._check_rows(later, 1) == held(9) + record(4), "the checks of the larger count, and the record the other count keeps"
+    first, later = sessions(dict(sequences=4), dict(sequences=9))
+    assert first._check_rows(later, 1) == held(9) + record(4), "whichever comes first"
+    assert first._check_rows(later, 2) == held(9, references=2) + record(4) and first._check_rows([], 1) == held(4)
+    first, later = sessions(dict(sequences=1), dict(sequences=1))
+    assert first._check_rows(later, 1) == 0, "one sequence: nothing beyond the first"
+    first, later = sessions(dict(sequences=16), dict(sequences=16, draft_tokens=1), capacity=42)
+    assert first._check_rows(later, 1) == held(16, 2, 42) + record(16, 1, 42), "a session behind its prompt: by its rows, two a sequence"
+    sentence = first.plan_table(later).splitlines()[-1]
+    kinds = "a plain session of 16 sequences and a session of 16 sequences x 2 tokens behind its prompt, one after the other"
+    assert f" for {kinds}, 1.67 GiB of it for the checks ({COPY}, and what they hold for the sequences beyond the first of a session); " in sentence
+    drafter = QwenDenseDrafter.seeded(model)
+    first, later = sessions(dict(sequences=1), dict(sequences=1, draft_tokens=5, drafter=drafter))
+    assert first._check_rows(later, 1) == 0 and "what they hold" not in first.plan_table(later), "a drafter serves one sequence"
+    first, later = sessions(dict(sequences=4), dict(sequences=9), stack="reference")
+    assert first._check_rows(later, 1) == 0, "the reference stack runs no checks"
+    # the share for PyTorch's pool is of the rows part, and is in the need without a name of its own
+    first, later = sessions(dict(sequences=64))
+    need = model.memory_bytes(64, 58, **first._kept(), page=64)
+    part = held(64) + model.check_bytes(first._kept()["uncopied"])
+    assert first.plan_table().splitlines()[-1].strip() == (
+        f"this stack needs about {(need + held(64) + int(held(64) * loop.CHECK_POOL)) / GIB:.1f} GiB on this GPU, {part / GIB:.2f} GiB of it for the checks "
+        f"({COPY}, and what they hold for the 63 sequences beyond the first); 200.0 GiB are free"
+    )
+    # a family that counts nothing is not asked: the sentence it had
+    with monkeypatch.context() as without:
+        without.delattr(QwenDense, "check_row_bytes")
+        first, later = sessions(dict(sequences=4), dict(sequences=9), stack="fe-cublas")
+        assert first._check_rows(later, 1) == 0
+        assert first.plan_table(later).splitlines()[-1].strip() == (
+            f"this stack needs about {(model.memory_bytes(4, 58) + model.state_bytes(9, 58)) / GIB:.1f} GiB on this GPU for 4 and 9 sequences, "
+            "one count after the other; 200.0 GiB are free"
+        )
+    # the clause in the three forms of the sentence, on a plan with stated facts
+    plan = _plan(stack="fe-entries", sequences=85)
+    rows, beyond = held(85), "the 84 sequences beyond the first"
+    clause = "3.86 GiB of it for the checks (what they hold for the 84 sequences beyond the first)"
+    assert plan.memory(8 * GIB, "", 0, rows, beyond) == f"this stack needs about 8.0 GiB on this GPU, {clause}; 80.0 GiB are free"
+    plan.facts = _facts(free=6 * GIB)
+    with pytest.raises(NotImplementedError) as skip:
+        plan.memory(8 * GIB, "", 0, rows, beyond)
+    assert str(skip.value).startswith(f"stack fe-entries needs about 8.0 GiB on this GPU, {clause}; 6.0 GiB are free: free memory on this GPU")
+    with pytest.raises(NotImplementedError) as skip:
+        plan.memory(200 * GIB, "", GIB // 2, rows, beyond)
+    assert str(skip.value).startswith(
+        f"stack fe-entries needs about 200.0 GiB on this GPU, 4.36 GiB of it for the checks ({COPY}, and what they hold for {beyond}); "
+        "this GPU has 180.0 GiB in total"
+    )
+    assert plan.memory(4 * GIB, "", 1, 0, beyond) == f"this stack needs about 4.0 GiB on this GPU, 0.00 GiB of it for the checks ({COPY}); 6.0 GiB are free"
+    assert plan.memory(4 * GIB, "", 0, 1, beyond).endswith(
+        ", 0.00 GiB of it for the checks (what they hold for the 84 sequences beyond the first); 6.0 GiB are free"
+    )
+    assert plan.memory(4 * GIB, "", 0, 0, beyond) == "this stack needs about 4.0 GiB on this GPU; 6.0 GiB are free", "no byte of the checks: no clause"

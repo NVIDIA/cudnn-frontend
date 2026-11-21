@@ -169,8 +169,13 @@ AREA_POLICY = (
     "family's kernel census was recorded with, and a pin changes only together with a recorded run; a security update of one fails the host tests "
     "until that run is made.",
 )
-#: what a run of the stack ``native`` at 65,535 rows needs: the library rows hold their weights on the stored codes at every row count
-MOST_NATIVE = "263.3 GiB on this GPU, 0.17 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)"
+#: the two parts of a memory sentence that are the checks' own, as the sentence names them
+COPY = "the reference's bf16 copy of one weight at a time, where the run keeps none"
+BEYOND = "what they hold for the sequences beyond the first of a count"
+#: what a run of 65,535 rows needs: its state, what its checks hold for 65,534 sequences beyond the first, and four tenths of
+#: that for PyTorch's pool; on the stack ``native`` the library rows hold their weights on the stored codes at every row count
+MOST = "6652.2 GiB on this GPU, 4563.36 GiB of it for the checks (what they hold for the 65534 sequences beyond the first)"
+MOST_NATIVE = f"6652.0 GiB on this GPU, 4563.53 GiB of it for the checks ({COPY}, and what they hold for the 65534 sequences beyond the first)"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -4470,7 +4475,8 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
     device a session resolves the tables of every sequence count, which allocates nothing, asks whether the whole run
     fits, and only then lets the entries make their first use -- still before anything is loaded.  A GPU that is too
     small gets the SKIP with the estimate on every provider stack, from the session and as the last line of the sample's
-    ``main()``, and nothing was built for it.  A toolchain an entry declines stays a SKIP before the weights, also for a
+    ``main()``, and nothing was built for it -- also a run of many sequences whose state would fit and whose checks
+    would not.  A toolchain an entry declines stays a SKIP before the weights, also for a
     session that is loaded without its table.  The library rows of ``native`` make their first use in the same place:
     behind the memory sentence, in the order of the blocks."""
     import cudnn
@@ -4534,9 +4540,9 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
 
     sentence = blocks.Plan.memory
 
-    def memory(plan, need_bytes, what="", checks_bytes=0):
+    def memory(plan, *parts):  # the need, what it covers, and the two parts of it that are the checks'
         events.append(("memory sentence", plan.stack))
-        return sentence(plan, need_bytes, what, checks_bytes)
+        return sentence(plan, *parts)
 
     def no_weights(model, *arguments, **options):
         raise AssertionError("reached a load")
@@ -4564,10 +4570,10 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
     assert state == 192 * GIB and model.state_bytes(65535, 256) > state + conv, "the scratch state of a first use at 65,535 rows: one slot pool of the run"
     assert configs.PROVIDERS["linear_attention.step"][0].sequences == (1, 65535), "the row count the fused step's rows admit"
 
-    def run(stack, *counts):
+    def run(stack, *counts, **request):  # ``capacity=58``: the positions of the sample's default request
         del events[:]
-        first = Session(model, text, sequences=counts[0], stack=stack, device="cuda:0")
-        later = [Session(model, text, sequences=count, stack=stack, device="cuda:0", share=first) for count in counts[1:]]
+        first = Session(model, text, sequences=counts[0], stack=stack, device="cuda:0", **request)
+        later = [Session(model, text, sequences=count, stack=stack, device="cuda:0", share=first, **request) for count in counts[1:]]
         return first, first.plan_table(later)
 
     def norm_builds(stack):
@@ -4602,7 +4608,7 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         gpu.update(total=180 * GIB, free=1 * GIB)
         with pytest.raises(NotImplementedError) as skipped:
             run(stack, 65535)
-        most = {"native": MOST_NATIVE}.get(stack, "263.5 GiB on this GPU")
+        most = {"native": MOST_NATIVE}.get(stack, MOST)
         assert str(skipped.value) == (
             f"stack {stack} needs about {most}; this GPU has 180.0 GiB in total: the run does not fit on it (CUDA_VISIBLE_DEVICES selects another GPU)"
         )
@@ -4611,15 +4617,26 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         # and whose gate / up multiply are on the stored weights at both counts keeps those and no bf16 copy of them (0.15 GiB
         # of 8-bit codes and 0.19 GiB of 4-bit codes where the copies are 0.29 and 0.66 GiB, for the two-layer model); the
         # reference of its checks then makes its copy of one such weight at a time (0.33 GiB the largest: a gate / up weight),
-        # and the sentence says that part
-        what, gib = " for 1 and 4 sequences, one count after the other", "3.7"
+        # and the sentence says that part beside what the checks hold for the three sequences beyond the first (0.14 GiB)
+        what, gib = f" for 1 and 4 sequences, one count after the other, 0.14 GiB of it for the checks ({BEYOND})", "3.9"
         if stack != "fe-cublas":
-            what += ", 0.33 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)"
-            gib = "3.2" if stack == "native" else "3.5"  # native keeps the out-projections, the down multiplies and the head on their stored codes too
+            what = f" for 1 and 4 sequences, one count after the other, 0.47 GiB of it for the checks ({COPY}, and {BEYOND})"
+            gib = "3.4" if stack == "native" else "3.7"  # native keeps the out-projections, the down multiplies and the head on their stored codes too
         few = "^" + re.escape(f"stack {stack} needs about {gib} GiB on this GPU{what}; 1.0 GiB are free: free memory on this GPU")
         with pytest.raises(NotImplementedError, match=few):
-            run(stack, 1, 4)
+            run(stack, 1, 4, capacity=58)
         assert events == [("memory sentence", stack)], stack
+        # ... and a run of 1,024 sequences on a GPU with 30 GiB free: its state is 3.3 GiB and would fit, what its checks hold
+        # for 1,023 sequences beyond the first does not -- declined here, and not by an allocation inside the checks
+        gpu.update(free=30 * GIB)
+        many = {"fe-cublas": "72.8", "native": "72.7"}.get(stack, "72.9")  # the weights each stack holds at that count
+        with pytest.raises(NotImplementedError) as skipped:
+            run(stack, 1024, capacity=58)
+        assert str(skipped.value).startswith(f"stack {stack} needs about {many} GiB on this GPU, ") and str(skipped.value).endswith(
+            "what they hold for the 1023 sequences beyond the first); 30.0 GiB are free: free memory on this GPU, or select another one with CUDA_VISIBLE_DEVICES"
+        ), str(skipped.value)
+        assert events == [("memory sentence", stack)], f"{stack}: nothing is built for a run whose checks do not fit"
+        gpu.update(free=1 * GIB)
         del events[:]
         with monkeypatch.context() as scoped:  # the sample's own run on such a device; what it patches ends with it
             code, out = _sample_main(scoped, capsys, ["--stack", stack], total=180 * GIB, free=1 * GIB)
@@ -4630,7 +4647,7 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         assert events == [("memory sentence", stack)], f"{stack}: the sample's own run builds nothing either"
         # (3) with room: the memory sentence, then the first use of every entry for every sequence count, then nothing more
         gpu.update(free=80 * GIB)
-        first, table = run(stack, 1, 4)
+        first, table = run(stack, 1, 4, capacity=58)
         assert f"this stack needs about {gib} GiB on this GPU{what}; 80.0 GiB are free" in table
         assert events == [("memory sentence", stack), *first_uses(stack, 1, 4)], f"{stack}: the budget first, then the builds"
         with pytest.raises(AssertionError, match="reached a load"):

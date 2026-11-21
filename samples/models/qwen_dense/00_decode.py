@@ -669,7 +669,7 @@ def main(argv=None) -> int:
         # what a library row of the stack does at its first use beyond an entry's build, said before it is made
         for note in dict.fromkeys(note for session, _ in runs for note in session.resolve().announcements()):
             _say(f"{TAG} planning: {note}", flush=True)
-        tables = [first.plan_table(later)] + [session.resolve().table() for session in later]
+        tables = [first.plan_table(later, references=2 if real else 1)] + [session.resolve().table() for session in later]
         claims = [session.claim() for session, _ in runs]  # of a stack that declares a target: how each run stands to it
     except NotImplementedError as error:
         _say(f"{TAG} SKIP {error}")

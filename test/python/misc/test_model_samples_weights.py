@@ -697,15 +697,25 @@ def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_te
     out = capsys.readouterr().err
     assert code == 0 and str(tmp_path) not in out, out
     assert out.splitlines()[0].startswith("[00] qwen_dense decode | checkpoint tiny-checkpoint (local): 2 shards, ") and "manifest hash" in out
+    # two sequences of the tiny geometry: what the checks hold for the second one is a few kilobytes, and the sentence names every part that is not zero
+    checks = "0.00 GiB of it for the checks (what they hold for the sequences beyond the first of a count)"
     skip = (
-        "[00] SKIP stack fe-cublas needs about 2.0 GiB on this GPU for 1 and 2 sequences, one count after the other; 1.0 GiB are free: free memory on this GPU"
+        f"[00] SKIP stack fe-cublas needs about 2.0 GiB on this GPU for 1 and 2 sequences, one count after the other, {checks}; 1.0 GiB are free: "
+        "free memory on this GPU"
     )
     assert out.splitlines()[-1].startswith(skip), out
     free[0] = 8 * 1024**3
+    from model_samples import Session
+
+    told, planned = [], Session.plan_table
+    monkeypatch.setattr(Session, "plan_table", lambda self, later=(), references=1: told.append(references) or planned(self, later, references))
     with pytest.raises(AssertionError, match="reached a load"):
         sample.main(arguments)
+    assert told == [2], "a run with a checkpoint checks a second reference stack, and its plan is told so: the count takes the larger of the two moments"
     out = capsys.readouterr().err
-    assert "this stack needs about 2.0 GiB on this GPU for 1 and 2 sequences, one count after the other; 8.0 GiB are free" in out and "SKIP" not in out
+    assert (
+        f"this stack needs about 2.0 GiB on this GPU for 1 and 2 sequences, one count after the other, {checks}; 8.0 GiB are free" in out and "SKIP" not in out
+    )
     assert "stack fe-cublas, 1 sequence, cc 10.0" in out and "[00] tokenizer and chat template of checkpoint tiny-checkpoint" in out
     monkeypatch.setitem(sys.modules, "safetensors", None)  # as if the package were not installed
     code = sample.main(arguments)

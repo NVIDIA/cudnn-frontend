@@ -407,17 +407,20 @@ class Plan(dict):
     def reserve_bytes(self) -> int:
         return sum(block.reserve_bytes() for block in self.values())
 
-    def memory(self, need_bytes: int, what: str = "", checks_bytes: int = 0) -> str:
+    def memory(self, need_bytes: int, what: str = "", checks_bytes: int = 0, rows_bytes: int = 0, beyond: str = "") -> str:
         """The memory sentence, in GiB (2^30 bytes); ``what`` names what the need covers when that is more than this plan's
-        run.  ``checks_bytes`` is the part of ``need_bytes`` that is the checks' own -- the bf16 copy their reference
-        makes, one at a time, of a weight the run keeps on its stored format alone: the sentence then states it, in GiB
-        to two places (a copy of one weight is a fraction of one).  Raises ``NotImplementedError`` (a SKIP that names
-        what to do) when the GPU has too little free, and says so when the need exceeds what the GPU has in total:
-        freeing memory cannot help there."""
+        run.  Two parts of ``need_bytes`` are the checks' own, and the sentence states their sum, in GiB to two places,
+        and names each that is not zero bytes: ``checks_bytes``, the bf16 copy their reference makes, one at a time, of
+        a weight the run keeps on its stored format alone (a copy of one weight is a fraction of a GiB), and
+        ``rows_bytes``, what they hold for the sequences ``beyond`` names (``the 84 sequences beyond the first``).
+        Raises ``NotImplementedError`` (a SKIP that names what to do) when the GPU has too little free, and says so
+        when the need exceeds what the GPU has in total: freeing memory cannot help there."""
         need = need_bytes + self.reserve_bytes()
         free, total = self.facts.free_bytes, self.facts.total_bytes
-        if checks_bytes:
-            what += f", {checks_bytes / GIB:.2f} GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)"
+        parts = ["the reference's bf16 copy of one weight at a time, where the run keeps none"] if checks_bytes else []
+        parts += [f"what they hold for {beyond}"] if rows_bytes else []
+        if parts:
+            what += f", {(checks_bytes + rows_bytes) / GIB:.2f} GiB of it for the checks ({', and '.join(parts)})"
         if total and need > total:
             raise NotImplementedError(
                 f"stack {self.stack} needs about {need / GIB:.1f} GiB on this GPU{what}; this GPU has {total / GIB:.1f} GiB in total: "

@@ -14,7 +14,8 @@ bytes of a step.  The performance mode of the same seeded model (``--perf``) run
 its verdict, its report in the reduced-model form and its report file are held, none of its times.  The
 verdict line, the stack, the versions and the wall time are recorded through ``frost_routing.measured``, so the result -- or
 the skip -- reaches the job log of a passing run.  L0 runs the two-layer model (one linear-attention + one attention layer), L1
-the four-layer one (three + one).
+the four-layer one (three + one), and a run of 85 sequences of the two-layer model, whose peak of allocated memory is held to the memory
+sentence and to the count behind it.
 
 The ``fe-entries`` cell runs the same default run on the stack ``fe-entries``: every cuDNN Frontend row of the stack ``native``
 (the fused linear-attention step in its wait + release form; on compute capability 10.x the attention gate + quantise
@@ -278,8 +279,9 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
             f"weights this run keeps on their stored format alone ({kept})" in line for line in made
         ), "no bf16 copy of these weights is held: the reference of the checks made its own, at both sequence counts"
         assert (
-            "GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)" in out
-        ), "and the memory sentence says so"
+            "GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none, and what they hold for the sequences "
+            "beyond the first of a count)" in out
+        ), "and the memory sentence says so, beside what the checks hold for the sequences beyond the first"
         held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
         assert len(held) == 2 and all(
             line.startswith(f"  stored weights    {count} of {count} weights this run keeps on their stored format alone hold the bytes of their load, ")
@@ -291,7 +293,10 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         peak = float(out.split("GPU memory: PyTorch peak ", 1)[1].split(" GiB allocated", 1)[0])
         assert 0.0 < peak < need, f"PyTorch held {peak} GiB at its peak; the memory sentence states {need} GiB"
     else:
-        assert "\n  on demand " not in out and " for the checks (" not in out, "every weight has its bf16 copy: nothing is made on demand"
+        assert "\n  on demand " not in out and "the reference's bf16 copy of one weight" not in out, "every weight has its bf16 copy: nothing is made on demand"
+        assert (
+            "GiB of it for the checks (what they hold for the sequences beyond the first of a count)" in out
+        ), "the checks' part of the sentence is of the rows alone"
         assert "\n  stored weights " not in out, "and the reference reads the copies of the load: no stored bytes to hold"
         assert "cudnn.SwigluFp4Decode" not in out and "cudnn.AttentionPrepareDecode" not in out, "the rows claim compute capability 10.x only"
         assert any(line.split()[:1] == ["mlp.gate_up"] and line.endswith("fallback: bf16 copy of 4-bit weights") for line in out.splitlines())
@@ -462,6 +467,63 @@ def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
         assert out.count("chosen by the library for projection.fp8.out at ") == 2, "the library's pick at both call sites: printed and compared, never gated"
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
     frost_routing.measured("model sample qwen_dense 00_decode --stack native: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
+
+
+@pytest.mark.L1
+def test_the_memory_sentence_holds_what_a_run_of_85_sequences_takes(sample):
+    """``--stack fe-entries --sequences 85`` in a fresh interpreter, on compute capability 10.x: a run of many sequences holds,
+    beyond its weights and its state, what its checks keep for every sequence, and the memory sentence counts it.  The run
+    passes its checks; PyTorch's peak of allocated bytes is below the sentence; and it is within 5 % of the weights the
+    plan holds, the state and what the family counts for the checks (``check_row_bytes``), formed here from the model's own
+    functions for the plan of this GPU.  This cell is what holds the judge's own tensors -- two fp64 copies of a pool,
+    their difference and its square -- to the count: they are alive inside one call, where no host case looks.
+    The run takes about 8 GiB of device memory, so the cell is L1: at L0 the count is held by the host cases alone, and
+    its largest term on a GPU is uncovered there.  Skipped by name on a class the stack's entries do not claim and
+    where the sentence declines the GPU."""
+    import re
+
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the runs this count is held to are of the rows of compute capability 10.x: uncovered on this class, not passing")
+    start = time.perf_counter()
+    code, out, written = _fresh_interpreter(["--stack", "fe-entries", "--sequences", "85"])
+    tagged = [line for line in out.splitlines() if line.startswith("[00] ")]
+    verdict = tagged[-1] if tagged else "no output"
+    frost_routing.measured("model sample qwen_dense 00_decode --stack fe-entries --sequences 85", f"{verdict}; {time.perf_counter() - start:.0f} s")
+    if verdict.startswith("[00] SKIP"):
+        assert " FAIL" not in out and "[00] ERROR" not in out, out[-6000:]  # a skip never covers a failed check
+        pytest.skip(verdict)
+    unobserved = verdict.startswith("[00] RAN fe-entries stack (kernels not observed: ")
+    assert code == 0 and (verdict == "[00] PASS" or unobserved) and " FAIL" not in out, out[-6000:]
+    assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
+    sentence = next(line.strip() for line in out.splitlines() if line.strip().startswith("this stack needs about "))
+    assert "what they hold for the 84 sequences beyond the first); " in sentence, sentence
+    need = float(sentence.split("this stack needs about ", 1)[1].split(" GiB", 1)[0])
+    peak = float(out.split("GPU memory: PyTorch peak ", 1)[1].split(" GiB allocated", 1)[0])
+    assert 0.0 < peak < need, f"PyTorch held {peak} GiB at its peak; the memory sentence states {need} GiB"
+    # the arithmetic of the sentence's parts, without its allowances: the weights and the state of this GPU's plan, and the count
+    import model_samples
+    from model_samples.qwen_dense import QwenDense
+
+    request = re.search(r"decoding: (\d+) prompt tokens through the decode step, then (\d+) new tokens", out)
+    capacity = int(request.group(1)) + int(request.group(2))  # the positions of the run: its prompt and its new tokens
+    model = QwenDense.reduced(2)
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    session = model_samples.Session(model, text, sequences=85, stack="fe-entries", device=f"cuda:{torch.cuda.current_device()}", capacity=capacity)
+    session.resolve()  # the tables of this GPU: nothing is built or loaded
+    held = model.copy_bytes(session.uncopied_weights()) + model.stored_bytes(session.stored_weights())
+    page = session.cache_page()
+    state = model.state_bytes(85, capacity, **({} if page is None else {"page": page}))
+    counted = (held + state + model.check_row_bytes(85, capacity)) / 2**30
+    frost_routing.measured(
+        "model sample qwen_dense 00_decode --stack fe-entries --sequences 85: memory",
+        f"the sentence {need} GiB; PyTorch's peak {peak} GiB; counted {counted:.2f} GiB",
+    )
+    assert abs(peak / counted - 1.0) <= 0.05, (
+        f"PyTorch held {peak} GiB at its peak; the weights held, the state and what the checks hold are {counted:.2f} GiB by the count "
+        f"({held / 2**30:.2f} + {state / 2**30:.2f} + {model.check_row_bytes(85, capacity) / 2**30:.2f})"
+    )
 
 
 @pytest.mark.L1

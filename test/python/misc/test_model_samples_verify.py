@@ -1429,9 +1429,10 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     behind = Session(wide, TextIO.synthetic(wide.geometry.vocab), share=first, draft_tokens=1, **several)
     sentence = first.plan_table([behind]).splitlines()[-1]
     assert (
-        "this stack needs about 3.7 GiB on this GPU for a plain session of 16 sequences and a session of 16 sequences x 2 tokens behind its prompt, "
-        "one after the other" in sentence
-    ), "today a pool of whole pages, 64 positions where the cache of that run held 42: the 3.6 GiB of the dated sentence below, and 0.1 more"
+        "this stack needs about 5.5 GiB on this GPU for a plain session of 16 sequences and a session of 16 sequences x 2 tokens behind its prompt, "
+        "one after the other, 1.67 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none, and what they "
+        "hold for the sequences beyond the first of a session); 80.0 GiB are free" in sentence
+    ), "today the sentence counts what the checks hold for the fifteen sequences beyond the first: the 3.6 GiB of the dated sentence below are of its day"
     assert (
         "At 16 sequences of two tokens the run asked for about 3.6 GiB, reserved 4.3 GiB and grew the device by 4.4 GiB: the comparison keeps what the "
         "session stands on after each step it replays -- 21 steps of 16 sequences in that run -- until its second replay has ended, and the memory "
