@@ -198,8 +198,12 @@ def _sm90_partial_pack(row: str, facts) -> bool:
     """SM90 d256 single-row decode whose GQA group the row packs only in part (the packed group must divide the tile): each
     packed CTA still re-reads K/V G / pack times. On H100 it ran 1.35-1.40x the backend where full packs ran 0.87-0.95 at b >= 8
     (sm90_dense_d256_q1_h100_20261118), so it keys apart; paged likewise (qwen36_27b 24/4 on the h200 nightly: 2.3-2.4x,
-    sm90_paged_decode_gaps_20261118). Scoped to the measured classes."""
-    if row != "sdpa_fwd_prefill_sm90" or (facts.d_qk, facts.d_v) != (256, 256) or facts.s_q != 1 or facts.thd:
+    sm90_paged_decode_gaps_20261118). Paged windowed d192 x 192 likewise: group 12 (pack 4) ran 1.09-1.45x at b >= 32 where
+    group 16 ran 0.53-0.58 (sm90_paged_window_mtp_gaps_20261121's holdout). Scoped to the measured classes."""
+    if row != "sdpa_fwd_prefill_sm90" or facts.s_q != 1 or facts.thd:
+        return False
+    d192_window = (facts.d_qk, facts.d_v) == (192, 192) and facts.has_paged_kv and facts.window_left is not None
+    if (facts.d_qk, facts.d_v) != (256, 256) and not d192_window:
         return False
     pack = _decode_pack_group(row, facts)
     return pack is not None and 1 < pack < facts.h_q // facts.h_kv
@@ -1856,7 +1860,8 @@ TABLE: Dict[Tuple, Entry] = {
     # - windowed d128 single-row decode leads up to 2^6.161 query rows (ripple / step37 swa); holdout 0.73 / 0.59, worst 1.03.
     # - windowed d128 verify off the tile leads from 2^1.5 parallel tiles; holdout 0.60. On the tile the 2^9.246-row entry above stays.
     # - windowed d64 MTP and verify lead always (muse_spark swa); holdout 0.71-0.78, worst 0.91.
-    # Windowed d192 x 192 and d64 single-row decode failed the holdout (group-12 and large-batch cells at 1.14-1.45) and keep the rules.
+    # Windowed d192 x 192 and d64 single-row decode failed the holdout (group-12 and large-batch cells at 1.14-1.45); d192 x 192 is
+    # sm90_paged_window_q1_v2_20261121's (below), d64 keeps the rules.
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_unpacked", False): Entry(
         "le", 4.0, "sm90_paged_window_mtp_gaps_20261121", "tiles", ("ge", 9.0, "kv")
     ),
@@ -1883,6 +1888,22 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "verify", "paged", "window", False, "gqa", True): Entry(
         "always", None, "sm90_paged_window_mtp_gaps_20261121"
+    ),
+    # study sm90_paged_window_q1_v2_20261121 (H200 700 W, cuDNN 9.24.0.43, FE b69cc1a63; paged page 16, windows 256-4096): windowed
+    # d192 x 192 single-row decode (step5 swa 64/4) keyed by the row's pack group. Whole packs (groups 2 / 4 / 8 / 16 / 32) lead always:
+    # 914 train cells at b 1-128, worst 0.83; holdout 0.45 / 0.48, worst 0.66. Partial packs (gqa_partial: groups 6-24) lead up to 2^5.5
+    # parallel tiles on the KV tile and 2^4.5 off it; holdout 0.53 / 0.33, worst 0.76. 1284 new train cells pooled with v1's.
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm90_paged_window_q1_v2_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm90_paged_window_q1_v2_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa_partial", False): Entry(
+        "le", 5.5, "sm90_paged_window_q1_v2_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa_partial", True): Entry(
+        "le", 4.5, "sm90_paged_window_q1_v2_20261121", "tiles"
     ),
     # study sm90_d64_sink_mtp_20261118 (H100 700 W, cuDNN 9.24.0.43 and 9.30.0.8; 813 + 318 off-tile train cells, 60 holdout cells at
     # fresh head pairs scored once): gpt-oss paged d64 MTP with a sink, which the row runs unpacked. Full cache leads up to 2^4.5 parallel

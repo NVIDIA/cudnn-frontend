@@ -1865,7 +1865,7 @@ def test_sm90_paged_decode_gap_entries_follow_the_study(s_kv):
 def test_sm90_paged_window_and_unpacked_mtp_follow_their_study(s_kv):
     """Study sm90_paged_window_mtp_gaps_20261121 (H200): d128 MTP with a group the decode tile does not divide leads up to 2^4 tiles
     (on the KV tile from 2^9 keys); windowed d128 single-row decode up to 2^6.161 query rows; windowed d128 verify off the tile from
-    2^1.5 tiles; windowed d64 MTP and verify always. Windowed d192 x 192 and d64 single-row decode keep the rules."""
+    2^1.5 tiles; windowed d64 MTP and verify always. Windowed d192 x 192 and d64 single-row decode are not this study's."""
     row = "sdpa_fwd_prefill_sm90"
     study = "sm90_paged_window_mtp_gaps_20261121"
     on_tile = s_kv % 128 == 0
@@ -1900,6 +1900,38 @@ def test_sm90_paged_window_and_unpacked_mtp_follow_their_study(s_kv):
     for single_row in (g(s_q=1, d_qk=192, d_v=192, h_q=64, h_kv=4, window_left=511), g(s_q=1, d_qk=64, d_v=64, h_q=16, h_kv=2, window_left=2047)):
         entry = pt.matched_entry(row, single_row)
         assert entry is None or entry.study != study
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm90_paged_window_d192_decode_keys_by_pack_group(s_kv):
+    """Study sm90_paged_window_q1_v2_20261121 (H200): windowed paged d192 x 192 single-row decode keys by the row's pack group. Whole packs
+    (groups 2 / 4 / 8 / 16 / 32) lead always; partial packs (group 12 packs 4 heads per tile) key gqa_partial and lead up to 2^5.5
+    parallel tiles on the KV tile, 2^4.5 off it, where group 12 at b >= 32 ran 1.09-1.45x the backend. Odd groups (unpacked), d192 without
+    a window, dense d192 and d256 keep their keys and rules."""
+    row = "sdpa_fwd_prefill_sm90"
+    study = "sm90_paged_window_q1_v2_20261121"
+    on_tile = s_kv % 128 == 0
+
+    def g(b, h_q, h_kv, **over):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=1, s_kv=s_kv, d_qk=192, d_v=192, causal=True, bottom_right=True, window_left=511)
+        base.update(device_cc=(9, 0), has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for b, h_q, h_kv in ((1, 64, 4), (128, 64, 4), (128, 16, 8), (64, 128, 4)):  # step5 swa; groups 2 and 32 at large batch
+        whole = g(b, h_q, h_kv)
+        assert pt.class_key(row, whole)[8] == "gqa" and pt.matched_entry(row, whole).study == study
+        assert pt.lookup(row, whole) is True
+    for b, h_q, h_kv, lead in ((1, 48, 4, True), (4, 48, 4, True), (64, 48, 4, False), (8, 96, 8, False), (16, 24, 2, on_tile)):
+        partial = g(b, h_q, h_kv)  # groups 12: 2^2 / 2^4 / 2^8 / 2^6 / 2^5 tiles
+        assert pt.class_key(row, partial)[8] == "gqa_partial" and pt.matched_entry(row, partial).study == study
+        assert pt.lookup(row, partial) is lead, (b, h_q, h_kv)
+    assert pt.class_key(row, g(1, 40, 8))[8] == "gqa_unpacked" and pt.matched_entry(row, g(1, 40, 8)) is None
+    for other in (g(8, 48, 4, causal=False, bottom_right=False, window_left=None), g(8, 48, 4, has_paged_kv=False, page_size=0, padded=False)):
+        assert pt.class_key(row, other)[8] == "gqa" and pt.matched_entry(row, other) is None
+    d256 = g(8, 48, 4, d_qk=256, d_v=256, causal=False, bottom_right=False, window_left=None)
+    assert pt.class_key(row, d256)[8] == "gqa_partial" and pt.matched_entry(row, d256).study == "sm90_paged_decode_gaps_20261118"
 
 
 @pytest.mark.L0
