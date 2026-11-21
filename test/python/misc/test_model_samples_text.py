@@ -1174,7 +1174,8 @@ def test_the_serving_style_flags_of_the_sample(monkeypatch, capsys):
     shown = " ".join(capsys.readouterr().out.split())  # argparse wraps its lines by the terminal's width
     assert stop.value.code == 0
     for part in (
-        "--max-tokens N, --max-new-tokens N",
+        # Python 3.13 prints the metavar of an option with two spellings once: "--max-tokens, --max-new-tokens N"
+        "--max-tokens N, --max-new-tokens N" if sys.version_info < (3, 13) else "--max-tokens, --max-new-tokens N",
         "the limit of a request that names none of its own",
         "--max-model-len N",
         "the positions a prompt and its new tokens share (default 2051)",
