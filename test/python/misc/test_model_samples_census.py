@@ -9394,6 +9394,15 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
     ref = tuple(t.clone() for t in twin(qkv, cache, position, params))
     ref_after = cache.pool.clone()
     assert tuple(ref[0].shape) == (rows, 24, 256) and tuple(ref[1].shape) == (rows, 6144) and ref[0].dtype == ref[1].dtype == torch.bfloat16
+    # the bands the twin hands the judge are the bands of its rows for THESE rows, element for element, and no multiple of them
+    turns = [torch_ref.rope_cos_sin(position + token, g.rotary_dim, g.rope_theta, "cpu") for token in range(3)]
+    cos, sin = (torch.stack([turn[part] for turn in turns]).repeat(2, 1)[:, None] for part in (0, 1))  # row (sequence, token): its token's position
+    for name, x, weight, kept in (
+        ("query", qkv[:, :12288].view(rows, 24, 512)[..., :256], params.q_norm, twin.terms.q_band),
+        ("key", qkv[:, 12288:13312].view(rows, 4, 256), params.k_norm, twin.terms.k_band),
+    ):
+        band = torch_ref.prepare_rows(x, weight, cos, sin, model.norm_eps)[1]
+        assert band[..., :64].amin() > 0 and torch.equal(kept, band), f"the band of the {name} rows that the judge is handed is the band of the twin's rows"
 
     # ... the twin against the operation written out row by row from its definition (mean and root in fp64, rounded to fp32 once)
     eps32 = float(torch.tensor(1e-6, dtype=torch.float32).double())
