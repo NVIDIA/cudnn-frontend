@@ -159,8 +159,6 @@ class FrostLaPlan(CompiledPlan):
         views = variant_pack.operands(self.indices)
         workspace = Workspace.over(variant_pack, self.compiled.workspace_size, type(self.compiled).__name__)
         if not self.context_size:
-            if ctx.context is not None:
-                raise ValueError(f"{self.compiled.plan_name}: this plan has no context (get_context_size() is 0)")
             self.compiled.run(views, workspace, ctx.stream)
             return
         if ctx.context is None:

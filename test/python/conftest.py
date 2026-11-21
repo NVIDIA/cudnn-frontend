@@ -439,12 +439,30 @@ def _skip_jax_tests_when_xla_cannot_compile(items):
             item.add_marker(skip)
 
 
+_LEVEL_MARKERS = frozenset(("L0", "L1", "L2", "L3", "L4"))
+# unittest suites run by their own command (see the directory's README), never selected by -m.
+_LEVEL_EXEMPT_DIRS = ("api_index/",)
+
+
+def _require_level_markers(items):
+    # Every -m selection deselects a test without a level, so it would never run.
+    unmarked = [
+        item.nodeid
+        for item in items
+        if not item.nodeid.startswith(_LEVEL_EXEMPT_DIRS) and not any(mark.name in _LEVEL_MARKERS for mark in item.iter_markers())
+    ]
+    if unmarked:
+        shown = "\n  ".join(unmarked[:50]) + (f"\n  ... and {len(unmarked) - 50} more" if len(unmarked) > 50 else "")
+        raise pytest.UsageError(f"{len(unmarked)} test(s) carry no level marker (L0..L4):\n  {shown}")
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
     # The tier markers must be ON the items before the built-in mark plugin's impl of this hook deselects by `-m`
     # (`_pytest/mark/__init__.py::deselect_by_mark`).  A plain conftest impl runs first today only because plain impls are
     # called last-registered-first and that impl carries no tryfirst; tryfirst makes the order explicit on every pytest
     # (pinned by test_tiers.py).  The JAX skip markers are order-independent.
+    _require_level_markers(items)
     _apply_tier_markers(config, items)
     _skip_jax_tests_when_xla_cannot_compile(items)
 

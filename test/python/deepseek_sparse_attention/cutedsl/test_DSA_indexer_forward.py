@@ -1217,9 +1217,9 @@ def test_require_fp4_indexer_skips_on_an_unsupported_dsl(monkeypatch, gate, prec
         expected = "requires nvidia-cutlass-dsl >= .*; found 4.6.2"
     elif gate == "dsl_target":
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 7))
-        monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.7.1")))
+        monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0rc1")))
         monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
-        expected = "SM107 requires a CuTe DSL build supporting sm_107a; found nvidia-cutlass-dsl 4.7.1"
+        expected = "SM107 requires a CuTe DSL build supporting sm_107a; found nvidia-cutlass-dsl 4.8.0rc1"
     else:
         monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
 

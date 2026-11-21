@@ -6678,8 +6678,8 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract(monkeypa
 
     with monkeypatch.context() as old_dsl:
         old_dsl.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
-        # CuTe DSL 4.7 is a relay-only requirement. Preserve the repository's
-        # 4.6.2 floor for the established short-context and two-CTA paths.
+        # The DSL floor is checked by the relay only; the established
+        # short-context and two-CTA paths still accept a 4.6.2 DSL.
         assert SparseAttentionBackward(**good, deterministic=True).check_support()
         for route in (
             metadata_case(4, 128, 96, 576, 64),  # H96 composite
@@ -6691,7 +6691,7 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract(monkeypa
 
         # Above 16 GiB of shards this shape runs the cluster relay under 'shards' or an explicit relay size.
         relay = metadata_case(257, 65537, 16, 512, 64)
-        relay_floor = r"deterministic DSA backward cluster relay requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"
+        relay_floor = r"deterministic DSA backward cluster relay requires nvidia-cutlass-dsl >= 4\.8\.0; found 4\.6\.2"
         with pytest.raises(RuntimeError, match=relay_floor):
             SparseAttentionBackward(**relay, deterministic=True, deterministic_dkv_mode="shards").check_support()
         with pytest.raises(RuntimeError, match=relay_floor):
@@ -6702,7 +6702,7 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract(monkeypa
         assert SparseAttentionBackward(**good).check_support()
 
     with monkeypatch.context() as supported_dsl:
-        supported_dsl.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.7.0")))
+        supported_dsl.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
         assert SparseAttentionBackward(**relay, deterministic=True, deterministic_dkv_mode="shards").check_support()
         assert SparseAttentionBackward(**relay, deterministic=True, deterministic_relay_cluster_size=8).check_support()
 

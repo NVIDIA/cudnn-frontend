@@ -208,7 +208,7 @@ def test_old_dsl_and_other_architecture_rejected():
     args = operands(33)
     old_dsl = (True, ("nvidia-cutlass-dsl", "4.6.2"))
     with patch.object(api, "cutedsl_state", return_value=old_dsl), patch("cudnn.frost.buffers.cutedsl_state", return_value=old_dsl):
-        with pytest.raises(RuntimeError, match="4.7"):
+        with pytest.raises(RuntimeError, match="4.8"):
             cudnn.VisionRoPEBackward(*args).check_support()
     with patch.object(torch.cuda, "get_device_capability", return_value=(8, 0)):
         with pytest.raises(NotImplementedError, match=r"got \(8, 0\)"):

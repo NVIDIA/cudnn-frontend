@@ -122,7 +122,7 @@ the state or weight meanings. The current public implementation rejects 3D
 - autograd: unsupported
 - pointer alignment: 16 bytes for FP16 and BF16 tensors and 4 bytes for indices
 
-The native kernel requires CUTLASS DSL 4.7 or newer for the inline-PTX
+The native kernel requires CUTLASS DSL 4.8 or newer for the inline-PTX
 integration it imports. The package-wide `cutedsl` extra keeps its broader
 `>=4.5` floor for unrelated APIs; installing only that minimum is not
 sufficient for this operation. The optional FLA 0.5.2 adapter treats the

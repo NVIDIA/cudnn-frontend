@@ -365,7 +365,6 @@ class Graph:
             "get_workspace_size_plan_at_index",
             "serialize",
             "deserialize",
-            "query_tensor_attributes_of_uid",
         ]
         if name in pass_through:
             return attr
@@ -393,7 +392,6 @@ class Graph:
             "get_plan_name_at_index",
             "key",
             "populate_cuda_graph",
-            "query_tensor_attributes_of_uid",
             "select_behavior_notes",
             "select_numeric_notes",
             "update_cuda_graph",

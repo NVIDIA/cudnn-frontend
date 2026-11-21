@@ -8,7 +8,7 @@ for block selection, bitmap training and the backward engine.
 indices directly. The implementation lives in `cudnn.QSA.indexed` and shares
 QSA's attention kernels. It supports BF16
 12Q/1KV and 6Q/1KV (one KV head shared by twelve or six query heads) with head
-dimension 256 on SM100/SM103 with CuTeDSL >= 4.7 and on SM107 with
+dimension 256 on SM100/SM103 with CuTeDSL >= 4.8 and on SM107 with
 CuTeDSL >= 4.8 (the backward needs the CUDA 13 build of the DSL).
 
 ```python

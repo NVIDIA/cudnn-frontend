@@ -89,7 +89,7 @@ class _QsaIndexedPlan(APIBase):
             if engine.dsl_cuda_major() < 13:
                 # the 12Q/1KV key-major kernel crashes the CUDA 12 DSL compiler
                 raise NotImplementedError(
-                    "Indexed QSA backward requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.7.0' with a CUDA 13 compatible driver"
+                    "Indexed QSA backward requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.8.0' with a CUDA 13 compatible driver"
                 )
             mode = engine.SEQ_CU if self.num_seqs else engine.SEQ_SINGLE
             self.engine_plan = engine.plan_for(self.total, self.device, 1, mode, max(self.num_seqs, 1), self.hq, self.max_seq_len, self.deterministic)

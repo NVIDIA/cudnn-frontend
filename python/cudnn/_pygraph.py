@@ -1060,16 +1060,7 @@ class pygraph:
         if self._backend_lowerable() and self._lowered_graph is None:
             validator = self._python_native_validator()
             if not (validator is not None and validator(self)):
-                self._lowered_graph = self._lower_to_cpp()
-                try:
-                    self._lowered_graph.validate()
-                    self._verify_uid_ownership()
-                except Exception:
-                    # A rejected lowering must not survive: the next validate()
-                    # would find _lowered_graph set, skip the backend check, and mark
-                    # the rejected graph valid.
-                    self._reset_lowered_state()
-                    raise
+                self._ensure_lowered()
         # Only a graph that passed EVERY check above is validated: a rejection
         # (python-native or C++) leaves the flag False so build()/plan() re-run
         # validate() and raise again instead of planning a rejected graph.
@@ -1161,7 +1152,7 @@ class pygraph:
         sequencing — lowering happens now, so plan-configuration and query
         methods (deselect_engines, get_engine_count, ...) work between
         build_operation_graph() and create_execution_plans(), exactly as on the
-        classic API (they delegate to the lowered C++ graph via __getattr__).
+        classic API.
         """
         if not self._is_validated:
             self.validate()
@@ -1592,6 +1583,26 @@ class pygraph:
         self._is_built = False
         return self
 
+    def get_engine_count(self) -> int:
+        """Classic: the number of cuDNN backend engines for this graph. Backend-only:
+        python engines are not counted (``plans`` lists every candidate). Lowers the graph."""
+        return self._lowered_for_backend_query("get_engine_count").get_engine_count()
+
+    def get_knobs_for_engine(self, engine_id: int) -> List[Any]:
+        """Classic: the knob domains of cuDNN backend engine ``engine_id``. Backend-only. Lowers the graph."""
+        return self._lowered_for_backend_query("get_knobs_for_engine").get_knobs_for_engine(engine_id)
+
+    def _lowered_for_backend_query(self, what: str) -> Any:
+        if self._lowered_graph is None:
+            node = self._unlowerable_node()
+            if node is not None:
+                raise cudnn_graph_not_supported(f"{what}() queries the cuDNN backend; {node.node_type.name} has no backend lowering")
+            if not self._is_validated:
+                self.validate()
+        if self._nodes:  # a deserialized container has no IR and is already lowered
+            self._lower_backend_graph()
+        return self._lowered_graph
+
     def deselect_workspace_greater_than(self, workspace_limit: int) -> "pygraph":
         """Classic: exclude plans needing more than ``workspace_limit`` bytes.
 
@@ -1759,14 +1770,14 @@ class pygraph:
             if cpp_uid != ir_uid:
                 raise AssertionError(f"uid ownership violated: IR tensor uid {ir_uid} lowered to C++ uid {cpp_uid} — a lowering path failed to push the uid")
 
-    def _lower_backend_graph(self) -> None:
-        """Lower to C++ and build its operation graph (once).
-
-        Kept separate from plan creation because the two failures mean different
-        things: a failure HERE is "the backend cannot represent this graph"
-        (a node it has no lowering for, a dtype/layout its descriptors reject),
-        which is a decline; a failure in plan creation is about engines."""
-        if self._lowered_graph is None:
+    def _ensure_lowered(self) -> None:
+        """Lower the IR to C++ (once): lower, backend validate, uid check, replay
+        the plan filters. The only place a lowering is created from the IR. Any
+        failure drops the partial lowering, so no later call finds a rejected
+        descriptor in ``_lowered_graph`` and operates on it."""
+        if self._lowered_graph is not None:
+            return
+        try:
             self._lowered_graph = self._lower_to_cpp()
             self._lowered_graph.validate()
             self._verify_uid_ownership()
@@ -1777,9 +1788,25 @@ class pygraph:
                 self._lowered_graph.deselect_engines(list(self._barred_names))
             if self._workspace_limit is not None:
                 self._lowered_graph.deselect_workspace_greater_than(self._workspace_limit)
+        except BaseException:
+            self._reset_lowered_state()
+            raise
 
+    def _lower_backend_graph(self) -> None:
+        """Lower to C++ and build its operation graph (once).
+
+        Kept separate from plan creation because the two failures mean different
+        things: a failure HERE is "the backend cannot represent this graph"
+        (a node it has no lowering for, a dtype/layout its descriptors reject),
+        which is a decline; a failure in plan creation is about engines."""
+        self._ensure_lowered()
         if not self._cpp_bog_done:
-            self._lowered_graph.build_operation_graph()
+            try:
+                self._lowered_graph.build_operation_graph()
+            except BaseException:
+                if self._nodes:  # a deserialized container has no IR to lower again
+                    self._reset_lowered_state()
+                raise
             self._cpp_bog_done = True
             self._sync_ir_shapes_from_backend()
 
@@ -2448,6 +2475,8 @@ class pygraph:
                 if not explicit_index:
                     self._is_built = True
             plan = self._compiled_plans[index]
+            if context is not None and not plan.get_context_size():
+                raise ValueError(f"{eng.name}: this plan takes no context (get_context_size() is 0); pass context= only to a plan that reports one")
             native_ordered = getattr(plan, "_ordered_native", None) if ordered else None
             if native_ordered is not None:
                 schema = self._prepare_ordered_binding_schema()
@@ -2882,19 +2911,6 @@ class pygraph:
             return lowered.get_cuda_graph_retention()
         return _pybind_module._effective_cuda_graph_retention(self._cpp_graph_kwargs.get("cuda_graph_retention"))
 
-    def __getattr__(self, name: str):
-        # Plan-configuration and query methods (deselect_engines,
-        # get_engine_and_knobs_at_index, key, populate_cuda_graph, ...) operate
-        # on the lowered C++ graph — delegate to it. Only reached when normal
-        # attribute lookup fails, i.e. for names this class doesn't define.
-        lowered = self.__dict__.get("_lowered_graph")
-        if lowered is not None and not name.startswith("_") and hasattr(lowered, name):
-            return getattr(lowered, name)
-        raise AttributeError(
-            f"{type(self).__name__!r} object has no attribute {name!r}"
-            + ("" if lowered is not None else " (graph not lowered yet — call build_operation_graph() first)")
-        )
-
     def __repr__(self) -> str:
         if self._lowered_graph is not None:
             return repr(self._lowered_graph)  # classic JSON dump
@@ -2930,10 +2946,7 @@ class pygraph:
                 # would deserialize as the f32 pipeline).
                 raise cudnn_graph_not_supported(f"serialize() is the cuDNN backend's graph format; the {node.node_type.name} node has no backend lowering")
             self.validate()
-            if self._lowered_graph is None:  # python engines registered
-                self._lowered_graph = self._lower_to_cpp()
-                self._lowered_graph.validate()
-                self._verify_uid_ownership()
+            self._ensure_lowered()  # validate() skips it when a python-native validator accepted the graph
         return self._lowered_graph.serialize(as_bytes=as_bytes)
 
     def deserialize(self, *args, **kwargs) -> None:
@@ -2963,7 +2976,7 @@ class pygraph:
 
             if self._nodes:  # deserializing into a built-up graph: lower it
                 self.validate()
-                self._lowered_graph = self._lower_to_cpp()
+                self._ensure_lowered()
             else:
                 # Fresh container: forward only the fields that should survive
                 # container replacement. Datatypes are deliberately NOT forwarded —

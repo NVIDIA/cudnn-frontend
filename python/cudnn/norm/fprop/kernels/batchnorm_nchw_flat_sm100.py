@@ -41,7 +41,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget, dsl_compile_lock
+from cudnn.norm.utils import sm_count, cur_stream, dyn, fake_stream, dsl_compile_lock
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -51,17 +51,6 @@ _BT = 256
 _UN = 4  # images issued per strip in the streamed loop
 _SMEM_CAP_PREF = 200 * 1024  # measured on sm_100; smem_budget clamps it elsewhere
 _TMEM_COLS = 512  # per SM
-
-_SM_COUNT = None
-
-
-def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
 
 
 def flat_cfg(C: int, N: int, S: int, elem_bytes: int, occ: int = 1, BT: int = _BT):
@@ -73,7 +62,7 @@ def flat_cfg(C: int, N: int, S: int, elem_bytes: int, occ: int = 1, BT: int = _B
     if VS < 2:
         return None
     PV = P // VS
-    target = max(1, occ * _nsm())
+    target = max(1, occ * sm_count())
     VPT = max(1, -(-PV // (BT * target)))
     pparts = max(1, -(-PV // (BT * VPT)))
     mparts = max(1, min(target // pparts, N))

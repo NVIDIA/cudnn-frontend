@@ -452,7 +452,7 @@ def _frost_dswiglu(
     # ordinal 0, not from the active context. A same-process heterogeneous-GPU
     # call must decline instead of compiling for one architecture and launching
     # that artifact on another; the caller's cuDNN backend path remains valid.
-    if torch.cuda.get_device_capability(device) != torch.cuda.get_device_capability(0):
+    if torch.cuda.get_device_capability(device) != torch.cuda.get_device_capability(0):  # allow-device-0
         raise NotImplementedError(
             "cudnn.gemm.swiglu_mlp: FROST backward requires the operand device " "architecture to match visible CUDA device 0's CuTeDSL JIT target"
         )

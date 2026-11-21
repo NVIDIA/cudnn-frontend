@@ -141,7 +141,7 @@ def test_admits_b200(monkeypatch):
     assert _decline_reason(use_causal_mask=True, s=1000) is None
 
 
-@pytest.mark.parametrize("version", ["4.7.0", "4.8.0"])
+@pytest.mark.parametrize("version", ["4.8.0", "4.8.0.post1"])
 def test_declines_below_the_dsl_floor(monkeypatch, version):
     """Rule 7: the row's own floor (nvidia-cutlass-dsl 4.8.1, above the library's) is checked at eligibility, not at build."""
     from cudnn.sdpa.bwd import engines

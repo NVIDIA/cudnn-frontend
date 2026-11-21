@@ -1338,15 +1338,15 @@ def test_reject_other_arch_lines(monkeypatch, cc):
     assert reason is not None and f"SM{_SM_RANGE[0]}-{_SM_RANGE[1]}" in reason, reason
 
 
-@pytest.mark.parametrize("dsl_version", ["4.7.0", "0.3.0+internal"])
+@pytest.mark.parametrize("dsl_version", ["4.8.0rc1", "0.3.0+internal"])
 def test_reject_missing_sm107a_dsl_target_before_compile(monkeypatch, dsl_version):
-    """AGENTS.md Rule 7 (review 2026-09-30): a cc 10.7 box on a DSL that does not know ``sm_107a`` (4.7.x is above FROST's floor
-    yet below Rubin's need) gets a TYPED decline at eligibility from every sm107 backward row -- never ``KeyError: 'sm_107a'``
+    """AGENTS.md Rule 7 (review 2026-09-30): a cc 10.7 box on a DSL that does not know ``sm_107a`` (a build at FROST's floor
+    can still lack it) gets a TYPED decline at eligibility from every sm107 backward row -- never ``KeyError: 'sm_107a'``
     out of ``Arch.from_string`` inside the template compile after the plan is ranked (fwd/engines.py has had this gate; the
     bwd copy lacked it).  The SM100 D256 MXFP8 engine, which owns this graph on a cc 10.0 device, is untouched."""
     from cudnn.frost import buffers
 
-    dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
+    dist = "nvidia-cutlass-dsl" if dsl_version == "4.8.0rc1" else "nvidia-cutlass-dsl-internal"
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, (dist, dsl_version)))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
     for engine in (_ENGINE, "sdpa_bwd_sm107_d256_f16_4x1", "sdpa_bwd_sm107_fp8"):

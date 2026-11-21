@@ -791,7 +791,7 @@ def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_
     assert f16.decode.served and f16.extend.served
 
 
-@pytest.mark.parametrize("version, has_target", [("4.7.0", False), ("4.8.0", False), ("4.8.0", True)])
+@pytest.mark.parametrize("version, has_target", [("4.8.0rc1", False), ("4.8.0", False), ("4.8.0", True)])
 def test_the_envelope_requires_the_rubin_dsl_target(monkeypatch, version, has_target):
     from cudnn.frost import buffers
 

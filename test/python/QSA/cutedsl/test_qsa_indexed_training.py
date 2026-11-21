@@ -293,5 +293,5 @@ def test_indexed_dsl_gate_precedes_kernel_import(supported_gpu, monkeypatch, ver
 
     plan = _QsaIndexedPlan(7, 4, torch.device("cuda", torch.cuda.current_device()), "bprop")
     monkeypatch.setattr(buffers, "cutedsl_state", lambda: (version is not None, version))
-    with pytest.raises(ImportError, match="nvidia-cutlass-dsl.*4.7.0"):
+    with pytest.raises(ImportError, match="nvidia-cutlass-dsl.*4.8.0"):
         plan.compile()

@@ -3,8 +3,8 @@
 
 """A too-old CuTe DSL is reported as a version problem, not a missing dependency.
 
-pyproject's floor on nvidia-cutlass-dsl is the downstream floor (4.6.2), below
-what the FROST-derived kernels need (CUTEDSL_MIN_VERSION). python/cudnn/AGENTS.md
+An environment can bypass pyproject's floor on nvidia-cutlass-dsl, and a kernel
+can need more than it (CUTEDSL_MIN_VERSION or its own floor). python/cudnn/AGENTS.md
 Rule 7 requires every route to decline below the kernel floor with an error that
 names the installed version; these host-only checks pin that contract at the two
 shared seams (the lazy-import wrapper and the decode-update route).
@@ -40,8 +40,8 @@ def test_too_old_dsl_names_the_versions(dsl_state):
 @pytest.mark.parametrize(
     "state",
     [
-        (True, ("nvidia-cutlass-dsl", "4.7.0")),
-        (True, ("nvidia-cutlass-dsl", "4.8.0a0+20260904")),
+        (True, ("nvidia-cutlass-dsl", "4.8.0")),
+        (True, ("nvidia-cutlass-dsl", "4.8.1a0+20260904")),
         (True, ("nvidia-cutlass-dsl-internal", "0.3.0+2026")),
         (False, None),
     ],
@@ -82,27 +82,27 @@ def test_decode_update_route_declines_by_version_before_importing_the_kernel(dsl
 @pytest.mark.parametrize(
     "version,too_old",
     [
-        ("4.6.2a0", True),
-        ("4.6.2rc1", True),
-        ("4.6.9b1", True),
-        ("4.7.0a0", False),
-        ("4.7.0rc1", False),
-        ("4.7.0a0+20260727", False),
+        ("4.7.1a0", True),
+        ("4.7.1rc1", True),
+        ("4.7.9b1", True),
+        ("4.8.0a0", False),
+        ("4.8.0rc1", False),
+        ("4.8.0a0+20260727", False),
         ("4.5.1", True),
-        ("4.7.0", False),
-        ("4.6", True),
+        ("4.8.0", False),
+        ("4.7", True),
         ("4", True),
-        ("4.7", False),
+        ("4.8", False),
         ("5", False),
-        ("4.6.post1", True),
-        ("4.6.2.post1", True),
-        ("4.6.2.dev0", True),
-        ("4.7.0.post1", False),
+        ("4.7.post1", True),
+        ("4.7.1.post1", True),
+        ("4.7.1.dev0", True),
+        ("4.8.0.post1", False),
     ],
 )
 def test_prerelease_versions_compare_by_release_number(version, too_old):
-    """A public prerelease of X compares as X against the floor (Rule 7): 4.6.2rc1 is
-    too old, 4.7.0a0 is not. Before, any letter in a component made the check
+    """A public prerelease of X compares as X against the floor (Rule 7): 4.7.1rc1 is
+    too old, 4.8.0a0 is not. Before, any letter in a component made the check
     return False and an unsupported DSL walked through every gate."""
     assert buffers.cutedsl_too_old(("nvidia-cutlass-dsl", version)) is too_old
 

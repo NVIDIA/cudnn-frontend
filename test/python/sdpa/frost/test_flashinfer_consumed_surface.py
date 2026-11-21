@@ -11,7 +11,7 @@ Every one of those is a caller boundary whatever its spelling (python/cudnn/AGEN
 each still resolves AS SPELLED and that its public twin exists -- a rename fails here, in this repository's CI, instead
 of silently degrading FlashInfer to its fallback path.
 
-The arch-aware probe gets the cell that motivated it: on a cc 10.7 part with a 4.7.x public DSL (no ``sm_107a`` target)
+The arch-aware probe gets the cell that motivated it: on a cc 10.7 part with a DSL that lacks the ``sm_107a`` target
 every FROST row declines, so ``cutedsl_runtime_available((10, 7))`` must read False while the device-blind form -- the
 check FlashInfer spells today -- reads True.  Modelled by pinning the DSL state exactly where the engines read it;
 nothing is imported from the DSL.
@@ -147,7 +147,7 @@ def test_unified_implementation_graph_helpers_and_decline_type_resolve():
 
 
 def test_dsl_gate_names_resolve_as_spelled():
-    assert buffers.CUTEDSL_MIN_VERSION == (4, 7, 0)
+    assert len(buffers.CUTEDSL_MIN_VERSION) == 3 and all(isinstance(part, int) for part in buffers.CUTEDSL_MIN_VERSION)
     assert list(inspect.signature(buffers.cutedsl_state).parameters) == []
     assert list(inspect.signature(buffers.cutedsl_too_old).parameters) == [
         "version",
@@ -187,16 +187,16 @@ def dsl_state(monkeypatch):
     "label, installed, version, has_sm107, blind, cc100, cc107",
     [
         ("dsl absent", False, None, False, False, False, False),
-        ("4.6.2 (the downstream floor, below ours)", True, (PUBLIC_DSL, "4.6.2"), False, False, False, False),
-        ("4.7.1 without sm_107a", True, (PUBLIC_DSL, "4.7.1"), False, True, True, False),
-        ("4.7.0rc1 without sm_107a", True, (PUBLIC_DSL, "4.7.0rc1"), False, True, True, False),
+        ("4.6.2 (below the floor)", True, (PUBLIC_DSL, "4.6.2"), False, False, False, False),
+        ("4.7.1 (below the floor)", True, (PUBLIC_DSL, "4.7.1"), False, False, False, False),
+        ("4.8.0rc1 without sm_107a", True, (PUBLIC_DSL, "4.8.0rc1"), False, True, True, False),
         ("4.8.0 with sm_107a", True, (PUBLIC_DSL, "4.8.0"), True, True, True, True),
         ("internal build without sm_107a", True, ("nvidia-cutlass-dsl-internal", "0.3.0+2026"), False, True, True, False),
     ],
 )
 def test_cutedsl_runtime_available_is_arch_aware(dsl_state, label, installed, version, has_sm107, blind, cc100, cc107):
-    """The floor is 4.7.0 everywhere and 4.8.0 on cc 10.7: the (10, 7) + 4.7.x row is the cell a device-blind probe
-    cannot see -- it reads True there while every FROST row declines."""
+    """A DSL at the version floor without ``sm_107a`` is the cell a device-blind probe cannot see on cc 10.7 -- it reads
+    True there while every FROST row declines."""
     dsl_state(installed, version, has_sm107)
     probe = cudnn.frost.cutedsl_runtime_available
     assert probe() is blind, label
@@ -208,8 +208,8 @@ def test_cutedsl_runtime_available_is_arch_aware(dsl_state, label, installed, ve
     assert probe([10, 7]) is cc107, label  # a list spells the same part
 
 
-def test_the_blind_spot_cell_cc107_with_a_47x_dsl(dsl_state):
-    dsl_state(True, (PUBLIC_DSL, "4.7.1"), False)
+def test_the_blind_spot_cell_cc107_without_sm107a(dsl_state):
+    dsl_state(True, (PUBLIC_DSL, "4.8.0rc1"), False)
     assert cudnn.frost.cutedsl_runtime_available() is True
     assert cudnn.frost.cutedsl_runtime_available((10, 7)) is False
     # The same install answers the engines' own gate the same way: the probe IS their decision.
@@ -232,13 +232,13 @@ def test_a_part_below_sm80_has_no_dsl_target(dsl_state, monkeypatch, cc):
 @pytest.mark.parametrize("bad", [(10, 7, 0), (10,), 107, "10.7", (10.5, 7)])
 def test_cutedsl_runtime_available_refuses_a_malformed_cc(dsl_state, bad):
     """A cc that is not a pair of integers is refused, never silently read as 'not cc 10.7'."""
-    dsl_state(True, (PUBLIC_DSL, "4.7.1"), False)
+    dsl_state(True, (PUBLIC_DSL, "4.8.0rc1"), False)
     with pytest.raises(TypeError):
         cudnn.frost.cutedsl_runtime_available(bad)
 
 
 def test_arch_aware_probe_touches_the_dsl_only_for_a_cc107_part(dsl_state, monkeypatch):
-    dsl_state(True, (PUBLIC_DSL, "4.7.1"), False)
+    dsl_state(True, (PUBLIC_DSL, "4.8.0rc1"), False)
     calls = []
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: calls.append(1) or False)
     assert cudnn.frost.cutedsl_runtime_available() is True
@@ -309,6 +309,5 @@ def test_the_docs_name_every_public_spelling():
         "graph.selected_engine",
         "graph.backend_plan_entries()",
         "is_cuda_graph_replay_expected",
-        "4.8.0 on cc 10.7",
     ):
         assert name in text, name

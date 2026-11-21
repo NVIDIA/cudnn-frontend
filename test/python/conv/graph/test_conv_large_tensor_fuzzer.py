@@ -1962,6 +1962,7 @@ TEST_PARAMS_L1 = tlist_with_configs(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.L0
 def test_conv_large_tensor_repro(cudnn_handle):
     cfg = _load_repro_config()
     if cfg is None:

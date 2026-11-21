@@ -3,7 +3,7 @@
 `cudnn.TailRoPEForward` copies a contiguous BF16 tensor and rotates only its
 last 64 channels. It accepts `[T,D]` or `[T,H,D]`, with `D=128` or `512`, and
 separate, caller-prepared FP32 cosine and sine tables of shape `[T,32]`.
-The implementation is experimental and supports SM100 with CuTe DSL 4.7.0 or newer.
+The implementation is experimental and supports SM100 with CuTe DSL 4.8.0 or newer.
 
 For each adjacent pair `(a,b)` in the tail, it computes:
 

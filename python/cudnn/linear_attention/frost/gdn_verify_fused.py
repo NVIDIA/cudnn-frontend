@@ -118,7 +118,7 @@ OPERANDS = (
 
 
 def _dsl_version_error() -> Optional[str]:
-    """The Rule-7 gate of this kernel: its own floor (``DSL_FLOOR`` = 4.8.0, the public wheel every consumer pins, above the library's
+    """The Rule-7 gate of this kernel: its own floor (``DSL_FLOOR`` = 4.8.0, the public wheel every consumer pins, not below the library's
     ``CUTEDSL_MIN_VERSION``) through the one version parser of :mod:`cudnn.frost.buffers`; None when the installed DSL serves."""
     installed, _ = cutedsl_state()
     if not installed:

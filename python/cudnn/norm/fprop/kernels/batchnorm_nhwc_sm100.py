@@ -34,6 +34,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.utils import (
+    sm_count,
     ws_bytes,
     ws_empty,
     ws_reset,
@@ -53,17 +54,6 @@ _CTA_SS = nvvm.SharedSpace.shared_cta
 
 # elem_bytes -> the integer type the raw 128-bit vector loads/stores are typed as.
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
-
-_SM_COUNT = None
-
-
-def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +93,7 @@ def nhwc_cfg(C: int, elem_bytes: int, block_threads: int = _BT):
 def _mparts(M: int, PPL: int, cblks: int, occ: int) -> int:
     """CTAs per channel tile. Cooperative launch requires the whole grid to
     co-reside, so ``cblks * mparts <= occ * NSM``."""
-    return max(1, min(occ * _nsm() // max(1, cblks), (M + PPL - 1) // PPL))
+    return max(1, min(occ * sm_count() // max(1, cblks), (M + PPL - 1) // PPL))
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +673,7 @@ def forward(
     if not training:
         rm = running_mean if running_mean is not None else torch.zeros(C, dtype=torch.float32, device=x2d.device)
         rv = running_var if running_var is not None else torch.ones(C, dtype=torch.float32, device=x2d.device)
-        nblk = max(1, min(_nsm() * 4 // max(1, cblks), (M + PPL - 1) // PPL))
+        nblk = max(1, min(sm_count() * 4 // max(1, cblks), (M + PPL - 1) // PPL))
         ce = (C, V, TPP, PPL, BT, cblks, nblk, it_ty, et, float(eps), has_beta)
         # dyn() specializes strides 0 and 1; larger strides are dynamic.
         key = ("infer", params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce

@@ -215,7 +215,7 @@ def test_frost_old_dsl_declines_before_kernel_import(monkeypatch):
 
     inputs, _ = _reference_case(256, 256, is_causal=False)
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
-    with pytest.raises(NotImplementedError, match=r"requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+    with pytest.raises(NotImplementedError, match=r"requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2"):
         Nvfp4AttentionQatBackward(*inputs[:6], backend="frost").check_support()
 
 

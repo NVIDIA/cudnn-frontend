@@ -39,23 +39,13 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, dsl_compile_lock
+from cudnn.norm.utils import sm_count, ws_bytes, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, dsl_compile_lock
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
 _BFLY_CLAMP = 0x1F  # shfl width == 32
 _SMEM_CAP_PREF = 160 * 1024  # measured on sm_100; smem_budget clamps it elsewhere
-_SM_COUNT = None
-
-
-def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
 
 
 def red_scratch_len(block_threads: int) -> int:
@@ -367,7 +357,7 @@ def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
     allocation the workspace exists to remove.
     """
     GPS, R = int(spec.groups_per_sample), int(spec.R)
-    ctas = max(GPS, (max(1, min(4 * _nsm(), R)) // GPS) * GPS)
+    ctas = max(GPS, (max(1, min(4 * sm_count(), R)) // GPS) * GPS)
     if ctas > R:
         ctas = max(GPS, (R // GPS) * GPS) or GPS
     n = ctas * int(spec.channels_per_group)
@@ -393,7 +383,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
 
     # ctas MUST be a multiple of GPS so every row a CTA sees shares its group
     # index -- that is what makes the channel set fixed and the partials [ctas,CPG].
-    target = max(1, min(4 * _nsm(), R))
+    target = max(1, min(4 * sm_count(), R))
     ctas = max(GPS, (target // GPS) * GPS)
     if ctas > R:
         ctas = max(GPS, (R // GPS) * GPS) or GPS
