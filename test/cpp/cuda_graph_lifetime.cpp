@@ -377,6 +377,118 @@ TEST_CASE("Cuda graph outlives the frontend graph", "[cudagraph][graph]") {
 #endif  // CUDART_VERSION < 12000
 }
 
+// A caller-owned binding map may be reused after any Graph that recorded it has gone.
+// Defaults must stay graph-local, while an explicit runtime scalar remains caller-owned.
+TEST_CASE("Native CUDA graph APIs preserve caller scalar bindings", "[cudagraph][graph][scalar_bindings]") {
+#if (CUDART_VERSION < 12000)
+    SKIP("Test requires cuda toolkit 12.0 or above");
+#else
+    if (cudnnGetCudartVersion() < 12000 || cudnn_frontend::detail::get_backend_version() < 90500) {
+        SKIP("Test requires native CUDA graph API support");
+    }
+    bool const direct          = GENERATE(false, true);
+    bool const explicit_scalar = GENERATE(false, true);
+    CAPTURE(direct, explicit_scalar);
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+    int64_t const b = 8, m = 32, n = 16, k = 8;
+    half bias            = __float2half(2.f);
+    float override_scale = .25f;
+    Surface<half> a(b * m * k, __float2half(1.f));
+    Surface<half> weights(b * k * n, __float2half(1.f));
+    Surface<half> output(b * m * n);
+    std::unordered_map<int64_t, void *> pack = {
+        {A_UID, a.devPtr}, {B_UID, weights.devPtr}, {C_UID, &bias}, {D_UID, output.devPtr}};
+    auto build = [&](float scale) {
+        auto graph = create_graph(b, m, n, k, scale);
+        REQUIRE(graph->validate().is_good());
+        REQUIRE(graph->build_operation_graph(handle).is_good());
+        REQUIRE(graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}).is_good());
+        graph->select_behavior_notes({cudnn_frontend::BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API});
+        if (graph->check_support().is_bad()) {
+            SKIP("No native CUDA graph engine for scalar-binding graph");
+        }
+        REQUIRE(graph->build_plans().is_good());
+        return graph;
+    };
+    auto graph           = build(.5f);
+    auto const &defaults = graph->get_variant_pack_scalar_defaults();
+    REQUIRE(defaults.size() == 1);
+    auto const scale_uid = defaults.begin()->first;
+    if (explicit_scalar) {
+        pack.emplace(scale_uid, &override_scale);
+    }
+    auto const original = pack;
+    Surface<int8_t> workspace(graph->get_workspace_size());
+    cudaGraph_t recorded;
+    CUDA_CHECK(cudaGraphCreate(&recorded, 0));
+    auto record = [&](auto const &g, auto &bindings, bool update) {
+        if (direct) {
+            return update ? g->update_cuda_graph_direct(handle, bindings, workspace.devPtr, recorded)
+                          : g->populate_cuda_graph_direct(handle, bindings, workspace.devPtr, recorded);
+        }
+        return update ? g->update_cuda_graph(handle, bindings, workspace.devPtr, recorded)
+                      : g->populate_cuda_graph(handle, bindings, workspace.devPtr, recorded);
+    };
+    // Failure after filling defaults must leave the map reusable too.
+    auto incomplete = pack;
+    incomplete.erase(D_UID);
+    auto const incomplete_before = incomplete;
+    REQUIRE(record(graph, incomplete, false).is_bad());
+    REQUIRE(incomplete == incomplete_before);
+    REQUIRE(record(graph, pack, false).is_good());
+    REQUIRE(pack == original);
+    graph.reset();
+
+    // Same UIDs, a different default, and the exact map from population.
+    graph = build(1.5f);
+    REQUIRE(graph->get_workspace_size() <= static_cast<int64_t>(workspace.size));
+    REQUIRE(record(graph, incomplete, true).is_bad());
+    REQUIRE(incomplete == incomplete_before);
+    REQUIRE(record(graph, pack, true).is_good());
+    REQUIRE(pack == original);
+    cudaGraphExec_t executable;
+    CUDA_CHECK(cudaGraphInstantiate(&executable, recorded, nullptr, nullptr, 0));
+    graph.reset();
+    CUDA_CHECK(cudaGraphDestroy(recorded));
+    CUDA_CHECK(cudaMemset(output.devPtr, 0xFF, output.size * sizeof(half)));
+    CUDA_CHECK(cudaGraphLaunch(executable, 0));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<half> actual(output.size);
+    CUDA_CHECK(cudaMemcpy(actual.data(), output.devPtr, actual.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    float expected = (explicit_scalar ? override_scale : 1.5f) * k + __half2float(bias);
+    for (auto value : actual) {
+        REQUIRE(__half2float(value) == expected);
+    }
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+
+    // The same map must also resolve a fresh eager graph's own default.
+    graph = build(2.f);
+    REQUIRE(graph->get_workspace_size() <= static_cast<int64_t>(workspace.size));
+    REQUIRE(graph->execute(handle, pack, workspace.devPtr).is_good());
+    REQUIRE(pack == original);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(actual.data(), output.devPtr, actual.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    expected = (explicit_scalar ? override_scale : 2.f) * k + __half2float(bias);
+    for (auto value : actual) {
+        REQUIRE(__half2float(value) == expected);
+    }
+
+    // The original ordered ABI has one pointer per required UID, and uses this graph's defaults.
+    std::vector<void *> required;
+    for (auto uid : graph->get_variant_pack_uids_sorted()) {
+        if (uid != scale_uid) required.push_back(original.at(uid));
+    }
+    CUDA_CHECK(cudaMemset(output.devPtr, 0xFF, output.size * sizeof(half)));
+    REQUIRE(graph->execute(handle, required.data(), static_cast<int>(required.size()), workspace.devPtr).is_good());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(actual.data(), output.devPtr, actual.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    for (auto value : actual) {
+        REQUIRE(__half2float(value) == 2.f * k + __half2float(bias));
+    }
+#endif
+}
+
 /*
 Only execution plans with runtime-compiled kernels are retained by the CUDA graphs recorded from
 them. A plan of a precompiled engine (kernels that are part of the cuDNN library) is recorded

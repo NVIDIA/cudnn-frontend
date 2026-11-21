@@ -16,6 +16,10 @@ host scalar values at capture time. Updating a host scalar afterwards takes
 effect on a new execute/capture, while device tensor inputs remain live on replay.
 `COMPILE_TIME_CONST` is baked into the graph and is not a runtime input slot.
 
+The C++ sorted-pointer overload accepts either the full sorted UID list or the
+original list containing only required bindings. The latter uses every graph
+default. To override a subset of runtime scalars, use the UID map.
+
 ## C++ API
 
 Create tensors from a scalar and `ScalarType`:
