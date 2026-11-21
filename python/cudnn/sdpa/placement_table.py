@@ -1227,8 +1227,10 @@ TABLE: Dict[Tuple, Entry] = {
     # refit on every earlier cell of them pooled (sm80_prefill_gaps_20261117, its edge supplement, sm80_paged_d256_d192_v2_20261117; 744
     # cells, default = the backend) with a query-token condition that keeps few-query long-cache chunks on the backend. Fresh holdout at
     # new head pairs incl. that edge, scored once: d192 x 128 0.680 / 0.678 (worst 0.917), d256 0.587 / 0.592 (worst 1.055).
+    # study sm80_paged_d192x128_pcie_20261121: v3's on-tile d192 x 128 floor, same form, re-fit on the nightly's board. The off-tile entry
+    # below stays v3's.
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 35.366, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+        "ge", 29.226, "sm80_paged_d192x128_pcie_20261121", "cost", ("ge", 6.5, "q")
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 6.792, "sm80_paged_d256_d192_v3_20261117", "tiles", ("ge", 7.506, "q")
@@ -1242,6 +1244,14 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 36.454, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+    ),
+    # study sm80_paged_d256_swa_v4_pcie_20261121: windowed d256 prefill. `cost` ignores the window, so the floors also need a wide grid:
+    # with few parallel tiles FROST's time stays flat as heads drop while the backend's falls. Off the tile the grid alone decides.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "ge", 27.792, "sm80_paged_d256_swa_v4_pcie_20261121", "cost", ("ge", 7.453, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", True): Entry(
+        "ge", 8.085, "sm80_paged_d256_swa_v4_pcie_20261121", "tiles"
     ),
     # study sm80_gen_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE c9d0bcb7d; the generation path's padded-Q paged GQA decode
     # shapes with no entry: d64 MTP / verify, d64 windowed, d128 windowed and d192 x 192 causal / windowed MTP / verify; b 1-128, KV 1k-128k
