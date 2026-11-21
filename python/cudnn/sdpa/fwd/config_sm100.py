@@ -339,7 +339,8 @@ def d256_mxfp8_pair_leg(*, device_cc, pertensor, thd, paged, split_kv) -> bool:
     unsplit, not THD, not paged.  Measured 2026-10-12 on cc 10.7 (B1 H32/8 GQA, CUDA-graph replay interleaved with the
     one-CTA build, O bitwise identical between the widths): dense S=8k / 16k / 32k -8.5 / -10.1 / -13.3 %, causal (LPT)
     -5.9 / -6.6 / -7.4 %.  The kernel's THD arm at the pair is untested, the split leg keeps one-CTA partials and the
-    paged loader was not measured at the pair, so those legs stay at cga1; per-tensor FP8 d256 keeps cga1 as well."""
+    paged loader was not measured at the pair, so those legs stay at cga1.  Per-tensor FP8 d256 keeps cga1 by default; its
+    two-warpgroup pair body is served on an explicit cga=2 (api_dsl check_support, `_d256_fp8_pair_leg`)."""
     return tuple(device_cc or ()) == (10, 7) and not pertensor and not thd and not paged and (split_kv or 1) == 1
 
 

@@ -2471,6 +2471,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (self.cga == 1 or self.pack_gqa)
         )
 
+    def _d256_fp8_pair_leg(self) -> bool:
+        """The cc 10.7 per-tensor FP8 d256 leg that also builds at cga 2 (the two-warpgroup body), on an explicit request only:
+        HALF softmax, dense queries, unsplit, nonpaged, unpacked, ungated.  Every other per-tensor d256 leg keeps cga 1."""
+        from cudnn import data_type
+
+        return (
+            self._device_cc == (10, 7)
+            and self._fp8
+            and self._pertensor
+            and self.flavor == (256, 256)
+            and self.softmax_precision == data_type.HALF
+            and not self.thd
+            and not self.paged
+            and self.split_kv == 1
+            and not self.pack_gqa
+            and self.gate_desc is None
+            and not self.packed_thd_split
+        )
+
     def _sm100_nonpaged_thd_single_cta_leg(self) -> bool:
         """The SM100 single-CTA D128 half THD prefill leg (``config_sm100.supports_sm100_nonpaged_d128_thd_single_cta``)."""
         return not self.softmax_scale_prefolded and supports_sm100_nonpaged_d128_thd_single_cta(
@@ -3168,6 +3187,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # This adapter parameter names the MMA group. Wide explicit
             # engines expose the physical cluster and lower its fixed pair.
             supported_cgas = (getattr(selected_kernel, "cta_group", selected_kernel.cga),)
+        elif self._d256_fp8_pair_leg():
+            supported_cgas = (1, 2)
         self._value_error_if(
             self.cga is not None and self.cga not in supported_cgas,
             f"SM100 DSL SDPA only supports cga in {supported_cgas}",
