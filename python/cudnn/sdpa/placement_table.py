@@ -1245,6 +1245,14 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 36.454, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
     ),
+    # study sm80_paged_d256_swa_v4_pcie_20261121: windowed d256 prefill. `cost` ignores the window, so the floors also need a wide grid:
+    # with few parallel tiles FROST's time stays flat as heads drop while the backend's falls. Off the tile the grid alone decides.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "ge", 27.792, "sm80_paged_d256_swa_v4_pcie_20261121", "cost", ("ge", 7.453, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", True): Entry(
+        "ge", 8.085, "sm80_paged_d256_swa_v4_pcie_20261121", "tiles"
+    ),
     # study sm80_gen_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE c9d0bcb7d; the generation path's padded-Q paged GQA decode
     # shapes with no entry: d64 MTP / verify, d64 windowed, d128 windowed and d192 x 192 causal / windowed MTP / verify; b 1-128, KV 1k-128k
     # on and off the tile, windows 512-2048 keys; 660 train cells; the backend ran them 1.2-5.1x behind). Holdout at fresh heads, scored
