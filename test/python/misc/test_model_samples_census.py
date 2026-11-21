@@ -9982,3 +9982,75 @@ def test_a_wrong_table_a_wrong_twin_and_a_wrong_accessor_each_fail_the_run(monke
         code, lines, block = run(*longer)
     tokens = next(line for line in lines if line.startswith("  tokens "))
     assert code == 1 and lines[-1] == "[00] FAIL" and tokens.endswith("FAIL") and block.endswith("[band: attention_prepare]  PASS"), (tokens, block)
+
+
+def test_the_source_hash_covers_what_the_hashed_files_import():
+    """The list of hashed files is closed under its rule, to the fixed point: every module under ``frost/``,
+    ``_torch_stream.py`` and ``_cutlass_*`` that a file of the list imports at module level is in the list, and so is
+    the ``__init__.py`` of every package such an import runs.  The fixed point is formed again here, from the files and
+    with ``ast``: a module a listed file starts to import turns this red until it is hashed, so the hash of a run
+    covers the modules its kernels are built from.  The two modules that ``frost/init_order.py`` imports are among
+    them, once each."""
+    import ast
+
+    import cudnn
+
+    from model_samples.providers import fe
+
+    package = Path(cudnn.__file__).parent
+
+    def module_file(dotted):  # cudnn.x.y -> x/y.py or x/y/__init__.py of the package, or None
+        parts = dotted.split(".")
+        if parts[0] != "cudnn":
+            return None
+        inner = "/".join(parts[1:])
+        return next((name for name in (f"{inner}.py" if inner else "__init__.py", f"{inner}/__init__.py") if (package / name).is_file()), None)
+
+    def run_at_import(body):  # every statement an import of the module runs: not the body of a function
+        for node in body:
+            yield node
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for field in ("body", "orelse", "finalbody", "handlers"):
+                    yield from run_at_import([inner for inner in getattr(node, field, []) if isinstance(inner, ast.AST)])
+
+    def imported(name):
+        """The files of the package the module ``name`` imports at module level, the ``__init__.py`` of every package on the way included."""
+        found, inside = set(), ["cudnn", *name.split("/")[:-1]]
+
+        def add(dotted):
+            parts = dotted.split(".")
+            found.update(filter(None, (module_file(".".join(parts[:depth])) for depth in range(2, len(parts) + 1))))
+
+        for node in run_at_import(ast.parse((package / name).read_text()).body):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                base = inside[: len(inside) - (node.level - 1)] if node.level else []
+                dotted = ".".join([*base, *(node.module.split(".") if node.module else [])])
+                add(dotted)
+                for alias in node.names:  # ``from package import module``
+                    add(f"{dotted}.{alias.name}")
+        return found
+
+    def under(name):
+        return name.startswith("frost/") or name == "_torch_stream.py" or name.startswith("_cutlass")
+
+    def fixed_point(listed):
+        closed, new = set(listed), list(listed)
+        while new:
+            new = sorted({name for each in new for name in imported(each) if under(name)} - closed)
+            closed.update(new)
+        return closed
+
+    listed = fe.SOURCE_FILES
+    assert len(listed) == len(set(listed)) == 42 and all((package / name).is_file() for name in listed), "every file once, and a file of the package"
+    assert fixed_point(listed) == set(listed), f"imported by a hashed file and not hashed: {sorted(fixed_point(listed) - set(listed))}"
+    # the rule finds a module that is left out, at the first level and behind it, and a package's own file
+    for name in ("frost/capture.py", "_torch_stream.py", "frost/tile_dsl/swizzle.py", "frost/buffers.py", "frost/__init__.py", "_cutlass_helpers/__init__.py"):
+        assert name in fixed_point([each for each in listed if each != name]), f"{name}: a listed file imports it"
+    assert not under("__init__.py") and "_device.py" not in listed, "outside the rule: the package's entry point, and a module imported inside a function"
+    source = (package / "frost/init_order.py").read_text()
+    assert re.search(r"^from cudnn\._torch_stream import ", source, re.M) and re.search(r"^from \. import capture\b", source, re.M)
+    at = listed.index("frost/init_order.py")
+    assert listed[at + 1 : at + 3] == ("frost/capture.py", "_torch_stream.py"), "what a call of an entry runs in front of its launch, with what that imports"
