@@ -165,6 +165,18 @@ def eager_dispatch(args) -> bool:
     )
 
 
+def summary_dispatch(op, body, *args, **kwargs):
+    """A summary op's call: ``op``, or its ``body`` directly where the call may bypass the custom op
+    (:func:`eager_dispatch`).  A summary's outputs are non-differentiable, so the op adds no autograd formula; the body
+    runs without grad, as it does under the op."""
+    if not eager_dispatch((*args, *kwargs.values())):
+        return op(*args, **kwargs)
+    if torch.is_grad_enabled():
+        with torch.no_grad():
+            return body(*args, **kwargs)
+    return body(*args, **kwargs)
+
+
 def torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
     return TORCH_DTYPE_TO_CUDNN[dtype]

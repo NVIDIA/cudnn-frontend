@@ -49,6 +49,7 @@ from .common import (
     make_summary_cache_key,
     select_plan,
     summary_backward,
+    summary_dispatch,
     summary_setup_context,
     torch_dtype_to_cudnn,
 )
@@ -2388,7 +2389,9 @@ def kimi_delta_attention_summary(
     """
     if k.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
-    final_state, transition = torch.ops.cudnn.kimi_delta_attention_summary(
+    final_state, transition = summary_dispatch(
+        torch.ops.cudnn.kimi_delta_attention_summary,
+        run_kda_summary,
         k,
         v,
         g,
@@ -2460,7 +2463,9 @@ def kimi_delta_attention_summary_bwd(
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    d_initial_state, transition, context = torch.ops.cudnn.kimi_delta_attention_summary_bwd(
+    d_initial_state, transition, context = summary_dispatch(
+        torch.ops.cudnn.kimi_delta_attention_summary_bwd,
+        run_kda_summary_bwd,
         dO,
         q,
         k,
