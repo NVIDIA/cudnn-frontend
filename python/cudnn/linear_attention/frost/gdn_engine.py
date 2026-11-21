@@ -131,11 +131,13 @@ class CompiledGdn:
     (one item per sequence and head), ``warmup`` (decay-warmup split-K), ``dv_split`` (two uncut items per sequence and head,
     each owning half of d_v) or ``chain`` (per-piece H and M from the fused summary, an fp32 state chain seeding every piece,
     the prefill over the pieces as independent sequences).  The chunk factor T comes from the T pass in chain
-    plans."""
+    plans.  A GDN plan without a context port and without ``batch_invariant`` keeps a chain, whole-batch or tail, only where
+    ``chain_pays`` against the scheme it would run instead."""
 
     def __init__(self, node, kernel_module):
         from .common.piece_chain import (
             DV_SPLIT_TILES,
+            chain_pays,
             chain_rows_per_cta,
             choose_pieces,
             is_dv_split,
@@ -213,22 +215,24 @@ class CompiledGdn:
             batch_invariant=self.batch_invariant,
             expand_num=self.expand_num,
         )
-        self.chain = self.pieces > 0
-        self.dv_split = (
-            not self.chain
-            and not self.batch_invariant
-            and is_dv_split(
-                num_seqs=B,
-                heads_out=HO,
-                dim_v=V,
-                num_sm=self.num_sm,
-                total_tokens=self.q_rows,
-                b_t=self.b_t,
-                expand_num=self.expand_num,
-                unit_chunks=self.unit_chunks,
-                uncut=self.overwrite_initial_state,
-            )
+        dv_split = not self.batch_invariant and is_dv_split(
+            num_seqs=B,
+            heads_out=HO,
+            dim_v=V,
+            num_sm=self.num_sm,
+            total_tokens=self.q_rows,
+            b_t=self.b_t,
+            expand_num=self.expand_num,
+            unit_chunks=self.unit_chunks,
+            uncut=self.overwrite_initial_state,
         )
+        # A context port fixes the pieces by the shared rule (common/context.py) and batch_invariant by the length rule; every
+        # other GDN forward chains only where the chain beats the plan it would run instead.  The rule's constants are GDN's.
+        chain_by_cost = self.expand_num == 1 and not self.batch_invariant and not self.has_context and not node.params.get("output_context", False)
+        if self.pieces and chain_by_cost and not chain_pays(pieces=self.pieces, num_seqs=B, total_tokens=self.q_rows, split=dv_split):
+            self.pieces = 0
+        self.chain = self.pieces > 0
+        self.dv_split = not self.chain and dv_split
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.tail = None
@@ -247,6 +251,9 @@ class CompiledGdn:
                 dim_v=V,
             )
             if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
+                self.tail = None
+            chain_tail = self.tail is not None and not self.tail.dv_split
+            if chain_tail and chain_by_cost and not chain_pays(pieces=self.tail.pieces, num_seqs=B, total_tokens=self.q_rows, tail=True):
                 self.tail = None
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=self.q_rows, batch_invariant=self.batch_invariant) if self.chain else B

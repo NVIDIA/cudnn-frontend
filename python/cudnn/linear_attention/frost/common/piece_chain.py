@@ -65,6 +65,11 @@ LENGTH_RULE_PIECE_TOKENS = 8192
 CHAIN_MIN_UNITS_PER_PIECE = 4
 CHAIN_MIN_MEAN_TOKENS = 2048
 DV_SPLIT_TILES = 2
+# What a GDN forward chain costs against the plan it replaces, in units of the uncut prefill (``chain_pays``).
+CHAIN_PASSES_PCT = 218
+CHAIN_FIXED_TOKENS = 1620
+CHAIN_TAIL_FIXED_TOKENS = 2300
+DV_SPLIT_CHUNK_PCT = 86
 
 PIECE_TABLE_ALIGN = 256
 CHAIN_K_WARPS = 4
@@ -131,6 +136,27 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
     if pieces >= (CHAIN_MIN_PIECES_REVERSE if reverse else CHAIN_MIN_PIECES):
         return pieces, unit_chunks
     return 0, unit_chunks
+
+
+def chain_pays(*, pieces, num_seqs, total_tokens, split=False, tail=False) -> bool:
+    """Whether a GDN forward chain of ``pieces`` slots per sequence is faster than the plan that runs without it.
+
+    A chain runs every chunk through the summary and through the prefill and factors it in a pass of its own:
+    ``CHAIN_PASSES_PCT`` percent of the uncut prefill's work per chunk, shared by ``pieces`` slots that run side by side.  Its
+    prologue, state chain and extra launches cost what the uncut prefill spends on ``CHAIN_FIXED_TOKENS`` tokens, whatever the
+    length.  The plan it replaces walks a sequence at the uncut prefill's pace, or at ``DV_SPLIT_CHUNK_PCT`` percent of it
+    where that plan is the d_v split (``split``).  The chain pays from the mean sequence length at which the per-chunk gain
+    covers the fixed part::
+
+        mean_tokens * (rival_pct - CHAIN_PASSES_PCT / pieces) >= 100 * fixed_tokens
+
+    ``tail``: the chain of ``choose_tail`` replaces the leftover tiles' round of the uncut prefill, which needs no launch of
+    its own and starts on the first CTAs to finish, so its fixed part is ``CHAIN_TAIL_FIXED_TOKENS``.  The rule's inputs are
+    the slot budget (the SM count over the tiles), the tokens and the rival plan; its four constants are tuning."""
+    pieces, num_seqs = int(pieces), max(1, int(num_seqs))
+    rival_pct = DV_SPLIT_CHUNK_PCT if split else 100
+    fixed_tokens = CHAIN_TAIL_FIXED_TOKENS if tail else CHAIN_FIXED_TOKENS
+    return int(total_tokens) * (rival_pct * pieces - CHAIN_PASSES_PCT) >= 100 * fixed_tokens * pieces * num_seqs
 
 
 def ragged_pieces(*, heads_out, num_sm, total_tokens):

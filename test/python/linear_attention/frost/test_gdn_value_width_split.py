@@ -24,6 +24,7 @@ from cudnn.linear_attention.frost.common.piece_chain import (
     CHAIN_MIN_MEAN_TOKENS,
     DV_SPLIT_TILES,
     LENGTH_RULE_PIECE_TOKENS,
+    chain_pays,
     choose_pieces,
     is_dv_split,
     ragged_pieces,
@@ -44,7 +45,7 @@ COARSE_CADENCE = 2 * CHAIN_MIN_MEAN_TOKENS  # a sequence of the chain's first le
 PIECE_EDGES = [pieces * LENGTH_RULE_PIECE_TOKENS + past for pieces in range(1, CHAIN_MAX_PIECES + 1) for past in (0, 1)]
 
 
-def takes_the_split(
+def plan_scheme(
     num_sm,
     lengths,
     *,
@@ -56,25 +57,47 @@ def takes_the_split(
     householders=1,
     cadence=0,
     summary=False,
+    context=False,
 ):
-    """Whether the plan of one call runs two thread blocks per tile on ``num_sm`` SMs, by the package's own piece rule.  A plan
-    that neither chains nor is ``batch_invariant`` answers the slot-budget rule (``is_dv_split`` without ``uncut``); one
-    in-place sequence at the split's value width that carries no chain group also splits wherever two thread blocks per head
-    fit in one wave.  A summary node has no in-place form."""
+    """``(pieces, split)`` of the plan of one call on ``num_sm`` SMs, by the package's own rules: the slots per sequence of its
+    chain (0 when it does not chain) and whether it runs two thread blocks per tile.  A plan that neither chains nor is
+    ``batch_invariant`` answers the slot-budget rule (``is_dv_split`` without ``uncut``); one in-place sequence at the split's
+    value width that carries no chain group also splits wherever two thread blocks per head fit in one wave.  A summary node
+    has no in-place form.  A GDN forward without a context port keeps the chain of the shared piece rule only where
+    ``chain_pays`` against the plan it would run instead; GDP, the summary node, a context port and ``batch_invariant`` keep
+    the shared rule."""
     heads_out, tokens = max(heads, value_heads), sum(lengths)
     shape = dict(num_seqs=len(lengths), heads_out=heads_out, num_sm=num_sm, total_tokens=tokens, b_t=CHUNK, expand_num=householders)
     pieces, unit_chunks = choose_pieces(**shape, cadence_tokens=cadence, batch_invariant=batch_invariant)
-    if pieces or batch_invariant:
-        return False
-    if is_dv_split(**shape, dim_v=value_dim, unit_chunks=unit_chunks):
-        return True
+    if batch_invariant:
+        return pieces, False
     one_wave = DV_SPLIT_TILES * heads_out <= num_sm
     chain_group = ragged_pieces(heads_out=heads_out, num_sm=num_sm, total_tokens=tokens)
-    return in_place and not summary and len(lengths) == 1 and value_dim == WIDTH and one_wave and not chain_group
+    split = is_dv_split(**shape, dim_v=value_dim, unit_chunks=unit_chunks)
+    split = split or (in_place and not summary and len(lengths) == 1 and value_dim == WIDTH and one_wave and not chain_group)
+    by_cost = not summary and householders == 1 and not context
+    if pieces and by_cost and not chain_pays(pieces=pieces, num_seqs=len(lengths), total_tokens=tokens, split=split):
+        pieces = 0
+    return pieces, split and not pieces
+
+
+def takes_the_split(num_sm, lengths, **call):
+    """Whether the plan of one call runs two thread blocks per tile on ``num_sm`` SMs (``plan_scheme``)."""
+    return plan_scheme(num_sm, lengths, **call)[1]
 
 
 def build_plan(
-    lengths, *, heads=KEY_HEADS, value_heads=VALUE_HEADS, value_dim=WIDTH, in_place=True, batch_invariant=False, householders=1, cadence=0, summary=False
+    lengths,
+    *,
+    heads=KEY_HEADS,
+    value_heads=VALUE_HEADS,
+    value_dim=WIDTH,
+    in_place=True,
+    batch_invariant=False,
+    householders=1,
+    cadence=0,
+    summary=False,
+    context=False,
 ):
     """The plan object the FROST engine builds for one GDN node (GDP with ``householders`` > 1), or for one GDN summary node."""
     total, heads_out = sum(lengths), max(heads, value_heads)
@@ -94,6 +117,7 @@ def build_plan(
         return gdn_engine.build_gdn_summary(graph)
     ports["q"] = graph.tensor([total, heads, WIDTH], data_type=bf16, name="q")
     attrs = dict(scale=0.125, output_final_state=True, batch_invariant=batch_invariant, overwrite_initial_state=in_place or None)
+    attrs["output_context"] = context or None
     if cadence:
         attrs["checkpoint_every_n_tokens"] = cadence
     if householders > 1:
