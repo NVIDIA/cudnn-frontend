@@ -1849,7 +1849,8 @@ def test_sm90_paged_decode_gap_entries_follow_the_study(s_kv):
 
     study = "sm90_paged_decode_gaps_20261118"
     for s_q in (4, 8):
-        assert pt.lookup(row, g(s_q=s_q)) is True and pt.matched_entry(row, g(s_q=s_q)).study == study  # step37_swa b 128
+        owner = "sm90_paged_window_mtp_gaps_20261121" if s_q == 8 and s_kv % 128 else study  # off-tile windowed verify was refit
+        assert pt.lookup(row, g(s_q=s_q)) is True and pt.matched_entry(row, g(s_q=s_q)).study == owner  # step37_swa b 128
     assert pt.lookup(row, g(b=1)) is True  # MTP: always
     assert pt.lookup(row, g(s_q=8, b=1, h_q=16, h_kv=2)) is False  # verify: 2^7 query rows, under the floor
     step5 = dict(d_qk=192, d_v=192, h_q=64, h_kv=4)
@@ -1857,6 +1858,48 @@ def test_sm90_paged_decode_gap_entries_follow_the_study(s_kv):
         assert pt.lookup(row, g(**step5, s_q=s_q, window_left=None)) is True  # step5_full
         assert pt.lookup(row, g(**step5, s_q=s_q)) is True  # step5_swa
     assert pt.lookup(row, g(**{**step5, "b": 1, "h_q": 16, "h_kv": 1})) is (s_kv % 128 != 0)  # windowed MTP: one tile leads only off the KV tile
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm90_paged_window_and_unpacked_mtp_follow_their_study(s_kv):
+    """Study sm90_paged_window_mtp_gaps_20261121 (H200): d128 MTP with a group the decode tile does not divide leads up to 2^4 tiles
+    (on the KV tile from 2^9 keys); windowed d128 single-row decode up to 2^6.161 query rows; windowed d128 verify off the tile from
+    2^1.5 tiles; windowed d64 MTP and verify always. Windowed d192 x 192 and d64 single-row decode keep the rules."""
+    row = "sdpa_fwd_prefill_sm90"
+    study = "sm90_paged_window_mtp_gaps_20261121"
+    on_tile = s_kv % 128 == 0
+
+    def g(**over):
+        base = dict(b=1, h_q=40, h_kv=8, s_q=4, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True, window_left=None)
+        base.update(device_cc=(9, 0), has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    qwen = g()  # qwen3-14b MTP: 2^3 tiles
+    assert pt.class_key(row, qwen)[8] == "gqa_unpacked" and pt.matched_entry(row, qwen).study == study
+    assert pt.lookup(row, qwen) is True
+    assert pt.lookup(row, g(b=64)) is False  # 2^9 tiles
+    assert pt.lookup(row, g(s_kv=256 + (not on_tile))) is (not on_tile)  # the KV floor binds on the tile only
+
+    ripple = g(h_q=10, h_kv=1, s_q=1, causal=True, window_left=1023)  # 2^3.32 query rows
+    assert pt.matched_entry(row, ripple).study == study and pt.lookup(row, ripple) is True
+    assert pt.lookup(row, g(b=128, h_q=16, h_kv=2, s_q=1, window_left=511)) is False  # 2^11 query rows
+
+    verify = g(h_q=10, h_kv=1, s_q=8, window_left=1023)  # one tile
+    if on_tile:
+        assert pt.matched_entry(row, verify).study == "sm90_paged_decode_gaps_20261118"
+    else:
+        assert pt.matched_entry(row, verify).study == study
+        assert pt.lookup(row, verify) is False
+        assert pt.lookup(row, g(b=4, h_q=64, h_kv=8, s_q=8, window_left=511)) is True  # 2^5 tiles
+
+    for s_q, h_q, h_kv in ((4, 16, 2), (8, 16, 2), (4, 128, 16), (8, 128, 16)):  # muse_spark swa
+        d64 = g(b=128, h_q=h_q, h_kv=h_kv, s_q=s_q, d_qk=64, d_v=64, window_left=2047)
+        assert pt.matched_entry(row, d64).study == study and pt.lookup(row, d64) is True
+    for single_row in (g(s_q=1, d_qk=192, d_v=192, h_q=64, h_kv=4, window_left=511), g(s_q=1, d_qk=64, d_v=64, h_q=16, h_kv=2, window_left=2047)):
+        entry = pt.matched_entry(row, single_row)
+        assert entry is None or entry.study != study
 
 
 @pytest.mark.L0

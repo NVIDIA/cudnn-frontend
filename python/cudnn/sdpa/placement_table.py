@@ -1817,9 +1817,6 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", False): Entry(
         "ge", 9.246, "sm90_paged_decode_gaps_20261118", "rows"
     ),
-    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", True): Entry(
-        "ge", 9.246, "sm90_paged_decode_gaps_20261118", "rows"
-    ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm90_paged_decode_gaps_20261118"
     ),
@@ -1849,6 +1846,43 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa_partial", True): Entry(
         "never", None, "sm90_paged_decode_gaps_20261118"
+    ),
+    # study sm90_paged_window_mtp_gaps_20261121 (H200 700 W, cuDNN 9.24.0.43, FE b69cc1a63; the inference benchmark's paged generation graph, page 16;
+    # 2154 train cells over KV 256-131072 on and off the tile, several windows per class; 112 holdout cells at fresh head pairs and
+    # windows, 8 per class key, scored once). Classes no study answered, where the h200 nightly and a develop re-time ran the backend
+    # 1.3-3.6x behind FROST:
+    # - d128 MTP with a group the decode tile does not divide (gqa_unpacked: qwen3-14b 40/8) leads up to 2^4 parallel tiles (on the tile from
+    #   KV 2^9); holdout 0.88 / 0.58.
+    # - windowed d128 single-row decode leads up to 2^6.161 query rows (ripple / step37 swa); holdout 0.73 / 0.59, worst 1.03.
+    # - windowed d128 verify off the tile leads from 2^1.5 parallel tiles; holdout 0.60. On the tile the 2^9.246-row entry above stays.
+    # - windowed d64 MTP and verify lead always (muse_spark swa); holdout 0.71-0.78, worst 0.91.
+    # Windowed d192 x 192 and d64 single-row decode failed the holdout (group-12 and large-batch cells at 1.14-1.45) and keep the rules.
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_unpacked", False): Entry(
+        "le", 4.0, "sm90_paged_window_mtp_gaps_20261121", "tiles", ("ge", 9.0, "kv")
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_unpacked", True): Entry(
+        "le", 4.0, "sm90_paged_window_mtp_gaps_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 6.161, "sm90_paged_window_mtp_gaps_20261121", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 6.161, "sm90_paged_window_mtp_gaps_20261121", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", True): Entry(
+        "ge", 1.5, "sm90_paged_window_mtp_gaps_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp", "paged", "window", False, "gqa_unpacked", False): Entry(
+        "always", None, "sm90_paged_window_mtp_gaps_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp", "paged", "window", False, "gqa_unpacked", True): Entry(
+        "always", None, "sm90_paged_window_mtp_gaps_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "verify", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm90_paged_window_mtp_gaps_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "verify", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm90_paged_window_mtp_gaps_20261121"
     ),
     # study sm90_d64_sink_mtp_20261118 (H100 700 W, cuDNN 9.24.0.43 and 9.30.0.8; 813 + 318 off-tile train cells, 60 holdout cells at
     # fresh head pairs scored once): gpt-oss paged d64 MTP with a sink, which the row runs unpacked. Full cache leads up to 2^4.5 parallel
