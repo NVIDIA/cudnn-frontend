@@ -9751,7 +9751,8 @@ def test_the_counts_with_the_attention_preparation_on_its_entry():
     set move by the 16 launches of that kernel -- 194 + 289 + 1 for the plain step, 146 + 337 + 1 for the verify step
     -- and the recorded launch shapes stay.  The plans of both target stacks follow, each count with its split (the cases
     below: 64 layers and two, a step of one token and of six), with what is held to a recorded launch shape and what by
-    membership.  The attention core is what is left ``not yet``."""
+    membership, and each beside the same plan without the row: the block on its reference chain reaches the launches of
+    the entry fewer, one per attention layer.  The attention core is what is left ``not yet``."""
     from model_samples import blocks, census
     from model_samples.qwen_dense import QwenDense, configs
 
@@ -9786,6 +9787,8 @@ def test_the_counts_with_the_attention_preparation_on_its_entry():
     library = "cuDNN FE 6 | FlashInfer 3 | fallbacks 1 (PyTorch chains 1) | PyTorch 2 | unverified in CI: 3"
     entries = "cuDNN FE 6 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
     core, decode_left = {"attention.core": 16}, {"projection.fp8.out": 64, "mlp.down": 64, "attention.core": 16, "output_head": 1}
+    chain_table = {**configs.PROVIDERS, "attention.prepare": configs.PROVIDERS["attention.prepare"][1:]}  # the block on its reference chain
+    counted = {}  # per plan: the numbers of its claim, and those of the same plan without the row
     for layers, stack, tokens, code, port, shaped, loose, left, provider in (
         (64, "native", 1, 178, 289, 403, 64, core, library),
         (64, "native", 6, 130, 337, 451, 16, core, library),
@@ -9820,15 +9823,26 @@ def test_the_counts_with_the_attention_preparation_on_its_entry():
                 " 1 name", f" {16 if layers == 64 else 1} name"
             ).split()
         ), where
-    # 467 = the 451 of the stack before this row and the 16 launches of the entry; the same 16 on the stack of the entries alone
-    assert (178 + 289, 49 + 289, 130 + 337, 49 + 337) == (467, 338, 467, 386) and 467 - 451 == 338 - 322 == 16
+        # the row moves what a stack reaches by the launches of its entry and by nothing else: the same plan without the row has
+        # them not yet, and reaches that many ports fewer
+        chain = blocks.plan(chain_table, model.regimes, facts, 1, tokens, stack, model=model, options={"device": "cpu", "check_kernels": True})
+        before = target.claim(chain, model, census.configuration_of(chain), installed=RECORDED).numbers()
+        prepared = claim.blocks.count("attention.prepare")  # the launches of the entry in a step: one per attention layer
+        assert prepared == model.geometry.layer_kinds.count("full_attention") and before["not_yet"] == {**left, "attention.prepare": prepared}, where
+        assert (before["target_code"], before["target_port"], before["not_the_target"]) == (code, port - prepared, {}), where
+        counted[where] = (numbers, before)
+    # 467 = the 451 of the stack without this row and the 16 launches of the entry; the same 16 on the stack of the entries alone
+    published = [(64, stack, tokens) for tokens in (1, 6) for stack in ("native", "fe-entries")]
+    now, then = ([sum(counted[where][side][kind] for kind in ("target_code", "target_port")) for where in published] for side in (0, 1))
+    assert (now, then) == ([467, 338, 467, 386], [451, 322, 451, 370]) and {with_row - without for with_row, without in zip(now, then)} == {16}
     # the family README's record of the runs with this row states the counts of these plans, each with its split
     said = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split())
+    of_step, of_step_entries, of_verify, of_verify_entries = (f"{count} of {counted[where][0]['launches']}" for count, where in zip(now, published))
     for count in (
-        f"467 of 484 launches of a step target kernels on `native` ({split.format(178, 289)}; 403 of them in the recorded launch shape, 64 by membership)",
-        f"338 of 484 on `fe-entries` ({split.format(49, 289)})",
-        f"467 of 484 launches of the verify step target kernels on `native` ({split.format(130, 337)}; 451 of them in the launch shape the census records, 16",
-        f"386 of 484 on `fe-entries` ({split.format(49, 337)})",
+        f"{of_step} launches of a step target kernels on `native` ({split.format(178, 289)}; 403 of them in the recorded launch shape, 64 by membership)",
+        f"{of_step_entries} on `fe-entries` ({split.format(49, 289)})",
+        f"{of_verify} launches of the verify step target kernels on `native` ({split.format(130, 337)}; 451 of them in the launch shape the census records, 16",
+        f"{of_verify_entries} on `fe-entries` ({split.format(49, 337)})",
         f"18 of 20 launches of a step target kernels on `native` ({split.format(7, 11)}) and 13 of 20 on `fe-entries` ({split.format(2, 11)})",
         f"of a verify step 18 of 20 ({split.format(6, 12)}) and 14 of 20 ({split.format(2, 12)})",
     ):

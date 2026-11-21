@@ -1008,7 +1008,12 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)  # and the lines a run printed are those of its data
     said = lines[lines.index("cuDNN Frontend model sample: decode performance report") :]
     assert max(len(line) for line in said) <= 110, "the text out line behind the screen too"
-    assert said[: len(perf.screen(outcome.data))] == perf.screen(outcome.data) and 34 <= len(perf.screen(outcome.data)) <= 40
+    screen = perf.screen(outcome.data)
+    assert said[: len(screen)] == screen
+    # the step of this run is the host's, GPU busy the stand-in profiler's fixed figure: where the host leaves a remainder larger
+    # than GPU busy the screen takes the step apart -- one line more under ``step``, and the note of two lines
+    apart = sum(" + launch overhead " in line for line in screen)
+    assert len(screen) == 38 + 3 * apart and sum(line.startswith("note  ") for line in screen) == apart <= 1, "\n".join(screen)
     assert perf.screen(json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))) == perf.screen(outcome.data), "the file's data and nothing else"
     unwritten = perf.screen(outcome.data, "--perf-report late.json: No space left on device")
     assert (
