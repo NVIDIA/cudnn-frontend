@@ -10177,3 +10177,124 @@ def test_the_source_hash_covers_what_the_hashed_files_import():
     assert re.search(r"^from cudnn\._torch_stream import ", source, re.M) and re.search(r"^from \. import capture\b", source, re.M)
     at = listed.index("frost/init_order.py")
     assert listed[at + 1 : at + 3] == ("frost/capture.py", "_torch_stream.py"), "what a call of an entry runs in front of its launch, with what that imports"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# The twin of a library attention kernel that documents no numerics contract (``torch_ref.AttentionBound``): the reference
+# chain itself, which also keeps the operand terms of a bound.  No row of a table names it, so nothing here runs a session:
+# the twin is called as the tie-out calls it, and its terms are held to the definition written out here.
+# ---------------------------------------------------------------------------------------------------------------------------
+#: query heads, key / value heads and head width of the published model's attention layers
+ATTENTION_WIDTHS = (24, 4, 256)
+
+
+def _attention_weights(query, keys, scale=None):
+    """The softmax weights of one row's attended rows, written out from the definition, head by head: per query head the
+    weights BEFORE they are normalised (``exp`` of every scaled score less the largest) and their sum, in fp64.  ``query``
+    ``[heads, D]``, ``keys`` ``[kv heads, attended rows, D]``; a query head reads the key / value head of its group; the
+    scores are ``(q . k_j) * D**-0.5`` unless ``scale`` says otherwise."""
+    heads, width = query.shape
+    group = heads // keys.shape[0]
+    scale = width**-0.5 if scale is None else scale
+    weights = []
+    for head in range(heads):
+        scores = (keys[head // group].double() @ query[head].double()) * scale
+        raw = torch.exp(scores - scores.max())
+        weights.append((raw, raw.sum()))
+    return weights
+
+
+def _attention_terms(query, keys, values, scale=None):
+    """``(chain, spread)`` of one row, ``[heads * D]`` each in fp64, from the definition: per query head and element the sum
+    of the attended values, and of their magnitudes, under the softmax weights of :func:`_attention_weights`."""
+    group = query.shape[0] // keys.shape[0]
+    chain, spread = [], []
+    for head, (raw, total) in enumerate(_attention_weights(query, keys, scale)):
+        held = values[head // group].double()
+        chain.append((raw / total) @ held)
+        spread.append((raw / total) @ held.abs())
+    return torch.stack(chain).flatten(), torch.stack(spread).flatten()
+
+
+def test_the_twin_of_a_library_attention_kernel_is_the_reference_chain_and_keeps_the_terms_of_its_bound():
+    """The twin of an attention kernel that documents no numerics contract is the reference chain itself: its bytes are the
+    chain's on a plain and on a paged cache, at one token per sequence and at several, in both precisions a run can ask of
+    its reference.  And it keeps the two operand terms of the band -- the chain before its rounding to bf16 and the
+    weighted magnitude of the attended values -- always in fp64, equal to the terms written out from the definition row by
+    row and head by head: token ``t`` of a sequence attends to the positions up to its own, never to a later token's or to a
+    row behind the step.  It reads the cache through its accessors with the host integer it is handed: a state whose
+    tables are shifted leaves its bytes and its terms as they were, and it writes nothing.  The terms it keeps are those
+    of its LAST call: one twin serves every call here."""
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import QwenDense
+    from model_samples.state import DecodeState, KvCache, PagedKvCache
+
+    model = QwenDense.reduced(2)
+    g = model.geometry
+    heads, kv_heads, width = g.attn_heads, g.attn_kv_heads, g.attn_head_dim
+    assert (heads, kv_heads, width) == ATTENTION_WIDTHS
+    layer = g.layer_kinds.index("full_attention")
+    fresh = torch_ref.AttentionBound(None, None, None, {})
+    assert fresh.entry == "torch_ref.attention with the operand terms of its bound" and fresh.bound is None and fresh.per_row == (0, 1)
+    assert fresh.state_args == () and fresh.cache_page is None, "it writes nothing and reaches the cache through its accessors, in either layout"
+
+    def bits(tensor):
+        return tensor.view(torch.int16)
+
+    twins = {precision: torch_ref.AttentionBound(None, None, None, {"reference_precision": precision}) for precision in ("fp64", "ieee-fp32")}
+    generator = torch.Generator().manual_seed(11)
+    capacity, moved = 130, {False: 0, True: 0}  # elements that are another byte in fp32 than in fp64: at one token per sequence, at several
+    for sequences, tokens, position in ((1, 1, 0), (1, 1, 36), (3, 1, 64), (2, 3, 62), (1, 6, 0), (2, 2, 128)):
+        rows = sequences * tokens
+        keys = torch.randn(sequences, kv_heads, capacity, width, generator=generator).bfloat16()
+        values = torch.randn(sequences, kv_heads, capacity, width, generator=generator).bfloat16()
+        query = torch.randn(rows, heads, width, generator=generator).bfloat16()
+        # the terms from the definition: row (sequence, token) attends to the positions 0 .. position + token of its sequence
+        defined = [
+            _attention_terms(query[row], keys[row // tokens, :, : position + row % tokens + 1], values[row // tokens, :, : position + row % tokens + 1])
+            for row in range(rows)
+        ]
+        chain, spread = (torch.stack([terms[part] for terms in defined]) for part in (0, 1))
+        kept = {}
+        for layout, page in (("plain", None), ("paged", 64)):
+            state = DecodeState(g.layer_kinds, sequences, capacity, model.state_shapes(), "cpu", tokens, page=page)
+            cache = state.layers[layer]
+            assert isinstance(cache, PagedKvCache if page else KvCache) and cache.tokens == tokens
+            for at in range(capacity):  # every position holds a drawn row: also the later tokens' of the step and the rows behind it
+                cache.write(at, keys[:, :, at], values[:, :, at])
+            before = [tensor.clone() for tensor in cache.tensors()]
+            for precision, acc in (("fp64", torch.float64), ("ieee-fp32", torch.float32)):
+                twin = twins[precision]
+                out = twin(query, cache, position)
+                where = f"{sequences} x {tokens} rows at position {position}, a {layout} cache, {precision}"
+                want = torch_ref.attention_tokens(query, cache, position, tokens, acc) if tokens > 1 else torch_ref.attention(query, cache, position, acc)
+                assert (
+                    out.dtype == torch.bfloat16 and tuple(out.shape) == (rows, heads * width) and torch.equal(bits(out), bits(want))
+                ), f"{where}: the chain's bytes"
+                got_chain, got_spread = twin.bound
+                assert got_chain.dtype == got_spread.dtype == torch.float64 and got_chain.shape == got_spread.shape == out.shape, f"{where}: both terms in fp64"
+                # held to the definition far below any rounding of the run: a term in fp32 is 1e-7 of its magnitude off, a rounded chain 1e-3
+                assert bool(((got_chain - chain).abs() <= 1e-12 * spread).all()) and bool(((got_spread - spread).abs() <= 1e-12 * spread).all()), where
+                if position + tokens > 1:  # a row that attends to two rows or more: the spread is of magnitudes, never the chain's own
+                    assert bool((got_spread >= got_chain.abs() * (1 - 1e-12)).all()) and bool((got_spread > got_chain.abs() * 1.5).any()), where
+                else:  # one attended row: its weight is 1
+                    assert torch.equal(got_spread, got_chain.abs()) and torch.equal(
+                        got_chain, values[:, :, 0].repeat_interleave(heads // kv_heads, 1).flatten(1).double()
+                    )
+                kept[layout, precision] = (out, got_chain, got_spread)
+                assert all(torch.equal(bits(a), bits(b)) for a, b in zip(cache.tensors(), before)), f"{where}: the twin writes nothing"
+            for term in (1, 2):  # the terms do not follow the run's precision: bit for bit the same in both
+                assert torch.equal(kept[layout, "fp64"][term], kept[layout, "ieee-fp32"][term]), (sequences, tokens, position, layout)
+            assert torch.equal(bits(kept[layout, "fp64"][0]), bits(kept[layout, "fp64"][1].bfloat16())), "in fp64 the bytes are the kept chain, rounded once"
+            moved[tokens > 1] += int((bits(kept[layout, "fp64"][0]) != bits(kept[layout, "ieee-fp32"][0])).sum())
+            if page:  # a state whose tables are shifted: the twin never reads them
+                state.table.positions += 1
+                state.table.slots += 1
+                shifted = torch_ref.AttentionBound(None, None, None, {})
+                again = shifted(query, cache, position)
+                assert torch.equal(bits(again), bits(kept[layout, "fp64"][0])) and all(
+                    torch.equal(a, b) for a, b in zip(shifted.bound, kept[layout, "fp64"][1:])
+                )
+        for part in (0, 1, 2):  # either layout hands the chain the same rows
+            assert torch.equal(kept["plain", "fp64"][part].double(), kept["paged", "fp64"][part].double()), (sequences, tokens, position, part)
+    assert moved[False] > 0 and moved[True] > 0, "the bytes DO follow the run's precision, at one token and at several: some element is another byte in fp32"

@@ -243,6 +243,34 @@ def attention_tokens(q: torch.Tensor, cache, position: int, tokens: int, acc) ->
     return torch.stack([attention(rows[:, t], cache, position + t, acc) for t in range(tokens)], dim=1).flatten(0, 1)
 
 
+def attention_bound(q: torch.Tensor, cache, position: int, tokens: int = 1):
+    """The reference attention of a step BEFORE its rounding to bf16, and the weighted magnitude of the values it attends to:
+    ``(chain, spread)``, each ``[rows, heads * D]`` in fp64.  For token ``t`` of a sequence, a query head and an element
+    ``d``, with ``p_j`` the softmax weight of the attended position ``j = 0 .. position + t`` of that sequence (its own
+    included, the later tokens' of the step not), formed as :func:`attention` forms it::
+
+        chain  = sum_j p_j * v[j, d]
+        spread = sum_j p_j * |v[j, d]|
+
+    The operand terms of the band ``attention_bf16_weights`` (``tie_out``).  Both are formed in fp64 on the bf16 operands
+    cast exactly, whatever precision the run's reference accumulates in: the band is stated against this evaluation, and
+    the chain is never rounded here.  The cache is read through its own accessors with host integers, on either layout,
+    and through no table of the state.  The rows of a step of several tokens stand sequence by sequence."""
+    rows = q.unflatten(0, (-1, tokens))
+    sequences, _, H, D = rows.shape
+    chains, spreads = [], []
+    for token in range(tokens):
+        count = position + token + 1  # the positions this token attends to: every earlier one and its own
+        k = cache.keys(count, torch.float64)
+        v = cache.values(count, torch.float64)
+        HK = k.shape[1]
+        qg = rows[:, token].to(torch.float64).reshape(sequences, HK, H // HK, D)
+        p = torch.softmax(torch.einsum("bhgd,bhtd->bhgt", qg, k) * D**-0.5, dim=-1)
+        chains.append(torch.einsum("bhgt,bhtd->bhgd", p, v).reshape(sequences, H * D))
+        spreads.append(torch.einsum("bhgt,bhtd->bhgd", p, v.abs()).reshape(sequences, H * D))
+    return torch.stack(chains, dim=1).flatten(0, 1), torch.stack(spreads, dim=1).flatten(0, 1)
+
+
 def gate_quantize(o: torch.Tensor, gate: torch.Tensor, quant):
     """``sigmoid(gate) * attention output`` with the chain's bf16 roundings, then the static 8-bit quantisation."""
     return quantize((o.float() * torch.sigmoid(gate.float()).to(BF16).float()).to(BF16), quant)
@@ -682,6 +710,30 @@ class Attention(_Reference):
 
     def __call__(self, q, cache, position):
         tokens = getattr(cache, "tokens", 1)
+        if tokens > 1:
+            return attention_tokens(q, cache, position, tokens, self.acc)
+        return attention(q, cache, position, self.acc)
+
+
+class AttentionBound(_Reference):
+    """The attention core as the reference chain itself, which also keeps the operand terms of a bound: the twin of an
+    adapter to a library attention kernel that documents no numerics contract and whose rounding points are not
+    established.  No reference block can be written at rounding points nobody has stated, so this block returns the
+    bytes of the reference chain (``attention`` / ``attention_tokens``, in the run's accumulation precision) and keeps
+    of the last call what the band of such a kernel is judged with (``tie_out``: ``attention_bf16_weights``): ``bound`` =
+    the chain of every element before its rounding to bf16 and the weighted magnitude of the values it attends to, both
+    in fp64 (:func:`attention_bound`).  It works from the host integer the step hands it and reads the cache through
+    its accessors, on either layout; it reads no table of the state, so a wrong length or page-table row cannot move
+    it.  It writes nothing.  Not a row of any table."""
+
+    entry = "torch_ref.attention with the operand terms of its bound"
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
+    per_row = (0, 1)
+    bound = None
+
+    def __call__(self, q, cache, position):
+        tokens = getattr(cache, "tokens", 1)
+        self.bound = attention_bound(q, cache, position, tokens)
         if tokens > 1:
             return attention_tokens(q, cache, position, tokens, self.acc)
         return attention(q, cache, position, self.acc)
