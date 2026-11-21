@@ -47,6 +47,7 @@ DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120", "sdpa_bwd_sm80"})
 SM80_DET_NARROW_WINDOW_MAX_LEFT = 383  # window_left at or below keys `window_narrow` on sdpa_bwd_sm80 prefill_det (256 measured, 512 not)
 SM120_PAGED_BODY_MAX_S_Q = 16  # sdpa_fwd_prefill_sm120 paged d128 up to this s_q, off the decode tile, keys `gqa_body`
 SM100_WINDOW_PREFILL_MIN_S_Q = 256  # the smallest S_q the SM100 windowed packing studies timed (sm100_d192x128_swa_sink_pack_20261118)
+SM100_WINDOW_LONG_CACHE_MIN_S_KV = 1 << 16  # dense d192 x 128 windowed packed prefill from this KV length keys `gqa_long_cache`
 """Rows whose deterministic graphs are classes of their own (phase ``<phase>_det``): the row's deterministic body is a different kernel
 (SM120: the two-kernel dS / dQ split), so those graphs neither share the default classes' entries nor count as unmeasured."""
 
@@ -181,6 +182,15 @@ def _sm100_unpacked_window_prefill(row: str, facts) -> bool:
         return False
     pack = _row_pack_group(row, facts)
     return pack is not None and pack < facts.h_q // facts.h_kv
+
+
+def _sm100_long_cache_window_d192(row: str, facts) -> bool:
+    """SM100 / SM103 dense d192 x 128 windowed prefill on the KV tile over a long cache. The backend's windowed time grows with the
+    KV length and FROST's does not, so the grid size at which FROST leads falls as the cache grows; one threshold cannot place both
+    cache ranges. Off the tile the class leads at every length and keeps its key."""
+    if not _sm100_window_prefill_measured(row, facts) or (facts.d_qk, facts.d_v) != (192, 128):
+        return False
+    return facts.s_kv >= SM100_WINDOW_LONG_CACHE_MIN_S_KV and facts.s_kv % 128 == 0
 
 
 def _sm100_short_window_d192(row: str, facts) -> bool:
@@ -324,6 +334,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         group = "gqa_body"
     if group == "gqa" and _sm100_short_window_d192(row, facts):
         group = "gqa_short"
+    if group == "gqa" and _sm100_long_cache_window_d192(row, facts):
+        group = "gqa_long_cache"
     if group == "gqa" and phase == "verify" and _sm107_verify_partial_pack(row, facts):
         group = "gqa_partial"
     # Off the 128-key tile dense KV cannot split and paged KV measures differently near the boundary: its own class, which
@@ -1901,9 +1913,14 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm100_d192x128_swa_sink_pack_20261118 (B200 1000 W train on cuDNN 9.24.0.43 and 9.30.0.8, B200 + B300 holdout at fresh head
     # pairs scored once; run-559 gates GB200 11 rows at 0.690, GB300 11 at 0.591): mimo swa dense d192 x 128 with a window and a sink,
     # keyed by whether the row packs the GQA group whole (`_sm100_unpacked_window_prefill`). On the tile both lead past a tiles floor
-    # (the b 1 2048-square 16-head rows stay below it); off the tile both lead
+    # (the b 1 2048-square 16-head rows stay below it); off the tile both lead.
+    # study sm100_d192x128_swa_sink_v2_20261121 re-fit the packed side on the tile, keyed apart from 2^16 keys
+    # (`_sm100_long_cache_window_d192`): over a long cache FROST leads from a smaller grid, which one tiles floor cannot place
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", False): Entry(
-        "ge", 9.5, "sm100_d192x128_swa_sink_pack_20261118", "tiles"
+        "ge", 9.085, "sm100_d192x128_swa_sink_v2_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa_long_cache", False): Entry(
+        "ge", 33.618, "sm100_d192x128_swa_sink_v2_20261121"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", True): Entry(
         "always", None, "sm100_d192x128_swa_sink_pack_20261118"
@@ -1915,7 +1932,10 @@ TABLE: Dict[Tuple, Entry] = {
         "always", None, "sm100_d192x128_swa_sink_pack_20261118"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", False): Entry(
-        "ge", 9.5, "sm100_d192x128_swa_sink_pack_20261118", "tiles"
+        "ge", 9.085, "sm100_d192x128_swa_sink_v2_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa_long_cache", False): Entry(
+        "ge", 33.618, "sm100_d192x128_swa_sink_v2_20261121"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", True): Entry(
         "always", None, "sm100_d192x128_swa_sink_pack_20261118"
