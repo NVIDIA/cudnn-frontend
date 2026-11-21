@@ -788,6 +788,54 @@ def test_sm80_paged_d256_on_tile_floor_follows_v7():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("off_tile", [0, 1], ids=["on_tile", "off_tile"])
+def test_sm80_d512_decode_follows_its_study(off_tile):
+    """A100 d512 decode (dense and paged, single-row and MTP, 1-8 KV heads) belongs to study sm80_d512_decode_v3_pcie_20261121 on and
+    off the KV tile. Within each class the lead is monotone in the entry's feature, and `cost` grows with h_kv."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_d512_decode_v3_pcie_20261121"
+
+    def f(b, h_q, h_kv, s_q, s_kv, paged):
+        causal = s_q > 1
+        return _facts(
+            b=b,
+            h_q=h_q,
+            h_kv=h_kv,
+            s_q=s_q,
+            s_kv=s_kv + off_tile,
+            d_qk=512,
+            d_v=512,
+            causal=causal,
+            bottom_right=causal,
+            has_paged_kv=paged,
+            page_size=64 if paged else 0,
+            padded=paged,
+            device_cc=(8, 0),
+        )
+
+    classes = {}
+    grid = [
+        (b, h_q, h_kv, s_q, s_kv, paged)
+        for paged in (False, True)
+        for s_q in (1, 2, 4)
+        for h_q, h_kv in ((16, 1), (128, 1), (16, 2), (32, 4), (32, 8))
+        for b in (1, 4, 64)
+        for s_kv in (128, 1024, 8192, 131072)
+    ]
+    for b, h_q, h_kv, s_q, s_kv, paged in grid:
+        facts = f(b, h_q, h_kv, s_q, s_kv, paged)
+        key = pt.class_key(row, facts)
+        entry = pt.matched_entry(row, facts)
+        assert key[-1] == bool(off_tile) and entry.study == study, (b, h_q, h_kv, s_q, s_kv, paged)
+        classes.setdefault(key, []).append((pt.FEATURES[entry.feature](facts), pt.lookup(row, facts)))
+    assert len(classes) == 4  # dense / paged x single-row / MTP
+    for key, points in classes.items():
+        leads = [lead for _, lead in sorted(points)]
+        assert leads == sorted(leads), key  # the backend below the floor, FROST from it
+    assert pt.FEATURES["cost"](f(1, 32, 8, 2, 4096, True)) > pt.FEATURES["cost"](f(1, 32, 1, 2, 4096, True))
+
+
+@pytest.mark.L0
 def test_sm107_dense_d128_noncausal_mha_follows_its_study():
     """sm107_dense_d128_nc_mha_v2_20261117 (Rubin): dense d128 MHA non-causal leads up to 2^14.246 query rows on the KV tile, which hands
     the hand rule's 256-tile S_q 256 chunks (FROST 1.36-1.53x) back to the backend; off the tile it leads cost <= 2^32.953 over at least
