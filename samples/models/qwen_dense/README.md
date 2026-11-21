@@ -2294,7 +2294,9 @@ the reference session of the first count -- its state and its record -- was stil
 in a reference cycle of the session's own (its stage clock held a closure over the session), until Python collected
 it. The stage clock is handed the device now, so the reference session of a count stands in no reference cycle and is
 released when its checks return; a host test holds that on two counts with Python's collection of reference cycles
-switched off.
+switched off. The same run then held 5.53 GiB at its peak, 1.6 % above the weights, the two states and the count,
+reserved the same 8.04 GiB and grew the device by the same 8.22 GiB, and but for its clocks and that peak it printed
+the lines it had printed.
 What the sentence leaves out, by the code (no run of these kinds was made). The token check holds four fp32 tensors of
 every checked logit at a time; it is the larger moment from about 150 checked steps of the two-layer model -- a
 request of more positions than that at many sequences -- and from 10 checked steps at the published widths, and such
