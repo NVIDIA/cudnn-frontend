@@ -1344,18 +1344,27 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", False): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", True): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
-    # study sm80_d512_decode_20261116 (A100 40GB PCIe, cuDNN 9.24.0.43; benchmark/attention_inference's generation graph, d512
-    # absorbed MLA over one KV head, h_q 16-128, b 1-64, dense and paged page 64; s_q 1 / 4 (mtp); 216 train cells on and off the
-    # 128-key tile + a 48-cell seeded holdout (24 off-tile, 24 on-tile) scored once: 1.004 geomean regret vs 8.51 for the
-    # measured default, worst 1.18; its one cell above the default ran the default's own plan (same-plan spread))
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "dense", "causal_br", False, "gqa", False): Entry("always", None, "sm80_d512_decode_20261116"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "dense", "causal_br", False, "gqa", True): Entry("always", None, "sm80_d512_decode_20261116"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry("always", None, "sm80_d512_decode_20261116"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm80_d512_decode_20261116"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "dense", "none", False, "gqa", False): Entry("ge", 26.006, "sm80_d512_decode_20261116"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "dense", "none", False, "gqa", True): Entry("ge", 8.0, "sm80_d512_decode_20261116", "rows"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 8.0, "sm80_d512_decode_20261116", "rows"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 8.0, "sm80_d512_decode_20261116", "rows"),
+    # study sm80_d512_decode_v2_pcie_20261121 (A100 80GB PCIe 300 W, cuDNN 9.24.0.43, FE b69cc1a63; benchmark/attention_inference's generation graph, d512
+    # absorbed MLA over one KV head, dense and paged page 64): 792 train cells (KV 128-131072 on and off the 128-key tile, s_q 1 / 2 / 4,
+    # h_q 16-128, b 1-64), fitted under the criterion; a 96-cell seeded holdout (half below KV 2048, per-request lengths on half the
+    # paged cells) scored once: every class passes, changed cells at 0.05-0.47 of the measured default, none slower. Short paged caches
+    # (KV 128-257 at small batch) stay below the cost floors and keep the backend.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_d512_decode_v2_pcie_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_d512_decode_v2_pcie_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 21.5, "sm80_d512_decode_v2_pcie_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 21.275, "sm80_d512_decode_v2_pcie_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "dense", "none", False, "gqa", False): Entry("ge", 25.006, "sm80_d512_decode_v2_pcie_20261121"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "dense", "none", False, "gqa", True): Entry("ge", 25.296, "sm80_d512_decode_v2_pcie_20261121"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 25.006, "sm80_d512_decode_v2_pcie_20261121"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 25.296, "sm80_d512_decode_v2_pcie_20261121"),
     # study sm90_decode_gaps_20261117 (H100 80GB HBM3, cuDNN 9.24.0.43, FE dbae6eec5; SM90 decode classes no study answered, found by
     # re-timing the h200 nightly on the branch: paged d512 verify (gemma4 global) and paged d256 sliding-window decode / MTP / verify
     # (gemma4 SWA, window 1024); 763 train cells fitted under the criterion, a 48-cell holdout scored once). FROST runs 0.05 of the
