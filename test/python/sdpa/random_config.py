@@ -92,6 +92,7 @@ class ExecConfig:
     _ENUM_FIELDS = {
         'data_type': torch,
         'output_type': torch,
+        'dO_type': torch,
         'diag_align': cudnn.diagonal_alignment,
         'implementation': cudnn.attention_implementation,
         'softmax_precision': cudnn.data_type,
@@ -264,6 +265,10 @@ class ExecConfig:
     # Missing ports retain compact prefixes. Serialized with --repro; these are
     # storage rows, before each port's token stride and offset multiplier.
     ragged_origin_rows: dict[str, list[int]] = None
+
+    # Backward only: None preserves the Q/K/V dtype used by old repros.
+    # Append so existing positional configs and seeded field order stay intact.
+    dO_type: torch.dtype = None
 
     @property
     def is_train(self):

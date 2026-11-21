@@ -230,7 +230,7 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
                          padding=None, bias=None,
                          left_bound=None, right_bound=None, diag_align=None, sink_token=None,
                          stats=None, return_intermediates=False, quantize_ds=True, dP_scale_dtype=None, dP_descale_dtype=None,
-                         dP_scale=None, quantize_grads=True, delta=None):
+                         dP_scale=None, quantize_grads=True, delta=None, torch_ds_type=None):
     """Compute backward pass reference.
     Returns (dQ, dK, dV, dSink_token, dP_amax, dQ_amax, dK_amax, dV_amax).
 
@@ -244,7 +244,12 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     [b, h_q, s_q, 1], TRUE units) replaces the reference's own ``rowsum(dO * O) * o_descale *
     dO_descale`` -- the row-sum an external producer hands the kernel (``external_delta``).
 
-    ``quantize_ds`` (default True: the cuDNN backend's recipe -- dS rounded to ``torch_itype`` with ``dP_scale`` before
+    ``torch_ds_type`` (appended, default None = ``torch_itype``) selects dS rounding independently of P, which
+    always uses ``torch_itype``. The per-tensor backend casts dS to the dO descriptor's dtype; its harness passes
+    that format explicitly. Omission preserves the previous recipe for existing reference callers. The scale
+    policy below is independent of this cast override.
+
+    ``quantize_ds`` (default True: dS rounded to ``torch_ds_type`` with ``dP_scale`` before
     the dQ / dK products; also the FROST sm107 d256 fp8 chain as shipped, ``dS_q = e4m3(dS * scale_dP)``) set False
     holds dS in fp32 for those products: the reference for an engine whose dQ / dK consume dS in a wider dtype (that
     chain's bf16-dS TWIN, ``api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16``), which an e4m3-dS reference would misreport by
@@ -262,8 +267,9 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     heads at s = 16K, twice that while ``finalize`` concatenates).
 
     ``dP_scale_dtype`` / ``dP_descale_dtype`` (default None / None) name the dtypes the dS scale pair is derived from.  The
-    default is ONE dtype: ``dP_scale = get_fp8_scale_factor(dP_amax, torch_itype)`` -- the dtype dS is rounded TO
-    (``ds_scaled = dS * dP_scale``, cast to ``torch_itype``) -- and ``dP_descale`` its exact reciprocal; ``torch_otype`` is
+    default retains the QKV-based scale policy: ``dP_scale = get_fp8_scale_factor(dP_amax, torch_itype)`` and
+    ``dP_descale`` its exact reciprocal. ``torch_ds_type`` only selects the cast of ``ds_scaled = dS * dP_scale``;
+    it does not change the supplied/default scale policy. ``torch_otype`` is
     the GRADIENTS' dtype and only casts dQ / dK / dV (scale 1.0 for a half dtype).  A caller whose graph derives the two
     scalars from other dtypes names them here, so the reference rounds and descales dS exactly where its graph does (the
     cuDNN backend suite's ``fp8.py``: scale from the output dtype, descale from the input dtype -- the pair its graph is
@@ -272,6 +278,7 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     _, s_kv, h_k, _ = k.shape
     _, _, h_v, d_v = v.shape
     device = q.device
+    torch_ds_type = torch_itype if torch_ds_type is None else torch_ds_type
 
     q, k, v = _prepare(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), padding, device)
     dO = dO.float().transpose(1, 2)
@@ -312,8 +319,8 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     for start in range(0, s_kv, 128):
         dP_amax = max(dP_amax, dP_block(start, min(start + 128, s_kv)).abs().max().item())
     if dP_scale is None:
-        # ONE dtype for the dS scale pair by default.  dS is rounded to torch_itype (the fp8 dS the dQ / dK products consume),
-        # so its scale derives from torch_itype and its descale is the exact reciprocal.  The former derivation -- scale from
+        # Preserve the legacy QKV-based scale pair, independently of the dS cast override.
+        # Its descale is the exact reciprocal. The former derivation -- scale from
         # torch_otype (the gradients' dtype), descale from torch_itype -- agreed only while the two dtypes did: with
         # half-precision gradients get_fp8_scale_factor(amax, half) is 1.0, so dS was rounded to e4m3 at UNIT scale
         # (quantize_ds=True: dQ / dK garbled) or left unscaled (quantize_ds=False) and then multiplied by 1 / scale_dP -- dQ /
@@ -344,7 +351,7 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
         dS = p * (dP_block(start, end) - D) * attn_scale
         # dS (FP32) -> dS (FP8)
         ds_scaled = dS * dP_scale
-        dS_quant = (ds_scaled.to(torch_itype)).float() if quantize_ds else ds_scaled
+        dS_quant = (ds_scaled.to(torch_ds_type)).float() if quantize_ds else ds_scaled
         if collect is not None:
             collect.add("p_scaled", start, end, p_scaled)
             collect.add("ds_scaled", start, end, ds_scaled)

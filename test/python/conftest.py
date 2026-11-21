@@ -283,6 +283,10 @@ def pytest_runtest_makereport(item, call):
     report = yield
     if report.when == "call" and report.failed:
         item._fe_call_failed = True
+        if os.environ.get("MXFP8_CAPTURE_DIR") and call.excinfo is not None:
+            from sdpa.mxfp8_failure_capture import capture_mxfp8_failure
+
+            capture_mxfp8_failure(item.nodeid, call.excinfo.value)
     return report
 
 

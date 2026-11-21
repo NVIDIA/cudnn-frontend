@@ -58,6 +58,7 @@ def mxfp8_bwd():
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         is_deterministic=RandomChoice({True: 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
+        dO_type=RandomChoice({torch.float8_e5m2: 2, torch.float8_e4m3fn: 1}),
     )
 
 
@@ -72,7 +73,7 @@ DENSE = SuiteSpec(
     exec_kind="mxfp8",
     min_sm=(10, 0),
     post=combine(post_mxfp8, post_mxfp8_bwd_flags, post_train),
-    fuzzed=COMMON_FUZZ + MASK_FUZZ + ("out fp16/bf16", "sink"),
+    fuzzed=COMMON_FUZZ + MASK_FUZZ + ("dO e4m3/e5m2 (1:2)", "out fp16/bf16", "sink"),
     pinned=(
         "train",
         "e4m3 in",
