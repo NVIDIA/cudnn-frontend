@@ -8,6 +8,7 @@ import math
 import cudnn
 import pytest
 import torch
+from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
 
 from frost_test_utils import requires_blackwell_geforce, requires_dsl
 
@@ -39,7 +40,10 @@ def _graph(dq, dv, dtype, *, record=None, split=None, sq=97, skv=301):
         index = next(i for i in range(len(g.plans)) if g.get_plan_name_at_index(i).startswith(_NAME))
         if split is not None:
             engine_id, knobs = g.get_engine_and_knobs_at_index(index)
-            g.create_execution_plan(engine_id, {**knobs, cudnn.knob_type.SPLIT_KV: split})
+            knobs = {**knobs, cudnn.knob_type.SPLIT_KV: split}
+            if split > 1:
+                knobs[cudnn.knob_type.SCHED_POLICY] = SCHED_NATURAL
+            g.create_execution_plan(engine_id, knobs)
             index = len(g.plans) - 1
         g.select_plan(index)
     else:
