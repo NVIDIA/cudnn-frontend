@@ -127,7 +127,8 @@ does not hold is printed as not known and ignored, so a new name for one of them
     sets one against the other -- launch overhead, a step less its GPU busy and its host time -- is formed step by
     step, at the same position, before anything is aggregated: the medians of three lists need not be one step's, and
     their difference can be a time no step has. Where its terms are printed as a sum they are the means over the same
-    steps, so that a reader can add them up, and it is called an estimate: the two sides are two requests. A row of the
+    steps, so that a reader can add them up, and it is called an estimate: the two sides are two requests. The median
+    of the per-step values is printed beside it: one stalled step moves a mean and not a median. A row of the
     per-kernel table is found by its place in the wiring, never by a kernel's name, and a traced pass whose kernel
     check does not hold prints no table. The row of a block a library serves names the library's entry, as the plan
     does, never the block alone and never a fallback; what a block launches beside a kernel of its own is the row of
@@ -240,6 +241,16 @@ does not hold is printed as not known and ignored, so a new name for one of them
     the mode is a branch of its own in the script, and a pull request that touches the loop, the census, the checks
     or the timing shows the area's plain runs line by line against the tree it started from
     (`test/python/misc/test_model_samples_perf.py`).
+    The GPU is observed through the driver's `nvidia-smi` tool in child processes, with no package added, and never by
+    a call of the timing process inside a request: the sampler is started in front of the warm-up request and its
+    files are read behind the traced request, and its loops end with the pipe the run holds: at the stop, or when the
+    run is gone. The report file says what the sampler was to the timed requests of its run, or that none ran, with
+    the reason (`protocol`).
+    A list of processes counts as empty only beside the run's own entry and a device memory in use that the run's own
+    explains. A count of other processes is stated only of a list that shows the run's own entry too. A `not observed`
+    carries a reason from a closed list, never the tool's path or its own words; no process name is asked for, and
+    the report keeps no id of another process. A lock is the operator's declaration: it is printed as declared, held
+    against the observed clock in both directions, and never set.
 
 ## What the first GPU run of this area taught
 
