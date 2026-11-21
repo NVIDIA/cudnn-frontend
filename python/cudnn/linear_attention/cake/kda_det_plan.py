@@ -3,6 +3,7 @@
 
 """Chunk-64 KDA serial plans with full backward recomputation."""
 
+from cudnn.engines.base import require_stream
 from cudnn.frost import buffers
 from cudnn.frost.device import current_device, device_context, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
@@ -98,7 +99,7 @@ class KdaCakeDetPlan(CakeLinearPlan):
         else:
             values["out"] = x["O"]
             stages = ("table", "fwd_intra", "wy_fwd", "fwdh")
-        with device_context(self.device), tvm_ffi.use_raw_stream(tvm_ffi.device("cuda", self.device), int(stream or 0)):
+        with device_context(self.device), tvm_ffi.use_raw_stream(tvm_ffi.device("cuda", self.device), require_stream(stream, "kda_cake_det")):
             for stage in stages:
                 if stage in self.entries:
                     grid = self.grids[stage]

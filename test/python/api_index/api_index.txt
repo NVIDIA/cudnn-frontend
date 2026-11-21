@@ -24,6 +24,7 @@ cudnn.DeviceInfo.device_name
 cudnn.DeviceInfo.l2_cache_bytes
 cudnn.DeviceInfo.oversized_shared_memory_per_block
 cudnn.DeviceInfo.shared_memory_per_block_optin
+cudnn.DeviceInfo.shared_memory_per_multiprocessor
 cudnn.DeviceInfo.sm_count
 cudnn.DeviceInfo.sm_version
 cudnn.DiscreteGroupedGemmDswigluSm100
