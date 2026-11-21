@@ -82,6 +82,7 @@ the larger magnitude and not below 2**-8 of the tensor's largest value (a multip
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
 ``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``swiglu_fp4`` = see below; ``attention_prepare`` = see below;
 ``same`` = the provider is the reference chain, nothing to compare.
+``attention_bf16_weights`` = see below: the bound of a stated model, for a library kernel that documents no contract.
 
 **What a provider block is compared with.**  The reference block of the same name -- unless the provider's kernel rounds at
 other points than the reference chain: then the block names its twin (``Block.twin``), a reference block written at the
@@ -158,6 +159,42 @@ operand, so a NaN or an infinity there is the twin's byte too.  The line prints 
 the twin's byte -- the approximate root moves a few by a unit, inside their band; the entry's page states no share for
 them, and none is gated -- and how many of them are outside their band.
 
+``attention_bf16_weights``, the band of an attention kernel of a library that documents no numerics contract, is not a
+contract of that kernel: it is the bound of a stated model of the kernel's arithmetic, declared here before any run of a
+row that names it.  Which values such a kernel rounds is not established, so no twin can be written at its rounding
+points.  The twin is the reference chain itself (``torch_ref.AttentionBound``), which also keeps, per output element, the
+two operand terms of the bound -- in fp64, whatever precision the run's reference accumulates in.  With ``p_j`` the
+softmax weight of the attended row ``j`` and ``v_j`` that row's value::
+
+    chain  = sum_j p_j v_j        (the reference attention before its rounding to bf16)
+    spread = sum_j p_j |v_j|
+
+The model: every softmax weight carries one rounding to nearest at eight significant bits, ``p_j (1 + d_j)`` with ``|d_j|
+<= u`` and ``u = 2**-8 / (1 + 2**-8)``; the number the weighted sum is divided by carries one of its own, ``1 + e`` with
+``|e| <= u``; and the output is rounded to bf16 once.  Before that last rounding the model's output is ``(sum_j p_j (1 +
+d_j) v_j) / (1 + e)``, so its distance from the chain is ``|sum_j p_j d_j v_j - e chain| / (1 + e)``, at most ``u (spread +
+|chain|) / (1 - u)`` -- and ``u / (1 - u)`` is exactly ``2**-8``.  The output's own rounding adds half a spacing of bf16
+values at the output.  The band, element by element::
+
+    out is finite and |out - chain| <= 1 x [ 2**-8 x (spread + |chain|) + 1 x spacing ]
+
+``spacing`` is the distance between two neighbouring bf16 values at the magnitude of the chain (at the smallest normal
+fp32 value where the chain is below it): the chain's alone, neither the output's nor the tensor's largest value's.  The
+coefficient, the weight term and the count of spacings are ``ATTENTION_BAND_COEFFICIENT``, ``ATTENTION_WEIGHT_TERM`` and
+``ATTENTION_SPACINGS``.  An element whose chain or spread is not finite is outside, whatever the output is.  The call
+writes nothing, so the cache it reads is held byte for byte.  The line prints how many
+elements are not the reference chain's byte, how many are outside their bound, and the largest share of its bound an
+element used with the chain and the spread of that element; the share is printed, not gated.
+
+What this band is and is not.  It is derived from a model and from no measured distance, and it claims nothing about
+what the kernel rounds.  It is the model's bound to first order: one spacing at the chain covers the output's rounding
+wherever the chain is not far below its bound, and where it is, half a spacing at the output is more than one spacing at
+the chain -- there an output of the model itself can use up to ``1 + 2**-8`` of its bound.  So an element outside is a
+finding, read with its share, its chain and its spread; it is never a reason for another coefficient, a further term or
+a shape left out.  A block in this band is not within one bf16 unit of the chain: the band's term is the weighted
+magnitude of the attended values, not the output's.  And what the band cannot see is the row's to say: one wrong,
+missing or extra attended row whose softmax weight is below the band's term.
+
 ``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
 output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
 of the state's largest value (of 1 when that is larger), every value finite, the conv history byte-identical and the null
@@ -214,6 +251,14 @@ GATE_MARGIN_ULP32 = 2.5
 #: (``docs/operations/normalizations/add_norm_quant_decode.md``), which is at most 20 fp32 units; beyond that distance
 #: from the midpoint of the two bf16 values around it the kernel rounds to the nearest one.  It moves only with that page
 NORM_MARGIN_ULP32 = 20.0
+#: the band of a library attention kernel that documents no numerics contract (``attention_bf16_weights``): an element is
+#: inside where ``|out - chain| <= COEFFICIENT * (WEIGHT_TERM * (spread + |chain|) + SPACINGS * spacing(|chain|))``.  The
+#: bound of a stated model of the kernel's arithmetic (the module's docstring), declared before any run of a row that
+#: names the band and never taken from a measured distance: an element outside is a finding, and none of the three
+#: moves to make a run pass
+ATTENTION_BAND_COEFFICIENT = 1.0
+ATTENTION_WEIGHT_TERM = 2.0**-8
+ATTENTION_SPACINGS = 1.0
 BANDS = {
     "same": "the provider is the reference chain",
     "bitwise": "byte-identical",
@@ -245,6 +290,13 @@ BANDS = {
         "bf16 unit at the larger magnitude, every rotated one inside that unit plus |cos| and |sin| times one unit of its two normalised operands; the gate "
         "rows bitwise; in the cache, the key rows at the positions of the call held as the query rows, their value rows and every other byte of the pool "
         "bitwise; every value finite"
+    ),
+    "attention_bf16_weights": (
+        "against the reference chain before its rounding to bf16 (chain = sum p v over the attended rows under their softmax weights p, spread = sum p |v|, "
+        f"both in fp64): every element finite and within {ATTENTION_BAND_COEFFICIENT:g} x [2**{math.log2(ATTENTION_WEIGHT_TERM):g} x (spread + |chain|) + "
+        f"{ATTENTION_SPACINGS:g} spacing of bf16 values at |chain|] -- the bound of a stated model of the kernel's arithmetic (every weight one rounding at "
+        "eight significant bits, the divisor one of its own, the output one), declared before any run and never taken from a measured distance; the cache "
+        "bitwise"
     ),
 }
 
@@ -336,6 +388,9 @@ class BlockStats:
     keys_outside: int = 0  # attention_prepare: key elements at the positions of a call outside their band (``outside``: query elements)
     gates_equal: bool = True  # attention_prepare: the gate rows, byte for byte
     values_equal: bool = True  # attention_prepare: the value rows at the positions of a call, byte for byte (``state_equal``: the rest of the pool)
+    #: attention_bf16_weights: the chain and the spread of the element that used the largest share of its bound (``worst_share``, for this band the
+    #: largest distance of an element from the chain as a share of its bound)
+    worst_at: Tuple[float, float] = (0.0, 0.0)
     cells: Dict[int, _Cells] = field(default_factory=dict)
     cell_bytes: Dict[int, Tuple[float, str]] = field(default_factory=dict)  # layer -> (the smallest share of a cell, which cell)
     cell_state: Dict[int, Tuple[float, str]] = field(default_factory=dict)
@@ -384,6 +439,13 @@ class BlockStats:
                 f"{self.elements:,} query and key elements, {self.other_value:,} of them not the twin's byte; "
                 f"{self.outside:,} query and {self.keys_outside:,} key elements outside their band; gate rows {'equal' if self.gates_equal else 'DIFFER'}; "
                 f"value rows {'equal' if self.values_equal else 'DIFFER'}; the rest of the pool {'untouched' if self.state_equal else 'WRITTEN'}{loud}"
+            )
+        if self.band == "attention_bf16_weights":
+            chain, spread = self.worst_at
+            return (
+                f"{self.elements:,} elements, {self.other_value:,} of them not the reference chain's byte; {self.outside:,} outside their bound; the largest "
+                f"distance {self.worst_share:.3f} of its bound, at a chain of {chain:.4g} with a spread of {spread:.4g} (printed, not gated); "
+                f"the cache {'untouched' if self.state_equal else 'WRITTEN'}{loud}"
             )
         share = self.off_by_one / max(self.elements, 1)
         state = "" if self.state_equal else "; STATE DIFFERS"
@@ -512,6 +574,11 @@ class BlockTap:
             return
         if stats.band == "attention_prepare":
             _judge_prepare(stats, out, ref, state, ref_state, twin)
+            return
+        if stats.band == "attention_bf16_weights":
+            _judge_attention_core(stats, out, ref, twin)
+            stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)  # the call writes nothing: what it reads, byte for byte
+            stats.ok = stats.ok and stats.state_equal
             return
         if stats.band == "gdn_step":
             codes, ref_codes = out[0], ref[0]
@@ -686,6 +753,41 @@ def _judge_prepare(stats: BlockStats, out, ref, state, ref_state, twin) -> None:
     rest[index[:, 0], index[:, 1]] = False
     stats.state_equal = stats.state_equal and bytes_equal(pool.transpose(1, 2)[rest], ref_pool.transpose(1, 2)[rest])
     stats.ok = stats.finite and stats.outside == 0 and stats.keys_outside == 0 and stats.gates_equal and stats.values_equal and stats.state_equal
+
+
+def _judge_attention_core(stats: BlockStats, out, ref, twin) -> None:
+    """One call of a library attention kernel that documents no numerics contract against its twin (band
+    ``attention_bf16_weights``): ``out`` is the kernel's output and ``ref`` the reference chain's bytes, ``[rows, heads *
+    D]`` bf16 each; the twin keeps the chain of every element before its rounding to bf16 and the weighted magnitude of
+    the values it attends to, both in fp64.  The bound, the distance and the comparison are formed in fp64, element by
+    element; the spacing is the chain's own.  The largest share of its bound an element used is kept with the chain and
+    the spread of that element: printed, not gated."""
+    from .providers import torch_ref
+
+    if getattr(twin, "bound", None) is None:  # a table that names this band for a block whose twin is another chain
+        raise ValueError(
+            "the band attention_bf16_weights is judged against the reference chain with the operand terms of its bound: the block's twin keeps no such terms"
+        )
+    chain, spread = twin.bound
+    if len(out) != 1 or len(ref) != 1 or out[0].dtype != torch.bfloat16 or out[0].shape != ref[0].shape or out[0].shape != chain.shape:
+        stats.outside += 1  # other outputs than the one bf16 tensor of the chain's shape: nothing can be compared
+        stats.ok = False
+        return
+    got = out[0].double()
+    spacing = torch_ref.bf16_unit(chain.abs().clamp_min(torch.finfo(torch.float32).tiny))  # of two neighbouring bf16 values at |chain|
+    bound = ATTENTION_BAND_COEFFICIENT * (ATTENTION_WEIGHT_TERM * (spread + chain.abs()) + ATTENTION_SPACINGS * spacing)
+    distance = (got - chain).abs()
+    stats.finite = stats.finite and bool(torch.isfinite(got).all())
+    stats.elements += got.numel()
+    stats.other_value += int((torch_ref._bf16_bits(out[0]) != torch_ref._bf16_bits(ref[0])).sum())
+    inside = (distance <= bound) & torch.isfinite(bound)  # element by element: a NaN is outside, and so is an element whose chain is not finite
+    stats.outside += int((~inside).sum())
+    share = (distance / bound).flatten()
+    at = int(torch.where(torch.isnan(share), torch.full_like(share, float("inf")), share).argmax())  # an element that is no number comes first
+    worst = float(share[at])
+    if math.isnan(worst) or worst > stats.worst_share:  # (a share that is no number stays, whatever follows)
+        stats.worst_share, stats.worst_at = worst, (float(chain.flatten()[at]), float(spread.flatten()[at]))
+    stats.ok = stats.finite and stats.outside == 0
 
 
 def _judge_swiglu(stats: BlockStats, out, ref, twin) -> None:

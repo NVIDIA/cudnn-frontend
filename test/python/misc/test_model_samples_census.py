@@ -10298,3 +10298,368 @@ def test_the_twin_of_a_library_attention_kernel_is_the_reference_chain_and_keeps
         for part in (0, 1, 2):  # either layout hands the chain the same rows
             assert torch.equal(kept["plain", "fp64"][part].double(), kept["paged", "fp64"][part].double()), (sequences, tokens, position, part)
     assert moved[False] > 0 and moved[True] > 0, "the bytes DO follow the run's precision, at one token and at several: some element is another byte in fp32"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# The band of such a kernel (``attention_bf16_weights``), declared before any row names it: the three constants and the
+# band's text, the judge on the model's own cases and on each defect alone, and the control arms.  The judge is called as
+# the tie-out calls it, on built operands (whose figures follow from plain arithmetic) and on drawn ones.
+# ---------------------------------------------------------------------------------------------------------------------------
+#: the largest relative error of one rounding to nearest at eight significant bits: what the band's model allows a weight and the divisor
+ROUNDING = 2.0**-8 / (1 + 2.0**-8)
+
+
+def _drawn_attention(pages, pool_seed, rows, query_seed, query_scale=1.0):
+    """Drawn operands of an attention core at the published widths, bf16: ``(queries [rows, 24, 256], keys, values)`` -- a
+    pool of ``pages`` pages of 64 rows drawn as ONE tensor ``[pages, 4, 64, 512]`` (the keys in the first half of the last
+    axis, the values in the second) and read page by page as one run of rows, ``[4, pages * 64, 256]`` each; the queries
+    times ``query_scale``.  Each from a generator of its own seed, on the CPU."""
+    heads, kv_heads, width = ATTENTION_WIDTHS
+    pool = torch.randn(pages, kv_heads, 64, 2 * width, generator=torch.Generator("cpu").manual_seed(pool_seed)).bfloat16()
+    queries = (torch.randn(rows, heads, width, generator=torch.Generator("cpu").manual_seed(query_seed)) * query_scale).bfloat16()
+    run = pool.permute(1, 0, 2, 3).reshape(kv_heads, pages * 64, 2 * width)
+    return queries, run[..., :width].contiguous(), run[..., width:].contiguous()
+
+
+def _kernel_like_attention(query, keys, values, scale=None, divisor=False):
+    """One row of a kernel-like chain of the band's model, ``[heads * D]`` bf16: every softmax weight carries one rounding to
+    bf16 and the output one.  ``divisor=False``: the NORMALISED weights are each rounded and the divisor is exact;
+    ``divisor=True``: the weights are rounded before they are normalised and their sum is rounded apart from them."""
+    group = query.shape[0] // keys.shape[0]
+    rows = []
+    for head, (raw, total) in enumerate(_attention_weights(query, keys, scale)):
+        held = values[head // group].double()
+        if divisor:
+            rows.append((raw.bfloat16().double() @ held) / total.bfloat16().double())
+        else:
+            rows.append((raw / total).bfloat16().double() @ held)
+    return torch.stack(rows).flatten().bfloat16()
+
+
+def _judged_attention(out, twin, ref=None, state=(), ref_state=()):
+    """One call judged in the band ``attention_bf16_weights`` as the tie-out judges it: the output ``out`` against the twin
+    ``twin`` (anything that keeps ``bound``), ``ref`` the reference chain's bytes (the output's own where none is given)."""
+    from model_samples import tie_out
+
+    stats = tie_out.BlockStats("attention_bf16_weights")
+    tie_out.BlockTap._judge(stats, (out,), (out if ref is None else ref,), list(state), list(ref_state), 0, twin)
+    return stats
+
+
+def _built_attention(first_key, first_value, second_value):
+    """BUILT operands of one row that attends to two rows, at two query heads on one key / value head of width 256, and
+    their twin after its call: ``(twin, the chain's bytes)``.  The query is 4 in its first element and zero elsewhere, the
+    first key ``first_key`` there and zero elsewhere, the second key zero: the scaled scores are ``first_key / 4`` and 0.
+    Every element of the first value row is ``first_value``, of the second ``second_value``: every element of the output is
+    the same judged element."""
+    from model_samples.providers import torch_ref
+    from model_samples.state import KvCache
+
+    query, keys, values = torch.zeros(1, 2, 256), torch.zeros(1, 1, 2, 256), torch.zeros(1, 1, 2, 256)
+    query[0, :, 0], keys[0, 0, 0, 0], values[0, 0, 0], values[0, 0, 1] = 4.0, first_key, first_value, second_value
+    twin = torch_ref.AttentionBound(None, None, None, {})
+    return twin, twin(query.bfloat16(), KvCache(keys.bfloat16(), values.bfloat16()), 1)
+
+
+def _model_extreme(share):
+    """The output of the band's model at its extreme, ``share`` of the largest rounding error it allows, on the built operands
+    of equal scores and the values +1 and -1 (chain 0, spread 1): the weight of +1 rounded up, the weight of -1 rounded
+    down, the divisor rounded down; then the output's own rounding.  ``[1, 512]`` bf16."""
+    error = share * ROUNDING
+    return torch.full((1, 512), (0.5 * (1 + error) * 1.0 + 0.5 * (1 - error) * -1.0) / (1 - error), dtype=torch.float64).bfloat16()
+
+
+def test_the_band_of_a_library_attention_kernel_is_the_bound_of_a_stated_model_and_its_judge_holds_it():
+    """The band ``attention_bf16_weights``: three constants and a text that a run prints, declared before any row names them,
+    and a docstring that states the model the band is the bound of -- and does not say that the band cannot be left.  The
+    judge, on the model's own cases, INSIDE: the chain itself; on drawn operands a chain whose normalised weights are each
+    rounded to bf16 with the divisor exact, and one whose weights are rounded before they are normalised with the
+    divisor rounded apart from them; on built operands the model's extreme at 0.9 of its largest rounding error (0.898 of
+    the bound) and at all of it (the bound itself).  OUTSIDE, each alone and by its own count: the extreme at 1.5 of that
+    error; the bf16 value next above the bound of a chain of zero, which says that the spacing is the chain's and not the
+    output's; one element one spacing beyond its bound among elements of larger chains, which says that the spacing is
+    not the tensor's largest value's; a NaN; an infinite value; a byte of the cache the call changed.  A twin that keeps
+    no terms is refused, other outputs than the one tensor are not compared, and the same output is NOT within one bf16
+    unit of the chain: the precedent band could not hold it."""
+    import math
+    from types import SimpleNamespace
+
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.state import KvCache
+
+    assert (tie_out.ATTENTION_BAND_COEFFICIENT, tie_out.ATTENTION_WEIGHT_TERM, tie_out.ATTENTION_SPACINGS) == (1.0, 2.0**-8, 1.0), "as declared"
+    assert tie_out.BANDS["attention_bf16_weights"] == (
+        "against the reference chain before its rounding to bf16 (chain = sum p v over the attended rows under their softmax weights p, spread = sum p |v|, "
+        "both in fp64): every element finite and within 1 x [2**-8 x (spread + |chain|) + 1 spacing of bf16 values at |chain|] -- the bound of a stated model "
+        "of the kernel's arithmetic (every weight one rounding at eight significant bits, the divisor one of its own, the output one), declared before any "
+        "run and never taken from a measured distance; the cache bitwise"
+    ), "the text a run prints for the band"
+    stated = " ".join((tie_out.__doc__ or "").split())
+    for sentence in (
+        "it is the bound of a stated model of the kernel's arithmetic, declared here before any run of a row that names it.",
+        "Which values such a kernel rounds is not established, so no twin can be written at its rounding points.",
+        "The model: every softmax weight carries one rounding to nearest at eight significant bits, ``p_j (1 + d_j)`` with ``|d_j| <= u`` and "
+        "``u = 2**-8 / (1 + 2**-8)``; the number the weighted sum is divided by carries one of its own, ``1 + e`` with ``|e| <= u``; and the output is "
+        "rounded to bf16 once.",
+        "-- and ``u / (1 - u)`` is exactly ``2**-8``.",
+        "out is finite and |out - chain| <= 1 x [ 2**-8 x (spread + |chain|) + 1 x spacing ]",
+        "the chain's alone, neither the output's nor the tensor's largest value's.",
+        "It is derived from a model and from no measured distance, and it claims nothing about what the kernel rounds.",
+        "there an output of the model itself can use up to ``1 + 2**-8`` of its bound.",
+        "So an element outside is a finding, read with its share, its chain and its spread; it is never a reason for another coefficient, a further "
+        "term or a shape left out.",
+        "A block in this band is not within one bf16 unit of the chain",
+        "one wrong, missing or extra attended row whose softmax weight is below the band's term.",
+    ):
+        assert sentence in stated, sentence
+    for never in ("cannot leave", "cannot be left", "never leaves its band", "rounds its weights to bf16", "derived from its arithmetic"):
+        assert never not in stated, f"the docstring claims more than the model gives: {never!r}"
+    assert ROUNDING / (1 - ROUNDING) == 2.0**-8, "the weight term is the model's own figure: u / (1 - u)"
+
+    # ---- BUILT operands, the model's extreme: equal scores, the values +1 and -1: chain 0, spread 1 in every element
+    twin, ref = _built_attention(0.0, 1.0, -1.0)
+    chain, spread = twin.bound
+    assert not chain.any() and bool((spread == 1.0).all()) and not ref.any() and tuple(chain.shape) == (1, 512)
+    inside = _judged_attention(_model_extreme(0.9), twin, ref)
+    assert inside.ok and inside.finite and (inside.elements, inside.outside, inside.other_value) == (512, 0, 512)
+    assert inside.worst_share == 0.8984375 and inside.worst_at == (0.0, 1.0), "0.9 of the model's largest rounding error: 0.898 of the bound"
+    assert inside.line() == (
+        "512 elements, 512 of them not the reference chain's byte; 0 outside their bound; the largest distance 0.898 of its bound, at a chain of 0 with a "
+        "spread of 1 (printed, not gated); the cache untouched"
+    )
+    whole = _judged_attention(_model_extreme(1.0), twin, ref)
+    assert whole.ok and whole.worst_share == 1.0 and float(_model_extreme(1.0)[0, 0]) == 2.0**-8, "all of it: the bound itself, and inside"
+    beyond = _judged_attention(_model_extreme(1.5), twin, ref)
+    assert not beyond.ok and beyond.finite and beyond.outside == 512 and beyond.worst_share == 1.5, "1.5 of it: outside"
+    assert beyond.line().split("; ")[1:3] == [
+        "512 outside their bound",
+        "the largest distance 1.500 of its bound, at a chain of 0 with a spread of 1 (printed, not gated)",
+    ]
+    # ... the spacing is the CHAIN's: at a chain of zero it is that of the smallest normal fp32 value, far below fp64's own
+    # spacing at the bound.  The bf16 value next above the bound is outside; with one spacing at the OUTPUT it would be the bound
+    above = torch.full((1, 512), 2.0**-8 * (1 + 2.0**-7), dtype=torch.float64).bfloat16()
+    assert float(above[0, 0]) == 2.0**-8 + 2.0**-15, "the next bf16 value above 2**-8"
+    next_value = _judged_attention(above, twin, ref)
+    assert (
+        not next_value.ok and next_value.outside == 512 and next_value.worst_share == 1.0078125
+    ), "one spacing of the output beyond a bound whose chain is zero"
+
+    # ---- BUILT operands, the chain's own term: the values +1 and +1 (chain 1, spread 1): the bound is 2**-8 x (1 + 1) + one
+    # spacing at 1 = 2**-6, on either side of the chain -- above 1 two bf16 values, below it four
+    twin_one, ref_one = _built_attention(0.0, 1.0, 1.0)
+    assert bool((twin_one.bound[0] == 1.0).all()) and bool((twin_one.bound[1] == 1.0).all()) and bool((ref_one == 1.0).all())
+    for value, share in ((1 + 2.0**-6, 1.0), (1 + 2.0**-6 + 2.0**-7, 1.5), (1 - 2.0**-6, 1.0), (1 - 2.0**-6 - 2.0**-8, 1.25)):
+        stats = _judged_attention(torch.full((1, 512), value, dtype=torch.float64).bfloat16(), twin_one, ref_one)
+        assert (stats.ok, stats.outside, stats.worst_share, stats.worst_at) == (share == 1.0, 0 if share == 1.0 else 512, share, (1.0, 1.0)), value
+    # ... and an element whose chain is not finite holds nothing: it is outside, whatever the output is
+    twin_inf, ref_inf = _built_attention(0.0, float("inf"), 1.0)
+    assert bool(torch.isinf(twin_inf.bound[0]).all()) and bool(torch.isinf(ref_inf).all())
+    stats = _judged_attention(torch.ones(1, 512).bfloat16(), twin_inf, ref_inf)
+    assert not stats.ok and stats.finite and stats.outside == 512, "a finite output against a chain that is not finite"
+
+    # ---- BUILT operands, weights rounded to bf16: the scaled scores 1 and 0, the values 0.375 and -1
+    twin_w, ref_w = _built_attention(4.0, 0.375, -1.0)
+    weight = 1.0 / (1.0 + math.exp(-1.0))  # of the first row; the second has the rest
+    chain_w, spread_w = twin_w.bound
+    assert abs(float(chain_w[0, 0]) - (weight * 0.375 - (1 - weight))) < 1e-15 and abs(float(spread_w[0, 0]) - (weight * 0.375 + (1 - weight))) < 1e-15
+    rounded = [float(torch.tensor(value, dtype=torch.float64).bfloat16()) for value in (weight, 1 - weight)]
+    assert rounded == [0.73046875, 0.26953125], "the two weights, each rounded to bf16"
+    out_w = torch.full((1, 512), rounded[0] * 0.375 + rounded[1] * -1.0, dtype=torch.float64).bfloat16()
+    held = _judged_attention(out_w, twin_w, ref_w)
+    assert held.ok and held.outside == 0 and abs(held.worst_share - 0.3733452) < 1e-6, "inside: 0.373 of the bound"
+
+    # ---- DRAWN operands at the published widths: a pool of three pages, one sequence, one row per step
+    queries, keys, values = _drawn_attention(3, 7001, 1, 9001)
+    cache = KvCache(keys[None], values[None])
+    for live in (2, 37, 100):
+        twin = torch_ref.AttentionBound(None, None, None, {})
+        ref = twin(queries, cache, live - 1)
+        chain, spread = twin.bound
+        itself = _judged_attention(ref, twin, ref)
+        assert (
+            itself.ok and (itself.elements, itself.outside, itself.other_value) == (6144, 0, 0) and 0.0 < itself.worst_share < 0.5
+        ), "the chain itself: its one rounding"
+        for divisor in (False, True):
+            out = _kernel_like_attention(queries[0], keys[:, :live], values[:, :live], divisor=divisor)[None]
+            stats = _judged_attention(out, twin, ref)
+            assert stats.ok and stats.finite and stats.outside == 0 and 0.25 < stats.worst_share < 0.75, (live, divisor, stats.line())
+            assert 1000 < stats.other_value < 6144, "a kernel-like chain: a share of its elements is another byte than the chain's, every one inside"
+            units = tie_out.BlockStats("bf16_unit")
+            tie_out.BlockTap._judge(units, (out,), (ref,), [], [], 0, twin)
+            assert (
+                not units.ok and units.worst_units > 4.0
+            ), "and it is NOT within one bf16 unit of the chain: the band's term is the attended values', not the output's"
+    # (the twin of the last pass, at 100 live rows, and its chain's bytes)
+    spacing = torch_ref.bf16_unit(chain.abs())
+    bound = 2.0**-8 * (spread + chain.abs()) + spacing
+    assert float(chain.abs().amin()) > float(torch.finfo(torch.float32).tiny), "no chain of zero among the drawn elements"
+    # one element one spacing beyond its bound -- an element whose chain is two binades or more below the tensor's largest, and
+    # whose bound ends inside its own binade, so that one spacing is one bf16 step there; one spacing INSIDE the bound first
+    eligible = (4 * spacing <= torch_ref.bf16_unit(chain.abs().amax())) & (torch_ref.bf16_unit(chain.abs() + bound + 2 * spacing) == spacing)
+    assert int(eligible.sum()) > 100, "the drawn operands have such elements"
+    at = tuple(int(i) for i in eligible.nonzero()[0])
+    away = 1.0 if float(chain[at]) > 0 else -1.0
+    for step, outside in ((-1.0, 0), (1.0, 1)):
+        moved = ref.clone()
+        moved[at] = float(chain[at] + away * (bound[at] + step * spacing[at]))
+        stats = _judged_attention(moved, twin, ref)
+        assert (stats.ok, stats.outside, stats.other_value) == (
+            not outside,
+            outside,
+            1,
+        ) and stats.finite, f"one spacing {'beyond' if outside else 'inside'} the bound"
+        assert (stats.worst_share > 1.0) == bool(outside) and abs(stats.worst_share - 1.0) < 2 * float(spacing[at] / bound[at]), stats.line()
+        assert stats.worst_at == (float(chain[at]), float(spread[at])), "the line names the chain and the spread of the element with the largest share"
+    for value, name in ((float("nan"), "a NaN"), (float("inf"), "an infinite value"), (float("-inf"), "an infinite value")):
+        not_finite = ref.clone()
+        not_finite[0, 4321] = value
+        stats = _judged_attention(not_finite, twin, ref)
+        assert not stats.ok and not stats.finite and stats.outside == 1 and stats.line().endswith("the cache untouched; NON-FINITE VALUES"), name
+        assert math.isnan(stats.worst_share) if name == "a NaN" else stats.worst_share == float("inf"), name
+        stats_after = tie_out.BlockStats("attention_bf16_weights")  # ... and a later clean call does not take it back
+        for out in (not_finite, ref):
+            tie_out.BlockTap._judge(stats_after, (out,), (ref,), [], [], 0, twin)
+        assert not stats_after.ok and not stats_after.finite and (stats_after.elements, stats_after.outside) == (12288, 1), name
+        assert math.isnan(stats_after.worst_share) if name == "a NaN" else stats_after.worst_share == float("inf"), name
+    # the call writes nothing: the cache it read is held byte for byte
+    pool = torch.cat((keys, values), dim=-1)
+    written = pool.clone()
+    written.view(torch.int16)[3, 150, 300] ^= 1  # one bit of a value row behind the live rows
+    untouched = _judged_attention(ref, twin, ref, state=[(pool,)], ref_state=[(pool.clone(),)])
+    assert untouched.ok and untouched.state_equal
+    stats = _judged_attention(ref, twin, ref, state=[(written,)], ref_state=[(pool,)])
+    assert (
+        not stats.ok and not stats.state_equal and stats.finite and stats.outside == 0 and stats.line().endswith("the cache WRITTEN")
+    ), "a byte of the cache the call changed"
+    # over several calls the counts add up and the largest share stays, with the element it is of
+    both = tie_out.BlockStats("attention_bf16_weights")
+    worse = _kernel_like_attention(queries[0], keys[:, :100], values[:, :100])[None]
+    for out in (worse, ref):
+        tie_out.BlockTap._judge(both, (out,), (ref,), [], [], 0, twin)
+    alone = _judged_attention(worse, twin, ref)
+    assert both.ok and (both.elements, both.other_value, both.worst_share, both.worst_at) == (12288, alone.other_value, alone.worst_share, alone.worst_at)
+    # what cannot be compared, and a twin that keeps no terms
+    for name, out in (("two outputs", (ref, ref)), ("another shape", (ref[:, :100],)), ("another dtype", (ref.float(),))):
+        stats = tie_out.BlockStats("attention_bf16_weights")
+        tie_out.BlockTap._judge(stats, out, (ref,), [], [], 0, twin)
+        assert not stats.ok and (stats.outside, stats.elements) == (1, 0), f"{name}: nothing is compared"
+    chain_row = SimpleNamespace(key="torch_ref.attention")  # the reference chain's own block: it keeps nothing
+    for other in (SimpleNamespace(), torch_ref.Attention(chain_row, None, None, {}), torch_ref.AttentionBound(None, None, None, {})):
+        with pytest.raises(ValueError, match="the band attention_bf16_weights is judged against the reference chain with the operand terms of its bound"):
+            _judged_attention(ref, other, ref)
+
+
+def test_every_control_arm_of_the_library_attention_band_fails_and_what_the_band_cannot_see_is_pinned(monkeypatch):
+    """The control arms of the band ``attention_bf16_weights`` through the judge; each must FAIL.  Two say that the band is
+    not slack, and are derived on built operands: at a coefficient of 0.5 the model's own extreme at 0.9 of its largest
+    rounding error is outside, and with the weight term of weights held at fp32 (``2**-24``) a chain whose weights are
+    rounded to bf16 is outside.  The others are defects of an operand, on drawn operands at 100 live rows -- one full page
+    and 36 rows of a second -- with a kernel-like chain of the model in the kernel's place.  In the CALL, judged against the
+    correct twin: the lengths one too long (a masked row let in), one too short (the newest attended row dropped), the
+    page-table entry of the last attended page exchanged with the entry of a full page, the scores scaled by 1.  In the
+    TWIN, with the call's bytes correct: the value row of the newest attended position read from the next slot, of
+    position 0 from slot 1, and in a step of six rows every row attending to all rows after the step.  What an arm needs
+    is pinned with it: two full pages exchanged are the same rows.  And what the band cannot see is pinned as that: a
+    value row off by one slot among 2,051 drawn rows, where the softmax weight of that row is below the band's term."""
+    from types import SimpleNamespace
+
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.state import KvCache
+
+    # ---- derived, on the built operands: the band is not slack by a factor of two, and its weight term is what the model needs
+    twin, ref = _built_attention(0.0, 1.0, -1.0)
+    twin_w, ref_w = _built_attention(4.0, 0.375, -1.0)
+    out_w = torch.full((1, 512), 0.73046875 * 0.375 + 0.26953125 * -1.0, dtype=torch.float64).bfloat16()
+    assert _judged_attention(_model_extreme(0.9), twin, ref).ok and _judged_attention(out_w, twin_w, ref_w).ok, "both inside the band as declared"
+    with monkeypatch.context() as arm:
+        arm.setattr(tie_out, "ATTENTION_BAND_COEFFICIENT", 0.5)
+        half = _judged_attention(_model_extreme(0.9), twin, ref)
+    assert not half.ok and half.outside == 512 and half.worst_share == 2 * 0.8984375, "at a coefficient of 0.5 the model's extreme at 0.9 is outside"
+    with monkeypatch.context() as arm:
+        arm.setattr(tie_out, "ATTENTION_WEIGHT_TERM", 2.0**-24)
+        narrow = _judged_attention(out_w, twin_w, ref_w)
+    assert (
+        not narrow.ok and narrow.outside == 512 and abs(narrow.worst_share - 26.5469) < 1e-3
+    ), "with the weight term 2**-24, weights rounded to bf16 are outside"
+
+    # ---- defects of an operand, on drawn operands: a pool of three pages of one sequence, 100 live rows
+    queries, keys, values = _drawn_attention(3, 7001, 6, 9001)
+    live = 100
+
+    def call(rows, lengths=None, table=(0, 1, 2), scale=None):
+        """What a kernel-like chain of the model returns for a step of ``rows`` rows that it is handed as a kernel is: the
+        length of the sequence AFTER the step (the live rows, where none is given), a page table and a scale.  Row ``t``
+        attends to ``lengths - (rows - 1 - t)`` positions; position ``j`` is the row ``j % 64`` of the page ``table[j // 64]``."""
+        out, lengths = [], live if lengths is None else lengths
+        for row in range(rows):
+            read = [table[at // 64] * 64 + at % 64 for at in range(lengths - (rows - 1 - row))]
+            out.append(_kernel_like_attention(queries[row], keys[:, read], values[:, read], scale))
+        return torch.stack(out)
+
+    def twin_with(rows, every=False, newest=False, oldest=False):
+        """A twin written from the definition for a step of ``rows`` rows that ends at ``live`` live rows, with one thing
+        wrong: every row attends to all rows after the step; the value row of the newest attended position is read from
+        the next slot; the value row of position 0 from slot 1."""
+        terms = []
+        for row in range(rows):
+            attended = live if every else live - (rows - 1 - row)
+            read = values[:, :attended].clone()
+            if newest:
+                read[:, attended - 1] = values[:, attended]
+            if oldest:
+                read[:, 0] = values[:, 1]
+            terms.append(_attention_terms(queries[row], keys[:, :attended], read))
+        return SimpleNamespace(bound=tuple(torch.stack([term[part] for term in terms]) for part in (0, 1)))
+
+    def correct(rows):
+        twin = torch_ref.AttentionBound(None, None, None, {})
+        return twin, twin(queries[:rows], KvCache(keys[None], values[None], rows), live - rows)
+
+    twin, ref = correct(1)
+    clean = _judged_attention(call(1), twin, ref)
+    assert clean.ok and clean.outside == 0 and 0.25 < clean.worst_share < 0.75, clean.line()
+    assert torch.equal(twin_with(1).bound[0], twin.bound[0]) or bool(((twin_with(1).bound[0] - twin.bound[0]).abs() <= 1e-12 * twin.bound[1]).all())
+    in_the_call = (
+        ("the lengths one too long: a masked row let in", dict(lengths=live + 1)),
+        ("the lengths one too short: the newest attended row dropped", dict(lengths=live - 1)),
+        ("the entry of the last attended page exchanged with the entry of a full page", dict(table=(1, 0, 2))),
+        ("the scores scaled by 1, a library's default, in place of the chain's scale", dict(scale=1.0)),
+    )
+    for name, defect in in_the_call:
+        stats = _judged_attention(call(1, **defect), twin, ref)
+        assert not stats.ok and stats.finite and stats.outside > 6144 // 10 and stats.worst_share > 10, f"{name}: {stats.line()}"
+    in_the_twin = (
+        ("the value row of the newest attended position read from the next slot", dict(newest=True)),
+        ("the value row of position 0 read from slot 1", dict(oldest=True)),
+    )
+    for name, defect in in_the_twin:
+        stats = _judged_attention(call(1), twin_with(1, **defect), ref)
+        assert not stats.ok and stats.finite and stats.outside > 6144 // 10 and stats.worst_share > 10, f"{name}: {stats.line()}"
+    twin6, ref6 = correct(6)
+    step = call(6)
+    clean = _judged_attention(step, twin6, ref6)
+    assert clean.ok and clean.elements == 6 * 6144 and clean.outside == 0, "a step of six rows, each attending to the rows up to its own"
+    stats = _judged_attention(step, twin_with(6, every=True), ref6)
+    assert not stats.ok and stats.outside > 36864 // 10, f"every row of the step attends to all rows after the step: {stats.line()}"
+    last = _judged_attention(step[5:], SimpleNamespace(bound=tuple(term[5:] for term in twin_with(6, every=True).bound)), ref6[5:])
+    assert last.ok, "the last row of the step attends to all of them either way: the arm is the five rows in front of it"
+    # what the page-table arm needs: a last page that is not full.  Two wholly live pages exchanged are the same attended rows
+    assert torch.equal(call(1, lengths=128, table=(1, 0, 2)).view(torch.int16), call(1, lengths=128).view(torch.int16)), "two full pages: no byte changes"
+    # with the weight term of fp32 weights the drawn kernel-like chain is outside too
+    with monkeypatch.context() as arm:
+        arm.setattr(tie_out, "ATTENTION_WEIGHT_TERM", 2.0**-24)
+        assert _judged_attention(call(1), twin, ref).outside > 100
+
+    # ---- what the band cannot see, pinned as that: one value row off by one slot among 2,051 attended rows
+    queries, keys, values = _drawn_attention(39, 5051, 1, 8051, query_scale=4.0)
+    live = 2051
+    twin, ref = correct(1)
+    out = call(1, table=tuple(range(39)))
+    assert _judged_attention(out, twin, ref).ok
+    for name, defect, at in (("the newest attended position", dict(newest=True), live - 1), ("position 0", dict(oldest=True), 0)):
+        stats = _judged_attention(out, twin_with(1, **defect), ref)
+        assert stats.ok and stats.outside == 0 and stats.worst_share < 1.0, f"the value row of {name} off by one slot, among 2,051: inside"
+        weight = max(float((raw / total)[at]) for raw, total in _attention_weights(queries[0], keys[:, :live]))
+        assert weight < tie_out.ATTENTION_WEIGHT_TERM / 4, f"{name}: the softmax weight of that row is below the band's term in every head"
