@@ -9093,3 +9093,56 @@ contract gap. The generic unsafe-ring control is not a reproduction of that
 specific defect. SM103 and untested shapes remain unverified.
 Evidence (logs, XML, provenance, before/after sources and PTX) is under
 `glu_canonical_validation/hadamard_sync_fix_20261119/` in the validation workspace.
+
+## Misc CuTeDSL CI device and capacity fixes — 2026-11-20
+
+Follow-up to pipeline 84114932:
+
+- The JAX invalid-input tests call `jax_inputs` directly. Its first DLPack
+  conversion could initialize XLA after entering a tensor's CUDA device guard,
+  changing the current device before export. Initialize XLA in a separate
+  restoring guard before conversion; exercise direct conversion and execution,
+  including initialization and execution errors.
+- The NSA THD Top-K test now uses the existing tcgen05 capability gate.
+  Paged QSA's FP32 deterministic Top-K capacity gate now covers SM121 as well
+  as SM120, matching the API's architecture check.
+- CSA ratio-128 backward support checks one compressed-row schedule, but
+  compilation previously built both small and default schedules. The unused
+  default could exceed SM12.x shared memory even when the declared shape fit.
+  Compile only the validated shape's schedule; empty plans compile no kernel.
+  Batch-invariance checks apply the existing shared-memory gate separately
+  to each packed backward layout. Unsupported shapes are skipped as unsupported,
+  without claiming byte determinism or extending the supported envelope.
+
+Validation used SM100, driver 610.11, Torch `2.14.0a0+b2c75dd062.nv26.09`,
+CUDA 13.4, cuDNN 92700, JAX 0.11.2, and CuTe DSL 4.8.0, in the existing image
+the cuDNN 9.27.0.42 / CUDA 13.4.1 amd64 CI image.
+The test runner prepended `/workspace/python/cudnn` to the installed package's
+search path and loaded the checkout's JAX version constants. Changed Python
+APIs and kernels resolved to `/workspace`; the container retained its installed
+1.28.0 native extension. These checks do not validate a new C++ build or the
+CI backend/DSL combinations. Base source was `fdae16db7dd55dc69ba8da4026bca272177948d5`
+plus this change.
+
+Run from `test/python`, with `CUDNN_TEST_NO_ISOLATION=1`,
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`, and `XLA_PYTHON_CLIENT_PREALLOCATE=false`:
+
+| Selection | Result |
+| --- | --- |
+| Targeted JAX device, NSA capability, QSA column-limit, CSA compilation and packed-layout memory regressions (`-m L0`) | 34 passed |
+| Complete `simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py` (`-m L0`) | 27 passed, 1 skipped in 156.96 s |
+| CSA backward batch-invariance cases and packed-layout memory regression (`-m L0 -k test_batch_invariance`) | 18 passed, 1 xpassed in 10.69 s |
+| CSA ratio-128 replay and CUDA Graph capture (`-m L0 -k 'replay_determinism_r128 or cuda_graph_capture_r128'`) | 2 passed in 2.30 s |
+| CSA ratio-128 schedule envelope (`-m 'L0 or L1' -k r128_envelope_execution`) | 10 passed in 10.55 s |
+| NSA THD noninterference, CSA compile-capacity and shared-memory checks, and CSA batch invariance (earlier bounded run) | 29 passed, 1 xpassed in 11.98 s |
+
+The one JAX skip requires a second visible CUDA device. The known CSA forward
+schedule-boundary xfail happened to pass; it remains a known failure and was
+not removed. The envelope checks retain independent FP32/FP64 references and
+existing replay comparisons. No golden files or numerical tolerances changed.
+
+A negative control restored the previous JAX conversion helper, CSA compile
+method, and paged QSA capacity helper while retaining the new tests: **10 failed,
+10 passed** in 3.52 s. The corrected versions passed the targeted regression run.
+Mocked capability cases cover SM120 and SM121, but no SM12.x GPU or DSL 4.9
+run was available. Those execution scopes remain unverified.

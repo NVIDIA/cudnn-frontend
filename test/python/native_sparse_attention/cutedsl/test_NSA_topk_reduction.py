@@ -16,13 +16,23 @@ from native_sparse_attention.cutedsl.nsa_utils import (
 
 
 def _requires_tcgen05():
-    """This API runs an SM100-family tcgen05 kernel and declines cc 12.x in check_support() (#2169); skip there instead of
-    reaching that RuntimeError. The other NSA APIs (selection, SWA) serve cc 12.x, so the shared nsa_init gate stays as it is."""
+    """Skip devices without the tcgen05 instructions this API requires."""
     from cudnn.tensor_adapter import has_tcgen05
 
     major, minor = torch.cuda.get_device_capability()
     if not has_tcgen05(major):
         pytest.skip(f"requires an SM100-family (tcgen05) device, found SM{major}{minor}")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0), (10, 3), (10, 7), (12, 0), (12, 1)])
+def test_topk_reduction_tcgen05_gate(monkeypatch, capability):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    if capability[0] < 10 or capability[0] == 12:
+        with pytest.raises(pytest.skip.Exception, match="tcgen05"):
+            _requires_tcgen05()
+    else:
+        _requires_tcgen05()
 
 
 @pytest.mark.L0
@@ -117,9 +127,7 @@ def test_nsa_topk_reduction_thd_ignores_keys_past_the_sequence(is_causal):
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     if not torch.cuda.is_available():
         pytest.skip("Environment not supported: requires CUDA")
-    major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
-        pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
+    _requires_tcgen05()
 
     s_q, s_k, h_q, h_k, d = 4096, 64, 4, 1, 128
     selection_block_size, compress_stride, k_value = 64, 32, 16
