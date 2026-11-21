@@ -269,7 +269,9 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     ),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait; +2: the tile-end S-read credit waits; the softmax tile-top wait is the idle mb_o_full[0] wait
     ("mxfp8", (192, 128)): (True, 35, 14),  # +1 ring wait: the P-slot hand-over wait; the softmax tile-top wait is the idle mb_o_full[0] wait
     ("f16", (256, 256)): (False, 30, 11),  # FP32 split-partial epilogue adds one output-ring wait
-    ("fp8", (256, 256)): (False, 30, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
+    # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +16 ring and +3 idle waits: the two-warpgroup body
+    # (its MMA warp's ring waits take the body's own lever, _PAIR_MMA_WAITS below)
+    ("fp8", (256, 256)): (False, 46, 14),
     ("mxfp8", (256, 256)): (False, 29, 11),
     ("f16", (512, 512)): (True, 23, 14),  # +1 ring wait: the in-loop mb_bmm2_done wait is spelled once per CORR_READY_BEFORE_DONE arm (ONE traced site)
     ("fp8", (512, 512)): (True, 22, 14),
@@ -290,6 +292,9 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
 # (poll-site count, targets).
 _D512_2X2_CROSS_PAIR_WAITS = (11, {"mb_k_empty", "mb_v_empty", "mb_k_full", "mb_v_full", "mb_o_empty"})
 _IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go", "mb_bias_full", "mb_bias_empty")
+# The d256 per-tensor FP8 two-warpgroup body: the ring waits of its MMA warp pass the body's own lever, SPIN_PAIR_MMA (defined
+# once, True), not the module's: (kind, flavor) -> site count.
+_PAIR_MMA_WAITS = {("fp8", (256, 256)): 14}
 
 
 def _wait_sites(code):
@@ -317,7 +322,7 @@ def test_sm107_ring_waits_take_the_module_spin_constant(flavor, kind, load_kw):
     ``spin=SPIN_RING_WAITS``, and no whole-tile idle target does.  A kernel that gains from the spin but regresses to the sleeping
     form at one site, or a loser that leaks the spin onto one ring, changes the count here before it costs 2-6 % on the node."""
     mod = _load(flavor, rubin=True, **load_kw)
-    _assert_ring_wait_contract(mod, _SPIN_RING_WAITS[(kind, flavor)])
+    _assert_ring_wait_contract(mod, _SPIN_RING_WAITS[(kind, flavor)], pair_mma=_PAIR_MMA_WAITS.get((kind, flavor), 0))
 
 
 def test_sm107_batch_pair_ring_waits_take_the_module_spin_constant():
@@ -326,7 +331,7 @@ def test_sm107_batch_pair_ring_waits_take_the_module_spin_constant():
     _assert_ring_wait_contract(mod, (True, 41, 14))
 
 
-def _assert_ring_wait_contract(mod, expected):
+def _assert_ring_wait_contract(mod, expected, pair_mma=0):
     import re
 
     want, n_ring, n_idle = expected
@@ -338,10 +343,15 @@ def _assert_ring_wait_contract(mod, expected):
     sites = _wait_sites(code)
     spun = [t for t, args in sites if "spin=SPIN_RING_WAITS" in args]
     assert len(spun) == n_ring, f"{mod.__name__}: {len(spun)} ring waits pass spin=SPIN_RING_WAITS, the classification says {n_ring}"
-    assert len(sites) == n_ring + n_idle, f"{mod.__name__}: {len(sites)} wait sites, expected {n_ring} ring + {n_idle} idle"
-    leaked = [t for t in spun if t.startswith(_IDLE_WAIT_TARGETS) or t.startswith("sched.")]
+    pair = [t for t, args in sites if "spin=SPIN_PAIR_MMA" in args]
+    assert len(pair) == pair_mma, f"{mod.__name__}: {len(pair)} MMA-warp waits pass spin=SPIN_PAIR_MMA, the classification says {pair_mma}"
+    if pair_mma:
+        assert mod.SPIN_PAIR_MMA is True, f"{mod.__name__}: SPIN_PAIR_MMA={mod.SPIN_PAIR_MMA}"
+        assert len(re.findall(r"^SPIN_PAIR_MMA: bool = (?:True|False)$", code, re.M)) == 1, f"{mod.__name__}: exactly one SPIN_PAIR_MMA definition"
+    assert len(sites) == n_ring + pair_mma + n_idle, f"{mod.__name__}: {len(sites)} wait sites, expected {n_ring} ring + {pair_mma} pair-MMA + {n_idle} idle"
+    leaked = [t for t in spun + pair if t.startswith(_IDLE_WAIT_TARGETS) or t.startswith("sched.")]
     assert not leaked, f"{mod.__name__}: whole-tile idle waits must keep the sleeping form: {leaked}"
-    assert code.count("spin=") == n_ring, f"{mod.__name__}: a spin= outside a .wait( call"
+    assert code.count("spin=") == n_ring + pair_mma, f"{mod.__name__}: a spin= outside a .wait( call"
 
 
 # The per-cell softmax mask is ONE tile_dsl op, `tile_dsl.mask.apply_mask_chunk`: a keep-word per 32 columns from two

@@ -65,8 +65,8 @@ pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.9.1; XLA e
 cd test/python
 pytest                        # default is -m L0 (smoke level) per pytest.ini
 pytest -m L1                  # deeper levels: L0..L4
-pytest test_conv_fprop.py     # one file (still filtered by -m L0 — pass -m "L0 or L1" to widen)
-pytest fe_api/                # OSS kernel tests; require `--group torch` (and `--group jax` for the *_jax tests) + SM90/SM100 GPU
+pytest sdpa/frost/test_sdpa_fwd_dsl_sm100.py   # one file (still filtered by -m L0; pass -m "L0 or L1" to widen)
+pytest norm/cutedsl/          # OSS kernel tests live in test/python/<op>/cutedsl/; need `--group torch` (`--group jax` for *_jax)
 ```
 
 Read [test/AGENTS.md](test/AGENTS.md) before touching tests — `test/python/conftest.py` has import-order and env-var requirements that are easy to break.
@@ -88,18 +88,41 @@ The internal pipeline's `analysis:guardwords_scan` scans the whole tree, docs in
 
 - `include/` is header-only: no `.cpp` files, no new required dependencies. Vendored third-party code lives in `include/cudnn_frontend/thirdparty/`.
 - Docs moves: check `/cudnn/<route>` and `/cudnn/latest/<route>` redirects against the navigation slugs. Shared Markdown pages need explicit GitHub links alongside Fern site links; see [docs/README.md](docs/README.md).
-- Every new frontend-only Python API needs: public functions, lazy export in `python/cudnn/ops/__init__.py`, docs under `docs/operations/`, and pytest coverage under `test/python/fe_api/`. Full recipe: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) and the `cutedsl-kernel-integration` skill.
+- Every new frontend-only Python API needs: public functions, lazy export in `python/cudnn/ops/__init__.py`, docs under `docs/operations/<family>/`, and pytest coverage under `test/python/<op>/cutedsl/`. The checklist in [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) and the `cutedsl-kernel-integration` skill are canonical.
 - Frontend-only OSS APIs are experimental; keep the lazy-import boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time). CuTeDSL is a required dependency now, but a tensor framework is not, and `import cudnn` still has to stay cheap.
-- The `pyproject.toml` floor on `nvidia-cutlass-dsl` is `>=4.8.0`, matching the version pinned by vLLM v0.32.0 and SGLang v0.5.22. Every backend/kernel gates the DSL version at runtime and declines with an error that names the version — never assume the installed DSL satisfies your kernel. [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) **Rule 7** is canonical; cite it in review.
+- The `nvidia-cutlass-dsl` floor must not exceed the lowest version any downstream pins exactly or caps: vLLM, SGLang, FlashInfer, TransformerEngine, Megatron-LM, and PyTorch's `torch/_native/cutedsl_utils.py` allowlist (4.8.0 as of 2026-11, set by vLLM/SGLang `==4.8.0`). Re-check them before raising it. Every backend/kernel gates the DSL version at runtime and declines with an error that names the version — never assume the installed DSL satisfies your kernel. [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) **Rule 7** is canonical; cite it in review.
 - Version lives in three places that must stay in sync: `CMakeLists.txt` (`project(... VERSION ...)`), `include/cudnn_frontend_version.h`, `python/cudnn/__init__.py` (`__version__`).
 - Runtime debugging: set `CUDNN_FRONTEND_LOG_INFO=1` and `CUDNN_FRONTEND_LOG_FILE=stderr` for FE logs; backend logs via `CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=stderr`.
 - Public-API signatures evolve **append-only**: new parameters go at the end (with defaults), never inserted mid-signature — positional callers across C++, pybind, and Python wrappers break silently otherwise (review on PR #266).
 - Backend and FROST are peers behind **one FE Python graph contract**. Callers, including FlashInfer, must not need different preparation/execution APIs or engine-specific handling. Share provider-independent host optimizations so both benefit; keep engine-specific lowering internal. [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) **Rule 9** is canonical; cite it in review.
 - Knobs are ONE public vocabulary, `KnobType_t` in `include/cudnn_frontend/knobs.h`, for backend and python engines alike: an autotune record is `(engine_id, {cudnn.knob_type: int})` and downstream caches persist the integers. Reuse a backend-mirrored type when the meaning matches (`TILE_M`, `TILE_CGA_M`, ...); a tuning axis the backend has no word for goes in the frontend-only band (`>= FRONTEND_KNOB_TYPE_BASE`, never handed to the backend). Both bands are append-only — never insert, renumber, or reuse a value (the `static_assert`s in `knobs.h` are the tripwire). A python engine keeps whatever native knob object it likes inside `PlanConfig.knobs` and converts at the boundary via `BaseEngine.knobs_to_public` / `knobs_from_public`; no engine-private knob namespace reaches `get_engine_and_knobs_at_index` / `create_execution_plan`. Knobs are performance-only: a plan computes the same function under any knob value, so an autotuner may pick freely. Anything numerics-changing (e.g. `softmax_precision`) is an **op attribute** declared in the op's spec `python_only_attrs` (never forwarded to C++; a SET value makes the node backend-unlowerable) and surfaces as a graph fact the capability rows gate on.
-- The FROST GEMM engine's arch-specific half exists once per arch family: `python/cudnn/gemm/frost/sm100/` and `sm120/` each own a `compiler.py`, `epilogue_codegen.py` and `kernel_templates/`. `cudnn.gemm.frost.compiler` / `.epilogue_codegen` are facades that *become* the active family's module on first import (`arch_family.active_family()`: decided once per process from the current GPU, pinned by `CUDNN_FRONTEND_GEMM_ARCH_FAMILY=sm100|sm120`), so callers keep importing the facade path and `monkeypatch.setattr(compiler, ...)` still reaches the real module. Each tree renders only its own pipelines: `_FAMILY` / `_check_own_family` in each compiler decline the other family's template *after* the semantic gates (message `is served by the sm<N> arch tree, but this process runs the sm<M> tree`, which the frost test conftest reports as a skip), and `kernel_registry.preferred_pipeline` never targets a family the process cannot render — so the sm120 pipeline on an SM 10.x GPU needs `CUDNN_FRONTEND_GEMM_ARCH_FAMILY=sm120`. A fix that applies to both trees lands in both copies; a test of one tree's renderer imports that tree by name (`cudnn.gemm.frost.sm120.compiler`). Locate a template through `kernel_registry.template_path(file)` / `KernelTemplate.path` (by its `sm<NNN>_` prefix), never via `Path(compiler.__file__)` — a family may render the other's template where both run. Code both trees' templates import stays above them (`gemm/frost/kernel_templates/`), per the owner-names-the-directory rule in [python/cudnn/frost/README.md](python/cudnn/frost/README.md).
+- FROST GEMM has one arch tree per family (`gemm/frost/sm100/`, `sm120/`) behind facade modules; see "FROST GEMM arch trees" in [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) before editing either.
 - Never delete an existing log or diagnostic statement in a cleanup/refactor — several were added after repeated hard-to-repro failures and are the only tripwire for a recurrence (review on PR #280). If one looks redundant, ask before removing.
 - Every new source file needs the repo's SPDX/license header (flagged in review on PR #747) — enforced by the `spdx-license-header` pre-commit hook.
 - Changing any FROST SDPA `Capabilities` field that affects graph eligibility, or adding/retiring an `EngineSpec`, updates the affected architecture section under [python/cudnn/sdpa/frost/support/](python/cudnn/sdpa/frost/support/README.md) in the same commit. Use its template and SM90 example for sections not yet migrated; mark unchecked scopes pending. The old `SUPPORT_MATRIX_TRACKER.md` is historical reference. A change confined to knob domains (`tile_ms`, `sched_policies`, ...) is exempt; a support-preserving refactor still updates moved source links and engine identities. [python/cudnn/sdpa/AGENTS.md](python/cudnn/sdpa/AGENTS.md) **Rule S2** is canonical for the exact scope; cite it in review.
+
+## Code, comments and tests
+
+**One concept, one definition.**
+- The graph API keeps each concept in one place: engine registry (`engines/manifest.py`), execute contract, public symbol lists, device facts (`cudnn._device`, reached as `Handle.device`), stream conversion (`cudnn._torch_stream`), DSL version (`cudnn.frost.buffers`), compiled cache (`cudnn.frost.compiled_cache`), dtype maps (`cudnn.datatypes`). Grep for the owner before adding a helper.
+- Engines may duplicate implementation. They may not answer the same public call differently (stream, device, overrides, error type). Fix a divergence; leave a duplicate that behaves the same.
+- No `__getattr__` forwarding to another object. No broad `except` that silently changes the result.
+- A graph-API engine builds for the device in scope (`frost.device.current_device()` inside the graph's `build_device`, or `ctx.handle.device`) and launches on `ctx.stream`. It never calls `torch.cuda.current_device()`, reads device 0, or falls back with `stream or 0`. Known violations being fixed: GEMM/conv/LA/CAKE `stream or 0`, `norm/utils.smem_per_sm`, the device lookup in `sdpa/graph_analyzer.py`.
+- Every `execute()` argument (`context`, overrides, workspace) is honored or rejected by the graph; a plan never drops one silently.
+- A cache of device facts (arch, SM count, shared memory) or of handles is keyed by device ordinal; a handle cache is also per thread. Detector: grep `lru_cache` and module globals next to `get_device_capability` / `get_device_properties` / `create_handle`.
+- License headers: NVIDIA-only code is `SPDX-License-Identifier: Apache-2.0`. Code derived from a third party keeps its upstream license and is listed in [LICENSING.md](LICENSING.md).
+- Kernels not behind the graph API (HSTU, BSA, DSA, NSA, CSA, flex attention, `gemm/cutedsl`, ...) belong to their contributing teams. Fix clear bugs there; do not impose graph-API conventions.
+
+**Comments** state what a reader cannot get from the code: an invariant, why a constraint exists, a trap. History, PR/issue numbers, dates, measurements and design narrative go in the PR description. A number stays only when it is the threshold itself. A module docstring states the contract (inputs, outputs, constraints). Public API docstrings are user documentation; keep them complete.
+
+**Tests**
+- Every test function has exactly one level marker. L0 covers one case per dtype × arch code path; sweeps go to L1 and above.
+- Test behavior through public entry points. Do not assert on repository source or doc text; a source-level invariant belongs in a pre-commit or lint check.
+- Do not re-encode measured tables (placement, heuristics, scheduler constants) or PTX/SASS hashes. Assert properties: well-formed, admissible, monotone. Append-only integer contracts (knob values) are the exception.
+- No wall-clock thresholds in unit tests. `pytest.raises(match=...)` matches a stable token such as the parameter name.
+- A new family, dtype or arch extends an existing parametrized harness instead of copying a test file.
+
+**AGENTS.md** holds rules: one to three imperative sentences per rule plus its detector. Keep rule numbers stable. Evidence and case histories go in the PR description.
 
 ## Agent skills
 
@@ -118,6 +141,8 @@ Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.cl
 ## PR labels
 
 When opening a pull request, apply **at minimum one label from each group**: one `cat-*` (change type), one or more `area:*` / `op:*` (affected area), and one `orig-*` (originator). See the full label list at <https://github.com/NVIDIA/cudnn-frontend/labels>.
+
+A draft PR gets no automatic review and skips the GitHub checks. Mark it ready (`gh pr ready <N>`) when it should be reviewed. GPU test lanes do not start on push: post a comment whose whole body is `@cudnn-ci-bot run <targets>` (the bot lists valid targets when one is wrong).
 
 Leave `closed-*` and `open-*` labels for maintainers; Milestone/Projects sidebar fields are set by reviewers/maintainers, not authors.
 
