@@ -1099,3 +1099,78 @@ def test_graph_thd_parallel_prefix_batches(batch):
     q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
     kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
     _run_graph(q, kv, h=2, d=128, poison=True, pad_cap=256)
+
+
+def _envelope_case(n_seq, long_len, h=2, hkv=1, d=64, dtype=torch.bfloat16, seed=3):
+    """One ``long_len`` sequence (it sets S_max) followed by ``n_seq - 1``
+    two-token sequences, so ``n_seq * S_max`` passes 2^31 at a small T.  The
+    long sequence has Q = dO = 0 and LSE = log(long_len): its P is uniform,
+    Delta and dS are 0, so its exact dQ/dK/dV are 0 and only the short
+    sequences need a (batched) reference."""
+    dev = "cuda"
+    lens = [long_len] + [2] * (n_seq - 1)
+    cu = [0]
+    for x in lens:
+        cu.append(cu[-1] + x)
+    t = cu[-1]
+    g = torch.Generator(device=dev).manual_seed(seed)
+    q = torch.randn(1, t, h, d, generator=g, device=dev, dtype=dtype) * 0.3
+    k = torch.randn(1, t, hkv, d, generator=g, device=dev, dtype=dtype) * 0.3
+    v = torch.randn(1, t, hkv, d, generator=g, device=dev, dtype=dtype) * 0.3
+    do = torch.randn(1, t, h, d, generator=g, device=dev, dtype=dtype) * 0.3
+    q[0, :long_len] = 0
+    do[0, :long_len] = 0
+    o = torch.empty_like(do)
+    lse = torch.empty(1, h, t, device=dev, dtype=torch.float32)
+    grp, scale, n = h // hkv, 1.0 / math.sqrt(d), n_seq - 1
+    o[0, :long_len] = v[0, :long_len].float().mean(0).repeat_interleave(grp, 0).to(dtype)
+    lse[0, :, :long_len] = math.log(long_len)
+    sl = lambda x, nh: x[0, long_len:].double().view(n, 2, nh, d).transpose(1, 2)  # noqa: E731  [n, nh, 2, d]
+    qs, ks, vs = sl(q, h), sl(k, hkv).repeat_interleave(grp, 1), sl(v, hkv).repeat_interleave(grp, 1)
+    sc = qs @ ks.transpose(-1, -2) * scale
+    lse[0, :, long_len:] = torch.logsumexp(sc, -1).transpose(0, 1).reshape(h, 2 * n).float()
+    o[0, long_len:] = (torch.softmax(sc, -1) @ vs).transpose(1, 2).reshape(2 * n, h, d).to(dtype)
+    return SimpleNamespace(
+        b=n_seq, h=h, hkv=hkv, d=d, d_v=d, dtype=dtype, scale=scale, causal=False, lens_q=lens, lens_kv=lens, cu_q=cu, cu_k=cu,
+        t_q=t, t_kv=t, cap_q=t, cap_kv=t, q=q, k=k, v=v, do=do, o=o, lse=lse,
+    )  # fmt: skip
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("n_seq,long_len", ((32768, 65536), (65535, 65538)), ids=("grid_2p31", "grid_wraps_positive"))
+def test_graph_thd_helper_grids_past_int32(n_seq, long_len):
+    """The Delta, dQ-cast and dK/dV-reduce helpers launch one CTA per
+    (sequence, row) of the envelope.  A 1-D grid of ``n_seq * S_max`` in Int32
+    fails to launch at 2^31 and, past 2^32, wraps to a small positive grid
+    that silently skips every sequence after the first few.  Gapped records
+    and GQA keep the caller-origin helpers and the dK/dV reduce in play; every
+    sequence is checked, the gap cells must stay NaN."""
+    c = _envelope_case(n_seq, long_len)
+    gaps = dict.fromkeys(_GAP_ROLES, 8)
+    g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(c, gaps=gaps)
+    _plan_graph(g)
+    grads = [_gapped(torch.full((1, c.t_q, nh, c.d), float("nan"), device="cuda", dtype=c.dtype), 8) for nh in (c.h, c.hkv, c.hkv)]
+    vp.update(zip((dq_t, dk_t, dv_t), grads, strict=True))
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute(vp, ws)
+    torch.cuda.synchronize()
+    for name, x in zip(("dQ", "dK", "dV"), grads, strict=True):
+        assert torch.isnan(_gap_columns(x)).all(), f"{name}: a gap column of the per-token record was written"
+    L0, n, grp = long_len, n_seq - 1, c.h // c.hkv
+    dq, dk, dv = (x[0].float() for x in grads)
+    for name, x in (("dQ", dq), ("dK", dk), ("dV", dv)):
+        assert torch.equal(x[:L0], torch.zeros_like(x[:L0])), f"{name}: long sequence 0 is not exactly zero"
+    sl = lambda x, nh: x[0, L0:].double().view(n, 2, nh, c.d).transpose(1, 2)  # noqa: E731
+    qs, dos, os_ = sl(c.q, c.h), sl(c.do, c.h), sl(c.o, c.h)
+    ks, vs = sl(c.k, c.hkv).repeat_interleave(grp, 1), sl(c.v, c.hkv).repeat_interleave(grp, 1)
+    lse = c.lse[0, :, L0:].double().view(c.h, n, 2).transpose(0, 1)[..., None]
+    p = torch.exp(qs @ ks.transpose(-1, -2) * c.scale - lse)
+    ds = p * (dos @ vs.transpose(-1, -2) - (dos * os_).sum(-1, keepdim=True))
+    fold = lambda x: x.view(n, c.hkv, grp, 2, c.d).sum(2)  # noqa: E731
+    refs = (ds @ ks * c.scale, fold(ds.transpose(-1, -2) @ qs * c.scale), fold(p.transpose(-1, -2) @ dos))
+    for name, x, want, nh in (("dQ", dq, refs[0], c.h), ("dK", dk, refs[1], c.hkv), ("dV", dv, refs[2], c.hkv)):
+        got = x[L0:].view(n, 2, nh, c.d).transpose(1, 2).double()
+        err = torch.nan_to_num((got - want).abs(), nan=float("inf")).amax(dim=(1, 2, 3))
+        bad = (err > 0.02 * want.abs().amax() + 1e-3).nonzero().flatten() + 1
+        assert bad.numel() == 0, f"{name}: {bad.numel()}/{n} short sequences wrong, first {bad[:4].tolist()}"
