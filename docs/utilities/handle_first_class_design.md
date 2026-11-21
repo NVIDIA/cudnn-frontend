@@ -31,8 +31,7 @@ becomes one consumer rather than the anchor.
    `(handle, data, ...)`), so it stays a passthrough and unwraps just its first
    positional. A reader can grep `backend_handle` and trace the plumbing
    top-to-bottom without an IDE. A full inventory confirmed **every** handle→C++
-   handoff is in `_pygraph`/`__init__` (the `__getattr__` delegation carries no
-   handle), so the set is closed. `Handle` deliberately has **no `__index__`**:
+   handoff is in `_pygraph`/`__init__`, so the set is closed. `Handle` deliberately has **no `__index__`**:
    the only path to the backend is those explicit calls, and a Handle that
    reaches a binding unconverted fails loudly instead of being silently coerced.
    C++ never reads device off the handle. **The C++ handle ABI is unchanged**;
@@ -180,7 +179,7 @@ covers them all at once:
   compile target follows the scope. The arch is part of the baked, content-hashed
   source, so a cross-arch kernel can no longer collide in the JIT cache with a
   same-source same-machine one. **Limitation:** the pin is honoured on the public
-  `nvidia-cutlass-dsl >= 4.7` (frost's `CUTEDSL_MIN_VERSION`) and on internal RCs;
+  `nvidia-cutlass-dsl >= 4.8` (frost's `CUTEDSL_MIN_VERSION`) and on internal RCs;
   only a public wheel below the floor never threads `--gpu-arch`, and frost already
   declines those as too-old (`buffers.cutedsl_too_old`, which the support check
   reuses so an internal RC's own `0.x` numbering is judged new, not old). On such a

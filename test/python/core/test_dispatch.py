@@ -194,6 +194,23 @@ def test_uid_map_plan_rejects_runtime_overrides_before_execute(monkeypatch, over
     assert _marked(result)
 
 
+def test_python_plan_without_context_rejects_one(monkeypatch):
+    """A context passed to a plan that reports none raises instead of being dropped."""
+    g = pygraph()
+    eng = StubEngine()
+    _offer(monkeypatch, eng)
+    C = g.matmul(torch.randn(2, 3, 4), torch.randn(2, 4, 5), name="mm")
+    c = torch.zeros(2, 3, 5)
+    _pin(g, "stub")
+    g.build_plans()
+    assert g.get_context_size() == 0
+    with pytest.raises(ValueError, match="context"):
+        g.execute({C: c}, context=torch.empty(16, dtype=torch.uint8))
+    assert not eng.seen
+    g.execute({C: c})
+    assert _marked(c)
+
+
 def test_variant_pack_plan_receives_runtime_overrides(monkeypatch):
     """The legacy guard must preserve the normalized-plan execution contract."""
     from unittest.mock import Mock
@@ -286,6 +303,46 @@ def test_select_plan_survives_build_and_execute(monkeypatch):
     assert g.selected_engine.name == "b"
     g.execute({C: torch.empty(2, 2)})  # implicit build() must preserve the pin
     assert EngB.ran == 1 and EngA.ran == 0
+
+
+class _RejectingLowering:
+    """A lowered C++ graph whose backend validate() rejects; every call is recorded."""
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def validate(self):
+        self.calls.append("validate")
+        raise RuntimeError("backend rejected the descriptor")
+
+    def build_operation_graph(self):
+        self.calls.append("build_operation_graph")
+
+    def key(self, *args, **kwargs):
+        self.calls.append("key")
+        return 0
+
+    def serialize(self, *args, **kwargs):
+        self.calls.append("serialize")
+        return b""
+
+
+@pytest.mark.parametrize("call", ["key", "serialize"])
+def test_a_rejected_lowering_is_not_reused(monkeypatch, call):
+    """A python-native validator accepted the graph, so the backend's rejection
+    surfaces at the first on-demand lowering; the next call lowers again and
+    raises again instead of reading the rejected descriptor."""
+    g = pygraph()
+    _offer(monkeypatch, StubEngine())
+    g.matmul(torch.randn(2, 3, 4), torch.randn(2, 4, 5), name="mm")
+    calls = []
+    monkeypatch.setattr(g, "_python_native_validator", lambda: lambda graph: True)
+    monkeypatch.setattr(g, "_lower_to_cpp", lambda: _RejectingLowering(calls))
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="rejected"):
+            getattr(g, call)()
+        assert g._lowered_graph is None
+    assert calls == ["validate", "validate"]
 
 
 def test_unexpected_engine_exception_propagates(monkeypatch):
