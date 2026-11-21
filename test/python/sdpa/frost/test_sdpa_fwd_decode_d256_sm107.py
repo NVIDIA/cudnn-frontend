@@ -2770,6 +2770,7 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits, dtype):
 
 @_gpu
 @pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_decode_64_column_tile_wide_output_replays(dtype):
     """The spill-free 64-column epilogue retains 64-bit physical O offsets."""
@@ -2784,7 +2785,10 @@ def test_decode_64_column_tile_wide_output_replays(dtype):
     q = torch.randn(B, SQ, H, D, device="cuda", dtype=dtype)
     k = torch.randn(B, SKV, KH, D, device="cuda", dtype=dtype)
     v = torch.randn_like(k)
-    o = torch.empty_strided((B, SQ, H, D), (batch_stride, H * D, D, 1), device="cuda", dtype=dtype)
+    try:
+        o = torch.empty_strided((B, SQ, H, D), (batch_stride, H * D, D, 1), device="cuda", dtype=dtype)
+    except torch.OutOfMemoryError:
+        pytest.skip("wide output stride storage unavailable at allocation")
     lse = torch.empty(B, H, SQ, device="cuda")
     seq_kv = torch.tensor([129, 65, 1, 0], device="cuda", dtype=torch.int32)
     qv, kv, vv, ov = (t.transpose(1, 2) for t in (q, k, v, o))
