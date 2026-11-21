@@ -183,7 +183,8 @@ class Session:
         drafter is refused where the session that loads was handed none (its weights are seeded), one of another
         model's widths by the first width that differs -- each a ``ValueError`` here, before anything is planned.
         ``max_model_len`` is the positions a sequence of the run may reach at most, the context length a serving engine
-        is started with: a constant of the run, which every block of the session's plans is handed in its options.  Left
+        is started with: a constant of the run, which every block of the session's plans is handed in its options, and
+        the state where a block reads the page table and the lengths of a paged cache (``attended_tables``).  Left
         out it is ``capacity``; below ``capacity`` it is a ``ValueError``: no step of the session writes a position past
         it."""
         if sampling is not GREEDY:
@@ -415,11 +416,32 @@ class Session:
             )
         return next(iter(asked), None)
 
+    def attended_tables(self) -> bool:
+        """Whether a block of this session's plans reads its attention cache through the state's page table and lengths
+        (``Block.attended_tables``): of its step's plan and, where it has one, of its prompt's, every part of a block
+        that several rows serve included.  The state is then built with both, for the run's maximum length
+        (``max_model_len``).  They are tables of a pool of pages: such a block in a session whose blocks ask for no
+        paged cache is a ``ValueError``, a wrong table, named with its plan."""
+        for plan, _ in self._kinds():
+            for label, _, _, _, block in plan.parts():
+                if not getattr(block, "attended_tables", False):
+                    continue
+                if self.cache_page() is None:
+                    where = f"{label} in the plan of {plan.sequences} sequence{'s' if plan.sequences > 1 else ''}{plan.tokens_text()}"
+                    raise ValueError(
+                        f"the provider table is wrong: {where} reads the page table and the lengths of a paged attention cache, "
+                        "and no block of this session asks for one (cache_page)"
+                    )
+                return True
+        return False
+
     def _paged(self) -> dict:
-        """The page of this session's attention cache as a keyword of a family's memory arithmetic, where a block of its
-        plans asks for a paged cache (a family whose states are plain is never asked)."""
-        page = self.cache_page()
-        return {} if page is None else {"page": page}
+        """The layout of this session's attention cache as keywords of its state and of a family's memory arithmetic: the
+        page, where a block of its plans asks for a paged cache, and with it the run's maximum length where a block
+        reads the page table and the lengths (a family whose states are plain is never asked).  Both wrong tables of
+        that layout are named here (``cache_page``, ``attended_tables``)."""
+        page, tables = self.cache_page(), self.attended_tables()
+        return {} if page is None else {"page": page, **({"max_model_len": self.max_model_len} if tables else {})}
 
     def _kept(self) -> dict:
         """What the plans of the run ask the family's loader to keep, as its keyword arguments: nothing for a run whose every
@@ -500,7 +522,7 @@ class Session:
         if self._share is None:
             self.stored_layouts()  # one weight in two row orders is a wrong table: named here, with the plans, before anything is built or read
         for session in (self, *later):
-            session.cache_page()  # ... and so are two layouts of one session's attention cache
+            session._paged()  # ... and so are two layouts of one session's attention cache, and tables of a pool that no block asks for
         sentence = ""
         if self.device.type == "cuda":
             # what the load of the first session holds follows the plans: the stored format of the weights a block multiplies
@@ -601,7 +623,7 @@ class Session:
         # the layout of a stored weight a provider multiplies on, where it has its own: asked first, so that plans that ask for
         # two row orders of one weight end here -- before an entry builds anything, before a byte is read
         layouts = self.stored_layouts() if self._share is None else {}
-        self.cache_page()  # two layouts of this session's attention cache: the same kind of wrong table, named at the same place
+        self._paged()  # two layouts of this session's attention cache, or its tables without a pool: the same kind of wrong table, named at the same place
         for each in self._first_used():
             each.first_use()  # made with the table (``plan_table``); a session that is loaded without one makes it here, before the weights
         if self.reference_precision == "ieee-fp32" and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
@@ -675,9 +697,10 @@ class Session:
 
     def _fresh_state(self) -> DecodeState:
         """A zero state at position 0 for this session's sequences and tokens per sequence, in allocations of its own; its
-        attention caches in the layout the blocks of the session's plans ask for (``cache_page``)."""
+        attention caches in the layout the blocks of the session's plans ask for (``cache_page``), with the page table
+        and the lengths of the run's maximum length where a block reads them (``attended_tables``)."""
         shapes = self.model.state_shapes()
-        state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, shapes, self.device, self.tokens, page=self.cache_page())
+        state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, shapes, self.device, self.tokens, **self._paged())
         if self.drafter is not None:  # the drafter's own cache: as many positions as the model's
             state.draft = self.drafter.state(self.sequences, self.capacity, self.device)
         return state

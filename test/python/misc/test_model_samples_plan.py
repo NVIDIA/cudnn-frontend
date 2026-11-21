@@ -1909,10 +1909,11 @@ def test_one_provider_asks_for_a_paged_cache_and_every_other_plan_builds_the_pla
 
 
 @contextlib.contextmanager
-def _a_block_asks_for_a_page(page=PAGE, key="torch_ref.attention_prepare"):
+def _a_block_asks_for_a_page(page=PAGE, key="torch_ref.attention_prepare", tables=False):
     """Inside: a plan that is resolved serves the block of ``key`` with a stand-in that runs the reference chain under another
     type and asks for an attention cache in pages of ``page`` positions (``Block.cache_page``) -- what the adapter of a
-    kernel that writes a paged pool states.  Yields the stand-in's class."""
+    kernel that writes a paged pool states.  ``tables``: the stand-in also says that it reads the state's page table and
+    lengths (``Block.attended_tables``), as the adapter of a kernel that reads such a pool does.  Yields the stand-in's class."""
     from model_samples import providers
 
     registry = providers.factories
@@ -1920,6 +1921,7 @@ def _a_block_asks_for_a_page(page=PAGE, key="torch_ref.attention_prepare"):
 
     class AsksForAPage(served):
         cache_page = page
+        attended_tables = tables
 
     providers.factories = lambda: dict(registry(), **{key: AsksForAPage})
     try:
@@ -2291,6 +2293,105 @@ def test_a_paged_cache_hands_out_its_rows_of_the_two_tables_as_views():
     for wrong in (0, -64, 2051.0, True, "2051"):
         with pytest.raises(ValueError, match="max_model_len"):
             DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", tokens, page=PAGE, max_model_len=wrong)
+
+
+def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_reads_them(monkeypatch):
+    """No adapter of the closed list reads the page table and the lengths (``Block.attended_tables``), so no state of a run
+    holds them: its tables, its bytes and the memory sentence of its run do not follow the run's maximum length.  A
+    session whose plans have a block that says so -- in its step's plan or in its prompt's, a part of a block that
+    several rows serve included -- builds its state with both, for the session's maximum length; the family's
+    arithmetic counts them to the byte and the memory sentence holds that count.  Such a block in a session whose
+    blocks ask for no pool of pages is a wrong table."""
+    import copy
+
+    import model_samples
+    from model_samples import blocks, providers
+    from model_samples.qwen_dense import QwenDense
+    from model_samples.state import DecodeState
+
+    reading = [key for key, factory in providers.factories().items() if getattr(factory, "attended_tables", False)]
+    assert providers.BlockBase.attended_tables is False and blocks.BySite.attended_tables is False and reading == []
+    tiny = _paged_model()
+    text = model_samples.TextIO.synthetic(tiny.geometry.vocab)
+    kinds, shapes = tiny.geometry.layer_kinds, tiny.state_shapes()
+    common = dict(sequences=3, stack="reference", device="cpu", capacity=100)
+
+    def built(tables, core="torch_ref.attention", **session):
+        made = model_samples.Session(tiny, text, **common, **session)
+        with _a_block_asks_for_a_page(), _a_block_asks_for_a_page(key=core, tables=tables):
+            made.resolve()
+        made.reset(fresh=True)
+        return made
+
+    paged = built(False, max_model_len=2051)
+    base = DecodeState(kinds, 3, 100, shapes, "cpu", page=PAGE)
+    assert not paged.attended_tables() and paged.state.table.blocks is None and paged.state.table.lengths is None
+    assert paged.state.bytes() == base.bytes() == tiny.state_bytes(3, 100, page=PAGE), "a paged state as it was, whatever the maximum length"
+    read = built(True, max_model_len=2051)
+    table = read.state.table
+    assert read.attended_tables() and (tuple(table.blocks.shape), tuple(table.lengths.shape)) == ((4, 36), (100, 4))
+    assert read.state.bytes() - base.bytes() == 4 * 36 * 4 + 100 * 4 * 4, "four bytes an entry of either table"
+    assert read.state.bytes() == tiny.state_bytes(3, 100, page=PAGE, max_model_len=2051)
+    assert tuple(built(True).state.table.blocks.shape) == (4, 4), "a session that names no maximum length: the pages of its capacity"
+    # a session that verifies behind its prompt has two plans: a block of either one that reads the tables builds them
+    for in_prompt in (False, True):
+        behind = model_samples.Session(tiny, text, draft_tokens=3, max_model_len=2051, **common)
+        with _a_block_asks_for_a_page(), _a_block_asks_for_a_page(key="torch_ref.attention", tables=not in_prompt):
+            behind.plan = behind._resolve(behind.tokens)
+        with _a_block_asks_for_a_page(), _a_block_asks_for_a_page(key="torch_ref.attention", tables=in_prompt):
+            behind.prefill_plan = behind._resolve(1, state_tokens=behind.tokens)
+        behind.reset(fresh=True)
+        held = behind.state.table
+        assert behind.attended_tables() and tuple(held.lengths.shape) == (97, 4) and tuple(held.first_token().lengths.shape) == (100, 4), in_prompt
+        assert behind.state.bytes() == tiny.state_bytes(3, 100, 4, page=PAGE, max_model_len=2051), in_prompt
+    # a block whose calls two rows serve by call site names nothing itself: every part of it is asked
+    split = model_samples.Session(tiny, text, max_model_len=2051, **common)
+    with _a_block_asks_for_a_page():
+        plan = split.resolve()
+    row, chain = plan.rows["attention.core"], plan["attention.core"]
+    part = copy.copy(chain)
+    part.attended_tables = True
+    plan["attention.core"] = blocks.BySite("attention.core", [("a", row, chain), ("b", row, part)])
+    assert plan["attention.core"].attended_tables is False and split.attended_tables(), "the part of the call site b reads them"
+    # the two tables are tables of a pool of pages: a block that reads them where no block asks for one is a wrong table
+    unpaged = model_samples.Session(tiny, text, **common)
+    with _a_block_asks_for_a_page(page=None, key="torch_ref.attention", tables=True):
+        unpaged.resolve()
+    for refused in (unpaged.attended_tables, unpaged.plan_table, unpaged.load):
+        with pytest.raises(ValueError, match="attention.core in the plan of 3 sequences"):
+            refused()
+    assert unpaged.state is None and unpaged.weights is None, "named before anything is read or built"
+    # the family's arithmetic is the state's own size, with the tables and without, at every case of the layout
+    for sequences, tokens, capacity, pages, longest, width in TABLE_CASES:
+        state = DecodeState(kinds, sequences, capacity, shapes, "cpu", tokens, page=PAGE, pages=pages, max_model_len=longest)
+        counted = tiny.state_bytes(sequences, capacity, tokens, page=PAGE, pages=pages, max_model_len=longest)
+        assert state.bytes() == counted, (sequences, tokens, capacity, pages, longest)
+        tables = counted - tiny.state_bytes(sequences, capacity, tokens, page=PAGE, pages=pages)
+        steps = sum(capacity - each + 1 for each in {tokens, 1})  # the lengths of the state's own steps and, where it has several tokens, of one
+        assert tables == (sequences + 1) * width * 4 + steps * 4 * _whole(sequences, 4) * 4, (sequences, tokens, capacity, pages, longest)
+        with_tables = tiny.memory_bytes(sequences, capacity, tokens=tokens, page=PAGE, pages=pages, max_model_len=longest)
+        assert with_tables - tiny.memory_bytes(sequences, capacity, tokens=tokens, page=PAGE, pages=pages) == tables
+    linear = _paged_model(("linear_attention", "linear_attention"))  # no attention layer: no pool, and no table to count
+    assert linear.state_bytes(3, 130, page=PAGE, max_model_len=2051) == linear.state_bytes(3, 130)
+    # the memory sentence: at the published widths and 65,535 sequences the lengths of a state are half a GiB
+    model = QwenDense()
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 10**6 * GIB)))
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    stated = dict(sequences=65535, stack="reference", device="cuda:0", capacity=2051)
+
+    def need(tables, **session):
+        first = model_samples.Session(model, text, **stated, **session)
+        later = model_samples.Session(model, text, share=first, tokens=2, **stated, **session)
+        for each in (first, later):
+            with _a_block_asks_for_a_page(), _a_block_asks_for_a_page(key="torch_ref.attention", tables=tables):
+                each.resolve()
+        return first.plan_table([later]).splitlines()[-1].split(" GiB on this GPU")[0]
+
+    without = model.memory_bytes(65535, 2051, page=PAGE) + model.state_bytes(65535, 2051, 2, page=PAGE)
+    counted = model.memory_bytes(65535, 2051, page=PAGE, max_model_len=4096) + model.state_bytes(65535, 2051, 2, page=PAGE, max_model_len=4096)
+    assert need(False) == need(False, max_model_len=4096) == f"  this stack needs about {without / GIB:.1f}", "no block reads the tables: the sentence it was"
+    assert need(True, max_model_len=4096) == f"  this stack needs about {counted / GIB:.1f}", "the tables of both sessions, at the run's maximum length"
+    assert f"{counted / GIB:.1f}" != f"{without / GIB:.1f}", "two sentences, two figures"
 
 
 def _nbytes(tensors) -> int:

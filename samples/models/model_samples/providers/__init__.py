@@ -24,7 +24,10 @@ several tokens per sequence takes the step's slot table where the decode step's 
 (``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).  An adapter whose
 entry reads or writes the attention cache as a pool of pages says so (``cache_page``): the session then builds its state
 in that layout, and the adapter takes the pool's two halves and the rows of the state's tables from the cache it is handed
-(``state.PagedKvCache.at``), never from the position.
+(``state.PagedKvCache.at``), never from the position.  An adapter whose kernel READS such a pool through a page table
+says so as well (``attended_tables``): the session then builds its state with the page table and the lengths of the
+run's maximum length -- the constant every block is handed in its options (``max_model_len``) -- and the adapter takes
+its rows of both from the cache (``state.PagedKvCache.attended``).
 """
 
 from __future__ import annotations
@@ -161,6 +164,11 @@ class BlockBase:
     #: that name two pages are a wrong table.  ``None``: the block reaches the cache through its accessors alone, in
     #: either layout -- every reference chain
     cache_page = None
+    #: for a block whose kernel reads a pool of pages through a page table and the positions each sequence holds: True.
+    #: A session whose plans have such a block builds its state with those two tables, for the run's maximum length
+    #: (``options["max_model_len"]``), and the block takes its rows of them from the cache it is handed
+    #: (``state.PagedKvCache.attended``).  Such a block names the page too (``cache_page``): the tables are a pool's
+    attended_tables = False
     #: for a block whose first use does more than build an entry's kernel -- a library that builds kernels of its own with
     #: the installed compiler: the sentence a sample prints before the plan makes that first use.  Empty: nothing to announce
     first_use_note = ""
