@@ -1094,8 +1094,16 @@ key and the value row of every row of a step into a pool of pages. What building
   tensor would put a launch between two rows that are judged one by one, and the kernel check would name it.
 - What tells a kernel where a row goes is a table the state builds once: its positions, its slots, its cos / sin rows.
   A judge that read the same tables would agree with a table that is one row late. The judge forms the rows of the
-  pool from host integers, and the twin forms its cosines from the position it is handed: a slot table and a position
-  table shifted by one row, an exchanged rotary half and an accessor that exchanges two pages each failed a run.
+  pool from host integers, and the twin forms its cosines from the position it is handed: on a GPU a slot table and a
+  position table shifted by one row, an exchanged rotary half and a write accessor that exchanges two pages each
+  failed a run on the entry's line.
+- A run's own checks hold what the kernel wrote, not what the next block reads. The accessor through which the
+  attention core's reference chain reads the pool, with two pages exchanged, PASSED a seeded run on a GPU: no check of
+  a run compares what that chain reads with anything, and the layer moves the seeded logits by less than their band.
+  That accessor is held by tests -- the host case of a session on stand-ins, whose tokens differ, the host case of the
+  paged cache against the plain one, and the cells of the GPU test that read the pool by index arithmetic of their
+  own -- and a check on a device of what the attention core reads belongs to the row of the core's own kernel. A
+  lesson says that a defect failed a run only of a run that was made.
 - The twin of an entry is the twin of the entry's own suite, statement by statement, and the band is the contract on
   the entry's page. Where the page states the kernel against an evaluation in fp64, the twin evaluates in fp64 whatever
   precision the run's reference accumulates in: a twin in another precision is held to a contract nobody stated.

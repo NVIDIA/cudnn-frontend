@@ -286,8 +286,10 @@ fused gate / up entry it was made on compute capability 10.0; for the attention 
 compute capability 10.0. What this
 sample holds an entry to is its documented numerics contract (the band of its row) and its launch facts.
 
-The stack is built block by block. A block whose target kernel is not served here yet stays on the fallback row it has in
-`fe-cublas`, and a run prints it as `not yet (<fallback reason>)`. Today six entries of cuDNN Frontend and three
+The stack is built block by block. A block whose target kernel is not served here yet stays on a fallback row -- the
+one it has in `fe-cublas`, or, for the attention core, a row of the two target stacks alone, the same reference chain
+with the reason that holds on a pool of pages -- and a run prints it as `not yet (<fallback reason>)`. Today six
+entries of cuDNN Frontend and three
 calls of a library, FlashInfer, are on their target forms:
 
 | block | launches per step (64 layers) | what `native` launches | identity |
@@ -302,7 +304,7 @@ calls of a library, FlashInfer, are on their target forms:
 | MLP down | 64 | `flashinfer.gemm.mm_fp4` on the stored 4-bit weight, with the library's CuTe DSL backend and outside any tuning context (`BACKEND cute-dsl`, `TUNED False`): the library's own pick for the shape, its split-K kernel class for this weight; needs FlashInfer; compute capability 10.x | target: the target's own compiled kernel, held to the kernel class and the launch shape the census records |
 | output head | 1 | the reference's 4-bit quantisation of the normed rows, then the same call of `flashinfer.gemm.mm_fp4` on the stored 4-bit weight: the library's persistent kernel class for this weight; needs FlashInfer; compute capability 10.x | target: the target's own compiled kernel, held to the kernel class and the launch shape the census records (the quantisation in front of it is the last row of this table) |
 | attention preparation | 16 | `cudnn.AttentionPrepareDecode` on the layer's cache as a pool of pages, the kernel stated whole: three position rows in the sections of the published rotary width, pages of 64 positions, 64-bit positions and slots, an ordinary launch (`POSITIONS 3d`, `SECTION (11, 11, 10)`, `PAGE_SIZE 64`, `POSITION_DTYPE int64`, `SLOT_DTYPE int64`, `PDL False`, `PDL_RELEASE False`); compute capability 10.x, 1 to 1,024 rows | target: a cuDNN Frontend entry with byte-equal results |
-| attention core | 16 | the fallback row of `fe-cublas`: the reference chain, which reads that pool through the cache's accessors | not yet |
+| attention core | 16 | a fallback row of the target stacks: the reference chain of `fe-cublas`, which reads that pool through the cache's accessors. `--provider attention.core=torch_ref.attention` names the key that both rows have and selects the row of `fe-cublas` and `reference`: the same chain and the same bytes, printed with that row's reason | not yet |
 | the 4-bit quantise in front of the output head | 1 | nothing: this sample has no block for it yet | the target's declared stand-in, not yet |
 
 The norm block is called at five kinds of site in a step, and the target calls its kernel in another form at each: the
@@ -429,8 +431,11 @@ with one run of positions per sequence.
 
 The adapter converts nothing: the entry reads four views of the in-projection's row (the queries with their gates, the
 keys, the values), the layer's two norm weights, the table rows and the two halves of the pool, and writes the pool and
-two output buffers of the call's own. Nothing is launched between the in-projection's kernel and this one, which the
-kernel check holds, since both are judged one by one. The attention core behind it is still the reference chain. It
+two output buffers of the call's own. Nothing is launched between the in-projection's kernel and this one. The
+kernel check holds that on compute capability 10.0, where the in-projection is an exact row (up to 32 rows) and both
+are judged one by one. Where the in-projection is on its fallback row -- on compute capability 10.3 and 10.7, and
+past 32 rows -- its launches are attributed by family, and a PyTorch launch between the two would be counted among
+them. The attention core behind it is still the reference chain. It
 reads the pool through the cache's accessors -- the pages of a sequence as one run of positions, by views and host
 integers alone -- as it reads the contiguous cache of the other stacks, and its launches are attributed to its
 families.
@@ -452,7 +457,9 @@ its first other token.
 What ran with this row (2026-11-20; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `fe-entries` in
 PyTorch 2.13.0, `native` in PyTorch 2.14.0 with FlashInfer 0.7.2.post1). The default run of both scripts on the four
 stacks, beside the same runs of the tree before the row. On `fe-cublas` and `reference` every line was the line it had
-been but the environment line, whose source hash now covers the entry's files. On `fe-entries` and `native` every ids
+been but ONE, the environment line: its source hash now covers the entry's files, the contract of the paged pools and
+the module a call of an entry runs in front of its launch, so that an edit of any of them shows in the line a run
+prints. On `fe-entries` and `native` every ids
 hash was the one it had been (`1509c0dd53ac`, and `11bfb9f9bcf5` for the speculative script), the logits were 1.00 bf16
 unit from the reference's, inside the band of 4, and the kernel check passed, with 18 of 20 launches of a step target
 kernels on `native` (7 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results) and 13 of
@@ -465,13 +472,17 @@ than the twin's, and 1,634,304 at four, 7 of them another byte and none outside 
 2 and 4 x 8 rows, 80 plain steps at two sequences across the first page boundary, and seeded runs at 85 and at 1,024
 sequences passed too: at 1,024 sequences one launch prepared the 1,024 rows of a step, 1,023 of 418,381,824 elements
 were another byte than the twin's, none was outside its band, and one sequence alone wrote the bytes it wrote among the
-1,024.
+1,024. The memory sentence does not yet count what a step holds per row beyond its state: at 85 and at 1,024 sequences
+a run held more than the sentence named, and fit the GPU it ran on. The sentence is corrected in a change of its own.
 
 On the published checkpoint the performance mode passed on both stacks, its blocks judged at positions 0-15, 63, 64, 312
 and 313 -- the two on either side of the first page boundary, on the pool -- and the kernel check of its traced steps
 with 467 of 484 launches of a step target kernels on `native` (178 the target's own compiled kernels + 289 cuDNN
 Frontend entries with byte-equal results; 403 of them in the recorded launch shape, 64 by membership) and 338 of 484 on
-`fe-entries` (49 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results). The greedy
+`fe-entries` (49 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results). Those two runs
+were made before the mode observed its GPU. With the observation (2026-11-21, the same checkpoint, prompt and GPU
+class, a shared GPU again) the mode passed on both stacks with the same judged positions and the same counts, and
+its report carried the `GPU` lines; what a run observes of a shared GPU is no figure for this page. The greedy
 text is not the text of the run before the row. On either stack the plain run of the default prompt takes another token
 at its 12th new token, where the two highest logits are the same two tokens in the other order: on `fe-entries` they
 were 2.0 apart before the row and are 0.25 apart with it, while the two row sets differ by 1.6 on average over the
@@ -485,14 +496,19 @@ cuDNN Frontend entries with byte-equal results; 451 of them in the launch shape 
 and 386 of 484 on `fe-entries` (49 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal
 results).
 
-Six runs with one thing wrong each, every one in a fresh interpreter (`fe-entries`, one sequence). A row that names one
+Seven runs with one thing wrong each, every one in a fresh interpreter (`fe-entries`, one sequence). A row that names one
 position row passed its checks and read `not the target` in the kernel table, with 12 of 20 launches of a step target
 kernels (2 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results). A row that names
 pages of 16 positions ended in `[00] ERROR`: the entry declined the pool at its first use. A slot table one row late, a
-position table one row late and a twin with its rotary halves exchanged each ended in `[00] FAIL` on the entry's line.
-An accessor that exchanges two pages in what the attention core reads ended in `[00] PASS`: no check of a run compares
-what that chain reads with anything, and the layer moves the seeded logits by less than the band. The GPU test reads the
-pool by index arithmetic of its own and fails on such an accessor.
+position table one row late, a twin with its rotary halves exchanged and a write accessor of the cache that exchanges
+two pages each ended in `[00] FAIL` on the entry's line. The READ accessor with two pages exchanged -- what the
+attention core reads -- ended in `[00] PASS`: a run's own checks hold what the kernel wrote; none of them compares
+what that chain reads with anything, and the layer moves the seeded logits by less than the band. The read accessor
+is held by tests, not by a run: by the host case of a session on stand-ins, whose tokens differ, by the host case of
+the paged cache against the plain one, and by the two cells of the GPU test that read the pool by index arithmetic
+of their own. With the defect planted, the host case of the paged cache failed and so did the cell of the reference
+chains, on compute capability 8.0; the cell of 80 steps reads the pool the same way and was not run with it. A check
+on a device of what the attention core reads comes with the row of the core's own kernel.
 
 What a consumer needs beyond a kernel's bytes is launched by the consumer, never inside the producer's call. The MLP's
 down multiply reads the codes of the gate / up kernel with their block scales in the layout the kernel writes
@@ -570,8 +586,8 @@ linear_attention.step=fe.gdn_decode_fused` the stack runs the fused step in its 
 release); the table then prints `not the target (...)` for the block and the census line says why the run is not the
 target set.
 
-`--stack fe-entries` is every cuDNN Frontend row of `native` with each block that a library or a temporary kernel will
-serve there on its fallback row. It needs no package beyond cuDNN Frontend and PyTorch, and it is the stack the GPU test
+`--stack fe-entries` is every cuDNN Frontend row of `native` with each block that a library serves there on its
+fallback row. It needs no package beyond cuDNN Frontend and PyTorch, and it is the stack the GPU test
 of this area runs, so the rows of the entries stay verified wherever that test runs. The two stacks differ in three
 rows: the MLP's down multiply, the output head and the 8-bit out-projection, which `native` hands to FlashInfer and
 `fe-entries` keeps on the multiplies over a copy of `fe-cublas`.
@@ -1814,7 +1830,13 @@ out-projection among them held by membership, on the library's own CUTLASS multi
 5.7 GiB. Without FlashInfer installed the same command ended in `[02] SKIP flashinfer.gemm.bmm_fp8 needs
 flashinfer-python 0.7.2.post1, which is not installed: ...` before anything was loaded, exit code 0.
 
-**The last run with a checkpoint on the cuDNN Frontend rows** (2026-11-19; the published checkpoint; cuDNN Frontend
+**The last runs of this recipe with a checkpoint** are those with the attention preparation on its entry, on `native`
+and on `fe-entries` (2026-11-20; the same checkpoint, command, prompt and list as the two runs below; compute
+capability 10.0, 148 SMs): the section "The attention preparation: pages, slots and positions" has their figures. The
+two runs below were made before that row and are kept as the records of their row sets.
+
+**The run with a checkpoint on the cuDNN Frontend rows, before the attention preparation's row** (2026-11-19; the
+published checkpoint; cuDNN Frontend
 1.34.0, CuTe DSL 4.8.0, PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native`
 selected those rows then, as `fe-entries` does today without the attention preparation's row; the third command of this
 section as it is
@@ -1838,7 +1860,8 @@ passes. The memory sentence asked for about 43.3 GiB on `native`, where PyTorch 
 40.0 GiB, and for about 61.0 GiB on `fe-cublas`, where PyTorch reserved 58.5 GiB and the device grew by 58.7 GiB; the
 GPU was otherwise empty at the start of each.
 
-**The last run with a checkpoint on `native` with its library rows** (2026-11-20; PyTorch 2.14.0, FlashInfer
+**The run with a checkpoint on `native` with its library rows, before the attention preparation's row** (2026-11-20;
+PyTorch 2.14.0, FlashInfer
 0.7.2.post1; the same checkpoint, command, prompt, list and GPU class; the attention preparation on its reference
 chain), made twice with the same figures. Both runs
 ended in `[02] PASS` at the end token. The loop wrote 231 new tokens in 71 steps: 3.27 kept tokens a step (1 + 161

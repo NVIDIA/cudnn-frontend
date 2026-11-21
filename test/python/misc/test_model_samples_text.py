@@ -2518,9 +2518,12 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         'Three drafted tokens passed in 13 steps, with "kernel identity: not stated for this run".',
         "The memory sentence of the default run asked for about 5.7 GiB. Without FlashInfer installed the same command ended in `[02] SKIP "
         "flashinfer.gemm.bmm_fp8 needs flashinfer-python 0.7.2.post1, which is not installed: ...` before anything was loaded, exit code 0.",
-        "**The last run with a checkpoint on the cuDNN Frontend rows** (2026-11-19;",
+        # the records of two row sets, and where the last runs with a checkpoint are
+        "**The last runs of this recipe with a checkpoint** are those with the attention preparation on its entry, on `native` and on `fe-entries` (2026-11-20;",
+        'compute capability 10.0, 148 SMs): the section "The attention preparation: pages, slots and positions" has their figures.',
+        "**The run with a checkpoint on the cuDNN Frontend rows, before the attention preparation's row** (2026-11-19;",
         "correctness only; `native` selected those rows then, as `fe-entries` does today without the attention preparation's row; the third command of this section as it is written,",
-        "**The last run with a checkpoint on `native` with its library rows** (2026-11-20; PyTorch 2.14.0, FlashInfer 0.7.2.post1; the same checkpoint, "
+        "**The run with a checkpoint on `native` with its library rows, before the attention preparation's row** (2026-11-20; PyTorch 2.14.0, FlashInfer 0.7.2.post1; the same checkpoint, "
         "command, prompt, list and GPU class; the attention preparation on its reference chain), made twice with the same figures. Both runs ended in `[02] PASS` at the end token.",
         "accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, "
         'the fifth in 10 of 17 -- the counts of the library loop on `native` in the section "The verify step".',
