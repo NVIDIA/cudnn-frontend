@@ -10550,6 +10550,63 @@ def test_the_band_of_a_library_attention_kernel_is_the_bound_of_a_stated_model_a
             _judged_attention(ref, other, ref)
 
 
+def test_a_cache_a_library_attention_kernel_wrote_in_one_call_is_not_taken_back_by_a_later_clean_call():
+    """The band ``attention_bf16_weights`` holds the cache a call reads byte for byte in EVERY call of a run: a block whose
+    cache was written in one call stays failed, with ``the cache WRITTEN`` in its line, whatever a later clean call finds --
+    as a NaN and an element outside stay.  The output is the chain's own bytes in both calls: the cache alone fails it."""
+    from model_samples import tie_out
+
+    twin, ref = _built_attention(4.0, 0.375, -1.0)
+    pool = torch.zeros(2, 4).bfloat16()
+    written = pool.clone()
+    written.view(torch.int16)[1, 2] ^= 1  # one bit of the cache the first call read
+    clean = _judged_attention(ref, twin, ref, state=[(pool,)], ref_state=[(pool.clone(),)])
+    assert clean.ok and clean.state_equal and clean.line().endswith("the cache untouched"), "the clean call alone passes"
+    stats = tie_out.BlockStats("attention_bf16_weights")
+    for state, ref_state in (([(written,)], [(pool,)]), ([(pool,)], [(pool.clone(),)])):
+        tie_out.BlockTap._judge(stats, (ref,), (ref,), state, ref_state, 0, twin)
+    assert (
+        not stats.ok and not stats.state_equal and stats.finite and (stats.elements, stats.outside) == (1024, 0) and stats.line().endswith("the cache WRITTEN")
+    ), "a later clean call does not take it back"
+
+
+def test_the_line_of_the_library_attention_band_is_pinned_whole_on_figures_that_are_not_round():
+    """The line a block in the band ``attention_bf16_weights`` prints, whole, on the built operands of weights rounded to
+    bf16 (scaled scores 1 and 0, the values 0.375 and -1): the share at three decimals, the chain and the spread of that
+    element at four significant digits each -- figures that are not 0 and 1, so that a digit less in either shows."""
+    twin, ref = _built_attention(4.0, 0.375, -1.0)
+    out = torch.full((1, 512), 0.73046875 * 0.375 + 0.26953125 * -1.0, dtype=torch.float64).bfloat16()
+    assert _judged_attention(out, twin, ref).line() == (
+        "512 elements, 512 of them not the reference chain's byte; 0 outside their bound; the largest distance 0.373 of its bound, at a chain of 0.005206 with "
+        "a spread of 0.5431 (printed, not gated); the cache untouched"
+    )
+
+
+def test_the_line_of_the_library_attention_band_prints_its_counts_with_the_thousands_separator():
+    """The three counts of the band's line above 999, each with its separator: twelve rows of the built operands and an
+    output of ones, every element of which is another byte than the chain's and outside its bound."""
+    from types import SimpleNamespace
+
+    twin, ref = _built_attention(4.0, 0.375, -1.0)
+    twelve = SimpleNamespace(bound=tuple(term.repeat(12, 1) for term in twin.bound))
+    line = _judged_attention(torch.ones(12, 512).bfloat16(), twelve, ref.repeat(12, 1)).line()
+    assert line.startswith("6,144 elements, 6,144 of them not the reference chain's byte; 6,144 outside their bound; "), line
+
+
+def test_terms_of_another_shape_than_the_output_are_not_compared_in_the_library_attention_band():
+    """Terms of another shape than the output are not compared in the band ``attention_bf16_weights``, also where they would
+    broadcast against it: one column of the terms against the 512 elements of the chain's own bytes is one thing outside
+    and no element judged, never 512 elements inside.  The same output against its own terms is compared, and inside."""
+    from types import SimpleNamespace
+
+    twin, ref = _built_attention(4.0, 0.375, -1.0)
+    other = SimpleNamespace(bound=tuple(term[:, :1] for term in twin.bound))  # terms that would broadcast against the output
+    stats = _judged_attention(ref, other, ref)
+    assert not stats.ok and (stats.outside, stats.elements) == (1, 0), "terms of another shape: nothing is compared"
+    whole = _judged_attention(ref, twin, ref)
+    assert whole.ok and (whole.outside, whole.elements) == (0, 512), "its own terms: every element compared"
+
+
 def test_every_control_arm_of_the_library_attention_band_fails_and_what_the_band_cannot_see_is_pinned(monkeypatch):
     """The control arms of the band ``attention_bf16_weights`` through the judge; each must FAIL.  Two say that the band is
     not slack, and are derived on built operands: at a coefficient of 0.5 the model's own extreme at 0.9 of its largest
