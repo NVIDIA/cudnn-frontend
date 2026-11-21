@@ -187,10 +187,12 @@ class KdaHopperEngine(BaseEngine):
         if sm != HOPPER_SM:
             raise NotImplementedError(f"KdaHopperEngine is the Hopper path and requires SM90 (found {sm})")
 
-        try:
-            from .kernel import kda_prefill_sm90  # noqa: F401 -- availability probe
-        except ImportError as exc:
-            raise NotImplementedError(f"KdaHopperEngine requires the cutedsl extra: {exc}") from exc
+        installed, _ = buffers.cutedsl_state()
+        if not installed:
+            raise NotImplementedError("KdaHopperEngine requires nvidia-cutlass-dsl, which is not installed")
+        dsl_error = buffers.cutedsl_requirement_error("KdaHopperEngine")
+        if dsl_error is not None:
+            raise NotImplementedError(dsl_error)
 
         # --- scope. Each of these is a real limit of the vendored kernel, and
         # declining is the point: a silently mis-served graph is worse than no

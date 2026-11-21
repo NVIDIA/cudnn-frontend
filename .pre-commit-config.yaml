@@ -41,3 +41,10 @@ repos:
         entry: '^\s*(?:#|//|\*|/\*)\s*SPDX-License-Identifier:\s*\S+'
         args: [--negate]
         types_or: [c++, c, cuda, python]
+    -   id: python-source-invariants
+        name: python source invariants
+        description: "Kernel name prefixes (python/cudnn/AGENTS.md Rule 6) and no literal device 0 in device-property queries"
+        language: python
+        entry: python scripts/check_python_invariants.py
+        files: '^python/cudnn/'
+        types: [python]

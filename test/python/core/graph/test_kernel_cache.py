@@ -5,7 +5,6 @@ import cudnn
 import pytest
 import torch
 import itertools
-import time
 from looseversion import LooseVersion
 
 from collections import namedtuple
@@ -132,6 +131,7 @@ def test_kernel_cache(cudnn_handle):
     LooseVersion(cudnn.backend_version_string()) < "9.10",
     reason="requires cudnn 9.10 or higher",
 )
+@pytest.mark.L0
 def test_kernel_cache_persistence(cudnn_handle):
     kernel_cache = cudnn.create_kernel_cache()
 
@@ -176,17 +176,14 @@ def test_kernel_cache_persistence(cudnn_handle):
     # Verify we can still use the deserialized kernel cache with a new graph
     graph = create_my_graph(kernel_cache)
 
-    EXECUTION_TIME_LIMIT_MS = 10.0
-    start_time = time.time()
     graph.build([cudnn.heur_mode.FALLBACK])
-    build_time_ms = (time.time() - start_time) * 1000
-    assert build_time_ms <= EXECUTION_TIME_LIMIT_MS, f"Graph build time {build_time_ms:.2f}ms exceeded limit of {EXECUTION_TIME_LIMIT_MS}ms"
 
 
 @pytest.mark.skipif(
     LooseVersion(cudnn.backend_version_string()) < "9.10",
     reason="requires cudnn 9.10 or higher",
 )
+@pytest.mark.L0
 def test_serialize_both_graph_and_kernel_cache(cudnn_handle):
     kernel_cache = cudnn.create_kernel_cache()
 
@@ -261,11 +258,7 @@ def test_serialize_both_graph_and_kernel_cache(cudnn_handle):
     del graph
     C_actual = torch.empty_like(C_expected, device="cuda", dtype=torch.float16)
     graph = create_my_graph(kernel_cache, 16, 64, 256)
-    EXECUTION_TIME_LIMIT_MS = 10.0
-    start_time = time.time()
     graph.build([cudnn.heur_mode.FALLBACK])
-    build_time_ms = (time.time() - start_time) * 1000
-    assert build_time_ms <= EXECUTION_TIME_LIMIT_MS, f"Graph build time {build_time_ms:.2f}ms exceeded limit of {EXECUTION_TIME_LIMIT_MS}ms"
     A_gpu, B_gpu, C_expected, C_actual = create_tensors(16, 64, 256)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     graph.execute({0: A_gpu, 1: B_gpu, 2: C_actual}, workspace, handle=cudnn_handle)

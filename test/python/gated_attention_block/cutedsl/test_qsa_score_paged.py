@@ -444,7 +444,7 @@ kv_lens = torch.tensor([9], dtype=torch.int32, device="cuda")
 try:
     fd.qsa_select_decode_paged_forward(qi, pool, table, kv_lens, seq_q=1)
 except NotImplementedError as error:
-    assert "qsa_select_decode_paged_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in str(error), str(error)
+    assert "qsa_select_decode_paged_forward requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2" in str(error), str(error)
 else:
     raise AssertionError("the selector ran on a sub-floor DSL")
 assert KERNEL not in sys.modules, "the decline imported the kernel module"
@@ -473,7 +473,7 @@ kv_lens = torch.tensor([9], dtype=torch.int32, device="cuda")
 try:
     dense.qsa_select_decode_forward(qi, kbar, kv_lens)
 except NotImplementedError as error:
-    assert "qsa_select_decode_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in str(error), str(error)
+    assert "qsa_select_decode_forward requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2" in str(error), str(error)
 else:
     raise AssertionError("the dense selector ran on a sub-floor DSL")
 assert not _dsl_modules(), f"the decline imported the DSL: {_dsl_modules()}"
@@ -495,12 +495,12 @@ def test_rule7_gates_run_before_any_compile(monkeypatch):
     monkeypatch.setattr(sp, "_bundled_cuda_version", lambda: (13, 3))  # the hint's decline is live from here on
     assert sp.l2_hint_requirement_error() is not None
     for mod in (sp, fd):
-        monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: f"{what} requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2")
-    with pytest.raises(NotImplementedError, match="qsa_score_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+        monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: f"{what} requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2")
+    with pytest.raises(NotImplementedError, match="qsa_score_paged requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16)
-    with pytest.raises(NotImplementedError, match="qsa_score_paged requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+    with pytest.raises(NotImplementedError, match="qsa_score_paged requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2"):
         sp.compile_qsa_score_paged(h_i=H, s_q=1, page_size=16, l2_hint=True)
-    with pytest.raises(NotImplementedError, match="qsa_select_decode_paged_forward requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+    with pytest.raises(NotImplementedError, match="qsa_select_decode_paged_forward requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2"):
         fd.qsa_select_decode_paged_forward(case.qi, case.pool, case.table, case.kv_lens, **kw)
     for mod in (sp, fd):
         monkeypatch.setattr(mod, "cutedsl_requirement_error", lambda what: None)

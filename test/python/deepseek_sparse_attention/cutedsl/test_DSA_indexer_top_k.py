@@ -133,6 +133,7 @@ def test_DSA_indexer_top_k_compile_execute(
         )
 
 
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("return_val", [True, False])
@@ -695,6 +696,7 @@ def test_DSA_indexer_top_k_wrapper_staging_outlives_the_released_original():
     assert torch.equal(torch.sort(got["indices"], dim=1).values, torch.sort(expected["indices"], dim=1).values)
 
 
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @pytest.mark.parametrize("dtype,num_cols", [(torch.bfloat16, 17), (torch.float32, 9)], ids=["bf16", "fp32"])
 def test_DSA_indexer_top_k_wrapper_short_misaligned_row(dtype, num_cols):

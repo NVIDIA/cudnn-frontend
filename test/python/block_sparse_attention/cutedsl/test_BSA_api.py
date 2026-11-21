@@ -152,7 +152,7 @@ def test_sm120_blk128_rejects_old_dsl_before_kernel_import(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", guarded_import)
     q = torch.zeros((1, 1, 128, 128), device="cuda", dtype=torch.bfloat16)
     indices = torch.zeros((1, 1, 1, 1), device="cuda", dtype=torch.int32)
-    with pytest.raises(RuntimeError, match=r"requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
+    with pytest.raises(RuntimeError, match=r"requires nvidia-cutlass-dsl >= 4\.8\.0; found 4\.6\.2"):
         ops.block_sparse_attention_forward(q, q, q, indices, block_sparse_num=1, sparse_block_size=128)
 
 

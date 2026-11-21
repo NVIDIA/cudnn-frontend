@@ -34,23 +34,13 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, dsl_compile_lock
+from cudnn.norm.utils import sm_count, ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, dsl_compile_lock
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
 _BFLY_CLAMP = 0x1F
 _WPB = 8
 _MAX_KREG = 8
-_SM_COUNT = None
-
-
-def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
 
 
 @cute.jit
@@ -319,7 +309,7 @@ def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
     """
     GPS, R, WPB = int(spec.groups_per_sample), int(spec.R), _WPB
     step = GPS * WPB // _gcd(GPS, WPB)  # same LCM step as backward(); see there
-    W = max(step, (max(1, min(4 * _nsm() * WPB, R)) // step) * step)
+    W = max(step, (max(1, min(4 * sm_count() * WPB, R)) // step) * step)
     return ws_bytes((W, 4), (W, 4))
 
 
@@ -346,7 +336,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     # dx was off by 8.1 with dgamma off by 179. Step by the LCM instead, so a
     # single rounding satisfies both.
     step = GPS * WPB // _gcd(GPS, WPB)
-    want = max(1, min(4 * _nsm() * WPB, R))
+    want = max(1, min(4 * sm_count() * WPB, R))
     W = max(step, (want // step) * step)
     ctas = W // WPB
 

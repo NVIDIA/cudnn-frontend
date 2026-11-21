@@ -524,10 +524,10 @@ def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int
     apply_fill_plan(ptr, plan, word, stream)
 
 
-# The CuTe primitives these engines lower through landed in 4.7.0; older DSLs
-# fail during codegen with errors that name a missing attribute rather than the
-# version, so the check belongs where an engine can still decline.
-CUTEDSL_MIN_VERSION = (4, 7, 0)
+# Matches the pyproject floor. Older DSLs fail during codegen with errors that
+# name a missing attribute rather than the version, so the check belongs where
+# an engine can still decline.
+CUTEDSL_MIN_VERSION = (4, 8, 0)
 
 _RELEASE_INT = _re.compile(r"^(\d+)")  # leading integer of one version component ("2rc1" -> 2)
 
@@ -629,8 +629,7 @@ def cutedsl_arch_requirement_error(device_cc):
     """Reject a DSL without the target architecture before kernel compilation.
 
     The TARGET half of the public probe :func:`cudnn.frost.cutedsl_runtime_available`: cc 10.7 needs a DSL whose
-    ``Arch`` knows ``sm_107a`` (the public 4.8.0 wheel is the first), so the floor is 4.7.0 everywhere and 4.8.0 on
-    cc 10.7. A part below cc 8.0 has no target in any CuTe DSL (its ``Arch`` starts at ``sm_80``; compiling for a
+    ``Arch`` knows ``sm_107a``; a build at the version floor can still lack it (an internal RC, a future part). A part below cc 8.0 has no target in any CuTe DSL (its ``Arch`` starts at ``sm_80``; compiling for a
     Turing part raises ``KeyError: 'sm_75'`` inside the DSL), so it is refused without importing the DSL. None when
     the target is present; otherwise the message names the part or the installed DSL."""
     if device_cc is not None and tuple(device_cc) < (8, 0):

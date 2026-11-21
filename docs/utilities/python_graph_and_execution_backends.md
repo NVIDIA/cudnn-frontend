@@ -557,7 +557,7 @@ instead of silently degrading FlashInfer to its fallback path.
 | does the native SDPA binder honor a packed-split / stride contract? | `cudnn._pybind_module._SdpaThdBinder.supports_stats_stride_override`, `.supports_nonpaged_packed_split`, `.supports_paged_split_sink`, ... (static read-only properties, `True`) | `"<cap>" in cudnn.sdpa_capabilities()` -- the frozenset of every `supports_<cap>` flag the build provides; append-only, never renamed |
 | which engine serves the selected plan? | `graph.selected_engine` (`None` = the cuDNN backend; else `.name`) | the same property, documented: `.name` is the engine's manifest name, a stable identifier (`sdpa_fwd_prefill_sm100` / `sdpa_fwd_prefill_sm107` / `sdpa_fwd_prefill_sm120`, ...; manifest names and slots are append-only) |
 | can the cuDNN backend still serve this graph? | `graph.backend_plan_entries()` after `create_execution_plans` (`[]` = declined, guarded or not installed) | the same method, documented above |
-| can the FROST engines run on this install, for this GPU? | `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old(version)` / `CUTEDSL_MIN_VERSION` -- the version half only | `cudnn.frost.cutedsl_runtime_available(device_cc=None)`: the version half, plus -- given a `(major, minor)` cc -- the target half (`cutedsl_arch_requirement_error`). **The floor is 4.7.0 everywhere and 4.8.0 on cc 10.7** (the first public wheel whose `Arch` knows `sm_107a`), and a part below cc 8.0 has no target in any DSL (its `Arch` starts at `sm_80`): a device-blind probe on a cc 10.7 part with a 4.7.x DSL says True while every FROST row declines, so pass the GPU you route to |
+| can the FROST engines run on this install, for this GPU? | `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old(version)` / `CUTEDSL_MIN_VERSION` -- the version half only | `cudnn.frost.cutedsl_runtime_available(device_cc=None)`: the version half, plus -- given a `(major, minor)` cc -- the target half (`cutedsl_arch_requirement_error`). **The version floor is 4.8.0; on cc 10.7 the DSL's `Arch` must also know `sm_107a`**, and a part below cc 8.0 has no target in any DSL (its `Arch` starts at `sm_80`): a device-blind probe on a cc 10.7 part with a DSL lacking `sm_107a` says True while every FROST row declines, so pass the GPU you route to |
 | the cuDNN dtype of a torch dtype | `cudnn.datatypes._torch_to_cudnn_data_type(dtype)` | `cudnn.datatypes.torch_to_cudnn_data_type(dtype)` (the private name is an alias of it) |
 | the unified attention implementation, the graph helpers, the caller hints | `cudnn.attention_implementation.UNIFIED`, `cudnn.graph_cache(key_fn=)`, `cudnn.jit(heur_modes=)`, `cudnn.graph(handle, **graph_kwargs)`, `cudnn.pygraph(is_override_shape_enabled=, is_cuda_graph_replay_expected=)` | already public; listed so the pin covers them |
 
@@ -889,8 +889,9 @@ plan from C++ is a separate problem: the engine's host logic is Python.
   rejection the *backend* alone would raise — version or arch gate — surfaces
   at `plan()` instead, and only if no python engine proposes a plan), conditional outputs return
   `None`, torch dtypes/`torch.Size` accepted, ragged (THD) offsets and
-  multipliers on outputs, serialize/deserialize passthrough, plan queries
-  delegate to the lowered graph.
+  multipliers on outputs, serialize/deserialize passthrough; the backend-only
+  queries `get_engine_count()` / `get_knobs_for_engine()` are explicit methods
+  that lower the graph.
 
 ## Naming
 

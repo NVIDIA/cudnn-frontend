@@ -137,13 +137,13 @@ rejections and do not trigger fallback. This is support-based dispatch,
 not timing-based autotuning or a guarantee of a speedup for every shape.
 
 The normal package dependencies remain required, including the base CuTe DSL
-dependency used by `APIBase`. An installed DSL below FROST's 4.7.0 floor (for
+dependency used by `APIBase`. An installed DSL below FROST's 4.8.0 floor (for
 example 4.6.2) selects Triton without importing the FROST kernel; this does
 not promise the API works with the base `cutlass` package completely absent.
 
 ## FROST backend (SM100/SM103)
 
-The FROST backend requires **CuTe DSL >= 4.7.0**, SM100 or SM103, BF16, D128,
+The FROST backend requires **CuTe DSL >= 4.8.0**, SM100 or SM103, BF16, D128,
 B=1, equal query/KV head counts, noncausal attention, and equal positive
 sequence lengths divisible by 256. With `auto`, unsupported FROST declarations
 select Triton, which has wider support including tails. Neither route adds

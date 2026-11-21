@@ -3,7 +3,7 @@
 
 """Benchmark the native SM120 blk128 BF16 block-sparse attention kernel against PyTorch's cuDNN dense SDPA backend.
 
-Requires an SM120 GPU, a CUDA-enabled PyTorch build and CuTe DSL >= 4.7.0.  With several editable checkouts, verify
+Requires an SM120 GPU, a CUDA-enabled PyTorch build and CuTe DSL >= 4.8.0.  With several editable checkouts, verify
 the imported kernel path first:
 
     python -c 'import cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fa4 as k; print(k.__file__)'

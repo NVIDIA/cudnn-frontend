@@ -64,7 +64,7 @@ Everything else executes the saved original FLA callable. Typed
 unsupported-kernel declines fall back, while unexpected native binding,
 allocation, and launch failures propagate.
 
-The current native kernel requires CUTLASS DSL 4.7 or newer, satisfied by the
+The current native kernel requires CUTLASS DSL 4.8 or newer, satisfied by the
 package-wide `nvidia-cutlass-dsl[cu13]>=4.8.0` floor. If an environment bypasses
 that dependency and the native import is unavailable, the adapter catches the
 typed `ImportError` and executes FLA's original path. Hardware correctness
@@ -119,13 +119,13 @@ pip install nvidia-cudnn-frontend
 The base install supplies the CUTLASS DSL and CUDA Python dependencies
 required by the native `gated_mlp` and `short_conv` targets. To
 require the native `short_conv` route instead of its typed fallback, also
-ensure CUTLASS DSL 4.7 or newer is installed using the package variant that
+ensure CUTLASS DSL 4.8 or newer is installed using the package variant that
 matches the CUDA Toolkit:
 
 ```bash
 # CUDA Toolkit 12.9
-pip install "nvidia-cutlass-dsl>=4.7"
+pip install "nvidia-cutlass-dsl>=4.8"
 
 # CUDA Toolkit 13.3
-pip install "nvidia-cutlass-dsl[cu13]>=4.7"
+pip install "nvidia-cutlass-dsl[cu13]>=4.8"
 ```

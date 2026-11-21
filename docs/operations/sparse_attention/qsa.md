@@ -240,7 +240,7 @@ The public functions select one of two architecture families internally:
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
 Selection rows are compacted 16 bytes per lane on every architecture, preserving block order.
-CuTeDSL 4.7 or newer is
+CuTeDSL 4.8 or newer is
 required; Rubin also requires a build with the `sm_107a` target. On SM107 the
 backward runs Rubin flavors of the dense pair and key-major kernels,
 which use the oversized shared memory carveout and a 576-column TMEM allocation

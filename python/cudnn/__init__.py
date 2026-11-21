@@ -49,7 +49,8 @@ symbols_to_import = [
 for symbol_name in symbols_to_import:
     globals()[symbol_name] = getattr(_pybind_module, symbol_name)
 
-for _optional_symbol in [
+# Built only when the extension was compiled with them.
+_OPTIONAL_PYBIND_SYMBOLS = (
     "causal_conv1d_forward",
     "causal_conv1d_backward",
     "causal_conv1d_nwh_forward",
@@ -69,7 +70,8 @@ for _optional_symbol in [
     "long_fft_causal_conv1d_get_buffer_sizes",
     "long_fft_causal_conv1d_forward",
     "long_fft_causal_conv1d_backward",
-]:
+)
+for _optional_symbol in _OPTIONAL_PYBIND_SYMBOLS:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
 
@@ -323,26 +325,7 @@ from typing import Any
 
 _EAGER_PUBLIC_NAMES = (
     *symbols_to_import,
-    *(
-        symbol
-        for symbol in (
-            "causal_conv1d_forward",
-            "causal_conv1d_backward",
-            "causal_conv1d_nwh_forward",
-            "causal_conv1d_nwh_backward",
-            "b2b_causal_conv1d_forward",
-            "b2b_causal_conv1d_backward",
-            "gnn_agg_op",
-            "gnn_agg_simple_forward",
-            "gnn_agg_simple_backward",
-            "gnn_activation_op",
-            "gnn_mha_gat_forward",
-            "gnn_mha_gat_backward",
-            "gnn_mha_gat_v2_forward",
-            "gnn_mha_gat_v2_backward",
-        )
-        if symbol in globals()
-    ),
+    *(symbol for symbol in _OPTIONAL_PYBIND_SYMBOLS if symbol in globals()),
     "create_handle",
     "destroy_handle",
     "get_stream",

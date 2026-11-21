@@ -2000,7 +2000,7 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   first-execute scale write is NOT refused under capture (the
   warm-up / re-capture contract above is the rule): `test_block_serving_capture.py`.
 - Rubin (SM107) for every form, or cc 10.0 (SM100) for the dense bf16 / f16 inference forms alone (the part table at the top;
-  functional only); cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names; the 4.7.0 floor on cc 10.0), torch.
+  functional only); cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names; the 4.8.0 floor on cc 10.0), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
   training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense or packed (`thd=True`), any `B*S`, head counts the TMA Q / K rebuild tiles),
   and MXFP8 over the MXFP8 training record (`quant=MxQuantSpec`: bf16 `dy` and gradients, dense only, `B*S % 32 == 0` when

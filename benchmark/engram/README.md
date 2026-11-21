@@ -1,7 +1,7 @@
 # Engram saved-state gate benchmark
 
 Run from an environment containing the candidate cuDNN Frontend package,
-CUDA-enabled PyTorch, CuTe DSL >=4.7.0 and Triton >=3.7.0 on an SM100 GPU:
+CUDA-enabled PyTorch, CuTe DSL >=4.8.0 and Triton >=3.7.0 on an SM100 GPU:
 
 ```bash
 python benchmark/engram/bench_saved_gate.py --tokens 4096 --output /tmp/engram.json

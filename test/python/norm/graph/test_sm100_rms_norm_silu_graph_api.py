@@ -286,6 +286,7 @@ C_VALUES = [64, 128, 160, 256, 320, 512, 640, 1024]
 TOKEN_VALUES = [1560, 6240, 24960, 99840, 399360]
 
 
+@pytest.mark.L1
 @pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
 @pytest.mark.parametrize("C", C_VALUES)
 @pytest.mark.parametrize("num_tokens", TOKEN_VALUES)
@@ -304,6 +305,7 @@ def test_bf16_full_sweep(C, num_tokens):
 # ============================================================
 
 
+@pytest.mark.L0
 @pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
 def test_bf16_smoke():
     """Quick smoke test with a single representative config."""
@@ -384,6 +386,7 @@ def _run_fp8_rmsnorm_silu_test(C, num_tokens, atol=0.125, rtol=0.125):
     }
 
 
+@pytest.mark.L1
 @pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
 @pytest.mark.parametrize("C", C_VALUES)
 @pytest.mark.parametrize("num_tokens", TOKEN_VALUES)
@@ -501,6 +504,7 @@ def _run_nvfp4_rmsnorm_silu_test(C, num_tokens):
 # NVFP4 requires C % 16 == 0 (block size). All our C values satisfy this.
 
 
+@pytest.mark.L1
 @pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
 @pytest.mark.parametrize("C", C_VALUES)
 @pytest.mark.parametrize("num_tokens", TOKEN_VALUES)
@@ -562,6 +566,7 @@ def test_non_lut_problem_sizes_run_on_the_fallback_knobs(C, num_tokens):
 # ============================================================
 
 
+@pytest.mark.L0
 @pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
 @pytest.mark.parametrize("C", [64, 256, 512, 1024])
 def test_epsilon_equivalence(C):

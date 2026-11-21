@@ -2563,6 +2563,7 @@ def test_sm121_causal_scheduler_walks_naturally_past_one_stream_per_sm():
     assert plans(device_cc=(12, 0), device_sm_count=36)[0].knobs.sched_policy == SCHED_LPT_L2
 
 
+@pytest.mark.L0
 def test_sm107_pt_fp8_d192_mha_causal_fp8_o_lists_the_single_cta(sm107_metadata_target):
     """The 107-line per-tensor FP8 d192x128 row lists both widths for a dense unsplit MHA causal graph with an fp8 O inside the
     K/V budget, and the auto pick takes the single CTA; a half-precision O, GQA, a mask-free graph or a larger K/V set keep cga2."""

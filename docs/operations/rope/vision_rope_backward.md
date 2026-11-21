@@ -38,7 +38,7 @@ The output is Q, then K, then V, with each group flattened over 16 heads
 and 64 channels. Output storage must not overlap any input. Other layouts,
 head counts, head dimensions, dtypes, and GPU architectures are rejected.
 `T` must be positive and `ceil(T/32)` must fit the CUDA x-grid limit.
-CuTe DSL >= 4.7.0 and the usual FE PyTorch dependencies are required.
+CuTe DSL >= 4.8.0 and the usual FE PyTorch dependencies are required.
 
 ## Usage
 

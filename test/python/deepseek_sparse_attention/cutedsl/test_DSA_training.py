@@ -160,7 +160,7 @@ def test_old_dsl_declines_before_any_kernel_launch(monkeypatch):
 
     q, kv, idx, a, lens = inputs()
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
-    with pytest.raises(RuntimeError, match="requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+    with pytest.raises(RuntimeError, match="requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2"):
         DSA.sparse_attention(q, kv, idx, a)
 
 
