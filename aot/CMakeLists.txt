@@ -5,7 +5,7 @@
 #
 # libcudnn_frontend_aot_sm120.so is produced by aot/sm120/build.py, which needs a Python with this checkout importable
 # (e.g. `pip install -e .`, which brings the CuTeDSL wheel). Point CMake at it with -DPython3_EXECUTABLE=<python>.
-# No GPU is needed to build; the test and benchmark need an sm_120 GPU and skip without one.
+# No GPU is needed to build; the test and benchmark need an SM120-family GPU and skip without one.
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 

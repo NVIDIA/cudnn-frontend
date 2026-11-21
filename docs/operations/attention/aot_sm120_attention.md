@@ -1,6 +1,6 @@
 # Ahead-of-time attention for SM120 (experimental)
 
-`libcudnn_frontend_aot_sm120.so` serves attention forward on compute capability 12.0 GPUs (RTX 50xx, RTX PRO Blackwell) to
+`libcudnn_frontend_aot_sm120.so` serves attention forward on compute capability 12.0 and 12.1 GPUs (RTX 50xx, RTX PRO Blackwell, DGX Spark) to
 C and C++ applications. It has no Python, cuDNN, NVRTC or runtime compiler. Every kernel is compiled ahead of time. A plan is
 built once per *shape class*, and `execute()` takes the run-time extents, strides and pointers and only launches. The
 motivating consumer is llama.cpp/ggml, where building a cuDNN graph cost about 30 ms per new shape.
@@ -9,8 +9,8 @@ motivating consumer is llama.cpp/ggml, where building a cuDNN graph cost about 3
 
 ## Contract
 
-- **Nothing compiles at run time.** The library holds SASS for `sm_120a` only (no PTX), so it loads on compute capability
-  12.0 and nowhere else. `ldd` lists libstdc++, libm, libgcc_s and libc; the CUDA runtime is linked statically and the CUDA
+- **Nothing compiles at run time.** The library holds `sm_120f` SASS for both compute capabilities.
+  Build the shared library for the host CPU architecture (aarch64 on DGX Spark). `ldd` lists libstdc++, libm, libgcc_s and libc; the CUDA runtime is linked statically and the CUDA
   driver is the only other run-time dependency.
 - **Plan build loads code; execute() launches.** `plan_create` loads every kernel module the plan can launch (a few ms for
   the first plan of a class in a process). `execute()` validates its arguments, looks up the kernel and launches it: no
@@ -137,7 +137,7 @@ without CMake.
 
 The steps are:
 1. the heuristic pass;
-2. one `cute.compile(..., options="--gpu-arch sm_120a")` plus `export_to_c` per kernel, through
+2. one `cute.compile(..., options="--gpu-arch sm_120f")` plus `export_to_c` per kernel, through
    `python/cudnn/sdpa/fwd/kernels/sm120/aot_host.py`;
 3. the generated dispatch registry;
 4. nvcc for the decode kernels;
@@ -167,7 +167,7 @@ instead, and `test_sdpa_sm120 --compare-lib` checks that both libraries produce 
   - two concurrent streams (bit-identical to single-stream runs);
   - rejection of unsupported classes and bad arguments.
 
-  It exits 0 with `SKIPPED` when there is no compute capability 12.0 device or no library.
+  It exits 0 with `SKIPPED` when there is no compute capability 12.0 or 12.1 device or no library.
 - `aot/sm120/test/crosscheck_frost.py --lib <so>` runs the AOT library and the Python FROST engine with the same knob set on
   the same inputs and requires bit-identical outputs.
 - `bench_sdpa_sm120 [--lib <so>]` reports, per case:
@@ -178,7 +178,6 @@ instead, and `test_sdpa_sm120 --compare-lib` checks that both libraries produce 
 
 ## Limits
 
-- **Architecture:** `sm_120a` only; sm_121 (DGX Spark) is not built.
 - **Masks:** the f16/bf16 kernels mask by index. There is no mask tensor, ALiBi or softcap, and a sliding window is built
   only with sinks at d = 64. A caller with a causal mask tensor (llama.cpp's `KQ_mask`) has to recognize it as causal.
 - **Outputs and sequences:** there is no LSE output. Batches are dense: every sequence has the same `s_q` and `s_kv`.
