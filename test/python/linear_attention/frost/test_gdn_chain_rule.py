@@ -7,7 +7,8 @@ The shared piece rule (``choose_pieces``) cuts long sequences on few tiles into 
 chain only where ``chain_pays`` against the plan it would run instead: the uncut plan or the split-K table, the value-width
 split for one in-place sequence, and the leftover tiles' own round for the chain tail of a batch above one wave.  A plan
 that does not chain carries the length-rule chain group for the device to take only where some batch of its shape can gain
-from it (``chain_group_pays``).  ``batch_invariant``, a context port, GDP and the summary node keep the shared rule.
+from it (``chain_group_pays``), and a chain whose plan below would carry that group stays.  ``batch_invariant``, a context
+port, GDP and the summary node keep the shared rule.
 
 The rule tests state properties of ``chain_pays``.  Equal function cannot tell which plan ran and the ops report no plan, so
 the plan tests read the plan object the engine builds for a graph node; they compile and launch nothing.  Every length and
@@ -170,6 +171,7 @@ CODE_PATHS = (
     "several_sequences",
     "chain_tail",
     "chain_group",
+    "chain_beside_group",
     "batch_invariant",
     "context_port",
     "expanded_timeline",
@@ -189,6 +191,14 @@ def group_calls(num_sm, **heads):
     return [dict(lengths=[tokens] * count, **heads) for count in sorted(edges)] + [dict(lengths=[long] * 2, heads=1, value_heads=1, cadence=one_row(long))]
 
 
+def calls_beside_the_group(num_sm):
+    """Sequences of the shared rule's first chain length on one head: the largest batch whose plan below the chain carries no
+    chain group, and one sequence more."""
+    tokens = CHAIN_MIN_MEAN_TOKENS
+    first = next(count for count in range(1, num_sm) if ragged_pieces(heads_out=1, num_sm=num_sm, total_tokens=count * tokens))
+    return [dict(lengths=[tokens] * count, heads=1, value_heads=1) for count in (first - 1, first)]
+
+
 def code_paths(num_sm):
     """The calls of each code path of the forward's chain decision on a GPU of ``num_sm`` SMs, as keyword arguments of
     ``build_plan``.  At one tile in three SMs the slot budget of one sequence is the chain's minimum and two thread blocks per
@@ -205,6 +215,7 @@ def code_paths(num_sm):
         "several_sequences": around_the_first_chain_length(num_sm, count=2, heads=KEY_HEADS, value_heads=KEY_HEADS),
         "chain_tail": [dict(lengths=[tokens] * 4, **third) for tokens in sorted(tail_lengths)],
         "chain_group": group_calls(num_sm, **third),
+        "chain_beside_group": calls_beside_the_group(num_sm),
         "batch_invariant": [dict(call, batch_invariant=True) for call in in_place],
         "context_port": [dict(call, context=True) for call in default_call],
         "expanded_timeline": [dict(call, householders=SUB_TOKENS) for call in in_place],
@@ -217,7 +228,8 @@ def code_paths(num_sm):
 def test_plan_follows_the_chain_rule(monkeypatch, path):
     """One cell per code path, on this GPU's SM count, at the shared rule's first chain length and on both sides of the
     forward's own: one sequence in place, the default call, a value width without the split, two sequences, and the chain tail
-    of four; ``batch_invariant``, a context port, GDP and the summary node answer the shared rule."""
+    of four; batches on both sides of the size from which a plan carries the chain group, without a chain and below one;
+    ``batch_invariant``, a context port, GDP and the summary node answer the shared rule."""
     assert_plans_follow_the_rules(monkeypatch, la.sm_count(), code_paths(la.sm_count())[path])
 
 

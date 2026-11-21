@@ -24,6 +24,7 @@ from cudnn.linear_attention.frost.common.piece_chain import (
     CHAIN_MIN_MEAN_TOKENS,
     DV_SPLIT_TILES,
     LENGTH_RULE_PIECE_TOKENS,
+    chain_group_pays,
     chain_pays,
     choose_pieces,
     is_dv_split,
@@ -64,8 +65,8 @@ def plan_scheme(
     ``batch_invariant`` answers the slot-budget rule (``is_dv_split`` without ``uncut``); one in-place sequence at the split's
     value width that carries no chain group also splits wherever two thread blocks per head fit in one wave.  A summary node
     has no in-place form.  A GDN forward without a context port keeps the chain of the shared piece rule only where
-    ``chain_pays`` against the plan it would run instead; GDP, the summary node, a context port and ``batch_invariant`` keep
-    the shared rule."""
+    ``chain_pays`` against the plan it would run instead, or where that plan would carry the chain group; GDP, the summary
+    node, a context port and ``batch_invariant`` keep the shared rule."""
     heads_out, tokens = max(heads, value_heads), sum(lengths)
     shape = dict(num_seqs=len(lengths), heads_out=heads_out, num_sm=num_sm, total_tokens=tokens, b_t=CHUNK, expand_num=householders)
     pieces, unit_chunks = choose_pieces(**shape, cadence_tokens=cadence, batch_invariant=batch_invariant)
@@ -76,7 +77,9 @@ def plan_scheme(
     split = is_dv_split(**shape, dim_v=value_dim, unit_chunks=unit_chunks)
     split = split or (in_place and not summary and len(lengths) == 1 and value_dim == WIDTH and one_wave and not chain_group)
     by_cost = not summary and householders == 1 and not context
-    if pieces and by_cost and not chain_pays(pieces=pieces, num_seqs=len(lengths), total_tokens=tokens, split=split):
+    group = dict(pieces=chain_group, num_seqs=len(lengths), heads_out=heads_out, num_sm=num_sm, total_tokens=tokens)
+    carries_group = chain_group and chain_group_pays(**group)
+    if pieces and by_cost and not carries_group and not chain_pays(pieces=pieces, num_seqs=len(lengths), total_tokens=tokens, split=split):
         pieces = 0
     return pieces, split and not pieces
 
