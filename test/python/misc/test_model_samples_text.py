@@ -1767,6 +1767,13 @@ def _a_request_of_a_drafting_checkpoint(tmp_path):
     return ["--model", str(directory), "--stack", "reference", "--draft-vocab", str(tmp_path / "draft_vocab.json"), "--prompt", "w1 w2 w3"]
 
 
+def _prompt_and_rows(line):
+    """The prompt tokens a line of the limit counts and the rows behind the last new token it counts beside them."""
+    (prompt,) = re.findall(r"(\d+) prompt tokens|the prompt is (\d+) tokens", line)
+    (rows,) = re.findall(r"verify step writes behind the last new token \((\d+)\)", line)
+    return int(prompt[0] or prompt[1]), int(rows)
+
+
 def test_a_speculative_request_that_names_no_limit_is_cut_to_what_fits_with_its_last_verify_step(tmp_path, monkeypatch, capsys):
     """The last verify step of a speculative run writes a row for every drafted token, all but one of them behind the
     last new token: the limit of new tokens is held against the context together with those rows.  A request that
@@ -1781,8 +1788,9 @@ def test_a_speculative_request_that_names_no_limit_is_cut_to_what_fits_with_its_
     err = capsys.readouterr().err
     assert "ERROR" not in err and len(built) == 2 and {(session.capacity, session.max_model_len) for session in built} == {(100, 100)}
     (said,) = [line for line in err.splitlines() if "not the default" in line]
-    assert said.startswith("[02] --prompt 1: ") and "verify step" in said and "--max-model-len 100" in said, said
+    assert said.startswith("[02] --prompt 1: ") and "--max-model-len 100" in said, said
     (cut,) = re.findall(r"up to (\d+) new tokens", said)
+    assert sum(_prompt_and_rows(said)) + int(cut) == 100, said  # the prompt, the rows behind the last new token and the cut fill the context
     built.clear()
     with pytest.raises(AssertionError, match="reached a load"):
         sample.main([*request, "--max-tokens", cut])
@@ -1817,7 +1825,7 @@ def test_the_count_an_error_line_of_the_speculative_script_names_reaches_the_loa
             sample.main([*arguments, flag, str(most)])
         assert "ERROR" not in capsys.readouterr().err, (flag, most)
         assert len(built) == 2 and {(session.capacity, session.max_model_len) for session in built} == {(length, length)}, (flag, most)
-        assert "verify step" in line and positions == 200 + length - most, line  # the prompt, the tokens asked for and the rows behind them
+        assert positions == 200 + length - most == 200 + sum(_prompt_and_rows(line)), line  # the prompt, the tokens asked for, the rows behind them
         assert refused(most + 1)[:2] == (most, length + 1), (flag, most)
 
 
@@ -1837,7 +1845,7 @@ def test_a_speculative_request_no_count_fits_for_is_one_error_line_that_names_no
         out, err = capsys.readouterr()
         last = err.splitlines()[-1]
         assert code == 1 and out == "" and "served by" not in err and err.count(" ERROR ") == 1, (limit, err[-600:])
-        assert last.startswith("[02] ERROR --prompt 1: ") and last.endswith("raise --max-model-len") and "verify step" in last, last
+        assert last.startswith("[02] ERROR --prompt 1: ") and last.endswith("raise --max-model-len") and sum(_prompt_and_rows(last)) == full, last
         assert re.findall(r"\d+ new tokens", err) == [], (limit, err[-600:])
     built.clear()
     with pytest.raises(AssertionError, match="reached a load"):
