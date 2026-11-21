@@ -9,26 +9,26 @@ its slot budget is exactly two.  A plan that runs ONE sequence uncut whatever it
 which it neither chains nor carries a chain group.  ``batch_invariant`` never splits.
 
 The byte tests call the public ops: the in-place call against its ``batch_invariant`` twin on the same operands, which runs
-the uncut plan at these lengths, and against the fp64 recurrence.  Equal bytes cannot tell which plan ran and the ops report
-no plan, so the plan tests read the plan object the engine builds for a graph node: its thread blocks per tile, and that
-those of a split fit in one wave.  They compile and launch nothing.  Lengths and expectations come from the package's own
-piece rule, so a change of its constants moves these tests with it."""
+the uncut plan at these lengths, bit for bit; output and final state also against the fp64 recurrence, except in the
+state-pool tests, which compare bytes only.  Equal bytes cannot tell which plan ran and the ops report no plan, so the plan
+tests read the plan object the engine builds for a graph node: its thread blocks per tile, and that those of a split fit in
+one wave.  They compile and launch nothing.  Expectations are computed from the package's own piece rule and from that fit,
+and every length that stands beside one of the rule's thresholds comes from its constants or from the rule itself, so a
+change of those constants moves these tests with it.  The L0 shapes below one chunk, one token past a chunk, over several
+chunks and of the state pool are counted in the suite's chunk size, as are the edges of one chunk in the length sweeps."""
 
 import pytest
 import torch
 
 import cudnn
 from cudnn.linear_attention.frost import gdn_engine
+from cudnn.linear_attention.frost.common import piece_chain
 from cudnn.linear_attention.frost.common.piece_chain import (
     CHAIN_MAX_PIECES,
     CHAIN_MIN_MEAN_TOKENS,
     DV_SPLIT_TILES,
     LENGTH_RULE_PIECE_TOKENS,
-    chain_group_pays,
-    chain_pays,
-    choose_pieces,
-    is_dv_split,
-    ragged_pieces,
+    piece_budget,
 )
 from determinism_utils import assert_bitwise, snapshot
 from linear_attention import test_la as la
@@ -60,26 +60,29 @@ def plan_scheme(
     summary=False,
     context=False,
 ):
-    """``(pieces, split)`` of the plan of one call on ``num_sm`` SMs, by the package's own rules: the slots per sequence of its
-    chain (0 when it does not chain) and whether it runs two thread blocks per tile.  A plan that neither chains nor is
-    ``batch_invariant`` answers the slot-budget rule (``is_dv_split`` without ``uncut``); one in-place sequence at the split's
-    value width that carries no chain group also splits wherever two thread blocks per head fit in one wave.  A summary node
-    has no in-place form.  An in-place GDN forward without a context port keeps the chain of the shared piece rule only
+    """``(pieces, split)`` of the plan of one call on ``num_sm`` SMs, by the package's own piece rule: the slots per sequence of
+    its chain (0 when it does not chain) and whether it runs two thread blocks per tile.  A plan that neither chains nor is
+    ``batch_invariant`` splits, at the split's value width, where its slot budget is the split's thread blocks per tile; one
+    in-place sequence that carries no chain group also splits wherever two thread blocks per head fit in one wave.  A summary
+    node has no in-place form.  An in-place GDN forward without a context port keeps the chain of the shared piece rule only
     where ``chain_pays`` against the plan it would run instead, or where that plan would carry the chain group; the default
     call, GDP, the summary node, a context port and ``batch_invariant`` keep the shared rule."""
     heads_out, tokens = max(heads, value_heads), sum(lengths)
     shape = dict(num_seqs=len(lengths), heads_out=heads_out, num_sm=num_sm, total_tokens=tokens, b_t=CHUNK, expand_num=householders)
-    pieces, unit_chunks = choose_pieces(**shape, cadence_tokens=cadence, batch_invariant=batch_invariant)
+    pieces, unit_chunks = piece_chain.choose_pieces(**shape, cadence_tokens=cadence, batch_invariant=batch_invariant)
     if batch_invariant:
         return pieces, False
     one_wave = DV_SPLIT_TILES * heads_out <= num_sm
-    chain_group = ragged_pieces(heads_out=heads_out, num_sm=num_sm, total_tokens=tokens)
-    split = is_dv_split(**shape, dim_v=value_dim, unit_chunks=unit_chunks)
-    split = split or (in_place and not summary and len(lengths) == 1 and value_dim == WIDTH and one_wave and not chain_group)
+    chain_group = piece_chain.ragged_pieces(heads_out=heads_out, num_sm=num_sm, total_tokens=tokens)
+    split = piece_budget(**shape, unit_chunks=unit_chunks) == DV_SPLIT_TILES or (
+        in_place and not summary and len(lengths) == 1 and one_wave and not chain_group
+    )
+    split = split and value_dim == WIDTH
     by_cost = in_place and not summary and householders == 1 and not context
     group = dict(pieces=chain_group, num_seqs=len(lengths), heads_out=heads_out, num_sm=num_sm, total_tokens=tokens)
-    carries_group = chain_group and chain_group_pays(**group)
-    if pieces and by_cost and not carries_group and not chain_pays(pieces=pieces, num_seqs=len(lengths), total_tokens=tokens, split=split):
+    carries_group = chain_group and piece_chain.chain_group_pays(**group)
+    whole = dict(pieces=pieces, num_seqs=len(lengths), total_tokens=tokens, split=split)
+    if pieces and by_cost and not carries_group and not piece_chain.chain_pays(**whole):
         pieces = 0
     return pieces, split and not pieces
 
