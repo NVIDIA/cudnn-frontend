@@ -150,6 +150,7 @@ SOURCE_FILES = (
     "linear_attention/frost/kernel/gdn_verify_fused_config.py",
     "linear_attention/frost/kernel/gdn_verify_fused_f16.py",
     "frost/launch_facts.py",
+    "frost/init_order.py",  # what a call of the gate, the preparation and the norm entry runs in front of its launch
     "attention_gate/frost/gate_quant_decode.py",
     "attention_gate/frost/kernel/gate_quant_decode_config.py",
     "attention_gate/frost/kernel/gate_quant_decode_f16.py",

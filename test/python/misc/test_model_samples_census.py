@@ -9089,8 +9089,15 @@ def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypa
         "attention_prepare/frost/kernel/prepare_decode_config.py",
         "attention_prepare/frost/kernel/prepare_decode_f16.py",
         "gated_attention_block/cache_write_contract.py",
+        "frost/init_order.py",  # what a call of this entry runs in front of its launch: the order behind the initialisation of entry-owned outputs
     ):
         assert name in fe.SOURCE_FILES and (Path(cudnn.__file__).parent / name).is_file(), f"the source hash of a run covers {name}"
+    importers = [
+        name for name in fe.SOURCE_FILES if re.search(r"^from cudnn\.frost import init_order\b", (Path(cudnn.__file__).parent / name).read_text(), re.M)
+    ]
+    assert (
+        "attention_prepare/frost/prepare_decode.py" in importers and fe.SOURCE_FILES.count("frost/init_order.py") == 1
+    ), "this entry's file imports it: hashed once"
     reference = torch_ref.AttentionPrepare(configs.PROVIDERS["attention.prepare"][1], model, block.facts, block.options)
     twin = block.twin(reference)
     assert type(twin) is torch_ref.AttentionPrepareRounded and block.twin(reference) is twin and twin.order == "3d" and reference.twin(reference) is reference
