@@ -45,6 +45,7 @@ from typing import Any, Dict, Optional, Tuple
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
+from .gdn_tickets import ReaderTickets
 from .kernel.gdn_decode_fused_config import (
     CFG,
     CONV_WIDTH,
@@ -355,6 +356,7 @@ class GdnDecodeFused:
         self.forms: Dict[Cfg, Cfg] = {}  # the picked forms on this part, by their module form
         self.picks: Dict[tuple, Cfg] = {}  # the picks by (rows, the readings they were made on)
         self.compiled: Dict[tuple, Any] = {}
+        self.reader_tickets = ReaderTickets()
         self.buffers: Dict[int, Dict[str, Any]] = {}
 
     def _on_this_part(self, cfg: Cfg) -> Cfg:
@@ -431,12 +433,12 @@ class GdnDecodeFused:
         return self.cfg.DEBUG
 
     def outputs(self, rows: int):
-        """The per-rows output buffers (the reference kernel's set) at the entry's geometry (V V heads, QKV channels): ``qout`` fp8
-        [rows, V, 128], ``out`` bf16 [rows, V, 128], ``counts`` int32 [rows * 512] (the reader tickets, zero between launches) and, under
-        ``DEBUG`` only, the debug buffers ``raw`` [rows, V, 128] bf16, ``convout`` [rows, QKV] bf16, ``baout`` [rows, 2 V] bf16 -- without
-        ``DEBUG`` the kernel's debug slots are compiled out (``None``), never bound to an allocation.  Entry-owned scratch, allocated once
-        per rows count at the first compile / call for it (outside any capture; a FlashInfer runner has no workspace contract to carve it
-        from)."""
+        """Borrowed output buffers for this shape. With R = rows, the defaults are ``qout`` [R, V, 128] fp8 and
+        ``out`` [R, V, 128] bf16. Debug mode adds ``raw`` [R, V, 128], ``convout`` [R, QKV] and ``baout`` [R, 2 V], all bf16.
+        These buffers are overwritten by later calls. Order accesses when using the same borrowed output or debug buffer.
+
+        ``counts`` [rows * 512] int32 contains the reader tickets from first binding. Each eager stream and each stream inside
+        a graph capture uses its own zero-ending tickets. A capture records their initialization on first use for that size and stream."""
         if rows not in self.buffers:
             import torch
 
@@ -445,7 +447,7 @@ class GdnDecodeFused:
             buffers = dict(
                 qout=torch.empty(rows, g.V_HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device=dev),
                 out=torch.empty(rows, g.V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
-                counts=torch.zeros(rows * TICKET_STRIDE, dtype=torch.int32, device=dev),
+                counts=self.reader_tickets.get(rows * TICKET_STRIDE, dev),
             )
             if self.debug:
                 buffers.update(
@@ -480,7 +482,7 @@ class GdnDecodeFused:
             _flat(z),
             _flat(w),
             _flat(scale),
-            _flat(b["counts"]),
+            _flat(self.reader_tickets.get(rows * TICKET_STRIDE, self.device)),
             _flat(b["out"]),
             _flat(b["qout"].view(torch.uint8)),
             _flat(hidden),
