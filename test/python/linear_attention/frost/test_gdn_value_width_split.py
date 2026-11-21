@@ -162,6 +162,33 @@ def test_plans_that_keep_their_scheme(monkeypatch, num_sm):
         assert (scheme(plan), plan.tiles_per_head) == ("uncut", 1), (lengths, heads)
 
 
+@pytest.mark.parametrize("num_sm", SM_COUNTS)
+def test_a_summary_plan_answers_the_slot_budget_rule(monkeypatch, num_sm):
+    """The summary engine asks the same rule.  A summary node has no in-place form, so its plan never runs one sequence
+    uncut by construction: it takes the split exactly where the slot-budget rule says so."""
+    if not torch.cuda.is_available():
+        pytest.skip("a plan object is built for a CUDA device")
+    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: num_sm)
+    bf16, fp32 = cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT
+    for tokens in (*NEW_LENGTHS, *BUDGET_TWO):
+        graph = cudnn.pygraph()
+        final_state, transition = graph.gdn_summary(
+            k=graph.tensor([tokens, KEY_HEADS, 128], data_type=bf16, name="k"),
+            v=graph.tensor([tokens, VALUE_HEADS, 128], data_type=bf16, name="v"),
+            g=graph.tensor([tokens, VALUE_HEADS], data_type=fp32, name="g"),
+            beta=graph.tensor([tokens, VALUE_HEADS], data_type=fp32, name="beta"),
+            cu_seqlens=graph.tensor([2], data_type=cudnn.data_type.INT32, name="cu_seqlens"),
+            initial_state=graph.tensor([1, VALUE_HEADS, 128, 128], data_type=fp32, name="initial_state"),
+            output_transition=True,
+            name="gdn_summary",
+        )
+        final_state.set_data_type(fp32)
+        transition.set_data_type(fp32)
+        plan = gdn_engine.build_gdn_summary(graph)
+        split = rule(tokens, num_sm=num_sm) == (0, True)
+        assert (plan.dv_split, plan.tiles_per_head) == (split, DV_SPLIT_TILES if split else 1), tokens
+
+
 @pytest.fixture
 def plans(monkeypatch):
     """Every forward plan object the GDN / GDP engine builds during the test, in build order."""
