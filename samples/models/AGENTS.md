@@ -492,3 +492,27 @@ Three blocks of the target kernel set are library multiplies; `native` calls Fla
 - When a stack gains rows, every dated README run of it is of another row set: name the rows it selected.
 - A figure of a greedy run on a checkpoint is a figure of a row set as well. A library multiply is inside the reference band but not the replaced multiply's bytes: with the three library rows the plain run of the default prompt was another text, and the speculative loop kept 3.27 tokens a step where it had kept 3.22 on the cuDNN Frontend rows. Such a figure is stated per row set that ran, each with its versions; it is never carried over.
 - A row a stack gains is a row of every script that plans the stack. The speculative script arrived while `native` had no library row. When the rows of a stack change, every script of the family is run on that stack again, and what it says of the stack is read.
+
+## What the attention preparation's row taught
+
+The attention preparation is the first block on an entry that writes a cache: `cudnn.AttentionPrepareDecode` writes the
+key and the value row of every row of a step into a pool of pages.
+
+- A kernel that writes a cache decides the cache's layout, and the layout belongs to the state, not to the block: the
+  adapter names its page (`cache_page`), the session builds one state in that layout, and every other block reads it
+  through accessors that launch nothing (views and host integers).
+- The judge forms the rows of the pool from host integers and the twin its cosines from the position it is handed: a
+  judge that read the state's own tables agrees with a table one row late.
+- A run's own checks hold what the kernel wrote, not what the next block reads: a read accessor is held by tests that
+  index the pool by arithmetic of their own, and a run checks what the next block reads only with the row of that
+  block's own kernel. Say that a defect failed a run only of a run that was made.
+- The twin of an entry is the twin of the entry's own suite, statement by statement, and the band is the contract on
+  the entry's page: where the page states the kernel against fp64, the twin evaluates in fp64 whatever the reference
+  accumulates in.
+- A stand-in entry that computes the twin's own arithmetic shows nothing about a band: run a kernel-like fp32 chain
+  (some elements another byte, every one inside) and place each defect alone.
+- Compare a form by value where a census file and a table meet (a list and a tuple are the same sections). A width the
+  kernel bakes into its name is a width of the row.
+- The first use builds the entry before it allocates anything, and its scratch pool is one page.
+- A pool is whole pages: a row that changes the layout of a state moves the memory sentence, and a row a stack gains
+  moves every table that follows the plan (the per-kernel table of the performance mode).

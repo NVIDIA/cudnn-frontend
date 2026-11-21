@@ -23,9 +23,9 @@ The stacks:
   and a run prints it as ``not yet``; how a row stands to the target is decided against the census file, not written here.
   Where the target's kernel is a library's, the row calls that library (``LIBRARY_ROWS``: FlashInfer's multiplies on the
   stored weights), so on the classes of those rows the stack needs the library's package;
-* ``fe-entries`` -- every cuDNN Frontend row of ``native``, with every block a library or a temporary kernel serves there
-  on its fallback row: no package beyond cuDNN Frontend and PyTorch, so the rows of the entries stay verified wherever the
-  area's GPU test runs;
+* ``fe-entries`` -- every cuDNN Frontend row of ``native``, with every block a library serves there on its fallback row:
+  no package beyond cuDNN Frontend and PyTorch, so the rows of the entries stay verified wherever the area's GPU test
+  runs;
 * ``reference`` -- every block in plain PyTorch.
 
 A plan is resolved for a number of tokens per sequence.  One is the decode step.  More is the verify step of speculative
@@ -57,9 +57,10 @@ TARGET_STACKS = ("native", "fe-entries")
 #: every stack with provider rows (all but the reference), and every stack
 PROVIDER_STACKS = ("fe-cublas", *TARGET_STACKS)
 #: the positions of one page of the paged attention cache that the attention core of the target kernel set reads (the census
-#: names that kernel).  The attention blocks of this family read one contiguous cache today; the performance mode of a sample
-#: judges the two positions on either side of the first page boundary inside its timed steps all the same, so that its
-#: judged positions do not move when the paged cache arrives
+#: names that kernel).  Where the attention preparation runs on its entry (``PREPARE_FORM``: the target stacks on compute
+#: capability 10.x) the state's attention cache is that pool of pages; everywhere else the attention blocks read one
+#: contiguous cache.  The performance mode of a sample judges the two positions on either side of the first page boundary
+#: inside its timed steps on every stack, so that its judged positions are the same whichever cache a stack has
 ATTENTION_PAGE = 64
 EVERY = (*BOTH, *TARGET_STACKS)
 
@@ -111,6 +112,20 @@ VERIFY_OUT_ROWS = (
     (("cc10.3", "cc10.7"), 2, 8, 4, 64, 7, 8),
     (("cc10.3", "cc10.7"), 9, 16, 4, 64, 7, 16),
     (("cc10.3", "cc10.7"), 17, 32, 4, 64, 7, 32),
+)
+
+#: the form the target calls the attention preparation kernel in, stated whole: three position rows in the sections of the
+#: published model's rotary width (a text position is one number, so the three rows the state's table hands over are equal),
+#: pages of 64 rows in both pools, 64-bit positions and slots, an ordinary launch -- no wait for its predecessor and no
+#: early release of its successor.  The entry has no default for the first five; the last two are its own defaults, named
+PREPARE_FORM = (
+    ("POSITIONS", "3d"),
+    ("SECTION", (11, 11, 10)),
+    ("PAGE_SIZE", ATTENTION_PAGE),
+    ("POSITION_DTYPE", "int64"),
+    ("SLOT_DTYPE", "int64"),
+    ("PDL", False),
+    ("PDL_RELEASE", False),
 )
 
 #: the fused gate / up kernel of the MLP by row count: the target runs the narrowest of its four token tiles that holds the
@@ -397,8 +412,38 @@ PROVIDERS = {
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 4-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
     ],
-    "attention.prepare": [ProviderRow(*ANY, "torch_ref.attention_prepare", EVERY, serves="any", fallback="reference chain")],
-    "attention.core": [ProviderRow(*ANY, "torch_ref.attention", EVERY, serves="any", fallback="reference chain over a plain per-layer cache")],
+    "attention.prepare": [
+        ProviderRow(
+            ("cc10.x",),  # the classes on which the target launches this kernel; the entry has run on a device of compute capability 10.0
+            (1, 1024),
+            (1, None),
+            "fe.attention_prepare_decode",
+            TARGET_STACKS,
+            serves="rows 1-1,024, 24 heads of width 256 on 4 key / value heads, rotary width 64 in the sections 11 + 11 + 10",
+            band="attention_prepare",
+            batch_invariant=("cc10.0",),
+            # the target's form (``PREPARE_FORM``).  The kernel is an ordinary launch: it starts when the in-projection's kernel
+            # has ended, reads that kernel's rows through four views and writes the queries, the gates and the two halves of
+            # the layer's pool; nothing is launched between the two.  The launch after it is the attention core's, which reads
+            # the pool and the queries: a reference chain here, which carries no attribute and starts behind this kernel.
+            # The entry writes a pool of pages, so a session whose plan has this row builds its attention cache as one
+            # (the adapter says so: ``cache_page``), with the cos / sin table and the position and slot rows the kernel reads
+            form=PREPARE_FORM,
+            rows=(1, 1024),
+            # the widths the entry serves (its page: the published model's attention widths) and the rotary sections the row's
+            # form names.  A checkpoint of the family with another one keeps the block on the reference chain below, on a
+            # plain cache, and its run states no kernel identity
+            widths=(("attn_heads", 24), ("attn_kv_heads", 4), ("attn_head_dim", 256), ("rotary_dim", 64), ("rotary_section", (11, 11, 10))),
+        ),
+        ProviderRow(*ANY, "torch_ref.attention_prepare", EVERY, serves="any", fallback="reference chain"),
+    ],
+    # the chain reads the layer's cache through its accessors.  On the two reference stacks that is one run of positions per
+    # sequence; on the target stacks it is the pool of pages the preparation's kernel writes wherever the row above serves,
+    # and the reason of their row holds for either layout
+    "attention.core": [
+        ProviderRow(*ANY, "torch_ref.attention", BOTH, serves="any", fallback="reference chain over a plain per-layer cache"),
+        ProviderRow(*ANY, "torch_ref.attention", TARGET_STACKS, serves="any", fallback="reference chain over the attention cache"),
+    ],
     "attention.gate_quantize": [
         ProviderRow(
             ("cc10.x",),
