@@ -92,12 +92,12 @@ arbitrary user callbacks.
 | `SwigluFp4Decode` (block-scaled FP4 gate / up product with SwiGLU for decode rows) | fprop (inference step) | FP4 E2M1 in / out with E4M3 block scales; FP32 accumulate; BF16 intermediate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `AttentionPrepareDecode` (attention preparation decode step) | fprop (inference step) | BF16 in and out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `RowQuantizeFp4Decode` (4-bit block-scaled quantization of decode rows) | fprop (inference step) | BF16 in; FP4 E2M1 codes with E4M3 block scales out | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
-| `simplified_sparse_attention_forward` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
-| `simplified_sparse_attention_forward` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
-| `simplified_sparse_attention_forward_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
-| `simplified_sparse_attention_forward_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
-| `dense_indexer_kl_forward`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Unverified | Unverified |
-| `dense_indexer_kl_forward`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_forward` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Replay only | Unsupported |
+| `simplified_sparse_attention_forward` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
+| `simplified_sparse_attention_forward_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Replay only | Unsupported |
+| `simplified_sparse_attention_forward_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
+| `dense_indexer_kl_forward`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Replay only | Unverified |
+| `dense_indexer_kl_forward`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
@@ -364,6 +364,11 @@ for replay, batch-invariance, and stress-test results.
   Its approved exception covers only the observed one-byte packed forward loss mismatch on SM100.
   Backward uses atomic reductions; dK/dV fail raw-byte replay and batch invariance.
   Numerical agreement does not establish bitwise determinism.
+  SM103 also has backward replay and forward batch-invariance failures in both
+  PyTorch and JAX. Dense KL indexer batch invariance fails with both providers;
+  replay also fails with `use_kf=True`. The temporary skips on SM100/SM103 cover only measured
+  failing case IDs and do not establish determinism. See the
+  [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#simplified-sparse-attention-ci-failures--2026-11-20).
 
 - Canonical grouped GLU: the new branch-order option is distinct from the
   APIs' natural-rank tensor support. The forward suite checks C, both D
