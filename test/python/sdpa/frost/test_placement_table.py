@@ -668,8 +668,8 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
     assert pt.lookup(row, f(**small, h_q=8, h_kv=2)) is False
     assert pt.matched_entry(row, f(d_qk=128, d_v=128)) is None
     for over in (dict(d_qk=256, d_v=256, h_q=32, h_kv=2), dict(d_qk=192, d_v=128, h_q=64, h_kv=4)):
-        on_tile_d256 = over["d_qk"] == 256 and s_kv % 128 == 0
-        expected = "sm80_paged_d256_v7_pcie_20261118" if on_tile_d256 else "sm80_paged_d256_d192_v3_20261117"
+        on_tile_owner = {256: "sm80_paged_d256_v7_pcie_20261118", 192: "sm80_paged_d192x128_pcie_20261121"}[over["d_qk"]]
+        expected = on_tile_owner if s_kv % 128 == 0 else "sm80_paged_d256_d192_v3_20261117"
         assert pt.matched_entry(row, f(**over)).study == expected, over
 
 
@@ -759,8 +759,8 @@ def test_sm80_paged_d256_d192_prefill_follow_v3(d, s_kv):
         base.update(over)
         return _facts(**base)
 
-    on_tile_d256 = d == (256, 256) and s_kv % 128 == 0
-    assert pt.matched_entry(row, f()).study == ("sm80_paged_d256_v7_pcie_20261118" if on_tile_d256 else "sm80_paged_d256_d192_v3_20261117")
+    on_tile_owner = {(256, 256): "sm80_paged_d256_v7_pcie_20261118", (192, 128): "sm80_paged_d192x128_pcie_20261121"}[d]
+    assert pt.matched_entry(row, f()).study == (on_tile_owner if s_kv % 128 == 0 else "sm80_paged_d256_d192_v3_20261117")
     assert pt.lookup(row, f()) is True
     edge = f(b=32, h_q=64, h_kv=8, s_q=32, max_total_seq_len_q=32 * 32)
     assert pt.lookup(row, edge) is False
