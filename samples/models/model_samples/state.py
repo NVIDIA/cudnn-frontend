@@ -38,7 +38,10 @@ table of every position, and the positions and slots of the step's rows.  The ta
 state and written by no call, so moving on by one position or by a kept count launches and copies nothing.  A step of
 several tokens that keeps fewer than it wrote restores nothing either, in a pool as in the plain cache: the next step
 starts at the first rejected position and writes as many positions as the last one did, so every rejected row is written
-again before a row behind the kept position is read.
+again before a row behind the kept position is read.  A kernel that READS such a pool is handed two more tables
+(``PagedKvCache.attended(position)``): the page table, which says which pages of the pool a sequence owns, and the
+positions each sequence holds after the step.  A state holds them where it is given the run's maximum length
+(``DecodeState(max_model_len=)``), which a session does where a block of its plans reads them.
 
 **What a drafter reads of the step before it** is part of the state too: ``hidden``, the final-norm rows of the model's last
 step, by reference -- the tensor that step's last norm returned, never a copy -- and ``greedy``, the ids that step chose
@@ -111,6 +114,18 @@ class PageTable:
     ``sequence * pages * page + p + t``, the flat index of that position's row in the pool.  No row stands for a step
     whose last token would lie past the capacity.
 
+    ``blocks`` and ``lengths`` are what a kernel that reads the pool through a page table is handed beside it; a state that
+    was given no maximum length has neither (``None``).  ``blocks`` ``[sequences + 1, width]`` int32, the page table:
+    row ``i`` names the pages of sequence ``i`` in the order of its positions, ``i * pages + j`` in column ``j``, and every
+    column past its own pages names its LAST own page: such a column stands for positions the sequence never holds,
+    and names a page of the pool all the same.  The width is the pages of the run's maximum length, which such a
+    kernel is told beside the table, or the sequence's own pages where those are more, rounded up to a multiple of
+    four (:meth:`width`).  The last row is slack: every entry names page 0, so that an entry behind the last
+    sequence's row names a page of the pool as well.  ``lengths`` ``[capacity - tokens + 1, sequences rounded up to four]``
+    int32: row ``p`` holds ``p + tokens`` in every column, the positions a sequence holds AFTER the step that starts at
+    ``p`` (every sequence of a state stands at the same position).  Rows of four elements or a multiple, so every row of
+    either table starts 16 bytes aligned -- the layout of ``TokenSlots.counts``.
+
     A kernel reads two things here that nothing can check for it on the host: the slots of one step are distinct (two
     rows of a launch never write one pool row), and every position is a row of ``cos_sin``.  Both hold by construction
     while a sequence's pages and the cos / sin table hold its capacity, which :meth:`build` asks of its integers before a
@@ -125,6 +140,8 @@ class PageTable:
     pages: int  # ... and the pages a sequence owns in it
     tokens: int = 1
     single: Optional["PageTable"] = None  # beside a table of several tokens per sequence: the table of one, for the decode steps of a prompt
+    blocks: Optional[torch.Tensor] = None  # the page table; one tensor for both tokens counts of a state
+    lengths: Optional[torch.Tensor] = None  # the positions a sequence holds after a step of ``tokens`` tokens
 
     @staticmethod
     def rotary(capacity: int, rotary_dim: int, theta: float, device) -> torch.Tensor:
@@ -135,23 +152,43 @@ class PageTable:
 
         return torch.stack([torch.cat(rope_cos_sin(position, rotary_dim, theta, device)) for position in range(capacity)])
 
+    @staticmethod
+    def width(page: int, pages: int, max_model_len: int) -> int:
+        """The entries of one sequence's row of the page table: the pages that hold ``max_model_len`` positions, or the
+        sequence's own ``pages`` where those are more, rounded up to a multiple of four."""
+        return -(-max(pages, -(-max_model_len // page)) // 4) * 4
+
     @classmethod
-    def build(cls, sequences: int, tokens: int, capacity: int, page: int, pages: int, cos_sin: torch.Tensor, device) -> "PageTable":
+    def build(
+        cls, sequences: int, tokens: int, capacity: int, page: int, pages: int, cos_sin: torch.Tensor, device, max_model_len: Optional[int] = None
+    ) -> "PageTable":
         """The tables of ``sequences`` sequences at ``tokens`` tokens per sequence, on the cos / sin table ``cos_sin`` (shared
-        by the tables of one state).  Made from host integers and moved to ``device`` once.  ``ValueError`` where the pages
-        of a sequence or the rows of ``cos_sin`` do not hold ``capacity`` positions."""
+        by the tables of one state); with ``max_model_len``, the run's maximum length, the page table and the lengths too.
+        Made from host integers and moved to ``device`` once.  ``ValueError`` where the pages of a sequence or the rows of
+        ``cos_sin`` do not hold ``capacity`` positions, or where ``capacity`` passes ``max_model_len``."""
         if capacity > pages * page:  # a position past a sequence's pages would have the slot of the next sequence's row
             raise ValueError(f"{capacity} positions per sequence need {-(-capacity // page)} pages of {page}; got pages={pages!r}")
         if capacity > cos_sin.shape[0]:  # ... and one past the table would rotate by what lies behind it
             raise ValueError(f"{capacity} positions per sequence need a cos / sin table of as many rows; got {cos_sin.shape[0]}")
+        if max_model_len is not None and capacity > max_model_len:  # a kernel that is told the maximum would be handed a length past it
+            raise ValueError(f"{capacity} positions per sequence pass the run's maximum length; got max_model_len={max_model_len!r}")
         steps = max(capacity - tokens + 1, 0)  # a step starts at 0 .. capacity - tokens
         position = torch.arange(steps, dtype=torch.int64)[:, None, None] + torch.arange(tokens, dtype=torch.int64)
         position = position.expand(steps, sequences, tokens)  # [the position a step starts at, sequence, token]: start + token
         slots = torch.arange(sequences, dtype=torch.int64)[None, :, None] * (pages * page) + position
         rows = sequences * tokens
         positions = position.reshape(steps, 1, rows).expand(steps, 3, rows).contiguous()  # three real rows: no axis of stride zero
-        single = None if tokens == 1 else cls.build(sequences, 1, capacity, page, pages, cos_sin, device)
-        return cls(cos_sin, positions.to(device), slots.reshape(steps, rows).contiguous().to(device), sequences, page, pages, tokens, single)
+        single = None if tokens == 1 else cls.build(sequences, 1, capacity, page, pages, cos_sin, device, max_model_len)
+        blocks = lengths = None
+        if max_model_len is not None:
+            blocks = None if single is None else single.blocks
+            if blocks is None:
+                column = torch.arange(cls.width(page, pages, max_model_len), dtype=torch.int32).clamp(max=pages - 1)  # past the own pages: the last own page
+                own = torch.arange(sequences, dtype=torch.int32)[:, None] * pages + column
+                blocks = torch.cat([own, torch.zeros_like(own[:1])]).contiguous().to(device)  # the slack row: page 0
+            lengths = (torch.arange(steps, dtype=torch.int32)[:, None] + tokens).expand(steps, -(-sequences // 4) * 4).contiguous().to(device)
+        table = cos_sin, positions.to(device), slots.reshape(steps, rows).contiguous().to(device)
+        return cls(*table, sequences, page, pages, tokens, single, blocks, lengths)
 
     def first_token(self) -> "PageTable":
         """The table of one token per sequence on the same cos / sin table: what the decode steps of a prompt read on a state
@@ -162,8 +199,11 @@ class PageTable:
         return ()  # a table: no call writes it
 
     def bytes(self) -> int:
-        """Bytes of the tables of a state: the cos / sin table once, and the positions and slots of each tokens count."""
+        """Bytes of the tables of a state: the cos / sin table once, and the positions and slots of each tokens count; where
+        the state holds them, the page table once and the lengths of each tokens count."""
         held = [self.cos_sin, self.positions, self.slots, *(() if self.single is None else (self.single.positions, self.single.slots))]
+        if self.blocks is not None:
+            held += [self.blocks, self.lengths, *(() if self.single is None else (self.single.lengths,))]
         return sum(t.numel() * t.element_size() for t in held)
 
 
@@ -276,14 +316,33 @@ class PagedKvCache:
         tables (the token axis contiguous, each aligned to its element).  What an adapter to a kernel hands on; the
         reference chains never ask.  ``IndexError`` for a position no step of this object's tokens starts at: one past
         the last row, and a negative one, which would index the tables from their end."""
+        self._starts(position)
+        first, last = self.first * self.tokens, (self.first + self.sequences) * self.tokens
+        return self.table.cos_sin, self.table.positions[position][:, first:last], self.table.slots[position][first:last]
+
+    def _starts(self, position: int) -> None:
+        """``IndexError`` for a position no step of this object's tokens starts at."""
         steps = int(self.table.positions.shape[0])
         if not 0 <= position < steps:
             raise IndexError(
                 f"position {position} is not one a step of {self.tokens} token{'s' if self.tokens > 1 else ''} per sequence starts at: "
                 f"the tables hold {steps} such positions, from 0"
             )
-        first, last = self.first * self.tokens, (self.first + self.sequences) * self.tokens
-        return self.table.cos_sin, self.table.positions[position][:, first:last], self.table.slots[position][first:last]
+
+    def attended(self, position: int) -> tuple:
+        """``(blocks, lengths)`` for the step that starts at ``position``: the page-table rows of this object's sequences,
+        ``[sequences, width]`` int32, and the positions each of them holds after the step, ``[sequences]`` int32 -- views
+        inside the state's tables, contiguous, each starting 16 bytes aligned, for every sequence of the pool and for a
+        window of them; behind a window's last row stands the next sequence's row or the slack row.  What an adapter to a
+        kernel that reads the pool through a page table hands on beside ``k_pool`` / ``v_pool``; the reference chains never
+        ask.  ``IndexError`` as :meth:`at`; ``ValueError`` on a state that was built without the two tables."""
+        self._starts(position)
+        if self.table.blocks is None:
+            raise ValueError(
+                "this attention cache has no page table and no lengths: its state was given no maximum length (DecodeState(max_model_len=)), "
+                "which a session hands the state where a block of its plans reads them"
+            )
+        return self.table.blocks[self.first : self.first + self.sequences], self.table.lengths[position, : self.sequences]
 
 
 @dataclass
@@ -373,7 +432,9 @@ class DecodeState:
     """Per-layer state of ``sequences`` fixed sequences plus the position of the next token.  ``tokens``: the tokens per
     sequence a step of the run feeds (1: a decode step; more: a verify step, whose table is ``slots``).  ``page``: the
     layout of the attention caches -- ``None``, the plain cache; a number of positions, a pool of pages of that many
-    (:class:`PagedKvCache`) with the state's position and slot tables (``table``)."""
+    (:class:`PagedKvCache`) with the state's position and slot tables (``table``).  ``max_model_len``: the run's maximum
+    length, for a paged state whose pool a kernel reads through a page table: the state then holds the page table and
+    the lengths as well (``PageTable.blocks`` / ``lengths``)."""
 
     def __init__(
         self,
@@ -385,16 +446,26 @@ class DecodeState:
         tokens: int = 1,
         page: Optional[int] = None,
         pages: Optional[int] = None,
+        max_model_len: Optional[int] = None,
     ):
         """``shapes``: ``"state"`` -> (value_heads, head_dim, head_dim), ``"conv"`` -> (taps, channels), ``"kv"`` -> (kv_heads,
         head_dim) and, read for a paged cache alone, ``"rotary"`` -> (rotary width, theta).  ``pages``: the pages a
-        sequence owns in a paged cache; left out, as many as hold the capacity, ``ceil(capacity / page)``."""
+        sequence owns in a paged cache; left out, as many as hold the capacity, ``ceil(capacity / page)``.
+        ``max_model_len``: the positions a sequence of the run may reach at most, a whole number that holds the capacity;
+        left out, the state has no page table and no lengths."""
         if sequences < 1 or capacity < 1 or tokens < 1:
             raise ValueError(
                 f"a decode state needs at least one sequence, one position and one token per sequence; got sequences={sequences}, capacity={capacity}, tokens={tokens}"
             )
         if page is None and pages is not None:
             raise ValueError(f"pages= says how many pages a sequence of a PAGED cache owns: it comes with page=, the positions of a page; got pages={pages!r}")
+        if max_model_len is not None:
+            if page is None:
+                raise ValueError(
+                    f"max_model_len= builds the page table and the lengths of a PAGED cache: it comes with page=; got max_model_len={max_model_len!r}"
+                )
+            if isinstance(max_model_len, bool) or not isinstance(max_model_len, int) or max_model_len < 1:
+                raise ValueError(f"the maximum length of a run is a whole number of positions from 1; got max_model_len={max_model_len!r}")
         if page is not None:
             if any(isinstance(count, bool) or not isinstance(count, int) or count < 1 for count in (page, 1 if pages is None else pages)):
                 raise ValueError(
@@ -410,7 +481,7 @@ class DecodeState:
         if page is not None and any(kind != "linear_attention" for kind in layer_kinds):
             width, theta = shapes["rotary"]
             cos_sin = PageTable.rotary(self.capacity, width, theta, self.device)
-            self.table = PageTable.build(self.sequences, self.tokens, self.capacity, page, pages, cos_sin, self.device)
+            self.table = PageTable.build(self.sequences, self.tokens, self.capacity, page, pages, cos_sin, self.device, max_model_len)
         self.slot_ids = torch.arange(1, sequences + 1, dtype=torch.int32, device=self.device)
         #: the slot table of a step of several tokens per sequence; a decode step takes ``slot_ids``
         self.slots: Optional[TokenSlots] = TokenSlots.build(self.sequences, self.tokens, self.device) if self.tokens > 1 else None

@@ -2176,6 +2176,100 @@ def test_two_layouts_in_one_session_are_a_wrong_table_and_the_memory_sentence_co
     assert f"{flat / GIB:.1f}" != f"{first / GIB:.1f}" != f"{both_paged / GIB:.1f}", "the three sentences state three figures"
 
 
+# The run's maximum length (``Session(max_model_len=)``) and the two tables a kernel that READS a paged attention cache is
+# handed beside the pool: the page table of every sequence and the positions it holds after a step (``state.PageTable.blocks``
+# / ``lengths``, ``PagedKvCache.attended``).  Every value of a table below is arithmetic written in the test.
+
+
+def _whole(value, unit):
+    """``value`` in whole units, rounded up."""
+    return -(-value // unit)
+
+
+#: (sequences, tokens per sequence, capacity, pages per sequence or None for as many as hold the capacity, the run's maximum
+#: length, the entries of one sequence's row of the page table)
+TABLE_CASES = (
+    (1, 6, 62, None, 2051, 36),  # one own page under a maximum of 33 pages: every column of the row names that page
+    (3, 1, 100, None, 2051, 36),  # two own pages, and 34 columns that name the second
+    (1, 1, 2051, None, 2051, 36),  # the capacity is the maximum: 33 own pages, and three columns up to a multiple of four
+    (2, 4, 130, 40, 2051, 40),  # more pages a sequence than the maximum length needs: the pages are the width
+    (3, 4, 64, None, 64, 4),  # a maximum of one page: a row of four entries
+)
+
+
+def test_the_page_table_and_the_lengths_of_a_paged_state():
+    """What a kernel that reads a paged cache is handed beside the pool, built with a state that is given the run's
+    maximum length (``DecodeState(max_model_len=)``).  ``blocks`` int32 ``[sequences + 1, width]``: row ``i`` names the pages
+    of sequence ``i``, ``i x pages + j`` in column ``j``, every column past its own pages its LAST own page, and the last
+    row page 0 in every column; the width is the pages of the maximum length, or the sequence's own where those are
+    more, rounded up to four.  ``lengths`` int32 ``[capacity - tokens + 1, sequences rounded up to four]``: row ``p`` holds
+    ``p + tokens``, the positions a sequence holds AFTER the step that starts at ``p``.  A state of several tokens per
+    sequence also holds the lengths of one token, for the decode steps of its prompt, on the same page table.  Every
+    row of either table starts at a 16-byte boundary."""
+    from model_samples.state import DecodeState
+
+    for sequences, tokens, capacity, pages, longest, width in TABLE_CASES:
+        state = DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", tokens, page=PAGE, pages=pages, max_model_len=longest)
+        case = f"{sequences} x {tokens}, capacity {capacity}, pages {pages}, maximum length {longest}"
+        own = _whole(capacity, PAGE) if pages is None else pages
+        assert state.pages == own and width == 4 * _whole(max(own, _whole(longest, PAGE)), 4), case
+        table = state.table
+        assert tuple(table.blocks.shape) == (sequences + 1, width) and table.blocks.dtype == torch.int32 and table.blocks.is_contiguous(), case
+        entries = table.blocks.tolist()
+        for sequence in range(sequences):
+            for column in range(width):
+                assert entries[sequence][column] == sequence * own + min(column, own - 1), f"{case}: sequence {sequence}, column {column}"
+        assert entries[sequences] == [0] * width, f"{case}: the row behind the last sequence"
+        assert max(max(row) for row in entries) < state.layers[0].pool.shape[0], f"{case}: every entry names a page of the pool"
+        assert all(table.blocks[row].data_ptr() % 16 == 0 for row in range(sequences + 1)), case
+        for each, lengths in ((tokens, table.lengths), (1, table.first_token().lengths)):
+            steps, columns = capacity - each + 1, 4 * _whole(sequences, 4)  # no row for a step whose last token would lie past the capacity
+            assert tuple(lengths.shape) == (steps, columns) and lengths.dtype == torch.int32 and lengths.is_contiguous(), case
+            assert lengths.tolist() == [[start + each] * columns for start in range(steps)], f"{case}: the positions held after a step of {each}"
+            assert all(lengths[start].data_ptr() % 16 == 0 for start in range(steps)), case
+        assert table.first_token().blocks is table.blocks, f"{case}: one page table for both kinds of step"
+
+
+def test_a_paged_cache_hands_out_its_rows_of_the_two_tables_as_views():
+    """``PagedKvCache.attended(position)`` -> the page-table rows of this object's sequences and the positions each of them
+    holds after the step that starts at ``position``: views inside the state's two tables -- the same memory, contiguous,
+    at a 16-byte boundary -- for every sequence of the pool and for a window of them (a check runs some sequences
+    alone), on a state of several tokens per sequence and for the decode steps of its prompt.  A position no step starts
+    at is the ``IndexError`` of ``at``.  A state that was not given a maximum length has no such table to hand out, and
+    one is given only to a paged state, as a whole number that holds the capacity."""
+    from model_samples.state import DecodeState
+
+    sequences, tokens, capacity, pages, width = 3, 4, 130, 3, 36
+    state = DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", tokens, page=PAGE, max_model_len=2051)
+    cache, table = state.layers[0], state.table
+    for held, first, count in ((cache, 0, sequences), (cache.rows(1 * tokens, 3 * tokens), 1, 2)):  # every sequence; sequences 1 and 2 alone
+        for each, view, source in ((tokens, held, table.lengths), (1, held.first_token(), table.first_token().lengths)):
+            for position in (0, 63, 64, capacity - each):
+                blocks, lengths = view.attended(position)
+                where = f"sequences {first} to {first + count - 1}, a step of {each} at {position}"
+                assert blocks.tolist() == [[i * pages + min(j, pages - 1) for j in range(width)] for i in range(first, first + count)], where
+                assert lengths.tolist() == [position + each] * count, where
+                assert (tuple(blocks.shape), tuple(lengths.shape)) == ((count, width), (count,)), where
+                for got, inside in ((blocks, table.blocks[first]), (lengths, source[position])):
+                    assert got.data_ptr() == inside.data_ptr() and got.untyped_storage().data_ptr() == inside.untyped_storage().data_ptr(), where
+                    assert got.dtype == torch.int32 and got.is_contiguous() and got.data_ptr() % 16 == 0, where
+    for outside in (-1, capacity - tokens + 1, capacity):
+        with pytest.raises(IndexError, match=f"position {outside} is not one a step of 4 tokens per sequence starts at"):
+            cache.attended(outside)
+    without = DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", tokens, page=PAGE)
+    assert without.table.blocks is None and without.table.lengths is None and without.table.first_token().lengths is None
+    with pytest.raises(ValueError, match="max_model_len"):
+        without.layers[0].attended(0)
+    with pytest.raises(ValueError, match="max_model_len"):  # the two tables are tables of a pool of pages
+        DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", tokens, max_model_len=2051)
+    with pytest.raises(ValueError, match="max_model_len") as short:  # a length past the maximum would be handed to a kernel that was told the maximum
+        DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", tokens, page=PAGE, max_model_len=capacity - 1)
+    assert str(capacity) in str(short.value) and str(capacity - 1) in str(short.value)
+    for wrong in (0, -64, 2051.0, True, "2051"):
+        with pytest.raises(ValueError, match="max_model_len"):
+            DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", tokens, page=PAGE, max_model_len=wrong)
+
+
 def _nbytes(tensors) -> int:
     return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
