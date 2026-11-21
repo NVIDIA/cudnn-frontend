@@ -203,7 +203,11 @@ class BlockBase:
         """The block the tie-out compares this block with, given the reference stack's block of the same name: that block,
         unless the provider's kernel rounds at other points than the reference chain -- then a reference block written at
         the kernel's rounding points.  The reference is matched to the kernel's documented arithmetic; a band is never
-        widened to cover a chain that rounds elsewhere.  The reference stack itself never asks."""
+        widened to cover a chain that rounds elsewhere.  The reference stack itself never asks.
+
+        The one exception is a library kernel that documents no numerics contract and whose rounding points are not
+        established: its twin is the reference chain itself, which also keeps the operand terms of a bound, and its band
+        is that bound, derived from a stated model of the kernel's arithmetic (``torch_ref.AttentionBound``)."""
         return reference
 
     def serving(self) -> Tuple[str, tuple]:

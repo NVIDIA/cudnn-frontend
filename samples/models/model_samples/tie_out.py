@@ -91,6 +91,11 @@ band is never widened to cover a chain that rounds elsewhere.  **A band is judge
 applies to and what it needs of the twin; an output it does not name is compared by its dtype (bf16: within one bf16
 unit; anything else: bytes), and state a call updates is compared byte for byte unless the band has a rule for it.
 
+**The one exception to a twin at the kernel's rounding points** is a library kernel that documents no numerics contract
+and whose rounding points are not established: its twin is the reference chain itself, which also keeps the operand
+terms of a bound, and its band is that bound -- derived from a stated model of the kernel's arithmetic, declared with
+that model before any run of the row, and never taken from a measured distance (``attention_bf16_weights`` below).
+
 ``gate_fp8``, the band of the attention gate + quantise entry, is that entry's documented numerics contract, not a share.
 Its kernel forms the gated value as the quotient ``attn / (1 + exp(-gate))`` in fp32, rounds it once to bf16 and once to an
 8-bit code.  The twin forms the same quotient in the reference's accumulation precision and keeps the two bf16 values

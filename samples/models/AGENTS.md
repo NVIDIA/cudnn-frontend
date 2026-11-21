@@ -70,6 +70,11 @@ does not hold is printed as not known and ignored, so a new name for one of them
    - A provider that rounds at other points than the reference chain is compared with its twin (`Block.twin`): a reference
      written at the kernel's rounding points, in the reference's accumulation precision. The band is the kernel's
      documented contract, never a width covering the distance between two chains.
+     The one exception is a library kernel that documents no numerics contract and whose rounding points are not
+     established: its twin is the reference chain itself, which also keeps the operand terms of a bound, and its band is
+     that bound -- derived from a stated model of the kernel's arithmetic, declared with that model before any run of
+     the row, held by control arms that must fail, and never taken from a measured distance; an element outside it is a
+     finding, and the family README says beside the row that the row is not within one bf16 unit of the chain.
    - A band names the outputs it applies to; an unnamed output is judged by its dtype, and updated state byte for byte.
    - Every band asks for finite values and is judged element by element (`(distance <= limit).all()`; a running `max`
      passes NaN). A share over a run is also held per unit of failure of the kernel (fused step: one value head of one

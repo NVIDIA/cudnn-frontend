@@ -10663,3 +10663,46 @@ def test_every_control_arm_of_the_library_attention_band_fails_and_what_the_band
         assert stats.ok and stats.outside == 0 and stats.worst_share < 1.0, f"the value row of {name} off by one slot, among 2,051: inside"
         weight = max(float((raw / total)[at]) for raw, total in _attention_weights(queries[0], keys[:, :live]))
         assert weight < tie_out.ATTENTION_WEIGHT_TERM / 4, f"{name}: the softmax weight of that row is below the band's term in every head"
+
+
+def test_rule_8_states_its_one_exception_word_for_word_and_so_do_the_places_that_state_the_rule():
+    """Rule 8 of the area's guide says that a band is the kernel's own contract against a twin at the kernel's rounding points.
+    The band of a library kernel that documents no contract is the one exception, and the guide states it in one
+    sentence, as it was agreed, behind the sentence it is the exception to -- which stands as it stood, and so does the
+    sentence behind it.  The two places of the helper layer that state the rule state the exception too, and each says
+    what the band is derived from: a stated model of the kernel's arithmetic, never the kernel's arithmetic itself."""
+    from model_samples import providers, tie_out
+
+    guide = " ".join((MODELS / "AGENTS.md").read_text().split())
+    rule = (
+        "8. **Bands are never widened in place.** The band of a block against the reference is named in its provider row (`tie_out.BANDS`). - A provider "
+        "that rounds at other points than the reference chain is compared with its twin (`Block.twin`): a reference written at the kernel's rounding "
+        "points, in the reference's accumulation precision. The band is the kernel's documented contract, never a width covering the distance between "
+        "two chains."
+    )
+    exception = (
+        "The one exception is a library kernel that documents no numerics contract and whose rounding points are not established: its twin is the "
+        "reference chain itself, which also keeps the operand terms of a bound, and its band is that bound -- derived from a stated model of the kernel's "
+        "arithmetic, declared with that model before any run of the row, held by control arms that must fail, and never taken from a measured distance; "
+        "an element outside it is a finding, and the family README says beside the row that the row is not within one bf16 unit of the chain."
+    )
+    behind = "- A band names the outputs it applies to; an unnamed output is judged by its dtype, and updated state byte for byte."
+    assert f"{rule} {exception} {behind}" in guide, "rule 8 as it stood, its one exception as agreed, and the sentence behind it as it stood"
+    assert guide.count("The one exception is a library kernel") == 1 and guide.count("never a width covering the distance between two chains.") == 1
+    for name, text in (("tie_out", tie_out.__doc__), ("BlockBase.twin", providers.BlockBase.twin.__doc__)):
+        stated = " ".join((text or "").split())
+        assert "a band is never widened to cover a chain that rounds elsewhere." in stated, f"{name}: the rule as it stood"
+        assert (
+            "a library kernel that documents no numerics contract and whose rounding points are not established: its twin is the reference chain itself, "
+            in stated
+        ), name
+        assert (
+            "which also keeps the operand terms of a bound, and its band is that bound" in stated
+            and "derived from a stated model of the kernel's arithmetic" in stated
+        ), name
+    assert "(``attention_bf16_weights`` below)" in " ".join(tie_out.__doc__.split()) and "(``torch_ref.AttentionBound``)" in " ".join(
+        providers.BlockBase.twin.__doc__.split()
+    )
+    assert (
+        "attention_bf16_weights" in tie_out.BANDS and providers.BlockBase.twin(providers.BlockBase, "the chain") == "the chain"
+    ), "the default twin is the reference block"
