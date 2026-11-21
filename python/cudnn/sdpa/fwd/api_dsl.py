@@ -123,6 +123,7 @@ from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as _decode_d256_q_til
 from cudnn.sdpa.fwd.config_sm100 import SM100_DENSE_ONLY_D_SHAPES as _SM100_DENSE_ONLY_D_SHAPES, SM100_SMALL_D_CGAS as _SM100_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
+    prefer_paged_fp8_dual_kv,
     supports_d64_fp8_swap_ab,
     supports_dense_fp8_swap_ab,
     FP8_DUAL_KV_STREAM_MAX_ROWS,
@@ -4595,6 +4596,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and self._device_cc == (10, 0)
                     # This decode body always puts batch in gridDim.y.
                     and self.batch_size <= 65535
+                    and not (
+                        params.dual_kv_stream
+                        and self.pack_gqa
+                        and self.s_q_max == 1
+                        and self.dtype == self.dtype_o == torch.float8_e4m3fn
+                        and prefer_paged_fp8_dual_kv(
+                            self.batch_size,
+                            self.s_k_max,
+                            heads=(self.h_q, self.h_kv),
+                            dims=(self.head_dim_qk, self.head_dim_v),
+                            page_size=self.paged_page_size,
+                            splits=self.split_kv,
+                        )
+                    )
                     and self._pertensor
                     and not params.pv_bf16
                     and not params.softmax_f16

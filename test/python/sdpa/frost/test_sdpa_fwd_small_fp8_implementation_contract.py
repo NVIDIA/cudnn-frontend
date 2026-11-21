@@ -130,6 +130,27 @@ def test_central_selection_preserves_body_boundaries(overrides, knobs, expected,
     assert selected.implementation == f"sdpa_fwd_sm100_d128_fp8_{expected}"
 
 
+@pytest.mark.parametrize(
+    "overrides,split,expected",
+    [
+        ({}, 2, "dual_kv"),
+        ({"b": 8, "s_kv": 65536}, 2, "dual_kv"),
+        ({"b": 32}, 2, "swap_ab"),
+        ({"s_kv": 8192}, 2, "swap_ab"),
+        ({"page_size": 128}, 2, "swap_ab"),
+        ({"dtype_o": cudnn.data_type.BFLOAT16}, 2, "swap_ab"),
+        ({}, 4, "swap_ab"),
+    ],
+)
+def test_medium_paged_fp8_decode_owner(overrides, split, expected, monkeypatch):
+    monkeypatch.setattr(legacy, "FP8_DUAL_KV_STREAM_ROUTED", True)
+    graph = dict(b=16, s_q=1, s_kv=32768, h_q=32, h_kv=4, has_paged_kv=True, page_size=16, dtype_o=cudnn.data_type.FP8_E4M3)
+    facts = _facts(**(graph | overrides))
+    knobs = engines.SdpaFwdKnobs(cga=1, pack_gqa=True, split_kv=split)
+    selected = heuristics.select_sm100_small_fp8_geometry(facts, knobs)
+    assert selected.implementation == f"sdpa_fwd_sm100_d128_fp8_{expected}"
+
+
 @pytest.mark.parametrize("variant", ["multi_q", "dual_kv", "swap_ab"])
 def test_fixed_host_never_reenters_selection(variant, monkeypatch):
     host = importlib.import_module(f"cudnn.sdpa.fwd.kernels.sm100.d128_fp8_{variant}.host")
