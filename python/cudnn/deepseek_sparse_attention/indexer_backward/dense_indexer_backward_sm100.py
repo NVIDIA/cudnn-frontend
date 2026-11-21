@@ -85,6 +85,20 @@ mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
 
 
+class _WarpSubsetBarrier(pipeline.NamedBarrier):
+    """Synchronize a counted subset of warp roles without the CTA-aligned promise."""
+
+    @dsl_user_op
+    def arrive_and_wait(self, *, loc=None, ip=None):
+        nvvm.barrier_cta_sync(
+            Int32(self.barrier_id).ir_value(loc=loc, ip=ip),
+            thread_count=Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
+
+
 @dsl_user_op
 def _tcgen05_fence_after_thread_sync(*, loc=None, ip=None):
     """Order subsequent tcgen05 operations after an inter-thread wait."""
@@ -441,15 +455,15 @@ class DenseIndexerBackward2QGemmSm100:
         self.cluster_shape = (1, 1, 1, 1)
         self.Q_mbar_size = 4  # 2 Q tokens x 2 barriers each (producer + consumer)
         self.K_mbar_size = 4  # 2-stage: 2 producer + 2 consumer
-        self.compute_sync_barrier = pipeline.NamedBarrier(
+        self.compute_sync_barrier = _WarpSubsetBarrier(
             barrier_id=3,
             num_threads=self.WARPGROUP_SIZE,
         )
-        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+        self.tmem_alloc_barrier = _WarpSubsetBarrier(
             barrier_id=4,
             num_threads=self.WARP_SIZE + 2 * self.WARPGROUP_SIZE,
         )
-        self.dk_reduce_sync_barrier = pipeline.NamedBarrier(
+        self.dk_reduce_sync_barrier = _WarpSubsetBarrier(
             barrier_id=5,
             num_threads=self.WARPGROUP_SIZE,
         )
@@ -1013,6 +1027,13 @@ class DenseIndexerBackward2QGemmSm100:
         # forbids early `return`, so we wrap instead.
         # =============================================================
         if has_q0:
+            if warp_idx == self.compute_warp_id[0]:
+                tmem.allocate(self.tmem_alloc_cols)
+            # Use the subset barrier directly: CuTe reconstructs the allocator's
+            # barrier as a plain NamedBarrier, whose wait assumes CTA convergence.
+            if warp_idx == self.mma_warp_id or warp_idx in self.compute_warp_id or warp_idx in self.reduce_warp_id:
+                self.tmem_alloc_barrier.arrive_and_wait()
+
             if warp_idx == self.load_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_wg0)
                 self._load_warp_2q(
@@ -1046,7 +1067,6 @@ class DenseIndexerBackward2QGemmSm100:
 
             elif warp_idx == self.mma_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_wg0)
-                tmem.wait_for_alloc()
                 tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
                 tStS, tDkDk, tDqDq_0, tDqDq_1 = self.get_tmem_tensor_2q(
                     s_acc_layout,
@@ -1080,9 +1100,6 @@ class DenseIndexerBackward2QGemmSm100:
 
             elif warp_idx in self.compute_warp_id:
                 cute.arch.setmaxregister_increase(self.num_regs_compute)
-                if warp_idx == self.compute_warp_id[0]:
-                    tmem.allocate(self.tmem_alloc_cols)
-                tmem.wait_for_alloc()
                 tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
                 tStS, tDkDk, tDqDq_0, tDqDq_1 = self.get_tmem_tensor_2q(
                     s_acc_layout,
@@ -1138,7 +1155,6 @@ class DenseIndexerBackward2QGemmSm100:
 
             elif warp_idx in self.reduce_warp_id:
                 cute.arch.setmaxregister_increase(self.num_regs_reduce)
-                tmem.wait_for_alloc()
                 tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
                 tStS, tDkDk, tDqDq_0, tDqDq_1 = self.get_tmem_tensor_2q(
                     s_acc_layout,

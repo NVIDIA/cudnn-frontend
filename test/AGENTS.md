@@ -28,6 +28,15 @@ collected cases separately from replay executions. Include tile/routing
 boundaries, grouped-head reductions, duplicate sequences, changed neighbors,
 and isolated upstream-gradient sources when the operation supports them.
 Keep these determinism suites in L0, including stress cases.
+For the dense SM100 indexer backward 2Q GEMM, run
+`test_DSA_dense_indexer_backward_staging_sync` under Synccheck. All TMEM
+users rendezvous at one counted instruction before the MMA, compute and
+reduce warp roles diverge. Separate wait sites with the same barrier ID
+can pass numerical tests and still trigger divergent-barrier errors.
+Also run `test_DSA_dense_indexer_backward_tmem_alloc_ptx`: Synccheck
+can pass even when allocator reconstruction changes the subset wait to
+the CTA-aligned PTX alias `bar.sync`.
+
 For DSA, shift valid Top-K indices with the KV offset and keep invalid indices
 invalid after packing. Use unique active indices for deterministic backward,
 except in cases pinned to an SM100/SM103 conflict-rank dKV layout (records,
