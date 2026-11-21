@@ -195,11 +195,9 @@ def _sm100_short_window_d192(row: str, facts) -> bool:
 
 
 def _sm90_partial_pack(row: str, facts) -> bool:
-    """SM90 d256 single-row decode whose GQA group the row packs only in part (the packed group must divide the tile): each
-    packed CTA still re-reads K/V G / pack times. On H100 it ran 1.35-1.40x the backend where full packs ran 0.87-0.95 at b >= 8
-    (sm90_dense_d256_q1_h100_20261118), so it keys apart; paged likewise (qwen36_27b 24/4 on the h200 nightly: 2.3-2.4x,
-    sm90_paged_decode_gaps_20261118). Paged windowed d192 x 192 likewise: group 12 (pack 4) ran 1.09-1.45x at b >= 32 where
-    group 16 ran 0.53-0.58 (sm90_paged_window_mtp_gaps_20261121's holdout). Scoped to the measured classes."""
+    """SM90 single-row decode whose GQA group the row packs only in part (the packed group must divide the tile). Each packed CTA
+    still re-reads K/V G / pack times, a different cost regime from a whole pack, so it keys apart. Scoped to the classes whose
+    studies timed the two regimes apart: d256, and paged windowed d192 x 192."""
     if row != "sdpa_fwd_prefill_sm90" or facts.s_q != 1 or facts.thd:
         return False
     d192_window = (facts.d_qk, facts.d_v) == (192, 192) and facts.has_paged_kv and facts.window_left is not None
@@ -1851,17 +1849,9 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa_partial", True): Entry(
         "never", None, "sm90_paged_decode_gaps_20261118"
     ),
-    # study sm90_paged_window_mtp_gaps_20261121 (H200 700 W, cuDNN 9.24.0.43, FE b69cc1a63; the inference benchmark's paged generation graph, page 16;
-    # 2154 train cells over KV 256-131072 on and off the tile, several windows per class; 112 holdout cells at fresh head pairs and
-    # windows, 8 per class key, scored once). Classes no study answered, where the h200 nightly and a develop re-time ran the backend
-    # 1.3-3.6x behind FROST:
-    # - d128 MTP with a group the decode tile does not divide (gqa_unpacked: qwen3-14b 40/8) leads up to 2^4 parallel tiles (on the tile from
-    #   KV 2^9); holdout 0.88 / 0.58.
-    # - windowed d128 single-row decode leads up to 2^6.161 query rows (ripple / step37 swa); holdout 0.73 / 0.59, worst 1.03.
-    # - windowed d128 verify off the tile leads from 2^1.5 parallel tiles; holdout 0.60. On the tile the 2^9.246-row entry above stays.
-    # - windowed d64 MTP and verify lead always (muse_spark swa); holdout 0.71-0.78, worst 0.91.
-    # Windowed d192 x 192 and d64 single-row decode failed the holdout (group-12 and large-batch cells at 1.14-1.45); d192 x 192 is
-    # sm90_paged_window_q1_v2_20261121's (below), d64 keeps the rules.
+    # study sm90_paged_window_mtp_gaps_20261121: paged d128 MTP whose group the decode tile does not divide (gqa_unpacked), windowed d128
+    # single-row decode, windowed d128 verify off the KV tile (its on-tile twin keeps the entry above), windowed d64 MTP and verify.
+    # Windowed d64 single-row decode has no entry and keeps the rules.
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_unpacked", False): Entry(
         "le", 4.0, "sm90_paged_window_mtp_gaps_20261121", "tiles", ("ge", 9.0, "kv")
     ),
@@ -1889,10 +1879,8 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "verify", "paged", "window", False, "gqa", True): Entry(
         "always", None, "sm90_paged_window_mtp_gaps_20261121"
     ),
-    # study sm90_paged_window_q1_v2_20261121 (H200 700 W, cuDNN 9.24.0.43, FE b69cc1a63; paged page 16, windows 256-4096): windowed
-    # d192 x 192 single-row decode (step5 swa 64/4) keyed by the row's pack group. Whole packs (groups 2 / 4 / 8 / 16 / 32) lead always:
-    # 914 train cells at b 1-128, worst 0.83; holdout 0.45 / 0.48, worst 0.66. Partial packs (gqa_partial: groups 6-24) lead up to 2^5.5
-    # parallel tiles on the KV tile and 2^4.5 off it; holdout 0.53 / 0.33, worst 0.76. 1284 new train cells pooled with v1's.
+    # study sm90_paged_window_q1_v2_20261121: windowed paged d192 x 192 single-row decode, keyed by the row's pack group
+    # (`_sm90_partial_pack`): a whole pack keys gqa, a partial pack gqa_partial.
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa", False): Entry(
         "always", None, "sm90_paged_window_q1_v2_20261121"
     ),
