@@ -1839,8 +1839,7 @@ def compute0_warp_group(
                 raw_col = channel_dim - raw_segment * 64
             if cutlass.const_expr(cfg.steep_mode != STEEP_EXACT and cfg.gate_dtype == cutlass.Float32):
                 # The fast kernel keeps the rolled fp32 scan: the unrolled scan below holds every row's conditioned gate for
-                # the steep path and cost this kernel about 3% on B300. Each warp reads and writes only its own swizzled
-                # region of the shared gate/exchange tile, so program order separates the reads from the stores.
+                # the steep path and cost this kernel about 3% on B300. The exchange permutes lanes within the warp's segment.
                 prefix_acc = cutlass.Float32(0.0)
                 exp_g_last = cutlass.Float32(0.0)
                 for row_pair in cutlass.range(cfg.b_t // 2, unroll=1):
@@ -1880,6 +1879,7 @@ def compute0_warp_group(
                     prefix1 = prefix_acc + row_pair_sum
                     exp_g0 = cute.math.exp2(prefix0, fastmath=True)
                     exp_g1 = cute.math.exp2(prefix1, fastmath=True)
+                    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
                     if channel_active:
                         (
                             sGate_exchange_ptr + f32_segment * (cfg.b_t * 32) + row0 * 32 + swizzle_xor_128b(row0 ^ f32_segment, f32_segment_dim, elem_bytes=4)

@@ -1141,6 +1141,16 @@ def test_bwd_under_nonreentrant_activation_checkpoint(backend, variant):
     assert all(value.grad is not None for value in leaves)
 
 
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", ["kda", "gdn2"])
+@pytest.mark.parametrize("key_dim", [64, 128])
+def test_fp32_gate_prep_exchange(backend, variant, key_dim):
+    """Exercise both lane mappings of the in-place FP32 gate scan under Compute Sanitizer Racecheck.
+    At 160 tokens with four heads on SM103, both families dispatch the separate preparation kernel."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[160], H=4, K=key_dim, V=128)
+    assert_fwd_parity(backend, case)
+
+
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)

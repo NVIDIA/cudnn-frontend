@@ -979,6 +979,12 @@ anything releases that stage, and prove the order in the compiled kernel.**
   are unread at the release again, without any error. A non-zero argument is
   undefined behaviour (the arrive lands on another word of shared memory):
   the host passes the literal 0 and nothing in the kernel tests for it.
+- **In-place layout changes.** Compare the lane reading each physical SMEM word with
+  the lane that overwrites it. In the FROST linear-attention FP32 gate scan,
+  the prefix swizzle permutes words within a warp. Consume the raw gate values
+  and rendezvous all participating lanes before the prefix stores. The group
+  barrier after those stores publishes the prefixes to their next consumers.
+  Run Racecheck on both 64- and 128-channel prep geometries.
 - **Tensor memory.** A value read from tensor memory (`tcgen05.ld`) whose
   slot the release frees follows the same order, as a precaution: keep the
   load's `tcgen05.wait::ld` and the first read of its registers in front of
