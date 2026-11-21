@@ -7170,15 +7170,14 @@ def test_over_sm_ragged_and_empty(backend, variant):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_over_sm_alternating_lengths(backend, variant):
-    """A batch above the SM count with lengths alternating T / 2 and T (no sequence long enough for the length-rule chain to
-    cut): o and final_state bitwise the sequences run alone in groups that fit the SM count for ``LEADING_BITWISE_VARIANTS``,
-    within INVARIANT_TOL otherwise."""
+    """Alternating lengths above the SM count match separate groups. Mamba-2 uses its batch-invariant mode for byte equality."""
     heads, B, _, _ = over_sm_shape()
     seq_lens = [8192 if b % 2 else 16384 for b in range(B)]
     case = long_case(variant, seq_lens, H=heads, HK=heads, HV=heads)
     state0 = random_state(case)
-    o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
-    o_u, fs_u = run_fwd_alone(backend, case, initial_state=state0, output_final_state=True)
+    kwargs = dict(initial_state=state0, output_final_state=True, batch_invariant=variant == "mamba2")
+    o, fs = run_fwd(backend, case, **kwargs)
+    o_u, fs_u = run_fwd_alone(backend, case, **kwargs)
     if variant in LEADING_BITWISE_VARIANTS:
         assert_bitwise("o vs alone", o, o_u)
         assert_bitwise("final_state vs alone", fs, fs_u)
