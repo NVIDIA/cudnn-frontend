@@ -4030,7 +4030,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(pds_ready_mbars)
                     if cutlass.const_expr(split_regime):
-                        cute.arch.mbarrier_arrive(ds_local_ready_mbar, Int32(0))
+                        if is_dq_owner:
+                            cute.arch.mbarrier_arrive(ds_local_ready_mbar, Int32(0))
                 if cutlass.const_expr(split_regime):
                     pds_state.advance()
                 else:
@@ -4599,7 +4600,9 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                     else:
                         _cpasync_bulk_s2cluster(p_xchg_raw.iterator, p_block_raw_ptrs[1], landing_mbars, self.PDS_BLOCK_BYTES, peer_rank)
                     _mbarrier_wait_acquire_cluster(landing_mbars, loop_iter & Int32(1))
-                    cute.arch.mbarrier_arrive(relay_mbars, Int32(0))
+                    # Only dKV consumers wait on the leader relay barriers.
+                    if has_dkv:
+                        cute.arch.mbarrier_arrive(relay_mbars, Int32(0))
                     cute.arch.mbarrier_wait(pds_ready_mbars, loop_iter & Int32(1))
                     cute.arch.mbarrier_arrive_and_expect_tx(landing_mbars + 1, self.PDS_BLOCK_BYTES, peer_cta_rank_in_cluster=peer_rank)
                     if rank == Int32(0):
@@ -4610,7 +4613,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                         pds_com = pipeline.PipelineState(1, loop_iter, Int32(0), Int32(1) ^ loop_iter & Int32(1))
                         pipe_pds.producer_commit(pds_com)
                     _mbarrier_wait_acquire_cluster(landing_mbars + 1, loop_iter & Int32(1))
-                    cute.arch.mbarrier_arrive(relay_mbars + 1, Int32(0))
+                    if has_dkv:
+                        cute.arch.mbarrier_arrive(relay_mbars + 1, Int32(0))
                 if cutlass.const_expr(split_regime):
                     if my_tile_count > Int32(0):
                         pds_tail = pipeline.PipelineState(1, my_tile_count, Int32(0), Int32(1) ^ my_tile_count & Int32(1))
@@ -4853,6 +4857,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             dq1_done_state,
             commit_final,
         )
+        # The caller releases this single stage after the relay warps commit.
+        pds_pipeline.consumer_wait(pds_consumer_state)
         return (kscore_consumer_state, pds_consumer_state)
 
     @cute.jit
