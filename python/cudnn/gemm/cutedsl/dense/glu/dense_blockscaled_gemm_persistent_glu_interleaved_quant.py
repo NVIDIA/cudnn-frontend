@@ -18,6 +18,8 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.cute.math as math
 from cutlass.cute.typing import Float32
 
+from ...grouped.moe_kernel_helpers import fmax as glu_fmax, fmin as glu_fmin, silu_f32_scaled
+
 
 def sigmoid_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
     """
@@ -136,6 +138,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         vector_f32: bool,
         ab12_stages: int,
+        act_func: str = "swiglu",
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -159,6 +162,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :type ab12_stages: Optional[int]
         """
 
+        if act_func not in ("swiglu", "geglu"):
+            raise ValueError(f"Invalid activation function: {act_func}")
+        self.act_func = act_func
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -373,6 +379,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfc_tensor: Optional[cute.Tensor],
         norm_const_tensor: Optional[cute.Tensor],
         alpha: cutlass.Float32,
+        linear_offset: cutlass.Float32,
+        geglu_alpha: cutlass.Float32,
+        glu_clamp_max: cutlass.Float32,
+        glu_clamp_min: cutlass.Float32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -654,6 +664,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.tile_sched_params,
             epilogue_op,
             alpha,
+            linear_offset,
+            geglu_alpha,
+            glu_clamp_max,
+            glu_clamp_min,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -696,6 +710,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tile_sched_params: PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cutlass.Float32,
+        linear_offset: cutlass.Float32,
+        geglu_alpha: cutlass.Float32,
+        glu_clamp_max: cutlass.Float32,
+        glu_clamp_min: cutlass.Float32,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1443,7 +1461,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                     # SwiGelu
                     tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.vector_f32):
+                    if cutlass.const_expr(self.act_func == "geglu"):
+                        for i in cutlass.range(0, cute.size(acc_vec_gate), 1, unroll_full=True):
+                            tCompute[i] = (glu_fmax(glu_fmin(acc_vec_up[i], glu_clamp_max), glu_clamp_min) + linear_offset) * silu_f32_scaled(
+                                glu_fmin(acc_vec_gate[i], glu_clamp_max), alpha=geglu_alpha, fastmath=True
+                            )
+                    elif cutlass.const_expr(self.vector_f32):
                         # SwiGelu Packed Version
                         LOG2_E = cutlass.Float32(1.4426950408889634)
                         for i in cutlass.range(0, cute.size(acc_vec_gate), 2, unroll_full=True):

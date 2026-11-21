@@ -17,7 +17,6 @@ cudnn.gemm.cutedsl.dense.amax
 cudnn.gemm.cutedsl.dense.dsrelu
 cudnn.gemm.cutedsl.dense.proj_rope_mxfp8
 cudnn.gemm.cutedsl.dense.srelu
-cudnn.gemm.cutedsl.dense.swiglu
 cudnn.gemm.cutedsl.discrete_grouped
 cudnn.gemm.cutedsl.grouped
 cudnn.gemm.mhc_projection_bwd

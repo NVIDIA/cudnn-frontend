@@ -43,7 +43,6 @@ cudnn.GemmDsreluSm100
 cudnn.GemmProjRopeMxfp8Bf16InSm100
 cudnn.GemmProjRopeMxfp8Mxfp8InSm100
 cudnn.GemmSreluSm100
-cudnn.GemmSwigluSm100
 cudnn.Graph
 cudnn.Graph.set_io_tuples
 cudnn.GraphContext
@@ -814,13 +813,6 @@ cudnn.gemm.cutedsl.dense.srelu.GemmSreluSm100.compile
 cudnn.gemm.cutedsl.dense.srelu.GemmSreluSm100.execute
 cudnn.gemm.cutedsl.dense.srelu.gemm_srelu_jax_sm100
 cudnn.gemm.cutedsl.dense.srelu.gemm_srelu_wrapper_sm100
-cudnn.gemm.cutedsl.dense.swiglu
-cudnn.gemm.cutedsl.dense.swiglu.GemmSwigluSm100
-cudnn.gemm.cutedsl.dense.swiglu.GemmSwigluSm100.check_support
-cudnn.gemm.cutedsl.dense.swiglu.GemmSwigluSm100.compile
-cudnn.gemm.cutedsl.dense.swiglu.GemmSwigluSm100.execute
-cudnn.gemm.cutedsl.dense.swiglu.gemm_swiglu_jax_sm100
-cudnn.gemm.cutedsl.dense.swiglu.gemm_swiglu_wrapper_sm100
 cudnn.gemm.cutedsl.discrete_grouped
 cudnn.gemm.cutedsl.discrete_grouped.DiscreteGroupedGemmDswigluSm100
 cudnn.gemm.cutedsl.discrete_grouped.DiscreteGroupedGemmDswigluSm100.check_support
@@ -959,8 +951,6 @@ cudnn.gemm_proj_rope_mxfp8_jax_sm100
 cudnn.gemm_proj_rope_mxfp8_wrapper_sm100
 cudnn.gemm_srelu_jax_sm100
 cudnn.gemm_srelu_wrapper_sm100
-cudnn.gemm_swiglu_jax_sm100
-cudnn.gemm_swiglu_wrapper_sm100
 cudnn.get_grouped_gemm_wgrad_workspace_size_sm100
 cudnn.get_last_error_string
 cudnn.get_stream
@@ -1607,6 +1597,8 @@ cudnn.ops.dsa_sparse_workspace_size
 cudnn.ops.fft_causal_conv1d
 cudnn.ops.gated_rmsnorm_backward
 cudnn.ops.gated_rmsnorm_forward
+cudnn.ops.gemm_glu_forward
+cudnn.ops.gemm_glu_forward_jax
 cudnn.ops.gqa_attention_backward
 cudnn.ops.gqa_attention_forward
 cudnn.ops.gqa_attention_workspace_size

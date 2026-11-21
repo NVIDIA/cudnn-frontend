@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""JAX-native (XLA custom call) entry point for the GEMM + SwiGLU kernels.
+"""JAX-native (XLA custom call) entry point for the GEMM + GLU kernels.
 
 Built on :func:`cudnn._jax.call` (CuTeDSL's native JAX bridge). Both the standard and
 the blockscaled (MXFP8) quantized kernels are supported: the quantized kernel's
@@ -21,7 +21,7 @@ import cutlass.utils
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype
 from cudnn._jax import call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec
-from .api import GemmSwigluSm100
+from .api import GemmGlu, check_act_func, resolve_linear_offset
 
 # config_key -> (kernel instance, max_active_clusters). The instance does not vary
 # with problem shapes, so the key holds only kernel-construction config — a shared
@@ -32,18 +32,18 @@ _validated_configs: set = set()
 
 
 @cute.jit
-def _swiglu_adapter(stream, a, b, ab12, c, *, kernel, mac, alpha):
-    kernel(a, b, ab12, c, alpha, mac, stream)
+def _glu_adapter(stream, a, b, ab12, c, *, kernel, mac, alpha, linear_offset, geglu_alpha, glu_clamp_max, glu_clamp_min):
+    kernel(a, b, ab12, c, alpha, linear_offset, geglu_alpha, glu_clamp_max, glu_clamp_min, mac, stream)
 
 
 @cute.jit
-def _swiglu_quant_adapter(stream, a, b, sfa, sfb, c, ab12, *, kernel, mac, alpha):
+def _glu_quant_adapter(stream, a, b, sfa, sfb, c, ab12, *, kernel, mac, alpha, linear_offset, geglu_alpha, glu_clamp_max, glu_clamp_min):
     # amax/sfc/norm_const are compile-time Nones: fp8-C and fp4-A/B configurations
     # (which would produce those outputs) are not reachable from JAX.
-    kernel(a, b, sfa, sfb, c, ab12, None, None, None, alpha, mac, stream)
+    kernel(a, b, sfa, sfb, c, ab12, None, None, None, alpha, linear_offset, geglu_alpha, glu_clamp_max, glu_clamp_min, mac, stream)
 
 
-def gemm_swiglu_jax_sm100(
+def gemm_glu_forward_jax(
     a_tensor: Any,
     b_tensor: Any,
     alpha: float = 1.0,
@@ -58,14 +58,25 @@ def gemm_swiglu_jax_sm100(
     sf_vec_size: int = 16,
     vector_f32: bool = False,
     ab12_stages: int = 4,
+    act_func: str = "swiglu",
+    linear_offset: Optional[float] = None,
+    geglu_alpha: float = 1.702,
+    glu_clamp_max: float = 7.0,
+    glu_clamp_min: float = -7.0,
 ) -> Tuple[Any, Any]:
-    """GEMM + SwiGLU as an XLA custom call; usable eagerly or under jax.jit.
+    """GEMM + GLU as an XLA custom call; usable eagerly or under jax.jit.
+
+    ``act_func`` is "swiglu" or "geglu" with the semantics of
+    ``cudnn.ops.gemm_glu_forward``; ``linear_offset``, ``geglu_alpha`` and the
+    clamps are static (trace-time) parameters like ``alpha``.
 
     A (M, K, 1) and B (N, K, 1) are k-major C-contiguous JAX arrays (or tracers);
     optional SFA/SFB (blockscaled MXFP8 path) in the physical atom shape
     (1, MN', K', 32, 4, 4). Returns a plain ``(ab12_tensor, c_tensor)`` tuple of
     fresh n-major JAX arrays. ``alpha`` is a static (trace-time) parameter.
     """
+    check_act_func(act_func)
+    linear_offset = resolve_linear_offset(act_func, linear_offset)
     ab12_dtype = _convert_to_cutlass_data_type(ab12_dtype)
     c_dtype = _convert_to_cutlass_data_type(c_dtype)
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
@@ -89,6 +100,7 @@ def gemm_swiglu_jax_sm100(
         sf_vec_size,
         vector_f32,
         ab12_stages,
+        act_func,
     )
     validation_key = (
         tuple(a_tensor.shape),
@@ -103,7 +115,7 @@ def gemm_swiglu_jax_sm100(
     )
 
     if validation_key not in _validated_configs:
-        gemm = GemmSwigluSm100(
+        gemm = GemmGlu(
             sample_a=_make_desc(tuple(a_tensor.shape), a_tensor.dtype, "sample_a"),
             sample_b=_make_desc(tuple(b_tensor.shape), b_tensor.dtype, "sample_b"),
             sample_ab12=_make_desc((m, n, l), ab12_dtype, "sample_ab12"),
@@ -117,6 +129,7 @@ def gemm_swiglu_jax_sm100(
             sf_vec_size=sf_vec_size,
             vector_f32=vector_f32,
             ab12_stages=ab12_stages,
+            act_func=act_func,
         )
         assert gemm.check_support()
         if config_key not in _kernel_cache:
@@ -127,6 +140,7 @@ def gemm_swiglu_jax_sm100(
                     cluster_shape_mn=gemm.cluster_shape_mn,
                     vector_f32=vector_f32,
                     ab12_stages=ab12_stages,
+                    act_func=act_func,
                 )
             else:
                 kernel = gemm._kernel(
@@ -134,6 +148,7 @@ def gemm_swiglu_jax_sm100(
                     use_2cta_instrs=(mma_tiler_mn[0] == 256),
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=gemm.cluster_shape_mn,
+                    act_func=act_func,
                 )
             mac = cutlass.utils.HardwareInfo().get_max_active_clusters(gemm.cluster_shape_mn[0] * gemm.cluster_shape_mn[1]) - gemm.num_cluster_overlap_margin
             _kernel_cache[config_key] = (kernel, mac)
@@ -149,24 +164,32 @@ def gemm_swiglu_jax_sm100(
     # and (m, n // 2, l). Zero-filling them was a full-size device write per dispatch.
     if not is_quantized:
         ab12_tensor, c_tensor = call(
-            _swiglu_adapter,
+            _glu_adapter,
             output_shape_dtype=out_types,
             input_spec=(operand, operand),
             output_spec=(operand, operand),
             kernel=kernel,
             mac=mac,
             alpha=float(alpha),
+            linear_offset=float(linear_offset),
+            geglu_alpha=float(geglu_alpha),
+            glu_clamp_max=float(glu_clamp_max),
+            glu_clamp_min=float(glu_clamp_min),
         )(a_tensor, b_tensor)
     else:
         sf = sf_atom_spec()
         c_tensor, ab12_tensor = call(
-            _swiglu_quant_adapter,
+            _glu_quant_adapter,
             output_shape_dtype=(out_types[1], out_types[0]),
             input_spec=(operand, operand, sf, sf),
             output_spec=(operand, operand),
             kernel=kernel,
             mac=mac,
             alpha=float(alpha),
+            linear_offset=float(linear_offset),
+            geglu_alpha=float(geglu_alpha),
+            glu_clamp_max=float(glu_clamp_max),
+            glu_clamp_min=float(glu_clamp_min),
         )(a_tensor, b_tensor, sfa_tensor, sfb_tensor)
 
     return ab12_tensor, c_tensor

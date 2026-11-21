@@ -547,12 +547,6 @@ _LAZY_OPTIONAL_IMPORTS = {
     "csa_compressor_forward_wrapper": (".csa", "csa_compressor_forward_wrapper"),
     "csa_compressor_backward_wrapper": (".csa", "csa_compressor_backward_wrapper"),
     "NSA": (".native_sparse_attention", "NSA"),
-    "GemmSwigluSm100": (".gemm.cutedsl.dense.swiglu", "GemmSwigluSm100"),
-    "gemm_swiglu_wrapper_sm100": (
-        ".gemm.cutedsl.dense.swiglu",
-        "gemm_swiglu_wrapper_sm100",
-    ),
-    "gemm_swiglu_jax_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_jax_sm100"),
     "gemm_srelu_jax_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_jax_sm100"),
     "MhcProjectionBackward": (".gemm.mhc_projection_bwd", "MhcProjectionBackward"),
     "mhc_projection_backward": (".gemm.mhc_projection_bwd", "mhc_projection_backward"),
