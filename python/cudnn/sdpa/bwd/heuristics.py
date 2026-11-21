@@ -185,19 +185,22 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     """The manifest hook: :func:`recommend`'s plans, the backend's block placed after the rows that lead
     (:func:`_leads`) and before the rest. ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` set keeps ours first everywhere."""
     ours = recommend(kind, facts, offered)
+    from cudnn.engines.heuristics import LAST, LEAD, TRAIL, order
     from cudnn.engines.manifest import opt_in_engines_enabled
 
-    if not ours or opt_in_engines_enabled():
+    if not ours:
         return ours
-    from cudnn.engines.heuristics import BACKEND, LAST_RESORT
-
+    if opt_in_engines_enabled():
+        return order(ours, lambda p: LEAD)
     spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
-    last = [p for p in ours if policy_name(spec_of[p.engine_id]) in TRAIL_ONLY_ROWS and not _measured_lead(spec_of[p.engine_id], facts)]
-    lead = [p for p in ours if p not in last and _leads(spec_of[p.engine_id], facts)]
-    trail = [p for p in ours if p not in last and p not in lead]
-    if last:
-        return lead + [BACKEND] + trail + [LAST_RESORT] + last
-    return lead + [BACKEND] + trail if trail else lead
+
+    def verdict(p):
+        spec = spec_of[p.engine_id]
+        if policy_name(spec) in TRAIL_ONLY_ROWS and not _measured_lead(spec, facts):
+            return LAST
+        return LEAD if _leads(spec, facts) else TRAIL
+
+    return order(ours, verdict)
 
 
 def _lists_last(spec: EngineSpec, facts) -> bool:

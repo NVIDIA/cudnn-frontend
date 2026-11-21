@@ -4222,23 +4222,23 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     ours = recommend(kind, facts, offered)
     if not ours:
         return ours
-    from cudnn.engines.heuristics import BACKEND, LAST_RESORT
+    from cudnn.engines.heuristics import LAST, LEAD, TRAIL, order
     from cudnn.engines.manifest import opt_in_engines_enabled
 
-    from .placement import LEAD, TRAIL_ONLY_ROWS, place
+    from .placement import TRAIL_ONLY_ROWS, place
 
     if opt_in_engines_enabled():
-        return ours + [BACKEND]
+        return order(ours, lambda p: LEAD)
     spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
     # A trail-only row still leads where a generated placement_table entry says so.
     last = [p for p in ours if p.engine_id in spec_of and spec_of[p.engine_id].name in TRAIL_ONLY_ROWS and place(spec_of[p.engine_id], facts) != LEAD]
     rest = [p for p in ours if p not in last]
-    if not rest:
-        return [BACKEND, LAST_RESORT] + last
-    spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == rest[0].engine_id)
-    position = place(spec, facts, rest[0].knobs) if spec.capabilities.implementation else place(spec, facts)
-    placed = rest + [BACKEND] if position == LEAD else [BACKEND] + rest
-    return placed + [LAST_RESORT] + last if last else placed
+    position = TRAIL
+    if rest:
+        # The first remaining proposal's placement decides for all of them.
+        spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == rest[0].engine_id)
+        position = place(spec, facts, rest[0].knobs) if spec.capabilities.implementation else place(spec, facts)
+    return order(ours, lambda p: LAST if p in last else position)
 
 
 # Mode blocks, the delegating entry, dedup, the mode strip: placement bookkeeping
