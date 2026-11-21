@@ -854,8 +854,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid("sdpa_fp8_backward requires " + " / ".join(_FP8_BWD_SCALARS))
 
     def _real_output(t):
-        """The op RETURNS its amax ports unconditionally; only a real
-        (non-virtual, set_output(True)) tensor is a requested output."""
+        """A returned optional port is observable only when marked as a graph output."""
         return t if (t is not None and not getattr(t, "is_virtual", True)) else None
 
     _quant_bwd = is_mxfp8_bwd or is_fp8_bwd
@@ -978,6 +977,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
             wants_stats = False
         if wants_stats and stats is None:
             return _invalid("generate_stats=True but no Stats tensor was returned")
+        # The recognized forward graphs have no consumer of Stats. A virtual Stats
+        # (e.g. FlashInfer FP8 prefill with return_lse=False) needs no external store.
+        wants_stats = wants_stats and _real_output(stats) is not None
 
     attn_scale = rec.get("attn_scale")
     dynamic_scale = attn_scale is not None and not isinstance(attn_scale, (int, float))
