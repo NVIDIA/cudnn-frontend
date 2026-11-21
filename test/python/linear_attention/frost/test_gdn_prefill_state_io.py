@@ -6,9 +6,12 @@
 ``STATE_IO_COALESCED`` and ``TILE_HANDOVER_EARLY`` change how compute group 1 moves the fp32 state between global and
 tensor memory and when it reads the next work item's seed; neither may change a word of the output or of a state."""
 
+import sys
+
 import pytest
 import torch
 
+from cudnn import cpp_launcher
 from cudnn.linear_attention.frost import gdn_engine
 from linear_attention.test_la import (
     FWD_TOL,
@@ -35,7 +38,8 @@ SPARE_FILL = 3.14159
 @pytest.fixture
 def frost(monkeypatch):
     """``(backend, built)``: the FROST backend and the prefill configs the test's calls build.  The host cache starts empty,
-    so every static configuration of the test is built inside it."""
+    so every static configuration of the test is built inside it.  Every call runs the op: the C++ launcher keys a call
+    by its arguments, not by a build switch, and would replay one setting's kernels for the next."""
     reason = frost_la_unavailable()
     if reason:
         pytest.skip(reason)
@@ -50,6 +54,7 @@ def frost(monkeypatch):
 
     monkeypatch.setattr(gdn_prefill_f16, "build_cfg", build_cfg)
     monkeypatch.setattr(gdn_warmup_forward_f16, "warmup_forward_cache", {})
+    monkeypatch.setattr(cpp_launcher, "HOT_CALLS", sys.maxsize)  # no call is recorded, none is served by a recording
     clear_caches()
     yield backend, built
     clear_caches()
@@ -167,13 +172,16 @@ def test_state_io_switches_keep_bytes_across_call_forms(monkeypatch, frost, form
     packed = random_state(case)
 
     def forward():
+        builds = len(built)
         if spec["call"] == "pool":
-            o, pool, _, _ = pooled_forward(backend, case, packed, **spec.get("pool_kw", {}))
-            return o, pool
-        state = packed.clone() if spec["call"] == "packed" else None
-        o, final_state = run_fwd(backend, case, initial_state=state, **spec["op_kw"])
-        torch.cuda.synchronize()
-        return o, (final_state if final_state is not None else state)
+            o, state, _, _ = pooled_forward(backend, case, packed, **spec.get("pool_kw", {}))
+        else:
+            state = packed.clone() if spec["call"] == "packed" else None
+            o, final_state = run_fwd(backend, case, initial_state=state, **spec["op_kw"])
+            torch.cuda.synchronize()
+            state = final_state if final_state is not None else state
+        assert len(built) > builds, "the call built no prefill kernel: it was not run under its own switch setting"
+        return o, state
 
     set_switches(monkeypatch, False, False)
     o_off, state_off = forward()
