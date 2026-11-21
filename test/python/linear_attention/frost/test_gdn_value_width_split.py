@@ -22,14 +22,13 @@ import torch
 
 import cudnn
 from cudnn.linear_attention.frost import gdn_engine
+from cudnn.linear_attention.frost.common import piece_chain
 from cudnn.linear_attention.frost.common.piece_chain import (
     CHAIN_MAX_PIECES,
     CHAIN_MIN_MEAN_TOKENS,
     DV_SPLIT_TILES,
     LENGTH_RULE_PIECE_TOKENS,
-    choose_pieces,
     piece_budget,
-    ragged_pieces,
 )
 from determinism_utils import assert_bitwise, snapshot
 from linear_attention import test_la as la
@@ -66,7 +65,7 @@ def takes_the_split(
     head fit in one wave.  A summary node has no in-place form."""
     heads_out, tokens = max(heads, value_heads), sum(lengths)
     shape = dict(num_seqs=len(lengths), heads_out=heads_out, num_sm=num_sm, total_tokens=tokens, b_t=CHUNK, expand_num=householders)
-    pieces, unit_chunks = choose_pieces(**shape, cadence_tokens=cadence, batch_invariant=batch_invariant)
+    pieces, unit_chunks = piece_chain.choose_pieces(**shape, cadence_tokens=cadence, batch_invariant=batch_invariant)
     if pieces or batch_invariant:
         return False
     if value_dim != WIDTH:
@@ -74,7 +73,7 @@ def takes_the_split(
     if piece_budget(**shape, unit_chunks=unit_chunks) == DV_SPLIT_TILES:
         return True
     one_wave = DV_SPLIT_TILES * heads_out <= num_sm
-    chain_group = ragged_pieces(heads_out=heads_out, num_sm=num_sm, total_tokens=tokens)
+    chain_group = piece_chain.ragged_pieces(heads_out=heads_out, num_sm=num_sm, total_tokens=tokens)
     return in_place and not summary and len(lengths) == 1 and one_wave and not chain_group
 
 
