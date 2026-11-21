@@ -2031,9 +2031,11 @@ two normed operands may move it by, each one unit off: the cosine times a unit o
 the second. The gate rows and the value rows must be the twin's bytes. The key and the value row of every row of the
 step must stand at the page and the row of its position, which the judge forms from host integers -- the position of the
 call, the sequences and the shape of the pool -- and from no table of the cache; and every other row of the pool must be
-what it was before the call. Every value finite. The line prints how many elements are not the twin's byte; one element
-outside its band, one gate or value bit, or one row of the pool written where no row of the step belongs fails the
-block.
+what it was before the call. Every value the call wrote must be finite: the queries, the gate rows, and the key and the
+value rows of the step. The gate rows and the value rows are held finite beside their bytes, because the entry and the
+twin copy them from the same operand: a NaN or an infinity in it is the same byte on both sides. The line prints how
+many elements are not the twin's byte; one element outside its band, one gate or value bit, one copied value that is
+not finite, or one row of the pool written where no row of the step belongs fails the block.
 
 The token check has a declared band because a band taken from the run's own logit distance cannot fail. With seeded
 weights it guards the path, not the layers: the layers move the logits by little (the two stacks are 1.0 to 1.4 units apart

@@ -9564,9 +9564,78 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
     paged[0, 1, 2, 0, 17] = float("inf")  # in a key row of the call
     stats = judged(pool=paged.view(6, 4, 64, 512))
     assert not stats.ok and not stats.finite and stats.keys_outside == 1
+    # a gate element and a written value element that are not finite on the entry's side alone: another byte than the twin's, and not finite
+    nan = out[1].clone()
+    nan[5, 6143] = float("nan")
+    stats = judged(gate=nan)
+    assert not stats.ok and not stats.gates_equal and not stats.finite, stats.line()
+    assert stats.line().endswith("; gate rows DIFFER; value rows equal; the rest of the pool untouched; NON-FINITE VALUES")
+    paged = after.clone().view(2, 3, 4, 64, 512)
+    paged[1, 1, 3, 0, 511] = float("inf")  # the last value element of sequence 1 at position 64
+    stats = judged(pool=paged.view(6, 4, 64, 512))
+    assert not stats.ok and not stats.values_equal and not stats.finite, stats.line()
+    assert stats.line().endswith("; gate rows equal; value rows DIFFER; the rest of the pool untouched; NON-FINITE VALUES")
     with pytest.raises(ValueError, match="the band attention_prepare is judged against the preparation at the kernel's rounding points"):
         judged(against=reference)
     assert "attention_prepare" in tie_out.BANDS and "one bf16 unit" in tie_out.BANDS["attention_prepare"] and "bitwise" in tie_out.BANDS["attention_prepare"]
+
+
+@pytest.mark.parametrize(
+    "where, value",
+    [("gate", float("nan")), ("value", float("inf")), ("value", float("nan")), ("unwritten", float("inf"))],
+    ids=[
+        "the same NaN in a gate row",
+        "the same infinity in a written value row",
+        "the same NaN in a written value row",
+        "an infinity in a row no position names",
+    ],
+)
+def test_a_copied_value_that_is_not_finite_is_outside_the_attention_preparations_band(monkeypatch, where, value):
+    """The gate rows and the value rows of the attention preparation are bit copies of the call's operand, and the entry
+    and its twin copy the same operand: a NaN or an infinity in it is the same byte on both sides, and equal bytes do
+    not say that a value is finite.  The judge holds the gate rows and the value rows a call wrote finite, as it holds
+    the queries and the key rows: such a call is not ok and not finite, on a line that still reads the rows equal and
+    ends in ``NON-FINITE VALUES``.  What a call wrote are the rows of the pool at its positions -- for every row of the
+    step the page and the slot of its position, formed from host integers.  A value that is not finite in a row no
+    position of the call names, there before the call on both sides, is no value of this call: the call that wrote
+    that row was judged with it.  One token on a page of 64 slots, and two sequences of three tokens across a page
+    boundary; the value stands in the last row of the step."""
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import configs
+
+    for sequences, tokens, position in ((1, 1, 5), (2, 3, 62)):
+        block, cache, qkv, params, _, model = _prepare_block(monkeypatch, [], sequences=sequences, tokens=tokens)
+        g, row = model.geometry, sequences * tokens - 1  # the last row of the step: the last token of the last sequence
+        heads, kv_heads, width = g.attn_heads, g.attn_kv_heads, g.attn_head_dim
+        twin = block.twin(torch_ref.AttentionPrepare(configs.PROVIDERS["attention.prepare"][1], model, block.facts, block.options))
+        own = (sequences - 1) * (cache.pool.shape[0] // sequences)  # the first page of the last sequence
+        page, slot = own + (position + tokens - 1) // 64, (position + tokens - 1) % 64  # the row of the pool that row's position names
+        beyond = (own + (position + tokens) // 64, 2, (position + tokens) % 64)  # value head 2 at the next position: no row of this step
+        operand, before = qkv.clone(), cache.pool.clone()
+        if where == "gate":  # head 3, element 17 of its gate row, which stands behind the head's query elements
+            operand[row, 3 * 2 * width + width + 17] = value
+        elif where == "value":  # value head 2, element 40: behind the queries with their gates and the keys
+            operand[row, (2 * heads + kv_heads) * width + 2 * width + 40] = value
+        else:  # in the pool before the call: a key element and a value element of that row
+            before[beyond + (40,)] = before[beyond + (width + 40,)] = value
+        results = []
+        for call in (block, twin):  # the entry's stand-in and the twin, each from the same pool
+            cache.pool.copy_(before)
+            results.append((tuple(t.clone() for t in call(operand, cache, position, params)), cache.pool.clone()))
+        (out, after), (ref, ref_after) = results
+        stats = tie_out.BlockStats("attention_prepare")
+        tie_out.BlockTap._judge(stats, out, ref, [(after,)], [(ref_after,)], 1, twin)
+        # both sides hold the value in the same bytes, and nothing else of the call is not finite
+        strays = [int((~torch.isfinite(t)).sum()) for t in (out[0], out[1], after[page, :, slot], after)]  # queries, gates, the row written, the pool
+        assert strays == {"gate": [0, 1, 0, 0], "value": [0, 0, 1, 1], "unwritten": [0, 0, 0, 2]}[where], (sequences, strays)
+        assert tie_out.bytes_equal(out[1], ref[1]) and tie_out.bytes_equal(after[..., width:], ref_after[..., width:]), sequences
+        assert (stats.outside, stats.keys_outside, stats.gates_equal, stats.values_equal, stats.state_equal) == (0, 0, True, True, True), stats.line()
+        equal = "; 0 query and 0 key elements outside their band; gate rows equal; value rows equal; the rest of the pool untouched"
+        if where == "unwritten":
+            assert stats.ok and stats.finite and stats.line().endswith(equal), (sequences, stats.line())
+        else:
+            assert not stats.ok and not stats.finite and stats.line().endswith(equal + "; NON-FINITE VALUES"), (sequences, stats.line())
 
 
 def _attention_layers(count=16, form=None, symbol=None):

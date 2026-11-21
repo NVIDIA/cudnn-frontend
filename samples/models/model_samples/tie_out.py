@@ -152,9 +152,11 @@ it is handed as a host integer.  Per call:
   wrote at another slot, or a row no position of the call names, fails here.  Which rows of the pool the positions of
   the call are is formed from host integers: the position, the tokens per sequence and the shape of the pool.
 
-Every value finite.  The line prints how many query and key elements are not the twin's byte -- the approximate root moves
-a few by a unit, inside their band; the entry's page states no share for them, and none is gated -- and how many of them
-are outside their band.
+Every value a call wrote must be finite: the queries, the gate rows, and the key and the value rows at the positions of
+the call.  The gate rows and the value rows are held finite beside their bytes: the twin copies them from the same
+operand, so a NaN or an infinity there is the twin's byte too.  The line prints how many query and key elements are not
+the twin's byte -- the approximate root moves a few by a unit, inside their band; the entry's page states no share for
+them, and none is gated -- and how many of them are outside their band.
 
 ``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
 output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
@@ -677,6 +679,9 @@ def _judge_prepare(stats: BlockStats, out, ref, state, ref_state, twin) -> None:
     written = pool[index[:, 0], :, index[:, 1]]  # [rows, key / value heads, 2 * head width]
     stats.keys_outside += held(written[..., :width], terms.k, terms.k_band)
     stats.values_equal = stats.values_equal and bytes_equal(written[..., width:], terms.v)
+    # the gate rows and the value rows are bit copies of the call's operand, which the twin copies too: a NaN or an infinity
+    # there is the twin's byte, so the two comparisons above do not see it
+    stats.finite = stats.finite and bool(torch.isfinite(gate).all()) and bool(torch.isfinite(written[..., width:]).all())
     rest = torch.ones(pool.shape[0], page, dtype=torch.bool, device=pool.device)
     rest[index[:, 0], index[:, 1]] = False
     stats.state_equal = stats.state_equal and bytes_equal(pool.transpose(1, 2)[rest], ref_pool.transpose(1, 2)[rest])

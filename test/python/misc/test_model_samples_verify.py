@@ -1376,7 +1376,9 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         in section
     )
     dated = "370 of 484 launches of a verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)"
-    assert "with " + dated in section and reached.startswith("386 of 484 launches of a step are target kernels (49 ") and 386 - 370 == 16
+    assert "with " + dated in section and reached.startswith("386 of 484 launches of a step are target kernels (49 ")
+    today, then = (int(sentence.split(" of 484 launches of a ", 1)[0]) for sentence in (reached, dated))  # the counts as the two sentences state them
+    assert today - then == 16, "the dated run: one launch per attention layer of the published model fewer than a step reaches today"
     # what the two runs asked for is the tree's arithmetic at their capacities: a plain session and such a session on one load, one
     # state of six tokens per sequence beside the plain session's (prompt + 32 new tokens + two windows of five drafted tokens)
     kept, alone = ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up"), ("projection.fp8.in", "mlp.gate_up")
