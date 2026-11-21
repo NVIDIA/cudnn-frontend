@@ -9537,13 +9537,15 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
     one_more = keyed(at, value + sign * (most + 1) * unit)
     outside = (one_more.outside, one_more.keys_outside)
     assert not one_more.ok and outside == (0, 1), "a rotated key element one unit past its own band: outside, the band is not doubled"
-    # ... and the same of a rotated QUERY element
+    # ... and the same of a rotated QUERY element, the first whose band is a WHOLE unit or more: the most units it admits are then two
+    # or more, so that a band which is narrower than the twin's admits fewer and a band which is wider admits one more -- held on both sides
     units = torch_ref.bf16_unit(ref[0].double())
-    tells = (twin.terms.q_band >= units / 2) & (ref[0].double().abs() > (3 + torch.floor(twin.terms.q_band / units)) * units)
-    assert tells[..., 64:].sum() == 0 and tells.any(), "a rotated query element whose band tells one band from two"
+    tells = (twin.terms.q_band >= units) & (ref[0].double().abs() > (3 + torch.floor(twin.terms.q_band / units)) * units)
+    assert tells[..., 64:].sum() == 0 and tells.any(), "a rotated query element whose band is a whole unit or more"
     at = tuple(int(i) for i in tells.nonzero()[0])
     value, unit, band = ref[0][at].double(), float(units[at]), float(twin.terms.q_band[at])
     most, sign = 1 + int(band // unit), -1.0 if float(ref[0][at]) > 0 else 1.0
+    assert most >= 2 and 1 + int(band / 2 // unit) < most, "half that band admits fewer units: a judge that halves it fails the next line"
     moved = ref[0].clone()
     moved[at] = float(value + sign * most * unit)
     assert judged(q=moved, pool=ref_after).ok, "a rotated query element moved by the most units its band admits: inside"
