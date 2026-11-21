@@ -205,6 +205,17 @@ def _sm90_partial_pack(row: str, facts) -> bool:
     return pack is not None and 1 < pack < facts.h_q // facts.h_kv
 
 
+def _sm100_window_decode_partial_pack(row: str, facts) -> bool:
+    """SM100 / SM103 windowed single-row decode whose GQA group the row packs only in part: each packed CTA still re-reads K/V
+    G / pack times, a different regime from whole packs, so it keys apart. Scoped to the measured head dims."""
+    if row != "sdpa_fwd_prefill_sm100" or tuple(facts.device_cc or ()) not in ((10, 0), (10, 3)) or facts.window_left is None or facts.s_q != 1:
+        return False
+    if (facts.d_qk, facts.d_v) not in ((128, 128), (64, 64)):
+        return False
+    pack = _decode_pack_group(row, facts)
+    return pack is not None and 1 < pack < facts.h_q // facts.h_kv
+
+
 def _sm107_verify_partial_pack(row: str, facts) -> bool:
     """Rubin padded-Q spec-decode verify whose GQA group the row packs only in part (2 of 6 or 10 heads, 4 of 12 per tile): group 6 ran
     1.04-1.09x the backend at b >= 16 where whole packs ran 0.20-0.66 (sm107_d192x128_sink_verify_20261118), so it keys apart."""
@@ -316,7 +327,7 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         group = "mha"
     elif _unpacked_decode(row, facts) or _sm100_unpacked_window_prefill(row, facts):
         group = "gqa_unpacked"
-    elif _sm90_partial_pack(row, facts):
+    elif _sm90_partial_pack(row, facts) or _sm100_window_decode_partial_pack(row, facts):
         group = "gqa_partial"
     else:
         group = "gqa_split" if _packed_split(row, facts) else "gqa"
@@ -508,6 +519,45 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry(
         "always", None, "sm100_d256_decode_v4_924_20261116"
+    ),
+    # study sm100_window_decode_v2_20261121: windowed paged single-row decode, each cc fit on its own board (B200 for cc 10.0, B300
+    # for cc 10.3). FROST leads between a grid floor and a rows / cost ceiling; partial packs key apart (`_sm100_window_decode_partial_pack`),
+    # and unpacked groups keep no entry.
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 11.246, "sm100_window_decode_v2_20261121", "rows", ("ge", 6.696, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 11.246, "sm100_window_decode_v2_20261121", "rows", ("ge", 6.904, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa_partial", False): Entry(
+        "le", 11.246, "sm100_window_decode_v2_20261121", "rows", ("ge", 7.292, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa_partial", True): Entry(
+        "le", 27.861, "sm100_window_decode_v2_20261121", "cost", ("ge", 15.704, "kv")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 32.422, "sm100_window_decode_v2_20261121", "cost", ("ge", 6.292, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 11.377, "sm100_window_decode_v2_20261121", "rows", ("ge", 6.292, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 11.246, "sm100_window_decode_v2_20261121", "rows", ("ge", 6.696, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 10.453, "sm100_window_decode_v2_20261121", "rows", ("ge", 6.696, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "q1", "paged", "window", False, "gqa_partial", False): Entry(
+        "le", 11.246, "sm100_window_decode_v2_20261121", "rows", ("ge", 7.292, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "q1", "paged", "window", False, "gqa_partial", True): Entry(
+        "le", 27.861, "sm100_window_decode_v2_20261121", "cost", ("ge", 16.744, "kv")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 32.422, "sm100_window_decode_v2_20261121", "cost", ("ge", 6.292, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 11.377, "sm100_window_decode_v2_20261121", "rows", ("ge", 6.292, "tiles")
     ),
     # study sm100_d576_prefill_20261117 (B200 1000 W, cuDNN 9.24.0.43, FE 8014a2c75; benchmark/attention_inference's context graph:
     # absorbed-MLA (576, 512) MQA prefill chunks, h_q 8-128, b 1-16, S_q 8-2048, KV 4k-128k on and off the tile; dense BSHD and paged
