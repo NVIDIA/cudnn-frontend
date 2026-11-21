@@ -790,7 +790,7 @@ def _judge_attention_core(stats: BlockStats, out, ref, twin) -> None:
     share = (distance / bound).flatten()
     at = int(torch.where(torch.isnan(share), torch.full_like(share, float("inf")), share).argmax())  # an element that is no number comes first
     worst = float(share[at])
-    if math.isnan(worst) or worst > stats.worst_share:  # (a share that is no number stays, whatever follows)
+    if math.isnan(worst) or worst > stats.worst_share or stats.elements == got.numel():  # (a NaN stays; the first judged call's element is kept at any share)
         stats.worst_share, stats.worst_at = worst, (float(chain.flatten()[at]), float(spread.flatten()[at]))
     stats.ok = stats.finite and stats.outside == 0
 

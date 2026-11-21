@@ -10607,6 +10607,57 @@ def test_terms_of_another_shape_than_the_output_are_not_compared_in_the_library_
     assert whole.ok and (whole.outside, whole.elements) == (0, 512), "its own terms: every element compared"
 
 
+def test_the_line_of_the_library_attention_band_names_an_element_where_every_element_is_on_its_chain():
+    """Where every element of a step is exactly on its chain, no element has used any of its bound: a step with ONE
+    attended row, whose chain is that row's value and whose output is the chain's bytes.  The line of the band
+    ``attention_bf16_weights`` then names the chain and the spread of an element of the first judged call -- its first --
+    and never figures that belong to no element.  A later call that is on its chain too leaves them; the first call that
+    is off its chain takes their place, and a later call on its chain does not take that back.  A call that cannot be
+    compared is no judged call: it keeps nothing, and the call behind it is the first."""
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.state import KvCache
+
+    def one_row(first):
+        """One row that attends to ONE row, at two query heads on one key / value head of width 256, and its twin after
+        its call: ``(twin, the chain's bytes)``.  The attended row's value is ``first`` in its first element and 0.5 in
+        every other: its weight is 1, so every element of the chain is that value, and of the spread its magnitude."""
+        values = torch.full((1, 1, 1, 256), 0.5)
+        values[0, 0, 0, 0] = first
+        twin = torch_ref.AttentionBound(None, None, None, {})
+        return twin, twin(torch.ones(1, 2, 256).bfloat16(), KvCache(torch.zeros(1, 1, 1, 256).bfloat16(), values.bfloat16()), 0)
+
+    twin, ref = one_row(-0.75)
+    chain, spread = twin.bound
+    assert torch.equal(ref.double(), chain) and torch.equal(spread, chain.abs()), "one attended row: the output is exactly its chain"
+    assert (float(chain[0, 0]), float(spread[0, 0]), float(chain[0, 1]), float(chain[0, 256])) == (-0.75, 0.75, 0.5, -0.75)
+    stats = _judged_attention(ref, twin, ref)
+    assert stats.ok and (stats.elements, stats.outside, stats.other_value, stats.worst_share) == (512, 0, 0, 0.0)
+    assert stats.worst_at == (-0.75, 0.75), "no element is off its chain: the first element of the first judged call, never the figures of no element"
+    assert stats.line() == (
+        "512 elements, 0 of them not the reference chain's byte; 0 outside their bound; the largest distance 0.000 of its bound, at a chain of -0.75 with a "
+        "spread of 0.75 (printed, not gated); the cache untouched"
+    )
+    # over the calls of a run: a second call that is on its chain too leaves the kept element ...
+    other_twin, other_ref = one_row(0.25)
+    assert float(other_twin.bound[0][0, 0]) == 0.25
+    tie_out.BlockTap._judge(stats, (other_ref,), (other_ref,), [], [], 0, other_twin)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (1024, 0.0, (-0.75, 0.75)), "a later call on its chain: the kept element stays"
+    # ... the first call that is off its chain takes its place (the model's extreme at 0.9 of its largest rounding error) ...
+    extreme_twin, extreme_ref = _built_attention(0.0, 1.0, -1.0)
+    tie_out.BlockTap._judge(stats, (_model_extreme(0.9),), (extreme_ref,), [], [], 0, extreme_twin)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (1536, 0.8984375, (0.0, 1.0)), "a larger share: its element"
+    # ... and a later call on its chain does not take that back
+    tie_out.BlockTap._judge(stats, (ref,), (ref,), [], [], 0, twin)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (2048, 0.8984375, (0.0, 1.0)), "the largest share stays with its element"
+    # a call that cannot be compared is no judged call: nothing is kept, and the call behind it is the first judged one
+    behind = tie_out.BlockStats("attention_bf16_weights")
+    tie_out.BlockTap._judge(behind, (other_ref, other_ref), (other_ref,), [], [], 0, other_twin)
+    assert not behind.ok and (behind.elements, behind.outside, behind.worst_at) == (0, 1, (0.0, 0.0)), "two outputs: nothing is compared and nothing kept"
+    tie_out.BlockTap._judge(behind, (ref,), (ref,), [], [], 0, twin)
+    assert not behind.ok and (behind.elements, behind.outside, behind.worst_share, behind.worst_at) == (512, 1, 0.0, (-0.75, 0.75)), "the first judged call"
+
+
 def test_every_control_arm_of_the_library_attention_band_fails_and_what_the_band_cannot_see_is_pinned(monkeypatch):
     """The control arms of the band ``attention_bf16_weights`` through the judge; each must FAIL.  Two say that the band is
     not slack, and are derived on built operands: at a coefficient of 0.5 the model's own extreme at 0.9 of its largest
