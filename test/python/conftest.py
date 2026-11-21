@@ -140,6 +140,13 @@ def _log_to_real_stderr(msg):
         pass  # a diagnostic must never be what breaks the run
 
 
+@pytest.hookimpl(optionalhook=True, tryfirst=True)
+def pytest_handlecrashitem(crashitem, report, sched):
+    # A later outer timeout may prevent the terminal failure summary. Retain
+    # xdist's attribution immediately without changing outcomes or rescheduling.
+    _log_to_real_stderr(f"[crash-guard] xdist crash item: {crashitem}")
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_cmdline_main(config):
     # Runs before xdist's own tryfirst hook, which expands numprocesses into tx
@@ -183,8 +190,8 @@ def _dead_cuda_context():
 def _trace(event, nodeid):
     # Opt-in per-worker journal of what each worker started and finished.
     #
-    # When a worker dies, all the log says is "node down"; the journal survives
-    # it and distinguishes the two deaths that otherwise look identical:
+    # The crash-item log uses xdist's attribution; this journal survives the
+    # worker and distinguishes the two deaths that otherwise look identical:
     #   - last line is a START, so the worker died *inside* that test (signal);
     #   - last line is DEAD-CONTEXT, so the crash guard below killed it after
     #     the test, and the line carries the CUDA error that condemned it.
