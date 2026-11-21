@@ -3,12 +3,13 @@
 
 """Where the chunked GDN forward chains, and that both sides of that length compute the same function.
 
-The shared piece rule (``choose_pieces``) cuts long sequences on few tiles into a chain of pieces.  A GDN forward keeps the
-chain only where ``chain_pays`` against the plan it would run instead: the uncut plan or the split-K table, the value-width
-split for one in-place sequence, and the leftover tiles' own round for the chain tail of a batch above one wave.  A plan
-that does not chain carries the length-rule chain group for the device to take only where some batch of its shape can gain
-from it (``chain_group_pays``), and a chain whose plan below would carry that group stays.  ``batch_invariant``, a context
-port, GDP and the summary node keep the shared rule.
+The shared piece rule (``choose_pieces``) cuts long sequences on few tiles into a chain of pieces.  A GDN forward that
+overwrites its initial state keeps the chain only where ``chain_pays`` against the plan it would run instead: the value-width
+split for one sequence, the uncut plan otherwise, and the leftover tiles' own round for the chain tail of a batch above one
+wave.  Such a plan that does not chain carries the length-rule chain group for the device to take only where some batch of
+its shape can gain from it (``chain_group_pays``), and a chain whose plan below would carry that group stays.  The default
+call, whose plan below the chain is the split-K table, ``batch_invariant``, a context port, GDP and the summary node keep the
+shared rule.
 
 The rule tests state properties of ``chain_pays``.  Equal function cannot tell which plan ran and the ops report no plan, so
 the plan tests read the plan object the engine builds for a graph node; they compile and launch nothing.  Every length and
@@ -120,7 +121,7 @@ def tail_scheme(num_sm, lengths, *, heads, value_heads, **call):
         return None
     shape = dict(num_seqs=len(lengths), heads_out=max(heads, value_heads), num_sm=num_sm, total_tokens=sum(lengths))
     tail = choose_tail(**shape, b_t=CHUNK, cadence_tokens=call.get("cadence", 0), expand_num=1, dim_v=call.get("value_dim", WIDTH))
-    by_cost = tail is not None and not tail.dv_split and not call.get("context")
+    by_cost = tail is not None and not tail.dv_split and call.get("in_place", True) and not call.get("context")
     if by_cost and not chain_pays(pieces=tail.pieces, num_seqs=len(lengths), total_tokens=sum(lengths), tail=True):
         return None
     return tail
@@ -128,12 +129,14 @@ def tail_scheme(num_sm, lengths, *, heads, value_heads, **call):
 
 def group_scheme(num_sm, lengths, *, heads, value_heads, **call):
     """The slots of the chain group the plan of one call carries, by the package's own rules: ``ragged_pieces``' for a plan
-    that neither chains nor is ``batch_invariant``, and for a GDN forward without a context port only where the group pays."""
+    that neither chains nor is ``batch_invariant``, and for an in-place GDN forward without a context port only where the
+    group pays."""
     if plan_scheme(num_sm, lengths, heads=heads, value_heads=value_heads, **call)[0] or call.get("batch_invariant"):
         return 0
     shape = dict(heads_out=max(heads, value_heads), total_tokens=sum(lengths))
     slots = ragged_pieces(**shape, num_sm=num_sm)
-    if slots and not call.get("context") and not chain_group_pays(pieces=slots, num_seqs=len(lengths), num_sm=num_sm, **shape):
+    by_cost = call.get("in_place", True) and not call.get("context")
+    if slots and by_cost and not chain_group_pays(pieces=slots, num_seqs=len(lengths), num_sm=num_sm, **shape):
         return 0
     return slots
 
@@ -227,8 +230,8 @@ def code_paths(num_sm):
 @pytest.mark.parametrize("path", CODE_PATHS)
 def test_plan_follows_the_chain_rule(monkeypatch, path):
     """One cell per code path, on this GPU's SM count, at the shared rule's first chain length and on both sides of the
-    forward's own: one sequence in place, the default call, a value width without the split, two sequences, and the chain tail
-    of four; batches on both sides of the size from which a plan carries the chain group, without a chain and below one;
+    forward's own: one sequence in place, a value width without the split, two sequences, and the chain tail of four; batches
+    on both sides of the size from which a plan carries the chain group, without a chain and below one; the default call,
     ``batch_invariant``, a context port, GDP and the summary node answer the shared rule."""
     assert_plans_follow_the_rules(monkeypatch, la.sm_count(), code_paths(la.sm_count())[path])
 
@@ -236,8 +239,8 @@ def test_plan_follows_the_chain_rule(monkeypatch, path):
 @pytest.mark.L0
 @pytest.mark.parametrize("fixed_tokens", [0, LENGTHS[-1]], ids=["chain_free", "chain_never_pays"])
 def test_tuning_moves_only_the_cost_ruled_forward(monkeypatch, fixed_tokens):
-    """With the chain's fixed part at nothing and beyond every length: ``batch_invariant``, a context port, GDP and the summary
-    node keep the slots of the shared rule; the cost-ruled forward follows the rule's verdict."""
+    """With the chain's fixed part at nothing and beyond every length: the default call, ``batch_invariant``, a context port,
+    GDP and the summary node keep the slots of the shared rule; the cost-ruled forward follows the rule's verdict."""
     monkeypatch.setattr(piece_chain, "CHAIN_FIXED_TOKENS", fixed_tokens)
     monkeypatch.setattr(piece_chain, "CHAIN_TAIL_FIXED_TOKENS", fixed_tokens)
     monkeypatch.setattr(piece_chain, "CHAIN_GROUP_TILE_TOKENS", fixed_tokens)
@@ -248,12 +251,11 @@ def test_tuning_moves_only_the_cost_ruled_forward(monkeypatch, fixed_tokens):
     shape = dict(num_seqs=1, heads_out=heads, num_sm=num_sm, total_tokens=tokens, b_t=CHUNK, cadence_tokens=0)
     shared = choose_pieces(**shape, batch_invariant=False, expand_num=1)[0]
     assert shared
-    for form in (dict(context=True, in_place=False), dict(summary=True), dict(householders=SUB_TOKENS)):
+    for form in (dict(in_place=False), dict(context=True, in_place=False), dict(summary=True), dict(householders=SUB_TOKENS)):
         slots = choose_pieces(**shape, batch_invariant=False, expand_num=form.get("householders", 1))[0]
         assert build_plan([tokens], **third, **form).pieces == slots, form
     assert build_plan([tokens], **third, batch_invariant=True).pieces == choose_pieces(**shape, batch_invariant=True, expand_num=1)[0]
-    for form in (dict(), dict(in_place=False)):
-        assert build_plan([tokens], **third, **form).pieces == (shared if fixed_tokens == 0 else 0), form
+    assert build_plan([tokens], **third).pieces == (shared if fixed_tokens == 0 else 0)
 
 
 @pytest.mark.L1

@@ -131,9 +131,9 @@ class CompiledGdn:
     (one item per sequence and head), ``warmup`` (decay-warmup split-K), ``dv_split`` (two uncut items per sequence and head,
     each owning half of d_v) or ``chain`` (per-piece H and M from the fused summary, an fp32 state chain seeding every piece,
     the prefill over the pieces as independent sequences).  The chunk factor T comes from the T pass in chain
-    plans.  A GDN plan without a context port and without ``batch_invariant`` carries the length-rule chain group only where
-    ``chain_group_pays``, and keeps a chain, whole-batch or tail, only where ``chain_pays`` against the scheme it would run
-    instead; a whole-batch chain whose scheme below would carry the chain group stays."""
+    plans.  A GDN plan that overwrites its initial state, without a context port and without ``batch_invariant``, carries the
+    length-rule chain group only where ``chain_group_pays``, and keeps a chain, whole-batch or tail, only where ``chain_pays``
+    against the scheme it would run instead; a whole-batch chain whose scheme below would carry the chain group stays."""
 
     def __init__(self, node, kernel_module):
         from .common.piece_chain import (
@@ -228,9 +228,11 @@ class CompiledGdn:
             unit_chunks=self.unit_chunks,
             uncut=self.overwrite_initial_state,
         )
-        # A context port fixes the pieces by the shared rule (common/context.py) and batch_invariant by the length rule; every
-        # other GDN forward chains only where the chain beats the plan it would run instead.  The rule's constants are GDN's.
-        chain_by_cost = self.expand_num == 1 and not self.batch_invariant and not self.has_context and not node.params.get("output_context", False)
+        # A context port fixes the pieces by the shared rule (common/context.py) and batch_invariant by the length rule.  A plan
+        # that does not overwrite its initial state runs the split-K table below the chain, whose pace follows the gates, and
+        # keeps the shared rule too.  Every other GDN forward chains only where the chain beats the plan it would run instead.
+        by_shape = self.batch_invariant or self.has_context or node.params.get("output_context", False)
+        chain_by_cost = self.expand_num == 1 and self.overwrite_initial_state and not by_shape
         chain_group = 0
         if not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
             chain_group = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
