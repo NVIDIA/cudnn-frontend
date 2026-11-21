@@ -1697,10 +1697,11 @@ class pygraph:
 
     def _handleless_device(self, index: Optional[int]) -> Optional[int]:
         """The GPU a handle-less execute of plan ``index`` (the selected plan when None) runs on: its
-        python build device, else the backend lowering device; None before either is known."""
+        python build device, else the backend lowering device; None before either is known. A
+        planned graph not built yet builds lazily in this call, on the lowering device."""
         if self._planning_done and index is None:
             if not self._is_built:
-                return None
+                return self._default_handle_device
             index = self._plan_index
         device = self._plan_devices.get(index) if index is not None else None
         return self._default_handle_device if device is None else device

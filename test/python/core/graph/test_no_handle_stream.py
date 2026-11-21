@@ -251,3 +251,79 @@ def test_default_handles_of_exited_threads_are_reused(monkeypatch):
         worker.start()
         worker.join()
     assert len(created) == 1
+
+
+def _planned_relu_graph():
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    x = graph.tensor(dim=[1, 32, 32], stride=[1024, 32, 1], data_type=cudnn.data_type.FLOAT)
+    y = graph.relu(x).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    return graph, x, y
+
+
+@pytest.mark.parametrize("side_stream", [False, True], ids=["default_stream", "side_stream"])
+def test_backend_first_lazy_execute_without_handle_while_another_gpu_is_current(side_stream):
+    """Planned (not built) on cuda:0; the first execute, which builds, comes from cuda:1."""
+    _two_gpus()
+    with torch.cuda.device(0):
+        graph, tx, ty = _planned_relu_graph()
+        x = torch.randn(1, 32, 32, device="cuda:0")
+        y = torch.zeros_like(x)
+        ws = torch.empty(1 << 20, device="cuda:0", dtype=torch.uint8)
+        stream = torch.cuda.Stream(device=0) if side_stream else torch.cuda.default_stream(0)
+        stream.wait_stream(torch.cuda.current_stream(0))
+        with torch.cuda.stream(stream):
+            with torch.cuda.device(1):
+                torch.cuda.current_stream(1)
+                graph.execute({tx: x, ty: y}, ws)
+                assert _bound_device() == 1 and torch.cuda.current_device() == 1
+    stream.synchronize()
+    torch.testing.assert_close(y, x.relu())
+
+
+def test_python_plan_first_lazy_execute_without_handle_builds_on_the_planning_device(monkeypatch):
+    _two_gpus()
+    seen = []
+
+    class Plan(CompiledPlan):
+        def execute(self, graph, tensor_data, ctx):
+            seen.append(("execute", _bound_device()))
+
+    class Engine(BaseEngine):
+        name = "no_handle_lazy_build_recorder"
+        engine_id = _FAKE + 4
+
+        def build_plan(self, graph, plan, ctx=None):
+            seen.append(("build", _bound_device()))
+            return Plan()
+
+    _offer(monkeypatch, Engine())
+    with torch.cuda.device(0):
+        graph = pygraph()
+        out = graph.matmul(torch.randn(2, 2), torch.randn(2, 2))
+        graph.create_execution_plans()
+        if graph._default_handle_device is None:
+            pytest.skip("the backend was never lowered, so planning recorded no device")
+        with torch.cuda.device(1):
+            torch.cuda.current_stream(1)
+            graph.execute({out: torch.empty(2, 2)})
+            assert _bound_device() == 1
+    assert seen == [("build", 0), ("execute", 0)]
+
+
+def test_thread_handle_pool_reclaims_a_lease_when_thread_state_is_dropped():
+    """A foreign native thread entering Python through repeated callbacks keeps one live
+    threading.current_thread() while its thread-local state is fresh on every entry."""
+    import threading
+
+    from cudnn._handle import ThreadHandlePool
+
+    pool = ThreadHandlePool()
+    created = []
+    for _ in range(5):
+        pool._local = threading.local()  # what each fresh callback entry sees
+        pool.get(0, lambda: created.append(object()) or created[-1])
+    assert len(created) == 1, f"{len(created)} handles for one thread re-entering 5 times"
