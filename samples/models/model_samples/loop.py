@@ -238,7 +238,11 @@ class Session:
         self.on_demand = on_demand  # the maker of the bf16 copies this session's blocks read and its weights do not hold
         self.traced: Optional[census.Traced] = None  # of the last traced pass that kept its launch records
         self._call_log: Optional[list] = None  # the block calls of the traced step that is running
-        self.stages = Stages(sync=lambda: torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None)
+        # the stage clock synchronises the session's device and is handed the device, never the session: a closure over the
+        # session would close a reference cycle, and a session in a cycle is released when Python next collects cycles, not
+        # when its last holder lets go -- the reference session of a run's checks would outlive them with its state and record
+        device = self.device
+        self.stages = Stages(sync=lambda: torch.cuda.synchronize(device) if device.type == "cuda" else None)
         self.plan: Optional[blocks.Plan] = None
         self.prefill_plan: Optional[blocks.Plan] = None  # the decode plan of the prompt of a session built with draft_tokens=
         self.weights = None
@@ -520,8 +524,10 @@ class Session:
         """What the checks of this run hold for every sequence beyond the first, in bytes: of each session what its family
         counts at its sequences less what it counts at one (``check_row_bytes``; a session of the reference stack runs
         no checks, and a family that counts nothing is not asked).  The checks of one session run at a time and drop
-        what they held when they return, so the run takes the largest such part -- and of every other session its
-        record, which stays allocated while another count runs."""
+        what they held when they return -- the reference session they build is released there with its state and its
+        record, by its last reference: its stage clock holds the device, not the session (``__init__``), and nothing
+        but the checks holds it --, so the run takes the largest such part -- and of every other session its record,
+        which stays allocated while another count runs."""
         parts, records = [], []
         for session in (self, *later):
             count = getattr(session.model, "check_row_bytes", None) if session.stack != REFERENCE else None

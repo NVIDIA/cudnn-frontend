@@ -2341,6 +2341,84 @@ def test_the_count_is_what_is_alive_at_the_judge_of_the_fused_step(sequences):
     )
 
 
+def test_the_reference_session_of_a_count_is_released_when_its_checks_return(monkeypatch):
+    """Of a run of several counts the memory sentence takes the checks of ONE count, the one that holds the most: it rests
+    on the checks of a count dropping what they held when they return.  Held here on the thing itself: two counts on one
+    load, as a sample builds them, on the tiny geometry through stand-in providers, with Python's collection of
+    reference cycles switched off.  Every reference session the checks build, and every state and record such a session
+    has, is kept by a weak reference; when the checks of a count have returned none of them is alive -- released by its
+    last reference, not by a collection that comes when it comes.  The second count checks a second reference too."""
+    import gc
+    import weakref
+
+    import model_samples
+    from model_samples import blocks, loop, tie_out
+    from model_samples.providers import factories, torch_ref
+
+    class Step(torch_ref.GdnDecodeStep):
+        pass
+
+    class Multiply(torch_ref.Linear):
+        def __call__(self, qx, weight, site=""):
+            return super().__call__(qx, weight)
+
+    class GateUp(torch_ref.GateUp):
+        pass
+
+    watched = []  # (what, a weak reference to it): the sessions the checks build, the states and the records they have
+
+    class Watched(loop.Session):
+        """The session the checks build, as it is: a weak reference is kept to it and to what each of its resets allocates."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            assert self.stack == loop.REFERENCE, "the checks build reference sessions and no other"
+            watched.append(("session", weakref.ref(self)))
+
+        def reset(self, fresh=True, recorded=True):
+            super().reset(fresh, recorded)
+            watched.extend((("state", weakref.ref(self.state)), ("record", weakref.ref(self.record))))
+
+    monkeypatch.setattr(tie_out, "Session", Watched)
+    stand_ins = {"fe.gdn_decode_fused": Step, "cublas.bf16_dequantized": Multiply, "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": GateUp}
+    model = _tiny_model()
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
+    options = {"reference_precision": "fp64", "device": "cpu"}
+
+    def counted(sequences, share=None):
+        session = model_samples.Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, record_steps=7, share=share)
+        session.plan = blocks.plan(
+            model.provider_table, model.regimes, facts, sequences, model=model, options=options, factories=dict(factories(), **stand_ins)
+        )
+        return session
+
+    enabled = gc.isenabled()
+    gc.disable()  # from here on an object in a reference cycle stays alive: what is released below is released by its last reference
+    try:
+        first = counted(2)
+        runs = [(first, {}), (counted(3, share=first), {"second_reference": True})]  # every count of a run is built before the first load
+        for session, more in runs:
+            session.load()
+            ids = session.prefill([text.encode("ab" + str(s)) for s in range(session.sequences)])
+            session.read(ids)
+            for _ in range(4):
+                ids = session.step(ids)
+                session.read(ids)
+            built = len(watched)
+            checks = tie_out.run_checks(session, prompt_tokens=3, **more)
+            mine = watched[built:]  # of the checks of this count
+            assert checks.ok, checks.text()
+            assert [what for what, _ in mine].count("session") == 1 + len(more), "the reference session, and the second reference where one is checked"
+            assert {what for what, _ in mine} == {"session", "state", "record"}, "each of them with a state and a record"
+            alive = [what for what, held in watched if held() is not None]
+            assert not alive, f"alive behind the checks of {session.sequences} sequences, with no collection of reference cycles: {alive}"
+        assert first.state is not None and first.record is not None, "the checked sessions keep their own state and record: those the sentence counts"
+    finally:
+        if enabled:
+            gc.enable()
+
+
 COPY = "the reference's bf16 copy of one weight at a time, where the run keeps none"
 
 
