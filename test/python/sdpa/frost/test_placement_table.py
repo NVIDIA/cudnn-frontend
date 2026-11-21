@@ -924,7 +924,7 @@ def test_sm80_verify_class_without_an_entry_keeps_its_prefill_entry(s_q):
 def test_sm120_decode_entries_follow_their_study():
     """Study sm120_decode_20261112 (RTX PRO 6000): paged d256 single-row decode keeps the backend, dense D576 single-row decode
     leads; d512 s_q 1 and paged D576 s_q 1 have no entry (hand rules decide: #2497, sm120_paged_d512_q1_v2_20261117 and its D576
-    transfer check); sink-only d64 MTP has no entry."""
+    transfer check); sink-only d64 MTP has no entry, and windowed sink d64 MTP belongs to a later study."""
     row = "sdpa_fwd_prefill_sm120"
 
     def f(**over):
@@ -942,7 +942,29 @@ def test_sm120_decode_entries_follow_their_study():
     assert pt.lookup(row, f(h_q=128, h_kv=1, d_qk=512, d_v=512, has_paged_kv=False, padded=False, page_size=0)) is None
     sink = dict(h_q=64, h_kv=8, d_qk=64, d_v=64, s_q=2, has_sink=True, causal=True, bottom_right=True)
     assert pt.lookup(row, f(**sink)) is None
-    assert pt.matched_entry(row, f(window_left=127, **sink)).study == "sm120_decode_20261112"
+    assert pt.matched_entry(row, f(window_left=127, **sink)).study == "sm120_paged_d64_swa_sink_mtp_20261121"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("off", [0, 1], ids=["on_tile", "off_tile"])
+def test_sm120_paged_d64_window_sink_mtp_follows_its_study(off):
+    """sm120_paged_d64_swa_sink_mtp_20261121: SM120 paged d64 windowed sink speculative decode (gpt-oss SWA) is owned by its study on
+    both tile sides, FROST's lead never shrinks as the grid widens, a wide grid leads, and on the tile a one-tile grid keeps the backend."""
+    row = "sdpa_fwd_prefill_sm120"
+    study = "sm120_paged_d64_swa_sink_mtp_20261121"
+
+    def f(b, h_q, h_kv, s_q):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=131072 + off, d_qk=64, d_v=64, causal=True, bottom_right=True, window_left=127)
+        base.update(has_sink=True, page_size=16, padded=True, device_cc=(12, 0), device_sm_count=188)
+        return _facts(**base)
+
+    for shape in [(b, h_q, h_kv, s_q) for b in (1, 3, 128) for h_q, h_kv in ((8, 1), (64, 8), (35, 5)) for s_q in (2, 3, 4)]:
+        assert pt.matched_entry(row, f(*shape)).study == study, shape
+    for s_q in (2, 4):
+        leads = [pt.lookup(row, f(b, 8 * h_kv, h_kv, s_q)) for b, h_kv in ((1, 1), (1, 2), (2, 4), (8, 8), (128, 8))]
+        assert leads == sorted(leads), (s_q, leads)
+    assert pt.lookup(row, f(128, 64, 8, 4)) is True
+    assert pt.lookup(row, f(1, 8, 1, 2)) is bool(off)
 
 
 @pytest.mark.L0
