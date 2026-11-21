@@ -61,7 +61,7 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA, compute_kv_loop_bounds
-from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16, fp32_to_fp8_pack
+from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16, fp32_to_fp8_pack, opaque_f32_zero
 from cudnn.sdpa.fwd.kernels._common_blackwell import row_max_for_exp2
 from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax
 
@@ -728,8 +728,10 @@ def _softmax_warp_group(
         p_words = []
         if cutlass.const_expr(FP8):
             # The shared packer takes one full 16-byte FP8 atom.
+            # Float literals cannot be immediate operands of its inline PTX.
+            pack_zero = opaque_f32_zero()
             for _ in cutlass.range_constexpr(16 - COLS):
-                p_cols.append(ZERO)
+                p_cols.append(pack_zero)
             packed = fp32_to_fp8_pack(p_cols, dtype=STORAGE_DTYPE)
             for w in cutlass.range_constexpr(P_GROUP_WORDS):
                 p_words.append(packed[w])
