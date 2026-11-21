@@ -111,6 +111,7 @@ arbitrary user callbacks.
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | NVFP4 packed E2M1 Q/K; E4M3 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
+| `DSA.indexer_top_k_wrapper` with `starts` and `deterministic=True` | fprop | FP32, FP16, BF16 | Supported | Supported | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Unsupported | Unsupported |
