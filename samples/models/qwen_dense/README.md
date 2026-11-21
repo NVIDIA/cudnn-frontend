@@ -2099,10 +2099,11 @@ hold that condition themselves: the loader takes a checksum of every weight it k
 the checks take it again before their first pass and after their last. A weight whose stored bytes are not those of
 the load fails the run, named by block and layer (`stored weights`); in a run that keeps its copies the same defect
 fails the block's band, because the reference reads the copy of the load. The memory sentence names the checks' part
--- the largest such copy, one at a time -- and the checks print what the copies cost:
+-- the largest such copy, one at a time, beside what the checks hold for the sequences beyond the first ("Support per
+GPU class") -- and the checks print what the copies cost:
 
 ```text
-  this stack needs about 3.5 GiB on this GPU for 1 and 4 sequences, one count after the other, 0.33 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none); 177.7 GiB are free
+  this stack needs about 3.7 GiB on this GPU for 1 and 4 sequences, one count after the other, 0.47 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none, and what they hold for the sequences beyond the first of a count); 177.7 GiB are free
   stored weights    4 of 4 weights this run keeps on their stored format alone hold the bytes of their load, before the checks and after them: the reference's copies were made from what was loaded    PASS
   on demand         the reference read 460 bf16 copies of weights this run keeps on their stored format alone (projection.fp8.in, mlp.gate_up): each made for one call and dropped after it; the largest 0.33 GiB, 110.1 GiB in all, 1.8 s of the checks (orientation only)
 ```
@@ -2259,7 +2260,36 @@ allowed, 18.5 GiB of them reserved and not allocated); with four tenths more bot
 20.9 GiB allowed and 19.9 GiB reserved, 1,024 sequences with 72.9 GiB allowed, 70.9 GiB reserved and a peak of
 52.4 GiB allocated. Four tenths is the smallest of the three shares with which both counts passed. It is an allowance
 from these runs and not a bound, and it is no part of the figure the sentence names for the checks.
-What the sentence leaves out, by the code; no run of these kinds was made. The token check holds four fp32 tensors of
+The sentence with the count, against runs (the same day, the same GPU, the same request; `fe-entries` where no stack is
+named; every run passed its checks):
+
+| sequences | the sentence asked for | PyTorch held at its peak | PyTorch reserved | the device grew by |
+|---|---|---|---|---|
+| 33 | 5.8 GiB | 2.94 GiB | 3.83 GiB | 4.01 GiB |
+| 64 | 7.9 GiB | 4.49 GiB | 6.04 GiB | 6.22 GiB |
+| 85 | 9.4 GiB | 5.99 GiB | 7.77 GiB | 7.94 GiB |
+| 85, `fe-cublas` | 9.4 GiB | 5.97 GiB | 7.75 GiB | 7.93 GiB |
+| 85, `native` | 9.2 GiB | 5.70 GiB | 7.47 GiB | 7.65 GiB |
+| 256, the pool capped at the sentence's figure | 20.9 GiB | 14.44 GiB | 19.86 GiB | 19.28 GiB |
+| 1,024 | 72.9 GiB | 52.43 GiB | 73.08 GiB | 73.26 GiB |
+| 1,024, the pool capped at the sentence's figure | 72.9 GiB | 52.43 GiB | 70.90 GiB | 71.07 GiB |
+| 16 sequences of five tokens, a verify session alone | 8.7 GiB | 5.45 GiB | 6.71 GiB | 6.89 GiB |
+
+In the eight runs of one sequence count PyTorch's peak was 0.6 to 3.2 % above the weights held, the state and the
+count; in the verify session it was 2.5 % below them. So from 33 to 256 sequences the sentence stands 1.5 to 1.8 GiB
+above what a run takes -- the flat working memory and the pool's share are both added to the count, and the direction
+is the one that only refuses a run. At 1,024 sequences a run that is given the memory takes 0.4 GiB more than the
+sentence, and the same run with its pool held to the sentence's figure passes. A run of one sequence asked for about
+3.5 GiB, as it did before the count, held 1.80 GiB at its peak, reserved 3.58 GiB and grew the device by 3.76 GiB:
+a quarter of a GiB more than its sentence, the miss this section states for the reduced models. A run of the
+published checkpoint at one sequence asked for about 37.1 GiB on `fe-entries`, the figure it asked for before the
+count.
+`--sequences 64,65` asked for about 8.6 GiB, reserved 8.04 GiB and grew the device by 8.22 GiB; PyTorch held 5.85 GiB
+at its peak, 0.4 GiB more than the weights, the two states and the count (below).
+What the sentence leaves out. In a run of several counts the reference session of an earlier count -- its state and
+its record -- is still alive when its checks have returned, until Python collects it: the count has no term for it,
+and the run of 64 and 65 sequences above held 0.4 GiB more at its peak than the count, inside what the sentence asked
+for. The rest is by the code, and no run of these kinds was made. The token check holds four fp32 tensors of
 every checked logit at a time; it is the larger moment from about 150 checked steps of the two-layer model -- a
 request of more positions than that at many sequences -- and from 10 checked steps at the published widths, and such
 a run can fail to allocate inside its checks behind a sentence that let it start. With a checkpoint the checks replay
