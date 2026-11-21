@@ -101,6 +101,21 @@ def test_chain_group_pays_for_long_batches_of_few_sequences():
                         assert all(b or not a for a, b in zip(carried[fewer, count], carried[more, count])), (pieces, heads, count)
 
 
+@pytest.mark.L0
+def test_chain_group_is_charged_by_the_sms_its_slots_hold():
+    """Where the slots of the cut sequence fill the SMs, a batch of enough short sequences carries no chain group; the same
+    batch carries it where those slots hold a small share of the SMs."""
+    tokens = CHAIN_MIN_PIECES * LENGTH_RULE_PIECE_TOKENS
+    for num_sm in SM_COUNTS:
+        heads = num_sm // CHAIN_MIN_PIECES
+        shape = dict(pieces=CHAIN_MIN_PIECES, heads_out=heads, total_tokens=tokens)
+        assert chain_group_pays(**shape, num_seqs=1, num_sm=num_sm), num_sm
+        counts = range(2, tokens // CHUNK + 1)
+        dropped = next((count for count in counts if not chain_group_pays(**shape, num_seqs=count, num_sm=num_sm)), None)
+        assert dropped is not None, num_sm
+        assert chain_group_pays(**shape, num_seqs=dropped, num_sm=num_sm * dropped * heads), (num_sm, dropped)
+
+
 def first_chain_length(num_sm, *, count=1, **call):
     """The shortest length in whole chunks at which a batch of ``count`` equal sequences chains on ``num_sm`` SMs."""
     return next((tokens for tokens in LENGTHS if plan_scheme(num_sm, [tokens] * count, **call)[0]), None)
