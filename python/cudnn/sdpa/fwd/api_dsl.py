@@ -448,6 +448,7 @@ _SM100_FP8_KERNEL_FILES = {
     (192, 128): "sm100/d192_fp8_multi_q/kernel.py",
     (256, 256): "sm100/d256_fp8_single_q/kernel.py",
     (512, 512): "sm100/d512_fp8_role_split/kernel.py",
+    SM100_NATIVE_D576_SHAPE: "sm100/d512_fp8_role_split/kernel.py",
 }
 
 
@@ -456,7 +457,8 @@ def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[
     if device_cc == (10, 7):
         return frozenset(_SM107_FP8_KERNEL_FILES if pertensor else _SM107_MXFP8_KERNEL_FILES)
     kernel_files = _SM100_FP8_KERNEL_FILES if pertensor else _SM100_MXFP8_KERNEL_FILES
-    return frozenset(kernel_files)
+    shapes = frozenset(kernel_files)
+    return shapes if device_cc in ((10, 0), (10, 3)) else shapes - {SM100_NATIVE_D576_SHAPE}
 
 
 # Per-native-shape ENVELOPE FLOOR (see engines.Capabilities.d_envelope_floors,
@@ -465,7 +467,7 @@ def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[
 # smaller FP8 flavor reaches, at most 2x zero-padding. A smaller graph is
 # declined rather than routed onto a kernel whose cga4x1 role-split geometry is
 # tuned for d = 512.
-_SM100_FP8_ENVELOPE_FLOORS = {(512, 512): 256}
+_SM100_FP8_ENVELOPE_FLOORS = {(512, 512): 256, SM100_NATIVE_D576_SHAPE: 512}
 
 
 def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
@@ -1131,6 +1133,12 @@ class SdpaFwdDsl(APIBase):
         # Stats = -inf).  0 = plain causal.  Numerics-changing, compile-time; served by the SM100 MXFP8 dense d128 body
         # (cc 10.0 / 10.3) at B = 32, the MXFP8 V scale block, and declined typed everywhere else.
         causal_exclude_own_block: int = 0,
+        # APPENDED: reduce the split_kv partials inside the launch (the graph's CLUSTER_K_REDUCE knob) -- the chunks of one unit
+        # run as one thread-block cluster and fold their partials in the separate reduction pass's own order, so the plan has
+        # one launch.  Served by the SM100 D256 swap-AB decode tile for the plans its contract admits
+        # (d256_f16_swap_ab.contract.cluster_reduce_decline); every other request declines at check_support.  None / False =
+        # the two-launch form.
+        cluster_reduce: Optional[bool] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -1361,6 +1369,9 @@ class SdpaFwdDsl(APIBase):
                 )
         self.use_pdl = bool(use_pdl)
         self._cluster_combine = False
+        if cluster_reduce and not isinstance(self, SdpaFwdDslSm100):
+            raise NotImplementedError("CLUSTER_K_REDUCE is a form of the SM100 D256 swap-AB split decode tile")
+        self.cluster_reduce = bool(cluster_reduce)
         # THD Stats declared WITHOUT ragged offsets: per-batch padded (b, s_max, h)
         # rows (FlashInfer's form). The kernel stores per batch; the adapter fills
         # the rows past each sequence's length with -inf, as the backend does.
@@ -2835,8 +2846,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # The per-arch-line split lives in the kernel FILES and the engine rows;
         # this adapter serves both lines, so the gate is simply "a cc10.x line
         # we have kernels for".
-        _allowed_cc = ((10, 0), (10, 3), (10, 7))
-        _allowed_msg = "cc=10.0/10.3 (Blackwell) or 10.7 (Rubin)"
+        _allowed_cc = ((10, 0), (10, 3), (10, 7), (11, 0))
+        _allowed_msg = "cc=10.0/10.3/11.0 (Blackwell) or 10.7 (Rubin)"
         self._value_error_if(
             self._device_cc not in _allowed_cc,
             f"SdpaFwdDslSm100 requires {_allowed_msg}; found SM{major}{minor} on {device}",
@@ -2854,6 +2865,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # key carries no head-dim entries — engines.thd_d_shapes) and MXFP8
         # stays exact (SF plumbing not audited for zero-padding).
         fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
+        if self._fp8 and self._pertensor and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
+            self._not_implemented_error_if(self._device_cc not in ((10, 0), (10, 3)) or self.thd, "FP8 D576/V512 requires dense queries on SM100/SM103")
         _fp8_envelope_ok = (
             self._pertensor and not self.thd and _fp8_envelope_covers(int(d_qk), int(d_v), fp8_shapes) and int(d_qk) % 16 == 0 and int(d_v) % 16 == 0
         )
@@ -2937,16 +2950,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 for f in tuple(sorted(_SM100_DENSE_ONLY_D_SHAPES)) + _SM100_FLAVORS
                 if f not in _SM100_DENSE_ONLY_D_SHAPES or (_leg is None and (self.cga is None or self.cga in _SM100_SMALL_D_CGAS[f]))
             )
-        # The native exact half D576 shape uses the architecture-specific 2x2
-        # body; quantized and THD contracts remain independently gated.
-        if not self._fp8 and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
+        # Exact D576 uses the half 2x2 body or the Blackwell per-tensor FP8
+        # role-split body. Other widths continue through their existing envelopes.
+        if (not self._fp8 or (self._pertensor and self._device_cc in ((10, 0), (10, 3)))) and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
             _flavor_pool += (SM100_NATIVE_D576_SHAPE,)
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
         if self.flavor == SM100_NATIVE_D576_SHAPE:
             from cudnn import _pybind_module
 
             self._not_implemented_error_if(
-                not getattr(_pybind_module._SdpaDenseBinder, "supports_native_d576", False),
+                not getattr(_pybind_module._SdpaDenseBinder, "supports_fp8_d576" if self._fp8 else "supports_native_d576", False),
                 "native D576x512 requires the matching cuDNN Frontend native extension",
             )
             self._not_implemented_error_if(
@@ -3549,15 +3562,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "softmax_scale_prefolded is not wired in the paged-KV / packed-split THD / single-CTA THD / shared dense D128 half kernel bodies (they apply the scale in-kernel)"
             )
         if self.paged:
-            # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
-            # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
-            # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d64/d128/d256/d512 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
-            # the unwired SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
-            # MXFP8 siblings, the d192x128 FP8 flavor, the d512
-            # 2x2-datapath twin) backstops
-            # with a module-scope guard on paged_kv, and these declines keep that
-            # guard unreachable from here.  On cc 10.7: half pools serve THD queries
+            # PAGED_KV requires a page loader in the selected kernel. Check the
+            # architecture and format here before loading the template. Keep these
+            # checks in sync with config_sm100._PAGED_KV_FLAVORS and each engine's paged_d_shapes.
+            # On cc 10.7: half pools serve THD queries
             # (native D128 or the remaining shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
             # (the sm107 siblings' own PAGED_KV loader). Native per-tensor FP8 D512 serves
             # dense Q over pools; other FP8 flavors retain their paging decline.
@@ -3588,8 +3596,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )
             self._not_implemented_error_if(
-                self._pertensor and self.flavor not in ((128, 128), (64, 64), (256, 256), (512, 512)),
-                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d256 / d512 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                self._pertensor and self.flavor not in ((128, 128), (64, 64), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE),
+                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d192 / d256 / d512 / d576 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
                 self._fp8 and not self._pertensor and self.flavor == (64, 64),
@@ -3979,10 +3987,48 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 not self._fp8_swap_ab_leg(),
                 "SWAP_AB requires per-tensor FP8 SM100 D64 paged or SM100/SM103/SM107 D128 dense decode, CGA1 and supported query geometry, without extra epilogues",
             )
+        if self.cluster_reduce:
+            reason = self._cluster_reduce_decline()
+            self._not_implemented_error_if(reason is not None, reason or "")
         self._check_native_dense_layouts()
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
         return True
+
+    def _cluster_reduce_decline(self) -> Optional[str]:
+        """Why this plan cannot reduce its split partials inside the launch (``cluster_reduce``), or None.
+
+        The standalone twin of the swap-AB engine row's decline: the same contract predicate, then the two things only a
+        device and an installed extension can answer -- whether the native binder binds the fused frame over pages and
+        lengths, and whether the device can launch a thread-block cluster of ``split_kv`` one-SM blocks at all."""
+        from cudnn import _pybind_module
+        from cudnn.frost import occupancy
+        from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import cluster_reduce_decline
+
+        tile = 0 if (self._fp8 or self._mixed_fp8_kv or self._device_cc == (10, 7)) else self._decode_q_tile()
+        if tile == 0:
+            return "CLUSTER_K_REDUCE=1 is a form of the SM100 D256 swap-AB split decode tile; this plan does not lower onto it"
+        reason = cluster_reduce_decline(
+            device_cc=self._device_cc,
+            d_shape=self.flavor,
+            tile=tile,
+            split_kv=self.split_kv,
+            q_rows=int(self.s_q_max) * ((int(self.h_q) // int(self.h_kv)) if self.pack_gqa else 1),
+            d_v=int(self.head_dim_v),
+            thd=self.thd,
+            has_sink=self.has_sink,
+            stats_log2=self.stats_log2,
+            gated=self.gate_desc is not None,
+            o_matches_qkv=self.o_desc.dtype == self.q_desc.dtype,
+            use_pdl=self.use_pdl,
+        )
+        if reason is not None:
+            return reason
+        if not getattr(_pybind_module._SdpaDenseBinder, "supports_fused_split_paged", False):
+            return "CLUSTER_K_REDUCE=1 needs the native binder that binds the reduced launch over pages and lengths; rebuild the extension"
+        if occupancy.occupancy_map(self.q_desc.device.index)[self.split_kv - 1] == 0:
+            return f"CLUSTER_K_REDUCE=1: the device cannot run a thread-block cluster of {self.split_kv} blocks of this kernel"
+        return None
 
     def _fp8_swap_ab_leg(self) -> bool:
         from cudnn import data_type
@@ -4770,7 +4816,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if "use_pdl" in accepted and self.use_pdl:
             # The programmatic-dependent-launch form (the launch attribute + the griddepcontrol pair); compile() declined a kernel without the knob.
             kw["use_pdl"] = True
-        if "cluster_combine" in accepted:
+        if "cluster_combine" in accepted and getattr(km, "CLUSTER_COMBINE_BY_KNOB", False):
+            # The Blackwell-line decode tile reduces inside the launch only on request (cluster_reduce, admitted by
+            # check_support). Without the request neither keyword is passed, so the two-launch rendering keeps one compile key.
+            self._cluster_combine = self.cluster_reduce
+            if self._cluster_combine:
+                self._not_implemented_error_if(
+                    not km.cluster_combine_supported(self.head_dim_qk, self.head_dim_v),
+                    "CLUSTER_K_REDUCE=1: the selected decode rendering has no in-launch reduction for this plan",
+                )
+                kw.update(cluster_combine=True, has_final_lse=self.lse_desc is not None)
+        elif "cluster_combine" in accepted:
             from cudnn import _pybind_module
 
             # A native implementation of an already selected split8 plan, not a
@@ -6347,6 +6403,10 @@ def sdpa_fwd_wrapper_dsl_sm90(
         window_size_left=window_size_left,
         scale_softmax=scale_softmax,
     )
+    # A D128 causal claim-counter plan (and any split or THD plan) needs caller workspace; the binder zeroes it per launch.
+    required = sdpa_fwd.scratch_workspace_bytes()
+    workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device) if required else None
+
     sdpa_fwd.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
@@ -6357,6 +6417,7 @@ def sdpa_fwd_wrapper_dsl_sm90(
         seq_q_lens=seq_q_lens,
         seq_kv_lens=seq_kv_lens,
         scale_softmax=scale_softmax,
+        workspace=workspace,
         current_stream=current_stream,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
@@ -7808,33 +7869,42 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
         self._device_cc = (major, minor)
-        self._value_error_if(
-            (major, minor) != (8, 0),
-            f"SdpaFwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}",
-        )
+        from cudnn.sdpa.native_sm80 import part_mismatch, smem_budget_bytes
+
+        part_reason = part_mismatch(self._device_cc, "SdpaFwdDslSm80")
+        self._value_error_if(part_reason is not None, f"{part_reason} on {device}")
 
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
-        tile_m_default, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
-        # Smaller CTAs expose more parallelism for short dense queries. At
-        # D192, 64 rows also shrink the Q/V shared-memory region. Keep sixteen
-        # rows per warp and leave explicit TILE_M requests intact.
-        short_d256 = not self.thd and d_qk == d_v == 256 and s_qo <= 128
-        if short_d256 or (not self.thd and ((d_qk == d_v == 128 and s_qo <= 128) or (d_qk == 192 and d_v == 128 and s_qo <= 64))):
-            tile_m_default = 64
+        _, num_warps_default, _ = _SM80_FLAVOR_KNOBS[self.flavor]
+        # The shared rule (the split-KV model reads it too); explicit TILE_M requests stay intact.
+        tile_m_default = _sm80_config.default_tile_m(d_qk, d_v, s_qo, self.thd)
         self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
         self.kernel_num_warps = 4 if self.flavor in ("llama", "dsv3", "qwen") and self.kernel_tile_m == 64 else num_warps_default
         if self.flavor not in ("wide512", "mla576") and self.kernel_tile_m in (16, 32):
             self.kernel_num_warps = self.kernel_tile_m // 16
-        # At D256 the 64-key double buffers still occupy 128 KiB. Pair the
-        # smaller Q tile with 32-key buffers to reduce that total to 64 KiB.
-        if short_d256 and self.kernel_tile_m == 64:
-            tile_n_default = 32
+        # Shared with the split-KV planner, like the Q tile.
+        tile_n_default = _sm80_config.default_tile_n(d_qk, d_v, s_qo, self.thd, self.kernel_tile_m)
         self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
         self._value_error_if(
             self.flavor in ("wide512", "mla576") and (self.kernel_tile_m, self.kernel_tile_n, self.kernel_num_warps) != (32, 16, 4),
             "SM80 wide heads require TILE_M=32 and TILE_N=16 with four warps",
         )
+        smem_budget = smem_budget_bytes(self._device_cc)
+        if smem_budget is not None:
+            from cudnn.sdpa.fwd.config_sm80 import graph_tile_domains, prefill_smem_bytes
+
+            def _smem(tile_n):
+                return prefill_smem_bytes(self.flavor_d_qk, self.flavor_d_v, self.kernel_tile_m, tile_n)
+
+            if self.tile_n is None and _smem(self.kernel_tile_n) > smem_budget:
+                narrower = sorted((n for n in graph_tile_domains(d_qk, d_v)[1] if n < self.kernel_tile_n and _smem(n) <= smem_budget), reverse=True)
+                self.kernel_tile_n = narrower[0] if narrower else self.kernel_tile_n
+            self._not_implemented_error_if(
+                _smem(self.kernel_tile_n) > smem_budget,
+                f"SM80 prefill at D_QK={self.flavor_d_qk}/D_V={self.flavor_d_v} needs {_smem(self.kernel_tile_n)} bytes of shared memory per CTA "
+                f"at TILE_M={self.kernel_tile_m}, TILE_N={self.kernel_tile_n}; cc {major}.{minor} provides {smem_budget}",
+            )
         self._value_error_if(
             self.cga not in (None, 1),
             f"SM80 SDPA has no CGA clustering; cga must be 1 (or unset), got {self.cga}",

@@ -9,6 +9,7 @@ tiny geometry on the reference stack, replayed byte for byte), and the tie-out i
 of a multiply accept and refuse on stated tensors, the token check against its declared band, and the checks of a whole run
 through stand-in providers with deliberate defects.  No GPU, no weights."""
 
+import contextlib
 import re
 import subprocess
 import sys
@@ -56,6 +57,145 @@ def test_tables_agree_with_the_family_readme():
     assert configs.readme_table(QwenDense().calls_text()) in readme, "regenerate the block table of the README from configs.readme_table()"
     assert configs.readme_regimes() in readme, "regenerate the regime table of the README from configs.readme_regimes()"
     assert set(configs.PROVIDERS) == set(configs.BLOCK_TITLES) == set(QwenDense().calls())
+
+
+def test_the_drafters_plan_its_table_and_its_keys():
+    """The drafter of a checkpoint as a model of a plan: its provider table resolved on stated facts in every stack, for any
+    GPU class and any row count; every block a reference chain but the embedding lookup; the five provider keys its pass
+    added to the closed list; its call sites; and the two tables of the family README rendered from the data."""
+    from model_samples import providers
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter, configs
+    from model_samples.qwen_dense.drafter import BODY, HEAD, MULTIPLIES
+
+    drafter = QwenDenseDrafter.seeded(QwenDense.reduced())
+    table = configs.DRAFTER_PROVIDERS
+    assert drafter.provider_table is table and drafter.regimes is configs.REGIMES and drafter.table_source == "model_samples/qwen_dense/configs.py"
+    assert not hasattr(drafter, "target_stacks"), "the drafter declares no target kernel set: no census section holds a draft pass"
+    assert drafter.geometry.layer_kinds == ("full_attention",) and drafter.norm_eps == QwenDense().norm_eps == 1.0e-6
+
+    # one pass: 18 block calls, 15 of the body and 3 of the head; the multiply at five sites, the norm + quantise at two
+    wiring, sites = drafter.wiring(), drafter.sites()
+    assert len(wiring) == len(sites) == drafter.calls_per_pass() == len(BODY) + len(HEAD) == 18 and (len(BODY), len(HEAD)) == (15, 3)
+    assert wiring == tuple((block, 0) for block, _ in (*BODY, *HEAD)) and sites == tuple(site for _, site in (*BODY, *HEAD))
+    assert [block for block, _ in wiring] == [
+        "draft.embedding",
+        "draft.pre_fc_norm",
+        "draft.projection",
+        "draft.norm_quantize",
+        "draft.projection",
+        "draft.attention.prepare",
+        "draft.attention.core",
+        "draft.gate_quantize",
+        "draft.projection",
+        "draft.norm_quantize",
+        "draft.projection",
+        "draft.silu_mul",
+        "draft.activation_quantize",
+        "draft.projection",
+        "draft.final_norm",
+        "draft.head.quantize",
+        "draft.head",
+        "draft.token_choice",
+    ]
+    assert sites == ("", "", "fc", "input", "qkv", "", "", "", "o", "mlp", "gate_up", "", "", "down", "", "", "", "")
+    assert drafter.calls() == {block: (5 if block == "draft.projection" else 2 if block == "draft.norm_quantize" else 1) for block in table}
+    assert drafter.calls_text() == {block: str(count) for block, count in drafter.calls().items()} and sum(drafter.calls().values()) == 18
+    assert list(table) == list(dict.fromkeys(block for block, _ in wiring)) == list(configs.DRAFTER_BLOCK_TITLES), "one row per block, in the order of the pass"
+    assert len(table) == 13 and set(table).isdisjoint(configs.PROVIDERS) and set(configs.DRAFTER_BLOCK_TITLES).isdisjoint(configs.BLOCK_TITLES)
+
+    # the call sites are data: the five weights by the loader's names with their shapes at the published widths, the two norms
+    assert (
+        [site for site, _ in configs.DRAFT_PROJECTION_SITES]
+        == [name for name, _ in MULTIPLIES]
+        == [s for (b, _), s in zip(wiring, sites) if b == "draft.projection"]
+    )
+    assert [site for site, _ in configs.DRAFT_NORM_SITES] == ["input", "mlp"] == [s for (b, _), s in zip(wiring, sites) if b == "draft.norm_quantize"]
+    shapes = {spec.name[len("drafter.") : -len(".weight")]: spec.shape for spec in drafter.tensor_specs() if spec.name.startswith("drafter.")}
+    merged = {name: (sum(shapes[part][0] for part in parts), shapes[parts[0]][1]) for name, parts in MULTIPLIES}
+    assert {site: (dict(fields)["OUT_FEATURES"], dict(fields)["IN_FEATURES"]) for site, fields in configs.DRAFT_PROJECTION_SITES} == merged
+    assert merged == {"fc": (5120, 10240), "qkv": (14336, 5120), "o": (5120, 6144), "gate_up": (34816, 5120), "down": (5120, 17408)}
+    assert dict(configs.DRAFT_NORM_SITES) == {"input": (("ADD", False),), "mlp": (("ADD", True),)}
+
+    # every row: every stack, any GPU class, any row count; a reference chain but the gather, and no form named for a chain
+    chain = "reference chain"
+    for block, rows in table.items():
+        assert len(rows) == 1, block
+        row = rows[0]
+        assert row.stacks == ("fe-cublas", "reference", "native", "fe-entries") and row.classes == ("any",) and row.serves == "any" and row.band == "same"
+        assert all(row.serves_run(sequences, tokens) for sequences, tokens in ((1, 1), (1, 6), (1, 8), (4, 6), (64, 1), (1000, 100))), block
+        assert all(row.serves_class(cc) for cc in ((8, 0), (10, 0), (10, 3), (12, 1))) and row.serves_model(drafter) and row.serves_model(None)
+        assert (row.form, row.sites, row.widths) == ((), (), ()), "a reference chain is called in no form: the kernel check has nothing to hold one to"
+        assert row.fallback == (
+            "" if block == "draft.embedding" else chain + " over a plain cache of the drafter's own" if block == "draft.attention.core" else chain
+        )
+    keys = {block: rows[0].key for block, rows in table.items()}
+    assert keys == {
+        "draft.embedding": "torch.index_select",
+        "draft.pre_fc_norm": "torch_ref.pre_fc_norm_quantize",
+        "draft.projection": "torch_ref.linear",
+        "draft.norm_quantize": "torch_ref.add_norm_quantize",
+        "draft.attention.prepare": "torch_ref.attention_prepare",
+        "draft.attention.core": "torch_ref.attention",
+        "draft.gate_quantize": "torch_ref.gate_row_quantize",
+        "draft.silu_mul": "torch_ref.silu_mul",
+        "draft.activation_quantize": "torch_ref.quantize",
+        "draft.final_norm": "torch_ref.add_norm_quantize",
+        "draft.head.quantize": "torch_ref.quantize",
+        "draft.head": "torch_ref.linear",
+        "draft.token_choice": "torch.argmax+lookup",
+    }
+
+    # the five keys of the pass in the closed list, each with its factory; the list is the model's keys and these
+    new = ("torch.argmax+lookup", "torch_ref.pre_fc_norm_quantize", "torch_ref.gate_row_quantize", "torch_ref.silu_mul", "torch_ref.quantize")
+    classes = (torch_ref.ListedTokenChoice, torch_ref.PreFcNormQuantize, torch_ref.GateRowQuantize, torch_ref.SiluMul, torch_ref.Quantize)
+    assert all(key in providers.KEYS for key in new) and [providers.factories()[key] for key in new] == list(classes)
+    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 25 and set(providers.KEYS) == set(providers.factories())
+    used_by_the_model = {row.key for rows in configs.PROVIDERS.values() for row in rows}
+    assert used_by_the_model.isdisjoint(new) and set(providers.KEYS) == used_by_the_model | set(new), "no key that no table names"
+    assert all(providers.ENTRY_NAMES[key] == key for key in new[1:]) and providers.ENTRY_NAMES[new[0]] == "torch.argmax + the token id of the chosen row"
+
+    # a dry plan in every stack: the same rows, the same table but for the stack's name
+    tables = {}
+    for stack in ("fe-cublas", "native", "fe-entries", "reference"):
+        for cc, sequences, tokens in (((10, 0), 1, 1), ((12, 0), 4, 6), ((8, 0), 1, 1)):
+            resolved = plan(table, drafter.regimes, DeviceFacts(cc), sequences, tokens, stack, model=drafter, source=drafter.table_source)
+            assert {block: row.key for block, row in resolved.rows.items()} == keys and list(resolved) == list(table), (stack, cc)
+            assert all(block.provider == "PyTorch" and block.row is resolved.rows[name] for name, block in resolved.items())
+            assert [kernel.id for kernel in resolved["draft.embedding"].kernels] == ["embedding_gather"]
+            assert all(
+                [kernel.relation for kernel in block.kernels] in (["fallback"], ["fallback", "fallback"])
+                for name, block in resolved.items()
+                if name != "draft.embedding"
+            )
+        text = plan(table, drafter.regimes, DeviceFacts((10, 0)), 1, 1, stack, model=drafter, source=drafter.table_source).table().splitlines()
+        assert text[0] == f"served by (decided before the load from model_samples/qwen_dense/configs.py; stack {stack}, 1 sequence, cc 10.0)"
+        assert text[-2] == "  by provider: fallbacks 12 (PyTorch chains 12) | PyTorch 1" and len(text) == 1 + 1 + 13 + 2
+        tables[stack] = text[1:]
+    assert tables["fe-cublas"] == tables["native"] == tables["fe-entries"] == tables["reference"]
+    lines = {line.split()[0]: line for line in tables["native"][1:14]}
+    assert lines["draft.projection"].split()[1:4] == ["5", "PyTorch", "torch_ref.linear"] and lines["draft.norm_quantize"].split()[1] == "2"
+    assert lines["draft.attention.core"].endswith("fallback: reference chain over a plain cache of the drafter's own")
+    assert lines["draft.embedding"].split() == ["draft.embedding", "1", "PyTorch", "torch.index_select", "any", "none"]
+    with pytest.raises(ValueError, match="unknown stack 'fast'"):
+        plan(table, drafter.regimes, DeviceFacts((10, 0)), 1, 1, "fast", model=drafter)
+
+    # the family README: the drafter's block table and its call-site table are rendered from this data; the model's table is untouched
+    readme = (MODELS / "qwen_dense" / "README.md").read_text()
+    rendered = configs.readme_table(drafter.calls_text(), "native", table=table, titles=configs.DRAFTER_BLOCK_TITLES, per="pass")
+    assert rendered.splitlines()[0] == "| block | calls per pass | provider key | entry [form] |" and len(rendered.splitlines()) == 2 + 13
+    assert rendered in readme, "regenerate the drafter's block table of the README from configs.readme_table(.., table=configs.DRAFTER_PROVIDERS, ..)"
+    assert all(
+        rendered == configs.readme_table(drafter.calls_text(), stack, cc, table, configs.DRAFTER_BLOCK_TITLES, "pass")
+        for stack in configs.EVERY
+        for cc in ((10, 0), (12, 0))
+    )
+    assert configs.readme_draft_sites() in readme and len(configs.readme_draft_sites().splitlines()) == 2 + 5 + 2
+    assert configs.readme_table(QwenDense().calls_text()).splitlines()[0] == "| block | calls per step (64 layers) | provider key | entry [form] |"
+    assert configs.readme_table(QwenDense().calls_text()) == configs.readme_table(
+        QwenDense().calls_text(), table=configs.PROVIDERS, titles=configs.BLOCK_TITLES
+    )
 
 
 def test_call_counts_of_a_decode_step():
@@ -243,8 +383,8 @@ def test_every_count_of_a_run_is_planned_before_the_first_load(monkeypatch):
         run(1, 4)
 
 
-def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, environment=None):
-    """``main()`` of the sample script on stated device facts, up to its first load: no GPU is touched and nothing is loaded.
+def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, environment=None, script="00_decode.py"):
+    """``main()`` of a sample script on stated device facts, up to its first load: no GPU is touched and nothing is loaded.
     Returns ``(exit code, printed text)``; raises ``AssertionError("reached a load")`` when the run gets that far."""
     import importlib.util
 
@@ -263,11 +403,11 @@ def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, envi
     monkeypatch.setattr(model_samples, "check_environment", environment or matching)
     monkeypatch.setattr(model_samples.Session, "load", no_load)
     paths = list(sys.path)
-    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_on_stated_facts", MODELS / "qwen_dense" / "00_decode.py")
+    spec = importlib.util.spec_from_file_location(f"model_sample_qwen_dense_{script[:2]}_on_stated_facts", MODELS / "qwen_dense" / script)
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.main(arguments), capsys.readouterr().out
+        return module.main(arguments), capsys.readouterr().err
     finally:
         sys.path[:] = paths
 
@@ -299,7 +439,7 @@ def test_the_sample_declines_before_its_first_load_and_checks_the_gpu_before_the
     assert code == 1 and out.splitlines()[-1].startswith("[00] ERROR --provider mlp.down=nothing: not a declared row"), out
     with pytest.raises(AssertionError, match="reached a load"):
         _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=8 * GIB)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "this stack needs about 6.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GiB are free" in out
     assert "[00] cuDNN Frontend 1.33.0 (editable checkout, source hash 0123456789ab; distribution 1.33.0)" in out and "SKIP" not in out
 
@@ -699,7 +839,7 @@ def _checked_run(sequences, step_defect=None, multiply_defect=None, band="declar
             return out
 
     class Multiply(torch_ref.Linear):
-        def __call__(self, qx, weight):
+        def __call__(self, qx, weight, site=""):  # the in-projection is handed its call site; a multiply over a copy ignores it
             product = super().__call__(qx, weight)
             return product if multiply_defect is None else multiply_defect(product, weight)
 
@@ -729,14 +869,14 @@ def _line(checks, start):
     return next(line for line in checks.lines if line.strip().startswith(start))
 
 
-def _sample_script(monkeypatch):
-    """The sample script as a module, for its own functions; what loading it changes in the process leaves with the test."""
+def _sample_script(monkeypatch, script="00_decode.py"):
+    """A sample script as a module, for its own functions; what loading it changes in the process leaves with the test."""
     import importlib.util
     import os
 
     monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models on the path
     monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # and sets a default for the profiler's log level
-    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_functions", MODELS / "qwen_dense" / "00_decode.py")
+    spec = importlib.util.spec_from_file_location(f"model_sample_qwen_dense_{script[:2]}_functions", MODELS / "qwen_dense" / script)
     sample = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sample)
     return sample
@@ -824,7 +964,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     capsys.readouterr()
     forced = StopRule(text.eos_ids, max_new_tokens=256, force_tokens=5)
     ok, judged, produced = sample._decode(session, text, forced, prompts, tie_out, check=True, checked_steps=None)
-    out = capsys.readouterr().out.splitlines()
+    out = capsys.readouterr().err.splitlines()
     assert ok and judged == 0 and [len(ids) for ids in produced] == [5, 5], "the reference stack: nothing to judge; 5 forced tokens per sequence"
     first = (
         "[00] decoding: 3 prompt tokens through the decode step, then 5 new tokens and a traced pass; the report and the text follow, the text is not streamed"
@@ -837,7 +977,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     session.new_report()
     open_end = StopRule(text.eos_ids, max_new_tokens=4)
     ok, judged, produced = sample._decode(session, text, open_end, prompts, tie_out, check=False, checked_steps=16)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert ok and judged == 0 and max(len(ids) for ids in produced) == 4
     assert out.startswith("[00] decoding: 3 prompt tokens through the decode step, then up to 4 new tokens and a traced pass; ") and "[00] checks on" not in out
 
@@ -936,6 +1076,11 @@ def test_the_traced_pass_is_read_from_kernel_activity_records():
     assert "note                  GPU busy 83% of the period: the GPU work of this stack bounds this step, not the launch path; no floor" in report.text()
     assert "rate                  10.3 tokens per second per sequence = 4 tokens / 0.390 s of the decode loop" in text
     assert "bytes per step        model 17.92 GB (weights 17.61 in their stored formats, state and cache 0.31); this stack moves 51.56 GB (2.88x)" in text
+    assert "this stack moves 51.56 GB (2.88x): bf16 copies of the weights (arithmetic, not a measurement)" in text, "every weight read as a copy"
+    kept = Report("qwen_dense", reduced=False)  # a stack with a block that multiplies on the stored format: those weights are read there
+    kept.bytes = {"weights": 17_610_000_000, "copies": 46_050_000_000, "stored": 5_200_000_000, "state": 310_000_000}
+    moves = "this stack moves 46.36 GB (2.59x): bf16 copies of the weights, and 5.20 GB of weights in their stored format (arithmetic, not a measurement)"
+    assert moves in kept.text()
     assert "first token           prefill route: decode step, 58 tokens x one step; not a time to first token of record" in text
     report.trace, report.trace_missing = None, "the profiler recorded no kernel activity on this GPU"
     assert "traced pass           not available: the profiler recorded no kernel activity on this GPU" in report.text()
@@ -1004,6 +1149,7 @@ def test_the_published_model_states_its_bytes_and_its_memory_need(monkeypatch):
     assert 51.2e9 < step["copies"] < 51.3e9 and 2.90 < step["copies"] / step["weights"] < 2.92, "the bf16 copies: 2 bytes per weight element"
     assert 0.30e9 < step["state"] < 0.36e9, "48 recurrent states read and written, 16 key/value caches read"
     assert model.bytes_per_step(4, 343)["state"] == 4 * step["state"] and model.bytes_per_step(4, 343)["copies"] - step["copies"] == 3 * 2 * 5120
+    assert step["stored"] == 0 and set(step) == {"weights", "copies", "stored", "state"}, "no weight of this stack is read on its stored format"
     need = model.memory_bytes(sequences=1, capacity=343)
     copies = model.copy_bytes()
     assert 50.0 * GIB < copies < 50.2 * GIB, "the bf16 copies incl. the embedding table"
@@ -1042,3 +1188,965 @@ def test_the_checks_of_a_long_run_cover_its_first_steps_and_print_a_second_refer
     assert bounded.record.inputs.shape[0] == 5 and bounded.record.logits.shape[0] == 5, "a long run keeps the ids and logits of its first steps only"
     bounded.prefill([text.encode("abcdefg")])
     assert bounded.record.count == 7 and tie_out.run_checks(bounded, prompt_tokens=7).lines[0] == "checks (1 sequence, the first 5 steps: 5 prompt + 0 decode)"
+
+
+def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_state(monkeypatch):
+    """A session built with ``draft_tokens=`` has a verify plan and a decode plan, on ONE state.  On stated facts (compute
+    capability 10.0, 148 SMs, stack ``native``, the published geometry): its load keeps the forms both plans read -- as a
+    run of a decode session and a verify session does -- and the memory sentence counts one state of ``draft_tokens + 1``
+    tokens per sequence, where two sessions count two."""
+    from model_samples import Session, TextIO, blocks, loop
+    from model_samples.qwen_dense import QwenDense
+
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 80 * GIB)))
+    model = QwenDense()
+    text = TextIO.synthetic(model.geometry.vocab)
+    common = dict(sequences=1, stack="native", device="cuda:0", capacity=2051)
+
+    def new(**more):
+        return Session(model, text, **common, **more)
+
+    session = new(draft_tokens=5)
+    table = session.plan_table()
+    assert (session.plan.tokens, session.prefill_plan.tokens) == (6, 1) and session.plan.first_used and session.prefill_plan.first_used
+    numbers = session.claim().numbers()  # what the session says about the target kernel set is its verify plan's
+    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 130, 321)
+    # in the stack native the library multiplies the out-projection on its stored codes at both call sites of both plans
+    stored = alone = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp.down", "output_head")
+    assert session.stored_weights() == stored and session.uncopied_weights() == alone
+    # the same forms as a decode session and a verify session on one load: the linear-attention out-projections in both forms
+    decode, verify = new(), new(tokens=6)
+    verify._share = decode
+    two = decode.plan_table([verify])
+    assert set(decode.stored_weights()) == set(stored) and set(decode.uncopied_weights()) == set(alone)
+    assert new(tokens=6).uncopied_weights() == stored, "a verify plan alone keeps the same forms: every multiplied weight on its stored codes, no copy"
+    entries = Session(model, text, **{**common, "stack": "fe-entries"}, draft_tokens=5)  # the cuDNN Frontend rows alone: the two plans differ there
+    entries.resolve()
+    assert entries.stored_weights() == ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up")
+    assert entries.uncopied_weights() == ("projection.fp8.in", "mlp.gate_up"), "the decode plan of its prompt reads a copy of the out-projections"
+    # the tables: the verify steps' rows, one line, the prompt's rows, then ONE memory sentence
+    head, line, rest = table.partition(f"\n{loop.PROMPT_ROWS}\n")
+    assert line and head == session.plan.table() and rest.startswith(session.prefill_plan.table() + "\n  this stack needs about ")
+    assert "stack native, 1 sequence x 6 tokens per sequence, cc 10.0" in head.splitlines()[0] and "stack native, 1 sequence, cc 10.0" in rest.splitlines()[0]
+    assert "cudnn.GdnVerifyFused" in head and "cudnn.GdnDecodeFused" not in head and "cudnn.GdnDecodeFused" in rest
+    need = model.memory_bytes(1, 2051, stored=stored, uncopied=alone, tokens=6)
+    checks = model.check_bytes(alone)
+    sentence = (
+        f"this stack needs about {need / GIB:.1f} GiB on this GPU for a session of 1 sequence x 6 tokens behind its prompt, "
+        f"{checks / GIB:.2f} GiB of it for the checks"
+    )
+    assert table.count("this stack needs about") == 1 and sentence in table, table.splitlines()[-1]
+    # one state: two sessions count the decode session's state of one token beside the verify session's
+    both = model.memory_bytes(1, 2051, stored=stored, uncopied=alone) + model.state_bytes(1, 2051, tokens=6)
+    assert both - need == model.state_bytes(1, 2051) and f"needs about {both / GIB:.1f} GiB on this GPU for 1 and 1 sequences, one count after the other" in two
+    # a run of a plain session and such a session names the kinds of step; a run without one keeps its words
+    plain = new()
+    behind = Session(model, text, share=plain, draft_tokens=5, **common)
+    run = plain.plan_table([behind])
+    assert plain.stored_weights() == decode.stored_weights() and plain.uncopied_weights() == decode.uncopied_weights()
+    assert (
+        f"needs about {both / GIB:.1f} GiB on this GPU for a plain session of 1 sequence and a session of 1 sequence x 6 tokens behind its prompt, one after the other"
+        in run
+    )
+    assert loop.PROMPT_ROWS not in run, "the first session's table; a later session prints its own"
+    four = Session(model, text, share=plain, **{**common, "sequences": 4})
+    counts = new().plan_table([four])
+    assert "for 1 and 4 sequences, one count after the other" in counts
+    # an override selects its row in both plans; a key whose rows do not serve one of the two kinds of step declines there
+    chain = new(draft_tokens=5, overrides={"linear_attention.step": "torch_ref.gdn_decode_step"})
+    chain.resolve()
+    assert chain.plan.rows["linear_attention.step"].key == chain.prefill_plan.rows["linear_attention.step"].key == "torch_ref.gdn_decode_step"
+    with pytest.raises(NotImplementedError, match="cudnn.GdnDecodeFused serves .*; this run has 1 sequences x 6 tokens per sequence"):
+        new(draft_tokens=5, overrides={"linear_attention.step": "fe.gdn_decode_fused"}).resolve()
+    with pytest.raises(NotImplementedError, match="cudnn.GdnVerifyFused serves .*; this run has 1 sequences x 1 tokens per sequence"):
+        new(draft_tokens=5, overrides={"linear_attention.step": "fe.gdn_verify_fused"}).resolve()
+    # a count no verify row of the stack holds is declined by that row's sentence, before anything is loaded
+    with pytest.raises(NotImplementedError) as declined:
+        new(draft_tokens=8).plan_table()
+    assert str(declined.value) == "cudnn.GdnVerifyFused serves 8 tokens per sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per sequence"
+    with pytest.raises(NotImplementedError) as declined:
+        Session(model, text, draft_tokens=5, **{**common, "sequences": 5}).plan_table()
+    assert str(declined.value) == "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
+    # what the first launch of the fused step reserves outside the pool is reserved once in a process, so the sentence carries it
+    # once -- not once more for the second plan of such a session.  On a class that has such a reserve (compute capability
+    # 12.x) a run with such a session asks what a decode session and a verify session on one load ask, and a lone one what
+    # its forms and its one state need plus one reserve
+    from model_samples.providers import fe
+
+    monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
+    monkeypatch.setattr(fe, "_VERIFY_LAUNCHED", set())
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((12, 0), "stated device", 170, 0, 80 * GIB)))
+    reserve = model.first_launch_reserve["cc12.x"]
+    assert reserve == 3 * GIB
+
+    def asked(table):
+        return table.splitlines()[-1].split("needs about ")[1].split(" GiB on this GPU")[0]
+
+    lone = new(draft_tokens=5)
+    alone_table = lone.plan_table()
+    assert lone.plan.reserve_bytes() == lone.prefill_plan.reserve_bytes() == reserve, "each plan has a fused step that would make the first launch"
+    need = model.memory_bytes(1, 2051, **lone._kept(), tokens=6)
+    assert asked(alone_table) == f"{(need + reserve) / GIB:.1f}" != f"{(need + 2 * reserve) / GIB:.1f}", alone_table.splitlines()[-1]
+    decode, verify, plain = new(), new(tokens=6), new()
+    verify._share = decode
+    behind = Session(model, text, share=plain, draft_tokens=5, **common)
+    with_prompt, two_sessions = plain.plan_table([behind]), decode.plan_table([verify])
+    assert asked(with_prompt) == asked(two_sessions), "one reserve and one more state in both runs"
+
+
+# --------------------------------------------------------------------------- the speculative script: its plan, its verdict, its help
+
+SPECULATIVE_SCRIPT = "02_speculative_decode.py"
+
+
+def test_the_speculative_script_plans_every_kind_of_step_before_its_first_load(monkeypatch, capsys):
+    """``main()`` of ``02_speculative_decode.py`` on stated device facts, up to its first load.  The plain plan, the verify
+    plan, the prompt's decode plan and the drafter's are printed with ONE memory sentence, the drafter in it, behind the
+    line that says what a prompt and a step are; a count of drafted tokens no verify row of the stack holds is declined
+    by that row's sentence -- a ``SKIP``, before any load; so is a GPU with less free memory than the sentence asks for."""
+    from model_samples import EnvironmentMismatch, loop
+
+    def run(*arguments, **facts):
+        return _sample_main(monkeypatch, capsys, list(arguments), script=SPECULATIVE_SCRIPT, **facts)
+
+    with pytest.raises(AssertionError, match="reached a load"):
+        run()
+    said = capsys.readouterr().err
+    lines = said.splitlines()
+    before = "[02] prompt of 26 tokens = 26 decode steps and 25 passes of the drafter before the first token; then every step is 5 draft passes and "
+    before += "one verify step of 6 tokens, and keeps 1 to 6 of them"
+    first = next(index for index, line in enumerate(lines) if line.startswith("served by (decided before the load"))
+    assert lines.index(before) < first, "the rule and the counts, before the tables and so before the load"
+    assert said.count("\nserved by (decided before the load") == 4, "the plain plan, the verify plan, the prompt's decode plan, the drafter's"
+    assert loop.PROMPT_ROWS in lines and loop.DRAFTER_ROWS.format(calls=18) in lines
+    kinds = "a plain session of 1 sequence and a session of 1 sequence x 6 tokens behind its prompt with its drafter, one after the other"
+    assert said.count("this stack needs about ") == 1 and f" GiB on this GPU for {kinds}; 80.0 GiB are free" in said, "one memory sentence for the run"
+    assert "[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method" in said
+    assert "[02] draft vocabulary seeded list (seed 0): 3,880 ids of the model's 15,520, in ascending order" in said
+    reductions = "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 "
+    assert reductions + "positions in turn and by another token behind them | the drafter runs on reference blocks" in lines[0]
+    # eight drafted tokens are nine tokens per sequence: no verify row of a provider stack holds them
+    eight = '{"method": "mtp", "num_speculative_tokens": 8, "use_local_argmax_reduction": true}'
+    code, out = run("--speculative-config", eight)  # the seeded default of new tokens follows the schedule: 38 here, said in the stop rule
+    last = out.splitlines()[-1]
+    assert code == 0 and last.startswith("[02] SKIP cudnn.GdnVerifyFused serves ") and last.endswith("this run has 1 sequences x 9 tokens per sequence"), last
+    with pytest.raises(AssertionError, match="reached a load"):  # seven are a row of the stack; and the reference stack holds any count
+        run("--speculative-config", eight.replace("8", "7"))
+    assert "then every step is 7 draft passes and one verify step of 8 tokens, and keeps 1 to 8 of them" in capsys.readouterr().err
+    with pytest.raises(AssertionError, match="reached a load"):
+        run("--speculative-config", eight, "--stack", "reference")
+    capsys.readouterr()
+    code, out = run("--speculative-config", eight.replace("8", "64"), "--stack", "reference")  # ... as far as its schedule fits the context
+    last = out.splitlines()[-1]
+    assert code == 1 and last.startswith("[02] ERROR the seeded prompt: 26 prompt tokens + 2,082 new tokens (--force-tokens 2082) are 2,108 positions"), last
+    code, out = run("--speculative-config", eight, "--stack", "reference", "--force-tokens", "37")  # a count that was typed is held, before the plan
+    short = "[02] ERROR --force-tokens 37: the seeded run schedules its steps to keep 0 to 8 drafted tokens in turn and needs 38 new tokens to keep every count once"
+    assert code == 1 and out.splitlines() == [short]
+    code, out = run(free=5 * GIB)
+    skip = rf"^\[02\] SKIP stack fe-cublas needs about \d\.\d GiB on this GPU for {kinds}; 5\.0 GiB are free: free memory on this GPU"
+    assert code == 0 and re.match(skip, out.splitlines()[-1]), out.splitlines()[-1]
+    code, out = run(cc=(9, 0))
+    assert code == 0 and out.splitlines()[-1] == "[02] SKIP cudnn.GdnDecodeFused serves compute capability 10.x or 12.x; this device is 9.0", out
+    code, out = run("--provider", "mlp.down=nothing")
+    assert code == 1 and out.splitlines()[-1].startswith("[02] ERROR --provider mlp.down=nothing: not a declared row"), out
+
+    def stale():  # an environment that is not the tree's ends the run in one ERROR line, behind the plan: a GPU that is not served skips first
+        raise EnvironmentMismatch("cudnn 1.33.0 was imported from an editable checkout, but the installed distribution says 1.29.0")
+
+    code, out = run(environment=stale)
+    assert code == 1 and out.splitlines()[-1] == "[02] ERROR cudnn 1.33.0 was imported from an editable checkout, but the installed distribution says 1.29.0"
+    code, out = run(cc=(9, 0), environment=stale)
+    assert code == 0 and out.splitlines()[-1].startswith("[02] SKIP cudnn.GdnDecodeFused serves compute capability 10.x or 12.x"), out
+    # --provider selects its row in both kinds of step: an entry's key of one kind is declined by that row's sentence, a fallback key serves both
+    code, out = run("--provider", "linear_attention.step=fe.gdn_decode_fused")
+    assert code == 0 and out.splitlines()[-1] == "[02] SKIP cudnn.GdnDecodeFused serves rows 1-65,535; this run has 1 sequences x 6 tokens per sequence"
+    code, out = run("--provider", "linear_attention.step=fe.gdn_verify_fused")
+    assert code == 0 and out.splitlines()[-1].endswith("this run has 1 sequences x 1 tokens per sequence") and "[02] SKIP cudnn.GdnVerifyFused serves " in out
+    with pytest.raises(AssertionError, match="reached a load"):
+        run("--provider", "mlp.down=torch_ref.linear")
+    capsys.readouterr()
+
+
+def test_both_scripts_end_in_the_verdict_the_readme_states(monkeypatch):
+    """The last line of a run is one function per script, and the two answer alike over every input: a failed check is
+    ``FAIL`` on every stack -- the speculative script compares on the reference stack too --, then the reference stack's
+    ``RAN``, kernels that could not be observed, and ``PASS`` only where provider blocks were judged.  The area README's
+    table of last lines is those answers, with ``[NN]`` for a script's tag."""
+    plain, speculative = _sample_script(monkeypatch), _sample_script(monkeypatch, SPECULATIVE_SCRIPT)
+    assert (plain.TAG, speculative.TAG) == ("[00]", "[02]")
+    reason = "the profiler failed (no tracing library)"
+    said = {}
+    for stack in plain.STACKS:
+        for passed in (True, False):
+            for judged in (0, 6):
+                for unobserved in ("", reason):
+                    answer = plain._verdict(stack, passed, judged, unobserved)
+                    assert speculative._verdict(stack, passed, judged, unobserved) == answer, (stack, passed, judged, unobserved)
+                    said[(stack, passed, judged, bool(unobserved))] = answer
+    assert all(answer == "FAIL" for (_, passed, _, _), answer in said.items() if not passed), "a failed check, whatever else is true"
+    assert {answer for (stack, passed, _, _), answer in said.items() if passed and stack == "reference"} == {"RAN reference stack (no provider checked)"}
+    assert said[("native", True, 6, True)] == f"RAN native stack (kernels not observed: {reason})" == said[("native", True, 0, True)]
+    assert (said[("fe-cublas", True, 6, False)], said[("fe-cublas", True, 0, False)]) == ("PASS", "RAN (no provider block was judged)")
+    readme = (MODELS / "README.md").read_text()
+    table = readme.split("| last line | exit code | meaning |\n|---|---|---|\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    rows = [(row.split(" | ")[0].strip("| `"), row.split(" | ")[1]) for row in table]
+    assert rows == [
+        ("[NN] PASS", "0"),
+        ("[NN] SKIP <requirement>", "0"),
+        ("[NN] RAN reference stack (no provider checked)", "0"),
+        ("[NN] RAN (no provider block was judged)", "0"),
+        ("[NN] RAN <stack> stack (kernels not observed: <reason>)", "0"),
+        ("[NN] ERROR <reason>", "1"),
+        ("[NN] FAIL", "1"),
+    ]
+    stated = {row.replace("<reason>", reason)[5:] for row, _ in rows}
+    answers = {answer.replace(f"RAN {stack} stack (kernels", "RAN <stack> stack (kernels") for (stack, _, _, _), answer in said.items()}
+    assert answers <= stated and len(answers) == 5, "every answer of the two functions is a row of the table: all but SKIP and ERROR, which main() prints"
+    assert "`[NN]` is the script's tag: `[00]` for `00_decode.py`, `[02]` for `02_speculative_decode.py`." in " ".join(readme.split())
+
+
+def test_the_speculative_scripts_help_states_the_memory_the_tree_computes(monkeypatch):
+    """The memory figures of the help text of ``02_speculative_decode.py``, per stack and GPU class, are the one memory
+    sentence of its run at the published widths on stated facts: a plain session and a session with the drafter (65,536
+    listed ids) at the default context length."""
+    from model_samples import Session, TextIO, blocks
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+
+    sample = _sample_script(monkeypatch, SPECULATIVE_SCRIPT)
+    model = QwenDense()
+    text, drafter = TextIO.synthetic(model.geometry.vocab), QwenDenseDrafter.seeded(model, rows=65536)
+
+    def asked(stack, cc):
+        monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls(cc, "stated device", 148, 0, 200 * GIB)))
+        common = dict(sequences=1, stack=stack, device="cuda:0", capacity=sample.serving_options.MAX_MODEL_LEN)
+        plain = Session(model, text, **common)
+        sentence = plain.plan_table([Session(model, text, draft_tokens=5, share=plain, drafter=drafter, **common)]).splitlines()[-1]
+        return round(float(sentence.split("needs about ", 1)[1].split(" GiB", 1)[0]))
+
+    figures = {(stack, cc): asked(stack, cc) for stack in ("fe-cublas", "native", "fe-entries") for cc in ((10, 0), (10, 3), (10, 7), (12, 0))}
+    cublas, entries, native = ([figures[(stack, cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] for stack in ("fe-cublas", "fe-entries", "native"))
+    # native keeps the weights of its three library rows on their stored codes on compute capability 10.x; elsewhere it plans as fe-entries
+    assert (cublas, entries, native) == ([61, 61, 61, 64], [44, 48, 48, 64], [32, 37, 37, 64])
+    said = (
+        f"about {cublas[0]} GiB of free GPU memory on the stack fe-cublas (about {cublas[3]} GiB on compute capability 12.x), on the stack fe-entries for "
+        f"about {entries[0]} GiB on compute capability 10.0, about {entries[1]} GiB on the other 10.x classes and about {entries[3]} GiB elsewhere, and on "
+        f"the stack native, whose three library rows need FlashInfer (00_decode.py --help has the command), for about {native[0]} GiB and about "
+        f"{native[1]} GiB there"
+    )
+    assert said in " ".join(sample.EPILOG.split()) and "a list of 65,536 ids and the default context length" in " ".join(sample.EPILOG.split())
+    # ... and the family README's section on the script states these figures, not others
+    readme = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split("\n## Speculative decoding\n", 1)[1].split("\n## ", 1)[0].split())
+    assert (
+        f"with a list of 65,536 ids and the default context length a run asks for about {cublas[0]} GiB free on the stack `fe-cublas` (about "
+        f"{cublas[3]} GiB on compute capability 12.x); on the stack `fe-entries` for about {entries[0]} GiB on compute capability 10.0, about "
+        f"{entries[1]} GiB on the other 10.x classes and about {entries[3]} GiB elsewhere; on the stack `native`, whose three library rows need "
+        f'FlashInfer (the section "The rows a library serves"), for about {native[0]} GiB and about {native[1]} GiB there.'
+    ) in readme
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The paged attention cache of a state (``state.PagedKvCache``, ``state.PageTable``): a pool of pages of 64 positions per
+# sequence, with the position and slot tables a kernel that writes a paged pool is handed.  No provider row asks for it
+# yet; a session builds it where a block of its plans does (``Block.cache_page``), and the reference chains reach either
+# layout through ``write`` / ``keys`` / ``values``.  Every index of the pool below is arithmetic written in the test.
+
+PAGE = 64
+
+
+def _bits(tensor):
+    """The bytes of a tensor as integers: 0.0 and -0.0 are two values, and a NaN compares equal to itself."""
+    whole = tensor.contiguous()
+    return whole.view({1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[whole.element_size()])
+
+
+def _same(a, b) -> bool:
+    return a.shape == b.shape and a.dtype == b.dtype and torch.equal(_bits(a), _bits(b))
+
+
+#: a geometry of the tiny kind with TWO key / value heads and four query heads: an axis of one head would hide a pool read
+#: in the wrong head order
+KV_SHAPES = {"state": (2, 8, 8), "conv": (3, 32), "kv": (2, 8), "rotary": (4, 1.0e7)}
+
+
+def _paged_model(kinds=("linear_attention", "full_attention")):
+    from model_samples.qwen_dense import Geometry, QwenDense
+
+    geometry = Geometry(
+        layer_kinds=kinds,
+        hidden=64,
+        vocab=272,
+        mlp=96,
+        la_key_heads=1,
+        la_value_heads=2,
+        la_head_dim=8,
+        attn_heads=4,
+        attn_kv_heads=2,
+        attn_head_dim=8,
+        rotary_dim=4,
+    )
+    return QwenDense(geometry, reductions=("tiny geometry",))
+
+
+def _two_states(sequences=3, capacity=130, tokens=1, pages=None):
+    """A plain state and a paged one of the same sequences, positions and tokens per sequence, one attention layer each."""
+    from model_samples.state import DecodeState
+
+    kinds = ("full_attention",)
+    plain = DecodeState(kinds, sequences, capacity, KV_SHAPES, "cpu", tokens)
+    paged = DecodeState(kinds, sequences, capacity, KV_SHAPES, "cpu", tokens, page=PAGE, pages=pages)
+    return plain, paged
+
+
+def _written(plain, paged, positions, seed=0):
+    """Write the same drawn key and value rows at ``positions`` into both caches; returns what was written, ``(keys, values)``
+    ``[sequences, kv heads, positions, head width]``, kept by the test."""
+    generator = torch.Generator().manual_seed(seed)
+    sequences, (heads, width) = plain.sequences, KV_SHAPES["kv"]
+    keys = torch.zeros((sequences, heads, len(positions), width), dtype=torch.bfloat16)
+    values = torch.zeros_like(keys)
+    for index, position in enumerate(positions):
+        k, v = (torch.randn((sequences, heads, width), generator=generator).to(torch.bfloat16) for _ in range(2))
+        keys[:, :, index], values[:, :, index] = k, v
+        for state in (plain, paged):
+            state.layers[0].write(position, k, v)
+    return keys, values
+
+
+def test_a_state_builds_the_plain_cache_or_a_pool_of_pages():
+    """``page=None`` builds exactly the tensors a state had: two per attention layer, ``[sequences, kv heads, capacity, head
+    width]``.  ``page=64`` builds per attention layer ONE zero pool ``[sequences x pages, kv heads, 64, 2 x head width]``
+    -- keys in the first half of the last axis, values in the second -- with ``ceil(capacity / 64)`` pages per sequence
+    unless ``pages`` says more; and the tables of the state, once for all its layers."""
+    from model_samples.state import DecodeState, KvCache, PagedKvCache, RecurrentSlots
+
+    kinds = ("linear_attention", "full_attention", "full_attention")
+    plain = DecodeState(kinds, 3, 130, KV_SHAPES, "cpu")
+    assert [type(layer) for layer in plain.layers] == [RecurrentSlots, KvCache, KvCache] and plain.page is None and plain.table is None
+    for cache in plain.layers[1:]:
+        assert [(tuple(t.shape), t.dtype) for t in cache.tensors()] == [((3, 2, 130, 8), torch.bfloat16)] * 2, "today's two tensors"
+    assert (
+        DecodeState(kinds, 3, 130, {name: shape for name, shape in KV_SHAPES.items() if name != "rotary"}, "cpu").bytes() == plain.bytes()
+    ), "a plain state reads no rotary fact"
+    for capacity, pages in ((1, 1), (63, 1), (64, 1), (65, 2), (128, 2), (129, 3), (130, 3)):
+        state = DecodeState(kinds, 3, capacity, KV_SHAPES, "cpu", page=PAGE)
+        assert (state.page, state.pages) == (PAGE, pages), f"capacity {capacity}: ceil(capacity / 64) pages per sequence"
+        assert isinstance(state.layers[0], RecurrentSlots) and tuple(state.layers[0].state.shape) == tuple(plain.layers[0].state.shape)
+        for cache in state.layers[1:]:
+            assert isinstance(cache, PagedKvCache) and (cache.page, cache.pages, cache.tokens) == (PAGE, pages, 1)
+            (pool,) = cache.tensors()
+            assert tuple(pool.shape) == (3 * pages, 2, PAGE, 16) and pool.dtype == torch.bfloat16 and not bool(pool.any()) and pool.is_contiguous()
+            assert pool.data_ptr() == cache.pool.data_ptr() and cache.table is state.table, "one pool per layer, the state's one table"
+            # the two halves a kernel is handed: views of the whole pool, the last axis contiguous, every other stride whole 16-byte vectors
+            for half, offset in ((cache.k_pool, 0), (cache.v_pool, 8)):
+                assert tuple(half.shape) == (3 * pages, 2, PAGE, 8) and half.stride() == (2 * PAGE * 16, PAGE * 16, 16, 1)
+                assert half.data_ptr() - cache.pool.data_ptr() == offset * 2 and all((stride * 2) % 16 == 0 for stride in half.stride()[:3])
+        assert state.layers[1].pool.data_ptr() != state.layers[2].pool.data_ptr(), "a pool per attention layer"
+    more = DecodeState(kinds, 3, 130, KV_SHAPES, "cpu", page=PAGE, pages=13)  # pages per sequence are an argument: more than the capacity needs
+    assert more.pages == 13 and tuple(more.layers[1].pool.shape) == (39, 2, PAGE, 16)
+    small = DecodeState(kinds, 2, 40, KV_SHAPES, "cpu", page=16)  # the page is the state's argument, not a constant of the class
+    assert (small.page, small.pages) == (16, 3) and tuple(small.layers[1].pool.shape) == (6, 2, 16, 16)
+    with pytest.raises(ValueError, match="130 positions per sequence need 3 pages of 64; got pages=2"):
+        DecodeState(kinds, 3, 130, KV_SHAPES, "cpu", page=PAGE, pages=2)
+    for wrong in (0, -64, 64.0, True, "64"):
+        with pytest.raises(ValueError, match="the page of an attention cache is a whole number of positions from 1"):
+            DecodeState(kinds, 3, 130, KV_SHAPES, "cpu", page=wrong)
+        with pytest.raises(ValueError, match=f"and a sequence owns a whole number of pages; got page=64, pages={wrong!r}"):
+            DecodeState(kinds, 3, 130, KV_SHAPES, "cpu", page=PAGE, pages=wrong)
+    with pytest.raises(ValueError, match="pages= says how many pages a sequence of a PAGED cache owns"):
+        DecodeState(kinds, 3, 130, KV_SHAPES, "cpu", pages=3)
+    without = DecodeState(("linear_attention",), 3, 130, KV_SHAPES, "cpu", page=PAGE)  # no attention layer: no pool, and no table to build
+    assert without.table is None and without.bytes() == DecodeState(("linear_attention",), 3, 130, KV_SHAPES, "cpu").bytes()
+
+
+def test_a_write_lands_on_the_page_and_the_row_of_its_position_and_nowhere_else():
+    """``write(position, k, v)`` of sequence ``i`` lands at ``pool[i x pages + position // 64, :, position % 64]``, keys in the
+    first half of the last axis and values in the second -- computed here, not by the class -- and every other byte of
+    the pool keeps what it held: three sequences, positions 0 to 129 (two full pages and two rows of a third)."""
+    plain, paged = _two_states(sequences=3, capacity=130)
+    cache, pages, width = paged.layers[0], 3, 8
+    generator = torch.Generator().manual_seed(3)
+    canary = torch.randn(cache.pool.shape, generator=generator).to(torch.bfloat16)
+    cache.pool.copy_(canary)
+    expected = canary.clone()
+    for position in range(130):
+        k, v = (torch.randn((3, 2, width), generator=generator).to(torch.bfloat16) for _ in range(2))
+        cache.write(position, k, v)
+        for sequence in range(3):
+            row = expected[sequence * pages + position // PAGE, :, position % PAGE]
+            row[:, :width], row[:, width:] = k[sequence], v[sequence]
+        assert _same(cache.pool, expected), f"position {position}: its row of every sequence, and no other byte"
+    # the rows no position of a sequence names: the 62 last rows of every sequence's third page still hold the canary
+    for sequence in range(3):
+        assert _same(cache.pool[sequence * pages + 2, :, 2:], canary[sequence * pages + 2, :, 2:])
+    # ... and the plain cache's write is the two statements it was: [sequences, kv heads, position, head width] of each tensor
+    k, v = (torch.randn((3, 2, width), generator=generator).to(torch.bfloat16) for _ in range(2))
+    before = [t.clone() for t in plain.layers[0].tensors()]
+    plain.layers[0].write(77, k, v)
+    for tensor, was, row in zip(plain.layers[0].tensors(), before, (k, v)):
+        was[:, :, 77] = row
+        assert _same(tensor, was)
+
+
+@pytest.mark.parametrize("pages", [None, 5])
+def test_the_keys_and_values_of_a_pool_are_those_of_the_plain_cache(pages):
+    """``keys(n, dtype)`` / ``values(n, dtype)``: the first ``n`` positions of every sequence, ``[sequences, kv heads, n, head
+    width]`` in ``dtype`` -- what the reference attention reads.  After the same writes the pool gives the plain cache's
+    bytes, and both give the rows the test wrote, for a count inside the first page, at both sides of every page
+    boundary and at the capacity, in bf16 (what ``standing()`` asks for) and in fp64 (what the chain accumulates in)."""
+    plain, paged = _two_states(sequences=3, capacity=130, pages=pages)
+    keys, values = _written(plain, paged, range(130))
+    for n in (0, 1, 2, 63, 64, 65, 127, 128, 129, 130):
+        for dtype in (torch.bfloat16, torch.float64):
+            for name, wrote in (("keys", keys), ("values", values)):
+                mine, theirs = getattr(paged.layers[0], name)(n, dtype), getattr(plain.layers[0], name)(n, dtype)
+                assert tuple(mine.shape) == (3, 2, n, 8) and mine.dtype == dtype, f"{name}({n}, {dtype})"
+                assert _same(mine, theirs) and _same(mine, wrote[:, :, :n].to(dtype)), f"{name}({n}, {dtype}): the rows written at positions 0 .. {n - 1}"
+    # the plain cache's read of bf16 is a view of its tensor, as it was; the pool's is a copy (the pages of a sequence are not one run of positions)
+    assert plain.layers[0].keys(70, torch.bfloat16).data_ptr() == plain.layers[0].k.data_ptr()
+    assert plain.layers[0].values(70, torch.bfloat16).data_ptr() == plain.layers[0].v.data_ptr()
+    copy = paged.layers[0].keys(70, torch.bfloat16)
+    copy.zero_()
+    assert _same(paged.layers[0].keys(70, torch.bfloat16), keys[:, :, :70]), "what a read returns is not the pool's memory"
+    # ... also where the rows read ARE one run of the pool: one sequence, one head, a page of one position, one position read
+    from model_samples.state import DecodeState
+
+    least = DecodeState(("full_attention",), 1, 4, dict(KV_SHAPES, kv=(1, 8)), "cpu", page=1).layers[0]
+    least.write(0, torch.ones((1, 1, 8), dtype=torch.bfloat16), torch.ones((1, 1, 8), dtype=torch.bfloat16))
+    least.keys(1, torch.bfloat16).zero_()
+    assert bool((least.pool[0] == 1).all()), "always a copy"
+
+
+def test_the_two_reference_chains_write_and_read_either_layout():
+    """The attention preparation and the attention core of the reference chain on a plain cache and on a paged one, positions
+    0 to 66 at three sequences: the same queries, gates and attention outputs, byte for byte.  And what the preparation
+    writes at its position is held against the in-projection's row itself -- the value rows are its value part, bit for
+    bit, and the key rows are not (they are normed and rotated) -- so a chain that hands its cache the two the other way
+    round fails here, on both layouts alike."""
+    from model_samples.providers import AttentionParams, torch_ref
+
+    heads, (kv_heads, width), (rotary, theta) = 4, KV_SHAPES["kv"], KV_SHAPES["rotary"]
+    generator = torch.Generator().manual_seed(4)
+    params = AttentionParams(heads, kv_heads, width, rotary, theta, *(0.02 * torch.randn(width, generator=generator).to(torch.bfloat16) for _ in range(2)))
+    plain, paged = _two_states(sequences=3, capacity=67)
+    for position in range(67):
+        row = torch.randn((3, (2 * heads + 2 * kv_heads) * width), generator=generator).to(torch.bfloat16)  # [q | gate] per query head, the keys, the values
+        outs = []
+        for state in (plain, paged):
+            cache = state.layers[0]
+            q, gate = torch_ref.attention_prepare(row, cache, position, params, 1e-6, torch.float64)
+            outs.append((q, gate, torch_ref.attention(q, cache, position, torch.float64)))
+            written = cache.values(position + 1, torch.bfloat16)[:, :, position], cache.keys(position + 1, torch.bfloat16)[:, :, position]
+            assert _same(written[0], row[:, (2 * heads + kv_heads) * width :].view(3, kv_heads, width)), f"position {position}: the value rows, a bit copy"
+            assert not _same(written[1], row[:, 2 * heads * width : (2 * heads + kv_heads) * width].view(3, kv_heads, width)) and not _same(*written)
+        assert all(_same(mine, theirs) for mine, theirs in zip(outs[1], outs[0])), f"position {position}: queries, gates and the attention output"
+    assert _same(paged.layers[0].keys(67, torch.float64), plain.layers[0].keys(67, torch.float64))
+
+
+def test_a_paged_cache_answers_what_the_plain_cache_answers():
+    """Everything a check asks of a cache -- the sequences that own some rows of a step (``rows``), where a sequence lives
+    (``of``), the cache as a decode step takes it (``first_token``), ``tensors``, and of the state ``snapshot``,
+    ``restore``, ``clear``, ``standing`` and ``bytes`` -- against the plain cache on the same writes, at four tokens per
+    sequence."""
+    from model_samples.state import PagedKvCache
+
+    tokens, pages, width = 4, 3, 8
+    plain, paged = _two_states(sequences=3, capacity=130, tokens=tokens)
+    keys, values = _written(plain, paged, range(100))
+    flat, cache = plain.layers[0], paged.layers[0]
+    assert cache.tokens == flat.tokens == tokens
+    # rows: the rows 4 to 7 of a step are sequence 1's; rows 4 to 11 those of sequences 1 and 2
+    for start, stop, sequences in ((4, 8, [1]), (4, 12, [1, 2]), (0, 4, [0]), (0, 12, [0, 1, 2])):
+        window, theirs = cache.rows(start, stop), flat.rows(start, stop)
+        assert isinstance(window, PagedKvCache) and window.pool is cache.pool and window.tokens == tokens, "the same pool: the window is of its sequences"
+        for n in (1, 64, 65, 100):
+            assert _same(window.keys(n, torch.float64), theirs.keys(n, torch.float64)) and _same(window.values(n, torch.bfloat16), theirs.v[:, :, :n])
+            assert _same(window.keys(n, torch.bfloat16), keys[sequences, :, :n])
+        (mine,) = window.tensors()  # the pages of its sequences, as views of the pool
+        assert tuple(mine.shape) == (len(sequences) * pages, 2, PAGE, 16) and mine.data_ptr() == cache.pool[sequences[0] * pages].data_ptr()
+        whole = (3 * pages, 2, PAGE, width)
+        assert window.k_pool.data_ptr() == cache.pool.data_ptr() and tuple(window.v_pool.shape) == whole, "a kernel is handed the WHOLE pool"
+    # a write through the window of sequence 1 is in the pool, at sequence 1's row of that position, and nowhere else
+    k, v = (torch.full((1, 2, width), fill, dtype=torch.bfloat16) for fill in (2.5, -3.5))
+    before = cache.pool.clone()
+    cache.rows(4, 8).write(101, k, v)
+    before[1 * pages + 101 // PAGE, :, 101 % PAGE, :width], before[1 * pages + 101 // PAGE, :, 101 % PAGE, width:] = k[0], v[0]
+    assert _same(cache.pool, before), "the same memory"
+    flat.rows(4, 8).write(101, k, v)
+    # of: where sequence i lives in each tensor of tensors() -- its pages; in the plain cache its row of both tensors
+    for sequence in range(3):
+        (where,) = cache.of(sequence)
+        mine = cache.tensors()[0][where]
+        assert tuple(mine.shape) == (pages, 2, PAGE, 16) and mine.data_ptr() == cache.pool[sequence * pages].data_ptr()
+        theirs = [tensor[at] for tensor, at in zip(flat.tensors(), flat.of(sequence))]
+        for half, plain_rows in zip((mine[..., :width], mine[..., width:]), theirs):
+            assert _same(half.transpose(0, 1).reshape(2, pages * PAGE, width)[:, :130], plain_rows), f"sequence {sequence}: its positions, page after page"
+    # first_token: the same pool as a decode step takes it, with the table of one token per sequence
+    first = cache.first_token()
+    assert isinstance(first, PagedKvCache) and first.pool is cache.pool and (first.tokens, first.pages) == (1, pages)
+    assert first.table is paged.table.first_token() and first.table.tokens == 1 and cache.table.tokens == tokens
+    assert paged.decode_layers[0].pool is cache.pool and paged.decode_layers[0].tokens == 1
+    alone = cache.rows(4, 8).first_token()  # of a window: the window's sequences, at one token each
+    assert (alone.first, alone.sequences, alone.tokens) == (1, 1, 1) and _same(alone.keys(100, torch.bfloat16), keys[1:2, :, :100])
+    assert cache.first_token().rows(1, 3).at(7)[2].tolist() == [1 * pages * PAGE + 7, 2 * pages * PAGE + 7], "rows of a decode step are sequences"
+    assert _same(first.keys(102, torch.bfloat16), flat.first_token().keys(102, torch.bfloat16))
+    # standing: the cached keys and values up to the position, whatever the layout
+    for position in (0, 1, 63, 64, 65, 102, 130):
+        plain.position = paged.position = position
+        for mine, theirs in zip(paged.standing()[0], plain.standing()[0]):
+            assert _same(mine, theirs) and tuple(mine.shape) == (3, 2, position, width)
+    # snapshot, restore and clear go through tensors(): the pool is saved, written back and zeroed in place; the tables are constants
+    table = paged.table
+    constants = [t.clone() for t in (table.cos_sin, table.positions, table.slots, table.first_token().positions, table.first_token().slots)]
+    plain.position = paged.position = 102
+    snaps = plain.snapshot(), paged.snapshot()
+    assert len(snaps[1]["layers"][0]) == 1 and _same(snaps[1]["layers"][0][0], cache.pool) and snaps[1]["layers"][0][0].data_ptr() != cache.pool.data_ptr()
+    held = cache.pool.clone()
+    _written(plain, paged, range(90, 130), seed=5)
+    plain.position = paged.position = 130
+    assert not _same(cache.pool, held)
+    pool = cache.pool
+    for state, snap in zip((plain, paged), snaps):
+        state.restore(snap)
+    assert paged.position == 102 and cache.pool is pool and _same(cache.pool, held), "written back into the existing allocation"
+    for mine, theirs in zip(paged.standing()[0], plain.standing()[0]):
+        assert _same(mine, theirs)
+    paged.clear()
+    assert paged.position == 0 and cache.pool is pool and not bool(cache.pool.any()) and paged.table is table
+    now = (table.cos_sin, table.positions, table.slots, table.first_token().positions, table.first_token().slots)
+    assert all(_same(tensor, was) for tensor, was in zip(now, constants)), "no call writes a table: not a write, not a restore, not a clear"
+    assert table.tensors() == () and table.first_token().tensors() == ()
+    # bytes: the pool and the tables
+    tables = sum(t.numel() * t.element_size() for t in now)
+    assert paged.bytes() == cache.pool.numel() * 2 + tables and plain.bytes() == 2 * flat.k.numel() * 2
+    assert (
+        cache.pool.numel() * 2 - plain.bytes() == 3 * 2 * (pages * PAGE - 130) * 2 * width * 2
+    ), "the capacity rounded up to a page: 62 positions more per sequence"
+
+
+def test_the_position_and_slot_tables_of_a_paged_state():
+    """``PageTable``: what a kernel that prepares the operands of a paged attention reads beside the pool.  ``cos_sin``
+    ``[capacity, rotary width]`` bf16, per position the cosines and then the sines, each row what the reference chain
+    forms for that position (``torch_ref.rope_cos_sin``), bit for bit; ``positions`` int64 ``[capacity - tokens + 1, 3,
+    rows]``, row ``p`` holding ``p + t`` for token ``t`` of every sequence, as three real rows; ``slots`` int64 ``[capacity
+    - tokens + 1, rows]``: ``sequence x pages x 64 + p + t``, the flat index of that position's row in the pool.  Every value
+    against that arithmetic written out here; ``at(position)`` hands out views of the tables."""
+    import math
+
+    from model_samples.providers import torch_ref
+    from model_samples.state import PageTable
+
+    sequences, tokens, capacity, pages = 3, 4, 130, 3
+    plain, paged = _two_states(sequences, capacity, tokens)
+    table, cache, rows = paged.table, paged.layers[0], sequences * tokens
+    steps = capacity - tokens + 1  # a step starts at 0 .. capacity - tokens: no row beyond, whose last token would be past the capacity
+    assert (table.tokens, tuple(table.positions.shape), tuple(table.slots.shape)) == (tokens, (steps, 3, rows), (steps, rows))
+    assert table.positions.dtype == table.slots.dtype == torch.int64 and table.positions.is_contiguous() and table.slots.is_contiguous()
+    assert table.positions.stride() == (3 * rows, rows, 1), "three REAL rows a position: no expanded axis"
+    positions, slots = table.positions.tolist(), table.slots.tolist()
+    for start in range(steps):
+        for sequence in range(sequences):
+            for token in range(tokens):
+                row = sequence * tokens + token  # the rows of a step stand sequence by sequence
+                assert [positions[start][axis][row] for axis in range(3)] == [start + token] * 3, f"step at {start}, sequence {sequence}, token {token}"
+                assert slots[start][row] == sequence * pages * PAGE + start + token
+        assert len(set(slots[start])) == rows, "the slots of a step are distinct: no two rows of a launch write one pool row"
+    assert max(max(row) for step in positions for row in step) == capacity - 1, "every position is a row of the cos / sin table"
+    assert max(max(step) for step in slots) == (sequences - 1) * pages * PAGE + capacity - 1 < cache.pool.shape[0] * PAGE
+    # the slot of a position is the row the accessor writes: read back by the slot's own arithmetic, page x 64 + row
+    keys, values = _written(plain, paged, range(capacity))
+    for start in (0, 60, 63, 64, 126):
+        for row, slot in enumerate(slots[start]):
+            sequence, token = divmod(row, tokens)
+            page, line = divmod(slot, PAGE)
+            assert _same(cache.k_pool[page, :, line], keys[sequence, :, start + token]) and _same(
+                cache.v_pool[page, :, line], values[sequence, :, start + token]
+            )
+    # the cos / sin table: the chain's own function at every position, bit for bit; cosines first, then sines
+    width, theta = KV_SHAPES["rotary"]
+    assert tuple(table.cos_sin.shape) == (capacity, width) and table.cos_sin.dtype == torch.bfloat16 and table.cos_sin.is_contiguous()
+    for position in range(capacity):
+        cos, sin = torch_ref.rope_cos_sin(position, width, theta, "cpu")
+        assert _same(table.cos_sin[position], torch.cat((cos, sin))), f"position {position}"
+        for index in range(width // 2):
+            angle = position * theta ** (-2 * index / width)
+            assert (
+                abs(float(table.cos_sin[position, index]) - math.cos(angle)) < 2.0**-7
+                and abs(float(table.cos_sin[position, width // 2 + index]) - math.sin(angle)) < 2.0**-7
+            )
+    # at(position): the rows of a step that starts there, as views inside the tables -- nothing is copied, nothing launched
+    for start in (0, 63, 64, steps - 1):
+        cos_sin, at, slot = cache.at(start)
+        assert cos_sin is table.cos_sin and tuple(at.shape) == (3, rows) and tuple(slot.shape) == (rows,)
+        assert at.data_ptr() == table.positions[start].data_ptr() and slot.data_ptr() == table.slots[start].data_ptr()
+        assert at.dtype == slot.dtype == torch.int64 and at.stride(-1) == 1 and slot.is_contiguous() and at.data_ptr() % 8 == slot.data_ptr() % 8 == 0
+    # a position no step starts at is refused: one past the last row, and a negative one, which would index the tables from their end
+    for outside in (-1, -steps, steps, capacity):
+        with pytest.raises(
+            IndexError, match=f"position {outside} is not one a step of 4 tokens per sequence starts at: the tables hold {steps} such positions, from 0"
+        ):
+            cache.at(outside)
+    with pytest.raises(IndexError, match=f"position -1 is not one a step of 1 token per sequence starts at: the tables hold {capacity} such positions, from 0"):
+        cache.first_token().at(-1)
+    # one sequence out of several (a check runs a sequence alone): the same table rows cut to its columns, the same slots, the whole pool
+    for sequence in range(sequences):
+        alone = cache.rows(sequence * tokens, (sequence + 1) * tokens)
+        cos_sin, at, slot = alone.at(64)
+        assert cos_sin is table.cos_sin and at.tolist() == [[64 + token for token in range(tokens)]] * 3
+        assert slot.tolist() == [sequence * pages * PAGE + 64 + token for token in range(tokens)], "its own slots: the pool is the whole pool"
+        assert at.data_ptr() == table.positions[64, 0, sequence * tokens :].data_ptr() and slot.data_ptr() == table.slots[64, sequence * tokens :].data_ptr()
+        assert (
+            at.stride(-1) == 1 and slot.is_contiguous() and at.data_ptr() % 8 == slot.data_ptr() % 8 == 0
+        ), "aligned to their element, the token axis contiguous"
+    # the decode steps of a prompt on a state of several tokens: the table of ONE token per sequence, on the same cos / sin table
+    single = table.first_token()
+    assert single.tokens == 1 and single.first_token() is single and single.cos_sin is table.cos_sin
+    assert (tuple(single.positions.shape), tuple(single.slots.shape)) == ((capacity, 3, sequences), (capacity, sequences))
+    for position in (0, 63, 64, capacity - 1):
+        _, at, slot = cache.first_token().at(position)
+        assert at.tolist() == [[position] * sequences] * 3 and slot.tolist() == [sequence * pages * PAGE + position for sequence in range(sequences)]
+    one_token = _two_states(sequences, capacity)[1].table
+    assert plain.table is None and one_token.first_token() is one_token, "at one token per sequence the table is its own table of one token"
+    # a state too short for one step of its tokens has no row to start from
+    assert tuple(_two_states(2, 3, tokens=4)[1].table.positions.shape) == (0, 3, 8)
+    # the two things a kernel cannot check are asked of the integers a table is built from: every position has a row of the
+    # cos / sin table, and a sequence's pages hold its positions (else two sequences would share a slot)
+    with pytest.raises(ValueError, match="130 positions per sequence need a cos / sin table of as many rows; got 129"):
+        PageTable.build(sequences, tokens, capacity, PAGE, pages, table.cos_sin[:129], "cpu")
+    with pytest.raises(ValueError, match="130 positions per sequence need 3 pages of 64; got pages=2"):
+        PageTable.build(sequences, tokens, capacity, PAGE, 2, table.cos_sin, "cpu")
+
+
+def test_a_paged_cache_takes_the_tables_of_its_own_pool_and_no_others():
+    """A slot is an index into ONE pool, and a row of the tables the rows of ONE step shape.  Tables built for other
+    sequences, other pages per sequence, another page or other tokens per sequence would hand a kernel slots past the
+    pool's end or inside another sequence's pages, and a kernel that is told a slot reads nothing back.  So a table
+    states the integers it was built from and a cache refuses one that was not built for its pool, as it refuses a
+    window that is not of the pool's sequences.  Everything a state builds itself is accepted."""
+    from model_samples.state import DecodeState, PagedKvCache
+
+    state = DecodeState(("full_attention",), 3, 130, KV_SHAPES, "cpu", tokens=4, page=PAGE)
+    cache, table = state.layers[0], state.table
+    assert (table.sequences, table.page, table.pages, table.tokens) == (3, PAGE, 3, 4), "what the tables were built from, as host integers"
+    assert (table.first_token().sequences, table.first_token().page, table.first_token().pages, table.first_token().tokens) == (3, PAGE, 3, 1)
+    # what a state builds: its cache, the cache of its decode steps, a window of some sequences and of none, a window's decode cache
+    for built in (cache, cache.first_token(), cache.rows(4, 12), cache.rows(8, 8), cache.rows(12, 12), cache.rows(4, 8).first_token()):
+        again = PagedKvCache(built.pool, built.pages, built.table, built.tokens, built.first, built.sequences)
+        assert (again.first, again.sequences) == (built.first, built.sequences) and again.pool is cache.pool
+    assert (
+        PagedKvCache(cache.pool, 3, table, 4).sequences == 3 and PagedKvCache(cache.pool, 3, table, 4, 1).sequences == 2
+    ), "left out: the pool's sequences from the first"
+
+    def pool(pages, page=PAGE):
+        return torch.zeros((pages, 2, page, 16), dtype=torch.bfloat16)
+
+    mine = "these are for a pool of 9 pages (3 a sequence) of 64 positions, tokens per sequence 4; the cache has a pool of "
+    planted = {  # each differs from the state's own cache in ONE thing; the last is what a cache built for two pages a sequence would be
+        "the pool of two sequences": (lambda: PagedKvCache(pool(6), 3, table, 4), "6 pages (3 a sequence) of 64 positions, tokens per sequence 4"),
+        "other pages per sequence": (lambda: PagedKvCache(cache.pool, 9, table, 4), "9 pages (9 a sequence) of 64 positions, tokens per sequence 4"),
+        "another page": (lambda: PagedKvCache(pool(9, 16), 3, table, 4), "9 pages (3 a sequence) of 16 positions, tokens per sequence 4"),
+        "the table of four tokens at one": (lambda: PagedKvCache(cache.pool, 3, table, 1), "9 pages (3 a sequence) of 64 positions, tokens per sequence 1"),
+        "a pool of two pages a sequence": (lambda: PagedKvCache(pool(6), 2, table, 4), "6 pages (2 a sequence) of 64 positions, tokens per sequence 4"),
+    }
+    for what, (build, theirs) in planted.items():
+        with pytest.raises(ValueError) as error:
+            build()
+        assert str(error.value) == "the tables of a paged cache are built for its pool: " + mine + theirs, what
+    with pytest.raises(ValueError, match="tokens per sequence 1; the cache has a pool of 9 pages .3 a sequence. of 64 positions, tokens per sequence 4"):
+        PagedKvCache(cache.pool, 3, table.first_token(), 4)  # ... and the table of one token is not the table of a step of four
+    # the window: sequences of the pool, and no others
+    for first, sequences in ((2, 2), (4, 0), (-1, 1), (1, -1)):
+        with pytest.raises(ValueError, match=f"a paged cache stands for sequences of its pool, which holds 3; got first={first}, sequences={sequences}"):
+            PagedKvCache(cache.pool, 3, table, 4, first, sequences)
+    with pytest.raises(ValueError, match="which holds 3; got first=2, sequences=2"):
+        cache.rows(8, 16)  # the rows 8 to 15 of a step would be sequences 2 and 3
+
+
+def test_no_provider_asks_for_a_paged_cache_yet_and_every_plan_builds_the_plain_one():
+    """The paged layout comes in front of the row that needs it: no adapter of the closed list names a page today, so no
+    plan of any family, stack, GPU class or step shape builds a pool, and the area README says so.  The first adapter
+    that names a page fails this case: its row changes what the runs of its stacks hold, and the README's sentence.
+    Two more sentences of that README are held here to what they are about: the page of the target kernel set, which
+    is the family's constant and the page of every case of this group; and where the GPU cell of the paged cache runs."""
+    from model_samples import Session, TextIO, providers
+    from model_samples.qwen_dense import configs
+
+    assert providers.BlockBase.cache_page is None and all(getattr(factory, "cache_page", None) is None for factory in providers.factories().values())
+    model = _tiny_model()
+    for more in ({}, {"tokens": 4}, {"draft_tokens": 3}):
+        assert Session(model, TextIO.synthetic(model.geometry.vocab), sequences=2, stack="reference", device="cpu", capacity=16, **more).cache_page() is None
+    readme = " ".join((MODELS / "README.md").read_text(encoding="utf-8").split())
+    assert "a session builds the pool where a block of its plans asks for one, and no provider row does yet, so every run builds the first layout" in readme
+    assert PAGE == configs.ATTENTION_PAGE and f"(a fixed number of positions each, {PAGE} in the target kernel set; a run of pages per sequence)" in readme
+    # the cell is gated: the classes the family serves and compute capability 8.0 (the GPU module holds the condition on stated capabilities)
+    assert (
+        "one GPU the family serves; L0 runs two layers, L1 four; the cell of the paged cache runs there and on compute capability 8.0, "
+        "and is skipped by name on any other class |"
+    ) in readme
+
+
+@contextlib.contextmanager
+def _a_block_asks_for_a_page(page=PAGE, key="torch_ref.attention_prepare"):
+    """Inside: a plan that is resolved serves the block of ``key`` with a stand-in that runs the reference chain under another
+    type and asks for an attention cache in pages of ``page`` positions (``Block.cache_page``) -- what the adapter of a
+    kernel that writes a paged pool states.  Yields the stand-in's class."""
+    from model_samples import providers
+
+    registry = providers.factories
+    served = registry()[key]
+
+    class AsksForAPage(served):
+        cache_page = page
+
+    providers.factories = lambda: dict(registry(), **{key: AsksForAPage})
+    try:
+        yield AsksForAPage
+    finally:
+        providers.factories = registry
+
+
+def _decoded(session, prompts, steps):
+    """A prompt and ``steps`` decode steps: ``(the ids of every step, the logits of every step, what the state stands on)``."""
+    ids = session.prefill(prompts)
+    chosen = [session.read(ids)]
+    for _ in range(steps):
+        ids = session.step(ids)
+        chosen.append(session.read(ids))
+    standing = [tuple(t.clone() for t in layer) for layer in session.state.standing()]
+    return chosen, session.record.logits[: session.record.count].clone(), standing
+
+
+@pytest.mark.parametrize("sequences", [1, 3])
+def test_a_session_on_a_paged_cache_is_the_session_on_the_plain_one_byte_for_byte(sequences):
+    """Two sessions of the reference stack on one load: in one the attention preparation is a stand-in that asks for a cache
+    in pages of 64 positions, so its state is paged; the other's is plain.  A prompt longer than a page and decode steps
+    up to the last position of the last page: equal ids, equal logits bytes, equal ``standing()`` bytes.  And a state
+    zeroed in place gives the run again."""
+    import model_samples
+    from model_samples.providers import torch_ref
+    from model_samples.state import KvCache, PagedKvCache
+
+    model = _paged_model()
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    common = dict(sequences=sequences, stack="reference", device="cpu", capacity=128)
+    plain = model_samples.Session(model, text, **common)
+    paged = model_samples.Session(model, text, share=plain, **common)
+    with _a_block_asks_for_a_page() as stand_in:
+        paged.resolve()
+    assert type(paged.plan["attention.prepare"]) is stand_in and type(plain.resolve()["attention.prepare"]) is not stand_in
+    assert (plain.cache_page(), paged.cache_page()) == (None, PAGE), "a session asks its own plans: no block of the plain one names a page"
+    assert plain.plan_table([paged]) == plain.plan.table(), "no memory sentence on the CPU"
+    plain.load()
+    paged.load()
+    assert isinstance(plain.state.layers[1], KvCache) and isinstance(paged.state.layers[1], PagedKvCache) and paged.state.pages == 2
+    g, table = model.geometry, paged.state.table  # the cos / sin table is built from the model's rotary width and theta, by the chain's function
+    assert all(_same(table.cos_sin[p], torch.cat(torch_ref.rope_cos_sin(p, g.rotary_dim, g.rope_theta, "cpu"))) for p in (0, 1, 63, 64, 127))
+    assert paged.weights is plain.weights and paged.state is not plain.state, "one load, two states: a pool is never shared"
+    generator = torch.Generator().manual_seed(1)
+    prompts = [torch.randint(0, model.geometry.vocab, (70,), generator=generator) for _ in range(sequences)]  # a prompt longer than one page
+    theirs = _decoded(plain, prompts, 58)
+    mine = _decoded(paged, prompts, 58)
+    assert paged.state.position == plain.state.position == 128, "the last step wrote position 127: the last row of the last page of every sequence"
+    assert mine[0] == theirs[0] and _same(mine[1], theirs[1]), "equal ids and equal logits bytes at every step, also across positions 63 and 64"
+    for layer, (own, other) in enumerate(zip(mine[2], theirs[2])):
+        assert all(_same(a, b) for a, b in zip(own, other)), f"layer {layer}: what the state stands on"
+    pool = paged.state.layers[1].pool
+    assert bool(pool[-1, :, -1].any()) and bool(pool[0, :, 0].any()), "the pool's first row and its very last one were written"
+    with pytest.raises(ValueError, match="built for 128 positions per sequence"):  # a step past the capacity, as on the plain cache
+        paged.step(torch.tensor(mine[0][-1], dtype=torch.int32))
+    # zeroed in place: the same pool, the same tables, and the same run
+    table = paged.state.table
+    paged.reset(fresh=False)
+    assert paged.state.layers[1].pool is pool and paged.state.table is table and not bool(pool.any()) and paged.state.position == 0
+    again = _decoded(paged, prompts, 58)
+    assert again[0] == mine[0] and _same(again[1], mine[1])
+    paged.reset(fresh=True)
+    assert paged.state.layers[1].pool is not pool and isinstance(paged.state.layers[1], PagedKvCache), "a fresh state is built in the session's layout"
+
+
+def _judged_run(defect=None):
+    """Three sequences of the reference stack whose attention preparation asks for a paged cache and stands in a row with
+    a band (``bitwise``), a prompt of 60 tokens and 12 decode steps -- across positions 63 / 64 -- and the checks of that
+    run.  ``defect(cache, position)`` runs behind every call of the stand-in."""
+    import dataclasses
+
+    import model_samples
+    from model_samples import tie_out
+    from model_samples.state import PagedKvCache
+
+    model = _paged_model()
+    (row,) = model.provider_table["attention.prepare"]
+    model.provider_table = dict(model.provider_table, **{"attention.prepare": [dataclasses.replace(row, band="bitwise")]})
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    session = model_samples.Session(model, text, sequences=3, stack="reference", device="cpu", capacity=80)
+    with _a_block_asks_for_a_page() as stand_in:
+        session.plan_table()
+    if defect is not None:
+        chain = stand_in.__call__
+
+        def wrong(self, qkv, cache, position, params):
+            out = chain(self, qkv, cache, position, params)
+            defect(cache, position)
+            return out
+
+        stand_in.__call__ = wrong
+    session.load()
+    generator = torch.Generator().manual_seed(2)
+    _decoded(session, [torch.randint(0, model.geometry.vocab, (60,), generator=generator) for _ in range(3)], 12)
+    assert session.state.position == 72 and isinstance(session.state.layers[1], PagedKvCache) and session.state.pages == 2
+    return tie_out.run_checks(session, prompt_tokens=60)
+
+
+def test_the_checks_of_a_run_on_a_paged_cache_judge_the_block_that_asked_for_it():
+    """The checks of a run whose attention preparation asks for a paged cache, over steps that cross positions 63 / 64 at
+    three sequences.  The stand-in is another type than the reference chain and its row names a band, so it is judged:
+    the reference block runs on the provider's own cache object, through the accessors, and the pool it leaves is
+    compared byte for byte.  Every sequence is also run alone, on its window of the pool (``rows``, ``of``).  A stand-in
+    that leaves the key rows of a position one row late in their page fails by the state."""
+    checks = _judged_run()
+    line = next(line for line in checks.lines if line.split()[:1] == ["attention.prepare"])
+    assert checks.ok and "1 of 1 provider blocks inside their bands" in checks.text(), checks.text()
+    assert "  72 calls  " in line and "STATE DIFFERS" not in line and line.endswith("[band: bitwise]  PASS"), line
+    assert "one sequence alone vs among 3 (step t: sequence t mod 3)" in checks.text() and "12 of 12 blocks equal" in checks.text(), checks.text()
+    assert checks.lines[1].endswith("byte-identical on a second run from a fresh state    PASS")
+
+    def one_row_late(cache, position):
+        keys = cache.k_pool.view(-1, cache.pages, *cache.k_pool.shape[1:])[:, position // PAGE]  # the page of the position, of every sequence
+        keys[:, :, (position + 1) % PAGE] = keys[:, :, position % PAGE].clone()
+        keys[:, :, position % PAGE] = 0
+
+    failed = _judged_run(one_row_late)
+    line = next(line for line in failed.lines if line.split()[:1] == ["attention.prepare"])
+    assert not failed.ok and "STATE DIFFERS" in line and line.endswith("[band: bitwise]  FAIL"), failed.text()
+
+
+def test_two_layouts_in_one_session_are_a_wrong_table_and_the_memory_sentence_counts_the_pool_and_the_tables(monkeypatch):
+    """A session has one state, so the blocks of its plans ask for one layout of its attention cache: two pages -- inside a
+    plan, or in the two plans of a session that verifies behind its prompt -- are a ``ValueError`` that names the blocks
+    and their plans, before anything is built; so is a page that is no whole number of positions from 1; and of a block
+    that several rows serve by call site every part is asked.  And what a paged state holds is what the memory sentence
+    counts: the pool (the capacity rounded up to whole pages) and the tables, megabytes at the published widths."""
+    import copy
+
+    import model_samples
+    from model_samples import blocks
+    from model_samples.qwen_dense import QwenDense
+    from model_samples.state import DecodeState
+
+    tiny = _paged_model()
+    text = model_samples.TextIO.synthetic(tiny.geometry.vocab)
+    common = dict(sequences=2, stack="reference", device="cpu", capacity=40)
+    both = model_samples.Session(tiny, text, **common)
+    with _a_block_asks_for_a_page(64), _a_block_asks_for_a_page(16, "torch_ref.attention"):
+        both.resolve()
+    sentence = (
+        "the provider table is wrong: the blocks of one session ask for two layouts of its attention cache -- attention.prepare in the plan of 2 "
+        "sequences asks for pages of 64 positions, attention.core in the plan of 2 sequences for pages of 16; a session has one state, in one layout"
+    )
+    for refused in (both.cache_page, both.plan_table, both.load):
+        with pytest.raises(ValueError) as error:
+            refused()
+        assert str(error.value) == sentence
+    assert both.state is None and both.weights is None, "named before anything is read or built"
+    first = model_samples.Session(tiny, text, **common)
+    with pytest.raises(ValueError) as error:  # ... also for a session that runs behind another one on its weights: the first plans it
+        first.plan_table([both])
+    assert str(error.value) == sentence and first.cache_page() is None
+    behind = model_samples.Session(tiny, text, draft_tokens=3, **common)
+    with _a_block_asks_for_a_page(64):
+        behind.plan = behind._resolve(behind.tokens)
+    with _a_block_asks_for_a_page(16):
+        behind.prefill_plan = behind._resolve(1, state_tokens=behind.tokens)
+    with pytest.raises(ValueError) as error:
+        behind.plan_table()
+    assert "attention.prepare in the plan of 2 sequences asks for pages of 16 positions" in str(error.value), "the prompt's decode plan"
+    assert "attention.prepare in the plan of 2 sequences x 4 tokens per sequence for pages of 64" in str(error.value), "the verify plan"
+    same = model_samples.Session(tiny, text, draft_tokens=3, **common)
+    with _a_block_asks_for_a_page(64):
+        same.plan = same._resolve(same.tokens)
+    assert same.resolve() is same.plan and same.cache_page() == 64, "a block that names no page reads either layout: the prompt's plan asks for nothing"
+    with _a_block_asks_for_a_page(64), _a_block_asks_for_a_page(64, "torch_ref.attention"):
+        assert model_samples.Session(tiny, text, **common).cache_page() == 64, "two blocks, one page"
+    # a page that is no whole number of positions from 1 is a wrong table too, named at the same places: before anything is read
+    for wrong in (0, -64, True, 64.0, "64"):
+        named = model_samples.Session(tiny, text, **common)
+        with _a_block_asks_for_a_page(wrong):
+            named.resolve()
+        for refused in (named.cache_page, named.plan_table, named.load):
+            with pytest.raises(ValueError) as error:
+                refused()
+            assert str(error.value) == (
+                f"the provider table is wrong: attention.prepare in the plan of 2 sequences asks for pages of {wrong!r} positions; "
+                "the page of an attention cache is a whole number of positions from 1"
+            )
+        assert named.state is None and named.weights is None, f"cache_page = {wrong!r}: named before anything is read or built"
+    # a block whose calls two rows serve by call site (``blocks.BySite``) names no page itself: every part of it is asked
+    split = model_samples.Session(tiny, text, **common)
+    with _a_block_asks_for_a_page(64):
+        plan = split.resolve()
+    row, chain = plan.rows["attention.core"], plan["attention.core"]
+    part = copy.copy(chain)
+    part.cache_page = 16
+    plan["attention.core"] = blocks.BySite("attention.core", [("a", row, chain), ("b", row, part)])
+    assert plan["attention.core"].cache_page is None and chain.cache_page is None, "the holder and the part of the call site a name none"
+    with pytest.raises(
+        ValueError, match="attention.prepare in the plan of 2 sequences asks for pages of 64 positions, attention.core at b in the plan of 2 sequences for"
+    ):
+        split.cache_page()
+    part.cache_page = 64
+    assert split.cache_page() == 64, "the part of the call site b asks for the page the preparation asks for"
+    # the arithmetic of the memory sentence is the state's own size, at every tokens count, capacity and pages per sequence
+    for sequences, tokens, capacity, pages in ((1, 1, 40, None), (3, 1, 130, None), (2, 4, 130, None), (3, 6, 64, None), (2, 1, 130, 13), (1, 5, 3, None)):
+        state = DecodeState(tiny.geometry.layer_kinds, sequences, capacity, tiny.state_shapes(), "cpu", tokens, page=PAGE, pages=pages)
+        assert state.bytes() == tiny.state_bytes(sequences, capacity, tokens, page=PAGE, pages=pages), (sequences, tokens, capacity, pages)
+        assert (
+            tiny.state_bytes(sequences, capacity, tokens)
+            == DecodeState(tiny.geometry.layer_kinds, sequences, capacity, tiny.state_shapes(), "cpu", tokens).bytes()
+        )
+    assert tiny.state_shapes()["rotary"] == (tiny.geometry.rotary_dim, tiny.geometry.rope_theta)
+    linear = _paged_model(("linear_attention", "linear_attention"))  # no attention layer: no pool, and no table to count
+    built = DecodeState(linear.geometry.layer_kinds, 3, 130, linear.state_shapes(), "cpu", page=PAGE)
+    assert built.bytes() == linear.state_bytes(3, 130, page=PAGE) == linear.state_bytes(3, 130)
+    # at the published widths: 16 attention layers, 4 key / value heads of 256, a context of 2,051 positions = 33 pages of 64
+    model = QwenDense()
+    plain, paged = model.state_bytes(16, 2051, 6), model.state_bytes(16, 2051, 6, page=PAGE)
+    pool = (
+        16 * 16 * 33 * 4 * PAGE * 512 * 2 - 16 * 2 * 16 * 4 * 2051 * 256 * 2
+    )  # per layer one pool of 33 pages a sequence, where two tensors of 2,051 positions were
+    tables = 2051 * 64 * 2 + (2051 - 6 + 1) * 96 * 32 + 2051 * 16 * 32  # cos / sin; positions and slots of a step of 6 tokens; and of the prompt's decode steps
+    assert (
+        paged - plain == pool + tables and pool == 16 * 16 * 4 * 61 * 512 * 2 and 7.0e6 < tables < 8.0e6
+    ), "61 positions more a sequence and layer; megabytes of tables"
+    assert model.memory_bytes(16, 2051, tokens=6, page=PAGE) - model.memory_bytes(16, 2051, tokens=6) == pool + tables
+    assert (
+        model.state_bytes(16, 2051, 6, page=PAGE, pages=39) - paged == 16 * 16 * 6 * 4 * PAGE * 512 * 2
+    ), "39 pages a sequence where 33 hold the capacity: six pages more a sequence"
+    # ... and the sentence of a session whose plan asks for a page counts it, for the session and for the sessions behind it
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 200 * GIB)))
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    stated = dict(sequences=64, stack="reference", device="cuda:0", capacity=2051)
+
+    def need(first_paged, later_paged):
+        first = model_samples.Session(model, text, **stated)
+        later = model_samples.Session(model, text, share=first, tokens=2, **stated)
+        for session, asked in ((first, first_paged), (later, later_paged)):
+            if asked:
+                with _a_block_asks_for_a_page():
+                    session.resolve()
+        return first.plan_table([later]).splitlines()[-1]
+
+    flat = model.memory_bytes(64, 2051) + model.state_bytes(64, 2051, 2)
+    assert (
+        need(False, False)
+        == f"  this stack needs about {flat / GIB:.1f} GiB on this GPU for 64 and 64 sequences, one count after the other; 200.0 GiB are free"
+    )
+    first = model.memory_bytes(64, 2051, page=PAGE) + model.state_bytes(64, 2051, 2)
+    assert (
+        need(True, False)
+        == f"  this stack needs about {first / GIB:.1f} GiB on this GPU for 64 and 64 sequences, one count after the other; 200.0 GiB are free"
+    )
+    both_paged = model.memory_bytes(64, 2051, page=PAGE) + model.state_bytes(64, 2051, 2, page=PAGE)
+    assert (
+        need(True, True)
+        == f"  this stack needs about {both_paged / GIB:.1f} GiB on this GPU for 64 and 64 sequences, one count after the other; 200.0 GiB are free"
+    )
+    assert f"{flat / GIB:.1f}" != f"{first / GIB:.1f}" != f"{both_paged / GIB:.1f}", "the three sentences state three figures"

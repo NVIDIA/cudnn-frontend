@@ -200,11 +200,6 @@ def test_public_record_rebuild_rebind_and_capture(monkeypatch, dtype, owner, fol
             3,
             False,
             20570,
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=AssertionError,
-                reason="Existing SM107 nonpaged D256 split lowering omits independent physical origins; parent control fails the origin_specs assertion",
-            ),
         ),
     ],
 )

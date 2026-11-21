@@ -408,7 +408,7 @@ On SM90 with `sparse_block_size=64` the backward's metadata kernels (the
 bucketed K-to-Q CSR build and, on the paired-KV path, the pair bitsets,
 matching, refinement and partitioned CSR; about 0.33 ms and ten launches on
 a 255K-token production mask) depend on the sparse metadata and the sequence
-lengths only, never on `q`, `k`, `v` or `dout`. `block_sparse_attention_prepare_backward`
+lengths only, never on `q`, `k`, `v` or `dout`. `block_sparse_attention_backward_metadata`
 runs them once and returns a `BsaBackwardMetadata`; a backward that takes it
 through `metadata=` launches only the preprocess, the main kernel and the
 dK/dV/dQ conversions (plus, on the paired-KV path, a copy of the object's small
@@ -417,17 +417,17 @@ layer of a training step, or the backward of the forward that has just been
 launched) pays for its metadata once, off the backward's critical path.
 
 ```python
-from cudnn.ops import block_sparse_attention_backward, block_sparse_attention_prepare_backward
+from cudnn.ops import block_sparse_attention_backward, block_sparse_attention_backward_metadata
 
 # Metadata as for the backward; the sequence lengths size the CSR. Runs on the current stream, never synchronizes.
-prepared = block_sparse_attention_prepare_backward(
+prepared = block_sparse_attention_backward_metadata(
     q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, seqlen_q=q.shape[2], seqlen_k=k.shape[2], sparse_block_size=64
 )
 for layer in layers:  # every backward over this mask skips the metadata kernels
     dq, dk, dv = block_sparse_attention_backward(do, q, k, v, o, lse, q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, sparse_block_size=64, metadata=prepared)
 ```
 
-The positional arguments of `block_sparse_attention_prepare_backward` have the
+The positional arguments of `block_sparse_attention_backward_metadata` have the
 backward's meaning; `bucket_size_blocks` is fixed when the object is built
 (`None` selects the SM90 default) and a backward may pass the same value or
 `None`. The object keeps the metadata tensors alive and remembers their
@@ -734,10 +734,9 @@ toward Speed of Light.
 
 `cudnn.ops.block_sparse_attention_forward_jax` and
 `cudnn.ops.block_sparse_attention_backward_jax` provide explicit forward/backward;
-`cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
+`cudnn.block_sparse_attention.jax_api.block_sparse_attention` adds first-order reverse-mode differentiation.
 All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
-`cudnn.jax.block_sparse_attention_forward` and `cudnn.jax.block_sparse_attention_backward`
-have been removed; use the `cudnn.ops` names.
+The `cudnn.jax` namespace has been removed; use the `cudnn.ops` names.
 
 The JAX implementation reuses the SM100/SM103 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
@@ -778,7 +777,7 @@ runtime operands. Do not mutate saved forward inputs or metadata before backward
 import jax
 import jax.numpy as jnp
 from functools import partial
-from cudnn.jax import block_sparse_attention as attention
+from cudnn.block_sparse_attention.jax_api import block_sparse_attention as attention
 from cudnn.ops import (
     block_sparse_attention_forward_jax as forward,
     block_sparse_attention_backward_jax as backward,

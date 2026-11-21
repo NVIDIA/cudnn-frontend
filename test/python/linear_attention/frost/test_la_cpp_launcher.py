@@ -1,0 +1,300 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The linear-attention ops under the C++ launcher (docs/utilities/cpp_launcher.md): the repeated forward, backward, summary
+and summary backward run from a recording and match the op's Python bitwise, also for other values (cu_seqlens included) at
+the recorded shapes."""
+
+import functools
+import math
+
+import pytest
+import torch
+
+from cudnn import cpp_launcher
+from cudnn.linear_attention.ops import gdn, gdn2, gdp, kda
+from cudnn.linear_attention.ops.mamba2 import run_mamba2_bwd, run_mamba2_fwd, run_mamba2_summary, run_mamba2_summary_bwd
+
+from linear_attention.test_la import (
+    LEAF_NAMES,
+    SEED,
+    frost_la_unavailable,
+    make_case,
+    mamba2_summary,
+    mamba2_summary_bwd,
+    op,
+    op_args,
+    run_summary,
+    run_summary_bwd,
+    set_seed,
+    to_thd,
+)
+
+requirement_error = frost_la_unavailable()
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+if not cpp_launcher.ENABLED or cpp_launcher.VERIFY:
+    pytest.skip("these tests count recordings: CUDNN_FRONTEND_CPP_LAUNCHER is 0 or verify", allow_module_level=True)
+
+pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
+
+D = 128
+FAST = dict(use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True, safe_gate=True)
+# name: (cu_seqlens of the recorded calls, cu_seqlens of the replay with other values, H, HV, options)
+CASES = {
+    "chain_state": ([0, 300, 1100, 1500, 2048], [0, 700, 900, 1800, 2048], 8, 8, dict(FAST, state=True, output_final_state=True)),
+    "uncut_many_seqs": ([i * 272 for i in range(17)], [0] + [100 + 271 * i for i in range(15)] + [4352], 32, 32, FAST),
+    "checkpoint": ([0, 1000, 2048], [0, 1500, 2048], 16, 16, dict(FAST, checkpoint_every_n_tokens=64)),
+    "log_gate": ([0, 777, 2048], [0, 64, 2048], 16, 16, dict(use_qk_l2norm_in_kernel=True)),
+    "gva_gate_params": ([0, 4000, 8192], [0, 123, 8192], 16, 32, dict(FAST, params=True)),
+    "context_parallel": ([0, 1024, 2048], [0, 1536, 2048], 8, 8, dict(FAST, state=True, output_final_state=True, preceding=True)),
+}
+
+
+# family: (its forward and backward, its public op, whether its gate is per key channel)
+FAMILIES = {
+    "kda": (kda.run_kda_fwd, kda.run_kda_bwd, kda.kimi_delta_attention, True),
+    "gdn": (gdn.run_gdn_fwd, gdn.run_gdn_bwd, gdn.gated_delta_net, False),
+}
+
+
+@pytest.fixture(autouse=True)
+def blackwell(monkeypatch):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family Frost linear attention")
+    monkeypatch.setattr(cpp_launcher, "HOT_CALLS", 2)  # record a signature's second call
+
+
+@pytest.fixture(params=FAMILIES)
+def family(request):
+    return FAMILIES[request.param]
+
+
+def inputs(seed, cu_list, H, HV, opts, channel_gate=True):
+    """The forward's and backward's keyword arguments for one draw of values."""
+    gen = torch.Generator().manual_seed(seed)
+    T, N, HO = cu_list[-1], len(cu_list) - 1, max(H, HV)
+
+    def draw(shape, dtype=torch.float32, scale=1.0, shift=0.0):
+        return (torch.randn(shape, generator=gen) * scale + shift).to(dtype).cuda()
+
+    fwd = dict(
+        q=draw((T, H, D), torch.bfloat16),
+        k=draw((T, H, D), torch.bfloat16),
+        v=draw((T, HV, D), torch.bfloat16),
+        g=draw((T, HO, D) if channel_gate else (T, HO), shift=-4.0 if opts.get("safe_gate") else -0.05),
+        beta=draw((T, HO)),
+        cu_seqlens=torch.tensor(cu_list, dtype=torch.int32, device="cuda"),
+        scale=D**-0.5,
+    )
+    fwd.update({k: v for k, v in opts.items() if k not in ("state", "params", "preceding")})
+    if opts.get("params"):
+        fwd.update(a_log=draw((HO,), scale=0.1), dt_bias=draw((HO, D) if channel_gate else (HO,), scale=0.1))
+    if opts.get("state"):
+        fwd["initial_state"] = draw((N, HO, D, D), scale=0.05)
+    if opts.get("preceding"):
+        fwd.update(preceding_state_update=draw((2, HO, D, D), scale=0.05), preceding_transition=draw((2, HO, D, D), scale=0.01))
+    bwd = {k: v for k, v in fwd.items() if k not in ("output_final_state", "preceding_state_update", "preceding_transition", "checkpoint_every_n_tokens")}
+    bwd["dO"] = draw((T, HO, D), torch.bfloat16)
+    if opts.get("output_final_state"):
+        bwd["d_final_state"] = draw((N, HO, D, D), scale=0.05)
+    return fwd, bwd
+
+
+def assert_bitwise(got, want, checkpoint_rows=None):
+    for i, (a, b) in enumerate(zip(got, want, strict=True)):
+        if i == 2 and checkpoint_rows is not None:  # the checkpoint series' capacity rows past the last checkpoint are never written
+            a, b = a[:checkpoint_rows], b[:checkpoint_rows]
+        assert a.shape == b.shape and a.dtype == b.dtype, i
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), f"output {i} differs"
+
+
+def recorded_kinds(fn):
+    return [type(p).__name__ for p in fn.recordings.values()]
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_replay_matches_python(family, case):
+    run_fwd, run_bwd, _, channel_gate = family
+    cu_a, cu_b, H, HV, opts = CASES[case]
+    run_fwd.recordings.clear()
+    run_bwd.recordings.clear()
+    every = opts.get("checkpoint_every_n_tokens", 0)
+
+    def rows(cu):
+        return sum(math.ceil((e - s) / every) for s, e in zip(cu, cu[1:])) if every else None
+
+    def step(fwd, bwd, run_fwd, run_bwd):
+        out = run_fwd(**fwd)
+        extra = {}
+        if every:
+            extra = dict(state_checkpoints=out[2], checkpoint_every_n_tokens=every)
+        if out[3].numel():
+            extra["composed_initial_state"] = out[3]
+        return out, run_bwd(**bwd, **extra)
+
+    fwd_a, bwd_a = inputs(1, cu_a, H, HV, opts, channel_gate)
+    first = step(fwd_a, bwd_a, run_fwd, run_bwd)  # runs the API
+    step(fwd_a, bwd_a, run_fwd, run_bwd)  # records them
+    replayed = step(fwd_a, bwd_a, run_fwd, run_bwd)
+    assert recorded_kinds(run_fwd) == ["_Recording"] and recorded_kinds(run_bwd) == ["_Recording"]
+    for got, want in zip(replayed, first):
+        assert_bitwise(got, want, rows(cu_a))
+
+    # other values, cu_seqlens included, at the recorded shapes: the recording runs, nothing host-side came from the values
+    fwd_b, bwd_b = inputs(2, cu_b, H, HV, opts, channel_gate)
+    replayed = step(fwd_b, bwd_b, run_fwd, run_bwd)
+    want = step(fwd_b, bwd_b, run_fwd.__wrapped__, run_bwd.__wrapped__)
+    assert recorded_kinds(run_fwd) == ["_Recording"] and recorded_kinds(run_bwd) == ["_Recording"]
+    for got, ref in zip(replayed, want):
+        assert_bitwise(got, ref, rows(cu_b))
+
+
+def test_overwrite_state_replay_matches_python(family):
+    """The in-place op writes the final state into initial_state; the recording binds it as the argument it is."""
+    run_fwd, _, _, channel_gate = family
+    cu_a, cu_b = [0, 700, 2048], [0, 1300, 2048]
+    run_fwd.recordings.clear()
+
+    def run(fwd, fn):
+        state = fwd["initial_state"].clone()
+        o = fn(**dict(fwd, initial_state=state, final_state_out=state))[0]
+        return o, state
+
+    fwd_a, _ = inputs(1, cu_a, 16, 16, dict(FAST, state=True, output_final_state=True), channel_gate)
+    first = run(fwd_a, run_fwd)
+    run(fwd_a, run_fwd)
+    assert_bitwise(run(fwd_a, run_fwd), first)
+    fwd_b, _ = inputs(2, cu_b, 16, 16, dict(FAST, state=True, output_final_state=True), channel_gate)
+    assert_bitwise(run(fwd_b, run_fwd), run(fwd_b, run_fwd.__wrapped__))
+    assert recorded_kinds(run_fwd) == ["_Recording"]
+
+
+def test_public_op_repeated_steps_are_replayed(family):
+    """Forward and autograd backward through the public op reach the recordings; a broadcast dO (out.sum()) is materialized by
+    the backward's Python, so that signature keeps running it."""
+    run_fwd, run_bwd, public, channel_gate = family
+    fwd, _ = inputs(1, [0, 1000, 2048], 8, 8, FAST, channel_gate)
+    run_fwd.recordings.clear()
+    run_bwd.recordings.clear()
+    cu = fwd.pop("cu_seqlens")
+    leaves = [fwd.pop(name).requires_grad_(True) for name in ("q", "k", "v", "g", "beta")]
+    ones = torch.ones(2048, 8, D, dtype=torch.bfloat16, device="cuda")
+    grads = []
+    for _ in range(3):
+        out, _ = public(*leaves, cu, **fwd)
+        grads.append(torch.autograd.grad(out, leaves, ones))
+    assert recorded_kinds(run_fwd) == ["_Recording"] and recorded_kinds(run_bwd) == ["_Recording"]
+    assert_bitwise(grads[2], grads[0])
+    for _ in range(3):
+        out, _ = public(*leaves, cu, **fwd)
+        broadcast = torch.autograd.grad(out.sum(), leaves)
+    assert sorted(recorded_kinds(run_bwd)) == ["_Recording", "int"] and -1 in run_bwd.recordings.values()
+    assert_bitwise(broadcast, grads[0])
+
+
+# family: its forward, backward, summary and summary backward, the bodies the C++ launcher records
+BODIES = {
+    "kda": (kda.run_kda_fwd, kda.run_kda_bwd, kda.run_kda_summary, kda.run_kda_summary_bwd),
+    "gdn": (gdn.run_gdn_fwd, gdn.run_gdn_bwd, gdn.run_gdn_summary, gdn.run_gdn_summary_bwd),
+    "gdn2": (gdn2.run_gdn2_fwd, gdn2.run_gdn2_bwd, gdn2.run_gdn2_summary, gdn2.run_gdn2_summary_bwd),
+    "gdp": (gdp.run_gdp_fwd, gdp.run_gdp_bwd, gdp.run_gdp_summary, gdp.run_gdp_summary_bwd),
+    "mamba2": (run_mamba2_fwd, run_mamba2_bwd, run_mamba2_summary, run_mamba2_summary_bwd),
+}
+# name: make_case's layout of the recorded calls and of the replay with other values, which has the same tokens and sequences
+LAYOUTS = {
+    "one_sequence": (dict(T=2048, H=32), dict(T=2048, H=32)),
+    "packed": (dict(seq_lens=[272] * 17, H=8), dict(seq_lens=[80 + 24 * i for i in range(17)], H=8)),
+}
+
+
+def tensors(result):
+    return [t for t in result if t is not None]
+
+
+def python_ran(*args):
+    raise AssertionError("the op's Python launched a kernel where its recording was to run")
+
+
+def assert_replays(monkeypatch, bodies, draw):
+    """``draw(seed, layout)`` is a call on one draw of values: its third run is a replay and equals its first, and the
+    replay of another draw at the same shapes, with other sequence boundaries, equals that draw's Python."""
+    for body in bodies:
+        body.recordings.clear()
+    call = draw(SEED, 0)
+    first = call()  # runs the API
+    call()  # records it
+    other = draw(SEED + 100, 1)
+    with monkeypatch.context() as recordings_only:
+        recordings_only.setattr(cpp_launcher, "launch", python_ran)
+        assert_bitwise(tensors(call()), tensors(first))
+        replayed = other()
+    for body in bodies:
+        assert set(recorded_kinds(body)) == {"_Recording"}
+        body.recordings.clear()
+    monkeypatch.setattr(cpp_launcher, "HOT_CALLS", 1 << 30)  # nothing recorded and nothing hot: the op's Python
+    assert_bitwise(tensors(replayed), tensors(other()))
+
+
+def cotangent(case, seed):
+    set_seed(seed + 1)
+    return to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("variant", ["gdn2", "gdp", "mamba2"])
+def test_training_step_is_replayed(monkeypatch, variant, layout):
+    """GDN-2, GDP and Mamba-2: the public op's forward and its autograd backward."""
+
+    def draw(seed, which):
+        case = make_case(variant, torch.bfloat16, seed=seed, **LAYOUTS[layout][which])
+        args = op_args(case)
+        count = len(LEAF_NAMES[variant])
+        leaves = [t.detach().requires_grad_(True) for t in args[:count]]
+        run = functools.partial(op(variant), plan_name=f"{variant}_frost")
+        d_o = cotangent(case, seed)
+
+        def call():
+            out = run(*leaves, *args[count:])
+            out = out[0] if isinstance(out, tuple) else out
+            return (out, *torch.autograd.grad(out, leaves, d_o, allow_unused=True))
+
+        return call
+
+    assert_replays(monkeypatch, BODIES[variant][:2], draw)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("variant", BODIES)
+def test_summaries_are_replayed(monkeypatch, variant, layout):
+    """Every family's summary and summary backward."""
+
+    def draw(seed, which):
+        case = make_case(variant, torch.bfloat16, seed=seed, **LAYOUTS[layout][which])
+        d_o = cotangent(case, seed)
+        if variant == "mamba2":
+            return lambda: (*mamba2_summary(case), *mamba2_summary_bwd(case, d_o))
+        return lambda: (*run_summary(case), run_summary_bwd(case, d_o))
+
+    assert_replays(monkeypatch, BODIES[variant][2:], draw)
+
+
+def test_gdp_qk_l2norm_eps_is_part_of_the_recorded_call(monkeypatch):
+    """GDP's ``qk_l2norm_eps`` is part of the call the launcher records: two epsilons are two recordings, and the replay
+    of each matches the op's Python at that epsilon."""
+    case = make_case("gdp", torch.bfloat16, T=2048, H=8)
+    for x in (case.q, case.k):  # rows with a squared norm near the epsilons, so that the output changes with the epsilon
+        x[:, 0::4] *= 1e-4
+        x[:, 1::4] *= 1e-5
+    run = functools.partial(op("gdp"), *op_args(case), use_qk_l2norm_in_kernel=True, plan_name="gdp_frost")
+    epsilons = (1e-8, 1e-10)
+    with monkeypatch.context() as python_only:
+        python_only.setattr(cpp_launcher, "HOT_CALLS", 1 << 30)  # nothing recorded and nothing hot: the op's Python
+        want = {eps: run(qk_l2norm_eps=eps)[0] for eps in epsilons}
+    assert not torch.equal(want[epsilons[0]], want[epsilons[1]])
+    gdp.run_gdp_fwd.recordings.clear()
+    for _ in range(4):
+        for eps in epsilons:
+            assert_bitwise([run(qk_l2norm_eps=eps)[0]], [want[eps]])
+    assert len(gdp.run_gdp_fwd.recordings) == len(epsilons)
+    gdp.run_gdp_fwd.recordings.clear()

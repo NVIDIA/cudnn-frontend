@@ -9,8 +9,8 @@ ratio-causal K range under CLC persistent scheduling, with K as the MMA's A oper
 packed Q as the B operand.  A load warp streams Q / K by TMA and stages the tile's per-head vector
 (W or the scaled LSE) in SMEM, an MMA warp fills TMEM accumulators, a CLC warp fetches the next
 tile, and math warpgroups reduce the heads.  :class:`ScoreKernelSm100` holds that common
-configuration and the host / device helpers; :class:`BlockScaledScoreSm100Mixin` adds the E8M0
-scale plumbing (scale TMA, SMEM -> TMEM S2T copies) of the MXFP8 / MXFP4 kernels.
+configuration and the host / device helpers; :class:`BlockScaledScoreSm100Mixin` adds the block-scale
+plumbing (scale TMA, SMEM -> TMEM S2T copies) of the MXFP8 / MXFP4 (E8M0) and NVFP4 (E4M3) kernels.
 """
 
 from __future__ import annotations
@@ -268,7 +268,7 @@ class ScoreKernelSm100:
 
 
 class BlockScaledScoreSm100Mixin:
-    """E8M0 block-scale plumbing of the MXFP8 / MXFP4 score kernels (mixed into a :class:`ScoreKernelSm100`)."""
+    """Block-scale plumbing of the MXFP8 / MXFP4 / NVFP4 score kernels (mixed into a :class:`ScoreKernelSm100`)."""
 
     sf_vec_size = 32
 
@@ -283,7 +283,7 @@ class BlockScaledScoreSm100Mixin:
 
     def _block_scaled_operands(self, mQ, mK, mQScale, mKScale, is_varlen, *, scale_tile_k, q_data_stages, q_scale_stages, k_data_stages, k_scale_stages):
         """Host side: packed Q/K, the block-scaled and data tiled MMAs, SMEM layouts and TMA atoms of Q, K and their
-        E8M0 scale tiles (``scale_tile_k`` wide along the head dim).  Returns a dict; also sets ``self.tma_bytes``."""
+        one-byte scale tiles (``scale_tile_k`` wide along the head dim).  Returns a dict; also sets ``self.tma_bytes``."""
         mQ = self._qk_tensor(mQ)
         mK = self._qk_tensor(mK)
         self.q_dtype = mQ.element_type
@@ -323,7 +323,7 @@ class BlockScaledScoreSm100Mixin:
         tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op, mK, cute.select(sK_layout, mode=[0, 1, 2]), self.mma_tiler_qk, tiled_mma_qk, self.cluster_layout_vmnk.shape
         )
-        # Scale TMA moves the packed E8M0 bytes as Int16 (the blockscaled layouts store two per compact element).
+        # Scale TMA moves the packed scale bytes as Int16 (the blockscaled layouts store two per compact element).
         k_scale_smem_layout = cute.slice_(sKScale_layout, (None, None, None, 0))
         q_scale_smem_layout = cute.slice_(sQScale_layout, (None, None, None, 0))
         tma_atom_KScale, mKScale = cute.nvgpu.make_tiled_tma_atom_A(
@@ -384,7 +384,7 @@ class BlockScaledScoreSm100Mixin:
 
     @cute.jit
     def _s2t_copy_and_partition(self, sSF: cute.Tensor, tSF: cute.Tensor) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        """tcgen05 S2T copy of a packed E8M0 scale tile from SMEM into a TMEM SF field (zeros of the blockscaled
+        """tcgen05 S2T copy of a packed scale tile from SMEM into a TMEM SF field (zeros of the blockscaled
         layout's sparse strides filtered out)."""
         tCsSF_compact = cute.filter_zeros(sSF)
         tCtSF_compact = cute.filter_zeros(tSF)

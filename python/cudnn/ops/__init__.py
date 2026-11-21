@@ -15,17 +15,19 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
-    "dense_indexer_kl": ("cudnn.simplified_sparse_attention.api", "dense_indexer_kl"),
-    "simplified_sparse_attention": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention"),
-    "simplified_sparse_attention_jax": ("cudnn.simplified_sparse_attention.jax_api", "simplified_sparse_attention_jax"),
+    "sdpa_forward_jax": ("cudnn.sdpa.jax_api", "sdpa_forward_jax"),
+    "sdpa_backward_jax": ("cudnn.sdpa.jax_api", "sdpa_backward_jax"),
+    "dense_indexer_kl_forward": ("cudnn.simplified_sparse_attention.api", "dense_indexer_kl_forward"),
+    "simplified_sparse_attention_forward": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention_forward"),
+    "simplified_sparse_attention_forward_jax": ("cudnn.simplified_sparse_attention.jax_api", "simplified_sparse_attention_forward_jax"),
     "SimplifiedSparseAttentionMetadata": ("cudnn.simplified_sparse_attention.api", "SimplifiedSparseAttentionMetadata"),
     "simplified_sparse_attention_reserve": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention_reserve"),
     "ragged_grouped_gemm_forward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_forward"),
     "ragged_grouped_gemm_backward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_backward"),
     "dense_gemm_forward": ("cudnn.gemm.cake.dense", "dense_gemm_forward"),
     "dense_gemm_backward": ("cudnn.gemm.cake.dense", "dense_gemm_backward"),
-    "gated_act_mxfp8_forward": ("cudnn.gemm.cake.gated_act_mxfp8", "gated_act_mxfp8_forward"),
-    "gated_act_mxfp8_backward": ("cudnn.gemm.cake.gated_act_mxfp8", "gated_act_mxfp8_backward"),
+    "swiglu_quantize_forward": ("cudnn.gemm.cake.gated_act_mxfp8", "swiglu_quantize_forward"),
+    "swiglu_quantize_backward": ("cudnn.gemm.cake.gated_act_mxfp8", "swiglu_quantize_backward"),
     "gated_rmsnorm_forward": ("cudnn.norm.cake.gated_rmsnorm", "gated_rmsnorm_forward"),
     "gated_rmsnorm_backward": ("cudnn.norm.cake.gated_rmsnorm", "gated_rmsnorm_backward"),
     "zero_centered_rmsnorm_forward": ("cudnn.norm.cake.zero_centered_rmsnorm", "zero_centered_rmsnorm_forward"),
@@ -33,8 +35,6 @@ _LAZY_EXPORTS = {
     "gqa_attention_forward": ("cudnn.sdpa.cake.api", "gqa_attention_forward"),
     "gqa_attention_backward": ("cudnn.sdpa.cake.api", "gqa_attention_backward"),
     "gqa_attention_workspace_size": ("cudnn.sdpa.cake.api", "gqa_attention_workspace_size"),
-    "dsa_indexer_topk_forward": ("cudnn.deepseek_sparse_attention.cake.api", "dsa_indexer_topk_forward"),
-    "dsa_indexer_topk_workspace_size": ("cudnn.deepseek_sparse_attention.cake.api", "dsa_indexer_topk_workspace_size"),
     "dsa_sparse_forward": ("cudnn.deepseek_sparse_attention.cake.sparse", "dsa_sparse_forward"),
     "dsa_sparse_backward": ("cudnn.deepseek_sparse_attention.cake.sparse", "dsa_sparse_backward"),
     "dsa_sparse_workspace_size": ("cudnn.deepseek_sparse_attention.cake.sparse", "dsa_sparse_workspace_size"),
@@ -51,20 +51,13 @@ _LAZY_EXPORTS = {
     "prepare_mok_training": ("cudnn.moe_ep.cake", "prepare_mok_training"),
     "create_mok_workspace": ("cudnn.moe_ep.cake", "create_mok_workspace"),
     "quantize_mok_weights": ("cudnn.moe_ep.cake", "quantize_mok_weights"),
-    "mhc_workspace_size": ("cudnn.mhc.api", "mhc_workspace_size"),
-    "mhc_prepare": ("cudnn.mhc.api", "mhc_prepare"),
-    "mhc_finish": ("cudnn.mhc.api", "mhc_finish"),
-    "mhc_backward_prepare": ("cudnn.mhc.api", "mhc_backward_prepare"),
-    "mhc_backward_finish": ("cudnn.mhc.api", "mhc_backward_finish"),
-    "mhc_head_forward": ("cudnn.mhc.api", "mhc_head_forward"),
-    "mhc_head_backward": ("cudnn.mhc.api", "mhc_head_backward"),
-    "mhc_jax": ("cudnn.mhc.jax_api", "mhc_jax"),
-    "mhc_prepare_jax": ("cudnn.mhc.jax_api", "mhc_prepare_jax"),
-    "mhc_finish_jax": ("cudnn.mhc.jax_api", "mhc_finish_jax"),
-    "mhc_backward_prepare_jax": ("cudnn.mhc.jax_api", "mhc_backward_prepare_jax"),
-    "mhc_backward_finish_jax": ("cudnn.mhc.jax_api", "mhc_backward_finish_jax"),
-    "mhc_head_forward_jax": ("cudnn.mhc.jax_api", "mhc_head_forward_jax"),
-    "mhc_head_backward_jax": ("cudnn.mhc.jax_api", "mhc_head_backward_jax"),
+    "cutemok_prepare": ("cudnn.moe_ep.cutemok", "cutemok_prepare"),
+    "cutemok_forward": ("cudnn.moe_ep.cutemok", "cutemok_forward"),
+    "cutemok_backward": ("cudnn.moe_ep.cutemok", "cutemok_backward"),
+    "cutemok_quantize_weights": ("cudnn.moe_ep.cutemok", "cutemok_quantize_weights"),
+    "CuteMoKConfig": ("cudnn.moe_ep.cutemok", "CuteMoKConfig"),
+    "CuteMoKPlan": ("cudnn.moe_ep.cutemok", "CuteMoKPlan"),
+    "CuteMoKSplitWeight": ("cudnn.moe_ep.cutemok", "CuteMoKSplitWeight"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),
@@ -84,7 +77,7 @@ _LAZY_EXPORTS = {
     "block_sparse_attention_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_backward": ("cudnn.block_sparse_attention", "block_sparse_attention_backward"),
     "block_sparse_attention_fp8_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_fp8_forward"),
-    "block_sparse_attention_prepare_backward": ("cudnn.block_sparse_attention", "block_sparse_attention_prepare_backward"),
+    "block_sparse_attention_backward_metadata": ("cudnn.block_sparse_attention", "block_sparse_attention_backward_metadata"),
     "kpage_prepare_layout": ("cudnn.block_sparse_attention", "kpage_prepare_layout"),
     "KPageLayout": ("cudnn.block_sparse_attention", "KPageLayout"),
     "BsaBackwardMetadata": ("cudnn.block_sparse_attention", "BsaBackwardMetadata"),
@@ -105,7 +98,7 @@ _LAZY_EXPORTS = {
 }
 
 # Op families are subpackages; they resolve lazily like the ops above.
-_FAMILIES = ("dsa", "nsa")
+_FAMILIES = ("dsa", "mhc", "nsa")
 
 __all__ = [*_LAZY_EXPORTS, *_FAMILIES]
 

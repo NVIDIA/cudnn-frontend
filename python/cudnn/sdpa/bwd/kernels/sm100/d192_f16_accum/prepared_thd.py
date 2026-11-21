@@ -31,10 +31,10 @@ def check_support(api):
     import torch
 
     from cudnn import _pybind_module
-    from cudnn.frost.buffers import cutedsl_state
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state
     from cudnn.frost.device import compute_capability, resolve_device
     from cudnn.sdpa.graph_analyzer import thd_stats_packing
-    from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
+    from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS, ACCUMULATION_PARTS, validate_accumulation_scale
 
     def require(condition, reason):
         if not condition:
@@ -45,7 +45,9 @@ def check_support(api):
     require(match is not None and tuple(map(int, match.groups())) >= (4, 8, 0), f"requires nvidia-cutlass-dsl >= 4.8.0; found {version}")
     require(api.q_desc.device.type == "cuda", "Q must reside on CUDA")
     cc = compute_capability(resolve_device(api.q_desc.device))
-    require(tuple(cc) in ACCUMULATION_CCS, f"requires SM100 or SM103; got {cc}")
+    require(tuple(cc) in ACCUMULATION_CCS, f"requires {ACCUMULATION_PARTS}; got {cc}")
+    arch_error = cutedsl_arch_requirement_error(cc)
+    require(arch_error is None, arch_error)
     require(getattr(getattr(_pybind_module, "_SdpaBwdBinder", None), "supports_zero_workspace", False), "requires prepared backward native binding support")
     require(not api.seq_q_lens_present and not api.seq_kv_lens_present, "lengths use the packed metadata path, not dense padding flags")
     require(not api.causal_bottom_right, "bottom-right causal is not supported")

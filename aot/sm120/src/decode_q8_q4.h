@@ -33,7 +33,7 @@ typedef enum {
                                                             // 4-byte
     CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_FEATURE,    // max_bias (ALiBi), logit_softcap, sinks
     CUDNN_FE_AOT_SM120_DECODE_ERROR_WORKSPACE_TOO_SMALL,
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH,  // device is not compute capability 12.0
+    CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH,  // device is not compute capability 12.0 or 12.1
     CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA,              // a CUDA runtime call failed (see cudaGetLastError)
 } cudnn_fe_aot_sm120_decode_status_t;
 

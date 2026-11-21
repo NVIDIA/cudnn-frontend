@@ -130,6 +130,11 @@ class EngineFamily:
     # typed decline; the backend's other engines stay. None: no engine is excluded. Same contract as
     # backend_guard: a documented backend defect on a measured domain, never placement policy.
     backend_engine_guard: Optional[Tuple[str, str]] = None
+    # ("module", "callable") naming ``backend_plan_guard(graph, facts, engine_id, knobs) -> Optional[str]``:
+    # a correctness decline for one backend configuration. Knobs are the public vocabulary, including backend-
+    # resolved defaults on explicit replay. The opaque BACKEND_HEURISTIC_ENGINE_ID sentinel may also be declined
+    # when its unfiltered fallback cannot be made safe. This is a measured defect, never ranking policy.
+    backend_plan_guard: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -329,9 +334,9 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_sm107_shared_d256_lookahead": EngineSlot(70),
             "sdpa_fwd_sm100_d512_fp8_role_split": EngineSlot(23),
             "sdpa_fwd_sm100_d256_fp8_single_q": EngineSlot(24),
-            "sdpa_fwd_sm100_d256_mxfp8_single_q": EngineSlot(45, opt_in=True),
-            "sdpa_fwd_sm100_d128_mxfp8_multi_q": EngineSlot(50, opt_in=True, unlocked_by=("causal_exclude_own_block",)),
-            "sdpa_fwd_sm100_d192_mxfp8_multi_q": EngineSlot(51, opt_in=True),
+            "sdpa_fwd_sm100_d256_mxfp8_single_q": EngineSlot(45),
+            "sdpa_fwd_sm100_d128_mxfp8_multi_q": EngineSlot(50, unlocked_by=("causal_exclude_own_block",)),
+            "sdpa_fwd_sm100_d192_mxfp8_multi_q": EngineSlot(51),
             "sdpa_fwd_sm100_d192_fp8_multi_q": EngineSlot(25),
             "sdpa_fwd_sm120_d512_paired": EngineSlot(26),
             "sdpa_fwd_sm100_d128_fp8_multi_q": EngineSlot(27),
@@ -352,9 +357,9 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_sm80_d256_kv_prefetch": EngineSlot(47),
             "sdpa_fwd_sm80_wide_cooperative": EngineSlot(48),
             "sdpa_fwd_sm107_d512_fp8_role_split": EngineSlot(49),
-            # Opt-in like the MXFP8 row they split; that row's causal_exclude_own_block unlock serves D128 only.
-            "sdpa_fwd_sm100_d512_mxfp8_slice_recompute": EngineSlot(52, opt_in=True),
-            "sdpa_fwd_sm100_d512_mxfp8_retained_p": EngineSlot(53, opt_in=True),
+            # Offered by default behind the backend (placement.TRAIL_ONLY_ROWS), unlike the opt-in MXFP8 row they split.
+            "sdpa_fwd_sm100_d512_mxfp8_slice_recompute": EngineSlot(52),
+            "sdpa_fwd_sm100_d512_mxfp8_retained_p": EngineSlot(53),
             "sdpa_fwd_sm107_d192_fp8_multi_q": EngineSlot(61),
             "sdpa_fwd_sm107_d256_fp8_single_q": EngineSlot(62),
             "sdpa_fwd_sm107_d128_fp8_multi_q": EngineSlot(63),
@@ -369,6 +374,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         validator=("cudnn._sdpa_validate", "validate_graph"),
         backend_guard=("cudnn.sdpa.fwd.backend_guard", "backend_guard"),
         backend_engine_guard=("cudnn.sdpa.fwd.backend_guard", "backend_engine_guard"),
+        backend_plan_guard=("cudnn.sdpa.fwd.backend_guard", "backend_plan_guard"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -381,12 +387,12 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm100": EngineSlot(2),
             "sdpa_bwd_sm100_mxfp8": EngineSlot(3, opt_in=True),
             "sdpa_bwd_sm107": EngineSlot(4),
-            "sdpa_bwd_sm107_fp8": EngineSlot(5, opt_in=True),
-            "sdpa_bwd_sm107_mxfp8": EngineSlot(6, opt_in=True),
+            "sdpa_bwd_sm107_fp8": EngineSlot(5),
+            "sdpa_bwd_sm107_mxfp8": EngineSlot(6),
             "sdpa_bwd_sm100_d256": EngineSlot(7),
             "sdpa_bwd_sm107_d512": EngineSlot(8),
             "sdpa_bwd_sm100_d128": EngineSlot(9),
-            "sdpa_bwd_sm107_d192": EngineSlot(10, opt_in=True),
+            "sdpa_bwd_sm107_d192": EngineSlot(10),
             "sdpa_bwd_sm100_d128_fp8": EngineSlot(11, opt_in=True),
             "sdpa_bwd_sm100_d192": EngineSlot(12, opt_in=True),
             "sdpa_bwd_sm100_d192_fp8": EngineSlot(13, opt_in=True),
@@ -401,7 +407,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm100_d128_fp8_pair": EngineSlot(22, opt_in=True),
             "sdpa_bwd_sm100_d128_fp8_accumulation": EngineSlot(23, opt_in=True),
             "sdpa_bwd_sm100_mxfp8_pair": EngineSlot(24, opt_in=True),
-            "sdpa_bwd_sm100_d256_mxfp8": EngineSlot(25, opt_in=True),
+            "sdpa_bwd_sm100_d256_mxfp8": EngineSlot(25),
             "sdpa_bwd_sm100_d512_role_split": EngineSlot(26),
             "sdpa_bwd_sm100_d512_2x2": EngineSlot(27, opt_in=True),
             "sdpa_bwd_sm100_d128_recompute": EngineSlot(28),
@@ -410,12 +416,17 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm100_d128_accumulation_2cta": EngineSlot(31),
             "sdpa_bwd_sm107_d256_f16_4x1": EngineSlot(32),
             "sdpa_bwd_sm107_d256_f16_2x2": EngineSlot(33, opt_in=True),
+            "sdpa_bwd_sm90": EngineSlot(34, opt_in=True),
+            "sdpa_bwd_sm89": EngineSlot(35),
+            "sdpa_bwd_sm89_f16_d64": EngineSlot(36),
+            "sdpa_bwd_sm100_d128_mxfp8": EngineSlot(37, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
         # (cudnn.sdpa.bwd.heuristics), so the record pins the kernel.
         heuristics=("cudnn.sdpa.bwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
+        backend_engine_guard=("cudnn.sdpa.bwd.backend_guard", "backend_engine_guard"),
     ),
     EngineFamily(
         FROST_CONV_ID_BASE,
@@ -532,6 +543,12 @@ def resolve_backend_engine_guard(family: EngineFamily):
     """The family's backend-engine guard, or None (see EngineFamily.backend_engine_guard)."""
 
     return _resolve(family, family.backend_engine_guard, "backend_engine_guard")
+
+
+def resolve_backend_plan_guard(family: EngineFamily):
+    """The family's backend-plan correctness guard, or None."""
+
+    return _resolve(family, family.backend_plan_guard, "backend_plan_guard")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

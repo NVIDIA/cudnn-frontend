@@ -73,6 +73,9 @@ DTYPE = cudnn.data_type.HALF
 def _fake_sm100(monkeypatch):
     """Fake an SM100 device so the device-family gate passes without a real GPU."""
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    # Keep all device facts synthetic: an unmocked SM-count probe initializes
+    # the CUDA driver on CPU hosts, once for every candidate and graph.
+    monkeypatch.setattr(ga, "_device_sm_count", lambda: 148)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 0))
@@ -183,7 +186,7 @@ def test_zero_attn_scale_declined_where_the_kernel_cannot_run_it(attn_scale):
 
 def test_zero_attn_scale_claims():
     """The rows claiming zero_scale are those qualified at zero scale on GPU, masked and unmasked: SM80 / SM90 forward
-    (score_sign / SCALE_ZERO) and the SM80 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
+    (score_sign / SCALE_ZERO) and the SM80 / SM89 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
     fwd = {s.name for s in engines.ENGINE_SPECS if s.capabilities.zero_scale}
     bwd = {s.name for s in bwd_engines.ENGINE_SPECS if s.capabilities.zero_scale}
     assert fwd == {
@@ -197,6 +200,8 @@ def test_zero_attn_scale_claims():
     }
     assert bwd == {
         "sdpa_bwd_sm80",
+        "sdpa_bwd_sm89",
+        "sdpa_bwd_sm89_f16_d64",
         "sdpa_bwd_sm80_f16_d64",
         "sdpa_bwd_sm80_f16_two_subgroup",
         "sdpa_bwd_sm100",
@@ -857,17 +862,17 @@ def test_resolve_padding_mask_with_seq_len_kv():
     assert _sm100_half_owner(g) in _eligible(g)
 
 
-def test_resolve_generate_stats():
+@pytest.mark.parametrize("materialize", [True, False])
+def test_resolve_generate_stats(materialize):
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
     o, stats = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, generate_stats=True)
     _finish_output(o, dims, strides)
-    if stats is not None:
-        stats.set_output(True).set_dim((B, H, S, 1)).set_stride((H * S, S, 1, 1))
-        stats.set_data_type(cudnn.data_type.FLOAT)
+    if materialize:
+        stats.set_output(True).set_dim((B, H, S, 1)).set_stride((H * S, S, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     cfg = _facts(g)
-    assert cfg.wants_stats is True
-    assert cfg.stats_t is not None
+    assert cfg.wants_stats is materialize
+    assert cfg.stats_t is (stats if materialize else None)
 
 
 def test_probe_rejects_bottom_right_swa_only():
@@ -2922,7 +2927,7 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
     fp8_d512 = spec["sdpa_fwd_sm100_d512_fp8_role_split"].capabilities
     assert "native per-tensor D128/D256" in engines.mismatch(fp8_d512, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
-    # D192/V192 selects the D256 envelope; D192/V128 selects the unpaged D192 flavor.
+    # D192/V192 selects the D256 envelope. D192/V128 has its own dense-query paged owner.
     d256_facts = paged_facts(is_fp8=True, d_qk=256, d_v=256)
     assert engines.mismatch(fp8_d256, d256_facts) is None
     assert "owned by the explicit implementation engines" in engines.mismatch(legacy_fp8, d256_facts)
@@ -2932,7 +2937,8 @@ def test_paged_quantized_rows_mismatch_reasons():
     fp8_d192 = spec["sdpa_fwd_sm100_d192_fp8_multi_q"].capabilities
     d192_facts = paged_facts(is_fp8=True, d_qk=192, d_v=128)
     assert "owned by the explicit implementation engines" in engines.mismatch(legacy_fp8, d192_facts)
-    assert "paged attention" in engines.mismatch(fp8_d192, d192_facts)
+    assert engines.mismatch(fp8_d192, d192_facts) is None
+    assert "native per-tensor D128/D256" in engines.mismatch(fp8_d192, paged_facts(is_fp8=True, d_qk=192, d_v=128, thd=True))
     for d in (64, 128):
         sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
         assert engines.mismatch(fp8, sink_facts) is None

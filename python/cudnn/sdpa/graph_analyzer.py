@@ -310,7 +310,10 @@ class SdpaGraphFacts:
     seq_q_trim: bool = False  # seq_len_q given without a padding mask
 
     padded: bool = False  # per-batch KV lengths present (padding mask or THD)
-    thd: bool = False  # ragged (THD) Q/K/V
+    thd: bool = False  # Q has ragged offsets (THD queries)
+    # Nonpaged Q/K/V do not all use the same ragged-offset form. Some backend
+    # engines support this; FROST rows currently require all dense or all ragged.
+    mixed_qkv_ragged: bool = False
     # Caller-declared packed token totals (sdpa(max_total_seq_len_q/kv=...)).
     # Ragged graphs describe extents as (B, H, S_max, D) plus device ragged
     # offsets, so the packed total is not otherwise expressible; when supplied
@@ -851,8 +854,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid("sdpa_fp8_backward requires " + " / ".join(_FP8_BWD_SCALARS))
 
     def _real_output(t):
-        """The op RETURNS its amax ports unconditionally; only a real
-        (non-virtual, set_output(True)) tensor is a requested output."""
+        """A returned optional port is observable only when marked as a graph output."""
         return t if (t is not None and not getattr(t, "is_virtual", True)) else None
 
     _quant_bwd = is_mxfp8_bwd or is_fp8_bwd
@@ -866,6 +868,11 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     binding_rejects_conflicts = not (is_backward and not is_fp8_bwd and not is_mxfp8_bwd)
     use_causal = bool(rec.get("use_causal_mask", False))
     use_causal_br = bool(rec.get("use_causal_mask_bottom_right", False))
+    from cudnn._sdpa_validate import _causal_alignment_error
+
+    alignment_error = _causal_alignment_error(rec)
+    if alignment_error is not None:
+        return _invalid(alignment_error)
     # Left window (== length; window offset is length-1). The op family uses several
     # spellings for the same knob: sdpa / sdpa_backward → sliding_window_length or
     # diagonal_band_left_bound; sdpa_mxfp8 → diagonal_band_left_bound; sdpa_fp8 →
@@ -911,7 +918,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     # invalid here (invalid means malformed-for-everyone; the backend accepts
     # it with its own precedence) — an engine that serves the cu form must
     # decline the ambiguous combination itself.
-    thd = getattr(q, "ragged_offset", None) is not None
+    ragged_qkv = tuple(getattr(t, "ragged_offset", None) is not None for t in (q, k, v))
+    thd = ragged_qkv[0]
+    mixed_qkv_ragged = not paged and any(ragged_qkv) and not all(ragged_qkv)
     use_padding_mask = bool(rec.get("use_padding_mask", False))
     seq_len_kv = rec.get("seq_len_kv")
     seq_len_q = rec.get("seq_len_q")
@@ -921,8 +930,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     if thd:
         # Paged KV: the pools are addressed through the block tables, so only
         # Q (and O) are ragged — chunked prefill over a paged cache.
-        if not paged and (getattr(k, "ragged_offset", None) is None or getattr(v, "ragged_offset", None) is None):
-            return _invalid("THD (ragged) requires ragged Q, K, and V")
+        # Mixed dense/ragged Q/K/V is provider-specific support, not a malformed
+        # graph. Preserve its facts for backend correctness guards; FROST's
+        # capability matcher declines it independently.
         if not q_lens_given or not kv_lens_given:
             return _invalid("THD (ragged) requires seq_len_q/cu_seq_len_q and seq_len_kv/cu_seq_len_kv")
         padded = True
@@ -967,6 +977,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
             wants_stats = False
         if wants_stats and stats is None:
             return _invalid("generate_stats=True but no Stats tensor was returned")
+        # The recognized forward graphs have no consumer of Stats. A virtual Stats
+        # (e.g. FlashInfer FP8 prefill with return_lse=False) needs no external store.
+        wants_stats = wants_stats and _real_output(stats) is not None
 
     attn_scale = rec.get("attn_scale")
     dynamic_scale = attn_scale is not None and not isinstance(attn_scale, (int, float))
@@ -1028,6 +1041,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         seq_q_trim=seq_q_trim,
         padded=padded,
         thd=thd,
+        mixed_qkv_ragged=mixed_qkv_ragged,
         max_total_seq_len_q=rec.get("max_total_seq_len_q"),
         max_total_seq_len_kv=rec.get("max_total_seq_len_kv"),
         has_cu_seq_len=has_cu_seq_len,

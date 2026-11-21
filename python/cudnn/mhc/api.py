@@ -51,8 +51,8 @@ def _constants(rms_eps, hc_eps, sinkhorn_iters):
         raise ValueError("sinkhorn_iters must be a host integer in [1,64]")
 
 
-def mhc_workspace_size(rows, hidden, *, backward=False, device=None):
-    """Bytes for prepare or backward-finish scratch."""
+def workspace_size(rows, hidden, *, backward=False, device=None):
+    """Bytes for pre-mix forward or backward scratch."""
     if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
         raise ValueError("rows must be a positive host integer")
     device = torch.device("cuda", torch.cuda.current_device()) if device is None else torch.device(device)
@@ -84,7 +84,7 @@ def _launch(kind, x, values, reads, writes, t, h, arch, stream, *, workspace=Non
         tensor.record_stream(launch)
 
 
-def mhc_prepare(x, fn, scale, base, *, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_iters=20, out=None, stats=None, workspace=None, stream=None):
+def pre_mix_forward(x, fn, scale, base, *, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_iters=20, out=None, stats=None, workspace=None, stream=None):
     """Return collapsed BF16 branch input and FP32 saved statistics."""
     t, h, arch = _input(x)
     _constants(rms_eps, hc_eps, sinkhorn_iters)
@@ -117,7 +117,7 @@ def mhc_prepare(x, fn, scale, base, *, rms_eps=1e-5, hc_eps=1e-6, sinkhorn_iters
     return TupleDict(out=out, stats=stats)
 
 
-def mhc_finish(x, branch, stats, *, out=None, stream=None):
+def post_mix_forward(x, branch, stats, *, out=None, stream=None):
     """Mix residual streams with the external branch output."""
     t, h, arch = _input(x)
     _tensor("branch", branch, (t, h), torch.bfloat16, x.device)
@@ -139,7 +139,7 @@ def mhc_finish(x, branch, stats, *, out=None, stream=None):
     return TupleDict(out=out)
 
 
-def mhc_backward_prepare(x, branch, stats, grad_out, *, grad_branch=None, grad_stats=None, stream=None):
+def post_mix_backward(x, branch, stats, grad_out, *, grad_branch=None, grad_stats=None, stream=None):
     """Return the branch-output gradient and saved coefficient gradients."""
     t, h, arch = _input(x)
     for name, value, shape, dtype in (
@@ -167,7 +167,7 @@ def mhc_backward_prepare(x, branch, stats, grad_out, *, grad_branch=None, grad_s
     return TupleDict(grad_branch=grad_branch, grad_stats=grad_stats)
 
 
-def mhc_backward_finish(
+def pre_mix_backward(
     x,
     grad_out,
     grad_u,
@@ -279,14 +279,14 @@ def _head(x, out, backward, stream):
     return TupleDict(out=out)
 
 
-def mhc_head_forward(x, *, out=None, stream=None):
+def head_forward(x, *, out=None, stream=None):
     """Mean the four BF16 residual streams in FP32, then round once."""
     return _head(x, out, False, stream)
 
 
-def mhc_head_backward(grad_out, *, out=None, stream=None):
+def head_backward(grad_out, *, out=None, stream=None):
     """Broadcast BF16(grad_out / 4) to each of four streams."""
     return _head(grad_out, out, True, stream)
 
 
-__all__ = ["mhc_workspace_size", "mhc_prepare", "mhc_finish", "mhc_backward_prepare", "mhc_backward_finish", "mhc_head_forward", "mhc_head_backward"]
+__all__ = ["workspace_size", "pre_mix_forward", "post_mix_forward", "post_mix_backward", "pre_mix_backward", "head_forward", "head_backward"]

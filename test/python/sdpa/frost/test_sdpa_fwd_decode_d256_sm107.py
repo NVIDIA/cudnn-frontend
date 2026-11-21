@@ -199,8 +199,10 @@ def test_sm107_decode_body_matches_the_sm100_body():
     """The partial producer remains the SM100 body line for line, modulo the
     declared deltas -- the config import, the DSL gate + the two module constants, the
     ``desc_version=DESC_VERSION`` keyword on every SmemTile, the ``spin=SPIN_RING_WAITS``
-    keyword on the ring waits, the SM100-only live-column specialization, and the
-    header prose. The optional cluster reducer and
+    keyword on the ring waits, the SM100-only live-column specialization, the SM100-only
+    hooks of its in-launch reduction (the fold's import, the ``reduce_follows`` flag with
+    the epilogue's per-thread load guard, the knob marker), and the header prose. The
+    optional cluster reducer and
     its host/compiler bindings are separate implementations, exercised by the cluster
     binding/GPU suites. A change to the shared partial producer still fails here."""
     from cudnn.sdpa.fwd import api_dsl
@@ -254,10 +256,24 @@ def test_sm107_decode_body_matches_the_sm100_body():
                 '            nvvm.fence_proxy("async.shared", space="cta")',
             )
         ): "",
+        # The in-launch reduction of a split (CLUSTER_K_REDUCE) exists on the SM100 tile only. Each hook is
+        # pinned as exact text, so an edit to one fails here; the partial producer around them stays shared.
+        "from cudnn.sdpa.fwd.kernels.sm100.split_combine import G_LEAN_SMALL as _FOLD_MAX_SPLITS, lean_fold_quad, lean_fold_stats": "",
+        "    reduce_follows: cutlass.Constexpr[bool] = False,": "",
+        "\n".join(
+            (
+                "                o_loaded = n_tiles > cutlass.Int32(0)",
+                "                if cutlass.const_expr(reduce_follows):",
+                "                    o_loaded = o_loaded & (d_idx < cutlass.Int32(D_V))",
+                "                if o_loaded:",
+            )
+        ): "                if n_tiles > cutlass.Int32(0):",
+        "            reduce_follows=final_o_tensor is not None,": "",
+        "CLUSTER_COMBINE_BY_KNOB = True": "",
     }
     a_src = "\n".join(a)
     for specialized, shared in sm100_only.items():
-        assert a_src.count(specialized) == 1, f"the declared SM100-only live-column delta changed:\n{specialized}"
+        assert a_src.count(specialized) == 1, f"a declared SM100-only delta changed:\n{specialized}"
         a_src = a_src.replace(specialized, shared)
     a = [ln for ln in a_src.splitlines() if ln.strip()]
     b = [ln for ln in b if ln.strip() not in ("desc_version=DESC_VERSION,",)]
@@ -1465,7 +1481,7 @@ def test_decode_graph_qwen_24_2_packs_twelve_rows_into_the_tile():
     plan = _run_graph(B=4, H=24, KH=2, s_q=1, lens=[700, 130, 5, 1024], page=16, dtype=torch.bfloat16, capture=cap)
     _assert_decode_tile_plan(plan, G=12, units=4 * 2, kv_tiles=8, grid=(4, 24, 1))
     mod = cap["module"]
-    assert "sm107" in mod.__name__ and mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py"), mod.__name__
+    assert mod.TEMPLATE_NAME == DECODE and mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py"), mod.__file__
     assert (mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_BOX_ROWS, mod.N_Q - mod.Q_BOX_ROWS, mod.N_Q, mod.CFG.SPLIT_KV) == (
         12,
         1,
@@ -1905,9 +1921,8 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
     requires paged KV' gate declined): ACCEPT -- a decode-shaped graph packs the whole group (24/2
     -> 12 rows) and splits (the fp32 partials + the shared combine), the 16-row MTP step packs 8:1;
     the 24/2 MTP step packs on the 32-column tile in two token units and splits; REJECT -- a packed
-    graph past the route (24/2 at S_q = 5: a third token unit) and a split past the route (33 MHA
-    rows) are typed declines naming the decode tile, because the d256 prefill kernel wires neither
-    (never a silent unpacked / unsplit run)."""
+    graph past the route (24/2 at S_q = 5 under the 32-column cap) is a typed decline.
+    An unpacked split past the decode route (33 MHA rows) uses native prefill with its split intact."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     def api(*, s_q, H, KH, pack, split=1, seq_lens=True, **extra):
@@ -1947,8 +1962,8 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
         api(s_q=11, H=24, KH=2, pack=True)  # 132 packed rows (a third token unit of the 64-column tile): no Rubin d256 kernel packs them
     with pytest.raises(NotImplementedError, match="d256 decode tile"):
         api(s_q=5, H=24, KH=2, pack=True, decode_q_tile_max=32)  # 60 packed rows under the cap: a third unit of the 32-column tile
-    with pytest.raises(NotImplementedError, match="d256 decode tile"):
-        api(s_q=33, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 33 MHA rows: the prefill kernel, no dense split
+    a = api(s_q=33, H=4, KH=4, pack=False, split=2, seq_lens=False)
+    assert a._decode_q_tile() == 0 and a.split_kv == 2 and a._fp32_partial_split()
     with pytest.raises(ValueError, match="unpadded dense graphs only"):
         api(s_q=1, H=24, KH=2, pack=True, split=2, seq_lens=True)  # a PADDED dense split: the shared structural rule
 
@@ -2560,7 +2575,7 @@ def test_decode_adapter_gated_split_cuda_graph_replay_no_host_sync():
 
 _SM107_DECODE_SPILL_PROBE = textwrap.dedent("""
     import glob, os, re, subprocess, sys
-    dump, n_q, g, form, cands = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5:]
+    dump, n_q, g, form, dtype, cands = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], int(sys.argv[5]), sys.argv[6:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
     os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
     os.environ["CUTE_DSL_ARCH"] = "sm_107a"       # unconditional: an inherited value would pin the wrong target's SASS
@@ -2568,7 +2583,7 @@ _SM107_DECODE_SPILL_PROBE = textwrap.dedent("""
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
     toks = form.split("+")
-    kw = dict(decode_q_tile=n_q, dtype_qkv=2, seq_kv_lens_present=True, pack_gqa=g > 1, qh_per_kh=g)
+    kw = dict(decode_q_tile=n_q, dtype_qkv=dtype, seq_kv_lens_present=True, pack_gqa=g > 1, qh_per_kh=g)
     kw["split_kv"] = next((int(t[5:]) for t in toks if t.startswith("split")), 1)
     if "paged" in toks:
         kw.update(paged_kv=True, page_size=16)
@@ -2629,21 +2644,17 @@ def _nvdisasm_candidates():
         pytest.param(12, "paged+br+hnd+pdl", id="24to2_mtp_paged_hnd_pdl"),
     ],
 )
-def test_sm107_decode_wide_tile_renderings_carry_no_spill(tmp_path, g, form):
-    """The 64-column tile's register budget, pinned on the SASS (no Rubin GPU: an sm_107a trace-compile in a subprocess, the
-    file's SASS-pin recipe): the 18-warp CTA's rendering stays SPILL-FREE at ptxas's 96-register cap on the admitted forms --
-    the 24/2 MTP step over HND pools, the 32/2 MTP step with split partials, a dense padded cache, and the admitted forms nearest
-    the spill edge: a packed group of TWO heads over pages (eight distinct causal thresholds per 16-column group) under the
-    bottom-right causal mask and under a left WINDOW (the predicate's other mask), plus the 24/2 step with the programmatic-
-    dependent-launch sites traced (the griddepcontrol pair must add no register pressure).  The keyed max exchange, the ftz max
-    intrinsics, the x8 O^T readbacks and the two-half epilogue of the shared body exist for this pin; a spill here is a perf
-    regression no numerics test sees (local-memory traffic in the hottest loop) -- an arm that spills is a form the config must
-    REFUSE (decode_d256_wide_tile_admits), never a silent admit.  Skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the
-    cubin; a compile failure is a FAIL."""
+@pytest.mark.parametrize("dtype_qkv", [2, 3], ids=["bf16", "fp16"])
+def test_sm107_decode_wide_tile_renderings_carry_no_spill(tmp_path, g, form, dtype_qkv):
+    """Compile admitted Rubin forms and reject local-memory spills.
+
+    Int64 output slices must fit the 18-warp CTA's 96-register limit in both
+    half precisions. Keep dense, paged, masked, split, and PDL controls.
+    """
     cands = _nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    argv = [sys.executable, "-c", _SM107_DECODE_SPILL_PROBE, str(tmp_path), "64", str(g), form, *cands]
+    argv = [sys.executable, "-c", _SM107_DECODE_SPILL_PROBE, str(tmp_path), "64", str(g), form, str(dtype_qkv), *cands]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500, env={**os.environ, "CUDNN_FRONTEND_ENABLE_FROST_ENGINES": "1"})
     assert proc.returncode == 0, f"sm_107a trace-compile of the 64-column decode tile (G={g}, {form}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
@@ -2664,7 +2675,8 @@ def test_sm107_decode_wide_tile_renderings_carry_no_spill(tmp_path, g, form):
     [(24, 2, (64, 12, 5, 60)), (32, 2, (64, 16, 4, 64))],
     ids=["24to2_48_rows_one_unit", "32to2_64_rows_one_unit"],
 )
-def test_decode_kernel_four_column_groups(H, KH, facts, splits):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_decode_kernel_four_column_groups(H, KH, facts, splits, dtype):
     """The 64-column tile at the template level (the module loader + launch_f16): the MTP step S_q = 4 of the 24/2 geometry
     (48 live rows + the 12 rows of a fifth, dead token + 4 zero tail rows: Q_BOX_TOKENS 5, Q_BOX_ROWS 60) and of the 32/2
     geometry (64 live rows, no tail) in ONE token unit, bottom-right causal over a paged cache (page 16, HND), 16 softmax warps
@@ -2673,7 +2685,6 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits):
     key at all: O := 0, LSE := -inf, an empty split range in BOTH splits), 384 (exactly the ring depth) and 500 (ring + a tail)."""
     B, P, s_q = 6, 16, 4
     lens = [700, 130, 5, 0, 384, 500]
-    dtype = torch.bfloat16
     torch.manual_seed(17 + H)
     S = max(lens)
     q = torch.randn(B, s_q, H, D, device="cuda", dtype=dtype)
@@ -2681,7 +2692,7 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits):
     v_dense = torch.randn(B, S, KH, D, device="cuda", dtype=dtype)
     k_c, v_c, bt4 = _pools(k_dense, v_dense, P, True, seed=17)
     mod = _load(
-        dtype_qkv=2,
+        dtype_qkv=2 if dtype == torch.bfloat16 else 3,
         seq_kv_lens_present=True,
         paged_kv=True,
         page_size=P,
@@ -2722,6 +2733,39 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits):
     torch.testing.assert_close(lse[~dead], ref_lse[~dead], atol=5e-3, rtol=0)
     assert dead[3].all() and torch.isneginf(lse[3]).all() and (o[3] == 0).all(), "the keyless batch: LSE := -inf, O := 0 exactly"
     assert not dead[:3].any() and not dead[4:].any()
+
+    from determinism_utils import assert_bitwise, assert_replays, snapshot
+
+    expected = snapshot({"o": o, "lse": lse})
+    inputs = dict(q=q, k=k_c, v=v_c, bt=bt4)
+    saved_inputs = snapshot(inputs)
+
+    def run(order, source_q=q):
+        index = torch.tensor(order, device="cuda")
+        out, stats = _launch_template(
+            mod,
+            q=source_q.index_select(0, index),
+            k_view=k_c.permute(0, 2, 1, 3),
+            v_view=v_c.permute(0, 2, 1, 3),
+            lens=[lens[i] for i in order],
+            scale=1.0 / math.sqrt(D),
+            splits=splits,
+            dtype=dtype,
+            bt=bt4.view(B, -1).index_select(0, index),
+            page=P,
+        )
+        return {"o": out, "lse": stats}
+
+    assert_bitwise(assert_replays(lambda: run(list(range(B))), repeats=3), expected, "fresh outputs and concurrent work")
+    for order in ([0], [5, 0, 3, 1, 0]):
+        index = torch.tensor(order, device="cuda")
+        want = {name: value.index_select(0, index) for name, value in expected.items()}
+        assert_bitwise(snapshot(run(order)), want, f"batch order {order}")
+    changed_q = q.clone()
+    changed_q[1:].mul_(-0.5)
+    actual = run(list(range(B)), changed_q)
+    assert_bitwise({name: value[:1] for name, value in actual.items()}, {name: value[:1] for name, value in expected.items()}, "changed neighbors")
+    assert_bitwise(inputs, saved_inputs, "inputs preserved")
 
 
 @_gpu
@@ -2869,6 +2913,13 @@ def test_paged_decode_independent_pool_layouts(hnd, dtype, split, pack):
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from test_sdpa_fwd_paged_sm100 import _run_graph
 
+    def check_body(graph, _vp, _workspace):
+        import inspect
+
+        api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
+        assert api.kernel_template == DECODE
+        assert api._k_mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py")
+
     _run_graph(
         2,
         8,
@@ -2886,7 +2937,8 @@ def test_paged_decode_independent_pool_layouts(hnd, dtype, split, pack):
         replay=True,
         arch="sm107",
         pack_gqa=pack,
-        explicit_knobs=SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=pack, split_kv=split),
+        extra_checks=check_body,
+        explicit_knobs=SdpaFwdKnobs(sched_policy=0, tile_m=16, tile_n=128, cga=1, pack_gqa=pack, split_kv=split),
     )
 
 

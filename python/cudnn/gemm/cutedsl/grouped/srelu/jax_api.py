@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry point for grouped GEMM SReLU, built on
-:func:`cudnn.jax.call`.
+:func:`cudnn._jax.call`.
 
 ``grouped_gemm_srelu_jax_forward`` is the canonical block-scaled forward with dense
 weights: MXFP8 or packed FP4 A ``(m, k)``, B ``(experts, n, k)`` and already
@@ -20,7 +20,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 
 from cudnn.api_base import TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.jax import neg_inf_init
+from cudnn._jax import neg_inf_init
 from cudnn.tensor_adapter import get_compute_capability
 from ..canonical import kernel_facing_b, kernel_facing_fp4, kernel_facing_mx, kernel_facing_prob
 from ..canonical_jax import check_block_scaled_operands, check_jax_inputs, check_packed_sf_size, fp8_dtypes, grouped_call, output_type, sf_array, sf_shape

@@ -26,6 +26,14 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestRaggedBackwardMetadata:
+    """Keep the shared backward metadata regression in the SM107 CI selection."""
+
+    from sdpa.graph.test_ragged_offset_multiplier import test_fp8_ragged_sm107_existing_route as _ragged
+
+    test_offset_units_and_declared_totals = staticmethod(_ragged)
+
+
 class TestServiceRegisterRelease:
     from service_register_release_checks import test_sm107_service_register_release as _release
 
@@ -38,6 +46,67 @@ class TestNativeHalfRegisterRelease:
     from sm107_register_release_checks import test_service_warpgroup_has_one_register_release as _release
 
     test_service_warpgroup_has_one_register_release = staticmethod(_release)
+
+
+@requires_rubin
+@pytest.mark.L0
+class TestBiasForwardRegressions:
+    """Keep explicit-loader and native-layout regressions in the CI selection."""
+
+    from sdpa.frost import test_sdpa_bias_max_form_sm107 as _max_form
+    from sdpa.frost import test_sdpa_bias_tile_n_additive_sm107 as _tile_n
+
+    test_default_loader = staticmethod(_max_form.test_the_default_pick_runs_the_hardware_form_on_the_kv_mask_only_plan_and_the_software_tree_with_a_bias)
+    test_tile_n_reference = staticmethod(_tile_n.test_tile_n_64_cells_match_the_fp64_oracle_and_the_128_wide_rendering)
+    test_bhsd_strides = staticmethod(_tile_n.test_bhsd_contiguous_activations_use_the_declared_strides)
+    test_strided_outer_axes = staticmethod(_tile_n.test_strided_outer_axes_are_addressed_through_the_declared_strides)
+    test_alignment_declines = staticmethod(_tile_n.test_non_16_byte_outer_strides_are_typed_declines_on_real_graphs)
+
+
+@requires_rubin
+@pytest.mark.L0
+class TestHalfForwardOwnerRegressions:
+    """Pin native half bodies without relying on standalone selection switches."""
+
+    from sdpa.frost import test_sdpa_fwd_dsl_sm107 as _half
+    from sdpa.frost import native_d128_dense_paged_sm107_checks as _small_paged
+    from sdpa.frost import native_d512_paged_sm107_checks as _wide_paged
+    from sdpa.frost import test_sdpa_fwd_d512_2x2_sm107 as _two_by_two
+    from sdpa.frost import test_sdpa_single_sequence_setup_sm107 as _single
+
+    _d512_role_split = staticmethod(_half._d512_role_split)
+    test_role_split_reference = staticmethod(_half.test_d512_half_prefolded_scale_matches_the_oracle)
+    test_role_split_dead_rows = staticmethod(_half.test_d512_half_prefolded_scale_keyless_and_dead_rows)
+    test_role_split_masked_leading_tile = staticmethod(_half.test_d512_half_masked_leading_tile_keeps_rows_with_later_keys_finite)
+    test_role_split_thd = staticmethod(_half.test_d512_half_prefolded_scale_thd)
+    test_role_split_sink_stats = staticmethod(_half.test_d512_half_prefolded_scale_sink_and_stats)
+    test_explicit_role_split = staticmethod(_two_by_two.test_two_by_two_role_split_untouched_when_twin_off)
+    test_small_paged_boundaries = staticmethod(_small_paged.test_page_boundaries)
+    test_wide_paged_boundaries = staticmethod(_wide_paged.test_boundaries)
+    test_single_sequence_batch_bytes = staticmethod(_single.test_single_sequence_batch_bytes)
+
+
+@requires_rubin
+@pytest.mark.L0
+class TestSparseDecodeForwardRegressions:
+    """Exercise the reference ABI and explicit decode body through the CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_sparse_sm107 as _sparse
+    from sdpa.frost import test_sdpa_fwd_decode_d256_sm107 as _decode
+
+    test_sparse_dense_reference = staticmethod(_sparse.test_identity_vs_the_dense_kernel_below_the_bound)
+    test_decode_qwen_token_tile = staticmethod(_decode.test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units)
+    test_decode_independent_pool_layouts = staticmethod(_decode.test_paged_decode_independent_pool_layouts)
+
+
+@requires_rubin
+class TestD256HalfSplitOrigins:
+    """Keep the shared half D256 origin regression in the selected SM107 CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_d256_split_origins_determinism as _origins
+
+    test_matching_extension = staticmethod(_origins.test_split_origins_require_matching_extension)
+    test_reference_replay_batch_and_golden = staticmethod(_origins.test_origins_reference_replay_batch_and_golden)
 
 
 @requires_rubin
@@ -140,10 +209,11 @@ def test_sm100_module_unchanged():
 
 
 def test_sm107_per_tensor_fp8_native_shapes():
-    """Both architecture lines provide native per-tensor D64 geometry."""
-    shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == shapes
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0)) == shapes
+    """Blackwell and Rubin share the D64 through D512 flavors. Blackwell also serves absorbed MLA."""
+    shared = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == shared
+    for cc in ((10, 0), (10, 3)):
+        assert _sm100_fp8_shapes(pertensor=True, device_cc=cc) == shared | {(576, 512)}
 
 
 @pytest.mark.parametrize("cga", [1, 2])
@@ -173,19 +243,17 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
 
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
-    assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
+    assert (sm107.sm_lo, sm107.sm_hi) == (107, 109)
     assert sm100.d_shapes == frozenset({(64, 64), (128, 128)})
-    assert sm100_envelopes.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert sm100_envelopes.d_shapes == sm107.d_shapes | {(576, 512)}
     assert dict(sm107.cgas_by_d_shape)[(64, 64)] == frozenset({1, 2})
     assert (64, 64) in sm107.split_d_shapes and (64, 64) in sm107.pack_gqa_d_shapes
     assert (64, 64) not in sm107.thd_d_shapes
-    # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
-    # so a row that gains a flavor must gain its floor in the same commit --
-    # otherwise mismatch() admits a graph check_support kills (contract 8b').
-    assert dict(sm107.d_envelope_floors) == dict(sm100_envelopes.d_envelope_floors)
-    # The legacy SM100 envelope row and Rubin retain the D512 floor. The
-    # explicit small-head owner only accepts its exact D64/D128 shapes.
-    assert sm100_envelopes.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
+    # Both rows share the D512 floor. On Blackwell, the D576 floor prevents narrower
+    # pairs from selecting the exact MLA flavor through the envelope matcher.
+    assert dict(sm107.d_envelope_floors) == {(512, 512): 256}
+    assert dict(sm100_envelopes.d_envelope_floors) == {(512, 512): 256, (576, 512): 512}
     assert sm100.d_envelope_floors == ()
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.

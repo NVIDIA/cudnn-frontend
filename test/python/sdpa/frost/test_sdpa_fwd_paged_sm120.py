@@ -666,6 +666,31 @@ def test_sm120_frost_paged_decode(dtype, dims, tile_m, split_kv, monkeypatch, *,
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("h,kh,sq", [(16, 1, 3), (64, 4, 3), (32, 2, 4)])
+@pytest.mark.parametrize("split_kv", [1, 2])
+def test_sm120_frost_paged_decode_multiple_packed_query_tiles(dtype, h, kh, sq, split_kv, monkeypatch):
+    # These 48/64 packed rows span multiple 32-row decode tiles. Pin the
+    # existing implementation so candidate ranking cannot erase coverage.
+    test_sm120_frost_paged_native_rebind_replay(
+        dtype,
+        kh,
+        True,
+        False,
+        16,
+        monkeypatch,
+        dims=(256, 256),
+        tile_m=32,
+        tile_n=16,
+        split_kv=split_kv,
+        sq=sq,
+        h=h,
+        packed=True,
+        replays=3,
+        explicit_plan=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tile_m,dims", [(16, (64, 64)), (32, (120, 88))])
 @pytest.mark.parametrize("split_kv", [1, 3])
 def test_sm120_frost_paged_decode_determinism(dtype, tile_m, dims, split_kv):

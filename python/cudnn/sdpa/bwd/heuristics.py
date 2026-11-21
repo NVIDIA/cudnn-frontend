@@ -79,6 +79,14 @@ def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]
             yield engine_id, spec
 
 
+def _placement_row(spec: EngineSpec) -> str:
+    # The Ada D64 study timed the dedicated body. Its shared policy still
+    # governs the generic owner and fallback order.
+    if spec.name == "sdpa_bwd_sm89_f16_d64":
+        return spec.name
+    return policy_name(spec)
+
+
 def _leads(spec: EngineSpec, facts) -> bool:
     """Whether a default row's plans go ahead of the backend's block.
 
@@ -104,7 +112,7 @@ def _leads(spec: EngineSpec, facts) -> bool:
     from cudnn.sdpa import placement_table
 
     name = policy_name(spec)
-    measured = placement_table.lookup(name, facts)
+    measured = placement_table.lookup(_placement_row(spec), facts)
     if measured is not None:
         return measured
     if name == "sdpa_bwd_sm100_d128":
@@ -114,13 +122,25 @@ def _leads(spec: EngineSpec, facts) -> bool:
     return name not in TRAIL_ONLY_ROWS
 
 
-TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512"})
+TRAIL_ONLY_ROWS = frozenset(
+    {
+        "sdpa_bwd_sm80",
+        "sdpa_bwd_sm89",
+        "sdpa_bwd_sm120",
+        "sdpa_bwd_sm107",
+        "sdpa_bwd_sm107_d512",
+        "sdpa_bwd_sm100_mxfp8",
+        "sdpa_bwd_sm107_fp8",
+        "sdpa_bwd_sm107_mxfp8",
+        "sdpa_bwd_sm107_d192",
+    }
+)
 """Default-offered rows with no hand-written lead shard: ranked after the backend's block, so they serve a graph only when the
 backend declines it (a correctness fallback, not a performance claim) -- except where a measured ``placement_table`` entry
 leads the graph's class (:func:`_measured_lead`)."""
 
 
-SQUARE_ONLY_STUDIES = ("sm80_bwd_square_", "sm120_bwd_")
+SQUARE_ONLY_STUDIES = ("sm80_bwd_square_", "sm120_bwd_", "sm120_det_bwd_", "sm80_det_bwd_")
 """Study name prefixes whose train and holdout timed square graphs only. ``class_key`` excludes squareness (Rule S12: a feature the key does not
 hold), so a non-square graph that one of their entries answers for keeps trailing. A100 under a left window: every square holdout case ran faster
 than the backend, while q < kv ran up to 1.45x slower in the same classes (b12 40/8 d64 q128 kv8960, 7.0 vs 4.8 ms). RTX 5090 (cc 12.0): the
@@ -134,7 +154,7 @@ def _measured_lead(spec: EngineSpec, facts) -> bool:
     same goes for a non-square graph whose entry comes from a study in :data:`SQUARE_ONLY_STUDIES`."""
     from cudnn.sdpa import placement_table
 
-    name = policy_name(spec)
+    name = _placement_row(spec)
     entry = placement_table.matched_entry(name, facts)
     if entry is not None and facts.s_q != facts.s_kv and entry.study.startswith(SQUARE_ONLY_STUDIES):
         return False

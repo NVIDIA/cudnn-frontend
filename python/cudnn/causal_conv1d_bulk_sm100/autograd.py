@@ -5,7 +5,7 @@
 
 This module intentionally stays separate from the inference API while the
 backward schedules are being compared.  Construction compiles the exact-shape
-backward once; calls then expose an ordinary PyTorch autograd edge. Packed
+backward once (packed N stays a runtime value); calls then expose an ordinary PyTorch autograd edge. Packed
 calls consume device ``cu_seqlens`` and optional BF16 channel bias. Bias-free
 calls may retain their width-four filter in FP32. Optional
 full-width initial/final state uses the same prefill-to-decode ABI as forward;
@@ -119,17 +119,18 @@ class _CausalConv1dBulkAutogradFunction(torch.autograd.Function):
         d_initial_state = None
         if initial_state is not None:
             d_initial_state = torch.empty_like(initial_state, memory_format=torch.contiguous_format)
+        num_sequences = backend.runtime_num_sequences(cu_seqlens)
         workspace = None
-        if backend.dweight_workspace_numel:
+        if backend.dweight_workspace_numel_for(num_sequences):
             workspace = torch.empty(
-                backend.dweight_workspace_numel,
+                backend.dweight_workspace_numel_for(num_sequences),
                 dtype=torch.float32,
                 device=weight.device,
             )
         packed_tile_map = None
-        if backend.packed_tile_map_numel:
+        if backend.packed_tile_map_numel_for(num_sequences):
             packed_tile_map = torch.empty(
-                backend.packed_tile_map_numel,
+                backend.packed_tile_map_numel_for(num_sequences),
                 dtype=torch.int32,
                 device=weight.device,
             )
@@ -213,9 +214,10 @@ class CausalConv1dBulkAutogradPrototype:
         self.backward_backend._validate_runtime_tensor(weight, self.backward_backend.weight_desc, "Weight")
         if (cu_seqlens is None) != (self.backward_backend.cu_seqlens_desc is None):
             raise ValueError("cu_seqlens presence must match the compiled signature")
+        num_sequences = self.backward_backend.runtime_num_sequences(cu_seqlens)
         if cu_seqlens is not None:
             assert self.backward_backend.cu_seqlens_desc is not None
-            self.backward_backend._validate_runtime_tensor(cu_seqlens, self.backward_backend.cu_seqlens_desc, "cu_seqlens")
+            self.backward_backend.validate_per_sequence_tensor(cu_seqlens, self.backward_backend.cu_seqlens_desc, num_sequences, "cu_seqlens")
         if (bias is None) != (self.backward_backend.bias_desc is None):
             raise ValueError("Bias presence must match the compiled signature")
         if bias is not None:
@@ -225,7 +227,7 @@ class CausalConv1dBulkAutogradPrototype:
             raise ValueError("Initial state presence must match the compiled signature")
         if initial_state is not None:
             assert self.backward_backend.initial_state_desc is not None
-            self.backward_backend._validate_runtime_tensor(initial_state, self.backward_backend.initial_state_desc, "Initial state")
+            self.backward_backend.validate_per_sequence_tensor(initial_state, self.backward_backend.initial_state_desc, num_sequences, "Initial state")
         if output_final_state is None:
             output_final_state = self.output_final_state
         elif not isinstance(output_final_state, bool):

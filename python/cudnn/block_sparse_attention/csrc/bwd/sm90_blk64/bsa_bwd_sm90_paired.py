@@ -11,7 +11,7 @@ accumulator chunk and the dQ fragments match, so the blk64 preprocess, workspace
 
 The pairing metadata (``PairedKvMetadataSm90``) and the compute (``MixedKvBackwardSm90``) are two compiled entry
 points: the metadata depends on the sparse pattern only, so a caller that reuses one pattern across calls builds it
-once (``block_sparse_attention_prepare_backward``) and the backward launches the preprocess, the main kernel and the
+once (``block_sparse_attention_backward_metadata``) and the backward launches the preprocess, the main kernel and the
 postprocess only.
 
 The FP32 dK/dV workspace is not zeroed: the first (pair, Q group) task to reach a KV64 block stores its fragments

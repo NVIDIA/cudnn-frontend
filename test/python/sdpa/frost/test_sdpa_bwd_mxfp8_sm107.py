@@ -119,7 +119,7 @@ _SLOT = 6  # engines/manifest.py: EngineSlot(6, opt_in=True) -> FROST_SDPA_BWD_I
 _ENGINE_ID = 20_606
 _D = 256
 _RUBIN_CC = (10, 7)
-_SM_RANGE = (107, 119)
+_SM_RANGE = (107, 109)
 # dV: the fp8 suite's tolerance recipe (test_sdpa_bwd_fp8_sm107.py::_FP8_GRAD_TOL): within atol 0.08 / rtol 0.2 of the oracle under
 # assert_close_fp8_grad's midpoint-flip budget.  dK / dQ: the bf16 row's recipe (test_sdpa_bwd_dsl_sm107.py::_TOL[bf16]), no flip
 # budget -- P-c's dK / dQ see no fp8 rounding.  ONE place each; never widened (report the magnitude instead).
@@ -1138,15 +1138,18 @@ def _decline_reason(monkeypatch, engine=_ENGINE, cc=_RUBIN_CC, **kw):
     return mismatch(spec.capabilities, facts)
 
 
-def test_row_is_registered_and_opt_in():
+def test_row_is_registered_and_offered_by_default():
     from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
     from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.bwd.heuristics import TRAIL_ONLY_ROWS
 
     _spec()
     fam = next(f for f in MANIFEST if f.name == _FAMILY_NAME)
     assert _ENGINE in fam.slots, f"{_ENGINE} has no manifest slot (append slot {_SLOT}; never reuse or renumber)"
     slot = fam.slots[_ENGINE]
-    assert slot.slot == _SLOT and slot.opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # Default since 2026-11-16, behind the backend (cudnn.sdpa.bwd.heuristics.TRAIL_ONLY_ROWS).
+    assert slot.slot == _SLOT and not slot.opt_in
+    assert _ENGINE in TRAIL_ONLY_ROWS
     assert FROST_SDPA_BWD_ID_BASE + slot.slot == _ENGINE_ID
     # The slot is appended: the sibling rows keep theirs.
     assert fam.slots["sdpa_bwd_sm107"].slot == 4 and fam.slots["sdpa_bwd_sm107_fp8"].slot == 5
@@ -2588,19 +2591,20 @@ def test_stage3_block_scale_dq_single_launch_is_bitwise_the_per_member_launches(
 
 
 @requires_rubin
-def test_graph_routes_to_the_row_when_opted_in_and_declines_typed_otherwise(monkeypatch):
-    """The d256 ``sdpa_mxfp8_backward`` graph on cc 10.7 lists THIS row (bracket-form name) and no other; with FROST opted out the
-    graph is admitted at validate / build and ``create_execution_plans`` raises the typed ``cudnnGraphNotSupportedError`` -- cuDNN
-    9.27 has no MXFP8 d=256 backward kernel on smVersion 1070 (verified 2026-09-29), so the row is the sole provider."""
-    g, _t, _outs = _mxfp8_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    assert any(n == _ENGINE or n.startswith(_ENGINE + "[") for n in names), names
-    assert not any(n.startswith(("sdpa_bwd_sm100_mxfp8", "sdpa_bwd_sm100_d256_mxfp8")) for n in names), names
-    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
-    g2, _t, _outs = _mxfp8_graph()
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        g2.create_execution_plans([cudnn.heur_mode.A])
+def test_graph_routes_to_the_row_with_or_without_the_flag(monkeypatch):
+    """The d256 ``sdpa_mxfp8_backward`` graph on cc 10.7 lists THIS row (bracket-form name) and no other, with or without the opt-in
+    flag: cuDNN 9.27 has no MXFP8 d=256 backward kernel on smVersion 1070 (verified 2026-09-29), so the row is the sole provider and is
+    offered by default, behind the backend (#2637)."""
+    for flag in ("1", None):
+        if flag is None:
+            monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        else:
+            monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", flag)
+        g, _t, _outs = _mxfp8_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+        names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+        assert any(n == _ENGINE or n.startswith(_ENGINE + "[") for n in names), (flag, names)
+        assert not any(n.startswith(("sdpa_bwd_sm100_mxfp8", "sdpa_bwd_sm100_d256_mxfp8")) for n in names), (flag, names)
 
 
 @requires_rubin

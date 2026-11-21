@@ -117,8 +117,8 @@ def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy(monkeypatch):
     # ragged-Q decode leg's plan-time facts (defaulted) follow it, then the Rubin decode
     # route's width cap and the programmatic-dependent-launch switch (the public tree's
     # tail), then the score side outputs (sample_score_max / sample_score_sum_exp), then
-    # the Rubin small tiles' resident-block operands and their knobs in landing order --
-    # the newest tail.
+    # the Rubin small tiles' resident-block operands and their knobs in landing order, then
+    # the in-launch reduction of a split (cluster_reduce) -- the newest tail.
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
     i = params.index("sample_scale_o")
     assert params[i : i + 5] == ["sample_scale_o", "ragged_divisors", "ragged_offsets_int64", "decode_q_tile_max", "use_pdl"], params[i : i + 6]
@@ -136,6 +136,7 @@ def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy(monkeypatch):
         "softmax_wgs",
         "swap_ab",
         "causal_exclude_own_block",
+        "cluster_reduce",
     ], params[j + 2 :]
 
 

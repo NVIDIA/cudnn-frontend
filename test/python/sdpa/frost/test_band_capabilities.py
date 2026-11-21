@@ -52,16 +52,39 @@ def _compiler_targets_available(monkeypatch):
 
 # Explicit engines that one mask band names: they decline every other band by ownership, not by a capability flag
 # (their flags equal their sibling's, which this matrix samples); test_sdpa_fwd_d512_mxfp8_implementation_contract pins the band.
-# The SM80 D64 body likewise serves only the plain aligned corner its selector names; test_sdpa_bwd_explicit_engines pins it.
-_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p", "sdpa_bwd_sm80_f16_d64"})
+# The SM80 and SM89 D64 bodies likewise serve only the plain aligned corner their shared selector names;
+# test_sdpa_bwd_explicit_engines pins the selector and test_sdpa_bwd_sm89 pins the Ada owner.
+_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p", "sdpa_bwd_sm80_f16_d64", "sdpa_bwd_sm89_f16_d64"})
+
+
+def _row_dsl_floors():
+    """Rows with their own nvidia-cutlass-dsl floor above the library's (Rule 7), checked in their declaration."""
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8 import contract as d128_mxfp8
+    from cudnn.sdpa.bwd.kernels.sm100.d128_mxfp8.geometry import CUTEDSL_FLOOR
+
+    return {d128_mxfp8.NAME: CUTEDSL_FLOOR}
+
+
+def _below_row_dsl_floor(spec) -> bool:
+    """The installed DSL (as the probe sees it) is below the row's own floor, so the row declines every graph by version.
+
+    It serves no graph to sample on such a lane; its eligibility tests pin that decline."""
+    floor = _row_dsl_floors().get(spec.name)
+    if floor is None:
+        return False
+    installed, version = bwd_engines.cutedsl_state()
+    return installed and bwd_engines.cutedsl_too_old(version, floor=floor)
 
 
 def _rows():
     """``[(kind, EngineSpec)]`` -- every row the registry actually ships that serves some graph.
 
-    A legacy row whose explicit engines own its whole domain keeps only its policy, so it has no graph to sample."""
+    A legacy row whose explicit engines own its whole domain keeps only its policy, so it has no graph to sample.
+    Neither does a row below its own DSL floor (``_below_row_dsl_floor``)."""
     rows = [("fwd", spec) for spec in fwd_engines.ENGINE_SPECS] + [("bwd", spec) for spec in bwd_engines.ENGINE_SPECS]
-    return [(kind, spec) for kind, spec in rows if spec.name not in _BAND_OWNED and _dims(kind, spec.capabilities) is not None]
+    return [
+        (kind, spec) for kind, spec in rows if spec.name not in _BAND_OWNED and not _below_row_dsl_floor(spec) and _dims(kind, spec.capabilities) is not None
+    ]
 
 
 def _probe(kind: str):
@@ -176,9 +199,13 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
 
     The band axes are then varied one at a time on top of this, so an arch /
     dtype / envelope / layout rejection can never stand in for a mask decision.
+    A row whose declaration pins the sequence geometry (``_pinned_geometry``)
+    keeps it whatever lengths a case asks for: the geometry axes then cannot
+    move its decisions, which is what the geometry cases assert.
     """
     values = _values(kind, caps, *_dims(kind, caps))
     values.update(overrides)
+    values.update(_pinned_geometry(kind, caps))
     # Wide native rows validate the actual binding declarations even without
     # shape overrides. Keep the non-mask baseline legal after geometry changes.
     b, hq, hk = values["b"], values["h_q"], values["h_kv"]
@@ -196,6 +223,24 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     ):
         values.setdefault(role, _DeclaredTensor(dim, dtype))
     return ga.SdpaGraphFacts(**values)
+
+
+def _pinned_geometry(kind: str, caps) -> dict:
+    """Sequence lengths a row's declaration check requires of every graph, or ``{}``.
+
+    A row serving S_q == S_kv only (``sdpa_bwd_sm100_d128_mxfp8``) accepts the matrix's baseline but declines every
+    unequal pair, so its samples keep the baseline lengths."""
+    base = _values(kind, caps, *_dims(kind, caps))
+    if declaration_reason(kind, caps, ga.SdpaGraphFacts(**base)) is not None:
+        return {}
+    if declaration_reason(kind, caps, ga.SdpaGraphFacts(**{**base, "s_kv": 2 * base["s_kv"]})) is None:
+        return {}
+    return dict(s_q=base["s_q"], s_kv=base["s_kv"])
+
+
+def band_served(caps) -> dict:
+    """A band every row's claim admits for the non-band cases: causal top-left where the row claims it, else unmasked."""
+    return band_causal_top_left() if declares(caps, right=band.RIGHT_CAUSAL) else band_unmasked()
 
 
 def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
@@ -735,12 +780,12 @@ def test_length_metadata_decisions_follow_the_row_claims():
             (dict(seq_q_trim=True), None if getattr(caps, "seq_q_trim", False) else trim_reason),
         )
         for overrides, expected in cases:
-            sample = legal_facts(kind, caps, s_kv=128, **{**band_causal_top_left(), **overrides})
+            sample = legal_facts(kind, caps, s_kv=128, **{**band_served(caps), **overrides})
             assert probe_matches(kind, caps, sample, expected), (spec.name, overrides, _probe(kind)(caps, sample))
         if kind == "fwd":
             # fwd-only combination: a padding mask plus generate_stats needs the
             # row's padded_stats claim; the padding gate itself comes first.
-            sample = legal_facts(kind, caps, s_kv=128, **{**band_causal_top_left(), "padded": True, "wants_stats": True})
+            sample = legal_facts(kind, caps, s_kv=128, **{**band_served(caps), "padded": True, "wants_stats": True})
             if not claims_padding:
                 expected = padding_reason
             elif getattr(caps, "padded_stats", False):
@@ -770,7 +815,7 @@ def test_dense_layout_envelope_decisions():
             (dict(bshd_layout=False, packed_layout=True, dense_layout=False), False),
         )
         for layout, ok in cases:
-            sample = legal_facts(kind, caps, s_kv=128, **{**band_causal_top_left(), **layout})
+            sample = legal_facts(kind, caps, s_kv=128, **{**band_served(caps), **layout})
             reason = _probe(kind)(caps, sample)
             assert (reason is None) == ok, (spec.name, layout, reason)
             if not ok:
