@@ -1344,10 +1344,8 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", False): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", True): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
-    # study sm80_d512_decode_v3_pcie_20261121 (A100 80GB PCIe 300 W, cuDNN 9.24.0.43, FE b69cc1a63; benchmark/attention_inference's generation graph, d512,
-    # dense and paged page 64): v2's one-KV-head cells (absorbed MLA, 888 timed) pooled with 2017 GQA cells over 1-8 KV heads with distinct K / V
-    # (groups 2-32), KV 128-131072 on and off the 128-key tile, s_q 1 / 2 / 4, b 1-64; fitted under the criterion. The cost floors grow with h_kv,
-    # so short multi-KV-head caches (b1 32/8 s_q 2 paged KV 256 / 257) keep the backend.
+    # study sm80_d512_decode_v3_pcie_20261121: d512 decode over one or more KV heads, K / V shared or distinct. The floors are on `cost`,
+    # which grows with h_kv, so a cache with more KV heads reaches them at fewer keys.
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "dense", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm80_d512_decode_v3_pcie_20261121"
     ),

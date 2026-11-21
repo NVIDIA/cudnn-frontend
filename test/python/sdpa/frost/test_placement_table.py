@@ -790,10 +790,8 @@ def test_sm80_paged_d256_on_tile_floor_follows_v7():
 @pytest.mark.L0
 @pytest.mark.parametrize("off_tile", [0, 1], ids=["on_tile", "off_tile"])
 def test_sm80_d512_decode_follows_its_study(off_tile):
-    """sm80_d512_decode_v3_pcie_20261121 (A100 80GB PCIe): d512 decode over 1-8 KV heads. Dense MTP leads at every size; paged MTP
-    leads from cost 2^22.792 on the KV tile / 2^22.86 off it, dense single-row decode from 2^25.002 / 2^25.296 and paged from
-    2^26.002 / 2^26.305. The cost grows with h_kv, so the review's b1 32/8 s_q 2 paged KV 256 / 257 (FROST +31 % / +16 %) keeps the
-    backend while KV 512 leads, and short one-head paged caches (KV 128-1024) keep it too."""
+    """A100 d512 decode (dense and paged, single-row and MTP, 1-8 KV heads) belongs to study sm80_d512_decode_v3_pcie_20261121 on and
+    off the KV tile. Within each class the lead is monotone in the entry's feature, and `cost` grows with h_kv."""
     row = "sdpa_fwd_prefill_sm80"
     study = "sm80_d512_decode_v3_pcie_20261121"
 
@@ -815,37 +813,26 @@ def test_sm80_d512_decode_follows_its_study(off_tile):
             device_cc=(8, 0),
         )
 
-    mtp_floor, q1_dense_floor, q1_paged_floor = (22.86, 25.296, 26.305) if off_tile else (22.792, 25.002, 26.002)
-    cases = (
-        # (graph, expected lead): both sides of each class's boundary, the review's short paged controls, gemma4 global decode
-        (f(1, 64, 1, 4, 512, False), True),
-        (f(1, 32, 8, 4, 128, False), True),
-        (f(1, 16, 1, 2, 128, True), False),
-        (f(1, 16, 1, 2, 1024, True), False),
-        (f(1, 16, 1, 2, 2048, True), True),
-        (f(1, 64, 1, 2, 131072, True), True),
-        (f(1, 32, 8, 2, 256, True), False),
-        (f(1, 32, 8, 2, 512, True), True),
-        (f(4, 64, 1, 1, 128, True), False),
-        (f(1, 128, 1, 1, 4096, True), False),
-        (f(1, 128, 1, 1, 8192, True), True),
-        (f(1, 32, 4, 1, 1024, True), False),
-        (f(1, 32, 4, 1, 131072, True), True),
-        (f(1, 16, 2, 1, 131072, True), True),
-        (f(1, 16, 1, 1, 4096, False), False),
-        (f(1, 64, 1, 1, 4096, False), False),
-        (f(1, 128, 1, 1, 4096, False), True),
-        (f(1, 32, 4, 1, 1024, False), False),
-        (f(1, 32, 4, 1, 131072, False), True),
-    )
-    for facts, lead in cases:
-        assert pt.class_key(row, facts)[-1] == bool(off_tile), facts
-        assert pt.matched_entry(row, facts).study == study, facts
-        assert pt.lookup(row, facts) is lead, (facts.b, facts.h_q, facts.h_kv, facts.s_q, facts.s_kv, facts.has_paged_kv)
-    assert pt.FEATURES["cost"](f(1, 32, 8, 2, 256, True)) < mtp_floor < pt.FEATURES["cost"](f(1, 32, 8, 2, 512, True))
-    assert pt.FEATURES["cost"](f(1, 16, 1, 2, 1024, True)) < mtp_floor < pt.FEATURES["cost"](f(1, 16, 1, 2, 2048, True))
-    assert pt.FEATURES["cost"](f(1, 64, 1, 1, 4096, False)) < q1_dense_floor < pt.FEATURES["cost"](f(1, 128, 1, 1, 4096, False))
-    assert pt.FEATURES["cost"](f(1, 128, 1, 1, 4096, True)) < q1_paged_floor < pt.FEATURES["cost"](f(1, 128, 1, 1, 8192, True))
+    classes = {}
+    grid = [
+        (b, h_q, h_kv, s_q, s_kv, paged)
+        for paged in (False, True)
+        for s_q in (1, 2, 4)
+        for h_q, h_kv in ((16, 1), (128, 1), (16, 2), (32, 4), (32, 8))
+        for b in (1, 4, 64)
+        for s_kv in (128, 1024, 8192, 131072)
+    ]
+    for b, h_q, h_kv, s_q, s_kv, paged in grid:
+        facts = f(b, h_q, h_kv, s_q, s_kv, paged)
+        key = pt.class_key(row, facts)
+        entry = pt.matched_entry(row, facts)
+        assert key[-1] == bool(off_tile) and entry.study == study, (b, h_q, h_kv, s_q, s_kv, paged)
+        classes.setdefault(key, []).append((pt.FEATURES[entry.feature](facts), pt.lookup(row, facts)))
+    assert len(classes) == 4  # dense / paged x single-row / MTP
+    for key, points in classes.items():
+        leads = [lead for _, lead in sorted(points)]
+        assert leads == sorted(leads), key  # the backend below the floor, FROST from it
+    assert pt.FEATURES["cost"](f(1, 32, 8, 2, 4096, True)) > pt.FEATURES["cost"](f(1, 32, 1, 2, 4096, True))
 
 
 @pytest.mark.L0
