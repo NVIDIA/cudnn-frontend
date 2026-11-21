@@ -2270,26 +2270,32 @@ named; every run passed its checks):
 | 85 | 9.4 GiB | 5.99 GiB | 7.77 GiB | 7.94 GiB |
 | 85, `fe-cublas` | 9.4 GiB | 5.97 GiB | 7.75 GiB | 7.93 GiB |
 | 85, `native` | 9.2 GiB | 5.70 GiB | 7.47 GiB | 7.65 GiB |
-| 256, the pool capped at the sentence's figure | 20.9 GiB | 14.44 GiB | 19.86 GiB | 19.28 GiB |
+| 256, the pool capped at the sentence's figure | 20.9 GiB | 14.44 GiB | 19.86 GiB | 20.04 GiB |
 | 1,024 | 72.9 GiB | 52.43 GiB | 73.08 GiB | 73.26 GiB |
 | 1,024, the pool capped at the sentence's figure | 72.9 GiB | 52.43 GiB | 70.90 GiB | 71.07 GiB |
 | 16 sequences of five tokens, a verify session alone | 8.7 GiB | 5.45 GiB | 6.71 GiB | 6.89 GiB |
 
 In the eight runs of one sequence count PyTorch's peak was 0.6 to 3.2 % above the weights held, the state and the
-count; in the verify session it was 2.5 % below them. So from 33 to 256 sequences the sentence stands 1.5 to 1.8 GiB
-above what a run takes -- the flat working memory and the pool's share are both added to the count, and the direction
-is the one that only refuses a run. At 1,024 sequences a run that is given the memory takes 0.4 GiB more than the
+count; in the verify session it was 2.5 % below them. That comparison holds where the checks' moment is the peak of
+the run -- at every measured count above one sequence (33 to 1,024) and in the verify session; the GPU test of 85
+sequences holds it within 5 % --, and at one sequence and in the default run the peak is another moment (a load, a
+multiply of the reference), as it was before the count and covered by the flat working memory: reported here, not
+held to the count. From 33 to 85 sequences the sentence stands 1.5 to 1.8 GiB above what a run takes, and 0.9 GiB at
+256 sequences -- the flat working memory and the pool's share are both added to the count, and the direction is the
+one that only refuses a run. At 1,024 sequences a run that is given the memory takes 0.4 GiB more than the
 sentence, and the same run with its pool held to the sentence's figure passes. A run of one sequence asked for about
 3.5 GiB, as it did before the count, held 1.80 GiB at its peak, reserved 3.58 GiB and grew the device by 3.76 GiB:
 a quarter of a GiB more than its sentence, the miss this section states for the reduced models. A run of the
 published checkpoint at one sequence asked for about 37.1 GiB on `fe-entries`, the figure it asked for before the
 count.
 `--sequences 64,65` asked for about 8.6 GiB, reserved 8.04 GiB and grew the device by 8.22 GiB; PyTorch held 5.85 GiB
-at its peak, 0.4 GiB more than the weights, the two states and the count (below).
-What the sentence leaves out. In a run of several counts the reference session of an earlier count -- its state and
-its record -- is still alive when its checks have returned, until Python collects it: the count has no term for it,
-and the run of 64 and 65 sequences above held 0.4 GiB more at its peak than the count, inside what the sentence asked
-for. The rest is by the code, and no run of these kinds was made. The token check holds four fp32 tensors of
+at its peak, 0.4 GiB more than the weights, the two states and the count. That run showed a defect, which is removed:
+the reference session of the first count -- its state and its record -- was still alive when its checks had returned,
+in a reference cycle of the session's own (its stage clock held a closure over the session), until Python collected
+it. The stage clock is handed the device now, so the reference session of a count stands in no reference cycle and is
+released when its checks return; a host test holds that on two counts with Python's collection of reference cycles
+switched off.
+What the sentence leaves out, by the code (no run of these kinds was made). The token check holds four fp32 tensors of
 every checked logit at a time; it is the larger moment from about 150 checked steps of the two-layer model -- a
 request of more positions than that at many sequences -- and from 10 checked steps at the published widths, and such
 a run can fail to allocate inside its checks behind a sentence that let it start. With a checkpoint the checks replay

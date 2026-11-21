@@ -538,5 +538,11 @@ rule (`fe.SOURCE_FILES`); an override by key takes the row of the run's stack wh
 - A hash names what ran only if an edit of what ran moves it: the list is closed to its fixed point, the `__init__.py`
   of every package on the way included, and a host test forms the fixed point again from the files. A module imported
   inside a function is outside the rule.
+- "Dropped when the checks return" is a sentence about references: hold it with weak references while Python's
+  collection of reference cycles is off, break a cycle where it is made (the stage clock is handed the device, not the
+  session), and never hide one behind a collection. A census of live objects must not keep them alive: a list of the
+  process's objects that a nested scope of the same function reads as a free variable (a generator expression, and
+  before Python 3.12 a comprehension) is held by a cell which the list itself holds; a canary object shows whether a
+  census holds what it lists.
 - When a figure moves, read every passage that states it, in every text, and reword the dated ones as sentences of
   their day.
