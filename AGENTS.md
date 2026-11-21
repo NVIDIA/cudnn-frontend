@@ -142,6 +142,8 @@ Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.cl
 
 When opening a pull request, apply **at minimum one label from each group**: one `cat-*` (change type), one or more `area:*` / `op:*` (affected area), and one `orig-*` (originator). See the full label list at <https://github.com/NVIDIA/cudnn-frontend/labels>.
 
+A draft PR gets no automatic review and skips the GitHub checks. Mark it ready (`gh pr ready <N>`) when it should be reviewed. GPU test lanes do not start on push: post a comment whose whole body is `@cudnn-ci-bot run <targets>` (the bot lists valid targets when one is wrong).
+
 Leave `closed-*` and `open-*` labels for maintainers; Milestone/Projects sidebar fields are set by reviewers/maintainers, not authors.
 
 ## Reviewing a PR (human or agent)
