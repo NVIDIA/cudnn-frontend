@@ -2559,6 +2559,42 @@ def test_the_rows_part_of_a_run_and_its_clause_in_every_form_of_the_sentence(mon
     assert plan.memory(4 * GIB, "", 0, 0, beyond) == "this stack needs about 4.0 GiB on this GPU; 6.0 GiB are free", "no byte of the checks: no clause"
 
 
+def test_the_plan_hands_the_count_the_sessions_recorded_steps_and_its_references(monkeypatch):
+    """What ``Session.plan_table`` hands the family's count are the session's own integers -- the steps it records and the
+    reference stacks its checks replay -- held where a run with a checkpoint stands and no other case looks: the
+    published widths at four sequences of 343 positions, 32 recorded steps and a second reference, where the second
+    reference's moment is the larger one.  Through ``_check_rows`` and ``plan_table`` to the sentence: the part it names
+    and the need it states."""
+    import model_samples
+    from model_samples import blocks, loop
+    from model_samples.qwen_dense import QwenDense
+
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 400 * GIB)))
+    full = QwenDense()
+    text = model_samples.TextIO.synthetic(full.geometry.vocab)
+
+    def session(**more):
+        return model_samples.Session(full, text, sequences=4, stack="fe-entries", device="cuda:0", capacity=343, **more)
+
+    def beyond(steps, references):
+        return full.check_row_bytes(4, 343, 1, steps, references) - full.check_row_bytes(1, 343, 1, steps, references)
+
+    kept = session(record_steps=32)
+    assert kept._check_rows([], 1) == beyond(32, 1) < beyond(None, 1) == session()._check_rows([], 1), "the steps the session records, not every position"
+    assert (
+        kept._check_rows([], 2) == beyond(32, 2) > beyond(32, 1)
+    ), "with a second reference its moment is the larger one at these widths, at four sequences and at one"
+    assert full.check_row_bytes(1, 343, 1, 32, 2) > full.check_row_bytes(1, 343, 1, 32, 1), "... so the count at one sequence is taken with the same references"
+    copy = full.check_bytes(kept._kept()["uncopied"])
+    for references in (1, 2):  # and through the plan to the sentence: the part it names and the need it states
+        line = kept.plan_table([], references).splitlines()[-1].strip()
+        rows = beyond(32, references)
+        need = full.memory_bytes(4, 343, **kept._kept(), **kept._paged()) + rows + int(rows * loop.CHECK_POOL)
+        assert line.startswith(f"this stack needs about {need / GIB:.1f} GiB on this GPU, {(copy + rows) / GIB:.2f} GiB of it for the checks ("), line
+    assert line.startswith("this stack needs about 39.3 GiB on this GPU, 1.59 GiB of it for the checks ("), "the sentence of that run with two references"
+    assert kept.plan_table([], 2) != kept.plan_table([], 1) != session().plan_table([], 1), "three sentences"
+
+
 def test_an_override_takes_the_row_of_the_runs_stack_where_it_names_the_same_call(monkeypatch, capsys):
     """``--provider BLOCK=KEY`` selects the first declared row of the key that serves the run -- and, where that row is of
     another stack, the row of the run's own stack that names the same call: equal in every field but its stacks and its
