@@ -39,7 +39,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import sm_count, ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, dsl_compile_lock
+from cudnn.norm.utils import sm_count, ws_bytes, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, dsl_compile_lock
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}

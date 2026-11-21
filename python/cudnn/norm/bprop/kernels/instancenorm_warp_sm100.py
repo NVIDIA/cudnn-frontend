@@ -34,7 +34,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import sm_count, ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, dsl_compile_lock
+from cudnn.norm.utils import sm_count, ws_bytes, ws_zeros, cur_stream, dyn, fake_stream, dsl_compile_lock
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
