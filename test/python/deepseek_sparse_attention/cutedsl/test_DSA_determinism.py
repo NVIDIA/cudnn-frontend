@@ -8,6 +8,7 @@ import torch
 
 from cudnn import DSA
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
+from deepseek_sparse_attention.cutedsl.block_scaled_kv_reference import ROW_LAYOUTS, quantize_rows, widen_rows
 from deepseek_sparse_attention.cutedsl.dsa_reference import check_ref_dsa_sparse_attention_backward, ref_sparse_attention_forward
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
@@ -16,6 +17,9 @@ SHAPES = {"h64-d512-k64": (64, 512, 64), "h64-d576-k64": (64, 576, 64), "h128-d5
 # SM100 H96 forward runs the H64 kernel on heads [0, 64) and [32, 96), and H128 D576 on [0, 64) and
 # [64, 128); this suite pins them forward only.
 FPROP_ONLY_SHAPES = {"h96-d576-k64": (96, 576, 64), "h128-d576-k64": (128, 576, 64)}
+# Packed KV caches the SM100 forward reads directly (``kv_format``): forward only, BF16 Q, D_qk 512. Each
+# sequence's cache rows are quantized once and travel unchanged through every batch.
+PACKED_KV_FORMATS = tuple(ROW_LAYOUTS)
 
 
 def layout_cases():
@@ -42,7 +46,8 @@ def supported_runtime():
         pytest.skip(reason)
 
 
-def sequences(lengths=(17, 3), *, heads=64, dim=512, topk=64, dtype=torch.bfloat16, selection="full", seed=20261104):
+def sequences(lengths=(17, 3), *, heads=64, dim=512, topk=64, dtype=torch.bfloat16, selection="full", seed=20261104, kv_format=None):
+    """Build the sequences; with ``kv_format``, each sequence's ``kv`` is the ``uint8`` rows of its quantized cache."""
     samples = []
     for index, length in enumerate(lengths):
         rng = torch.Generator().manual_seed(seed + index)
@@ -63,6 +68,8 @@ def sequences(lengths=(17, 3), *, heads=64, dim=512, topk=64, dtype=torch.bfloat
         if selection == "invalid":
             sample["topk_idxs"][:, ::7] = -7
             sample["topk_idxs"][:, 1::7] = kv_length + 3
+        if kv_format is not None:
+            sample["kv"] = quantize_rows(sample["kv"].float(), kv_format)
         samples.append({name: value.cuda() for name, value in sample.items()})
     return samples
 
@@ -85,8 +92,10 @@ def pack(samples, gradient_target=None):
     return {**{name: torch.cat(values) for name, values in parts.items()}, "attn_sink": samples[0]["attn_sink"]}
 
 
-def run(inputs, backward, indexer_topk=0, *, dkv_mode="records", workspace_fill=None):
+def run(inputs, backward, indexer_topk=0, *, dkv_mode="records", workspace_fill=None, kv_format=None):
     """Run the public wrappers; ``workspace_fill`` passes a caller workspace filled with that byte.
+
+    ``kv_format`` names the packed cache format of ``inputs["kv"]`` (forward only).
 
     Inputs that carry ``out`` and ``lse`` (H128 D576, which the public forward does not support) run the
     backward wrapper only, on those fixed reference forward results.
@@ -99,7 +108,7 @@ def run(inputs, backward, indexer_topk=0, *, dkv_mode="records", workspace_fill=
         assert backward and indexer_topk == 0, "reference forward inputs serve backward-only runs"
         out, lse, result = fixed["out"], fixed["lse"], {}
     else:
-        output = DSA.sparse_attention_forward_wrapper(**local, indexer_topk=indexer_topk)
+        output = DSA.sparse_attention_forward_wrapper(**local, indexer_topk=indexer_topk, kv_format=kv_format)
         assert tuple(output.keys()) == ("out", "max_logits", "lse", "lse_indexer")
         assert (output["lse_indexer"] is None) == (indexer_topk == 0)
         result = {name: value for name, value in zip(output.keys(), output) if value is not None}
@@ -146,8 +155,10 @@ def backward_plan(local, out, dout, lse, dkv_mode):
     return plan
 
 
-def check_reference(inputs, actual, backward, indexer_topk=0):
+def check_reference(inputs, actual, backward, indexer_topk=0, kv_format=None):
     local = {name: value for name, value in inputs.items() if name not in ("dout", "out", "lse")}
+    if kv_format is not None:
+        local["kv"] = widen_rows(local["kv"], kv_format)
     if "out" in inputs:
         actual = {**actual, "out": inputs["out"], "lse": inputs["lse"]}
     else:
@@ -184,14 +195,14 @@ def piece(result, samples, index):
     return selected
 
 
-def check_batch(samples, backward, indexer_topk=0, targets=None):
+def check_batch(samples, backward, indexer_topk=0, targets=None, kv_format=None):
     for target in range(len(samples)) if targets is None else targets:
         # Isolate the target's loss because d_sink is shared across sequences.
-        expected = run(pack([samples[target]]), backward, indexer_topk)
+        expected = run(pack([samples[target]]), backward, indexer_topk, kv_format=kv_format)
         for order in (tuple(range(len(samples))), tuple(reversed(range(len(samples)))), (target, target)):
             selected = [samples[index] for index in order]
             position = order.index(target)
-            actual = run(pack(selected, gradient_target=position if backward else None), backward, indexer_topk)
+            actual = run(pack(selected, gradient_target=position if backward else None), backward, indexer_topk, kv_format=kv_format)
             assert_bitwise(piece(actual, selected, position), expected, f"batch {order}, sequence {target}")
 
 
@@ -369,6 +380,56 @@ class TestDSA:
         actual = assert_replays(lambda: run(inputs, backward), repeats=3, allowed_inf=ALLOWED_INF)
         check_reference(inputs, actual, backward)
         assert_golden(f"dsa-{'bprop' if backward else 'fprop'}", inputs, actual, allowed_inf=ALLOWED_INF)
+
+
+class TestDSAPackedKV:
+    """Forward on a packed KV cache (``kv_format``): the kernel stages each tile's raw rows and widens them into the BF16
+    tile, so these cases pin that path's replay, batch invariance and isolation; the reference reads the widened pool."""
+
+    @pytest.mark.parametrize("kv_format", PACKED_KV_FORMATS)
+    @pytest.mark.parametrize("heads", [64, 96], ids=["h64-d512-k64-fprop", "h96-d512-k64-fprop"])
+    def test_replay(self, kv_format, heads):
+        inputs = pack(sequences(heads=heads, kv_format=kv_format))
+        actual = assert_replays(lambda: run(inputs, False, kv_format=kv_format), allowed_inf=ALLOWED_INF)
+        check_reference(inputs, actual, False, kv_format=kv_format)
+
+    @pytest.mark.parametrize("kv_format", PACKED_KV_FORMATS)
+    @pytest.mark.parametrize("heads", [64, 96], ids=["h64-d512-k64-fprop", "h96-d512-k64-fprop"])
+    def test_batch_invariance(self, kv_format, heads):
+        check_batch(sequences(heads=heads, kv_format=kv_format), False, kv_format=kv_format)
+
+    @pytest.mark.parametrize("kv_format", PACKED_KV_FORMATS)
+    @pytest.mark.parametrize("selection", ["ragged", "invalid", "empty", "tail65", "prefix512"])
+    def test_selection(self, kv_format, selection):
+        topk = 512 if selection == "prefix512" else 65 if selection == "tail65" else 64
+        prefix = 512 if selection == "prefix512" else 0
+        samples = sequences((5, 3), topk=topk, selection=selection, kv_format=kv_format)
+        inputs = pack(samples)
+        actual = assert_replays(lambda: run(inputs, False, prefix, kv_format=kv_format), allowed_inf=ALLOWED_INF)
+        check_reference(inputs, actual, False, prefix, kv_format=kv_format)
+        check_batch(samples, False, prefix, kv_format=kv_format)
+
+    @pytest.mark.parametrize("kv_format", PACKED_KV_FORMATS)
+    def test_query_boundary(self, kv_format):
+        # 257 queries, one CTA each, cross the second wave of a 148-SM part.
+        samples = sequences((17, 240), kv_format=kv_format)
+        assert_replays(lambda: run(pack(samples), False, kv_format=kv_format), repeats=4, allowed_inf=ALLOWED_INF)
+        check_batch(samples, False, targets=(0,), kv_format=kv_format)
+
+    @pytest.mark.parametrize("kv_format", PACKED_KV_FORMATS)
+    def test_neighbor_isolation(self, kv_format):
+        samples = sequences(kv_format=kv_format)
+        expected = piece(run(pack(samples), False, kv_format=kv_format), samples, 0)
+        changed = [samples[0], sequences(seed=20261105, kv_format=kv_format)[1]]
+        actual = piece(run(pack(changed), False, kv_format=kv_format), changed, 0)
+        assert_bitwise(actual, expected, "changed neighbor")
+
+    @pytest.mark.parametrize("kv_format", PACKED_KV_FORMATS)
+    def test_golden(self, kv_format):
+        inputs = pack(sequences((3, 2), topk=16, kv_format=kv_format))
+        actual = assert_replays(lambda: run(inputs, False, kv_format=kv_format), repeats=3, allowed_inf=ALLOWED_INF)
+        check_reference(inputs, actual, False, kv_format=kv_format)
+        assert_golden(f"dsa-{kv_format}-fprop", inputs, actual, allowed_inf=ALLOWED_INF)
 
 
 class TestDSADeterministicDKV:

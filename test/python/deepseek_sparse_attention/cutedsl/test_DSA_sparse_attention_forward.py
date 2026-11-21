@@ -883,10 +883,13 @@ def test_DSA_sparse_attention_forward_compile_cache_separates_structural_special
     monkeypatch.setattr(forward_api, "_cache_of_sparse_attention_forward_objects", {})
     monkeypatch.setattr(interface_sm100, "_compile_kernel", fake_compile_kernel)
 
-    def run(head_dim, *, dtype=torch.bfloat16, has_sink=False, has_length=False, indexer_topk=0):
+    def run(head_dim, *, dtype=torch.bfloat16, has_sink=False, has_length=False, indexer_topk=0, kv_format=None):
         logical_topk = max(indexer_topk, 1)
         q = torch.zeros((1, 64, head_dim), dtype=dtype, device="cuda")
-        kv = torch.zeros((1, head_dim), dtype=dtype, device="cuda")
+        if kv_format is None:
+            kv = torch.zeros((1, head_dim), dtype=dtype, device="cuda")
+        else:
+            kv = torch.zeros((1, {"mxfp8_528": 528, "nvfp4_288": 288}[kv_format]), dtype=torch.uint8, device="cuda")
         topk_idxs = torch.zeros((1, logical_topk), dtype=torch.int32, device="cuda")
         attn_sink = torch.zeros(64, dtype=torch.float32, device="cuda") if has_sink else None
         topk_length = torch.full((1,), logical_topk, dtype=torch.int32, device="cuda") if has_length else None
@@ -897,18 +900,21 @@ def test_DSA_sparse_attention_forward_compile_cache_separates_structural_special
             attn_sink=attn_sink,
             topk_length=topk_length,
             indexer_topk=indexer_topk,
+            kv_format=kv_format,
         )
 
     specializations = (
-        (512, torch.bfloat16, False, False, 0),
-        (576, torch.bfloat16, False, False, 0),
-        (512, torch.bfloat16, True, False, 0),
-        (512, torch.bfloat16, False, True, 0),
-        (512, torch.bfloat16, False, False, 512),
-        (512, torch.float16, False, False, 0),
+        (512, torch.bfloat16, False, False, 0, None),
+        (576, torch.bfloat16, False, False, 0, None),
+        (512, torch.bfloat16, True, False, 0, None),
+        (512, torch.bfloat16, False, True, 0, None),
+        (512, torch.bfloat16, False, False, 512, None),
+        (512, torch.float16, False, False, 0, None),
+        (512, torch.bfloat16, False, False, 0, "mxfp8_528"),
+        (512, torch.bfloat16, False, False, 0, "nvfp4_288"),
     )
-    for expected_entries, (head_dim, dtype, has_sink, has_length, indexer_topk) in enumerate(specializations, start=1):
-        run(head_dim, dtype=dtype, has_sink=has_sink, has_length=has_length, indexer_topk=indexer_topk)
+    for expected_entries, (head_dim, dtype, has_sink, has_length, indexer_topk, kv_format) in enumerate(specializations, start=1):
+        run(head_dim, dtype=dtype, has_sink=has_sink, has_length=has_length, indexer_topk=indexer_topk, kv_format=kv_format)
         assert len(compiled_callables) == len(interface_sm100._compile_cache) == expected_entries
         assert len(forward_api._cache_of_sparse_attention_forward_objects) == expected_entries
 
@@ -935,16 +941,22 @@ def test_DSA_sparse_attention_forward_packed_kv_declarations(monkeypatch):
     kv = torch.empty((2, 512), dtype=torch.bfloat16, device=device)
     topk = torch.zeros((1, 640), dtype=torch.int32, device=device)
 
-    # Every format: its byte rows, also as the view of a padded buffer, are validated, then declined until a kernel serves them.
+    # Every format: its byte rows, also as the view of a padded buffer, are validated; a served format passes, the others
+    # are declined until a kernel serves them.
+    served = ("mxfp8_528", "nvfp4_288")
     for fmt in KV_FORMATS.values():
         q_fmt = queries[fmt.head_dim_qk]
         rows = torch.empty((2, fmt.record_bytes), dtype=torch.uint8, device=device)
         padded = torch.empty((2, fmt.record_bytes + 32), dtype=torch.uint8, device=device)[:, : fmt.record_bytes]
         for pool in (rows, padded):
-            with pytest.raises(NotImplementedError, match=f"does not serve kv_format='{fmt.name}' on SM10"):
-                DSA.SparseAttentionForward(q_fmt, pool, topk, kv_format=fmt.name).check_support()
-        with pytest.raises(NotImplementedError, match=f"does not serve kv_format='{fmt.name}'"):
-            DSA.sparse_attention_forward_wrapper(q_fmt, rows, topk, kv_format=fmt.name)
+            if fmt.name in served:
+                assert DSA.SparseAttentionForward(q_fmt, pool, topk, kv_format=fmt.name).check_support()
+            else:
+                with pytest.raises(NotImplementedError, match=f"does not serve kv_format='{fmt.name}' on SM10"):
+                    DSA.SparseAttentionForward(q_fmt, pool, topk, kv_format=fmt.name).check_support()
+        if fmt.name not in served:
+            with pytest.raises(NotImplementedError, match=f"does not serve kv_format='{fmt.name}'"):
+                DSA.sparse_attention_forward_wrapper(q_fmt, rows, topk, kv_format=fmt.name)
         with pytest.raises(ValueError, match=f"must be the \\(total_S_kv, {fmt.record_bytes}\\) byte rows"):
             DSA.SparseAttentionForward(q_fmt, rows[:, :-1], topk, kv_format=fmt.name).check_support()
         other_d = 576 if fmt.head_dim_qk == 512 else 512
@@ -1001,7 +1013,7 @@ def test_DSA_sparse_attention_forward_packed_kv_declarations(monkeypatch):
         DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra_bf16, sample_extra_topk_idxs=extra_idxs).check_support()
     with pytest.raises(NotImplementedError, match="does not serve a second KV pool"):
         DSA.sparse_attention_forward_wrapper(q, kv, topk, extra_kv=extra, extra_kv_format="nvfp4_288", extra_topk_idxs=extra_idxs, extra_topk_length=extra_len)
-    with pytest.raises(NotImplementedError, match="does not serve kv_format='mxfp8_528'"):
+    with pytest.raises(NotImplementedError, match="does not serve a second KV pool"):
         DSA.sparse_attention_forward_wrapper(q, rows, topk, kv_format="mxfp8_528", extra_kv=extra, extra_kv_format="nvfp4_288", extra_topk_idxs=extra_idxs)
     with pytest.raises(NotImplementedError, match="indexer_topk > 0 \\(lse_indexer\\) with a second KV pool"):
         DSA.SparseAttentionForward(q, kv, topk, indexer_topk=512, **packed_extra).check_support()
@@ -1114,7 +1126,7 @@ _MODEL_CALLS = (
     _ModelCall("deepseek-v4-pro", "csa", 128, 512, _Pool("fp8", 128), _Pool("fp8", 1024), sink=True),
     # DeepSeek-V4.1-Flash: as V4-Flash, with window-only layers and compressed layers (ratio 1 or 2) whose indexer picks
     # 512 entries. Its window cache is mxfp8_528 or per-tensor FP8, and its compressed cache nvfp4_288.
-    _ModelCall("deepseek-v4.1-flash", "window", 64, 512, _Pool("mxfp8_528", 128), sink=True),
+    _ModelCall("deepseek-v4.1-flash", "window", 64, 512, _Pool("mxfp8_528", 128), sink=True, served=True),
     _ModelCall("deepseek-v4.1-flash", "window", 64, 512, _Pool("fp8", 128), sink=True),
     _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("bf16", 640), indexer_topk=512, sink=True, served=True),
     _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("bf16", 128), _Pool("bf16", 512), sink=True),
