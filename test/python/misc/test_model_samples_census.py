@@ -4205,6 +4205,41 @@ def test_a_launch_shape_recorded_at_a_fact_of_the_run_is_held_for_a_run_that_sta
     assert census.Target(stated), "the fact as the reader takes it"
 
 
+def test_a_run_fact_is_asked_of_the_part_that_serves_the_call_site(monkeypatch):
+    """A block whose calls several rows serve by call site hands each part its own options, and the holder of the parts
+    carries none.  The fact of the run that a census entry names is asked of the part that serves the call's site: at
+    the recorded maximum length the launch shape of that call is held as the census without the fact holds it, at
+    another one it counts under membership and the reason names the block and both lengths."""
+    import copy
+
+    from model_samples import Session, TextIO, blocks, census
+    from model_samples.qwen_dense import QwenDense
+
+    family = QwenDense.target()
+    data = copy.deepcopy(family.data)
+    section = data["configurations"][census.VERIFY]["cc10.0/sm148"]
+    recorded, tokens = section["recorded"]["max_model_len"], section["tokens"]
+    stated = [facts for block, _, facts in section["rows"][str(tokens)]["linear_attention_layer"] if block == "projection.fp8.out" and "launch" in facts]
+    assert len(stated) == 1, "one call of the block in a linear-attention layer records a launch shape"
+    stated[0]["run"] = {"max_model_len": recorded}
+    target = census.Target(data)
+    model = QwenDense.reduced(2)
+    text = TextIO.synthetic(model.geometry.vocab)
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 0)))
+
+    def claimed(census_file, length):
+        plan = Session(model, text, stack="native", device="cuda:0", capacity=62, draft_tokens=tokens - 1, max_model_len=length).resolve()
+        holder = plan["projection.fp8.out"]
+        assert len(holder.parts) > 1 and not hasattr(holder, "options"), "several rows serve the block's calls, and the holder carries no options"
+        return census_file.claim(plan, model, configuration=census.VERIFY, installed=RECORDED)
+
+    without, held, other = claimed(family, recorded), claimed(target, recorded), claimed(target, recorded + 1)
+    assert (held.recorded, held.reasons, held.compared()) == (without.recorded, without.reasons, without.compared()), "held at the recorded length"
+    (call,) = [index for index, block in enumerate(held.blocks) if block == "projection.fp8.out" and index in held.recorded]
+    assert call not in other.recorded and other.compared()[0] == held.compared()[0] - 1 and other.compared()[2] == held.compared()[2] + 1
+    assert any("projection.fp8.out" in reason and f"{recorded + 1}" in reason and f"{recorded}" in reason for reason in other.reasons)
+
+
 def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     """An entry gates the installed toolchain where it builds its kernel.  On a device where a kernel can be built the
     adapter makes that first use while the run is planned, on scratch operands of the run's row count: a decline is then a
