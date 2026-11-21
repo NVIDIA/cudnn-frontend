@@ -78,7 +78,10 @@ A kernel of a library has no entry that states its launch: what is held of it is
 one call with several classes of kernel, the census entry names the class (``class``, a part of the kernel's name) and item
 7 holds it with the launch shape.  Where the library's own tuner chooses the kernel, the census records that tuner's pick
 (``pick``) and no launch shape: the launch is held as a member of the kernels the call can launch, and the run prints the
-kernel it launched beside the recorded pick -- compared, never gated.
+kernel it launched beside the recorded pick -- compared, never gated.  Where a kernel's launch follows a fact of the run
+beyond its row count -- the maximum length a paged attention kernel is told -- the entry names the fact it was recorded
+with (``run``), and item 7 holds its launch shape and its class for a run that states the same value alone: at another
+one the launch is held as a member of its kernel's family, and the census line says so.
 
 A census holds one configuration per kind of step: ``plain`` for the decode step (one token per sequence) and ``verify``
 for the step that feeds several (:func:`configuration_of`); a section of the latter also names the tokens per sequence it
@@ -738,8 +741,12 @@ PARTS = ("prologue", "epilogue", "after_step")
 #: form the target passes at THIS call, beyond the form its kernel has everywhere (a kernel that is called in several forms);
 #: ``class`` = the kernel class of a library kernel at this call, as the kernel's name carries it (a library that serves one
 #: call with several classes of kernel: held like the launch shape, and with it); ``pick`` = the kernel a library's tuner
-#: chose at this call in the recorded run, by name (printed and compared, never gated: another run's tuner may choose another)
-ENTRY_FACTS = ("launch", "at", "form", "class", "pick")
+#: chose at this call in the recorded run, by name (printed and compared, never gated: another run's tuner may choose another);
+#: ``run`` = the facts of the run, beyond the section's row count, that this one launch shape and class were recorded with
+#: (:data:`RUN_FACTS`): held for a run that states the same values, as a block's options carry them, and for no other
+ENTRY_FACTS = ("launch", "at", "form", "class", "pick", "run")
+#: the facts of a run an entry may name under ``run``: the positions a sequence of the run may reach at most
+RUN_FACTS = ("max_model_len",)
 #: an optional part of a section's row count: per block the facts that differ at that block's first call in the model's
 #: first layer (the first norm of a step has no residual to add)
 FIRST_LAYER = "first_layer"
@@ -772,6 +779,7 @@ class Identity(NamedTuple):
     launch: Optional[tuple] = None  # the launch shape the census recorded for the target's kernel at this place
     named: str = ""  # the kernel class the census recorded there for a library kernel (a part of its name); held with ``launch``
     pick: str = ""  # the kernel a library's tuner chose there in the recorded run: printed and compared, never gated
+    run: str = ""  # of TARGET / STAND_IN: the facts of this run that are not the ones ``launch`` was recorded with; neither it nor ``named`` is held then
 
     def text(self) -> str:
         if self.relation in (NOT_YET, OTHER):
@@ -809,6 +817,23 @@ def _other_widths(recorded: Mapping[str, object], geometry) -> str:
         for name, value in recorded.items()
         if _plain(getattr(geometry, name, None)) != _plain(value)
     )
+
+
+def _other_run(recorded: Mapping[str, int], options: Mapping) -> str:
+    """The facts of a run that are not the recorded ones, as a run names them: ``max_model_len 4096 (recorded 2051)``; empty
+    where the run states every recorded fact.  ``options``: what the plan handed the block of the call; a fact it does
+    not carry is one the run does not share."""
+    stated = {name: options.get(name) for name in recorded}
+    return ", ".join(
+        f"{name} {'not stated' if stated[name] is None else stated[name]} (recorded {value})"
+        for name, value in recorded.items()
+        if type(stated[name]) is not int or stated[name] != value
+    )
+
+
+def _run_facts(value) -> bool:
+    """Whether ``value`` is the ``run`` of a census entry: an object of facts of a run this reader knows, a whole number each."""
+    return isinstance(value, dict) and all(name in RUN_FACTS and isinstance(n, int) and not isinstance(n, bool) and n >= 1 for name, n in value.items())
 
 
 def _launch_shape(value) -> bool:
@@ -993,7 +1018,8 @@ class Target:
       before the layers, per layer kind, after the layers, after the step.  The facts of an entry (:data:`ENTRY_FACTS`):
       ``launch`` = ``[grid, block, shared memory]``, ``at`` = further fields of the geometry that this one launch
       shape was recorded with, and ``form`` = the fields of the kernel's form the target passes at this call beyond the
-      form the kernel has everywhere (a kernel the target calls in several forms).  ``first_layer`` (optional): per
+      form the kernel has everywhere (a kernel the target calls in several forms), and ``run`` = the facts of the run
+      that this one launch shape was recorded with (:data:`RUN_FACTS`).  ``first_layer`` (optional): per
       block the facts that differ at its first call in the model's first layer.
 
     ``ValueError`` for a file that is not such a census; for a section that says ``claimed`` on a basis that is not
@@ -1054,6 +1080,10 @@ class Target:
                     for block, facts in first.items():
                         if not isinstance(facts.get("form", {}), dict) or ("launch" in facts and not _launch_shape(facts["launch"])):
                             wrong(f"{where}, {rows} rows, {FIRST_LAYER}: the form of {block} is not an object, or its launch is not a launch shape")
+                        if not _run_facts(facts.get("run", {})):
+                            wrong(
+                                f"{where}, {rows} rows, {FIRST_LAYER}: run of {block} is not an object of facts of a run ({' and '.join(RUN_FACTS)}: whole number)"
+                            )
                     for part in (*PARTS, *layers.values()):
                         if not isinstance(parts.get(part), list):
                             wrong(f"{where}, {rows} rows: no entry list {part}")
@@ -1073,6 +1103,10 @@ class Target:
                                 wrong(f"{where}, {rows} rows, {part}: the form of {block} is not an object of form fields")
                             if any(name in facts and (not isinstance(facts[name], str) or not facts[name]) for name in ("class", "pick")):
                                 wrong(f"{where}, {rows} rows, {part}: class and pick of {block} are names: a kernel class, a kernel")
+                            if not _run_facts(facts.get("run", {})):
+                                wrong(
+                                    f"{where}, {rows} rows, {part}: run of {block} is not an object of facts of a run ({' and '.join(RUN_FACTS)}: whole number)"
+                                )
                             meta = kernels[kernel_id]
                             if section["claimed"] and "launch" not in facts and meta["relation"] == TARGET and "selection" not in meta:
                                 wrong(
@@ -1143,8 +1177,9 @@ class Target:
                 for block, identity in zip(claim.blocks, claim.identities):
                     if identity.relation == OTHER and block not in getattr(plan, "overridden", ()):
                         found.append(f"not the target set: {block} ({identity.reason})")
-                    elif identity.relation in (TARGET, STAND_IN) and identity.reason:
-                        found.append(f"no recorded launch shape of {block} for this model: {identity.reason}")
+                    elif identity.relation in (TARGET, STAND_IN):
+                        found += [f"no recorded launch shape of {block} for this model: {identity.reason}"] if identity.reason else []
+                        found += [f"no recorded launch shape of {block} for this run: {identity.run}"] if identity.run else []
                 reasons += list(dict.fromkeys(found))
                 reasons += [f"the plan has no block for {block}" for block in dict.fromkeys(block for block, _, _ in claim.absent)]
                 if not reasons and not section["claimed"]:
@@ -1216,10 +1251,13 @@ class Target:
         # a launch shape recorded with a field of the geometry this model does not share (the output head's: the vocabulary) is
         # not this model's: it is held by nothing, and the claim says so
         other = _other_widths(facts.get("at", {}), geometry) if shape is not None else ""
-        named = "" if other else str(facts.get("class", ""))  # recorded with the launch shape: held where that one is
-        return Identity(
-            STAND_IN if meta["relation"] == STAND_IN else TARGET, kernel_id, kind, other, None if other else shape, named, str(facts.get("pick", ""))
-        )
+        # ... and so is one recorded at a fact of the run that this run does not state (the maximum length a kernel is told):
+        # asked of what the plan handed the block of this call
+        apart = _other_run(facts.get("run", {}), getattr(part, "options", None) or {})
+        held = not (other or apart)
+        named = str(facts.get("class", "")) if held else ""  # recorded with the launch shape: held where that one is
+        relation = STAND_IN if meta["relation"] == STAND_IN else TARGET
+        return Identity(relation, kernel_id, kind, other, shape if held else None, named, str(facts.get("pick", "")), apart)
 
 
 # ---------------------------------------------------------------------------------------------------------- a traced pass

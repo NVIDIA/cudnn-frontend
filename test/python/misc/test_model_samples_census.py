@@ -4082,7 +4082,7 @@ def test_equal_says_what_was_compared_and_a_file_that_records_less_is_refused():
     for claimed in (True, False):  # a misspelt key is a fact the reader does not know: never "nothing recorded"
         misspelt = _small_census(claimed=claimed)
         step_facts(misspelt)["lauch"] = step_facts(misspelt).pop("launch")
-        assert refused(misspelt) == "linear_attention.step states lauch; an entry states launch and at and form and class and pick"
+        assert refused(misspelt) == "linear_attention.step states lauch; an entry states launch and at and form and class and pick and run"
     for bad in (
         [[96, 1], [256, 1, 1], 42112],
         [[96, 1, 1], [256, 1, 1]],
@@ -4126,6 +4126,83 @@ def test_equal_says_what_was_compared_and_a_file_that_records_less_is_refused():
     status, lines = traced.judge()
     assert status == census.FAIL and len(lines) == 1 and f"the {CENSUS} has grid (96, 1, 1)" in lines[0], lines
     assert traced.details()[-1] == f"{CENSUS}: NOT EQUAL (the kernel check did not hold)"
+
+
+def test_a_launch_shape_recorded_at_a_fact_of_the_run_is_held_for_a_run_that_states_it(monkeypatch):
+    """An entry of a census section can name the facts of the run its launch shape was recorded with (``run``: the maximum
+    length a run is started with).  A session at that maximum length is held to the entry's launch shape and to its
+    kernel class.  At another one the call is still the target's and nothing of it is held by shape: the launch counts
+    under membership, and the reason names the block and both lengths, as a fact of the run.  A plan that states no
+    maximum length shares none.  The reader refuses a fact that is no object of whole numbers and a name it does not
+    know; and the family's file documents every fact its reader knows, and states this one where its record does."""
+    import copy
+
+    from model_samples import Session, TextIO, blocks, census
+    from model_samples.qwen_dense import QwenDense
+
+    family = QwenDense.target()
+    about = " ".join(family.data["about"])
+    assert [fact for fact in census.ENTRY_FACTS if f"'{fact}'" not in about] == [], "the file documents every fact of an entry"
+    stating = set()
+    for configuration, sections in family.data["configurations"].items():
+        for key, section in sections.items():
+            for rows, parts in section["rows"].items():
+                for block, _, facts in family.sequence(parts, QwenDense().geometry.layer_kinds):
+                    if "run" in facts:
+                        stating.add((configuration, block))
+                        assert facts["run"] == {"max_model_len": section["recorded"]["max_model_len"]} and "launch" in facts, (configuration, key, rows, block)
+    assert stating == {(census.PLAIN, "attention.core"), (census.VERIFY, "attention.core")}, "the launch shapes that follow the maximum length"
+
+    # the family's census with the fact on an entry that a row of the stack serves today: the down multiply, a class and a launch shape
+    data = copy.deepcopy(family.data)
+    section = data["configurations"]["plain"]["cc10.0/sm148"]
+    recorded = section["recorded"]["max_model_len"]
+    down = [facts for part in ("linear_attention_layer", "attention_layer") for block, _, facts in section["rows"]["1"][part] if block == "mlp.down"]
+    assert len(down) == 2 and all(facts["class"] and facts["launch"] for facts in down)
+    for facts in down:
+        facts["run"] = {"max_model_len": recorded}
+    target = census.Target(data)
+    model = QwenDense.reduced(2)
+    text = TextIO.synthetic(model.geometry.vocab)
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 0)))
+
+    def claimed(census_file, **session):
+        plan = Session(model, text, stack="native", device="cuda:0", capacity=58, **session).resolve()
+        return census_file.claim(plan, model, installed=RECORDED)
+
+    as_it_is = claimed(family, max_model_len=recorded)
+    held = claimed(target, max_model_len=recorded)
+    calls = [index for index, block in enumerate(held.blocks) if block == "mlp.down"]
+    assert len(calls) == 2 and all(held.classes[index] == down[0]["class"] and index in held.recorded for index in calls), "shape and class are held"
+    assert (held.reasons, held.recorded, held.classes, held.compared()) == (as_it_is.reasons, as_it_is.recorded, as_it_is.classes, as_it_is.compared())
+    other = claimed(target, max_model_len=recorded + 1)
+    said = f"no recorded launch shape of mlp.down for this run: max_model_len {recorded + 1} (recorded {recorded})"
+    assert other.reasons.count(said) == 1 and sorted(other.reasons) == sorted([*held.reasons, said]), "said once for its two calls"
+    assert [other.identities[index].relation for index in calls] == [census.TARGET] * 2 and other.numbers() == held.numbers(), "the target's call, as it was"
+    assert not any(index in other.recorded or index in other.classes for index in calls), "neither the launch shape nor the class is held"
+    assert (other.compared()[0], other.compared()[2]) == (held.compared()[0] - 2, held.compared()[2] + 2), "the two launches count under membership"
+    assert said in other.line(census.PASS) and f"{held.compared()[2] + 2} more by membership alone" in other.line(census.PASS)
+    unnamed = claimed(target)  # a session that names no maximum length: its capacity
+    assert f"no recorded launch shape of mlp.down for this run: max_model_len 58 (recorded {recorded})" in unnamed.reasons
+    plan, _, _ = _target_plan(2)  # a plan that was resolved without a session states none
+    unstated = target.claim(plan, model, installed=RECORDED)
+    assert not any(index in unstated.recorded or index in unstated.classes for index in calls) and any("for this run" in reason for reason in unstated.reasons)
+
+    def refused(change, where="layer"):
+        wrong = _small_census(claimed=False)
+        change(wrong["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"])
+        with pytest.raises(ValueError) as error:
+            census.Target(wrong)
+        assert str(error.value).startswith(f"kernel_census.json: plain / cc10.0/sm148, 1 rows, {where}"), str(error.value)
+        return str(error.value)
+
+    for bad in ({"max_model_len": "2051"}, {"max_model_len": 2051.0}, {"max_model_len": True}, {"max_model_len": 0}, {"max_model_length": 2051}, [2051], 2051):
+        assert "run of linear_attention.step" in refused(lambda rows: rows["layer"][0][2].update(run=bad)), bad
+        assert "run of linear_attention.step" in refused(lambda rows: rows.update(first_layer={"linear_attention.step": {"run": bad}}), "first_layer"), bad
+    assert "linear_attention.step states runs" in refused(lambda rows: rows["layer"][0][2].update(runs={"max_model_len": 2051}))
+    stated = _small_census()
+    stated["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["layer"][0][2]["run"] = {"max_model_len": 2051}
+    assert census.Target(stated), "the fact as the reader takes it"
 
 
 def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
@@ -5206,11 +5283,11 @@ def test_a_census_names_the_form_of_every_call_of_a_kernel_with_several_forms():
         (lambda rows: rows["epilogue"][0][2].update(form=["BF16_OUT"]), "1 rows, epilogue: the form of add_norm_quantize is not an object of form fields"),
         (
             lambda rows: rows.update({census.FIRST_LAYER: [["add_norm_quantize", {}]]}),
-            "1 rows: first_layer is not an object of block: facts (launch and at and form and class and pick)",
+            "1 rows: first_layer is not an object of block: facts (launch and at and form and class and pick and run)",
         ),
         (
             lambda rows: rows[census.FIRST_LAYER]["add_norm_quantize"].update(forms={}),
-            "1 rows: first_layer is not an object of block: facts (launch and at and form and class and pick)",
+            "1 rows: first_layer is not an object of block: facts (launch and at and form and class and pick and run)",
         ),
         (lambda rows: rows[census.FIRST_LAYER]["add_norm_quantize"].update(form="first"), "first_layer: the form of add_norm_quantize is not an object"),
     ):
