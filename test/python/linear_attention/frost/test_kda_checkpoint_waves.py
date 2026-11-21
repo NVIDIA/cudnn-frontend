@@ -7,7 +7,6 @@ from itertools import accumulate
 
 import pytest
 import torch
-import cutlass.cute as cute
 
 import cudnn
 from cudnn.linear_attention.frost import kda_engine
@@ -112,19 +111,20 @@ def test_checkpoint_wave_capacity_policy():
 
 
 def test_checkpoint_wave_compile_count(monkeypatch):
+    """Count chain specializations whether compiled or loaded from cache."""
     reason = frost_la_unavailable()
     if reason:
         pytest.skip(reason)
     from cudnn.linear_attention.frost.kernel import kda_chain_backward_f16 as chain
 
-    original_compile = cute.compile
+    original_compile = chain.compile_cached
     calls = []
 
     def record_compile(*args, **kwargs):
         calls.append(args[0])
         return original_compile(*args, **kwargs)
 
-    monkeypatch.setattr(cute, "compile", record_compile)
+    monkeypatch.setattr(chain, "compile_cached", record_compile)
     monkeypatch.setattr(chain, "chain_backward_cache", {})
     handle = cudnn.create_handle()
     cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream().cuda_stream)
