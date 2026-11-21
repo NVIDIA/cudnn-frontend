@@ -417,6 +417,10 @@ DSL satisfies your kernel.**
   requirements still need runtime checks: environments can bypass dependency
   resolution, and newer kernels can require APIs or targets above the package
   floor. Keep the existing version gates and actionable errors.
+- CUTLASS can extend `cutlass.__path__` with operator-only packages. Do not
+  count namespace directories as DSL installations. Compare concrete `cutlass`,
+  `cutlass.cute`, and `cutlass.base_dsl` origins; reject mixed or missing core
+  origins. `moe_ep/cutemok/test_cutemok.py` pins these checks.
 - Before a path imports a DSL-version-specific API, check the installed version
   with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
   `CUTEDSL_MIN_VERSION`; a kernel whose own floor is higher passes it as
