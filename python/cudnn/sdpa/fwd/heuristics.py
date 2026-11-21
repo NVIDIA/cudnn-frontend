@@ -286,11 +286,9 @@ _SM80_SPLIT_KV_CTA_COST = 3.0
 _SM80_SPLIT_KV_COMBINE_COST = 0.02
 # SM80 half d256 decode on the short-d256 tile (64-row Q tile, 32-key KV tiles), paged at S_q <= 16 and dense single-row: the wave
 # model mis-splits it in both directions, so it takes a direct rule (_sm80_d256_decode_split_choice): the largest power-of-two split
-# that keeps >= 8 KV tiles per split and <= 16 waves of CTAs. Study sm80_d256_decode_split_cal_20261118: regret vs the best forced
-# split 1.388 -> 1.038 on 60 train cells, 1.338 -> 1.033 on 30 holdout cells, no cell slower than today's choice. Dense S_q 2-16
-# keeps the shared model: its S_q 16 cells conflict with the rule.
-# Single-row decode on a one-CTA base grid (b 1, one KV head) may split to 128: 0.790 of split 64 on 18 fresh cells, none slower
-# (sm80_d256_split128_q1_20261118); at S_q 4 it was not always faster (sm80_d256_split128_base1_20261118: 1.101).
+# that keeps >= 8 KV tiles per split and <= 16 waves of CTAs. Dense S_q 2-16 keeps the shared model: its S_q 16 cells conflict with
+# the rule. Single-row decode on a one-CTA base grid (b 1, one KV head) may split to 128; multi-row decode stays at 64, where a
+# 128 split did not always win.
 _SM80_D256_DECODE_SPLIT_MIN_KV_TILES = 8
 _SM80_D256_DECODE_SPLIT_MAX_WAVES = 16
 _SM80_SPLIT_PARTIAL_O_MAX_ELEMS = 1 << 31  # SM80 split-KV faults once the partial-O buffer reaches 2^31 elements
