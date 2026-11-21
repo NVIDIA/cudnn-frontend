@@ -113,7 +113,47 @@ defaults); JAX arrays, tensors inside lists, and functions taking `*args` or
 
 Each function keeps its 256 most recently used signatures
 (`CUDNN_FRONTEND_CPP_LAUNCHER_MAX`, read at import), so a workload whose shapes keep
-changing cannot grow the recordings without bound.
+changing cannot grow the recordings without bound. Use is tracked once a function
+holds more than half that many.
+
+## What a launched call costs
+
+A launched call skips the function's Python, not all Python. On every call it still
+binds the arguments, computes the key, allocates what the function returns, and
+hands the addresses to C++. Host time per call on a B200 host (one x86 core):
+
+| Step | Host time |
+|---|---|
+| Bind the arguments and compute the key | 5 µs for 6 tensor arguments, 9 µs for 11 tensors among 40 parameters |
+| Allocate each returned tensor, and the scratch buffer | 1.6 µs each |
+| `_Launcher.execute`: checks, fills and kernel launches | 4 µs with one kernel, 9 to 23 µs for the linear-attention engines |
+
+So the launcher helps where the function's own warm path costs more than a key
+plus the launches, and does nothing for a function that is already that short.
+Two examples, Python path against launched call:
+
+- `kimi_delta_attention` forward on the FROST engine (T=2048, 32 heads): 74 µs against 33 µs.
+- `grouped_gemm_dglu_wrapper_sm100` (MXFP8, 8 experts): 69 µs against 32 µs.
+
+What keeps the key short:
+
+- What an argument adds to the key follows from its type, so that is decided once per
+  combination of argument types and a call only reads values: dtype, shape, strides
+  and device of each tensor, and the other arguments as they are.
+- A list or tuple of ints, bools, strings or `None` is keyed in one step. A sequence
+  holding anything else is walked element by element; one holding a tensor is not
+  keyed at all, and the call runs the function.
+- Each environment variable named in `cpp_launched(env=...)` is read on every call.
+- A returned tensor costs an allocation per call whether the function or the
+  launcher makes it, so the launcher cannot shorten that part.
+
+## APIs that use it
+
+- Linear attention on the FROST engines: forward and backward of KDA, GDN, GDN-2,
+  GDP and Mamba-2, and each family's summary and summary backward
+  ([Linear attention](../operations/LinearAttention.md)).
+- Grouped GEMM: `grouped_gemm_wrapper_sm100` and the GLU, dGLU, quant and WGrad
+  wrappers ([Grouped GEMM](../operations/gemm_fusions/grouped_gemm.md)).
 
 ## Checking a `cpp_launched` function
 
@@ -122,7 +162,10 @@ them. Every call of a `cpp_launched` function runs the function, then records it
 replays the recording on copies of the arguments at other addresses. The replay has
 to return, and leave in its arguments, bit for bit what the call did, or the call
 raises. New tensors are zero-filled in this mode so bytes no kernel writes compare
-equal. A call inside a CUDA graph capture is not checked. At exit the process prints
+equal. A call inside a CUDA graph capture is not checked. Memory the function
+reaches only through addresses stored in an argument (a tensor of per-expert
+pointers) is not copied, so a function that accumulates there does it twice in
+this mode. At exit the process prints
 how many calls matched and why others were not recorded. Run a `cpp_launched` API's tests in this mode: it is how a launch the recording
 misses, or a result that does not follow from the arguments, shows up.
 
