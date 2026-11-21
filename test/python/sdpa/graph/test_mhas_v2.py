@@ -5510,6 +5510,7 @@ _P1_ROW_LAYOUT = "k: native dense forward"
 # THD-shape clause, which sits ahead of the row's own cc 10.7 clause in engines.mismatch.
 _P1_ROW_THD_LEG = "THD (ragged) rides the packed native-tile leg on this engine"
 _P1_BACKEND_PAGED = "MXFP8 SDPA over paged K/V caches is not supported by the cuDNN backend."
+_P1_BACKEND_K_STRIDE = "K: stride 129 of dimension 2 times element size 1 bytes is not a multiple of the tensor's 16-byte alignment"
 _P1_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.0 / 10.3 / 10.7"
 _P1_GUARD_TAIL = "the backend is not consulted for this graph"
 _P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason -- unread once the expectation is "frost")
@@ -5519,7 +5520,7 @@ _P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason -- unr
     "d64":           (dict(d=64, dv=64),                   "frost_absent", _P1_ROW_EXACT),
     "d200":          (dict(d=200, dv=200),                 "frost_absent", _P1_ROW_EXACT),
     "sq1_bhsd":      (dict(sq=1, bshd=False, stats=False), "frost",        None),  # native layout, backend remains guarded
-    "sq1_unaligned_k": (dict(sq=1, stats=False, unaligned_k=True), "guard", _P1_ROW_LAYOUT),  # both native row and guarded backend decline
+    "sq1_unaligned_k": (dict(sq=1, stats=False, unaligned_k=True), "guard", _P1_ROW_LAYOUT),  # both the native row and the backend (guarded or not) decline
 }
 
 
@@ -5532,9 +5533,10 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
     ``decline``: planning raises with both reasons.  ``frost_absent``: the backend may legitimately claim the graph, so
     the row's absence and its reason (graph-level check_support) are asserted and nothing runs; when planning declines
     the error names the row's reason too.  ``guard``: below the fixed backend the frontend answers without consulting
-    (or lowering for) the backend; at or above it the backend may serve the BHSD graph.  ``frost``: the row serves the
-    request (the P6a hand-off for paged 128 pools, one value in the table): its check_support passes, the flag-less plan
-    list carries the row, nothing runs."""
+    (or lowering for) the backend; at or above it the backend is asked and planning raises with both reasons, the
+    backend's being the frontend's stride-alignment check on K.  ``frost``: the row serves the request (the P6a hand-off
+    for paged 128 pools, one value in the table): its check_support passes, the flag-less plan list carries the row,
+    nothing runs."""
     import re
     from cudnn.engines import manifest
     try:
@@ -5589,9 +5591,9 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
                 assert _P1_GUARD in str(error) and _P1_GUARD_TAIL in str(error) and row_reason in str(error), str(error)
                 assert g._lowered_graph is None, "the guard must answer before any C++ lowering"
             else:
-                assert error is None and names and g.selected_engine is None
-                g.check_support()
-                g.build_plans()  # a backend plan builds without buffers; nothing is executed
+                assert isinstance(error, cudnn.cudnnGraphNotSupportedError), error
+                msg = str(error)
+                assert row_reason in msg and _P1_BACKEND_K_STRIDE in msg and _P1_GUARD not in msg and "python engines declined:" in msg, msg
         assert snap() == before, "a decline must not re-declare any tensor"
 
 
