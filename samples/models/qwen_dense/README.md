@@ -304,7 +304,7 @@ calls of a library, FlashInfer, are on their target forms:
 | MLP down | 64 | `flashinfer.gemm.mm_fp4` on the stored 4-bit weight, with the library's CuTe DSL backend and outside any tuning context (`BACKEND cute-dsl`, `TUNED False`): the library's own pick for the shape, its split-K kernel class for this weight; needs FlashInfer; compute capability 10.x | target: the target's own compiled kernel, held to the kernel class and the launch shape the census records |
 | output head | 1 | the reference's 4-bit quantisation of the normed rows, then the same call of `flashinfer.gemm.mm_fp4` on the stored 4-bit weight: the library's persistent kernel class for this weight; needs FlashInfer; compute capability 10.x | target: the target's own compiled kernel, held to the kernel class and the launch shape the census records (the quantisation in front of it is the last row of this table) |
 | attention preparation | 16 | `cudnn.AttentionPrepareDecode` on the layer's cache as a pool of pages, the kernel stated whole: three position rows in the sections of the published rotary width, pages of 64 positions, 64-bit positions and slots, an ordinary launch (`POSITIONS 3d`, `SECTION (11, 11, 10)`, `PAGE_SIZE 64`, `POSITION_DTYPE int64`, `SLOT_DTYPE int64`, `PDL False`, `PDL_RELEASE False`); compute capability 10.x, 1 to 1,024 rows | target: a cuDNN Frontend entry with byte-equal results |
-| attention core | 16 | a fallback row of the target stacks: the reference chain of `fe-cublas`, which reads that pool through the cache's accessors. `--provider attention.core=torch_ref.attention` names the key that both rows have and selects the row of `fe-cublas` and `reference`: the same chain and the same bytes, printed with that row's reason | not yet |
+| attention core | 16 | a fallback row of the target stacks: the reference chain of `fe-cublas`, which reads that pool through the cache's accessors. `--provider attention.core=torch_ref.attention` names the key that both rows have and selects, on each stack, that stack's own row: the same chain and the same bytes, printed with the reason of the stack that runs (an override takes the row of the run's stack where that row names the same call, and the first declared row of its key elsewhere) | not yet |
 | the 4-bit quantise in front of the output head | 1 | nothing: this sample has no block for it yet | the target's declared stand-in, not yet |
 
 The norm block is called at five kinds of site in a step, and the target calls its kernel in another form at each: the
@@ -472,8 +472,9 @@ than the twin's, and 1,634,304 at four, 7 of them another byte and none outside 
 2 and 4 x 8 rows, 80 plain steps at two sequences across the first page boundary, and seeded runs at 85 and at 1,024
 sequences passed too: at 1,024 sequences one launch prepared the 1,024 rows of a step, 1,023 of 418,381,824 elements
 were another byte than the twin's, none was outside its band, and one sequence alone wrote the bytes it wrote among the
-1,024. The memory sentence does not yet count what a step holds per row beyond its state: at 85 and at 1,024 sequences
-a run held more than the sentence named, and fit the GPU it ran on. The sentence is corrected in a change of its own.
+1,024. The memory sentence of that day did not count what the checks of a run hold for every sequence: at 85 and at
+1,024 sequences a run held more than the sentence named, and fit the GPU it ran on. The sentence counts that part since
+2026-11-21 (the section "Support per GPU class" says what it counts and what it leaves out).
 
 On the published checkpoint the performance mode passed on both stacks, its blocks judged at positions 0-15, 63, 64, 312
 and 313 -- the two on either side of the first page boundary, on the pool -- and the kernel check of its traced steps
@@ -1609,12 +1610,13 @@ and grew the device by 3.8 GiB; the verify session alone, which keeps the out-pr
 layer on its codes without a copy, asked for about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; three
 sequences of three tokens, with the decode session on the same load, asked for about 3.6 GiB, reserved 3.1 GiB and
 grew the device by 3.3 GiB -- half a GiB below its sentence, in each of its runs; every other step shape up to 32
-rows reserved 3.6 GiB. Beyond 32 rows the sentence is short, as it is
-for a decode plan beyond 33 sequences (the section "Support per GPU class"): 16 sequences of three, four and five
+rows reserved 3.6 GiB. Beyond 32 rows the sentence of that day was short, as it was
+for a decode plan beyond 33 sequences: 16 sequences of three, four and five
 tokens -- 48, 64 and 80 rows -- asked for about 4.0, 4.0 and 4.4 GiB, reserved 4.3, 5.6 and 7.0 GiB and grew the
-device by 4.5, 5.8 and 7.1 GiB. A GPU whose free memory is what the sentence says passes the plan of such a run and
-can fail to allocate inside its checks: at these step shapes the device grew by 0.5 to 2.7 GiB more than the
-sentence said.
+device by 4.5, 5.8 and 7.1 GiB, 0.5 to 2.7 GiB more than the sentence said. Since 2026-11-21 the sentence counts
+what the checks of a session hold for every sequence beyond the first, a session of several tokens by its rows (the
+section "Support per GPU class" has the count, its reach and the runs); the figures of this paragraph are those of
+their day.
 
 **What the entry states about one sequence alone.** `cudnn.GdnVerifyFused` is replay-identical, and it states no
 batch invariance between one sequence and several: one sequence takes another association of the gated norm's sum
@@ -2097,10 +2099,11 @@ hold that condition themselves: the loader takes a checksum of every weight it k
 the checks take it again before their first pass and after their last. A weight whose stored bytes are not those of
 the load fails the run, named by block and layer (`stored weights`); in a run that keeps its copies the same defect
 fails the block's band, because the reference reads the copy of the load. The memory sentence names the checks' part
--- the largest such copy, one at a time -- and the checks print what the copies cost:
+-- the largest such copy, one at a time, beside what the checks hold for the sequences beyond the first ("Support per
+GPU class") -- and the checks print what the copies cost:
 
 ```text
-  this stack needs about 3.5 GiB on this GPU for 1 and 4 sequences, one count after the other, 0.33 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none); 177.7 GiB are free
+  this stack needs about 3.7 GiB on this GPU for 1 and 4 sequences, one count after the other, 0.47 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none, and what they hold for the sequences beyond the first of a count); 177.7 GiB are free
   stored weights    4 of 4 weights this run keeps on their stored format alone hold the bytes of their load, before the checks and after them: the reference's copies were made from what was loaded    PASS
   on demand         the reference read 460 bf16 copies of weights this run keeps on their stored format alone (projection.fp8.in, mlp.gate_up): each made for one call and dropped after it; the largest 0.33 GiB, 110.1 GiB in all, 1.8 s of the checks (orientation only)
 ```
@@ -2203,19 +2206,23 @@ held by a host test over a stand-in entry and was seen on a real GPU only with t
 decline, not on such an installation.
 
 Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak,
-reserved 3.5 GiB and grew the device by 3.7 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB
-free there. On compute capability 12.x
-it adds an allowance of 3 GiB and asks for about 6.7 GiB: the first launch of the fused step reserves device memory outside
+reserved 3.5 GiB and grew the device by 3.7 GiB on a compute capability 10.0 GPU. The sample asks for about 3.9 GiB
+free there: 3.7 GiB for the weights, the state and the working memory, and 0.2 GiB for what its checks hold for the
+three sequences beyond the first of the larger count (below). On compute capability 12.x
+it adds an allowance of 3 GiB and asks for about 6.9 GiB: the first launch of the fused step reserves device memory outside
 PyTorch's pool on that class. The need is stated once, for every sequence count of the run, before anything is loaded: the
-copies, the working memory and the first launch are counted once, the state per count. The run measures that launch and
+copies, the working memory and the first launch are counted once, the state per count, and of the checks the part of the
+count that holds the most. The run measures that launch and
 prints what it took. Measured by this sample on a compute
 capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence form, nothing at the 4-sequence form, and
 6.9 GiB of growth on the device over the whole run.
-On the reduced models the memory sentence is an estimate: its working memory is a flat 2 GiB, and the runs of this page
-miss it by a few tenths of a GiB in either direction, with the copies of the in-projections and of the gate / up
-weights, with both of their forms and with their codes alone. Over these runs on compute capability 10.0 (one to four
-layers, 1 to 33 sequences) PyTorch reserved between 0.5 GiB less and 0.1 GiB more than the sentence said, and the
-device grew by about 0.2 GiB more than PyTorch reserved. The default run on the cuDNN Frontend rows (`fe-entries` today
+On the reduced models the memory sentence is an estimate: its working memory is a flat 2 GiB, and the runs of this
+paragraph missed the sentence of their day by a few tenths of a GiB in either direction, with the copies of the
+in-projections and of the gate / up weights, with both of their forms and with their codes alone. Over these runs on
+compute capability 10.0 (one to four layers, 1 to 33 sequences) PyTorch reserved between 0.5 GiB less and 0.1 GiB
+more than that sentence said, and the device grew by about 0.2 GiB more than PyTorch reserved. That sentence did not
+count what the checks hold for the sequences beyond the first: the sentence of today asks 0.2 GiB more for a default
+run than the figures below, and more with every further sequence. The default run on the cuDNN Frontend rows (`fe-entries` today
 without the attention preparation's row; `native` selected the same rows until 2026-11-17), with the in-projections and
 the
 gate / up weights on their codes alone, asked for about 3.5 GiB, reserved 3.6 GiB and grew the device by 3.8 GiB; the
@@ -2227,19 +2234,86 @@ and grew the device by 2.9 GiB; its four-layer run asked for about 3.8 GiB, rese
 The room a run takes beyond its
 weights does not follow the copies it leaves out: with every multiplied weight of the two-layer model on its stored
 format alone (a driver's own blocks, 1.5 GiB of copies not made) a run asked for about 3.2 GiB, reserved 2.7 GiB and
-grew the device by 2.9 GiB. So a GPU whose free memory is within half a GiB of the sentence can still fail to allocate
-after the plan with these models; with the published checkpoint the working memory is an eighth of the weights held
-and the runs stayed inside the sentence (the section on checkpoints).
-Beyond 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step -- the
-sentence is short, on every stack: what a run holds per row beyond the state the
-sentence counts is not in its flat allowance. At 64 sequences the default stack asked for about 3.9 GiB, reserved
+grew the device by 2.9 GiB. So a GPU whose free memory is within half a GiB of the sentence of a run of one sequence
+can still fail to allocate after the plan with these models; with the published checkpoint the working memory is an
+eighth of the weights held and the runs stayed inside the sentence (the section on checkpoints).
+Beyond the first sequence the sentence counts what the checks of a run hold, by arithmetic on the model's widths and
+with no term taken from a run (`check_row_bytes` in `model_samples/qwen_dense/model.py` names every term). At their
+largest moment -- the judge of the fused linear-attention step inside the checked replay -- the checks hold four
+records of the run's steps (the ids and the logits of every recorded step), the state of the reference session, three
+saves of the judged layer's pool and what the judge forms over it: the distance of the recurrent states, and four
+fp64 tensors of the pool for a ratio that is printed and not gated. For the two-layer model at the default request
+that is 47 MiB a sequence, where the state is 3 MiB a sequence. The sentence adds it for every sequence beyond the
+first -- of a run of several counts for the count that holds the most, and of every other count its record --,
+names it as the checks' part, and adds four tenths of it more for PyTorch's pool, which keeps blocks beyond the
+tensors that are alive. A step of several tokens per sequence is counted by its rows. Nothing is added at one
+sequence, where the working memory holds the checks of the runs it was taken from, and nothing on the stack
+`reference`, which runs no checks: no sentence of a run of one sequence moved.
+The share for PyTorch's pool is from runs (2026-11-21; compute capability 10.0, 148 SMs; a shared GPU: correctness
+only; `fe-entries`, the default request, the tree before the count). A driver capped the pool of the process in front
+of the sample's `main()` (`torch.cuda.set_per_process_memory_fraction`). Capped at the counted figure alone, a run of
+256 sequences (16.3 GiB) and a run of 1,024 sequences (54.1 GiB) each ended in PyTorch's out-of-memory error inside
+the judge of the fused step, with 3.4 and 12.5 GiB of the pool reserved and not allocated: free blocks into which the
+next tensor, of 1.5 and of 6.0 GiB, did not fit. With a tenth of the checks' part more, 256 sequences failed the same
+way; with a quarter more they passed (19.2 GiB allowed, 18.4 GiB reserved) and 1,024 sequences failed (65.8 GiB
+allowed, 18.5 GiB of them reserved and not allocated); with four tenths more both passed -- 256 sequences with
+20.9 GiB allowed and 19.9 GiB reserved, 1,024 sequences with 72.9 GiB allowed, 70.9 GiB reserved and a peak of
+52.4 GiB allocated. Four tenths is the smallest of the three shares with which both counts passed. It is an allowance
+from these runs and not a bound, and it is no part of the figure the sentence names for the checks.
+The sentence with the count, against runs (the same day, the same GPU, the same request; `fe-entries` where no stack is
+named; every run passed its checks):
+
+| sequences | the sentence asked for | PyTorch held at its peak | PyTorch reserved | the device grew by |
+|---|---|---|---|---|
+| 33 | 5.8 GiB | 2.94 GiB | 3.83 GiB | 4.01 GiB |
+| 64 | 7.9 GiB | 4.49 GiB | 6.04 GiB | 6.22 GiB |
+| 85 | 9.4 GiB | 5.99 GiB | 7.77 GiB | 7.94 GiB |
+| 85, `fe-cublas` | 9.4 GiB | 5.97 GiB | 7.75 GiB | 7.93 GiB |
+| 85, `native` | 9.2 GiB | 5.70 GiB | 7.47 GiB | 7.65 GiB |
+| 256, the pool capped at the sentence's figure | 20.9 GiB | 14.44 GiB | 19.86 GiB | 20.04 GiB |
+| 1,024 | 72.9 GiB | 52.43 GiB | 73.08 GiB | 73.26 GiB |
+| 1,024, the pool capped at the sentence's figure | 72.9 GiB | 52.43 GiB | 70.90 GiB | 71.07 GiB |
+| 16 sequences of five tokens, a verify session alone | 8.7 GiB | 5.45 GiB | 6.71 GiB | 6.89 GiB |
+
+In the eight runs of one sequence count PyTorch's peak was 0.6 to 3.2 % above the weights held, the state and the
+count; in the verify session it was 2.5 % below them. That comparison holds where the checks' moment is the peak of
+the run -- at every measured count above one sequence (33 to 1,024) and in the verify session; the GPU test of 85
+sequences holds it within 5 % --, and at one sequence and in the default run the peak is another moment (a load, a
+multiply of the reference), as it was before the count and covered by the flat working memory: reported here, not
+held to the count. From 33 to 85 sequences the sentence stands 1.5 to 1.8 GiB above what a run takes, and 0.9 GiB at
+256 sequences -- the flat working memory and the pool's share are both added to the count, and the direction is the
+one that only refuses a run. At 1,024 sequences a run that is given the memory takes 0.4 GiB more than the
+sentence, and the same run with its pool held to the sentence's figure passes. A run of one sequence asked for about
+3.5 GiB, as it did before the count, held 1.80 GiB at its peak, reserved 3.58 GiB and grew the device by 3.76 GiB:
+a quarter of a GiB more than its sentence, the miss this section states for the reduced models. A run of the
+published checkpoint at one sequence asked for about 37.1 GiB on `fe-entries`, the figure it asked for before the
+count.
+`--sequences 64,65` asked for about 8.6 GiB, reserved 8.04 GiB and grew the device by 8.22 GiB; PyTorch held 5.85 GiB
+at its peak, 0.4 GiB more than the weights, the two states and the count. That run showed a defect, which is removed:
+the reference session of the first count -- its state and its record -- was still alive when its checks had returned,
+in a reference cycle of the session's own (its stage clock held a closure over the session), until Python collected
+it. The stage clock is handed the device now, so the reference session of a count stands in no reference cycle and is
+released when its checks return; a host test holds that on two counts with Python's collection of reference cycles
+switched off. The same run then held 5.53 GiB at its peak, 1.6 % above the weights, the two states and the count,
+reserved the same 8.04 GiB and grew the device by the same 8.22 GiB, and but for its clocks and that peak it printed
+the lines it had printed.
+What the sentence leaves out, by the code (no run of these kinds was made). The token check holds four fp32 tensors of
+every checked logit at a time; it is the larger moment from about 150 checked steps of the two-layer model -- a
+request of more positions than that at many sequences -- and from 10 checked steps at the published widths, and such
+a run can fail to allocate inside its checks behind a sentence that let it start. With a checkpoint the checks replay
+a second reference stack: the count holds its moment, by the code, and not the third reference state that is alive
+while the second one is reset. The comparison of a verify session with its decode session is not counted (the
+section "The verify step"), nor are the records of the prompt of a session that verifies behind its prompt. And a
+context beyond about 2,000 positions at many sequences rests on the attention chain's term alone.
+Until 2026-11-21 the sentence counted the state alone and was short from about 33 rows of a step -- 33 sequences of a
+decode step, sequences x tokens per sequence of a verify step --, on every stack. At 64 sequences the default stack
+asked for about 3.9 GiB, reserved
 6.6 GiB and grew the device by 6.8 GiB; the cuDNN Frontend rows (`fe-entries` today without the attention preparation's
 row) asked for about 3.8 GiB,
 reserved 6.0 GiB and grew it by 6.2 GiB, and with `--sequences 64,65` for about 4.4 GiB, reserved 8.0 GiB and grew it
 by 8.2 GiB; `--stack native --sequences 64,65` with its library rows asked for about 4.2 GiB, reserved 7.1 GiB and
 grew it by 7.3 GiB. A
-verify plan of 48 to 80 rows is short by 0.3 to 2.6 GiB (the section "The verify step" has the runs). At
-such a count a GPU needs several GiB more than the sentence says.
+verify plan of 48 to 80 rows was short by 0.3 to 2.6 GiB (the section "The verify step" has the runs).
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
 Blackwell GPU: a second or two to plan, which includes building the entries' kernels for both sequence counts (1.1 to
 1.7 s in the runs since that build became part of the plan, 3.6 s in the first of them; built after the load, the fused

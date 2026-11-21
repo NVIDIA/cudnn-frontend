@@ -139,7 +139,11 @@ from ..state import PagedKvCache, RecurrentSlots, TokenSlots
 from ..weights import BLOCK, TILE_COLUMNS, TILE_ROWS, BlockScaledTensor, InterleavedBlockScaledTensor, ScaledTensor, TiledBlockScaledTensor, tile_scales
 from . import BlockBase, GdnParams, split_qkvz
 
-#: the files of the package this adapter runs, relative to the ``cudnn`` package: the source hash of ``check_environment``
+#: the files of the package this adapter runs, relative to the ``cudnn`` package: the source hash of ``check_environment``.
+#: The list is closed under one rule, to its fixed point: a module under ``frost/``, ``_torch_stream.py`` or ``_cutlass_*``
+#: that a file of the list imports at module level is in the list, and so is the ``__init__.py`` of every package such an
+#: import runs.  The kernels are built from those modules: an edit of one of them changes what a run launches, and the
+#: hash a run prints says so.  A host test forms the fixed point again from the files
 SOURCE_FILES = (
     "__init__.py",
     "linear_attention/frost/gdn_decode_fused.py",
@@ -151,6 +155,8 @@ SOURCE_FILES = (
     "linear_attention/frost/kernel/gdn_verify_fused_f16.py",
     "frost/launch_facts.py",
     "frost/init_order.py",  # what a call of the gate, the preparation and the norm entry runs in front of its launch
+    "frost/capture.py",  # what that module asks in front of a launch: whether the stream is being captured into a CUDA graph
+    "_torch_stream.py",  # ... and the stream and the device context it puts the launch behind
     "attention_gate/frost/gate_quant_decode.py",
     "attention_gate/frost/kernel/gate_quant_decode_config.py",
     "attention_gate/frost/kernel/gate_quant_decode_f16.py",
@@ -167,6 +173,23 @@ SOURCE_FILES = (
     "gemm/frost/swiglu_decode/swiglu_fp4_decode.py",
     "gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_config.py",
     "gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_nvfp4.py",
+    # what the files above import at module level, to the fixed point: the package with its probe of the installed CuTe DSL,
+    # the buffers an entry exchanges with its kernel, the tile primitives the kernels are written on, and the two helpers of
+    # the multiply kernels
+    "frost/__init__.py",
+    "frost/buffers.py",
+    "frost/tile_dsl/__init__.py",
+    "frost/tile_dsl/barrier.py",
+    "frost/tile_dsl/pointwise.py",
+    "frost/tile_dsl/regtile.py",
+    "frost/tile_dsl/requirements.py",
+    "frost/tile_dsl/rowwise.py",
+    "frost/tile_dsl/sf_layout.py",
+    "frost/tile_dsl/swizzle.py",
+    "frost/tile_dsl/tma.py",
+    "_cutlass_compat.py",
+    "_cutlass_helpers/__init__.py",
+    "_cutlass_helpers/static_persistent_tile_scheduler.py",
 )
 #: a field of the entry's form a provider row may name -> the constructor argument of ``cudnn.GdnDecodeFused`` that sets it
 FORM_ARGUMENTS = {"PDL": "pdl", "PDL_RELEASE": "pdl_release"}

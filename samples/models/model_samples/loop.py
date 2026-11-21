@@ -79,6 +79,11 @@ DRAFTER_ROWS = (
     "and every pass over the prompt at S rows; every row of this table serves any row count"
 )
 ONE_SEQUENCE = "a session with a drafter serves one sequence: one request, as the drafter rows are for"
+#: what the memory sentence adds for PyTorch's pool to what the checks hold for every sequence beyond the first, as a share of
+#: that part: the pool keeps blocks beyond the tensors that are alive, and a run whose pool is capped at the tensors' own
+#: figure fails to allocate inside its checks.  The smallest of a tenth, a quarter and four tenths with which capped runs at
+#: 256 and at 1,024 sequences both passed (the family README has the runs); an allowance from runs, not a bound
+CHECK_POOL = 0.4
 
 
 class StopRule:
@@ -233,7 +238,11 @@ class Session:
         self.on_demand = on_demand  # the maker of the bf16 copies this session's blocks read and its weights do not hold
         self.traced: Optional[census.Traced] = None  # of the last traced pass that kept its launch records
         self._call_log: Optional[list] = None  # the block calls of the traced step that is running
-        self.stages = Stages(sync=lambda: torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None)
+        # the stage clock synchronises the session's device and is handed the device, never the session: a closure over the
+        # session would close a reference cycle, and a session in a cycle is released when Python next collects cycles, not
+        # when its last holder lets go -- the reference session of a run's checks would outlive them with its state and record
+        device = self.device
+        self.stages = Stages(sync=lambda: torch.cuda.synchronize(device) if device.type == "cuda" else None)
         self.plan: Optional[blocks.Plan] = None
         self.prefill_plan: Optional[blocks.Plan] = None  # the decode plan of the prompt of a session built with draft_tokens=
         self.weights = None
@@ -446,12 +455,17 @@ class Session:
         plan = self.resolve()
         return self.model.target().claim(plan, self.model, census.configuration_of(plan))
 
-    def plan_table(self, later: Sequence["Session"] = ()) -> str:
+    def plan_table(self, later: Sequence["Session"] = (), references: int = 1) -> str:
         """The served-by table and the memory sentence; raises ``NotImplementedError`` (a SKIP) before anything is loaded.
 
         ``later`` are the sessions that will run after this one in the same process on its weights (``share=self``).  Their
         plans are resolved here too, and the memory sentence then covers the whole run -- this session's need plus their
         state -- against what is free now: every decline of a run comes before its first load, none after it.
+
+        The sentence also counts what the checks of the run hold for every sequence beyond the first (``_check_rows``:
+        the family's arithmetic, nothing at one sequence and nothing on the reference stack, which runs no checks),
+        names that part, and adds a share of it for PyTorch's pool (``CHECK_POOL``).  ``references``: how many reference
+        stacks the checks of the run replay (2 for a run that checks a second one).
 
         In this order: the tables of every session are resolved, which allocates nothing; the memory sentence says whether
         the whole run fits; and only then do the entries of each plan make their first use (``Plan.first_use``: an entry
@@ -488,16 +502,44 @@ class Session:
             # reserves outside the pool is reserved once in a process, and the sentence carries it once (``Plan.memory``)
             counts = [self.sequences, *(session.sequences for session in later)]
             what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
-            if any(session.draft_tokens is not None for session in (self, *later)):  # a run with two kinds of step names them
+            kinded = any(session.draft_tokens is not None for session in (self, *later))
+            if kinded:  # a run with two kinds of step names them
                 kinds = [session._kind() for session in (self, *later)]
                 what = f" for {', '.join(kinds[:-1])} and {kinds[-1]}, one after the other" if later else f" for {kinds[0]}"
-            # the part of the need that is the checks': the reference's copy of a weight the load keeps no copy of, one at a time
+            # the part of the need that is the checks': the reference's copy of a weight the load keeps no copy of, one at a time,
+            # and what they hold for every sequence beyond the first -- with a share of that for PyTorch's pool, which is not named
             checks = self.model.check_bytes(held["uncopied"]) if "uncopied" in held else 0
-            sentence = "\n  " + plan.memory(need, what, checks)  # before anything is built on the GPU: this is where a run that does not fit ends
+            rows = self._check_rows(later, references)
+            need += rows + int(rows * CHECK_POOL)
+            beyond = f"the {self.sequences - 1} sequence{'s' if self.sequences > 2 else ''} beyond the first"
+            if later:
+                beyond = "the sequences beyond the first of a " + ("session" if kinded else "count")
+            sentence = "\n  " + plan.memory(need, what, checks, rows, beyond)  # before anything is built on the GPU: here a run that does not fit ends
         for session in (self, *later):
             for each in session._first_used():
                 each.first_use()
         return self._tables() + sentence
+
+    def _check_rows(self, later: Sequence["Session"], references: int) -> int:
+        """What the checks of this run hold for every sequence beyond the first, in bytes: of each session what its family
+        counts at its sequences less what it counts at one (``check_row_bytes``; a session of the reference stack runs
+        no checks, and a family that counts nothing is not asked).  The checks of one session run at a time and drop
+        what they held when they return -- the reference session they build is released there with its state and its
+        record, by its last reference: its stage clock holds the device, not the session (``__init__``), and nothing
+        but the checks holds it --, so the run takes the largest such part -- and of every other session its record,
+        which stays allocated while another count runs."""
+        parts, records = [], []
+        for session in (self, *later):
+            count = getattr(session.model, "check_row_bytes", None) if session.stack != REFERENCE else None
+            if count is None:
+                parts.append(0)
+                records.append(0)
+                continue
+            shape = (session.capacity, session.tokens, session.record_steps)
+            parts.append(count(session.sequences, *shape, references) - count(1, *shape, references))
+            records.append(session.model.check_row_terms(session.sequences, *shape)["record"] - session.model.check_row_terms(1, *shape)["record"])
+        most = max(range(len(parts)), key=parts.__getitem__)
+        return parts[most] + sum(record for index, record in enumerate(records) if index != most)
 
     def _first_used(self) -> list:
         """The plans whose blocks make their first use for this session: its own and, where it has one, its drafter's."""
