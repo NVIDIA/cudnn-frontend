@@ -51,7 +51,8 @@ def caller_stream(device: Optional[int]) -> int:
         if getter is None:
             getter = _RAW_CURRENT_GETTER = getattr(torch._C, "_cuda_getCurrentRawStream", False)
         if not getter:
-            return torch.cuda.current_stream(device).cuda_stream
+            # A CPU-only torch has no CUDA stream: a caller using CUDA without it runs on the default stream.
+            return torch.cuda.current_stream(device).cuda_stream if torch.cuda.is_available() else 0
     return getter(device)
 
 

@@ -33,7 +33,7 @@ import cudnn
 from cudnn import _pybind_module
 
 from ._device import ensure_current_context, execution_context, execution_context_matches
-from ._handle import Handle, to_backend_handle
+from ._handle import Handle, ThreadHandlePool, to_backend_handle
 from ._torch_stream import caller_stream as _current_stream
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _dlpack_lanes, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
@@ -46,27 +46,20 @@ _LOG = logging.getLogger("cudnn.pygraph")
 # A handle-less graph used to let the C++ PyGraph cudnnCreate a handle of its own
 # at lowering and cudnnDestroy it from the destructor: a GC-timed backend release
 # that, inside someone else's stream capture, poisons every later launch (Rule 8,
-# #1151). Lend it a process default instead: one per (thread, device) -- cuDNN
-# forbids sharing a handle across threads -- set to the caller's current stream by
-# each execute that names no handle, destroyed at interpreter exit.
-_DEFAULT_HANDLES = threading.local()
-_DEFAULT_HANDLE_REGISTRY: List[Handle] = []
-_DEFAULT_HANDLE_LOCK = threading.Lock()
+# #1151). Lend it a process default instead: one per (live thread, device), set to
+# the caller's current stream by each execute that names no handle, destroyed at
+# interpreter exit.
+_DEFAULT_HANDLES = ThreadHandlePool()
 
 
 def _default_handle(device: int) -> Handle:
-    by_device = getattr(_DEFAULT_HANDLES, "by_device", None)
-    if by_device is None:
-        by_device = _DEFAULT_HANDLES.by_device = {}
-    handle = by_device.get(device)
-    if handle is None:
+    def create() -> Handle:
         from .frost.device import ambient_device, device_context
 
         with nullcontext() if ambient_device() == device else device_context(device):
-            handle = by_device[device] = cudnn.create_handle()
-        with _DEFAULT_HANDLE_LOCK:
-            _DEFAULT_HANDLE_REGISTRY.append(handle)
-    return handle
+            return cudnn.create_handle()
+
+    return _DEFAULT_HANDLES.get(device, create)
 
 
 def _default_backend_handle() -> int:
@@ -86,9 +79,7 @@ def _device_scope(handle: Any):
 
 
 def _destroy_default_handles() -> None:
-    with _DEFAULT_HANDLE_LOCK:
-        handles, _DEFAULT_HANDLE_REGISTRY[:] = list(_DEFAULT_HANDLE_REGISTRY), []
-    for handle in handles:
+    for handle in _DEFAULT_HANDLES.clear():
         try:
             cudnn.destroy_handle(handle)
         except Exception:  # noqa: BLE001 -- CUDA may already be torn down at exit
@@ -1704,6 +1695,16 @@ class pygraph:
         except (NotImplementedError, RuntimeError):
             return None
 
+    def _handleless_device(self, index: Optional[int]) -> Optional[int]:
+        """The GPU a handle-less execute of plan ``index`` (the selected plan when None) runs on: its
+        python build device, else the backend lowering device; None before either is known."""
+        if self._planning_done and index is None:
+            if not self._is_built:
+                return None
+            index = self._plan_index
+        device = self._plan_devices.get(index) if index is not None else None
+        return self._default_handle_device if device is None else device
+
     def _backend_exec_handle(self, handle: Any) -> Optional[int]:
         """The backend handle an execute passes to C++, or None to let the lowering handle run.
 
@@ -2293,8 +2294,9 @@ class pygraph:
         """Execute one ranked plan without changing the graph's selected plan."""
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
             h = handle if handle is not None else self._handle
-            if isinstance(h, Handle):
-                stream, device = self._resolve_stream(h), h.device.ordinal
+            device = h.device.ordinal if isinstance(h, Handle) else self._default_handle_device if h is None else None
+            if device is not None:
+                stream = self._resolve_stream(h, device)
                 if not execution_context_matches(stream, device):
                     # Same contract as _execute(): run in the handle's context, then restore the caller's.
                     with execution_context(stream, device):
@@ -2376,9 +2378,14 @@ class pygraph:
         _context_bound=False,
     ):
         h = handle if handle is not None else self._handle
-        if not _context_bound and isinstance(h, Handle):
-            stream, device = self._resolve_stream(h), h.device.ordinal
-            if not execution_context_matches(stream, device):
+        if not _context_bound and (h is None or isinstance(h, Handle)):
+            if h is None:
+                # No handle: the plan's build/lowering device and the caller's stream there.
+                device = self._handleless_device(index)
+                stream = None if device is None else _current_stream(device)
+            else:
+                stream, device = self._resolve_stream(h), h.device.ordinal
+            if device is not None and not execution_context_matches(stream, device):
                 # Backend plans and Python plans share the handle's device and
                 # stream contract. Only a foreign/cold context takes this path;
                 # ordinary same-context calls keep their existing launch path.
@@ -2395,7 +2402,7 @@ class pygraph:
                         context=context,
                         _context_bound=True,
                     )
-            _context_bound = True
+            _context_bound = device is not None
         # Keep the caller's choice local across binding and launch. Temporarily
         # selecting/restoring an index lets overlapping callers run each other's
         # plan and can corrupt the selection left for ordinary execute().

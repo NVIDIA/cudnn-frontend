@@ -136,3 +136,25 @@ def test_no_handle_execute_is_capturable(frost_case):
         torch.testing.assert_close(out.float(), reference(), **tol, msg=lambda d: "the no-handle capture did not record the launch: " + d)
     finally:
         cg.reset()
+
+
+@pytest.mark.parametrize("side_stream", [False, True], ids=["default_stream", "side_stream"])
+def test_no_handle_execute_runs_on_the_plan_device_while_another_is_current(frost_case, side_stream):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible GPUs")
+    from cuda.bindings import driver
+
+    graph, pack, src, out, reference, tol, ws = frost_case
+    plan_device = torch.cuda.current_device()
+    other = next(i for i in range(torch.cuda.device_count()) if i != plan_device)
+    src.mul_(-1)
+    out.zero_()
+    stream = torch.cuda.Stream() if side_stream else torch.cuda.default_stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        with torch.cuda.device(other):
+            torch.cuda.current_stream(other)
+            graph.execute(pack, ws)
+            assert int(driver.cuCtxGetDevice()[1]) == other and torch.cuda.current_device() == other
+    stream.synchronize()
+    torch.testing.assert_close(out.float(), reference(), **tol)

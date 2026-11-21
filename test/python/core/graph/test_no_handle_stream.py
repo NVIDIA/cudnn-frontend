@@ -149,3 +149,105 @@ def test_engine_launch_refuses_a_missing_stream():
     assert require_stream(0, "engine") == 0
     with pytest.raises(ValueError, match="engine: no launch stream"):
         require_stream(None, "engine")
+
+
+def _bound_device():
+    from cuda.bindings import driver
+
+    err, device = driver.cuCtxGetDevice()
+    assert int(err) == 0
+    return int(device)
+
+
+def _two_gpus():
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible GPUs")
+
+
+@pytest.mark.parametrize("side_stream", [False, True], ids=["default_stream", "side_stream"])
+def test_backend_without_handle_runs_on_its_device_while_another_is_current(side_stream):
+    """No handle, plan on cuda:0, caller on cuda:1: the execute binds cuda:0 and restores cuda:1."""
+    _two_gpus()
+    with torch.cuda.device(0):
+        graph, tx, ty = _relu_graph()
+        x = torch.randn(1, 32, 32, device="cuda:0")
+        y = torch.zeros_like(x)
+        ws = torch.empty(max(graph.get_workspace_size(), 1), device="cuda:0", dtype=torch.uint8)
+        graph.execute({tx: x, ty: y}, ws)
+        torch.cuda.synchronize(0)
+        x.copy_(torch.randn_like(x))
+        y.zero_()
+        stream = torch.cuda.Stream(device=0) if side_stream else torch.cuda.default_stream(0)
+        stream.wait_stream(torch.cuda.current_stream(0))
+        with torch.cuda.stream(stream):
+            with torch.cuda.device(1):
+                torch.cuda.current_stream(1)  # bind cuda:1's context as the caller's
+                assert _bound_device() == 1
+                graph.execute({tx: x, ty: y}, ws)
+                assert _bound_device() == 1 and torch.cuda.current_device() == 1
+    stream.synchronize()
+    torch.testing.assert_close(y, x.relu())
+
+
+@pytest.mark.parametrize("side_stream", [False, True], ids=["default_stream", "side_stream"])
+def test_python_plan_without_handle_runs_on_its_build_device_while_another_is_current(monkeypatch, side_stream):
+    _two_gpus()
+    seen = []
+
+    class Plan(CompiledPlan):
+        def execute(self, graph, tensor_data, ctx):
+            seen.append((_bound_device(), ctx.stream))
+
+    class Engine(BaseEngine):
+        name = "no_handle_device_recorder"
+        engine_id = _FAKE + 3
+
+        def build_plan(self, graph, plan, ctx=None):
+            return Plan()
+
+    _offer(monkeypatch, Engine())
+    with torch.cuda.device(0):
+        graph = pygraph()
+        out = graph.matmul(torch.randn(2, 2), torch.randn(2, 2))
+        graph.execute({out: torch.empty(2, 2)})
+        stream = torch.cuda.Stream(device=0) if side_stream else torch.cuda.default_stream(0)
+        with torch.cuda.stream(stream):
+            with torch.cuda.device(1):
+                torch.cuda.current_stream(1)
+                graph.execute({out: torch.empty(2, 2)})
+                assert _bound_device() == 1 and torch.cuda.current_device() == 1
+    assert seen[-1] == (0, stream.cuda_stream)
+
+
+def test_caller_stream_with_a_cpu_only_torch_is_the_default_stream(monkeypatch):
+    """A CUDA caller next to a CPU-only torch (no raw-stream getter, no CUDA) runs on stream 0."""
+    import sys
+    from types import SimpleNamespace
+
+    from cudnn import _torch_stream
+
+    def no_cuda(*args, **kwargs):
+        raise AssertionError("Torch not compiled with CUDA enabled")
+
+    fake = SimpleNamespace(_C=SimpleNamespace(), cuda=SimpleNamespace(is_available=lambda: False, current_stream=no_cuda, current_device=no_cuda))
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    monkeypatch.setattr(_torch_stream, "_RAW_CURRENT_GETTER", None)
+    assert _torch_stream.caller_stream(0) == 0
+    assert _torch_stream.caller_stream(None) == 0
+
+
+def test_default_handles_of_exited_threads_are_reused(monkeypatch):
+    """A handle-less execute on many short-lived threads keeps one default handle per live thread."""
+    import threading
+
+    from cudnn import _pygraph
+    from cudnn._handle import ThreadHandlePool
+
+    created = []
+    pool = ThreadHandlePool()
+    monkeypatch.setattr(_pygraph, "_DEFAULT_HANDLES", pool)
+    for _ in range(4):
+        worker = threading.Thread(target=lambda: pool.get(0, lambda: created.append(object()) or created[-1]))
+        worker.start()
+        worker.join()
+    assert len(created) == 1
