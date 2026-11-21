@@ -2250,8 +2250,7 @@ def _judged_with_what_is_alive(sequences, steps=7):
     ``(session, checks, alive)``."""
     import gc
 
-    import model_samples
-    from model_samples import blocks, tie_out
+    from model_samples import Session, TextIO, blocks, tie_out
     from model_samples.loop import Record
     from model_samples.providers import factories, torch_ref
     from model_samples.state import DecodeState
@@ -2274,8 +2273,8 @@ def _judged_with_what_is_alive(sequences, steps=7):
     known = {id(each) for each in earlier}
     stand_ins = {"fe.gdn_decode_fused": Step, "cublas.bf16_dequantized": Multiply, "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": GateUp}
     model = _tiny_model()
-    text = model_samples.TextIO.synthetic(model.geometry.vocab)
-    session = model_samples.Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, record_steps=steps)
+    text = TextIO.synthetic(model.geometry.vocab)
+    session = Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, record_steps=steps)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
     options = {"reference_precision": "fp64", "device": "cpu"}
     session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, model=model, options=options, factories=dict(factories(), **stand_ins))
@@ -2351,8 +2350,7 @@ def test_the_reference_session_of_a_count_is_released_when_its_checks_return(mon
     import gc
     import weakref
 
-    import model_samples
-    from model_samples import blocks, loop, tie_out
+    from model_samples import Session, TextIO, blocks, loop, tie_out
     from model_samples.providers import factories, torch_ref
 
     class Step(torch_ref.GdnDecodeStep):
@@ -2382,12 +2380,12 @@ def test_the_reference_session_of_a_count_is_released_when_its_checks_return(mon
     monkeypatch.setattr(tie_out, "Session", Watched)
     stand_ins = {"fe.gdn_decode_fused": Step, "cublas.bf16_dequantized": Multiply, "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": GateUp}
     model = _tiny_model()
-    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    text = TextIO.synthetic(model.geometry.vocab)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
     options = {"reference_precision": "fp64", "device": "cpu"}
 
     def counted(sequences, share=None):
-        session = model_samples.Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, record_steps=7, share=share)
+        session = Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, record_steps=7, share=share)
         session.plan = blocks.plan(
             model.provider_table, model.regimes, facts, sequences, model=model, options=options, factories=dict(factories(), **stand_ins)
         )
@@ -2424,16 +2422,15 @@ COPY = "the reference's bf16 copy of one weight at a time, where the run keeps n
 
 def _sentences(monkeypatch, model, free=200 * GIB, cc=(10, 0)):
     """``sentence(stack, *counts)``: the memory sentence of a run of ``model`` on stated device facts, one session per count."""
-    import model_samples
-    from model_samples import blocks
+    from model_samples import Session, TextIO, blocks
 
-    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    text = TextIO.synthetic(model.geometry.vocab)
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls(cc, "stated device", 148, 0, free)))
 
     def sentence(stack, *counts, **session):
         common = dict(stack=stack, device="cuda:0", capacity=58, **session)
-        first = model_samples.Session(model, text, sequences=counts[0], **common)
-        later = [model_samples.Session(model, text, sequences=count, share=first, **common) for count in counts[1:]]
+        first = Session(model, text, sequences=counts[0], **common)
+        later = [Session(model, text, sequences=count, share=first, **common) for count in counts[1:]]
         return first.plan_table(later).splitlines()[-1].strip()
 
     return sentence
@@ -2485,12 +2482,11 @@ def test_the_rows_part_of_a_run_and_its_clause_in_every_form_of_the_sentence(mon
     record; a session that verifies behind its prompt by its rows; nothing for a session of one sequence, with a drafter
     or without, nothing on the reference stack, and nothing of a family that counts nothing.  And the clause in the three
     forms of the sentence: the line, the SKIP for too little free memory, the SKIP for a run the GPU cannot hold."""
-    import model_samples
-    from model_samples import blocks, loop
+    from model_samples import Session, TextIO, blocks, loop
     from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
 
     model = QwenDense.reduced(2)
-    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    text = TextIO.synthetic(model.geometry.vocab)
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 200 * GIB)))
 
     def held(sequences, tokens=1, capacity=58, references=1):
@@ -2500,8 +2496,8 @@ def test_the_rows_part_of_a_run_and_its_clause_in_every_form_of_the_sentence(mon
         return model.check_row_terms(sequences, capacity, tokens)["record"] - model.check_row_terms(1, capacity, tokens)["record"]
 
     def sessions(*shapes, stack="fe-entries", capacity=58):
-        first = model_samples.Session(model, text, stack=stack, device="cuda:0", capacity=capacity, **shapes[0])
-        return first, [model_samples.Session(model, text, stack=stack, device="cuda:0", capacity=capacity, share=first, **shape) for shape in shapes[1:]]
+        first = Session(model, text, stack=stack, device="cuda:0", capacity=capacity, **shapes[0])
+        return first, [Session(model, text, stack=stack, device="cuda:0", capacity=capacity, share=first, **shape) for shape in shapes[1:]]
 
     first, later = sessions(dict(sequences=9), dict(sequences=4))
     assert first._check_rows(later, 1) == held(9) + record(4), "the checks of the larger count, and the record the other count keeps"
@@ -2565,16 +2561,15 @@ def test_the_plan_hands_the_count_the_sessions_recorded_steps_and_its_references
     published widths at four sequences of 343 positions, 32 recorded steps and a second reference, where the second
     reference's moment is the larger one.  Through ``_check_rows`` and ``plan_table`` to the sentence: the part it names
     and the need it states."""
-    import model_samples
-    from model_samples import blocks, loop
+    from model_samples import Session, TextIO, blocks, loop
     from model_samples.qwen_dense import QwenDense
 
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 400 * GIB)))
     full = QwenDense()
-    text = model_samples.TextIO.synthetic(full.geometry.vocab)
+    text = TextIO.synthetic(full.geometry.vocab)
 
     def session(**more):
-        return model_samples.Session(full, text, sequences=4, stack="fe-entries", device="cuda:0", capacity=343, **more)
+        return Session(full, text, sequences=4, stack="fe-entries", device="cuda:0", capacity=343, **more)
 
     def beyond(steps, references):
         return full.check_row_bytes(4, 343, 1, steps, references) - full.check_row_bytes(1, 343, 1, steps, references)
