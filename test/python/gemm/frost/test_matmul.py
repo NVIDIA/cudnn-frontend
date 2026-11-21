@@ -4517,7 +4517,7 @@ def test_cluster_splitk_smem_budget_declines(monkeypatch):
 @requires_sm100
 def test_cluster_splitk_override_capture_and_k_guard():
     """Reuse cluster plans under capture and reject insufficient K before output writes."""
-    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+    from cudnn.gemm.frost import build_gemm_plan
     from cudnn.gemm.frost.knobs import GemmKnobs
     from dataclasses import replace
 

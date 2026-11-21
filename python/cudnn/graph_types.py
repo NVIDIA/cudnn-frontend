@@ -75,6 +75,7 @@ class NodeType(Enum):
     MAMBA2_SUMMARY = auto()
     MAMBA2_SUMMARY_BWD = auto()
     CUSTOM_REDUCTION = auto()
+    GATHER = auto()
 
 
 @dataclass(eq=False)  # identity-based hash/eq: uid/name are mutable

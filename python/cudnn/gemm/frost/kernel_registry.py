@@ -12,6 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from . import arch_family
+from .operand_contracts import per_k_scale_reject, linear_token_sf_reject
 from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain, MoeSwapAbSpec, swap_ab as swap_ab_graph
 from .tile_config import CATALOG, TileConfig, as_mma_tile_k, as_pipeline, config_class_for_pipeline
 
@@ -46,25 +47,6 @@ MMA_INST_K64_ARCH_RANGES: tuple[tuple[int, int], ...] = ((107, 110),)
 
 # Pointwise ops a mainloop-fusion template can transform in SMEM.
 _SUPPORTED_MAINLOOP_OPS: frozenset[str] = frozenset(UNARY_OPS) | frozenset(BINARY_OPS)
-
-
-def per_k_scale_reject(*, op, operand_dtype, load_dtype, major, scale_stride, scale_dtype, compute_dtype, out_dtype) -> str | None:
-    """Shared eligibility for the legacy unit-stride per-K loading ABI.
-
-    Graph preparation uses this before choosing the optimization; the registry
-    also checks it for callers supplying FusionChain directly.
-    """
-    checks = (
-        (op != "mul", "only mul is implemented"),
-        (operand_dtype not in ("bf16", "fp16"), "operand must be BF16 or FP16"),
-        (load_dtype is not None, "operand load casts are not implemented"),
-        (major != "k", "operand must be K-major"),
-        (scale_stride != 1, "scale K axis must have unit stride"),
-        (scale_dtype not in ("bf16", "fp16", "fp32"), "scale must be BF16, FP16 or FP32"),
-        (compute_dtype != "fp32", "multiply must compute in FP32"),
-        (out_dtype != operand_dtype, "multiply result must match the MMA operand dtype"),
-    )
-    return next((reason for rejected, reason in checks if rejected), None)
 
 
 # Dimension 1: graph type
@@ -261,15 +243,6 @@ MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]]
     ("sm120", _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16)): ((120, 130),),
     ("sm120", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((120, 130),),
 }
-
-
-def linear_token_sf_reject(dim, stride, rows, scale_k) -> str | None:
-    """GATHER SF layout support, shared by graph checks and runtime binding."""
-    if dim is None or stride is None or tuple(dim) != (1, rows, scale_k):
-        return f"MoE GATHER token SF must have shape [1, {rows}, {scale_k}]"
-    if len(stride) != 3 or stride[2] != 1 or stride[1] < ((scale_k + 15) // 16) * 16 or stride[1] % 16:
-        return "MoE GATHER token SF needs contiguous K scales and a row stride padded to a multiple of 16 bytes"
-    return None
 
 
 def moe_gather_sf_reject(chain: FusionChain) -> str | None:
@@ -997,6 +970,11 @@ def select_template(
     config: TileConfig,
 ) -> KernelTemplate:
     """The single template that renders (chain, config)."""
+    if chain.gathers:
+        raise NotImplementedError("logical gather requires execution-route lowering before template selection")
+    if chain.group_partition is not None and chain.group_partition.is_uniform:
+        if config.pipeline not in ("sm100", "sm120") or config.swap_ab or isinstance(chain.moe, MoeSwapAbSpec) or chain.has_block_scale:
+            raise NotImplementedError("indirect row gather requires a non-swapped, non-block-scaled grouped loader")
     gt = classify_graph_type(chain)
     matches = [
         t
