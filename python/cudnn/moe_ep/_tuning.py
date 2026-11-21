@@ -49,6 +49,28 @@ _DGRAD_OPTIMIZATIONS = frozenset(
     }
 )
 
+Scheduling = Literal[
+    "static",
+    "atomic",
+    "phase_interleave",
+]
+
+_SCHEDULINGS = frozenset(
+    {
+        "static",
+        "atomic",
+        "phase_interleave",
+    }
+)
+_FC2_BULK_STORE_MODES = frozenset({"off", "auto"})
+_FC2_BULK_STORE_STAGES = frozenset({1, 2, 4, 8})
+# Forward-kernel knobs and their defaults; training backward accepts only these.
+_FORWARD_KERNEL_TUNING_DEFAULTS = (
+    ("scheduling", "static"),
+    ("fc2_bulk_store", "off"),
+    ("mixed_cga", False),
+)
+
 
 @dataclass(frozen=True, kw_only=True)
 class MoeEpTuningConfig:
@@ -59,7 +81,8 @@ class MoeEpTuningConfig:
     parallel group must use the same configuration.
 
     ``group_hint=None`` preserves the default behavior: the backend uses the
-    number of hardware-resident CTA clusters.
+    number of hardware-resident CTA clusters, or the merged preferred-cluster
+    slot count when ``mixed_cga=True``.
 
     ``dgrad_optimization`` applies only to training backward. ``baseline``
     preserves the default grouped schedule, ``rolling`` selects the upstream
@@ -67,6 +90,17 @@ class MoeEpTuningConfig:
     qualified on DS3 EP4 and now supported on additional topology and shape
     combinations. The DS3 profile owns its preset fields and canonicalizes
     ``epi_flag_batch`` to ``(4, 2)``.
+
+    ``scheduling``, ``fc2_bulk_store`` and ``mixed_cga`` select forward-kernel
+    implementations and apply only to inference and training forward; training
+    backward keeps their defaults. ``scheduling`` picks static work
+    distribution (``static``), atomic-counter work claiming (``atomic``), or
+    atomic claiming with interleaved FC1/FC2 tiles (``phase_interleave``).
+    ``fc2_bulk_store`` keeps per-thread FC2 output stores (``off``) or stages
+    them through shared memory as bulk stores, with a kernel-chosen depth
+    (``auto``) or an explicit depth of 1, 2, 4 or 8 stages. ``mixed_cga``
+    launches preferred (4, 1, 1) clusters and fills the remaining SMs with
+    fallback (2, 1, 1) clusters; it requires exclusive use of the GPU.
     """
 
     token_back_mode: TokenBackMode = "epi_warps"
@@ -79,6 +113,9 @@ class MoeEpTuningConfig:
         "rolling",
         "ds3_ep4_pattern",
     ] = "baseline"
+    scheduling: Scheduling = "static"
+    fc2_bulk_store: Literal["off", "auto"] | int = "off"
+    mixed_cga: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.token_back_mode, str) or self.token_back_mode not in _TOKEN_BACK_MODES:
@@ -95,6 +132,24 @@ class MoeEpTuningConfig:
             raise ValueError("dgrad_optimization must be one of " f"{tuple(sorted(_DGRAD_OPTIMIZATIONS))}, got " f"{self.dgrad_optimization!r}")
         if self.reduce_topk_in_kernel and self.token_back_mode != "epi_warps":
             raise ValueError("reduce_topk_in_kernel requires " "token_back_mode='epi_warps'")
+        if not isinstance(self.scheduling, str) or self.scheduling not in _SCHEDULINGS:
+            raise ValueError("scheduling must be one of " f"{tuple(sorted(_SCHEDULINGS))}, got {self.scheduling!r}")
+        fc2_bulk_store = self.fc2_bulk_store
+        if isinstance(fc2_bulk_store, str):
+            valid_fc2_bulk_store = fc2_bulk_store in _FC2_BULK_STORE_MODES
+        else:
+            # bool is an int subclass; True must not alias a one-stage store.
+            valid_fc2_bulk_store = isinstance(fc2_bulk_store, int) and not isinstance(fc2_bulk_store, bool) and fc2_bulk_store in _FC2_BULK_STORE_STAGES
+        if not valid_fc2_bulk_store:
+            raise ValueError(
+                "fc2_bulk_store must be one of "
+                f"{tuple(sorted(_FC2_BULK_STORE_MODES))} or a stage count in "
+                f"{tuple(sorted(_FC2_BULK_STORE_STAGES))}, got {fc2_bulk_store!r}"
+            )
+        if not isinstance(self.mixed_cga, bool):
+            raise ValueError(f"mixed_cga must be a bool, got {self.mixed_cga!r}")
+        if self.fc2_bulk_store != "off" and self.reduce_topk_in_kernel:
+            raise ValueError("fc2_bulk_store requires reduce_topk_in_kernel=False")
         if self.dgrad_optimization != "ds3_ep4_pattern":
             return
         if self.token_back_mode != "epi_warps":

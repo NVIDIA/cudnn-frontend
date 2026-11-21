@@ -18,6 +18,7 @@ from cutlass.cutlass_dsl import dsl_user_op, Int32 as _epi_Int32, Int64
 from cutlass.cute.typing import Float32
 
 from ......helpers.iket_compat import iket
+from ......helpers.tmem_transpose import _TmemTranspose16x32Core
 from ......helpers.flag_batch import GpuReleaseFlagBatchTracker
 from ......helpers.ptx_helpers import (
     red_add_relaxed_sys_f32 as _red_add_relaxed_sys_f32,
@@ -28,7 +29,6 @@ from ......helpers.ptx_helpers import (
 from ..helpers.utils import swiglu_act, dswiglu_act, quant_sfd_row, quant_sfd_col
 from ......quant_def import CombineFormat
 from .....schedulers.fc12_mapping import BlockPhase
-from ..tmem_transpose import _TmemTranspose16x32Core
 from ..fwd_glu.glu_mxfp8_fc12_epilogue import Fc2OutputDest
 
 Fc1GateUpInterleave = 32
@@ -692,32 +692,33 @@ class DgluMxfp8Epilogue:
 
         is_valid_row = token_row_in_cta < valid_tokens
 
-        r_gate = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
-        r_up = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
-        for j in cutlass.range_constexpr(EN):
-            r_gate[j] = r_gate_bf[j].to(self.acc_dtype)
-            r_up[j] = r_up_bf[j].to(self.acc_dtype)
-        # Zero invalid rows' inputs (their r_acc/r_gate/r_up are padding garbage) so the
-        # warp-wide column amax is not polluted and no NaN propagates into the reduction.
+        # Zero invalid rows' inputs (their r_acc/r_gate_bf/r_up_bf are padding garbage) so
+        # the warp-wide column amax is not polluted and no NaN propagates into the reduction.
         if token_row_in_cta >= valid_tokens:
             for j in cutlass.range_constexpr(EN):
                 r_acc[j] = self.acc_dtype(0.0)
-                r_gate[j] = self.acc_dtype(0.0)
-                r_up[j] = self.acc_dtype(0.0)
+                r_gate_bf[j] = cutlass.BFloat16(0.0)
+                r_up_bf[j] = cutlass.BFloat16(0.0)
 
         # dswiglu backward: acc(grad_h) x (gate, up) -> (d_gate, d_up) ----
         d_gate = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
         d_up = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
         if cutlass.const_expr(self._act_func == "swiglu"):
             subtile_dprob = dswiglu_act(
-                d_gate, d_up, r_acc, r_gate, r_up, beta, prob, self._gate_up_clamp
+                d_gate, d_up, r_acc, r_gate_bf, r_up_bf, beta, prob, self._gate_up_clamp
             )
 
         # dSwiGLU backward has consumed r_acc. Reuse that fragment for the
-        # independent forward recompute now so r_gate/r_up die before the two
-        # dgrad quantization paths instead of remaining live across them.
+        # independent forward recompute now so the pre-activations die before the two
+        # dgrad quantization paths instead of remaining live across them. The recompute
+        # needs the unscaled f32 values, so widen here (only in this configuration).
         if cutlass.const_expr(self._dfc2_recompute):
             if cutlass.const_expr(self._act_func == "swiglu"):
+                r_gate = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
+                r_up = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
+                for j in cutlass.range_constexpr(EN):
+                    r_gate[j] = r_gate_bf[j].to(self.acc_dtype)
+                    r_up[j] = r_up_bf[j].to(self.acc_dtype)
                 swiglu_act(
                     r_acc,
                     r_up,

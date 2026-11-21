@@ -15,6 +15,71 @@ from ._formats import combine_wire_format
 
 _PHYSICAL_POOL_ALIGNMENT = 128
 MXFP8_CLUSTER_SHAPE_MNK = (2, 1, 1)
+# The only mixed-CGA geometry upstream validates for the training GLU kernel.
+MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK = (4, 1, 1)
+MXFP8_MIXED_CGA_FALLBACK_CLUSTER_SHAPE_MN = (2, 1)
+
+
+@dataclass(frozen=True)
+class Mxfp8MixedCgaLaunch:
+    """Resident preferred 4-CTA clusters and fallback 2-CTA clusters."""
+
+    preferred_cluster_count: int
+    fallback_cluster_count: int
+
+    @property
+    def launch_cluster_count(self) -> int:
+        """Grid Z: preferred-cluster slots, two fallback clusters per slot."""
+
+        return self.preferred_cluster_count + self.fallback_cluster_count // 2
+
+
+def resolve_mixed_cga_launch(
+    *,
+    preferred_max_active_clusters: int,
+    fallback_max_active_clusters: int,
+) -> Mxfp8MixedCgaLaunch:
+    """Split the device between 4-CTA and 2-CTA clusters.
+
+    Mirrors upstream ``tester/host_utils.max_active_clusters``: fallback clusters
+    fill only the CTA capacity the preferred clusters leave idle, rounded to
+    whole preferred-cluster slots.
+    """
+
+    preferred = preferred_max_active_clusters
+    fallback_total = fallback_max_active_clusters
+    if preferred <= 0:
+        raise RuntimeError("hardware occupancy query returned no launchable 4-CTA clusters")
+    if fallback_total * 2 < preferred * 4:
+        raise RuntimeError(
+            "mixed CGA requires the 2-CTA cluster capacity to cover the 4-CTA capacity, " f"got {fallback_total} 2-CTA and {preferred} 4-CTA clusters"
+        )
+    split = MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK[0] // MXFP8_MIXED_CGA_FALLBACK_CLUSTER_SHAPE_MN[0]
+    remaining = (fallback_total * 2 - preferred * 4) // 2
+    return Mxfp8MixedCgaLaunch(
+        preferred_cluster_count=preferred,
+        fallback_cluster_count=remaining // split * split,
+    )
+
+
+def _resolve_forward_scheduling(scheduling: str) -> tuple[str, str]:
+    """Map public ``scheduling`` to ``(load_balance_mode, schedule_mode)``."""
+
+    return {
+        "static": ("static", "grouped"),
+        "atomic": ("atomic_counter", "grouped"),
+        "phase_interleave": ("atomic_counter", "phase_interleave"),
+    }[scheduling]
+
+
+def _resolve_fc2_bulk_store(value: str | int) -> tuple[bool, int | None]:
+    """Map public ``fc2_bulk_store`` to ``(fc2_use_bulk, fc2_tma_stages)``."""
+
+    if value == "off":
+        return False, None
+    if value == "auto":
+        return True, None
+    return True, value
 
 
 @dataclass(frozen=True)
@@ -64,6 +129,11 @@ class Mxfp8KernelConfig:
         "rolling",
         "ds3_ep4_pattern",
     ] = "baseline"
+    # Forward kernel only; the backward schedule follows dgrad_optimization.
+    schedule_mode: str = "grouped"
+    fallback_cluster_shape_mn: tuple[int, int] | None = None
+    preferred_cluster_count: int | None = None
+    fallback_cluster_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.physical_recv_pool_size <= 0:
@@ -104,6 +174,7 @@ class Mxfp8KernelConfig:
         ],
         launch_cluster_count: int,
         weight_storage_mode: str,
+        mixed_cga_launch: Mxfp8MixedCgaLaunch | None = None,
     ) -> "Mxfp8KernelConfig":
         topology = config.topology
         public = config.public_config
@@ -136,6 +207,25 @@ class Mxfp8KernelConfig:
         else:
             logical_route_limit = receive_capacity.inference_logical_route_capacity
         ds3 = dgrad_optimization == "ds3_ep4_pattern"
+        if backward:
+            load_balance_mode = "atomic_counter" if dgrad_optimization in ("rolling", "ds3_ep4_pattern") else "static"
+            schedule_mode = "grouped"
+            fc2_use_bulk, fc2_tma_stages = False, None
+        else:
+            load_balance_mode, schedule_mode = _resolve_forward_scheduling(tuning.scheduling)
+            fc2_use_bulk, fc2_tma_stages = _resolve_fc2_bulk_store(tuning.fc2_bulk_store)
+        cluster_shape_mnk = MXFP8_CLUSTER_SHAPE_MNK
+        fallback_cluster_shape_mn = preferred_cluster_count = fallback_cluster_count = None
+        if not backward and tuning.mixed_cga:
+            if mixed_cga_launch is None:
+                raise ValueError(f"{phase} mixed_cga requires a mixed-CGA launch geometry")
+            cluster_shape_mnk = MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK
+            launch_cluster_count = mixed_cga_launch.launch_cluster_count
+            # With no fallback clusters the kernel collapses to a uniform 4-CTA launch.
+            if mixed_cga_launch.fallback_cluster_count:
+                fallback_cluster_shape_mn = MXFP8_MIXED_CGA_FALLBACK_CLUSTER_SHAPE_MN
+                preferred_cluster_count = mixed_cga_launch.preferred_cluster_count
+                fallback_cluster_count = mixed_cga_launch.fallback_cluster_count
         return cls(
             num_experts=topology.experts_per_rank,
             world_size=topology.ep_size,
@@ -164,11 +254,18 @@ class Mxfp8KernelConfig:
             flag_batch=tuning.token_in_flag_batch,
             fc2_in_kernel_topk_reduce=tuning.reduce_topk_in_kernel,
             weight_storage_mode=weight_storage_mode,
+            cluster_shape_mnk=cluster_shape_mnk,
             launch_cluster_count=launch_cluster_count,
             col_quant_num_ctas=(-1 if ds3 else 2368),
-            load_balance_mode=("atomic_counter" if dgrad_optimization in ("rolling", "ds3_ep4_pattern") else "static"),
+            load_balance_mode=load_balance_mode,
             num_sched_stages=(2 if ds3 else None),
+            fc2_use_bulk=fc2_use_bulk,
+            fc2_tma_stages=fc2_tma_stages,
             dgrad_optimization=dgrad_optimization,
+            schedule_mode=schedule_mode,
+            fallback_cluster_shape_mn=fallback_cluster_shape_mn,
+            preferred_cluster_count=preferred_cluster_count,
+            fallback_cluster_count=fallback_cluster_count,
         )
 
     @classmethod
@@ -177,12 +274,14 @@ class Mxfp8KernelConfig:
         config: ResolvedMoeEpConfig,
         *,
         launch_cluster_count: int,
+        mixed_cga_launch: Mxfp8MixedCgaLaunch | None = None,
     ) -> "Mxfp8KernelConfig":
         return cls._for_phase(
             config,
             phase="inference",
             launch_cluster_count=launch_cluster_count,
             weight_storage_mode="contiguous",
+            mixed_cga_launch=mixed_cga_launch,
         )
 
     @classmethod
@@ -191,12 +290,14 @@ class Mxfp8KernelConfig:
         config: ResolvedMoeEpConfig,
         *,
         launch_cluster_count: int,
+        mixed_cga_launch: Mxfp8MixedCgaLaunch | None = None,
     ) -> "Mxfp8KernelConfig":
         return cls._for_phase(
             config,
             phase="training_forward",
             launch_cluster_count=launch_cluster_count,
             weight_storage_mode=(config.public_config.training_weight_storage_mode.value),
+            mixed_cga_launch=mixed_cga_launch,
         )
 
     @classmethod
@@ -221,9 +322,7 @@ class Mxfp8KernelConfig:
     def cluster_size(self) -> int:
         return self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1]
 
-    def tuning_signature(
-        self,
-    ) -> tuple[str, tuple[int, int], int, int, bool]:
+    def tuning_signature(self) -> tuple:
         """Return the effective rank-independent transport/scheduler knobs."""
 
         return (
@@ -232,6 +331,12 @@ class Mxfp8KernelConfig:
             self.flag_batch,
             self.group_hint,
             self.fc2_in_kernel_topk_reduce,
+            self.fc2_use_bulk,
+            self.fc2_tma_stages,
+            self.load_balance_mode,
+            self.schedule_mode,
+            self.cluster_shape_mnk,
+            self.fallback_cluster_shape_mn,
         )
 
     def effective_config(self) -> dict[str, object]:
@@ -260,4 +365,11 @@ class Mxfp8KernelConfig:
         )
 
 
-__all__ = ["MXFP8_CLUSTER_SHAPE_MNK", "Mxfp8KernelConfig"]
+__all__ = [
+    "MXFP8_CLUSTER_SHAPE_MNK",
+    "MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK",
+    "MXFP8_MIXED_CGA_FALLBACK_CLUSTER_SHAPE_MN",
+    "Mxfp8KernelConfig",
+    "Mxfp8MixedCgaLaunch",
+    "resolve_mixed_cga_launch",
+]

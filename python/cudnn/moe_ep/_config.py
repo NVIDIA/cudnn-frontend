@@ -13,7 +13,7 @@ from typing import Literal
 
 import torch.distributed as dist
 
-from ._tuning import MoeEpTuningConfig
+from ._tuning import _FORWARD_KERNEL_TUNING_DEFAULTS, MoeEpTuningConfig
 from ._types import MoeEpNativeWeightStorageMode, MoeFormat
 
 _PHYSICAL_RECV_POOL_ALIGNMENT = 128
@@ -178,6 +178,12 @@ class MoeEpConfig:
             raise ValueError("training_backward_tuning requires " "token_back_mode='epi_warps'")
         if backward.reduce_topk_in_kernel:
             raise ValueError("training_backward_tuning does not support " "reduce_topk_in_kernel=True")
+        for name, default in _FORWARD_KERNEL_TUNING_DEFAULTS:
+            if getattr(backward, name) != default:
+                raise ValueError(
+                    f"training_backward_tuning does not support {name}={getattr(backward, name)!r}; "
+                    "forward kernel knobs are supported only by inference_tuning and training_forward_tuning"
+                )
 
 
 @dataclass(frozen=True)

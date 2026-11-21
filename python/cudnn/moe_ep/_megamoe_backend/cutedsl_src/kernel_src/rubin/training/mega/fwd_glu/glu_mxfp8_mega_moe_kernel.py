@@ -12,18 +12,20 @@ from cutlass.cute.typing import AddressSpace
 
 from ......api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from ......helpers.device_workspace import DeviceWorkspace
+from ......helpers.mxfp8_col_requant import Mxfp8ColRequant
 from ......helpers.smem_workspace import SmemWorkspace
+from ......helpers.topk_reduce import TopkReduce
 from ......helpers.utils import ceil_div, round_up
 from ......quant_def import CombineFormat, QuantKind
 from ......communication.nvlink_domain.token_comm_deterministic import TokenCommDeterministic
-from ..topk_reduce import TopkReduce
-from .glu_mxfp8_col_requant import Mxfp8ColRequant
+from .....schedulers.non_clc_mixed_cga import NonClcMixedCgaConfig
 from .glu_mxfp8_fc12_extension import (
     WeightStorageMode,
     discrete_weight_descriptor_workspace_alignment,
     discrete_weight_descriptor_workspace_size,
 )
 from .glu_mxfp8_fc12_kernel import Sm107Mxfp8GluFc12Kernel
+from ..helpers.constants import SupportedMmaTileM
 
 
 _AB_DTYPE_TO_QUANT_KIND = {cutlass.Float8E4M3FN: QuantKind.mxfp8_e4m3, cutlass.Float8E5M2: QuantKind.mxfp8_e5m2}
@@ -39,6 +41,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
     fc1_output_region = "rubin.glu_mxfp8.mega.fc1_output"
     fc1_output_sf_region = "rubin.glu_mxfp8.mega.fc1_output_sf"
     fc1_done_counter_region = "rubin.glu_mxfp8.mega.fc1_done_counter"
+    sched_work_id_region = "rubin.glu_mxfp8.mega.sched_work_id"
     col_quant_sizes_region = "rubin.glu_mxfp8.mega.col_quant_expert_token_sizes"
     weight_descriptor_region = "rubin.glu_mxfp8.mega.weight_descriptors"
 
@@ -70,6 +73,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             "cluster_shape_mnk": tuple,
             "use_2cta_instrs": bool,
             "group_hint": int,
+            "schedule_mode": str,
             "token_padding_block": int,
             "sf_padding_block": int,
             "load_balance_mode": str,
@@ -79,6 +83,9 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             "acc_dtype": type,
             "sf_vec_size": int,
             "launch_cluster_count": int,
+            "fallback_cluster_shape_mn": OptionalRequirement(Optional[tuple]),
+            "preferred_cluster_count": OptionalRequirement(Optional[int]),
+            "fallback_cluster_count": OptionalRequirement(Optional[int]),
             "drop_on_overflow": bool,
             "fc2_in_kernel_topk_reduce": bool,
             "token_back_mode": str,
@@ -98,13 +105,17 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         return (
             f"sm107_megamoe_glu_{self.quant_kind}_m{self.mma_tiler_mnk[0]}n{self.mma_tiler_mnk[1]}"
             f"k{self.mma_tiler_mnk[2]}_e{self.expert_count}_ep{self.world_size}_topk{self.topk}_"
+            f"cluster{self.cluster_shape_mnk}_"
             f"h{self.hidden_size}_i{self.intermediate_gateup_size}_combine{self.combine_format}_"
             f"clamp{self.gate_up_clamp}_"
             f"tokenback{self.token_back_mode}_hint{self.group_hint}_"
             f"epi{self.epi_flag_batch[0]}x{self.epi_flag_batch[1]}_tif{self.flag_batch}_"
+            f"sched{self.schedule_mode}_work{self.load_balance_mode}_"
             f"deterministic_mtpr{self.max_tokens_per_rank}_mrpr{self.max_recv_size_per_rank}_"
             f"drop{int(self.drop_on_overflow)}_lc{self.launch_cluster_count}_"
-            f"genc{int(self.generate_c)}_topkfc11_"
+            f"fallback{self.fallback_cluster_shape_mn}_prefc{self.preferred_cluster_count}_"
+            f"fallbackc{self.fallback_cluster_count}_"
+            f"genc{int(self.generate_c)}_stgfc1{int(self.use_stg_fc1)}_topkfc11_"
             f"fc2bulk{int(self.fc2_use_bulk)}x{self.fc2_tma_stages}_"
             f"redtopk{int(self.reduce_topk_in_kernel)}_"
             f"weight{self.weight_storage_mode}"
@@ -249,6 +260,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         group_hint: int,
         token_padding_block: int,
         sf_padding_block: int,
+        schedule_mode: str = "grouped",
         load_balance_mode: str = "static",
         static_expert_shape: Optional[Tuple[int, int, int]] = None,
         force_static_sched: bool = True,
@@ -265,6 +277,9 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         max_recv_size_per_rank: int,
         hidden: int,
         launch_cluster_count: int,
+        fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None,
+        preferred_cluster_count: Optional[int] = None,
+        fallback_cluster_count: Optional[int] = None,
         drop_on_overflow: bool,
         data_token_capacity: Optional[int] = None,
         fc2_in_kernel_topk_reduce: bool = False,
@@ -320,6 +335,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 "cluster_shape_mnk": tuple(cluster_shape_mnk),
                 "use_2cta_instrs": use_2cta_instrs,
                 "group_hint": group_hint,
+                "schedule_mode": schedule_mode,
                 "token_padding_block": token_padding_block,
                 "sf_padding_block": sf_padding_block,
                 "load_balance_mode": load_balance_mode,
@@ -329,6 +345,15 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 "acc_dtype": acc_dtype,
                 "sf_vec_size": sf_vec_size,
                 "launch_cluster_count": launch_cluster_count,
+                **(
+                    {
+                        "fallback_cluster_shape_mn": tuple(fallback_cluster_shape_mn),
+                        "preferred_cluster_count": preferred_cluster_count,
+                        "fallback_cluster_count": fallback_cluster_count,
+                    }
+                    if fallback_cluster_shape_mn is not None
+                    else {}
+                ),
                 "drop_on_overflow": drop_on_overflow,
                 "fc2_in_kernel_topk_reduce": fc2_in_kernel_topk_reduce,
                 "token_back_mode": token_back_mode,
@@ -380,17 +405,34 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
 
         mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         cluster_shape_mnk = impl_desc["cluster_shape_mnk"]
+        # Reject standalone-only features up front, before the base class is built.
+        if mma_tiler_mnk[0] not in SupportedMmaTileM:
+            raise NotImplementedError(
+                f"mma_tiler M {mma_tiler_mnk[0]} is not supported on the MegaMoE path "
+                f"(supported: {SupportedMmaTileM}); the B-reuse tiler (M 512) is "
+                "supported only on the standalone fc12 path."
+            )
         use_2cta_instrs = impl_desc["use_2cta_instrs"]
         group_hint = impl_desc["group_hint"]
+        schedule_mode = impl_desc["schedule_mode"]
         token_padding_block = impl_desc["token_padding_block"]
         sf_padding_block = impl_desc["sf_padding_block"]
         load_balance_mode = impl_desc["load_balance_mode"]
+        if load_balance_mode == "cluster_launch_control":
+            raise NotImplementedError(
+                "cluster_launch_control is not supported on the MegaMoE path: token_comm derives "
+                "linear_cta_idx and promised_launchable_sm_count from the persistent launch grid, "
+                "which a full-ticket CLC grid does not satisfy."
+            )
         force_static_sched = impl_desc["force_static_sched"]
         clc_bundle_size = impl_desc["clc_bundle_size"]
         num_sched_stages = impl_desc["num_sched_stages"]
         acc_dtype = impl_desc["acc_dtype"]
         sf_vec_size = impl_desc["sf_vec_size"]
         launch_cluster_count = impl_desc["launch_cluster_count"]
+        fallback_cluster_shape_mn = impl_desc.get("fallback_cluster_shape_mn")
+        preferred_cluster_count = impl_desc.get("preferred_cluster_count")
+        fallback_cluster_count = impl_desc.get("fallback_cluster_count")
         drop_on_overflow = impl_desc["drop_on_overflow"]
         fc2_in_kernel_topk_reduce = impl_desc["fc2_in_kernel_topk_reduce"]
         token_back_mode = impl_desc["token_back_mode"]
@@ -418,19 +460,50 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             raise ValueError(f"unsupported token_back_mode={token_back_mode!r}.")
         if ab_dtype not in _AB_DTYPE_TO_QUANT_KIND:
             raise ValueError(f"ab_dtype {ab_dtype} has no mxfp8 QuantKind.")
-        # FC2 bulk store
-        if fc2_use_bulk and not combine_format.is_quantized:
-            raise ValueError("fc2_use_bulk currently supports only a quantized (mxfp8) combine format.")
+        # Keep the deterministic training path separate from the in-kernel REDG reduction.
+        if fc2_use_bulk and fc2_in_kernel_topk_reduce:
+            raise ValueError("fc2_use_bulk is not supported with fc2_in_kernel_topk_reduce.")
+        fc2_cta_token_tile = mma_tiler_mnk[0] // (2 if use_2cta_instrs else 1)
+        if (
+            fc2_use_bulk
+            and token_back_by_dispatch
+            and token_padding_block % fc2_cta_token_tile != 0
+        ):
+            raise ValueError(
+                "Dispatch FC2 TMA store requires token_padding_block to be divisible "
+                f"by the per-CTA token tile ({fc2_cta_token_tile})."
+            )
         if fc2_tma_stages is not None and not fc2_use_bulk:
             raise ValueError("fc2_tma_stages requires fc2_use_bulk=True.")
+
+        preferred_cluster_shape_mn = tuple(cluster_shape_mnk[:2])
+        self.mixed_cga_config = NonClcMixedCgaConfig(
+            preferred_cluster_shape=preferred_cluster_shape_mn,
+            fallback_cluster_shape=fallback_cluster_shape_mn,
+            launch_cluster_count=launch_cluster_count,
+            preferred_cluster_count=preferred_cluster_count,
+            fallback_cluster_count=fallback_cluster_count,
+        )
+        if launch_cluster_count != self.mixed_cga_config.launch_cluster_cnt_merge_as_preferred:
+            raise ValueError(
+                "launch_cluster_count must equal the canonical preferred-cluster slot count "
+                "resolved from preferred_cluster_count and fallback_cluster_count."
+            )
+        self.fallback_cluster_shape_mn = self.mixed_cga_config.fallback_cluster_shape
+        self.preferred_cluster_count = self.mixed_cga_config.preferred_cluster_count
+        self.fallback_cluster_count = self.mixed_cga_config.fallback_cluster_count
 
         super().__init__(
             mma_tiler_mnk=mma_tiler_mnk,
             cluster_shape_mnk=cluster_shape_mnk,
+            fallback_cluster_shape_mn=self.fallback_cluster_shape_mn,
+            preferred_cluster_count=self.preferred_cluster_count,
+            fallback_cluster_count=self.fallback_cluster_count,
             use_2cta_instrs=use_2cta_instrs,
             group_hint=group_hint,
             token_padding_block=token_padding_block,
             sf_padding_block=sf_padding_block,
+            schedule_mode=schedule_mode,
             load_balance_mode=load_balance_mode,
             static_expert_shape=static_expert_shape,
             force_static_sched=force_static_sched,
@@ -447,17 +520,23 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             generate_c=generate_c,
             use_stg_fc1=use_stg_fc1,
             act_func=act_func,
+            combine_format=combine_format,
             fc2_use_bulk=fc2_use_bulk,
             fc2_tma_stages=fc2_tma_stages,
             weight_storage_mode=weight_storage_mode,
         )
 
-        # --- Warp topology: expand to 12 warps (or 16 for standalone token-back). ---
+        # --- Warp topology: append transfer warps after the compute warps. ---
         self.enable_token_comm = True
-        self.dispatch_warp_id = (8, 9, 10, 11)
+        dispatch_warp_base = self.sched_warp_id + 1
+        self.dispatch_warp_id = tuple(range(dispatch_warp_base, dispatch_warp_base + 4))
         self.token_back_mode = token_back_mode
         self.token_back_standalone = token_back_by_dispatch and token_back_mode == "standalone_warps"
-        self.token_back_warp_id = (12, 13, 14, 15) if self.token_back_standalone else None
+        self.token_back_warp_id = (
+            tuple(range(dispatch_warp_base + 4, dispatch_warp_base + 8))
+            if self.token_back_standalone
+            else None
+        )
         num_token_back_warps = len(self.token_back_warp_id) if self.token_back_standalone else 0
         self.threads_per_cta = 32 * (len(self.epilogue_warp_id) + 4 + len(self.dispatch_warp_id) + num_token_back_warps)
 
@@ -483,9 +562,9 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         cta_tile_m = mma_tiler_mnk[0] // mma_cta_count
         cluster_m, cluster_n = self.cluster_shape_mn
         tokens_per_fc1_ready_slot = cta_tile_m * cluster_m
-        hidden_per_fc2_cluster_tile = cta_tile_m * cluster_m
+        hidden_per_fc2_cluster_tile = mma_tiler_mnk[1] * cluster_n
         fc2_done_signals_per_token_tile = ceil_div(hidden, hidden_per_fc2_cluster_tile) * cluster_m * cluster_n
-        promised_launchable_sm_count = launch_cluster_count * cluster_m * cluster_n
+        promised_launchable_sm_count = self.mixed_cga_config.total_cta_cnt
         quant_kind = _AB_DTYPE_TO_QUANT_KIND[ab_dtype]
         tc_problem_desc = ProblemDesc(
             {
@@ -550,6 +629,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         self.cluster_shape_mnk = tuple(cluster_shape_mnk)
         self.mma_tiler_mnk = tuple(mma_tiler_mnk)
         self.group_hint = group_hint
+        self.schedule_mode = schedule_mode
         self.token_padding_block = token_padding_block
         self.sf_padding_block = sf_padding_block
         self.load_balance_mode = load_balance_mode
@@ -666,6 +746,16 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             byte_alignment=16,
             reset="tail_reset",
         )
+        # Embed the scheduler's complete local workspace.
+        sched_workspace_bytes = max(16, self.sched_device_ws.total_bytes("local"))
+        device_workspace.register(
+            self.sched_work_id_region,
+            cutlass.Uint8,
+            (sched_workspace_bytes,),
+            buffer_space="local",
+            byte_alignment=16,
+            reset="tail_reset",
+        )
         if self.enable_col_quant:
             # Persistent per-expert token-count snapshot for the post-kernel col-quant launch.
             device_workspace.register(
@@ -679,7 +769,10 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             device_workspace.register(
                 self.weight_descriptor_region,
                 cutlass.Uint8,
-                (discrete_weight_descriptor_workspace_size(self.num_experts_per_rank),),
+                (discrete_weight_descriptor_workspace_size(
+                    self.num_experts_per_rank,
+                    self.is_mixed_cga,
+                ),),
                 buffer_space="local",
                 byte_alignment=discrete_weight_descriptor_workspace_alignment(),
             )

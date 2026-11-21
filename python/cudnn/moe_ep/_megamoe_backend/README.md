@@ -9,7 +9,21 @@ The private backend provides Rubin SM107 MXFP8 execution for `cudnn.moe_ep`.
 - `hidden_size % 128 == 0`
 - `intermediate_size % 256 == 0`
 - `top_k <= min(32, num_experts)`
-- positive `max_tokens_per_rank`
+- positive `max_tokens_per_rank`, at most 65536 (the vendored routing metadata
+  stores the source token index in 16 bits)
+- expert-parallel group size at most 256 (the same record stores the source
+  rank in 8 bits)
+- forward `fc2_bulk_store` requires `hidden_size % 256 == 0`, and an explicit
+  stage count within the store path's limit (4 for BF16 and 2 for MXFP8 combine
+  under `epi_warps`, 8 under dispatch token-back); the vendored epilogue only
+  checks these at compile time, after workspace allocation
+- exclusive use of the GPU: the persistent kernels size their launch from the
+  device's occupancy and deadlock when fewer clusters are resident
+
+Forward-kernel tuning maps onto these upstream `Sm107MegaMoEMxfp8GluKernel`
+parameters, which a vendor sync must keep compatible: `load_balance_mode`,
+`schedule_mode`, `fc2_use_bulk`, `fc2_tma_stages`, `fallback_cluster_shape_mn`,
+`preferred_cluster_count`, and `fallback_cluster_count`.
 - `apply_topk_in_fc1=True`
 
 Inference accepts BF16/FP16/FP32 or MXFP8 operands. Training accepts

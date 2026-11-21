@@ -27,6 +27,7 @@ from moe_ep.moe_ep_distributed_workers import (
 from moe_ep.moe_ep_test_support import (
     _assert_matches_reference,
     _forward_config,
+    _join_spawned_with_deadline,
     _make_forward_case,
     _moe_ep_config,
     _naive_reference,
@@ -34,6 +35,7 @@ from moe_ep.moe_ep_test_support import (
     _reference_forward,
     _replay_cuda_graph,
     _require_distributed_sm107,
+    _run_isolated,
     _sm107_device,
     _stress_backend_reuse,
     make_forward_inputs,
@@ -601,6 +603,49 @@ def test_dgrad_optimization_public_contract_and_phase_scope():
 
 
 @pytest.mark.L0
+def test_forward_kernel_tuning_public_contract_and_phase_scope():
+    from cudnn import MoeEpTuningConfig
+
+    baseline = MoeEpTuningConfig()
+    assert (baseline.scheduling, baseline.fc2_bulk_store, baseline.mixed_cga) == ("static", "off", False)
+
+    for scheduling in ("static", "atomic", "phase_interleave"):
+        assert MoeEpTuningConfig(scheduling=scheduling).scheduling == scheduling
+    for fc2_bulk_store in ("off", "auto", 1, 2, 4, 8):
+        assert MoeEpTuningConfig(fc2_bulk_store=fc2_bulk_store).fc2_bulk_store == fc2_bulk_store
+    assert MoeEpTuningConfig(mixed_cga=True).mixed_cga is True
+
+    with pytest.raises(ValueError, match="scheduling must be one of"):
+        MoeEpTuningConfig(scheduling="cluster_launch_control")
+    # bool is an int subclass: True must not alias a one-stage bulk store.
+    for invalid in (True, False, 0, 3, 16, "on", None, 2.0):
+        with pytest.raises(ValueError, match="fc2_bulk_store must be one of"):
+            MoeEpTuningConfig(fc2_bulk_store=invalid)
+    with pytest.raises(ValueError, match="mixed_cga must be a bool"):
+        MoeEpTuningConfig(mixed_cga=1)
+    with pytest.raises(ValueError, match="fc2_bulk_store requires reduce_topk_in_kernel=False"):
+        MoeEpTuningConfig(fc2_bulk_store="auto", reduce_topk_in_kernel=True)
+
+    # The DS3 backward preset is unaffected by the forward-kernel fields.
+    assert MoeEpTuningConfig(dgrad_optimization="ds3_ep4_pattern").epi_flag_batch == (4, 2)
+
+    forward_knobs = (
+        {"scheduling": "atomic"},
+        {"scheduling": "phase_interleave"},
+        {"fc2_bulk_store": "auto"},
+        {"fc2_bulk_store": 8},
+        {"mixed_cga": True},
+    )
+    for overrides in forward_knobs:
+        tuning = MoeEpTuningConfig(**overrides)
+        for phase in ("inference_tuning", "training_forward_tuning"):
+            config = _moe_ep_config(**_forward_config(), **{phase: tuning})
+            assert getattr(config, phase) is tuning
+        with pytest.raises(ValueError, match="training_backward_tuning does not support"):
+            _moe_ep_config(**_forward_config(), training_backward_tuning=tuning)
+
+
+@pytest.mark.L0
 def test_dgrad_profile_versions_kernel_fingerprint_metadata():
     from cudnn.moe_ep._megamoe_backend.mxfp8._fingerprint import (
         FINGERPRINT_SCHEMA_VERSION,
@@ -877,6 +922,12 @@ def test_nondefault_inference_tuning_reuses_runtime_workspace():
             4,
             64,
             False,
+            False,
+            None,
+            "static",
+            "grouped",
+            (2, 1, 1),
+            None,
         )
 
     _assert_matches_reference(first, expected)
@@ -1109,6 +1160,172 @@ def test_mxfp8_forward_multi_gpu_matches_reference(
     )
 
 
+_FORWARD_TUNING_CASES = {
+    "bulk-auto-bf16": ({"fc2_bulk_store": "auto"}, "bf16"),
+    "bulk-auto-mxfp8": ({"fc2_bulk_store": "auto"}, "mxfp8"),
+    "bulk-4-epi": ({"fc2_bulk_store": 4}, "bf16"),
+    "bulk-8-dispatch": ({"fc2_bulk_store": 8, "token_back_mode": "standalone_warps"}, "bf16"),
+    "atomic": ({"scheduling": "atomic"}, "bf16"),
+    "phase-mixed-bulk": ({"scheduling": "phase_interleave", "mixed_cga": True, "fc2_bulk_store": "auto"}, "bf16"),
+    # atomic and phase_interleave switch token-back to atomic-counter claiming; standalone warps then claim that way too.
+    "atomic-standalone": ({"scheduling": "atomic", "token_back_mode": "standalone_warps"}, "bf16"),
+    "phase-mixed-standalone": (
+        {"scheduling": "phase_interleave", "mixed_cga": True, "token_back_mode": "standalone_warps"},
+        "bf16",
+    ),
+}
+
+
+def _forward_tuning_inference_worker(case_name: str) -> None:
+    from cudnn import MoeEp, MoeEpTuningConfig
+
+    tuning_kwargs, combine_format = _FORWARD_TUNING_CASES[case_name]
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    hidden = 256  # FC2 bulk stores need whole 256-column FC2 tiles.
+    args = _make_forward_case(
+        device,
+        experts=2,
+        tokens=5,
+        hidden=hidden,
+        intermediate=256,
+        top_k=2,
+        index_dtype=torch.int32,
+        weight_dtype=torch.float32,
+    )
+    config = _forward_config(hidden_size=hidden, combine_format=combine_format)
+    expected = _reference_forward(args, **config)
+    original_topk_idx = args[3].clone()
+    alternate_topk_idx = original_topk_idx.flip(1).contiguous()
+    alternate_expected = _reference_forward((*args[:3], alternate_topk_idx, args[4]), **config)
+
+    with MoeEp(_moe_ep_config(**config)) as op:
+        default_output = op(*args).clone()
+        torch.cuda.synchronize(device)
+
+    tuning = MoeEpTuningConfig(**tuning_kwargs)
+    with MoeEp(_moe_ep_config(**config, inference_tuning=tuning)) as op:
+        outputs = [op(*args).clone() for _ in range(2)]
+        torch.cuda.synchronize(device)
+        for output in outputs:
+            _assert_matches_reference(output, expected)
+            # Tuning changes scheduling and transport only: raw bytes match the default.
+            assert torch.equal(output.view(torch.int16), default_output.view(torch.int16))
+        prepared = op._execution_state.backend._prepared_kernel
+        expected_cluster = (4, 1, 1) if tuning.mixed_cga else (2, 1, 1)
+        assert prepared.config.cluster_shape_mnk == expected_cluster
+        _replay_cuda_graph(
+            op,
+            args,
+            original_topk_idx,
+            expected,
+            device,
+            alternate_topk_idx=alternate_topk_idx,
+            alternate_expected=alternate_expected,
+        )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("case_name", sorted(_FORWARD_TUNING_CASES))
+def test_forward_kernel_tuning_inference_matches_reference_and_replays(case_name):
+    _sm107_device()
+    _run_isolated(
+        _forward_tuning_inference_worker,
+        (case_name,),
+        what=f"inference forward tuning case {case_name}",
+    )
+
+
+# In-kernel top-k reduction composes with the forward scheduling knobs (only bulk store excludes it).
+_IN_KERNEL_REDUCE_TUNING_CASES = {
+    "atomic": {"scheduling": "atomic"},
+    "phase-mixed": {"scheduling": "phase_interleave", "mixed_cga": True},
+}
+
+
+def _in_kernel_reduce_tuning_inference_worker(case_name: str) -> None:
+    from cudnn import MoeEp, MoeEpTuningConfig
+
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    args = make_forward_inputs(device)
+    expected = _reference_forward(args)
+
+    with MoeEp(_moe_ep_config(**_forward_config(), inference_tuning=MoeEpTuningConfig(reduce_topk_in_kernel=True))) as op:
+        static_output = op(*args).clone()
+        torch.cuda.synchronize(device)
+
+    tuning = MoeEpTuningConfig(reduce_topk_in_kernel=True, **_IN_KERNEL_REDUCE_TUNING_CASES[case_name])
+    with MoeEp(_moe_ep_config(**_forward_config(), inference_tuning=tuning)) as op:
+        outputs = [op(*args).clone() for _ in range(3)]
+        torch.cuda.synchronize(device)
+        # BF16 atomics make the reduction order-dependent: check each call against the reference.
+        for output in outputs:
+            _assert_matches_reference(output, expected)
+        prepared = op._execution_state.backend._prepared_kernel
+        assert prepared.config.cluster_shape_mnk == ((4, 1, 1) if tuning.mixed_cga else (2, 1, 1))
+    identical = all(torch.equal(output.view(torch.int16), static_output.view(torch.int16)) for output in outputs)
+    print(f"in-kernel reduce inference {case_name}: byte-identical to static scheduling: {identical}")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("case_name", sorted(_IN_KERNEL_REDUCE_TUNING_CASES))
+def test_in_kernel_topk_reduce_with_forward_scheduling_matches_reference(case_name):
+    _sm107_device()
+    _run_isolated(
+        _in_kernel_reduce_tuning_inference_worker,
+        (case_name,),
+        what=f"in-kernel top-k reduce inference case {case_name}",
+    )
+
+
+_MIXED_CGA_INFERENCE_TUNINGS = {
+    "mixed": {"mixed_cga": True},
+    "mixed-phase-bulk": {"mixed_cga": True, "scheduling": "phase_interleave", "fc2_bulk_store": "auto"},
+    "mixed-phase-standalone": {"mixed_cga": True, "scheduling": "phase_interleave", "token_back_mode": "standalone_warps"},
+}
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+# EP4 covers EP2's single-node transport; the multi-node cases cover EP8 and above.
+@pytest.mark.parametrize("world_size", [4])
+@pytest.mark.parametrize("tuning_name", sorted(_MIXED_CGA_INFERENCE_TUNINGS))
+def test_mxfp8_forward_multi_gpu_mixed_cga_matches_reference(world_size, tuning_name, tmp_path):
+    """Mixed-CGA acceptance G1: upstream CI covers mixed CGA only at EP1."""
+
+    _require_distributed_sm107(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / f"mixed_cga_{tuning_name}_ep{world_size}.init"
+    context = mp.spawn(
+        _distributed_output_worker,
+        args=(world_size, str(init_file), "bf16", 256, _MIXED_CGA_INFERENCE_TUNINGS[tuning_name]),
+        nprocs=world_size,
+        join=False,
+    )
+    _join_spawned_with_deadline(context, what=f"EP{world_size} mixed-CGA inference {tuning_name}")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+# EP4 covers EP2's single-node transport; the multi-node cases cover EP8 and above.
+@pytest.mark.parametrize("world_size", [4])
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "standalone_warps"])
+def test_mxfp8_forward_multi_gpu_fc2_bulk_store_matches_reference(world_size, token_back_mode, tmp_path):
+    _require_distributed_sm107(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / f"fc2_bulk_{token_back_mode}_ep{world_size}.init"
+    context = mp.spawn(
+        _distributed_output_worker,
+        args=(world_size, str(init_file), "bf16", 256, {"fc2_bulk_store": "auto", "token_back_mode": token_back_mode}),
+        nprocs=world_size,
+        join=False,
+    )
+    _join_spawned_with_deadline(context, what=f"EP{world_size} FC2 bulk-store inference {token_back_mode}")
+
+
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -1145,14 +1362,15 @@ def test_inference_ep_asymmetric_overflow_policy(
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_inference_ep2_rejects_overflow_policy_mismatch(tmp_path):
+@pytest.mark.parametrize("mismatch", ["drop_on_overflow", "forward_tuning"])
+def test_inference_ep2_rejects_overflow_policy_mismatch(tmp_path, mismatch):
     world_size = 2
     _require_distributed_sm107(world_size)
     os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
     init_file = tmp_path / "overflow_policy_mismatch.init"
     mp.spawn(
         _distributed_inference_policy_mismatch_worker,
-        args=(world_size, str(init_file)),
+        args=(world_size, str(init_file), mismatch),
         nprocs=world_size,
         join=True,
     )
@@ -1417,6 +1635,112 @@ def test_megamoe_capability_and_kernel_config_accept_ep_above_16():
     assert kernel_config.world_size == 32
     assert kernel_config.num_experts == 1
     assert config.topology.ep_rank == 31
+
+
+@pytest.mark.L0
+def test_megamoe_capability_bounds_tokens_by_routing_metadata():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend._capability import (
+        _MAX_TOKENS_PER_RANK,
+        validate_config,
+    )
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.token_protocol import (
+        TokenSrcMetadata,
+    )
+
+    # The capability bound mirrors the vendored record's 16-bit token field.
+    assert _MAX_TOKENS_PER_RANK == TokenSrcMetadata.MAX_TOKENS
+
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
+        resolved = op._execution_state.resolved_config
+
+    def with_max_tokens(max_tokens_per_rank):
+        public = resolved.public_config
+        parallel = replace(public.parallel, max_tokens_per_rank=max_tokens_per_rank)
+        return replace(resolved, public_config=replace(public, parallel=parallel))
+
+    validate_config(with_max_tokens(_MAX_TOKENS_PER_RANK))
+    with pytest.raises(NotImplementedError, match=f"max_tokens_per_rank must be <= {_MAX_TOKENS_PER_RANK}"):
+        validate_config(with_max_tokens(_MAX_TOKENS_PER_RANK + 1))
+
+
+@pytest.mark.L0
+def test_megamoe_capability_bounds_ep_size_by_routing_metadata():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend._capability import (
+        _MAX_EP_SIZE,
+        validate_config,
+    )
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.token_protocol import (
+        TokenSrcMetadata,
+    )
+
+    # The capability bound mirrors the vendored record's 8-bit rank field.
+    assert _MAX_EP_SIZE == TokenSrcMetadata.MAX_RANKS
+
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
+        resolved = op._execution_state.resolved_config
+
+    def with_ep_size(ep_size):
+        return replace(
+            resolved,
+            public_config=replace(
+                resolved.public_config,
+                model=replace(resolved.public_config.model, num_experts=ep_size),
+            ),
+            topology=replace(
+                resolved.topology,
+                experts_per_rank=1,
+                ep_size=ep_size,
+                ep_rank=ep_size - 1,
+                ep_global_ranks=tuple(range(ep_size)),
+            ),
+        )
+
+    validate_config(with_ep_size(_MAX_EP_SIZE))
+    with pytest.raises(NotImplementedError, match=f"expert-parallel size must be <= {_MAX_EP_SIZE}"):
+        validate_config(with_ep_size(_MAX_EP_SIZE + 1))
+
+
+@pytest.mark.L0
+def test_megamoe_capability_bounds_fc2_bulk_store():
+    from cudnn import MoeEp, MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend._capability import validate_config
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import Mxfp8KernelConfig
+
+    # The bulk-store hidden multiple is the FC2 CTA tile N of the vendored kernel.
+    assert Mxfp8KernelConfig.__dataclass_fields__["mma_tiler_mnk"].default[1] == 256
+
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
+        base = op._execution_state.resolved_config
+
+    def resolved(*, phase="training_forward_tuning", hidden_size=256, combine_format="bf16", **tuning):
+        public = _moe_ep_config(
+            **_forward_config(hidden_size=hidden_size, combine_format=combine_format),
+            **{phase: MoeEpTuningConfig(**tuning)},
+        )
+        return replace(base, public_config=public)
+
+    for phase in ("inference_tuning", "training_forward_tuning"):
+        validate_config(resolved(phase=phase, fc2_bulk_store="auto"))
+        with pytest.raises(NotImplementedError, match=f"{phase}.fc2_bulk_store requires hidden_size divisible by 256"):
+            validate_config(resolved(phase=phase, hidden_size=128, fc2_bulk_store="auto"))
+
+    # Stage limits follow the store path: peer UBLKs under epi_warps, TMA under dispatch.
+    allowed = {
+        ("epi_warps", "bf16"): (1, 2, 4),
+        ("epi_warps", "mxfp8"): (1, 2),
+        ("standalone_warps", "bf16"): (1, 2, 4, 8),
+        ("reuse_dispatch_warps", "mxfp8"): (1, 2, 4, 8),
+    }
+    for (token_back_mode, combine_format), stages in allowed.items():
+        for stage in (1, 2, 4, 8):
+            config = resolved(combine_format=combine_format, token_back_mode=token_back_mode, fc2_bulk_store=stage)
+            if stage in stages:
+                validate_config(config)
+            else:
+                with pytest.raises(NotImplementedError, match=f"exceeds the {stages[-1]}-stage limit"):
+                    validate_config(config)
 
 
 @pytest.mark.L0

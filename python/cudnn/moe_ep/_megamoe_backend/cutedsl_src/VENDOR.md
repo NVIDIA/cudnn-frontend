@@ -7,20 +7,32 @@ documented in the parent backend `README.md`.
 ## Upstream
 
 - **Project**: `cutedsl_megamoe` (NVIDIA-internal repository; URL omitted).
+- **Source tree**: `sources` at the repository root (formerly
+  `next/sources`).
 - **Current synchronized commit**:
-  `e8df888670a44b099e9d7009d5338a4ab45bf848`.
+  `72796e96cfdd4690b6af583302a3258bada40f27`.
 - **Discrete-weight implementation ancestor**:
   `7cc8d2eb2fb2fc9643ccd6244d6c810ed9f4341b`.
-- **Last synced**: 2026-09-22.
+- **Last synced**: 2026-11-11.
 - **Vendored subset**: the exact export closure produced for
   `RubinTrainingFwdGluMegaMoE` and `RubinTrainingBwdDgluMegaMoE`, including
-  materialized source-copy modules.
-- **Raw exported source files**: 37 (plus 15 generated package markers).
-- **Expected vendored Python files**: 48 after the local overlay.
+  the materialized source copy
+  `kernel_src/rubin/custom_mix_cga_helpers.py` (from
+  `kernel_src/blackwell/custom_mix_cga_helpers.py`).
+- **Raw exported source files**: 38 (plus 12 generated package markers).
+- **Expected vendored Python files**: 50 after the local overlay.
 - **Expected vendored Python tree SHA256**:
-  `5c000a4c2824b71ea669415a35c27f0ac678a076b6b3d4f586595d6b2d1796d4`.
+  `eb883900803f459a3fa55c620d9235396d1d03d532f73a759957b767dfba7146`.
   This uses the same relative-path-and-content algorithm as
   `_megamoe_backend.mxfp8._fingerprint.source_tree_sha256`.
+
+The export command, run from the upstream repository root, is:
+
+```bash
+python export_src.py \
+  --kernels RubinTrainingFwdGluMegaMoE RubinTrainingBwdDgluMegaMoE \
+  --dst_dir <empty-directory>
+```
 
 ## Policy
 
@@ -50,20 +62,31 @@ The synchronized Python sources use BSD-3-Clause SPDX identifiers.
   always supplies its exact caller-prescribed pool rows. Upstream topology
   clamps remain intact, and the component rejects physical capacity below the
   padded requirement for the clamped logical limit.
-- Overflow policy is group-consistent without a post-kernel collective:
-  every rank derives the same group-wide overflow bit from the replicated
-  pre-truncation destination totals, while only the overflowing destination
-  truncates its local expert sizes.
-- The materialized Rubin training TMEM helper replaces two unused Blackwell
-  swap-AB extension annotations with `Any`; the extension and its now-empty
-  local `kernel_src/blackwell` package tree are omitted from the vendored
-  closure.
-- Forward epilogue comments that referenced unavailable external design
-  material are replaced with self-contained dataflow descriptions.
+- The forward epilogue module docstring that referenced unavailable external
+  design material is replaced with a self-contained description.
+- Code blocks that the vendored training closure never reaches are removed
+  from `helpers/dsl_helpers.py`, `helpers/ptx_helpers.py`, and
+  `kernel_src/rubin/custom_mix_cga_helpers.py`.
+- One comment in `kernel_src/schedulers/non_clc_mixed_cga.py` that named a
+  class outside the export closure is shortened.
 - Repository-required copyright and BSD-3-Clause SPDX headers are added to
   generated empty package markers.
 
 No other vendored Python source-body differences are expected.
+
+The group-consistent overflow policy, previously a local difference, is
+upstream as of this snapshot: every rank derives the same group-wide overflow
+bit from the replicated pre-truncation destination totals, while only the
+overflowing destination truncates its local expert sizes. The export closure
+no longer reaches Blackwell swap-AB extension types, so the former `Any`
+annotation overlay and the omitted `kernel_src/blackwell` package tree are no
+longer needed.
+
+Public `nvidia-cutlass-dsl` 4.8.0 and 4.8.1 do not provide
+`PipelineUmmaAsync.create(defer_init=...)`. Upstream's forward fused FC1/FC2
+kernel feature-detects that keyword at import: without it, the kernel keeps
+the per-create mbarrier initialization that mixed-CGA launches already use
+instead of the folded initialization. No local overlay is needed for this.
 
 ## Integration boundary
 
@@ -76,6 +99,10 @@ Discrete mode passes four caller-owned CUDA `int64[E_local]` pointer arrays
 directly to the vendored forward/backward kernels. MoeEP owns neither the
 per-expert buffers nor the pointer tables.
 
+The vendored routing metadata record stores the source token index in 16 bits,
+so the communication component rejects `max_tokens_per_rank > 65536`. The
+MegaMoE capability check declines such configurations before compilation.
+
 The vendored Rubin sources require a CUTLASS DSL distribution that provides
 `cutlass.utils.rubin_helpers`. The executable backend enforces
 `nvidia-cutlass-dsl>=4.8.0` before importing these kernels.
@@ -86,3 +113,8 @@ The vendored Rubin sources require a CUTLASS DSL distribution that provides
   compilation.
 - `_megamoe_backend/mxfp8/_backward_compile.py`: Rubin MXFP8 backward dGLU
   preparation and compilation.
+- `_megamoe_backend/_comm.py`: symmetric-buffer peer mapping.
+- `_megamoe_backend/mxfp8/_training_stage_kernel.py`: MXFP8 staging constants
+  and PTX conversion helpers.
+- `_megamoe_backend/mxfp8/_fingerprint.py` and `_training_resources.py`:
+  vendored source-tree fingerprint.

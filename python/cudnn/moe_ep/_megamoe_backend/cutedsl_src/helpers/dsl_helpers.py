@@ -1,6 +1,6 @@
 """General-purpose CuTe DSL helpers."""
 
-from typing import Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -232,4 +232,10 @@ def tma_multicast_mask(
     return Int16(result)
 
 
-__all__ = ["mark_alignment", "smem_exclusive_prefix", "spin_peek", "spin_wait", "tma_multicast_mask"]
+__all__ = [
+    "mark_alignment",
+    "smem_exclusive_prefix",
+    "spin_peek",
+    "spin_wait",
+    "tma_multicast_mask",
+]

@@ -22,8 +22,9 @@ from ._compile import (
     compile_or_get,
     prepare_environment,
     prepare_kernel,
+    prepare_mixed_cga_launch,
 )
-from ._config import Mxfp8KernelConfig
+from ._config import Mxfp8KernelConfig, Mxfp8MixedCgaLaunch
 from ._launch import launch_forward
 
 
@@ -44,6 +45,7 @@ class Mxfp8Backend:
         self._device = resolved_device
         self._adapter = Mxfp8InputAdapter(config.public_config.data_path.fc1_weight_layout)
         self._prepare_context: tuple[tuple[int, int], int] | None = None
+        self._mixed_cga_launch: Mxfp8MixedCgaLaunch | None = None
         self._prepared_kernel: PreparedMxfp8Kernel | None = None
         self._compiled: CompiledMxfp8Kernel | None = None
         self._inference_resources: _InferenceRuntimeWorkspaceOwner | None = None
@@ -74,6 +76,19 @@ class Mxfp8Backend:
             self._prepare_context = prepare_environment(self.device)
         return self._prepare_context
 
+    def _mixed_cga_launch_for(self, tuning) -> Mxfp8MixedCgaLaunch | None:
+        """Query 4-CTA occupancy only for a phase whose tuning selects mixed CGA."""
+
+        if not tuning.mixed_cga:
+            return None
+        if self._mixed_cga_launch is None:
+            _, launch_cluster_count = self._ensure_prepare_context()
+            self._mixed_cga_launch = prepare_mixed_cga_launch(
+                self.device,
+                fallback_max_active_clusters=launch_cluster_count,
+            )
+        return self._mixed_cga_launch
+
     @property
     def kernel_fingerprint(self) -> dict | None:
         """Fingerprint of the callable compiled by the most recent launch."""
@@ -102,6 +117,7 @@ class Mxfp8Backend:
                 kernel_config = Mxfp8KernelConfig.for_inference(
                     self.resolved_config,
                     launch_cluster_count=launch_cluster_count,
+                    mixed_cga_launch=self._mixed_cga_launch_for(self.resolved_config.public_config.inference_tuning),
                 )
                 self._prepared_kernel = prepare_kernel(
                     self.resolved_config,
@@ -272,6 +288,7 @@ class Mxfp8Backend:
             forward_kernel_config = Mxfp8KernelConfig.for_training_forward(
                 self.resolved_config,
                 launch_cluster_count=launch_cluster_count,
+                mixed_cga_launch=self._mixed_cga_launch_for(self.resolved_config.public_config.training_forward_tuning),
             )
             backward_kernel_config = Mxfp8KernelConfig.for_training_backward(
                 self.resolved_config,
@@ -322,6 +339,7 @@ class Mxfp8Backend:
                     self._inference_resources.close()
                     self._inference_resources = None
                 self._prepare_context = None
+                self._mixed_cga_launch = None
                 self._prepared_kernel = None
                 self._compiled = None
                 self._completion_event = None

@@ -16,12 +16,12 @@ from cutlass.cutlass_dsl import Int32, Int64
 
 from ......api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from ......helpers.device_workspace import DeviceWorkspace
+from ......helpers.mxfp8_col_requant import Mxfp8ColRequant
 from ......helpers.smem_workspace import SmemWorkspace
+from ......helpers.topk_reduce import TopkReduce
 from ......helpers.utils import ceil_div, round_up
 from ......quant_def import CombineFormat, QuantKind
 from ......communication.nvlink_domain.token_comm_deterministic import TokenCommDeterministic
-from ..topk_reduce import TopkReduce
-from ..fwd_glu.glu_mxfp8_col_requant import Mxfp8ColRequant
 from ..fwd_glu.glu_mxfp8_fc12_extension import (
     WeightStorageMode,
     discrete_weight_descriptor_workspace_alignment,
@@ -1134,7 +1134,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         beta: cute.Tensor,  # (experts_per_rank,) Float32
         fc1_preact: cute.Tensor,  # (pool_token_capacity, intermediate_gateup) BFloat16
         output_activation: cute.Tensor,  # (max_tokens_per_rank, hidden) BF16
-        overflow_flag: cute.Tensor,  # (1,) Int32, per-rank FC12 overflow output
+        overflow_flag: cute.Tensor,  # (1,) Int32, group-wide router overflow bit stored per rank
         dprob: cute.Tensor,  # (max_tokens_per_rank, topk) Float32; symmetric, pre-zeroed
         fc1_recompute: cute.Tensor,  # (pool_token_capacity, inter_downproj)
         fc1_recompute_sf: cute.Tensor,  # (inter_padded, col_sf_rows)

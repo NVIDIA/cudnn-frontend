@@ -26,11 +26,9 @@ from cutlass.cutlass_dsl import (
 from cutlass._mlir.dialects import arith, llvm
 from cutlass.cute.typing import AddressSpace
 
-from ......helpers.constants import Fp8E4M3FNMax, Fp8E5M2Max
+from .constants import Fp8E4M3FNMax, Fp8E5M2Max
 
-# The next/ helpers do not export these two block-size constants; they are fixed
-# by the MXFP8 spec / the dispatch pool's 32x4x4 SF atom layout, so define them
-# locally.
+# Fixed by the MXFP8 spec and the dispatch pool's 32x4x4 SF atom layout.
 Mxfp8BlockSize = 32
 SfPaddingBlock = 128
 
@@ -328,7 +326,8 @@ class Mxfp8ColRequant:
     # --- this kernel's tile ------------------------------------------------
     TILE_TOK: int = 128  # == SfAtomNonK, so a tile is one whole SF atom row
     NSTAGE: int = 2  # 2 is what leaves shared memory for 2 CTAs per SM
-    KMajorStages: int = 1  # Short-lived K-major CTAs do not amortize stage two.
+    KMajorStages: int = 1  # Scaled-conversion K-major path (Rubin).
+    KMajorStagesPortable: int = 2  # Overlap TMA with portable requant/store on Blackwell.
 
     # Tile width and per-lane access width, per requant path.  Both are tuned:
     # the two paths have different shared-memory budgets and different
@@ -496,6 +495,8 @@ class Mxfp8ColRequant:
         self.sf_out_pad = self.SfOutPad
         self.smem_capacity = _smem_capacity()
         self.NumStages = self.KMajorStages if self.dst_k_major else self.NSTAGE
+        if self.dst_k_major and not self.scaled_cvt:
+            self.NumStages = self.KMajorStagesPortable
         while (
             self._smem_bytes_for(self.TILE_HID, self.NumStages) > self.smem_capacity
             and len(self._tile_hid_choices) > 1
