@@ -1034,11 +1034,16 @@ for sequence in range(SEQUENCES):
         if position >= STEPS:
             behind += int(bool(row.any()))
             continue
-        got, want = row[:, :width].double(), plain.k[sequence, :, position].double()
+        got, want = row[:, :width].double().cpu(), plain.k[sequence, :, position].double().cpu()  # compared on the host
         larger = torch.maximum(got.abs(), want.abs())
-        unit = torch.ldexp(torch.ones_like(larger), torch.frexp(larger).exponent - 8)  # one bf16 unit at the larger magnitude
-        keys[position // PAGE] += int(bool(((got - want).abs() <= unit + bands[position][sequence]).all()))
+        unit = torch.ldexp(torch.ones_like(larger), torch.frexp(larger).exponent - 8)  # one bf16 unit at the larger magnitude, formed on the host
+        keys[position // PAGE] += int(bool(((got - want).abs() <= unit + bands[position][sequence].cpu()).all()))
         values[position // PAGE] += int(same(row[:, width:], plain.v[sequence, :, position]))
+# the unit this program holds the key rows with is its own.  It is formed on the host and asked of no device: there it is the exact
+# power of two in every binade of a bf16 value, which the line below holds (the sample's own unit on this device is the other cell's)
+binades = range(-125, 128)
+units = torch.ldexp(torch.ones(len(binades), dtype=torch.float64), torch.tensor([e - 7 for e in binades]))
+hold("unit", units.tolist() == [2.0 ** (e - 7) for e in binades], f"the bf16 unit of this comparison, formed on the host, is the exact power of two in each of {{len(binades)}} binades")
 first, second = SEQUENCES * PAGE, SEQUENCES * (STEPS - PAGE)
 hold("pool", keys == values == [first, second] and behind == 0,
      f"{{keys[0]}} of {{first}} key rows of the first pages and {{keys[1]}} of {{second}} of the second inside the entry's band around the twin's; "
@@ -1071,7 +1076,8 @@ def test_the_attention_preparations_entry_writes_the_pool_its_twin_would_across_
     preparation's entry writes positions 0 to 79 of a paged attention cache, 64 on a sequence's first page and 16 on its
     second.  The program keeps the row the in-projection handed the entry at every step and runs the entry's twin on
     those rows over a plain cache; then it reads the pool by index arithmetic of its own and holds, on both pages, every
-    value row to the twin's bytes and every key row inside the entry's band around the twin's, every row behind
+    value row to the twin's bytes and every key row inside the entry's band around the twin's -- with a bf16 unit of its
+    own, formed on the host, where it is an exact power of two -- every row behind
     position 79 still zero, and the cache's accessors to the same arithmetic.  The session's own checks follow, over
     all 80 steps: the entry against its twin at every step, the kernel check on every traced step -- the steps past
     position 63 among them, where the attention core reads two pages of a sequence.  On a class whose plan has no such
@@ -1080,7 +1086,7 @@ def test_the_attention_preparations_entry_writes_the_pool_its_twin_would_across_
         PREPARE_PROGRAM, "[prepare]", "model sample qwen_dense: the attention preparation's entry across a page boundary", "run of the attention preparation"
     )
     lines = out.splitlines()
-    for name in ("calls", "pool", "accessors"):
+    for name in ("calls", "unit", "pool", "accessors"):
         (line,) = [line for line in lines if line.startswith(f"  {name} ")]
         assert line.endswith("    PASS"), line
     assert "128 of 128 key rows of the first pages and 32 of 32 of the second inside the entry's band" in out and "0 of the 96 rows behind position 79" in out

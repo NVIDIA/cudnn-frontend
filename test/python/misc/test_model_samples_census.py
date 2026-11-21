@@ -8968,7 +8968,7 @@ def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypa
     the cos / sin table and the position and slot rows of ``cache.at(position)``, the two halves of the cache's pool,
     and outputs of its own; what it returns are the tensors the entry wrote.  Handed a second state, it hands its entry
     that state's pool and table rows: nothing of a call is kept.  A row that leaves a field of the form out, a cache
-    that is no pool of pages and a decline inside a step are errors.  The first use,
+    that is no pool of pages, a pool of pages of another size and a decline inside a step are errors.  The first use,
     while the run is planned: the entry's build, whose every typed decline is the installation's, then one call on
     scratch operands, whose decline is of the adapter's operands -- unless the installation cannot import what the
     call needs."""
@@ -9063,6 +9063,7 @@ def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypa
     assert tuple(calls[-1][1]["positions"].shape) == (3,) and calls[-1][1]["positions"].data_ptr() == state.table.positions[5].data_ptr()
     assert one_row.serving() == ("cudnn.AttentionPrepareDecode #3", (("POSITIONS", "1d"), ("SECTION", None), *row.form[2:])), "one position row: another form"
     # what is not a call of this row
+    launched = len(calls)
     plain = DecodeState(model.geometry.layer_kinds, 3, 130, model.state_shapes(), "cpu").layers[1]
     with pytest.raises(ValueError) as wrong:
         block(qkv, plain, 0, params)
@@ -9070,6 +9071,14 @@ def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypa
         "cudnn.AttentionPrepareDecode writes an attention cache that is a pool of pages of 64 positions; this block is handed KvCache: "
         "the session's state was built for another plan"
     )
+    halved = DecodeState(model.geometry.layer_kinds, 3, 130, model.state_shapes(), "cpu", page=32).layers[1]
+    with pytest.raises(ValueError) as wrong:
+        block(qkv, halved, 0, params)
+    assert str(wrong.value) == (
+        "cudnn.AttentionPrepareDecode writes an attention cache that is a pool of pages of 64 positions; this block is handed pages of 32 positions: "
+        "the session's state was built for another plan"
+    ), "a pool of pages of another size is not this adapter's either"
+    assert len(calls) == launched, "neither cache was handed to the entry"
     declined = "the attention preparation decode step serves at most 1024 rows (tokens) per call; got 1025"
     with monkeypatch.context() as patched:
         patched.setattr(type(entry), "__call__", lambda self, *operands: (_ for _ in ()).throw(NotImplementedError(declined)))
@@ -9085,6 +9094,7 @@ def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypa
     reference = torch_ref.AttentionPrepare(configs.PROVIDERS["attention.prepare"][1], model, block.facts, block.options)
     twin = block.twin(reference)
     assert type(twin) is torch_ref.AttentionPrepareRounded and block.twin(reference) is twin and twin.order == "3d" and reference.twin(reference) is reference
+    assert one_row.twin(reference).order == "1d" and one_row.twin(reference) is not twin, "the twin of a row of one position row rotates in that row's order"
 
     # the first use, while the run is planned: on a real device alone
     real = DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
@@ -9161,6 +9171,86 @@ def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypa
         "the provider table is wrong: the row of fe.attention_prepare_decode claims this run (1024 rows on compute capability 10.0), and "
         "cudnn.AttentionPrepareDecode declines it: this stand-in serves at most 1000 rows (tokens) per call; got 1024"
     )
+
+
+def test_a_decline_of_the_attention_preparations_entry_at_load_is_an_error_that_says_whose_it_is(monkeypatch):
+    """After the plan nothing skips.  At load the adapter of ``cudnn.AttentionPrepareDecode`` asks its entry for its
+    kernel once more and launches it once, on scratch operands of the run's row count.  A typed decline there -- of the
+    build or of that launch -- is a ``RuntimeError`` raised from the entry's own: never a return, never a SKIP.  Its
+    sentence says whose the decline is: the installation's where the adapter can name a requirement that is not met (a
+    CuTe DSL without the part's target, by cuDNN Frontend's public probe; on compute capability 10.7 a CuTe DSL whose
+    compiler is older than CUDA 13.4, which the entry's page asks for there), the operands this adapter built where it
+    can name none."""
+    from types import SimpleNamespace
+
+    import cudnn
+    import cudnn.frost
+    import cutlass.base_dsl.version_info as dsl_version
+
+    from model_samples.blocks import DeviceFacts
+    from model_samples.providers import fe
+    from model_samples.qwen_dense import QwenDense, configs
+
+    calls, declines = [], [""]
+    row, model = configs.PROVIDERS["attention.prepare"][0], QwenDense.reduced(2)
+
+    class OnTheCpu(fe.AttentionPrepareDecodeBlock):
+        first_use_devices = ("cpu",)
+
+    def planned(cc, sms):  # the block of a run on a real device of that class, behind its plan: the entry built, nothing declined
+        del calls[:]
+        declines[0] = ""
+        monkeypatch.setattr(cudnn, "AttentionPrepareDecode", _prepare_entry(calls, decline=declines), raising=False)
+        monkeypatch.setattr(fe, "_ENTRIES", {})
+        made = OnTheCpu(row, model, DeviceFacts(cc, "stated device", sms, 180 * GIB, 80 * GIB), {"device": "cpu", "check_kernels": True})
+        made.check_support(2, 1)
+        made.first_use(2, 1)
+        assert [kind for kind, *_ in calls] == ["prepare compile", "prepare launch"]
+        return made
+
+    needs = "the attention preparation decode step on compute capability 10.7 requires a CuTe DSL whose compiler is CUDA 13.4 or later"
+    pool = "the attention preparation decode step serves at most 1024 rows (tokens) per call; got 1025"
+    installation = "cudnn.AttentionPrepareDecode declines this installation at its first launch: "
+    operands = "cudnn.AttentionPrepareDecode declined the operands this adapter built for its first launch: "
+    for cc, sms, target, compiler, whose in (
+        ((10, 0), 148, True, (12, 9), operands),  # the part's target is there, and either flavour of the CuTe DSL serves this class
+        ((10, 0), 148, False, (13, 4), installation),  # a CuTe DSL without the part's target
+        ((10, 3), 152, True, (12, 9), operands),
+        ((10, 7), 212, True, (12, 9), installation),  # the entry's page: on this class a compiler of CUDA 13.4 or later
+        ((10, 7), 212, True, (13, 3), installation),
+        ((10, 7), 212, True, (13, 4), operands),
+        ((10, 7), 212, True, (14, 0), operands),
+    ):
+        monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None, target=target: target)
+        monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=compiler[0], minor=compiler[1]))
+        made = planned(cc, sms)
+        made.compile(2, 1)
+        assert [kind for kind, *_ in calls[2:]] == ["prepare compile", "prepare launch"], "a load nothing declines: the kernel found, one launch"
+        # the build declines at load
+        declines[0] = needs
+        del calls[:]
+        with pytest.raises(RuntimeError) as declined:
+            made.compile(2, 1)
+        assert str(declined.value) == whose + needs, f"compute capability {cc}, compiler {compiler}: the sentence says whose the decline of the build is"
+        assert type(declined.value.__cause__) is NotImplementedError and str(declined.value.__cause__) == needs, "raised from the entry's own decline"
+        assert [kind for kind, *_ in calls] == ["prepare compile"], "declined by the build: nothing was launched"
+        # the launch on the scratch operands declines at load
+        declines[0] = ""
+        with monkeypatch.context() as patched:
+            patched.setattr(type(made._build("cpu")), "__call__", lambda self, *handed: (_ for _ in ()).throw(NotImplementedError(pool)))
+            with pytest.raises(RuntimeError) as declined:
+                made.compile(2, 1)
+        assert str(declined.value) == whose + pool, f"compute capability {cc}, compiler {compiler}: the sentence says whose the decline of the launch is"
+        assert type(declined.value.__cause__) is NotImplementedError and str(declined.value.__cause__) == pool
+    # what is no typed decline of the entry is not reworded: an operand the entry refuses by type or value is the adapter's defect as it is raised
+    made = planned((10, 0), 148)
+    for raised in (TypeError, ValueError):
+        with monkeypatch.context() as patched:
+            patched.setattr(
+                type(made._build("cpu")), "__call__", lambda self, *handed, error=raised: (_ for _ in ()).throw(error("positions must be torch.int64"))
+            )
+            with pytest.raises(raised, match=r"^positions must be torch.int64$"):
+                made.compile(2, 1)
 
 
 @pytest.mark.parametrize("sequences, tokens, position", [(1, 1, 0), (1, 1, 63), (3, 1, 64), (2, 3, 62), (16, 5, 125), (1, 6, 0)])
