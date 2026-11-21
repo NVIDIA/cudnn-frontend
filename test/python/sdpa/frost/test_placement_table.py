@@ -789,19 +789,20 @@ def test_sm80_paged_d256_on_tile_floor_follows_v7():
 
 @pytest.mark.L0
 @pytest.mark.parametrize("off_tile", [0, 1], ids=["on_tile", "off_tile"])
-def test_sm80_d512_absorbed_decode_follows_its_study(off_tile):
-    """sm80_d512_decode_v2_pcie_20261121 (A100 80GB PCIe): d512 absorbed-MLA decode over one KV head. Dense MTP leads at every size
-    (KV 128-128k); paged MTP leads from cost 2^21.5 on the KV tile / 2^21.275 off it, and single-row decode from 2^25.006 / 2^25.296,
-    so short paged caches (KV 128-257, where the backend ran 0.72-0.80x of FROST) keep the backend."""
+def test_sm80_d512_decode_follows_its_study(off_tile):
+    """sm80_d512_decode_v3_pcie_20261121 (A100 80GB PCIe): d512 decode over 1-8 KV heads. Dense MTP leads at every size; paged MTP
+    leads from cost 2^22.792 on the KV tile / 2^22.86 off it, dense single-row decode from 2^25.002 / 2^25.296 and paged from
+    2^26.002 / 2^26.305. The cost grows with h_kv, so the review's b1 32/8 s_q 2 paged KV 256 / 257 (FROST +31 % / +16 %) keeps the
+    backend while KV 512 leads, and short one-head paged caches (KV 128-1024) keep it too."""
     row = "sdpa_fwd_prefill_sm80"
-    study = "sm80_d512_decode_v2_pcie_20261121"
+    study = "sm80_d512_decode_v3_pcie_20261121"
 
-    def f(b, h_q, s_q, s_kv, paged):
+    def f(b, h_q, h_kv, s_q, s_kv, paged):
         causal = s_q > 1
         return _facts(
             b=b,
             h_q=h_q,
-            h_kv=1,
+            h_kv=h_kv,
             s_q=s_q,
             s_kv=s_kv + off_tile,
             d_qk=512,
@@ -814,28 +815,37 @@ def test_sm80_d512_absorbed_decode_follows_its_study(off_tile):
             device_cc=(8, 0),
         )
 
-    mtp_floor, q1_floor = (21.275, 25.296) if off_tile else (21.5, 25.006)
+    mtp_floor, q1_dense_floor, q1_paged_floor = (22.86, 25.296, 26.305) if off_tile else (22.792, 25.002, 26.002)
     cases = (
-        # (graph, expected lead): both sides of each class's boundary, plus the review's short paged controls
-        (f(1, 64, 4, 512, False), True),
-        (f(1, 64, 4, 128, False), True),
-        (f(1, 16, 2, 128, True), False),
-        (f(1, 16, 2, 256, True), False),
-        (f(1, 16, 2, 512, True), False),
-        (f(1, 16, 2, 1024, True), True),
-        (f(1, 64, 2, 131072, True), True),
-        (f(4, 64, 1, 128, True), False),
-        (f(1, 64, 1, 4096, True), False),
-        (f(1, 128, 1, 4096, True), True),
-        (f(1, 16, 1, 4096, False), False),
-        (f(1, 128, 1, 8192, False), True),
+        # (graph, expected lead): both sides of each class's boundary, the review's short paged controls, gemma4 global decode
+        (f(1, 64, 1, 4, 512, False), True),
+        (f(1, 32, 8, 4, 128, False), True),
+        (f(1, 16, 1, 2, 128, True), False),
+        (f(1, 16, 1, 2, 1024, True), False),
+        (f(1, 16, 1, 2, 2048, True), True),
+        (f(1, 64, 1, 2, 131072, True), True),
+        (f(1, 32, 8, 2, 256, True), False),
+        (f(1, 32, 8, 2, 512, True), True),
+        (f(4, 64, 1, 1, 128, True), False),
+        (f(1, 128, 1, 1, 4096, True), False),
+        (f(1, 128, 1, 1, 8192, True), True),
+        (f(1, 32, 4, 1, 1024, True), False),
+        (f(1, 32, 4, 1, 131072, True), True),
+        (f(1, 16, 2, 1, 131072, True), True),
+        (f(1, 16, 1, 1, 4096, False), False),
+        (f(1, 64, 1, 1, 4096, False), False),
+        (f(1, 128, 1, 1, 4096, False), True),
+        (f(1, 32, 4, 1, 1024, False), False),
+        (f(1, 32, 4, 1, 131072, False), True),
     )
     for facts, lead in cases:
         assert pt.class_key(row, facts)[-1] == bool(off_tile), facts
         assert pt.matched_entry(row, facts).study == study, facts
-        assert pt.lookup(row, facts) is lead, (facts.b, facts.h_q, facts.s_q, facts.s_kv, facts.has_paged_kv)
-    assert pt.FEATURES["cost"](f(1, 16, 2, 512, True)) < mtp_floor < pt.FEATURES["cost"](f(1, 16, 2, 1024, True))
-    assert pt.FEATURES["cost"](f(1, 64, 1, 4096, True)) < q1_floor < pt.FEATURES["cost"](f(1, 128, 1, 4096, True))
+        assert pt.lookup(row, facts) is lead, (facts.b, facts.h_q, facts.h_kv, facts.s_q, facts.s_kv, facts.has_paged_kv)
+    assert pt.FEATURES["cost"](f(1, 32, 8, 2, 256, True)) < mtp_floor < pt.FEATURES["cost"](f(1, 32, 8, 2, 512, True))
+    assert pt.FEATURES["cost"](f(1, 16, 1, 2, 1024, True)) < mtp_floor < pt.FEATURES["cost"](f(1, 16, 1, 2, 2048, True))
+    assert pt.FEATURES["cost"](f(1, 64, 1, 1, 4096, False)) < q1_dense_floor < pt.FEATURES["cost"](f(1, 128, 1, 1, 4096, False))
+    assert pt.FEATURES["cost"](f(1, 128, 1, 1, 4096, True)) < q1_paged_floor < pt.FEATURES["cost"](f(1, 128, 1, 1, 8192, True))
 
 
 @pytest.mark.L0
