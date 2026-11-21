@@ -4186,7 +4186,16 @@ def test_a_launch_shape_recorded_at_a_fact_of_the_run_is_held_for_a_run_that_sta
     assert f"no recorded launch shape of mlp.down for this run: max_model_len 58 (recorded {recorded})" in unnamed.reasons
     plan, _, _ = _target_plan(2)  # a plan that was resolved without a session states none
     unstated = target.claim(plan, model, installed=RECORDED)
-    assert not any(index in unstated.recorded or index in unstated.classes for index in calls) and any("for this run" in reason for reason in unstated.reasons)
+    assert not any(index in unstated.recorded or index in unstated.classes for index in calls)
+    assert f"no recorded launch shape of mlp.down for this run: max_model_len not stated (recorded {recorded})" in unstated.reasons
+    # an entry recorded with a width this model does not share AND with the fact: both reasons are said, each in its own words
+    doubled = copy.deepcopy(family.data)
+    (head,) = [facts for block, _, facts in doubled["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["after_step"] if block == "output_head"]
+    head["run"] = {"max_model_len": recorded}
+    reasons = claimed(census.Target(doubled), max_model_len=recorded + 1).reasons
+    widths = [reason for reason in other.reasons if reason.startswith("no recorded launch shape of output_head for this model: ")]
+    assert len(widths) == 1 and widths[0] in reasons, "the reason of the model's widths, as it was"
+    assert f"no recorded launch shape of output_head for this run: max_model_len {recorded + 1} (recorded {recorded})" in reasons
 
     def refused(change, where="layer"):
         wrong = _small_census(claimed=False)
