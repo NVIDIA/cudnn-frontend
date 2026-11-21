@@ -675,7 +675,7 @@ def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, blo
     if hkv == 1 and dsl_cuda_major() < 13:
         # the one-KV-head key-major kernel crashes the CUDA 12 DSL compiler
         raise NotImplementedError(
-            "QSA backward with one KV head requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.7.0' with a CUDA 13 compatible driver"
+            "QSA backward with one KV head requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.8.0' with a CUDA 13 compatible driver"
         )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     ids, counts = _metadata.compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)

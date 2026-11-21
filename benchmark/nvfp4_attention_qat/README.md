@@ -1,7 +1,7 @@
 # NVFP4 QAT backward backend comparison
 
 Run from an installed FE checkout with CUDA-enabled PyTorch, Triton >=3.7
-and CuTe DSL >=4.7.0 on SM100:
+and CuTe DSL >=4.8.0 on SM100:
 
 ```bash
 python benchmark/nvfp4_attention_qat/benchmark_backends.py --output results.json

@@ -799,8 +799,8 @@ def test_declines_a_dsl_below_the_floor_by_version(monkeypatch):
     assert entry._dsl_version_error() is None
     installed((False, None))
     assert "not installed" in entry._dsl_version_error()
-    assert entry.DSL_FLOOR > buffers.CUTEDSL_MIN_VERSION, "the kernel's floor is above the library's: one call covers both"
-    assert buffers.cutedsl_too_old(("nvidia-cutlass-dsl", "4.7.9"), floor=entry.DSL_FLOOR) and not buffers.cutedsl_too_old(("nvidia-cutlass-dsl", "4.7.9"))
+    assert entry.DSL_FLOOR >= buffers.CUTEDSL_MIN_VERSION, "the kernel's floor is not below the library's: one call covers both"
+    assert buffers.cutedsl_too_old(("nvidia-cutlass-dsl", "4.7.9"), floor=entry.DSL_FLOOR)
 
 
 def test_compile_key_is_plan_time_only():

@@ -258,7 +258,7 @@ def test_old_dsl_declines_before_kernel_load(monkeypatch):
 
     plan = cudnn.TailRoPEForward(*inputs((1, 128)))
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
-    with pytest.raises(RuntimeError, match="4.7.0"):
+    with pytest.raises(RuntimeError, match="4.8.0"):
         plan.check_support()
 
 

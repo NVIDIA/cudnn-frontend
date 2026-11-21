@@ -36,7 +36,7 @@ except ModuleNotFoundError as e:
 from cudnn.frost.tile_dsl.requirements import requirement_error, tma_gather4_requirement_error
 out["version_msg"] = tma_gather4_requirement_error()
 out["generic_msg"] = requirement_error("tile_dsl.mask.apply_membership_words")
-buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.7.0"))  # at the floor: the arch half decides
+buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.8.0"))  # at the floor: the arch half decides
 buffers._cutedsl_has_sm107 = lambda: False
 out["arch_msg"] = tma_gather4_requirement_error((10, 7))
 out["served_msg"] = tma_gather4_requirement_error((10, 0))
@@ -58,12 +58,12 @@ def _run_below_floor_probe(timeout_s=300):
 def test_host_gate_is_importable_and_names_the_floor_below_the_dsl_floor():
     """Fresh process, ``cutlass.experimental`` blocked, version state 4.6.2: importing the gate through ``tile_dsl.tma`` dies
     with ``ModuleNotFoundError`` (the condition reproduced), while ``tile_dsl.requirements`` imports and returns the message
-    naming 4.6.2 and the 4.7.0 floor, the arch half names ``sm_107a`` on a cc 10.7 part and is silent on a served part, a
+    naming 4.6.2 and the floor, the arch half names ``sm_107a`` on a cc 10.7 part and is silent on a served part, a
     pre-Blackwell part is refused by its cc, and nothing of the DSL was imported along the way."""
     out = _run_below_floor_probe()
     assert out["tma_import"].startswith("ModuleNotFoundError"), f"the probe must reproduce the below-floor import failure: {out['tma_import']}"
     msg = out["version_msg"]
-    assert msg is not None and "4.6.2" in msg and "4.7.0" in msg and "tma_gather4" in msg, msg
+    assert msg is not None and "4.6.2" in msg and "4.8.0" in msg and "tma_gather4" in msg, msg
     assert out["generic_msg"] is not None and "4.6.2" in out["generic_msg"] and "apply_membership_words" in out["generic_msg"], out["generic_msg"]
     assert out["arch_msg"] is not None and "sm_107a" in out["arch_msg"], out["arch_msg"]
     assert out["served_msg"] is None, out["served_msg"]

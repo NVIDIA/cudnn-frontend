@@ -109,7 +109,7 @@ def test_tma_gather4_declines_a_dsl_below_the_floor_by_name(monkeypatch):
     assert tma_gather4_requirement_error() is None, "the installed DSL satisfies the floor (requires_dsl)"
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
     msg = tma_gather4_requirement_error()
-    assert msg is not None and "4.6.2" in msg and "4.7.0" in msg and "tma_gather4" in msg, msg
+    assert msg is not None and "4.6.2" in msg and "4.8.0" in msg and "tma_gather4" in msg, msg
     with pytest.raises(RuntimeError, match=re.escape("found 4.6.2")):
         tma_gather4(None, None, None, 0, 0, 0, 0, 0)  # the gate fires before any operand is touched
 

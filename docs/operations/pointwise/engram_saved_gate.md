@@ -1,7 +1,7 @@
 # Engram saved-state gate
 
 Experimental SM100 forward and backward APIs for the four-stream Engram gate.
-The backend name is `frost`. CUDA-enabled PyTorch, CuTe DSL >=4.7.0 and, for
+The backend name is `frost`. CUDA-enabled PyTorch, CuTe DSL >=4.8.0 and, for
 backward, the existing `triton` extra (>=3.7.0) are required.
 
 ```bash

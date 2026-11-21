@@ -24,7 +24,7 @@ def _require_native_route() -> None:
         pytest.skip(f"CuTe DSL dependencies unavailable: {error}")
     installed, version = cutedsl_state()
     if not installed or cutedsl_too_old(version):
-        pytest.skip("causal_conv1d state requires nvidia-cutlass-dsl>=4.7.0")
+        pytest.skip("causal_conv1d state requires nvidia-cutlass-dsl>=4.8.0")
     capability = torch.cuda.get_device_capability()
     if not is_functional_arch(capability):
         pytest.skip(f"unsupported compute capability {capability}")

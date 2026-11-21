@@ -86,10 +86,10 @@ def test_default_engines_enabled_follows_the_manifest(monkeypatch):
     """The default admission follows the manifest, not the raw flag: the cc 10.7 and SM120 rows and the SM100 MXFP8 owners
     (default since 2026-11-16, behind the backend) are offered with the flag deleted, and the flag changes nothing.  A CuTe DSL at
     the FROST floor and the sm_107a target are modelled as present (test/AGENTS.md: SM107 metadata tests run on every
-    lane; the public 4.7.0 wheel lacks the target)."""
+    lane; a DSL at the floor can lack the target)."""
     from cudnn.frost import buffers
 
-    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.0")))
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     assert _draw(32, sm=107, engines_enabled=None) == 32

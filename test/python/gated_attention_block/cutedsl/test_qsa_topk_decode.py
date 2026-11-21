@@ -806,8 +806,8 @@ def test_the_facade_declines_a_too_old_dsl_by_version_without_importing_the_kern
     proc = subprocess.run([sys.executable, "-c", _FACADE_PROBE], capture_output=True, text=True, timeout=600)
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
     out = proc.stdout
-    assert "DECLINE qsa_topk_decode requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in out, out
-    assert "DECLINE_MODULE qsa_topk_decode requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2" in out, out
+    assert "DECLINE qsa_topk_decode requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2" in out, out
+    assert "DECLINE_MODULE qsa_topk_decode requires nvidia-cutlass-dsl >= 4.8.0; found 4.6.2" in out, out
     assert "ModuleNotFoundError" not in out + proc.stderr, out + proc.stderr
     assert "KERNEL_IMPORTED False" in out and "TILE_DSL_IMPORTED False" in out, out
 

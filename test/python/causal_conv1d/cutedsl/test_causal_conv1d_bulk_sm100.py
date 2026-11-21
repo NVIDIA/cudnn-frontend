@@ -51,7 +51,7 @@ def _load_wrapper():
         pytest.skip(f"CuTe DSL dependencies unavailable: {error}")
     installed, version = cutedsl_state()
     if not installed or cutedsl_too_old(version):
-        pytest.skip("causal_conv1d_bulk_sm100 requires nvidia-cutlass-dsl>=4.7.0")
+        pytest.skip("causal_conv1d_bulk_sm100 requires nvidia-cutlass-dsl>=4.8.0")
     return causal_conv1d_bulk_fwd_wrapper_sm100
 
 
@@ -63,7 +63,7 @@ def _load_class():
         pytest.skip(f"CuTe DSL dependencies unavailable: {error}")
     installed, version = cutedsl_state()
     if not installed or cutedsl_too_old(version):
-        pytest.skip("causal_conv1d_bulk_sm100 requires nvidia-cutlass-dsl>=4.7.0")
+        pytest.skip("causal_conv1d_bulk_sm100 requires nvidia-cutlass-dsl>=4.8.0")
     return CausalConv1dBulkFwdSm100
 
 

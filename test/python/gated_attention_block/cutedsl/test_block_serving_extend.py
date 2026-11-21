@@ -443,7 +443,7 @@ def test_the_stage_declines_a_dsl_below_the_floor_by_version(monkeypatch):
 
     blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16)
     monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.6.2")))
-    with pytest.raises(NotImplementedError, match=r"paged KV-cache write-through requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
+    with pytest.raises(NotImplementedError, match=r"paged KV-cache write-through requires nvidia-cutlass-dsl >= 4\.8\.0; found 4\.6\.2"):
         blk._cache_write.check_support()
     monkeypatch.undo()
     blk._cache_write.check_support()  # at or above the floor the same stage accepts

@@ -6,7 +6,7 @@ using prepared FP32 tables. It does not measure table preparation, projection,
 attention, backward, or model throughput.
 
 Install this checkout and FlashInfer in an environment with PyTorch, CuTe DSL
-4.7.0 or newer, a CUDA compiler and an NVIDIA B200. Confirm that
+4.8.0 or newer, a CUDA compiler and an NVIDIA B200. Confirm that
 `cudnn.__file__` points at this checkout, especially with editable installations.
 Supply `model.py` and `config.json` from the `inference` directory of
 [DeepSeek-V4.1-Flash revision dba1be0](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/tree/dba1be0a40aa45a94ad051997016db3960a90277/inference).

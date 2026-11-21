@@ -130,7 +130,7 @@ assert auto.fuse_prepare is True and auto.fuse_prepare_requested is None and aut
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="the gated attention block requires torch")
 def test_indexer_decode_declaration_declines_old_dsl_at_check_support_not_at_construction():
-    """The same declaration on the package's supported DSL floor (4.6.2, simulated through the buffers hook as the NVFP4 cell does): it
+    """The same declaration on a DSL below the floor (4.6.2, simulated through the buffers hook as the NVFP4 cell does): it
     CONSTRUCTS under the prepare fusion, and the fused prepare stage and the indexer stage each decline at ``check_support`` with the
     typed version error naming the floor and the installed version -- never a ``ModuleNotFoundError`` from inside the DSL at construction
     (Rule 7), and the kernel module stays unimported through both declines."""
@@ -161,7 +161,7 @@ for kw in (dict(fuse_prepare=True), dict()):
         try:
             stage.check_support()
         except NotImplementedError as error:
-            assert "4.7.0" in str(error) and "4.6.2" in str(error), (stage.name, str(error))
+            assert "4.8.0" in str(error) and "4.6.2" in str(error), (stage.name, str(error))
         else:
             raise AssertionError(f"{stage.name} accepted the unsupported DSL 4.6.2")
 assert "cudnn.gated_attention_block.kernels.qsa_prepare" not in sys.modules
@@ -459,7 +459,7 @@ assert getattr(cudnn.ops, symbol) is export
 
 
 def test_nvfp4_conversion_declines_old_dsl_before_kernel_import():
-    """The supported package floor must produce an operation-specific decline."""
+    """A DSL below the floor must produce an operation-specific decline."""
     probe = """
 import importlib
 import sys
@@ -468,7 +468,7 @@ buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.6.2"))
 try:
     importlib.import_module("cudnn.ops.nvfp4")
 except ImportError as exc:
-    assert "4.7.0" in str(exc) and "4.6.2" in str(exc), str(exc)
+    assert "4.8.0" in str(exc) and "4.6.2" in str(exc), str(exc)
 else:
     raise AssertionError("NVFP4 conversion accepted unsupported DSL 4.6.2")
 assert "cudnn.ops._nvfp4_block_scale_kernels" not in sys.modules

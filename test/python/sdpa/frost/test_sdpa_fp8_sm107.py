@@ -159,13 +159,13 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
         monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
 
 
-@pytest.mark.parametrize("dsl_version", ["4.7.0", "0.3.0+internal"])
+@pytest.mark.parametrize("dsl_version", ["4.8.0rc1", "0.3.0+internal"])
 def test_sm107_missing_dsl_target_declines_before_compile(monkeypatch, dsl_version):
     import torch
     from cudnn.frost import buffers
     from cudnn.sdpa.fwd import engines
 
-    dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
+    dist = "nvidia-cutlass-dsl" if dsl_version == "4.8.0rc1" else "nvidia-cutlass-dsl-internal"
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, (dist, dsl_version)))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)

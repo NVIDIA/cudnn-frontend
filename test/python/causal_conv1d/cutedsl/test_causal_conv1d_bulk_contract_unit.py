@@ -123,7 +123,7 @@ def test_support_rejects_the_package_wide_4_5_dsl_floor(monkeypatch):
     api = api_class(x, weight, output)
     monkeypatch.setattr(api_module, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.5.0")))
 
-    with pytest.raises(RuntimeError, match=r"nvidia-cutlass-dsl>=4\.7\.0; found 4\.5\.0"):
+    with pytest.raises(RuntimeError, match=r"nvidia-cutlass-dsl>=4\.8\.0; found 4\.5\.0"):
         api.check_support()
 
 
