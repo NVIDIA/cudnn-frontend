@@ -1853,6 +1853,33 @@ def test_a_speculative_request_no_count_fits_for_is_one_error_line_that_names_no
     assert {(session.capacity, session.max_model_len) for session in built} == {(full + 1, full + 1)}
 
 
+def test_the_rows_the_speculative_limit_holds_are_one_fewer_than_the_tokens_the_configuration_drafts(tmp_path, monkeypatch, capsys):
+    """The rows the limit of new tokens is held with are the ones the last verify step writes behind the last new
+    token: one fewer than the tokens ``--speculative-config`` drafts.  A step that drafts one token writes none, and
+    the line of a limit that does not fit names none; a step that drafts two writes one, and the line names it.  At
+    either count the count the line names reaches the load with sessions that hold exactly the context length, one
+    more does not, and one more drafted token leaves one new token fewer."""
+    sample, built = _speculative_script_and_its_sessions(monkeypatch)
+    request = [*_a_request_of_a_drafting_checkpoint(tmp_path), "--max-model-len", "100"]
+    fits = {}
+    for drafted in (1, 2):
+        config = json.dumps({"method": "mtp", "num_speculative_tokens": drafted, "use_local_argmax_reduction": True})
+        arguments = [*request, "--speculative-config", config]
+        capsys.readouterr()
+        assert sample.main([*arguments, "--max-tokens", "200"]) == 1
+        last = capsys.readouterr().err.splitlines()[-1]
+        rows = re.findall(r"verify step writes behind the last new token \((\d+)\)", last)
+        assert last.startswith("[02] ERROR ") and rows == [str(drafted - 1)][: drafted - 1], last  # a run that writes no row names none
+        (most,) = re.findall(r"ask for at most (\d+) new tokens", last)
+        built.clear()
+        with pytest.raises(AssertionError, match="reached a load"):
+            sample.main([*arguments, "--max-tokens", most])
+        assert len(built) == 2 and {(session.capacity, session.max_model_len) for session in built} == {(100, 100)}, drafted
+        assert sample.main([*arguments, "--max-tokens", str(int(most) + 1)]) == 1
+        fits[drafted] = int(most)
+    assert fits[1] - fits[2] == 1, fits
+
+
 def test_the_family_readme_says_of_a_request_what_the_data_and_the_run_say():
     """The section "Coming from a serving engine": the table of fields that would change the output is the data, row for
     row; every other field the sample answers is named; the lines the README quotes are the lines a run prints; and the
