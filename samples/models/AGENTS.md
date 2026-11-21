@@ -516,3 +516,27 @@ key and the value row of every row of a step into a pool of pages.
 - The first use builds the entry before it allocates anything, and its scratch pool is one page.
 - A pool is whole pages: a row that changes the layout of a state moves the memory sentence, and a row a stack gains
   moves every table that follows the plan (the per-kernel table of the performance mode).
+
+## What counting the checks into the memory sentence taught
+
+The memory sentence counts what the checks of a run hold for every sequence beyond the first (`check_row_bytes` of the
+family's model, `Session.plan_table`, the pool's share `loop.CHECK_POOL`); the list of hashed files is closed under one
+rule (`fe.SOURCE_FILES`); an override by key takes the row of the run's stack where that row names the same call.
+
+- Count what is alive at the largest moment of the checks, term by term, and name the moment. Say of every term what
+  holds it: a host test finds the records, the states and the saves among the live objects at the judge; what is alive
+  inside one call is held on a GPU alone, by PyTorch's peak against the count.
+- An allowance taken from runs holds what those runs held: the working memory was measured at one sequence, checks
+  included, so the count is added for the sequences beyond the first and no sentence of one sequence moves.
+- Arithmetic on tensors says nothing about an allocator's pool. Find the pool's share by capping the pool at two
+  sequence counts where the cap binds: the smallest share with which both pass, as one named constant with its runs in
+  the family README, never a factor read off one run. The share is in the need, not in the part the sentence names.
+- A count has a reach: its docstring and the family README say where it ends and name what is not counted. Name a
+  part of the sentence whenever it is not zero bytes, also where it prints as 0.00 GiB.
+- A key is by stack only between rows that name the same call: the selection compares every field but the stacks and
+  the reason.
+- A hash names what ran only if an edit of what ran moves it: the list is closed to its fixed point, the `__init__.py`
+  of every package on the way included, and a host test forms the fixed point again from the files. A module imported
+  inside a function is outside the rule.
+- When a figure moves, read every passage that states it, in every text, and reword the dated ones as sentences of
+  their day.

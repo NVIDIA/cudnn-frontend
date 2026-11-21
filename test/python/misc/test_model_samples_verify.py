@@ -1290,7 +1290,9 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert f"a verify plan of `fe-entries` with such a row counts what the decode plan counts on compute capability 10.0 -- {counted} --" in section
     assert "A plan of `native` counts FlashInfer 3 beside them at either step shape, and one fallback multiply fewer per library row." in section
     assert "makes the verify plan cuDNN Frontend 6 where the decode plan is cuDNN Frontend 5, with the same fallbacks" in section
-    assert "Beyond 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step --" in " ".join(family.split())
+    assert "was short from about 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step --" in " ".join(
+        family.split()
+    )
     decline = "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
     assert decline in section, "the decline the README quotes is the plan's own sentence"
     assert "## What the verify step taught" in guide and "fe.gdn_verify_fused" in guide
@@ -3869,12 +3871,13 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     guide_text = (MODELS / "AGENTS.md").read_text(encoding="utf-8")
     guide = " ".join(guide_text.split())
     sections = [section.split("\n", 1)[0] for section in guide_text.rstrip().split("\n## ")[1:]]
-    assert sections[-4:] == [
+    assert sections[-5:] == [
         "What the speculative step taught",
         "What building the speculative script taught",
         "What the rows a library serves taught",
         "What the attention preparation's row taught",
-    ], "the section, and the script's behind it; the last four sections of the guide, in the order they were built"
+        "What counting the checks into the memory sentence taught",
+    ], "the section, and the script's behind it; the last five sections of the guide, in the order they were built"
     speculative = guide_text.split("\n## What the speculative step taught\n", 1)[1].split("\n## ", 1)[0]
     assert "(`Session._weights_owner`)" in speculative, "the lesson of the drafter's load stands in the speculative step's section, where it was appended"
     lessons = (
