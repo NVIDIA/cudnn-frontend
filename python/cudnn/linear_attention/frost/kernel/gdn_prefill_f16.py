@@ -55,6 +55,7 @@ three stages for the MMA warp's two-chunk compute-group-0 lookahead):
   A tile output                    8192       3     <-- 2 with io or fp32 rows at d_v 128 and with fp32 rows
   O store                         16384       1
   checkpoint staging  DK*DV*1, *2 or *4       1    <-- enable_checkpoints only
+  state scratch (per cg1 warp)     2048       1    <-- STATE_IO_COALESCED builds only, which run the A ring at 2 stages
   cumsumlog / cumprod / Beta        256       3
   scheduler ticket ring               4       2    <-- next-tile publish ring
 
@@ -139,7 +140,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     softplus2,
     sub_f16x2,
 )
-from cudnn.frost.tile_dsl.swizzle import swizzle_xor, swizzle_xor_128b
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor, swizzle_xor_64b, swizzle_xor_128b
 from cudnn.frost.tile_dsl.tma import (
     tma_load_tile,
     tma_store_tile,
@@ -151,6 +152,21 @@ from .gdn_prefill_config import CFG
 
 USE_PDL = True
 TINV_SOURCES = ("compute", "gmem")
+# Coalesced state I/O.  A tensor-memory lane is a state row, so every 16-byte global load / store of the row-per-lane
+# path touches 32 state rows.  With the switch on, lane j of a compute-group-1 warp moves 16-byte piece j % 4 of row
+# 8 g + j // 4 (8 rows x 64 B per instruction) and a per-warp shared-memory scratch transposes between that order and the
+# row-per-lane order of tcgen05.ld / tcgen05.st.  The words and their bytes do not change.  build_cfg admits it for fp32
+# states at d_v 128 with the chunk factor built in the kernel; the scratch takes the A ring's third stage.
+STATE_IO_COALESCED = False
+STATE_XFER_ROWS = 32  # rows of one warp's scratch region = the lanes of a warp
+STATE_XFER_ROW_WORDS = 16  # fp32 words per scratch row (64 B: half of a 32-column tcgen05.ld / tcgen05.st round)
+# Early hand-over between work items (acts only where STATE_IO_COALESCED acts and a state table seeds the items).  Compute
+# group 1 takes the next ticket before the item's final-state store, loads the next work item, its seed index and its
+# final-state destination there and issues the next seed's global loads, so the seed arrives under the final-state store
+# and enters tensor memory behind it; the next item starts without a global load.  The next seed is therefore read before
+# this item's final state is written: when both are the same block (same head, same state row) the early read is not
+# taken and the next item loads its seed at its own start, behind the store.
+TILE_HANDOVER_EARLY = False
 
 
 class GdnPrefillBars(NamedTuple):
@@ -1888,6 +1904,41 @@ def compute0_warp_group(
 
 
 @cute.jit
+def coalesced_state_loads(gState, gmem_row, row_step, gmem_col, v_offset, num_rounds: int, round_words: int):
+    """The global loads of one fp32 state in the coalesced order: per instruction ``g`` every lane reads 16 bytes of row
+    ``gmem_row + g * row_step`` at word ``gmem_col`` of the half round.  Returns ``pieces[round][half][g]``."""
+    pieces_per_row = STATE_XFER_ROW_WORDS // 4
+    rows = [(gState.iterator + gState.layout((gmem_row + row_step * g + v_offset, 0))).raw_ptr() for g in range(pieces_per_row)]
+    return [
+        [
+            [(rows[g] + (i * round_words + half * STATE_XFER_ROW_WORDS) + gmem_col).load(count=4, alignment=16) for g in range(pieces_per_row)]
+            for half in range(round_words // STATE_XFER_ROW_WORDS)
+        ]
+        for i in range(num_rounds)
+    ]
+
+
+@cute.jit
+def coalesced_state_to_tmem(pieces, xfer_base, xfer_co_off, xfer_row_off, tmem_state_addr, num_rounds: int, round_words: int):
+    """Through the warp's scratch into the row-per-lane order, then one tcgen05.st per round of ``round_words`` columns."""
+    pieces_per_row = STATE_XFER_ROW_WORDS // 4
+    for i in cutlass.range_constexpr(num_rounds):
+        words = []
+        for half in cutlass.range_constexpr(round_words // STATE_XFER_ROW_WORDS):
+            for g in cutlass.range_constexpr(pieces_per_row):
+                (xfer_base + xfer_co_off[g]).store(pieces[i][half][g], alignment=16)
+            for piece in cutlass.range_constexpr(pieces_per_row):
+                row_piece = (xfer_base + xfer_row_off[piece]).load(count=4, alignment=16)
+                for t in cutlass.range_constexpr(4):
+                    words.append(row_piece[t])
+        nvvm.tcgen05_st(
+            "32x32b",
+            nvvm.make_tmem_ptr(tmem_state_addr + i * round_words, cutlass.Float32),
+            cutlass.Vector.from_elements(tuple(words), cutlass.Float32),
+        )
+
+
+@cute.jit
 def compute1_warp_group(
     cfg,
     total_tiles,
@@ -1905,6 +1956,7 @@ def compute1_warp_group(
     sCumsumToken,
     sO,
     sCheckpoint_raw,
+    sStateXfer_raw,
     mState_init,
     mComposed,
     mState_out,
@@ -1961,6 +2013,22 @@ def compute1_warp_group(
     sV_base = sV_trans[0].base
     sO_base = sO[0].base
     num_vals = 32
+    if cutlass.const_expr(cfg.state_io_coalesced):
+        # The warp's scratch region: STATE_XFER_ROWS rows of 64 B under the 64-byte XOR swizzle.  No descriptor reads it; the
+        # swizzle spreads the banks for both access orders (a row per lane, and 8 rows x 4 pieces per instruction).
+        xfer_rows = STATE_XFER_ROWS // 4
+        xfer_pieces = STATE_XFER_ROW_WORDS // 4
+        xfer_halves = ldtm_width // STATE_XFER_ROW_WORDS
+        xfer_base = sStateXfer_raw.data_ptr() + (cg1_tidx // cfg.threads_per_warp) * (STATE_XFER_ROWS * STATE_XFER_ROW_WORDS)
+        xfer_gmem_row = (cg1_tidx // cfg.threads_per_warp) * cfg.threads_per_warp + lane_idx // xfer_pieces
+        xfer_gmem_col = (lane_idx % xfer_pieces) * 4
+        xfer_co_off = []
+        for g in cutlass.range_constexpr(xfer_pieces):
+            co_row = cutlass.Int32(g * xfer_rows) + lane_idx // xfer_pieces
+            xfer_co_off.append(co_row * STATE_XFER_ROW_WORDS + swizzle_xor_64b(co_row, xfer_gmem_col, elem_bytes=4))
+        xfer_row_off = []
+        for piece in cutlass.range_constexpr(xfer_pieces):
+            xfer_row_off.append(lane_idx * STATE_XFER_ROW_WORDS + swizzle_xor_64b(lane_idx, cutlass.Int32(piece * 4), elem_bytes=4))
 
     nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
@@ -1983,53 +2051,91 @@ def compute1_warp_group(
         cg1_tidx % 8 + (cg1_tidx // 16 % 2) * 8
         (cg1_tidx // 8 % 2) * 8 + (cg1_tidx // 32 % 2) * 32
 
+    early_handover = False
+    if cutlass.const_expr(cfg.tile_handover_early):
+        early_handover = mState_init.element_type == cutlass.Float32
     scheduler_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
+    if cutlass.const_expr(early_handover):
+        # The work item, its seed index and its final-state destination are carried one item ahead: loaded here for the
+        # block's first item and at each item's end for the next.  A block that owns no first item reads no table row:
+        # the row at its index was not written by this launch.
+        ahead = (cutlass.Int32(0),) * 10
+        ahead_seed_row = cutlass.Int32(0)
+        if cutlass.const_expr(cfg.store_final_state):
+            ahead_final_dst = cutlass.Int32(-1)
+        if tile_idx < total_tiles:
+            ahead = decode_work_item(cfg, tile_idx, mWorkItems)
+            ahead_seed_row = ahead[0]
+            if cutlass.const_expr(mSeedIndices is not None):
+                ahead_seed_row = cutlass.Int32(mSeedIndices[ahead[0]])
+            if cutlass.const_expr(cfg.store_final_state):
+                ahead_final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
+        seed_in_tmem = cutlass.Int32(0)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        if cutlass.const_expr(early_handover):
+            batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = ahead
+        else:
+            batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
+                cfg, tile_idx, mWorkItems
+            )
         head_o, v_offset = decode_head(cfg, head_idx)
         seed_row = batch_idx
         if cutlass.const_expr(mSeedIndices is not None):
-            seed_row = cutlass.Int32(mSeedIndices[batch_idx])
+            if cutlass.const_expr(early_handover):
+                seed_row = ahead_seed_row
+            else:
+                seed_row = cutlass.Int32(mSeedIndices[batch_idx])
         n_local = write_end - compute_start
         if cutlass.const_expr(cfg.enable_checkpoints):
             checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
             checkpoint_mod = compute_start % checkpoint_chunks
         if n_local > 0:
             if cutlass.const_expr(cfg.use_initial_state):
-                if cutlass.const_expr(cfg.state_table):
+                if cutlass.const_expr(cfg.state_table and not early_handover):
                     gState_init = mState_init[None, None, head_o, seed_row]
                 seed_state = compute_start == 0
                 if seed_state:
-                    if cutlass.const_expr(cfg.state_table):
+                    if cutlass.const_expr(cfg.state_table and not early_handover):
                         seed_vw = 16 // (mState_init.element_type.width // 8)
                         seed_src = (gState_init.iterator + gState_init.layout((state_gmem_row + v_offset, 0))).raw_ptr()
                     if cutlass.const_expr(cfg.has_composed):
                         is_boundary = batch_idx == cutlass.Int32(0)
                         gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
                         composed_src = (gComposed.iterator + gComposed.layout((state_gmem_row + v_offset, 0))).raw_ptr()
-                    for i in cutlass.range_constexpr(num_ldtms):
-                        words = []
-                        if cutlass.const_expr(cfg.state_table):
-                            for g in cutlass.range_constexpr(ldtm_width // seed_vw):
-                                seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
-                                for t in cutlass.range_constexpr(seed_vw):
-                                    words.append(seed_chunk[t].to(cfg.acc_dtype))
-                        else:
-                            for _ in cutlass.range_constexpr(ldtm_width):
-                                words.append(cutlass.Float32(0.0))
-                        if cutlass.const_expr(cfg.has_composed):
-                            for g in cutlass.range_constexpr(ldtm_width // 4):
-                                composed_chunk = (composed_src + i * ldtm_width + g * 4).load(count=4, alignment=16)
-                                for t in cutlass.range_constexpr(4):
-                                    words[g * 4 + t] = composed_chunk[t] if is_boundary else words[g * 4 + t]
-                        nvvm.tcgen05_st(
-                            "32x32b",
-                            nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
-                            cutlass.Vector.from_elements(tuple(words), cutlass.Float32),
-                        )
+                    if cutlass.const_expr(early_handover):
+                        # Only an item whose seed did not come in at the previous item's end (the block's first item, and the
+                        # items the early path leaves alone) loads it here.
+                        if seed_in_tmem == 0:
+                            seed_pieces = coalesced_state_loads(
+                                mState_init[None, None, head_o, seed_row], xfer_gmem_row, xfer_rows, xfer_gmem_col, v_offset, num_ldtms, ldtm_width
+                            )
+                            coalesced_state_to_tmem(seed_pieces, xfer_base, xfer_co_off, xfer_row_off, row_lo_addr + tmem_state_col, num_ldtms, ldtm_width)
+                    elif cutlass.const_expr(cfg.state_io_coalesced and cfg.state_table and mState_init.element_type == cutlass.Float32):
+                        # Every global load first (8 rows x 64 B per instruction), then the transposition round by round.
+                        seed_pieces = coalesced_state_loads(gState_init, xfer_gmem_row, xfer_rows, xfer_gmem_col, v_offset, num_ldtms, ldtm_width)
+                        coalesced_state_to_tmem(seed_pieces, xfer_base, xfer_co_off, xfer_row_off, row_lo_addr + tmem_state_col, num_ldtms, ldtm_width)
+                    else:
+                        for i in cutlass.range_constexpr(num_ldtms):
+                            words = []
+                            if cutlass.const_expr(cfg.state_table):
+                                for g in cutlass.range_constexpr(ldtm_width // seed_vw):
+                                    seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
+                                    for t in cutlass.range_constexpr(seed_vw):
+                                        words.append(seed_chunk[t].to(cfg.acc_dtype))
+                            else:
+                                for _ in cutlass.range_constexpr(ldtm_width):
+                                    words.append(cutlass.Float32(0.0))
+                            if cutlass.const_expr(cfg.has_composed):
+                                for g in cutlass.range_constexpr(ldtm_width // 4):
+                                    composed_chunk = (composed_src + i * ldtm_width + g * 4).load(count=4, alignment=16)
+                                    for t in cutlass.range_constexpr(4):
+                                        words[g * 4 + t] = composed_chunk[t] if is_boundary else words[g * 4 + t]
+                            nvvm.tcgen05_st(
+                                "32x32b",
+                                nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
+                                cutlass.Vector.from_elements(tuple(words), cutlass.Float32),
+                            )
                     nvvm.tcgen05_wait("store")
                 else:
                     for i in cutlass.range_constexpr(num_ldtms):
@@ -2389,6 +2495,39 @@ def compute1_warp_group(
                         nvvm.fence_proxy("async.shared", space="cta")
                         bars.mb_o_tmastg_ready[o_idx].arrive()
 
+        if cutlass.const_expr(early_handover):
+            # ---- the next item, ahead of this item's final-state store: the ticket, this item's final-state index
+            # (issued; first read at the global stores), the next work item with its seed index, and the next seed's
+            # loads, which arrive under the final-state store below ----
+            next_tile, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
+            has_next = next_tile < total_tiles
+            ahead_tile = next_tile if has_next else tile_idx
+            if cutlass.const_expr(cfg.store_final_state):
+                final_row_early = ahead_final_dst
+                if cutlass.const_expr(mFinalIndices is not None):
+                    final_row_early = cutlass.Int32(mFinalIndices[cutlass.max(ahead_final_dst, cutlass.Int32(0))])
+                next_final_dst = mWorkItems[ahead_tile, WORK_ITEM_FINAL_DST]
+            ahead = decode_work_item(cfg, ahead_tile, mWorkItems)
+            ahead_seed_row = ahead[0]
+            if cutlass.const_expr(mSeedIndices is not None):
+                ahead_seed_row = cutlass.Int32(mSeedIndices[ahead[0]])
+            next_head_o, next_v_offset = decode_head(cfg, ahead[1])
+            seed_next = has_next and (ahead[7] - ahead[8] > 0) and (ahead[8] == 0)
+            if cutlass.const_expr(cfg.store_final_state):
+                # The one case in which the order inside this block decides the bytes: the next seed is the block this
+                # item writes its final state to.  Then the next item loads its seed at its own start, behind the store.
+                seed_next = seed_next and not ((next_head_o == head_o) and (ahead_seed_row == final_row_early))
+            # Issued on every path (a select, not a branch): without an early seed all lanes load one 16-byte piece.
+            next_pieces = coalesced_state_loads(
+                mState_init[None, None, next_head_o, ahead_seed_row],
+                xfer_gmem_row if seed_next else cutlass.Int32(0),
+                cutlass.Int32(xfer_rows) if seed_next else cutlass.Int32(0),
+                xfer_gmem_col if seed_next else cutlass.Int32(0),
+                next_v_offset,
+                num_ldtms,
+                ldtm_width,
+            )
+
         # ---- final state store: TMEM -> GMEM -----------------------------------------
         if n_local > 0:
             kv_last_idx = kv_acc_index.idx
@@ -2463,24 +2602,54 @@ def compute1_warp_group(
                     bars.mb_checkpoint_tmastg_ready[checkpoint_stage].arrive()
                     checkpoint_cnt = checkpoint_cnt + 1
             if cutlass.const_expr(cfg.store_final_state):
-                final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
+                if cutlass.const_expr(early_handover):
+                    final_dst = ahead_final_dst
+                else:
+                    final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
                 if final_dst >= 0:
                     final_row = final_dst
                     if cutlass.const_expr(mFinalIndices is not None):
-                        final_row = cutlass.Int32(mFinalIndices[final_dst])
+                        if cutlass.const_expr(early_handover):
+                            final_row = final_row_early
+                        else:
+                            final_row = cutlass.Int32(mFinalIndices[final_dst])
                     gState_out = mState_out[None, None, head_o, final_row]
                     state_vw = 16 // (mState_out.element_type.width // 8)
                     state_dst = (gState_out.iterator + gState_out.layout((state_gmem_row + v_offset, 0))).raw_ptr()
-                    for i in cutlass.range_constexpr(num_ldtms):
-                        state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32), num=32)
-                        if state_row_valid:
-                            for g in cutlass.range_constexpr(ldtm_width // state_vw):
-                                (state_dst + i * ldtm_width + g * state_vw).store(
-                                    cutlass.Vector.from_elements(
-                                        tuple(state_vec[g * state_vw + t].to(mState_out.element_type) for t in range(state_vw)), mState_out.element_type
-                                    ),
-                                    alignment=16,
-                                )
+                    if cutlass.const_expr(cfg.state_io_coalesced and mState_out.element_type == cutlass.Float32):
+                        # Round by round: each thread's row into the scratch, 8 rows x 64 B out of it per global store.
+                        final_rows = [
+                            (gState_out.iterator + gState_out.layout((xfer_gmem_row + g * xfer_rows + v_offset, 0))).raw_ptr() for g in range(xfer_pieces)
+                        ]
+                        for i in cutlass.range_constexpr(num_ldtms):
+                            state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32), num=32)
+                            for half in cutlass.range_constexpr(xfer_halves):
+                                for piece in cutlass.range_constexpr(xfer_pieces):
+                                    (xfer_base + xfer_row_off[piece]).store(
+                                        cutlass.Vector.from_elements(
+                                            tuple(state_vec[half * STATE_XFER_ROW_WORDS + piece * 4 + t] for t in range(4)), cutlass.Float32
+                                        ),
+                                        alignment=16,
+                                    )
+                                for g in cutlass.range_constexpr(xfer_pieces):
+                                    (final_rows[g] + (i * ldtm_width + half * STATE_XFER_ROW_WORDS) + xfer_gmem_col).store(
+                                        (xfer_base + xfer_co_off[g]).load(count=4, alignment=16), alignment=16
+                                    )
+                    else:
+                        for i in cutlass.range_constexpr(num_ldtms):
+                            state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32), num=32)
+                            if state_row_valid:
+                                for g in cutlass.range_constexpr(ldtm_width // state_vw):
+                                    (state_dst + i * ldtm_width + g * state_vw).store(
+                                        cutlass.Vector.from_elements(
+                                            tuple(state_vec[g * state_vw + t].to(mState_out.element_type) for t in range(state_vw)), mState_out.element_type
+                                        ),
+                                        alignment=16,
+                                    )
+                    if cutlass.const_expr(cfg.state_io_coalesced):
+                        # The fp32 state region's next writer is the next item's seed, issued by these same threads; the
+                        # final-state loads are complete before anything overwrites their columns.
+                        nvvm.tcgen05_wait("load")
         else:
             if cutlass.const_expr(cfg.store_final_state):
                 final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
@@ -2514,7 +2683,17 @@ def compute1_warp_group(
                                 if state_row_valid:
                                     gState_out[state_gmem_row + v_offset, i * ldtm_width + k] = cutlass.Float32(0.0).to(mState_out.element_type)
 
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
+        if cutlass.const_expr(early_handover):
+            # ---- the next item's seed into the fp32 state region, behind this item's final-state store ----
+            if seed_next:
+                coalesced_state_to_tmem(next_pieces, xfer_base, xfer_co_off, xfer_row_off, row_lo_addr + tmem_state_col, num_ldtms, ldtm_width)
+                nvvm.tcgen05_wait("store")
+            seed_in_tmem = cutlass.Int32(1) if seed_next else cutlass.Int32(0)
+            if cutlass.const_expr(cfg.store_final_state):
+                ahead_final_dst = next_final_dst
+            tile_idx = next_tile
+        else:
+            tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
     bars.mb_tmem_done[0].arrive()
 
@@ -3138,6 +3317,15 @@ def frost_gdn_prefill(
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
+    if cutlass.const_expr(cfg.state_io_coalesced):
+        sStateXfer_raw = cutlass.Array(
+            cutlass.Float32,
+            len(cfg.compute_group_1_warp_ids) * STATE_XFER_ROWS * STATE_XFER_ROW_WORDS,
+            space=cutlass.AddressSpace.smem,
+            alignment=cfg.buffer_align_bytes,
+        )
+    else:
+        sStateXfer_raw = None
     sV_raw = cutlass.Array(
         cfg.io_dtype,
         cfg.v_cosize,
@@ -3314,6 +3502,7 @@ def frost_gdn_prefill(
             ),
             sO=sO,
             sCheckpoint_raw=sCheckpoint_raw,
+            sStateXfer_raw=sStateXfer_raw,
             mState_init=mState_init,
             mComposed=mComposed,
             mState_out=mState_out,
@@ -3453,6 +3642,8 @@ class GdnPrefillCfg:
     tiles_per_head: int = 1
     state_table: bool = True
     has_composed: bool = False
+    state_io_coalesced: bool = False
+    tile_handover_early: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -3599,6 +3790,24 @@ def build_cfg(
     if expand_num > 1 and d_v != 64:
         cfg.smem_gate_stages = 2
         cfg.smem_beta_stages = 2
+    # The coalesced state I/O needs one state row per compute-group-1 thread and whole 32-column rounds, and its scratch
+    # takes the A ring's third stage: a build that already trimmed the ring, or that loads the chunk factor, keeps the
+    # row-per-lane path.
+    cfg.state_io_coalesced = bool(
+        STATE_IO_COALESCED
+        and tinv_source == "compute"
+        and d_v == 128
+        and d_k % 32 == 0
+        and expand_num == 1
+        and not enable_checkpoints
+        and not has_composed
+        and state_dtype == cutlass.Float32
+        and cfg.smem_a_stages == CFG.SMEM_A_STAGES
+        and ((use_initial_state and cfg.state_table) or store_final_state)
+    )
+    if cfg.state_io_coalesced:
+        cfg.smem_a_stages = CFG.SMEM_A_STAGES - 1
+    cfg.tile_handover_early = bool(TILE_HANDOVER_EARLY and cfg.state_io_coalesced and use_initial_state and cfg.state_table)
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
     cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_cg0 + n_cg1)
