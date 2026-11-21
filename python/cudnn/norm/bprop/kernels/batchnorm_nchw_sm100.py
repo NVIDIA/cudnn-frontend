@@ -34,23 +34,25 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.batchnorm_nchw_sm100 import nchw_cfg
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, coop_launch_too_large, dsl_compile_lock
+from cudnn.norm.utils import (
+    sm_count,
+    ws_bytes,
+    ws_empty,
+    ws_reset,
+    ws_zeros,
+    cur_stream,
+    dyn,
+    fake_stream,
+    smem_budget,
+    coop_launch_too_large,
+    dsl_compile_lock,
+)
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
 _BFLY_CLAMP = 0x1F
 _SMEM_CAP_PREF = 200 * 1024  # measured on sm_100; smem_budget clamps it elsewhere
-_SM_COUNT = None
-
-
-def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
 
 
 @cute.jit
@@ -473,7 +475,7 @@ def scratch_bytes(spec, params, shape, has_beta=False, knobs=None):
     if geo is None:
         return 0
     _VS, _UF, _WPB, _CPW, CT, cparts, _BTg = geo
-    mparts = max(1, min(2 * _nsm() // max(1, cparts), N))
+    mparts = max(1, min(2 * sm_count() // max(1, cparts), N))
     return ws_bytes((cparts * 2 * mparts * CT, 4), (cparts, 4))
 
 
@@ -499,7 +501,7 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
     okey = (params.io_dtype, C, S, N, has_beta)
     occ0 = _OCC.get(okey, 2)
     for occ in ([2, 1] if occ0 == 2 else [1]):
-        mparts = max(1, min(occ * _nsm() // max(1, cparts), N))
+        mparts = max(1, min(occ * sm_count() // max(1, cparts), N))
         nloc = (N + mparts - 1) // mparts
         KSR = _ksr(nloc, WPB, CPW, S, eb, occ) if knobs is None else int(knobs)
         smem_bytes = 2 * (2 * CT) * 4 + 2 * WPB * CPW * KSR * S * eb + 128

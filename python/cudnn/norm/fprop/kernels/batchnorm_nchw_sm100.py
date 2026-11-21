@@ -50,6 +50,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.utils import (
+    sm_count,
     ws_bytes,
     ws_empty,
     ws_reset,
@@ -72,17 +73,6 @@ _BFLY_CLAMP = 0x1F  # shfl width == 32
 _BT = 256
 _SMEM_CAP_PREF = 200 * 1024  # headroom under the opt-in cap; smem_budget clamps per arch
 _INFLIGHT = 8  # target loads in flight per warp (UF * CPW)
-
-_SM_COUNT = None
-
-
-def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +104,7 @@ def nchw_cfg(C: int, N: int, S: int, elem_bytes: int, block_threads: int = _BT):
     cpw = 1
     while cpw < want and C // (wpb * cpw) > 1 and (C // (wpb * cpw)) % 2 == 0:
         cpw *= 2
-    while C // (wpb * cpw) > 2 * _nsm() and (C // (wpb * cpw)) % 2 == 0:
+    while C // (wpb * cpw) > 2 * sm_count() and (C // (wpb * cpw)) % 2 == 0:
         cpw *= 2
     ct = wpb * cpw
     if C % ct != 0:
@@ -123,7 +113,7 @@ def nchw_cfg(C: int, N: int, S: int, elem_bytes: int, block_threads: int = _BT):
 
 
 def _split(N: int, cparts: int, occ: int) -> int:
-    return max(1, min(occ * _nsm() // max(1, cparts), N))
+    return max(1, min(occ * sm_count() // max(1, cparts), N))
 
 
 @cute.jit
@@ -863,7 +853,7 @@ def forward(
     if not training:
         rm = running_mean if running_mean is not None else torch.zeros(C, dtype=torch.float32, device=x3d.device)
         rv = running_var if running_var is not None else torch.ones(C, dtype=torch.float32, device=x3d.device)
-        nblk = max(1, min(_nsm() * 4 // max(1, cparts), N))
+        nblk = max(1, min(sm_count() * 4 // max(1, cparts), N))
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, cparts, nblk, it_ty, et, float(eps), has_beta)
         # dyn() specializes strides 0 and 1; larger strides are dynamic.
         key = ("infer", params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce

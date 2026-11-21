@@ -38,18 +38,6 @@ KERNEL_PREFIX_ROOTS = (
 
 DEVICE0_ROOT = "python/cudnn/"
 DEVICE0_PRAGMA = "# allow-device-0"
-# TODO: remove each entry once the file reads the device in scope.
-DEVICE0_PENDING = frozenset(
-    (
-        "python/cudnn/norm/bprop/kernels/batchnorm_nchw_sm100.py",
-        "python/cudnn/norm/bprop/kernels/batchnorm_nhwc_sm100.py",
-        "python/cudnn/norm/bprop/kernels/groupnorm_fast_sm100.py",
-        "python/cudnn/norm/bprop/kernels/instancenorm_warp_sm100.py",
-        "python/cudnn/norm/fprop/kernels/batchnorm_nchw_flat_sm100.py",
-        "python/cudnn/norm/fprop/kernels/batchnorm_nchw_sm100.py",
-        "python/cudnn/norm/fprop/kernels/batchnorm_nhwc_sm100.py",
-    )
-)
 
 _KERNEL_DECORATORS = ("cute.kernel", "cute.experimental.kernel")
 _DEVICE_QUERIES = ("get_device_properties", "get_device_capability")
@@ -119,7 +107,7 @@ def check_file(path: str, text: str) -> list:
     if rel.startswith("./"):
         rel = rel[2:]
     in_prefix_root = rel.startswith(KERNEL_PREFIX_ROOTS)
-    in_device0_root = rel.startswith(DEVICE0_ROOT) and rel not in DEVICE0_PENDING
+    in_device0_root = rel.startswith(DEVICE0_ROOT)
     if not (in_prefix_root or in_device0_root):
         return []
     try:

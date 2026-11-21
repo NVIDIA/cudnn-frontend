@@ -35,11 +35,22 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.batchnorm_nhwc_sm100 import nhwc_cfg as _fwd_nhwc_cfg
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, coop_launch_too_large, dsl_compile_lock
+from cudnn.norm.utils import (
+    sm_count,
+    ws_bytes,
+    ws_empty,
+    ws_reset,
+    ws_zeros,
+    cur_stream,
+    dyn,
+    fake_stream,
+    smem_budget,
+    coop_launch_too_large,
+    dsl_compile_lock,
+)
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
-_SM_COUNT = None
 
 # Channel tile for the BACKWARD. The forward caps at 256, giving TPP = CPC/V = 32 --
 # so a warp is exactly one pixel group and the tp-reduction is entirely cross-warp
@@ -64,15 +75,6 @@ def nhwc_cfg(C, eb, block_threads=512):
     if tpp > block_threads or block_threads % tpp != 0:
         return None
     return V, cpc, tpp, block_threads // tpp, C // cpc, block_threads
-
-
-def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
 
 
 @cute.kernel
@@ -382,7 +384,7 @@ def scratch_bytes(spec, params, shape, has_beta=False, knobs=None):
     if geo is None:
         return 0
     V, _CPC, TPP, PPL, cblks, _BTg = geo
-    mparts = max(1, min(2 * _nsm() // max(1, cblks), (M + PPL - 1) // PPL))
+    mparts = max(1, min(2 * sm_count() // max(1, cblks), (M + PPL - 1) // PPL))
     return ws_bytes((cblks * mparts * TPP * V * 2, 4), (cblks, 4))
 
 
@@ -414,7 +416,7 @@ def backward(spec, dy2d, x2d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
     can2 = smem_bytes * 2 <= smem_budget(224 * 1024)
     fn = _KCACHE.get(key)
     for occ in ([2, 1] if (occ0 == 2 and can2) else [1]):
-        mparts = max(1, min(occ * _nsm() // max(1, cblks), (M + PPL - 1) // PPL))
+        mparts = max(1, min(occ * sm_count() // max(1, cblks), (M + PPL - 1) // PPL))
         ws_reset(ws)  # this block is retried at a lower occupancy
         pbuf = ws_empty(ws, cblks * mparts * TPP * V * 2, torch.float32, x2d.device)
         ret = ws_zeros(ws, cblks, torch.int32, x2d.device)
