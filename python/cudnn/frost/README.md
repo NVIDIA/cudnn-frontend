@@ -1307,15 +1307,14 @@ block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
     (`test/python/init_order_schedules.py`). On the helper today:
     `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`,
     `SharedExpertDecode` (they allocate: record and order),
-    `Fp8ProjectionDecode` (they own nothing: order). Not yet, to follow in a
-    separate change: `GdnDecodeFused`, `GdnVerifyFused` (they allocate: record
-    and order), `SwigluFp4Decode` (it owns nothing: order), and
-    `RowQuantizeFp4Decode` (an entry object orders the launches into the outputs
-    it allocated itself, with a copy of this ordering kept in the entry; it
-    moves onto the helper). Until then the caller orders (allocates on the
-    stream its calls run on, or orders that stream behind the allocating one)
-    every launch of one of `GdnDecodeFused`, `GdnVerifyFused`, `SwigluFp4Decode`
-    into an entry-owned buffer, its own or another entry's; every launch of
-    `RowQuantizeFp4Decode` into a buffer another entry object allocated; and
-    every launch of any other entry into a buffer `GdnDecodeFused`,
-    `GdnVerifyFused` or `RowQuantizeFp4Decode` allocated.
+    `Fp8ProjectionDecode`, `SwigluFp4Decode` (they own nothing: order). Not yet,
+    to follow in a separate change: `GdnDecodeFused`, `GdnVerifyFused` (they
+    allocate: record and order), and `RowQuantizeFp4Decode` (an entry object
+    orders the launches into the outputs it allocated itself, with a copy of
+    this ordering kept in the entry; it moves onto the helper). Until then the
+    caller orders (allocates on the stream its calls run on, or orders that
+    stream behind the allocating one) every launch of one of `GdnDecodeFused`,
+    `GdnVerifyFused` into an entry-owned buffer, its own or another entry's;
+    every launch of `RowQuantizeFp4Decode` into a buffer another entry object
+    allocated; and every launch of any other entry into a buffer
+    `GdnDecodeFused`, `GdnVerifyFused` or `RowQuantizeFp4Decode` allocated.

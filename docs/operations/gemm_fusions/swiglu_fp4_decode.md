@@ -52,6 +52,14 @@ count, contiguity, alignment) before the compiled kernel is looked up; the host 
 copy, no device allocation, no device read. `alpha` and `out_global_scale` are read on the device. The launch goes to
 torch's current stream of the entry's device. `out` or `out_scale` overlapping an input is undefined (not checked).
 
+`out` or `out_scale` can be a buffer another direct-call entry of the device allocated for itself and recorded with
+`cudnn.frost.init_order` (for example an output of `cudnn.AddNormQuantDecode`; rule 16 of `python/cudnn/frost/README.md`
+lists the entries that record and those that do not yet), whose initialization is still queued on the stream that
+allocated it. The entry allocates nothing, but its launch is ordered behind every such pending initialization of the bytes
+it writes, on whatever stream it runs: the launch stream waits for an event recorded behind the allocation, without a host
+wait and without synchronizing a stream or the device; under a stream capture the call waits for that one event on the
+host before its captured launch. The operands the launch only reads stay the caller's to order.
+
 **The row count is a runtime value.** The kernel is compiled once per token tile, not per row count: `compile()` builds the
 four forms, after which a launch at any served row count is a cache hit that compiles nothing; `compile(rows)` builds the
 form of one row count. A launch of a form that was never compiled compiles it on first use; a serving path should not rely
