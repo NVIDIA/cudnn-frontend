@@ -683,6 +683,7 @@ def build_warmup_forward(
         # build_cfg reads the prefill kernel's build switches: they select the compiled code.
         bool(gdn_prefill_f16.STATE_IO_COALESCED),
         bool(gdn_prefill_f16.TILE_HANDOVER_EARLY),
+        bool(gdn_prefill_f16.STATE_SEED_COPY),
     )
     if key not in warmup_forward_cache:
         prefill_cfg = gdn_prefill_f16.build_cfg(

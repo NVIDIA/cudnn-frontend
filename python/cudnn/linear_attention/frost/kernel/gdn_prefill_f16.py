@@ -56,8 +56,11 @@ three stages for the MMA warp's two-chunk compute-group-0 lookahead):
   O store                         16384       1
   checkpoint staging  DK*DV*1, *2 or *4       1    <-- enable_checkpoints only
   state scratch (per cg1 warp)     2048       1    <-- STATE_IO_COALESCED builds only, which run the A ring at 2 stages
+  final-state keys (per cg1 warp)    12       1    <-- STATE_SEED_COPY builds that store a final state
   cumsumlog / cumprod / Beta        256       3
   scheduler ticket ring               4       2    <-- next-tile publish ring
+A STATE_SEED_COPY build passes a seeded work item's fp32 seed through the K + Q ring as fills of its own, in ring order in
+front of the item's first chunk; no buffer is added for it.
 
 TMEM layout (512 columns):
   Buffer                  Cols
@@ -126,7 +129,7 @@ from cudnn.frost.tile_dsl.barrier import (
     advance,
     wait_on_dependent_grids,
 )
-from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
+from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.pointwise import (
     f16x2_to_f32,
@@ -167,6 +170,31 @@ STATE_XFER_ROW_WORDS = 16  # fp32 words per scratch row (64 B: half of a 32-colu
 # this item's final state is written: when both are the same block (same head, same state row) the early read is not
 # taken and the next item loads its seed at its own start, behind the store.
 TILE_HANDOVER_EARLY = False
+# The seed through the copy engine (acts only where TILE_HANDOVER_EARLY acts, with one tile per head).  The fp32 seed of
+# a work item is d_v rows x d_k columns: under the 128-byte swizzle that is d_k / 32 subtiles of d_v rows x 128 B, the
+# layout a K + Q ring stage holds for its [K;Q] operand.  With the switch on the load warp TMA-loads the seed into ring
+# stages of its own, in ring order in front of the item's first chunk; the tensor-core warp moves it into the fp32 state
+# region with tcgen05.cp behind both [K;Q] K^T products of the item's first chunk pair and releases the stages with the
+# commit behind the copies; compute group 1 loads no seed.
+# - Two roles then write the state region between two work items, so its order is two barriers.  Compute group 1 arrives
+#   mb_state_free behind its last tcgen05.ld of an item's state and a tcgen05.wait::ld; the tensor-core warp waits it in
+#   front of the copies and commits mb_seed_ready behind them; compute group 1 waits that in front of the item's first
+#   state stage.
+# - A seed is read from global memory when its ticket is held and its ring stages are free.  The scheduler ring publishes
+#   a ticket when every warp has taken the ticket scheduler_stages back, and compute group 1 takes a ticket in front of
+#   its item's final-state store, so the final states of the last scheduler_stages + 1 work items of the thread block can
+#   still be unwritten at that read.  Each warp of compute group 1 keeps one key per final state it stored in those
+#   items; a seeded item whose seed block has one of the keys loads its seed again at its own start, behind those
+#   stores, over the copied one.  The key is head * STATE_SEED_KEY_HEAD + state row in 32 bits: equal blocks have equal
+#   keys, and a key shared by two blocks costs a reload that was not needed.
+# - Earlier final states of the thread block were stored through the generic proxy and the seed is read through the
+#   async proxy: compute group 1 issues fence.proxy.async.global in front of taking each ticket.
+STATE_SEED_COPY = False
+STATE_SEED_BOX_BYTES = 128  # one row of a seed subtile = the swizzle span
+STATE_SEED_CALL_BYTES = 32  # bytes per row of one tcgen05.cp.128x256b
+STATE_SEED_DESC_STEP_BYTES = 16  # one step of a tcgen05 shared-memory descriptor
+STATE_SEED_KEY_HEAD = 1 << 20
+STATE_SEED_KEY_NONE = -1  # an empty slot of the final-state keys
 
 
 class GdnPrefillBars(NamedTuple):
@@ -213,6 +241,9 @@ class GdnPrefillBars(NamedTuple):
 
     mb_scheduler_ready: MBarrier
     mb_scheduler_done: MBarrier
+
+    mb_state_free: Optional[MBarrier] = None
+    mb_seed_ready: Optional[MBarrier] = None
 
 
 def make_bars(cfg) -> GdnPrefillBars:
@@ -311,6 +342,8 @@ def make_bars(cfg) -> GdnPrefillBars:
         mb_scheduler_done=MBarrier(
             alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=11 * cfg.threads_per_warp, producer=Producer.THREAD
         ),
+        mb_state_free=(MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1_THREADS, producer=Producer.THREAD) if cfg.state_seed_copy else None),
+        mb_seed_ready=(MBarrier(alloc(1), try_wait=True, stages=1, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT) if cfg.state_seed_copy else None),
     )
 
 
@@ -723,6 +756,31 @@ def issue_cg0_gemm(cfg, bmm_kq_k_desc, bmm_q_k_desc, desc_kq_cg0, member: int, a
 
 
 @cute.jit
+def copy_seed_to_state(cfg, bars, sSeed, tmem_base_slot, seed_stages):
+    """One lane of the tensor-core warp: tcgen05.cp of a seed's ring stages into the fp32 state region (d_v rows x
+    STATE_SEED_CALL_BYTES per call), one commit that publishes the seed and one commit per stage that releases it.  The
+    commits stand behind the copies in the same thread, so each completes when the copies have read their stage."""
+    calls_per_subtile = STATE_SEED_BOX_BYTES // STATE_SEED_CALL_BYTES
+    calls_per_fill = cfg.seed_subtiles_per_fill * calls_per_subtile
+    subtile_desc_stride = (cfg.d_v * STATE_SEED_BOX_BYTES) // STATE_SEED_DESC_STEP_BYTES
+    call_desc_steps = STATE_SEED_CALL_BYTES // STATE_SEED_DESC_STEP_BYTES
+    cols_per_call = STATE_SEED_CALL_BYTES // 4
+    seed_col = (tmem_base_slot.load() & 0xFFFF) + cfg.tmem_state_acc_offset
+    for fill in cutlass.range_constexpr(cfg.seed_fills):
+        desc_seed = desc_opaque(sSeed[seed_stages[fill]].desc())
+        for call in cutlass.range_constexpr(calls_per_fill):
+            nvvm.tcgen05_cp(
+                nvvm.Tcgen05CpShape.SHAPE_128X256B,
+                nvvm.make_tmem_ptr(seed_col + (fill * calls_per_fill + call) * cols_per_call, cutlass.Float32),
+                desc_seed + ((call // calls_per_subtile) * subtile_desc_stride + (call % calls_per_subtile) * call_desc_steps),
+                group=nvvm.CTAGroup.CTA_1,
+            )
+    bars.mb_seed_ready[0].arrive(cta_group=1)
+    for fill in cutlass.range_constexpr(cfg.seed_fills):
+        bars.mb_kq_done[seed_stages[fill]].arrive(cta_group=1)
+
+
+@cute.jit
 def tcgen05_mma_warp(
     cfg,
     total_tiles,
@@ -876,6 +934,18 @@ def tcgen05_mma_warp(
     INP_SLOT_COLS = cfg.b_t // 2
 
     tmem_cg0_acc_col = (tmem_base_slot.load() & 0xFFFF) + cfg.tmem_cg0_acc_offset
+    if cutlass.const_expr(cfg.state_seed_copy):
+        # A seed fill is read through the ring stage's own descriptor form: K-major rows of 128 B under the 128-byte swizzle.
+        sSeed = SmemTile(
+            base=sKQ.base,
+            elems_per_stage=sKQ.elems_per_stage,
+            stages=sKQ.stages,
+            leading_byte_offset=0,
+            stride_byte_offset=sKQ.stride_byte_offset,
+            layout=sKQ.layout,
+        )
+        # Pre-armed: the block's first work item with chunks has no predecessor in the fp32 state region.
+        state_free_index = PipelineState.start(phase=1)
 
     scheduler_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
@@ -890,6 +960,12 @@ def tcgen05_mma_warp(
             cg0_acc_idx = cg0_acc_index.idx
             bars.mb_cg0_acc_done[cg0_acc_idx].wait(cg0_acc_index.phase)
             cg0_acc_index = advance(cg0_acc_index, cfg.tmem_cg0_acc_stages)
+            if cutlass.const_expr(cfg.state_seed_copy):
+                # A seeded item's seed fills stand in ring order in front of its first chunk: the look-ahead index passes
+                # them here, the chunk index behind this product.
+                if compute_start == 0:
+                    for _fill in cutlass.range_constexpr(cfg.seed_fills):
+                        kq_cg0_index = advance(kq_cg0_index, cfg.smem_kq_stages)
             kq_cg0_idx = kq_cg0_index.idx
             bars.mb_kq_ready[kq_cg0_idx].wait(kq_cg0_index.phase)
             kq_cg0_index = advance(kq_cg0_index, cfg.smem_kq_stages)
@@ -898,6 +974,10 @@ def tcgen05_mma_warp(
             issue_cg0_gemm(cfg, bmm_kq_k_desc, bmm_q_k_desc, desc_kq_cg0, 0, acc_cg0, KQ_SEG, KQ_BOX, KQ_SUBTILES, KQ_STEPS)
             if elect_one:
                 bars.mb_cg0_acc_ready[cg0_acc_idx].arrive(cta_group=1)
+            if cutlass.const_expr(cfg.state_seed_copy):
+                if compute_start == 0:
+                    for _fill in cutlass.range_constexpr(cfg.seed_fills):
+                        kq_index = advance(kq_index, cfg.smem_kq_stages)
         if n_local > 1:
             cg0_acc_idx = cg0_acc_index.idx
             bars.mb_cg0_acc_done[cg0_acc_idx].wait(cg0_acc_index.phase)
@@ -910,6 +990,21 @@ def tcgen05_mma_warp(
             issue_cg0_gemm(cfg, bmm_kq_k_desc, bmm_q_k_desc, desc_kq_cg0, 1, acc_cg0, KQ_SEG, KQ_BOX, KQ_SUBTILES, KQ_STEPS)
             if elect_one:
                 bars.mb_cg0_acc_ready[cg0_acc_idx].arrive(cta_group=1)
+        if cutlass.const_expr(cfg.state_seed_copy):
+            # ---- the seed: ring stages -> the fp32 state region, behind the previous item's last read of it ----
+            if n_local > 0:
+                bars.mb_state_free[0].wait(state_free_index.phase)
+                state_free_index = advance(state_free_index, 1)
+                if compute_start == 0:
+                    # The seed fills stand seed_fills ring positions behind the chunk index, which has passed them.
+                    seed_stages = []
+                    for fill in cutlass.range_constexpr(cfg.seed_fills):
+                        seed_pos = kq_index.idx + (cfg.smem_kq_stages - cfg.seed_fills + fill)
+                        seed_stage = seed_pos % cfg.smem_kq_stages
+                        seed_stages.append(seed_stage)
+                        bars.mb_kq_ready[seed_stage].wait(kq_index.phase ^ 1 ^ (seed_pos // cfg.smem_kq_stages))
+                    if elect_one:
+                        copy_seed_to_state(cfg, bars, sSeed, tmem_base_slot, seed_stages)
 
         block_pos = compute_start % cutlass.Int32(cfg.expand_num) if cutlass.const_expr(cfg.expand_num > 1) else cutlass.Int32(0)
         for peel in cutlass.range_constexpr(1 if cfg.use_initial_state else 2):
@@ -1089,6 +1184,8 @@ def tmaldg_warp(
     k_ratio,
     v_ratio,
     arr_words,
+    mSeedIndices=None,
+    state_seed_map=None,
 ):
     """TMA-LDG warp role (warp 9): persistent scheduler loop + per-chunk
     Q/K/V G->S TMA loads, plus the chunk-factor tile TMA loads at the V
@@ -1146,6 +1243,20 @@ def tmaldg_warp(
         tma_subtile_stride_elems=bt * box_elems,
     )
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
+    if cutlass.const_expr(cfg.state_seed_copy):
+        # A seed fill = one ring stage of seed subtiles (d_v rows x 128 B each), loaded in boxes of seed_box_cols fp32 columns.
+        sSeed_tma = SmemTile(
+            base=sKQ_raw,
+            elems_per_stage=kq_stage_elements,
+            stages=cfg.smem_kq_stages,
+            leading_byte_offset=0,
+            stride_byte_offset=0,
+            layout=0,
+            tma_loads_per_tile=cfg.seed_subtiles_per_fill,
+            tma_granu_elems=cfg.seed_box_cols,
+            tma_subtile_stride_elems=kq_stage_elements // cfg.seed_subtiles_per_fill,
+        )
+        seed_tma = GmemTileTma(state_seed_map)
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
@@ -1173,6 +1284,20 @@ def tmaldg_warp(
                     tma_tensormap_acquire(desc_tinv_slot)
 
         if write_end > compute_start:
+            if cutlass.const_expr(cfg.state_seed_copy):
+                # ---- the seed fills of a seeded item, in ring order in front of its first K + Q fill ----
+                if compute_start == 0:
+                    seed_row = batch_idx
+                    if cutlass.const_expr(mSeedIndices is not None):
+                        seed_row = cutlass.Int32(mSeedIndices[batch_idx])
+                    for fill in cutlass.range_constexpr(cfg.seed_fills):
+                        kq_idx = kq_index.idx
+                        bars.mb_kq_done[kq_idx].wait(kq_index.phase)
+                        kq_index = advance(kq_index, cfg.smem_kq_stages)
+                        if elect_one:
+                            bars.mb_kq_ready[kq_idx].arrive(n_bytes=cfg.tma_kq_bytes)
+                        seed_slice = seed_tma(cutlass.Int32(fill * cfg.seed_subtiles_per_fill * cfg.seed_box_cols), v_offset, head_o, seed_row)
+                        tma_load_tile(sSeed_tma[kq_idx], seed_slice, bars.mb_kq_ready[kq_idx].smem_ptr)
             kq_idx = kq_index.idx
             bars.mb_kq_done[kq_idx].wait(kq_index.phase)
             kq_index = advance(kq_index, cfg.smem_kq_stages)
@@ -1966,6 +2091,7 @@ def compute1_warp_group(
     sScheduler,
     bars,
     rz,
+    sFinalKeys=None,
 ):
     """Compute warp-group 1 role (warps 4-7): persistent scheduler loop
     running the per-chunk state-update and output epilogues."""
@@ -2054,6 +2180,23 @@ def compute1_warp_group(
     early_handover = False
     if cutlass.const_expr(cfg.tile_handover_early):
         early_handover = mState_init.element_type == cutlass.Float32
+    # With the seed copy an item with chunks hands the fp32 state region to the tensor-core warp exactly once, behind its
+    # last tcgen05.ld of the region: inside the coalesced final-state store where one is compiled (free_in_store), behind
+    # the final-state section otherwise.
+    free_in_store = False
+    if cutlass.const_expr(cfg.state_seed_copy and cfg.store_final_state):
+        free_in_store = mState_out.element_type == cutlass.Float32
+    if cutlass.const_expr(cfg.state_seed_copy):
+        seed_ready_index = PipelineState.start(phase=0)
+    if cutlass.const_expr(cfg.seed_alias_guard):
+        # The warp's keys of the final states it stored last (STATE_SEED_KEY_NONE = none).  Every lane of the warp stores
+        # the same words and reads back words it stored itself; no other role touches them.  The address is warp-uniform,
+        # so the compare that selects the reload is too.
+        guard_items = cfg.scheduler_stages + 1
+        final_keys = sFinalKeys.data_ptr() + (warp_idx - cfg.compute_group_1_warp_ids[0]) * guard_items
+        for entry in cutlass.range_constexpr(guard_items):
+            (final_keys + entry).store(cutlass.Int32(STATE_SEED_KEY_NONE))
+        final_key_slot = cutlass.Int32(0)
     scheduler_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     if cutlass.const_expr(early_handover):
@@ -2103,7 +2246,23 @@ def compute1_warp_group(
                         is_boundary = batch_idx == cutlass.Int32(0)
                         gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
                         composed_src = (gComposed.iterator + gComposed.layout((state_gmem_row + v_offset, 0))).raw_ptr()
-                    if cutlass.const_expr(early_handover):
+                    if cutlass.const_expr(cfg.state_seed_copy):
+                        # The seed is in the fp32 state region when the tensor-core warp's copies have completed.
+                        bars.mb_seed_ready[0].wait(seed_ready_index.phase)
+                        seed_ready_index = advance(seed_ready_index, 1)
+                        if cutlass.const_expr(cfg.seed_alias_guard):
+                            # The copied seed was read in front of the final-state stores of the thread block's last work
+                            # items: when its block is one of theirs, load it again here, behind them, over the copy.
+                            seed_key = head_o * cutlass.Int32(STATE_SEED_KEY_HEAD) + seed_row
+                            seed_stale = cutlass.Boolean(False)
+                            for entry in cutlass.range_constexpr(guard_items):
+                                seed_stale = seed_stale or ((final_keys + entry).load() == seed_key)
+                            if seed_stale:
+                                fresh_pieces = coalesced_state_loads(
+                                    mState_init[None, None, head_o, seed_row], xfer_gmem_row, xfer_rows, xfer_gmem_col, v_offset, num_ldtms, ldtm_width
+                                )
+                                coalesced_state_to_tmem(fresh_pieces, xfer_base, xfer_co_off, xfer_row_off, row_lo_addr + tmem_state_col, num_ldtms, ldtm_width)
+                    elif cutlass.const_expr(early_handover):
                         # Only an item whose seed did not come in at the previous item's end (the block's first item, and the
                         # items the early path leaves alone) loads it here.
                         if seed_in_tmem == 0:
@@ -2499,6 +2658,10 @@ def compute1_warp_group(
             # ---- the next item, ahead of this item's final-state store: the ticket, this item's final-state index
             # (issued; first read at the global stores), the next work item with its seed index, and the next seed's
             # loads, which arrive under the final-state store below ----
+            if cutlass.const_expr(cfg.seed_alias_guard):
+                # The final states these threads stored went through the generic proxy; the load warp reads seeds through the
+                # async proxy behind the ticket taken here.
+                nvvm.fence_proxy("async.global")
             next_tile, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
             has_next = next_tile < total_tiles
             ahead_tile = next_tile if has_next else tile_idx
@@ -2511,22 +2674,23 @@ def compute1_warp_group(
             ahead_seed_row = ahead[0]
             if cutlass.const_expr(mSeedIndices is not None):
                 ahead_seed_row = cutlass.Int32(mSeedIndices[ahead[0]])
-            next_head_o, next_v_offset = decode_head(cfg, ahead[1])
-            seed_next = has_next and (ahead[7] - ahead[8] > 0) and (ahead[8] == 0)
-            if cutlass.const_expr(cfg.store_final_state):
-                # The one case in which the order inside this block decides the bytes: the next seed is the block this
-                # item writes its final state to.  Then the next item loads its seed at its own start, behind the store.
-                seed_next = seed_next and not ((next_head_o == head_o) and (ahead_seed_row == final_row_early))
-            # Issued on every path (a select, not a branch): without an early seed all lanes load one 16-byte piece.
-            next_pieces = coalesced_state_loads(
-                mState_init[None, None, next_head_o, ahead_seed_row],
-                xfer_gmem_row if seed_next else cutlass.Int32(0),
-                cutlass.Int32(xfer_rows) if seed_next else cutlass.Int32(0),
-                xfer_gmem_col if seed_next else cutlass.Int32(0),
-                next_v_offset,
-                num_ldtms,
-                ldtm_width,
-            )
+            if cutlass.const_expr(not cfg.state_seed_copy):
+                next_head_o, next_v_offset = decode_head(cfg, ahead[1])
+                seed_next = has_next and (ahead[7] - ahead[8] > 0) and (ahead[8] == 0)
+                if cutlass.const_expr(cfg.store_final_state):
+                    # The one case in which the order inside this block decides the bytes: the next seed is the block this
+                    # item writes its final state to.  Then the next item loads its seed at its own start, behind the store.
+                    seed_next = seed_next and not ((next_head_o == head_o) and (ahead_seed_row == final_row_early))
+                # Issued on every path (a select, not a branch): without an early seed all lanes load one 16-byte piece.
+                next_pieces = coalesced_state_loads(
+                    mState_init[None, None, next_head_o, ahead_seed_row],
+                    xfer_gmem_row if seed_next else cutlass.Int32(0),
+                    cutlass.Int32(xfer_rows) if seed_next else cutlass.Int32(0),
+                    xfer_gmem_col if seed_next else cutlass.Int32(0),
+                    next_v_offset,
+                    num_ldtms,
+                    ldtm_width,
+                )
 
         # ---- final state store: TMEM -> GMEM -----------------------------------------
         if n_local > 0:
@@ -2614,6 +2778,9 @@ def compute1_warp_group(
                         else:
                             final_row = cutlass.Int32(mFinalIndices[final_dst])
                     gState_out = mState_out[None, None, head_o, final_row]
+                    if cutlass.const_expr(cfg.seed_alias_guard):
+                        (final_keys + final_key_slot).store(head_o * cutlass.Int32(STATE_SEED_KEY_HEAD) + final_row)
+                        final_key_slot = cutlass.Int32(0) if final_key_slot == cutlass.Int32(guard_items - 1) else final_key_slot + 1
                     state_vw = 16 // (mState_out.element_type.width // 8)
                     state_dst = (gState_out.iterator + gState_out.layout((state_gmem_row + v_offset, 0))).raw_ptr()
                     if cutlass.const_expr(cfg.state_io_coalesced and mState_out.element_type == cutlass.Float32):
@@ -2631,6 +2798,11 @@ def compute1_warp_group(
                                         ),
                                         alignment=16,
                                     )
+                                if cutlass.const_expr(free_in_store and i == num_ldtms - 1 and half == 0):
+                                    # The item's last tcgen05.ld of the fp32 state region is complete and its first words
+                                    # are stored: the region is the next seed's.
+                                    nvvm.tcgen05_wait("load")
+                                    bars.mb_state_free[0].arrive()
                                 for g in cutlass.range_constexpr(xfer_pieces):
                                     (final_rows[g] + (i * ldtm_width + half * STATE_XFER_ROW_WORDS) + xfer_gmem_col).store(
                                         (xfer_base + xfer_co_off[g]).load(count=4, alignment=16), alignment=16
@@ -2646,10 +2818,20 @@ def compute1_warp_group(
                                         ),
                                         alignment=16,
                                     )
-                    if cutlass.const_expr(cfg.state_io_coalesced):
+                    if cutlass.const_expr(cfg.state_io_coalesced and not free_in_store):
                         # The fp32 state region's next writer is the next item's seed, issued by these same threads; the
                         # final-state loads are complete before anything overwrites their columns.
                         nvvm.tcgen05_wait("load")
+            if cutlass.const_expr(cfg.state_seed_copy):
+                # The paths that did not hand the fp32 state region over inside the store: no final state to store, or none
+                # compiled.  The region's last tcgen05.ld is then the last chunk's state stage.
+                if cutlass.const_expr(free_in_store):
+                    if final_dst < 0:
+                        nvvm.tcgen05_wait("load")
+                        bars.mb_state_free[0].arrive()
+                else:
+                    nvvm.tcgen05_wait("load")
+                    bars.mb_state_free[0].arrive()
         else:
             if cutlass.const_expr(cfg.store_final_state):
                 final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
@@ -2658,6 +2840,9 @@ def compute1_warp_group(
                     if cutlass.const_expr(mFinalIndices is not None):
                         final_row = cutlass.Int32(mFinalIndices[final_dst])
                     gState_out = mState_out[None, None, head_o, final_row]
+                    if cutlass.const_expr(cfg.seed_alias_guard):
+                        (final_keys + final_key_slot).store(head_o * cutlass.Int32(STATE_SEED_KEY_HEAD) + final_row)
+                        final_key_slot = cutlass.Int32(0) if final_key_slot == cutlass.Int32(guard_items - 1) else final_key_slot + 1
                     if cutlass.const_expr(cfg.use_initial_state):
                         if cutlass.const_expr(cfg.state_table):
                             gState_in = mState_init[None, None, head_o, seed_row]
@@ -2685,10 +2870,11 @@ def compute1_warp_group(
 
         if cutlass.const_expr(early_handover):
             # ---- the next item's seed into the fp32 state region, behind this item's final-state store ----
-            if seed_next:
-                coalesced_state_to_tmem(next_pieces, xfer_base, xfer_co_off, xfer_row_off, row_lo_addr + tmem_state_col, num_ldtms, ldtm_width)
-                nvvm.tcgen05_wait("store")
-            seed_in_tmem = cutlass.Int32(1) if seed_next else cutlass.Int32(0)
+            if cutlass.const_expr(not cfg.state_seed_copy):
+                if seed_next:
+                    coalesced_state_to_tmem(next_pieces, xfer_base, xfer_co_off, xfer_row_off, row_lo_addr + tmem_state_col, num_ldtms, ldtm_width)
+                    nvvm.tcgen05_wait("store")
+                seed_in_tmem = cutlass.Int32(1) if seed_next else cutlass.Int32(0)
             if cutlass.const_expr(cfg.store_final_state):
                 ahead_final_dst = next_final_dst
             tile_idx = next_tile
@@ -3131,6 +3317,20 @@ def host(
 
     num_descs = batch_size
 
+    # ---- the seed's tensor map: (key column, value row, head, state row), boxes of seed_box_cols columns x d_v rows ----
+    state_seed_map = None
+    if cutlass.const_expr(cfg.state_seed_copy):
+        seed_columns = cute.make_tensor(
+            state_in.iterator,
+            cute.make_layout(
+                (state_in.shape[1], state_in.shape[0], state_in.shape[2], state_in.shape[3]),
+                stride=(state_in.stride[1], state_in.stride[0], state_in.stride[2], state_in.stride[3]),
+            ),
+        )
+        state_seed_map = tma.create_tensor_map_tiled_from_view(
+            seed_columns, box_dims=(cfg.seed_box_cols, cfg.d_v, 1, 1), stride_order=(0, 1, 2, 3), swizzle=tma.TensorMapSwizzle.s128b
+        )
+
     # ---- launch ----------------------------------------------------------------------
     grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
 
@@ -3164,6 +3364,7 @@ def host(
         tensormap_workspace,
         cutlass.Int32(num_descs),
         cutlass.Int32(0),
+        state_seed_map,
     ).launch(
         grid=grid_shape,
         block=(cfg.threads_per_cta, 1, 1),
@@ -3205,6 +3406,7 @@ def frost_gdn_prefill(
     tensormap_workspace: cute.Tensor,
     n_desc: cutlass.Int32,
     rz_arg: cutlass.Int32,
+    state_seed_map: Optional[cutlass.GridConstant[tma.TensorMap]] = None,
 ):
     """Main GDN chunked kernel: warp-specialized persistent tile loop."""
     rz = release_zero(rz_arg)
@@ -3281,6 +3483,10 @@ def frost_gdn_prefill(
         layout=SWZ,
     )
     bars = make_bars(cfg)
+    if cutlass.const_expr(cfg.seed_alias_guard):
+        sFinalKeys = cutlass.Array(cutlass.Int32, len(cfg.compute_group_1_warp_ids) * (cfg.scheduler_stages + 1), space=SMEM, alignment=16)
+    else:
+        sFinalKeys = None
     tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
     sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
     cumsumlog_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
@@ -3400,6 +3606,9 @@ def frost_gdn_prefill(
         bars.mb_scheduler_ready[s].init()
         bars.mb_scheduler_done[s].init()
     bars.mb_tmem_done[0].init()
+    if cutlass.const_expr(cfg.state_seed_copy):
+        bars.mb_state_free[0].init()
+        bars.mb_seed_ready[0].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
@@ -3512,6 +3721,7 @@ def frost_gdn_prefill(
             sScheduler=sScheduler,
             bars=bars,
             rz=rz,
+            sFinalKeys=sFinalKeys,
         )
 
     elif warp_idx == cfg.load_gate_warp_id:
@@ -3592,6 +3802,8 @@ def frost_gdn_prefill(
             k_ratio=k_ratio,
             v_ratio=v_ratio,
             arr_words=arr_words,
+            mSeedIndices=mSeedIndices,
+            state_seed_map=state_seed_map,
         )
 
     if warp_idx == cfg.epilogue_warp_id:
@@ -3644,6 +3856,11 @@ class GdnPrefillCfg:
     has_composed: bool = False
     state_io_coalesced: bool = False
     tile_handover_early: bool = False
+    state_seed_copy: bool = False
+    seed_alias_guard: bool = False
+    seed_box_cols: int = 0
+    seed_subtiles_per_fill: int = 0
+    seed_fills: int = 0
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -3808,6 +4025,23 @@ def build_cfg(
     if cfg.state_io_coalesced:
         cfg.smem_a_stages = CFG.SMEM_A_STAGES - 1
     cfg.tile_handover_early = bool(TILE_HANDOVER_EARLY and cfg.state_io_coalesced and use_initial_state and cfg.state_table)
+    # The seed copy: a seed subtile is d_v rows x 128 B.  A K + Q ring stage must hold a whole number of them and the seed
+    # a whole number of stages; the ring must keep two stages beside the seed's, so that the fill of an item's second
+    # chunk, whose product is issued in front of the copies, never waits for a seed stage.
+    if STATE_SEED_COPY and cfg.tile_handover_early and tiles_per_head == 1:
+        seed_subtile_bytes = d_v * STATE_SEED_BOX_BYTES
+        kq_stage_bytes = 2 * cfg.b_t * d_k * (io_dtype.width // 8)
+        seed_box_cols = STATE_SEED_BOX_BYTES // (state_dtype.width // 8)
+        if kq_stage_bytes % seed_subtile_bytes == 0 and d_k % seed_box_cols == 0:
+            seed_subtiles_per_fill = kq_stage_bytes // seed_subtile_bytes
+            seed_subtiles = d_k // seed_box_cols
+            if seed_subtiles % seed_subtiles_per_fill == 0 and cfg.smem_kq_stages >= 2 + seed_subtiles // seed_subtiles_per_fill:
+                cfg.state_seed_copy = True
+                cfg.seed_box_cols = seed_box_cols
+                cfg.seed_subtiles_per_fill = seed_subtiles_per_fill
+                cfg.seed_fills = seed_subtiles // seed_subtiles_per_fill
+                # Without a final state nothing of this launch can be a later seed.
+                cfg.seed_alias_guard = bool(store_final_state)
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
     cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_cg0 + n_cg1)
