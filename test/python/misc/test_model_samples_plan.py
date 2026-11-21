@@ -2278,9 +2278,12 @@ def test_a_paged_cache_hands_out_its_rows_of_the_two_tables_as_views():
                 for got, inside in ((blocks, table.blocks[first]), (lengths, source[position])):
                     assert got.data_ptr() == inside.data_ptr() and got.untyped_storage().data_ptr() == inside.untyped_storage().data_ptr(), where
                     assert got.dtype == torch.int32 and got.is_contiguous() and got.data_ptr() % 16 == 0, where
-    for outside in (-1, capacity - tokens + 1, capacity):
-        with pytest.raises(IndexError, match=f"position {outside} is not one a step of 4 tokens per sequence starts at"):
+    for outside in (-1, capacity - tokens + 1, capacity):  # a position no step starts at: the message ``at`` raises for it
+        with pytest.raises(IndexError) as of_at:
+            cache.at(outside)
+        with pytest.raises(IndexError) as refused:
             cache.attended(outside)
+        assert str(refused.value) == str(of_at.value) and str(outside) in str(refused.value), outside
     without = DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", tokens, page=PAGE)
     assert without.table.blocks is None and without.table.lengths is None and without.table.first_token().lengths is None
     with pytest.raises(ValueError, match="max_model_len"):
@@ -2326,7 +2329,7 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
     paged = built(False, max_model_len=2051)
     base = DecodeState(kinds, 3, 100, shapes, "cpu", page=PAGE)
     assert not paged.attended_tables() and paged.state.table.blocks is None and paged.state.table.lengths is None
-    assert paged.state.bytes() == base.bytes() == tiny.state_bytes(3, 100, page=PAGE), "a paged state as it was, whatever the maximum length"
+    assert paged.state.bytes() == base.bytes() == tiny.state_bytes(3, 100, page=PAGE), "a paged state without the tables, whatever the maximum length"
     read = built(True, max_model_len=2051)
     table = read.state.table
     assert read.attended_tables() and (tuple(table.blocks.shape), tuple(table.lengths.shape)) == ((4, 36), (100, 4))
@@ -2334,16 +2337,16 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
     assert read.state.bytes() == tiny.state_bytes(3, 100, page=PAGE, max_model_len=2051)
     assert tuple(built(True).state.table.blocks.shape) == (4, 4), "a session that names no maximum length: the pages of its capacity"
     # a session that verifies behind its prompt has two plans: a block of either one that reads the tables builds them
-    for in_prompt in (False, True):
+    for reads in ("plan", "prefill_plan"):
         behind = model_samples.Session(tiny, text, draft_tokens=3, max_model_len=2051, **common)
-        with _a_block_asks_for_a_page(), _a_block_asks_for_a_page(key="torch_ref.attention", tables=not in_prompt):
-            behind.plan = behind._resolve(behind.tokens)
-        with _a_block_asks_for_a_page(), _a_block_asks_for_a_page(key="torch_ref.attention", tables=in_prompt):
-            behind.prefill_plan = behind._resolve(1, state_tokens=behind.tokens)
+        with _a_block_asks_for_a_page():
+            behind.resolve()
+        assert behind.plan["attention.core"] is not behind.prefill_plan["attention.core"] and not behind.attended_tables(), reads
+        getattr(behind, reads)["attention.core"].attended_tables = True  # the core's block of this one plan says so
         behind.reset(fresh=True)
         held = behind.state.table
-        assert behind.attended_tables() and tuple(held.lengths.shape) == (97, 4) and tuple(held.first_token().lengths.shape) == (100, 4), in_prompt
-        assert behind.state.bytes() == tiny.state_bytes(3, 100, 4, page=PAGE, max_model_len=2051), in_prompt
+        assert behind.attended_tables() and tuple(held.lengths.shape) == (97, 4) and tuple(held.first_token().lengths.shape) == (100, 4), reads
+        assert behind.state.bytes() == tiny.state_bytes(3, 100, 4, page=PAGE, max_model_len=2051), reads
     # a block whose calls two rows serve by call site names nothing itself: every part of it is asked
     split = model_samples.Session(tiny, text, max_model_len=2051, **common)
     with _a_block_asks_for_a_page():
@@ -2389,7 +2392,7 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
 
     without = model.memory_bytes(65535, 2051, page=PAGE) + model.state_bytes(65535, 2051, 2, page=PAGE)
     counted = model.memory_bytes(65535, 2051, page=PAGE, max_model_len=4096) + model.state_bytes(65535, 2051, 2, page=PAGE, max_model_len=4096)
-    assert need(False) == need(False, max_model_len=4096) == f"  this stack needs about {without / GIB:.1f}", "no block reads the tables: the sentence it was"
+    assert need(False) == need(False, max_model_len=4096) == f"  this stack needs about {without / GIB:.1f}", "no block reads the tables: none is counted"
     assert need(True, max_model_len=4096) == f"  this stack needs about {counted / GIB:.1f}", "the tables of both sessions, at the run's maximum length"
     assert f"{counted / GIB:.1f}" != f"{without / GIB:.1f}", "two sentences, two figures"
 
