@@ -9078,6 +9078,13 @@ def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypa
         "cudnn.AttentionPrepareDecode writes an attention cache that is a pool of pages of 64 positions; this block is handed pages of 32 positions: "
         "the session's state was built for another plan"
     ), "a pool of pages of another size is not this adapter's either"
+    doubled = DecodeState(model.geometry.layer_kinds, 3, 130, model.state_shapes(), "cpu", page=128).layers[1]
+    with pytest.raises(ValueError) as wrong:
+        block(qkv, doubled, 0, params)
+    assert str(wrong.value) == (
+        "cudnn.AttentionPrepareDecode writes an attention cache that is a pool of pages of 64 positions; this block is handed pages of 128 positions: "
+        "the session's state was built for another plan"
+    ), "nor is a pool of larger pages"
     assert len(calls) == launched, "neither cache was handed to the entry"
     declined = "the attention preparation decode step serves at most 1024 rows (tokens) per call; got 1025"
     with monkeypatch.context() as patched:
@@ -9490,6 +9497,34 @@ def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypa
         stats = keyed(at, value + 3 * (torch_ref.bf16_unit(value) + twin.terms.k_band[at]))
         assert not stats.ok and (stats.outside, stats.keys_outside) == (0, 1) and stats.gates_equal and stats.values_equal and stats.state_equal, name
         assert stats.line().split("; ")[1] == "0 query and 1 key elements outside their band", name
+    # a rotated key element is held to ITS OWN band and to no multiple of it: the first that tells one band from two (a band of half its unit or more),
+    # moved toward zero by whole bf16 units (the unit is then the twin's) -- the most units inside `unit + band` are inside, one more is outside
+    units = torch_ref.bf16_unit(twin.terms.k.double())
+    tells = (twin.terms.k_band >= units / 2) & (twin.terms.k.double().abs() > (3 + torch.floor(twin.terms.k_band / units)) * units)
+    assert tells[..., 64:].sum() == 0 and tells.any(), "a rotated key element whose band tells one band from two"
+    at = tuple(int(i) for i in tells.nonzero()[0])
+    value, unit, band = twin.terms.k[at].double(), float(units[at]), float(twin.terms.k_band[at])
+    most = 1 + int(band // unit)  # the most whole units that stay inside unit + band
+    sign = -1.0 if float(value) > 0 else 1.0
+    inside = keyed(at, value + sign * most * unit)
+    assert inside.ok and inside.keys_outside == 0, "a rotated key element moved by the most units its band admits: inside"
+    one_more = keyed(at, value + sign * (most + 1) * unit)
+    outside = (one_more.outside, one_more.keys_outside)
+    assert not one_more.ok and outside == (0, 1), "a rotated key element one unit past its own band: outside, the band is not doubled"
+    # ... and the same of a rotated QUERY element
+    units = torch_ref.bf16_unit(ref[0].double())
+    tells = (twin.terms.q_band >= units / 2) & (ref[0].double().abs() > (3 + torch.floor(twin.terms.q_band / units)) * units)
+    assert tells[..., 64:].sum() == 0 and tells.any(), "a rotated query element whose band tells one band from two"
+    at = tuple(int(i) for i in tells.nonzero()[0])
+    value, unit, band = ref[0][at].double(), float(units[at]), float(twin.terms.q_band[at])
+    most, sign = 1 + int(band // unit), -1.0 if float(ref[0][at]) > 0 else 1.0
+    moved = ref[0].clone()
+    moved[at] = float(value + sign * most * unit)
+    assert judged(q=moved, pool=ref_after).ok, "a rotated query element moved by the most units its band admits: inside"
+    moved[at] = float(value + sign * (most + 1) * unit)
+    one_more = judged(q=moved, pool=ref_after)
+    outside = (one_more.outside, one_more.keys_outside)
+    assert not one_more.ok and outside == (1, 0), "a rotated query element one unit past its own band: outside, the band is not doubled"
     bit = out[1].clone()
     bit.view(torch.int16)[5, 6143] ^= 1
     stats = judged(gate=bit)
