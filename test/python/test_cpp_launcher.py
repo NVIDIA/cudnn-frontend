@@ -519,6 +519,37 @@ def test_equal_values_of_other_types_are_other_signatures():
     assert len(keys) == 6
 
 
+def test_a_sequence_argument_is_keyed_by_its_values_and_their_types():
+    from cudnn.cpp_launcher import _key
+
+    x = torch.ones(8, device="cuda")
+    sequences = ((256, 256), (256, 128), (256.0, 256.0), (True, 256), [256, 256], (256, (1, 2)), (256, (1, 2.0)))
+    assert len({_key([x, sequence], (), None) for sequence in sequences}) == len(sequences)
+    assert _key([x, (256, 256)], (), None) == _key([x, (256, 256)], (), None)
+    with pytest.raises(TypeError):
+        _key([x, (256, x)], (), None)
+
+
+def test_the_recordings_used_last_are_kept(monkeypatch):
+    from cudnn import cpp_launcher
+
+    monkeypatch.setattr(cpp_launcher, "MAX_RECORDINGS", 2)
+    calls = []
+    api = make_api(calls)
+    first, second, third = (torch.randn(n, device="cuda") for n in (256, 512, 768))
+    for x in (first, second):
+        for _ in range(3):
+            api(x, alpha=1.0)
+    api(first, alpha=1.0)
+    for _ in range(3):
+        api(third, alpha=1.0)
+    recorded = len(calls)
+    api(first, alpha=1.0)
+    assert len(calls) == recorded  # still replayed: the signature dropped was the one used least recently
+    api(second, alpha=1.0)
+    assert len(calls) == recorded + 1
+
+
 def test_verify_mode_checks_every_call(monkeypatch):
     """In verify mode a call is recorded and replayed on copies of its arguments, and has to come out the same."""
     import itertools
@@ -614,7 +645,7 @@ def test_a_shape_that_does_not_repeat_is_only_counted(monkeypatch):
     from cudnn import cpp_launcher
 
     monkeypatch.setattr(cpp_launcher, "HOT_CALLS", 16)
-    monkeypatch.setattr(cpp_launcher, "_key", lambda *a: pytest.fail("a shape seen fewer than 8 times was keyed"))
+    monkeypatch.setattr(cpp_launcher, "signature", lambda *a: pytest.fail("a shape seen fewer than 8 times was keyed"))
     calls = []
     api = make_api(calls)
     for n in range(256, 256 + 3000):
