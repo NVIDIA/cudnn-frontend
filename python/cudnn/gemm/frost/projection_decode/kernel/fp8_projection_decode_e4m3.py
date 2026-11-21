@@ -139,6 +139,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 from cudnn._cutlass_compat import AddressSpace, LayoutEnum
 
@@ -202,6 +203,18 @@ def _store_shared_remote_v4(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@cute.jit
+def _wait_cluster_acquire(mb, parity):
+    """The reduction wait of rank 0: the peers' ``st.async`` complete this CTA's word with ``complete_tx``, a RELEASE at CLUSTER scope,
+    and the ``.acquire.cta`` of ``cute.arch.mbarrier_wait`` does not synchronize with a release by a thread of another CTA, so this
+    CTA's reads of the shipped partial sums were not ordered after the peers' writes.  A relaxed try-wait at CLUSTER scope followed by
+    ``fence.acquire.sync_restrict::shared::cluster.cluster`` acquires at the scope of the release, restricted to the shared::cluster
+    writes the barrier covers (cheaper than ``mbarrier.try_wait.parity.acquire.cluster``)."""
+    while not prims.mbarrier_try_wait_parity(mb, parity, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 class Fp8ProjectionDecodeKernel:
@@ -580,7 +593,7 @@ class Fp8ProjectionDecodeKernel:
                         Int32(OWNER_RANK),
                     )
             else:
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                _wait_cluster_acquire(bar_reduce, 0)
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = rAcc[value_idx] + mailbox[peer * values_per_peer + epi_tid * values_per_thread + value_idx]
