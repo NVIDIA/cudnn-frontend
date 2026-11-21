@@ -39,7 +39,7 @@ All GEMM fusions live under `gemm/`, grouped by operand layout:
 ```
 python/cudnn/gemm/
 ├── cutedsl/
-│   ├── dense/{amax,dsrelu,proj_rope_mxfp8,srelu,swiglu}/
+│   ├── dense/{amax,dsrelu,glu,proj_rope_mxfp8,srelu}/
 │   ├── grouped/{dglu,dsrelu,dswiglu,glu,glu_hadamard,quant,srelu,swiglu,unfused,wgrad}/
 │   └── discrete_grouped/{dswiglu,swiglu}/        # per-expert discrete weight pointers
 ├── ops/                                          # backend-independent torch custom-op contracts
@@ -63,7 +63,7 @@ To add a new frontend-only API, follow these steps:
 - `cudnn.ops.causal_conv1d` (full-sequence forward/backward) and `cudnn.ops.causal_conv1d_update` (one-token mutable update)
 - `GEMM + Amax`
 - `RMSNorm + RHT + Amax`
-- `GEMM + SwiGLU`
+- `GEMM + GLU`
 - `GEMM + sReLU`
 - `GEMM + dsReLU`
 - `Grouped Gemm + GLU (Unified)`

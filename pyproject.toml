@@ -109,7 +109,7 @@ dev = [
     "clang-format==21.1.6",
 ]
 # Per-framework groups for the type-erased CuTeDSL GEMM APIs (JAX is supported
-# by the dense fusions: amax, swiglu, srelu, dsrelu): install with
+# by the dense fusions: amax, glu, srelu, dsrelu): install with
 # `pip install --group torch` / `pip install --group jax`. GPU wheels
 # (torch cuXX, jax[cuda12]/[cuda13]) are left to the user.
 torch = [
