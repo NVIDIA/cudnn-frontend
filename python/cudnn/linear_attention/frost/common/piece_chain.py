@@ -68,7 +68,9 @@ DV_SPLIT_TILES = 2
 # What a GDN forward chain costs against the plan it replaces, in units of the uncut prefill (``chain_pays``, ``chain_group_pays``).
 CHAIN_PASSES_PCT = 218
 CHAIN_FIXED_TOKENS = 1620
-CHAIN_TAIL_FIXED_TOKENS = 2300
+# The fixed part of a chain tail, in tokens of the uncut prefill: what the tail's prologue, state chain and launches cost beside the
+# leftover round it replaces.  A tail of ``p`` slots is taken from a mean of ``100 * p * CHAIN_TAIL_FIXED_TOKENS / (100 * p - CHAIN_PASSES_PCT)`` tokens.
+CHAIN_TAIL_FIXED_TOKENS = 2239
 CHAIN_GROUP_TILE_TOKENS = 7
 DV_SPLIT_CHUNK_PCT = 86
 
