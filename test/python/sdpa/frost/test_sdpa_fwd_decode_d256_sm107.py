@@ -2788,7 +2788,7 @@ def test_decode_64_column_tile_wide_output_replays(dtype):
     try:
         o = torch.empty_strided((B, SQ, H, D), (batch_stride, H * D, D, 1), device="cuda", dtype=dtype)
     except torch.OutOfMemoryError:
-        return pytest.skip("wide output stride storage unavailable at allocation")
+        raise pytest.skip.Exception("wide output stride storage unavailable at allocation") from None
     lse = torch.empty(B, H, SQ, device="cuda")
     seq_kv = torch.tensor([129, 65, 1, 0], device="cuda", dtype=torch.int32)
     qv, kv, vv, ov = (t.transpose(1, 2) for t in (q, k, v, o))
