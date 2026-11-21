@@ -9,10 +9,13 @@ its slot budget is exactly two.  A plan that runs ONE sequence uncut whatever it
 which it neither chains nor carries a chain group.  ``batch_invariant`` never splits.
 
 The byte tests call the public ops: the in-place call against its ``batch_invariant`` twin on the same operands, which runs
-the uncut plan at these lengths, and against the fp64 recurrence.  Equal bytes cannot tell which plan ran and the ops report
-no plan, so the plan tests read the plan object the engine builds for a graph node: its thread blocks per tile, and that
-those of a split fit in one wave.  They compile and launch nothing.  Lengths and expectations come from the package's own
-piece rule, so a change of its constants moves these tests with it."""
+the uncut plan at these lengths, bit for bit; output and final state also against the fp64 recurrence, except in the
+state-pool tests, which compare bytes only.  Equal bytes cannot tell which plan ran and the ops report no plan, so the plan
+tests read the plan object the engine builds for a graph node: its thread blocks per tile, and that those of a split fit in
+one wave.  They compile and launch nothing.  Expectations are computed from the package's own piece rule and from that fit,
+and every length that stands beside one of the rule's thresholds comes from its constants or from the rule itself, so a
+change of those constants moves these tests with it.  The L0 shapes below one chunk, one token past a chunk, over several
+chunks and of the state pool are counted in the suite's chunk size, as are the edges of one chunk in the length sweeps."""
 
 import pytest
 import torch
@@ -25,7 +28,7 @@ from cudnn.linear_attention.frost.common.piece_chain import (
     DV_SPLIT_TILES,
     LENGTH_RULE_PIECE_TOKENS,
     choose_pieces,
-    is_dv_split,
+    piece_budget,
     ragged_pieces,
 )
 from determinism_utils import assert_bitwise, snapshot
@@ -58,19 +61,21 @@ def takes_the_split(
     summary=False,
 ):
     """Whether the plan of one call runs two thread blocks per tile on ``num_sm`` SMs, by the package's own piece rule.  A plan
-    that neither chains nor is ``batch_invariant`` answers the slot-budget rule (``is_dv_split`` without ``uncut``); one
-    in-place sequence at the split's value width that carries no chain group also splits wherever two thread blocks per head
-    fit in one wave.  A summary node has no in-place form."""
+    that neither chains nor is ``batch_invariant`` splits, at the split's value width, where its slot budget is the split's
+    thread blocks per tile; one in-place sequence that carries no chain group also splits wherever two thread blocks per
+    head fit in one wave.  A summary node has no in-place form."""
     heads_out, tokens = max(heads, value_heads), sum(lengths)
     shape = dict(num_seqs=len(lengths), heads_out=heads_out, num_sm=num_sm, total_tokens=tokens, b_t=CHUNK, expand_num=householders)
     pieces, unit_chunks = choose_pieces(**shape, cadence_tokens=cadence, batch_invariant=batch_invariant)
     if pieces or batch_invariant:
         return False
-    if is_dv_split(**shape, dim_v=value_dim, unit_chunks=unit_chunks):
+    if value_dim != WIDTH:
+        return False
+    if piece_budget(**shape, unit_chunks=unit_chunks) == DV_SPLIT_TILES:
         return True
     one_wave = DV_SPLIT_TILES * heads_out <= num_sm
     chain_group = ragged_pieces(heads_out=heads_out, num_sm=num_sm, total_tokens=tokens)
-    return in_place and not summary and len(lengths) == 1 and value_dim == WIDTH and one_wave and not chain_group
+    return in_place and not summary and len(lengths) == 1 and one_wave and not chain_group
 
 
 def build_plan(
