@@ -2479,3 +2479,50 @@ def test_the_rows_part_of_a_run_and_its_clause_in_every_form_of_the_sentence(mon
         ", 0.00 GiB of it for the checks (what they hold for the 84 sequences beyond the first); 6.0 GiB are free"
     )
     assert plan.memory(4 * GIB, "", 0, 0, beyond) == "this stack needs about 4.0 GiB on this GPU; 6.0 GiB are free", "no byte of the checks: no clause"
+
+
+def test_an_override_takes_the_row_of_the_runs_stack_where_it_names_the_same_call(monkeypatch, capsys):
+    """``--provider BLOCK=KEY`` selects the first declared row of the key that serves the run -- and, where that row is of
+    another stack, the row of the run's own stack that names the same call: equal in every field but its stacks and its
+    printed reason.  The attention core has such a pair: on the target stacks the override plans their row, with the
+    reason of a chain that reads the attention cache.  A row of the run's stack that differs in anything else is another
+    call and is not taken: the fused step selected on a target stack is still the form of ``fe-cublas``."""
+    from dataclasses import replace
+
+    from model_samples.blocks import ProviderRow, select_row
+    from model_samples.qwen_dense import QwenDense
+
+    model = QwenDense.reduced(2)
+    core = model.provider_table["attention.core"]
+    pool, plain = "reference chain over the attention cache", "reference chain over a plain per-layer cache"
+    assert [(row.key, row.fallback) for row in core] == [("torch_ref.attention", plain), ("torch_ref.attention", pool)], "one call on two rows"
+    for stack, reason in (("fe-entries", pool), ("native", pool), ("fe-cublas", plain), ("reference", plain)):
+        row = select_row("attention.core", core, _facts(), 1, 1, stack, key="torch_ref.attention", model=model)
+        assert row.fallback == reason and stack in row.stacks, f"{stack}: the row of the stack that runs"
+        assert row is select_row("attention.core", core, _facts(), 1, 1, stack, model=model), f"{stack}: the row the stack plans without the override"
+        planned = _plan(stack=stack, overrides={"attention.core": "torch_ref.attention"})
+        assert planned.rows["attention.core"] is row
+        printed = [line for line in planned.table().splitlines() if line.split()[:1] == ["attention.core"]]
+        assert len(printed) == 1 and printed[0].endswith(f"fallback: {reason}"), printed
+    with pytest.raises(AssertionError, match="reached a load"):  # ... and through the sample's own main(), to the table it prints
+        _sample_main(monkeypatch, capsys, ["--stack", "fe-entries", "--provider", "attention.core=torch_ref.attention"])
+    printed = [line for line in capsys.readouterr().err.splitlines() if line.split()[:1] == ["attention.core"] and "fallback: " in line]
+    assert len(printed) == 1 and printed[0].endswith(f"fallback: {pool}"), "the served-by table the run prints before its first load"
+    # the fused step has the key on a row of fe-cublas and, in another form, on a row of the target stacks: the first declared row wins
+    step = model.provider_table["linear_attention.step"]
+    for stack in ("native", "fe-entries"):
+        row = select_row("linear_attention.step", step, _facts(), 1, 1, stack, key="fe.gdn_decode_fused", model=model)
+        assert row.stacks == ("fe-cublas",) and dict(row.form) == {"PDL": False, "PDL_RELEASE": False}, f"{stack}: the form of fe-cublas"
+        own = select_row("linear_attention.step", step, _facts(), 1, 1, stack, model=model)
+        assert own.key == row.key and dict(own.form) == {"PDL": True, "PDL_RELEASE": True}, "the stack's own row is another form of the entry"
+    # on a constructed table: only a row that differs in its stacks and its reason alone is the same call
+    first = ProviderRow(("any",), (1, None), (1, None), "fe.gdn_decode_fused", "fe-cublas", serves="any", fallback="one reason", form=(("PDL", False),))
+    same = replace(first, stack=("native", "fe-entries"), fallback="another reason")
+
+    def chosen(*rows, stack="native"):
+        return select_row("a block", rows, _facts(), 1, 1, stack, key="fe.gdn_decode_fused")
+
+    assert chosen(first, same) is same and chosen(same, first, stack="fe-cublas") is first, "the row of the stack that runs, in either order"
+    assert chosen(first, same, stack="reference") is first, "a stack with no row of the key: the first declared row"
+    for field, value in (("form", (("PDL", True),)), ("sequences", (1, 8)), ("band", "bf16_rounding"), ("serves", "rows 1-8"), ("classes", ("cc10.x",))):
+        assert chosen(first, replace(same, **{field: value})) is first, f"a row of the stack with another {field}: another call"

@@ -32,7 +32,7 @@ This module imports nothing beyond the standard library: a plan on stated device
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
 from .census import Kernel
@@ -449,7 +449,13 @@ def select_row(
     block: str, rows: Sequence[ProviderRow], facts: DeviceFacts, sequences: int, tokens: int, stack: str, key: Optional[str] = None, model=None
 ) -> ProviderRow:
     """The row that serves ``block`` in this run: the first match of the stack's rows, or of the rows with ``key``.  A row
-    that names layer widths matches the ``model`` that has them."""
+    that names layer widths matches the ``model`` that has them.
+
+    A key is by stack only between rows that name the same call.  Where the first match of a key is a row of another
+    stack and the run's own stack has a row that is that row in every field but its stacks and its printed reason,
+    the stack's row is taken: the call is the same, and the reason printed is the one of the stack that runs.  A row
+    of the run's stack that differs in anything else -- the form of the entry, a range -- is another call and is not
+    taken: the first declared row of the key still wins there."""
     if key is not None:
         candidates = [r for r in rows if r.key == key]
         if not candidates:
@@ -460,6 +466,8 @@ def select_row(
             raise NotImplementedError(f"block {block} has no provider row in stack {stack}")
     for row in candidates:
         if row.serves_class(facts.cc) and row.serves_model(model) and row.serves_run(sequences, tokens):
+            if key is not None and stack not in row.stacks:  # the same call on a row of the run's own stack: that row
+                return next((own for own in candidates if stack in own.stacks and replace(own, stack=row.stack, fallback=row.fallback) == row), row)
             return row
     first = candidates[0]
     if tokens > 1:  # a step of several tokens per sequence: a decline is named by the block's rows for such a step, where it has some
