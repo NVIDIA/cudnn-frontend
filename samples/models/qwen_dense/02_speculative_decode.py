@@ -473,6 +473,16 @@ def main(argv=None) -> int:
             limit, note = serving_options.new_tokens(request, int(ids.numel()), args.max_model_len, flag, args.force_tokens, args.limit_flag)
             if note:
                 _say(f"{TAG} {note}")
+            # a verify step writes a row for every drafted token: the last step of a request writes drafted - 1 rows behind its last new token
+            behind = drafted - 1
+            reach, room = int(ids.numel()) + limit + behind, args.max_model_len - int(ids.numel()) - behind
+            if reach > args.max_model_len:
+                fewer = f"ask for at most {room:,} new tokens, or " if room >= 1 else ""
+                raise ValueError(
+                    f"{request.shown}: {int(ids.numel()):,} prompt tokens + {limit:,} new tokens + {behind} position{'s' if behind > 1 else ''} that "
+                    f"the last verify step of {drafted} drafted tokens writes behind them are {reach:,} positions and --max-model-len is "
+                    f"{args.max_model_len:,}; {fewer}raise --max-model-len"
+                )
             sets.append((ids, seconds, StopRule(text.eos_ids, max_new_tokens=limit, force_tokens=args.force_tokens)))
     except ValueError as error:  # a template that refuses its messages or renders them to nothing; a request beyond the context
         _say(f"{TAG} ERROR {error}")
@@ -485,6 +495,7 @@ def main(argv=None) -> int:
         overrides=overrides,
         reference_precision=args.reference_precision,
         capacity=max(int(ids.numel()) + rule.limit for ids, _, rule in sets) + drafted - 1,
+        max_model_len=args.max_model_len,
         check_kernels=args.check_kernels,
     )
     # the plain session loads: it is handed the checkpoint.  It makes the token stream of a seeded run and is what every run is compared with

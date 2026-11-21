@@ -649,6 +649,7 @@ def main(argv=None) -> int:
             overrides=overrides,
             reference_precision=args.reference_precision,
             capacity=max(_positions(args, int(prompts[0].numel()), rule) for prompts, _, rule in prompt_sets),
+            max_model_len=args.max_model_len,
             checkpoint=checkpoint,
             share=runs[0][0] if runs else None,
             record_steps=_record_steps(real, args.perf),

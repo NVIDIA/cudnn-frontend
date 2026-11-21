@@ -2197,6 +2197,29 @@ TABLE_CASES = (
 )
 
 
+def test_a_session_holds_the_runs_maximum_length_and_hands_it_to_every_block_of_its_plans():
+    """``Session(max_model_len=)`` is the positions a sequence of the run may reach at most.  Left out it is the session's
+    capacity; below the capacity it is a ``ValueError`` that names both; so is a value that is no whole number from 1.
+    Every block of every plan of the session is handed it in its options."""
+    from model_samples import Session, TextIO
+
+    model = _tiny_model()
+    text = TextIO.synthetic(model.geometry.vocab)
+    common = dict(stack="reference", device="cpu", capacity=40)
+    assert Session(model, text, **common).max_model_len == 40, "left out: the capacity"
+    assert Session(model, text, max_model_len=40, **common).max_model_len == 40, "a maximum that is the capacity"
+    session = Session(model, text, draft_tokens=3, max_model_len=2051, **common)
+    session.resolve()
+    handed = [block.options["max_model_len"] for plan in (session.plan, session.prefill_plan) for *_, block in plan.parts()]
+    assert session.max_model_len == 2051 and handed and set(handed) == {2051}, "the blocks of the verify plan and of the prompt's"
+    with pytest.raises(ValueError, match="max_model_len") as below:
+        Session(model, text, max_model_len=39, **common)
+    assert "39" in str(below.value) and "40" in str(below.value), "the maximum and the capacity are both named"
+    for wrong in (0, -2051, 2051.0, True, "2051"):
+        with pytest.raises(ValueError, match="max_model_len"):
+            Session(model, text, max_model_len=wrong, **common)
+
+
 def test_the_page_table_and_the_lengths_of_a_paged_state():
     """What a kernel that reads a paged cache is handed beside the pool, built with a state that is given the run's
     maximum length (``DecodeState(max_model_len=)``).  ``blocks`` int32 ``[sequences + 1, width]``: row ``i`` names the pages

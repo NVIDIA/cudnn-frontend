@@ -159,6 +159,7 @@ class Session:
         tokens: int = 1,
         draft_tokens: Optional[int] = None,
         drafter=None,
+        max_model_len: Optional[int] = None,
     ):
         """``capacity`` is the number of positions (prompt + new tokens) a sequence may reach.  ``checkpoint`` defaults to the
         model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
@@ -180,7 +181,11 @@ class Session:
         ``QwenDenseDrafter``), the drafter's: the session then runs its passes (``speculate``).  A drafter needs
         ``draft_tokens`` and serves one sequence.  It drafts for this session's weights and widths: a checkpoint's
         drafter is refused where the session that loads was handed none (its weights are seeded), one of another
-        model's widths by the first width that differs -- each a ``ValueError`` here, before anything is planned."""
+        model's widths by the first width that differs -- each a ``ValueError`` here, before anything is planned.
+        ``max_model_len`` is the positions a sequence of the run may reach at most, the context length a serving engine
+        is started with: a constant of the run, which every block of the session's plans is handed in its options.  Left
+        out it is ``capacity``; below ``capacity`` it is a ``ValueError``: no step of the session writes a position past
+        it."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if on_demand is not None and (share is None or stack != REFERENCE):
@@ -194,6 +199,14 @@ class Session:
             raise ValueError(f"a session needs at least one sequence; got {sequences}")
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1:
             raise ValueError(f"a session's step feeds at least one token per sequence; got tokens={tokens!r}")
+        if max_model_len is not None:
+            if isinstance(max_model_len, bool) or not isinstance(max_model_len, int) or max_model_len < 1:
+                raise ValueError(f"max_model_len is the positions a sequence of the run may reach at most: a whole number from 1; got {max_model_len!r}")
+            if max_model_len < int(capacity):
+                raise ValueError(
+                    "max_model_len is the positions a sequence of the run may reach at most, and this session is built for "
+                    f"capacity={int(capacity)} positions per sequence; got max_model_len={max_model_len}"
+                )
         if draft_tokens is not None:
             if isinstance(draft_tokens, bool) or not isinstance(draft_tokens, int) or draft_tokens < 1:
                 raise ValueError(
@@ -232,6 +245,7 @@ class Session:
         self.draft_weights = None
         self.device = torch.device(device)
         self.overrides, self.reference_precision, self.capacity = dict(overrides or {}), reference_precision, int(capacity)
+        self.max_model_len = self.capacity if max_model_len is None else max_model_len  # of the run: what a kernel that is told a maximum length is told
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
         self.record_steps = self.capacity if record_steps is None else max(1, min(int(record_steps), self.capacity))
         self.check_kernels = bool(check_kernels) or stack in getattr(model, "target_stacks", ())
@@ -280,6 +294,7 @@ class Session:
             "device": str(self.device),
             "check_kernels": self.check_kernels,
             "merge_rule": self.merge_rule,
+            "max_model_len": self.max_model_len,
             **more,
         }
         facts = self.device if self.device.type == "cuda" else blocks.DeviceFacts((0, 0), "cpu")

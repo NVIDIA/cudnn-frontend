@@ -1724,6 +1724,42 @@ def test_a_request_beyond_the_context_is_an_error_before_the_load(tmp_path, monk
     assert "served by (decided before the load" in err and err.index("[00] first token: ") < err.index("served by (decided before the load")
 
 
+def test_both_scripts_hand_the_context_length_to_every_session_they_build(monkeypatch, capsys):
+    """``--max-model-len`` is a constant of the run: every session a script builds is handed it (``Session(max_model_len=)``),
+    the default and a typed one.  The speculative script builds its sessions for the positions its last verify step
+    writes, which lie behind the last new token: a request whose step would write past the context length is one
+    ``[02] ERROR`` line before anything is planned, and one that just fits reaches the load."""
+    import serving_options
+
+    model_samples = importlib.import_module("model_samples")
+    for script in ("00_decode.py", "02_speculative_decode.py"):
+        with monkeypatch.context() as patched:
+            sample = _sample_on_the_cpu(patched, loads=False, script=script)
+            through, built = model_samples.Session, []
+            patched.setattr(model_samples, "Session", lambda model, text, **options: built.append(through(model, text, **options)) or built[-1])
+            for typed, length in (([], serving_options.MAX_MODEL_LEN), (["--max-model-len", "300"], 300)):
+                built.clear()
+                with pytest.raises(AssertionError, match="reached a load"):
+                    sample.main(["--stack", "reference", *typed])
+                assert len(built) == 2 and {session.max_model_len for session in built} == {length}, (script, typed)
+            capsys.readouterr()
+            if script.startswith("02"):  # its sessions hold more positions than the prompt and its new tokens
+                fits = max(session.capacity for session in built)
+                with pytest.raises(AssertionError, match="reached a load"):
+                    sample.main(["--stack", "reference", "--max-model-len", str(fits)])
+                assert {session.max_model_len for session in built[-2:]} == {fits} and "ERROR" not in capsys.readouterr().err
+                code = sample.main(["--stack", "reference", "--max-model-len", str(fits - 1)])
+                out, err = capsys.readouterr()
+                last = err.splitlines()[-1]
+                assert code == 1 and out == "" and "served by" not in err and last.startswith("[02] ERROR the seeded prompt: "), err[-600:]
+                assert f"are {fits} positions and --max-model-len is {fits - 1}" in last and last.endswith("or raise --max-model-len"), last
+                (most,) = re.findall(r"ask for at most (\d+) new tokens", last)  # the fix the line names is one that fits, and the largest
+                with pytest.raises(AssertionError, match="reached a load"):
+                    sample.main(["--stack", "reference", "--max-model-len", str(fits - 1), "--force-tokens", most])
+                assert sample.main(["--stack", "reference", "--max-model-len", str(fits - 1), "--force-tokens", str(int(most) + 1)]) == 1
+                capsys.readouterr()
+
+
 def test_the_family_readme_says_of_a_request_what_the_data_and_the_run_say():
     """The section "Coming from a serving engine": the table of fields that would change the output is the data, row for
     row; every other field the sample answers is named; the lines the README quotes are the lines a run prints; and the
