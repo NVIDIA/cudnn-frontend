@@ -4304,14 +4304,18 @@ tree that holds the set: `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" p
 `test_inputs_are_unmodified` 1, `test_one_element_moves_only_its_own_row` 1, `test_the_row_ceiling_call` 1 (measured: 22 rows
 compared alone against the 1024-row call: rows 0, 511, 512, 1023 and both sides of every multiple of 148 SMs),
 `test_row_ceiling_is_the_typed_decline` 1, `test_golden` 2.
-`pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 140 passed, 1 skipped: the module 135 passed and 1
+`pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 144 passed, 1 skipped: the module 139 passed and 1
 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices are required" -- one
-device is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the symbol-prefix test 5
-passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 9 of 9 cells (one kernel
-per call; grid `(rows, 1, 1)`, block `(1024, 1, 1)`, 128 B of shared memory).  The module's case behind a predecessor that released
-early (`test_wait_holds_every_read_behind_a_predecessor_that_released_early`) compared 8 of 8 launches of the step equal to the plain
+device is visible, so a launch on a device that is not the caller's current one is not covered on cc 10.0; a host case holds, on
+stand-ins, that the compile and the launch run inside the scope of the entry's device), the symbol-prefix test 5 passed.  The
+module's launch-facts case compared the profiler's record of a launch with the entry's facts in 9 of 9 cells (one kernel per call;
+grid `(rows, 1, 1)`, block `(1024, 1, 1)`, 128 B of shared memory).  The module's case behind a predecessor that released early
+(`test_wait_holds_every_read_behind_a_predecessor_that_released_early`) compared 8 of 8 launches of the step equal to the plain
 step, behind its positive control: a dependent without a wait read other bytes than the written ones in 4 of 4 eager launches and 4
-of 4 replays.  On a part where that control does not reproduce the case skips -- a coverage gap, not a pass.  The reference cases
+of 4 replays.  The module's case for the release in front of the wait
+(`test_release_reaches_a_dependent_while_the_predecessor_still_runs`) read the step's own dependent starting while the step's
+predecessor still ran in 4 of 4 eager launches and 4 of 4 replays, behind its control (4 and 4).  On a part where such a control
+does not reproduce the case skips -- a coverage gap, not a pass.  The reference cases
 found no differing byte: every code and every scale bit of the random and structured rows at 1 .. 1024 rows, and the scale and the
 codes of all 32,640 finite bf16 magnitudes as a row maximum.  Rows with a NaN or an infinity are outside the status; what they held
 on this run is reported by the module, not asserted: a row with an infinity had an infinite scale, the codes of signed zeros and the
@@ -4321,8 +4325,10 @@ unchanged.
 CUDA 12.9 compiler flavour on the same part and runtime (the CuTe DSL 4.8.0 install without its CUDA 13 toolchain libraries, so the
 DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL compatibility and is not a
 CUDA 12 runtime): the strict check -> 17 passed against the SAME golden set (the compiler flavour is not part of the runtime key, and
-the bytes are equal); the functional module with the symbol-prefix test -> 139 passed, 2 skipped (the two-device case, and the
-`sm_107a` rendering case: that flavour does not assemble the target, which is the entry's own typed decline on cc 10.7).
+the bytes are equal); the functional module with the symbol-prefix test -> 143 passed, 2 skipped (the two-device case, and the
+`sm_107a` rendering case: that flavour does not assemble the target, which is the entry's own typed decline on cc 10.7); the two
+dependent-launch cases compared as under CUDA 13.4 (8 of 8 launches equal; the release read in 4 of 4 eager launches and 4 of 4
+replays, each behind its control).
 
 ### QSA: 42 cases
 
