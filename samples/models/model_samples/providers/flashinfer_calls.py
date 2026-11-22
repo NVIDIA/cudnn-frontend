@@ -48,6 +48,7 @@ is raised as it is.
 from __future__ import annotations
 
 import importlib.metadata as metadata
+import os
 from typing import Optional
 
 from ..census import Kernel
@@ -56,7 +57,8 @@ from . import PYTORCH_CHAIN, BlockBase
 
 #: the distribution these adapters import, and the versions of it this area has validated: those the launch records of the
 #: family's kernel census were recorded with.  ``samples/models/constraints-native.txt`` pins the same; a host test holds
-#: the three to each other
+#: the three to each other.  The one pin that is not a version of that record is the library's kernel-binary package
+#: below: it joined the list when its files were held to the files the record's runs read
 DISTRIBUTION = "flashinfer-python"
 VALIDATED = ("0.7.2.post1",)
 REQUIREMENTS = "samples/models/requirements-flashinfer.txt"
@@ -69,6 +71,19 @@ FP4_OPERATION = "fp4_gemm"
 #: chosen the kernel (a row says False: the library's untuned pick)
 MM_FP4_FORM = ("BACKEND", "TUNED")
 BMM_FP8_FORM = ("BACKEND",)
+#: the library's kernel-binary package: its distribution, the module the library looks for, its requirement file and the
+#: index its versions are published on.  The library reads a package of its OWN version alone, so the validated version
+#: of the package is the library's (``VALIDATED``); the constraints file pins it beside the library
+BINARIES_DISTRIBUTION = "flashinfer-cubin"
+BINARIES_MODULE = "flashinfer_cubin"
+BINARIES_REQUIREMENTS = "samples/models/requirements-flashinfer-cubin.txt"
+BINARIES_INDEX = "https://flashinfer.ai/whl"
+#: the command that installs that package at the validated version: the index is named for this one command alone
+BINARIES_INSTALL = f"pip install --no-deps --index-url {BINARIES_INDEX} -c {CONSTRAINTS} -r {BINARIES_REQUIREMENTS}"
+#: the two variables of the library these adapters read or set: the directory it reads kernel binaries from in the place
+#: of its package, and its switch against downloading one (any text that is not empty refuses)
+BINARIES_DIRECTORY = "FLASHINFER_CUBIN_DIR"
+NO_DOWNLOAD = "FLASHINFER_NO_DOWNLOAD"
 
 
 def installed() -> Optional[str]:
@@ -93,6 +108,15 @@ def check_package(entry: str) -> str:
     return version
 
 
+def refuse_downloads() -> None:
+    """Switch the library's own download of kernel binaries off for this process and for every process it starts: the
+    variable the library reads at every load, set where the environment does not hold it or holds it empty (the library
+    tests the text's truth).  A run then reads kernel binaries from the package or from a directory filled beforehand, and
+    a file that is not there is the library's refusal, never a fetch."""
+    if not os.environ.get(NO_DOWNLOAD):
+        os.environ[NO_DOWNLOAD] = "1"
+
+
 class LibraryBlock(BlockBase):
     """An adapter to a FlashInfer multiply on the stored format of its weight: what the three share.  A subclass names the
     fields of its row's form (``fields``), makes the call (``__call__``; it notes what it passed: ``_served``) and builds
@@ -109,7 +133,10 @@ class LibraryBlock(BlockBase):
     _scalars = None  # (value, device) -> the one-element fp32 tensor a call reads: built once per value, never inside a later step
 
     def _library(self):
-        import flashinfer  # on a device only: a plan on stated device facts never comes here
+        """The library, imported on a device only (a plan on stated device facts never comes here) -- and never before its
+        download of kernel binaries is switched off for the process: the one place every row reaches the library."""
+        refuse_downloads()
+        import flashinfer
         import flashinfer.autotuner  # noqa: F401 -- the tuner's state is read through the package (``_tuned``)
 
         return flashinfer

@@ -49,6 +49,10 @@ does not hold is printed as not known and ignored, so a new name for one of them
      file of a real checkpoint; tests generate what they read.
    - A third-party provider may build its own kernels at its first use; a sample makes that first use while the run is
      planned, before anything is loaded, and says so in one line.
+     A provider's precompiled kernel binaries are not built: they come from a package of that provider at a pinned
+     version (`constraints-native.txt`) or from a directory the user filled beforehand, never from a fetch inside a run
+     -- a sample switches the provider's own download off before its first use, and a binary that is not on the machine
+     is a `SKIP` that names what is missing and the fix.
 6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `native` is
    the target kernel set of the family's census; `fe-entries` is its cuDNN Frontend rows with every other block on a
    fallback row, so it runs without further packages. `--stack reference` reports `[NN] RAN reference stack (no provider
@@ -116,6 +120,10 @@ does not hold is printed as not known and ignored, so a new name for one of them
     (`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the
     versions the launch records of the family's census were recorded with. The maintainers of this area own that list; a
     version joins it with a recorded run, never with an update of the pin alone.
+    The one pin that is not a version of that record is the library's kernel-binary package
+    (`requirements-flashinfer-cubin.txt`): the record's runs read kernel binaries the library had fetched, and the
+    package joined the list when its files were held byte for byte to those files and a run on it launched the recorded
+    kernels in the recorded launch shapes (the census names that run: `validated.kernel_binaries`).
 13. **The report's GPU side comes from kernel activity records, never from a pair of CUDA events** (a pair spans every
     host wait). The traced pass (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler; a step
     ends at its one host read, and a block that reads the device shows as an extra step, which the pass reports. Only the

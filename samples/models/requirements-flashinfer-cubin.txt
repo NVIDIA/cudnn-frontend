@@ -1,0 +1,12 @@
+# Sample-only dependency; not part of cudnn-frontend's runtime package and not needed by any default run.
+# Needed only for the stack `native` of a model sample (--stack native) on compute capability 10.x: the attention core of
+# the target kernel set is FlashInfer's paged decode attention, whose kernels are precompiled binaries. This package
+# holds them. FlashInfer reads it only at its own version, and a sample never lets the library fetch a kernel binary:
+# without the package (and without a directory of kernel binaries filled beforehand) the run is a SKIP that names it.
+# A lower bound, no pin; samples/models/constraints-native.txt holds the validated version as an exact pin. This version
+# is published on the library's release index and not on PyPI, so the index is named on the command, for this one
+# package (install with both files):
+#   pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt
+# Nothing of it is fetched at run time (the family README of a sample: "What the first run does").
+# Validated with: flashinfer-cubin 0.7.2.post1
+flashinfer-cubin>=0.7.2.post1

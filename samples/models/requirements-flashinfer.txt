@@ -5,7 +5,9 @@
 # A lower bound, no pin. The adapters run on a validated version alone (samples/models/constraints-native.txt holds the
 # validated versions as exact pins; install with both files):
 #   pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt
-# FlashInfer builds its kernels at its first use and needs the CUDA compiler and ninja for that (the family README of a
-# sample: "What the first run does").
+# FlashInfer builds the kernels of its multiplies and the launcher of its attention at its first use and needs the CUDA
+# compiler and ninja for that; the kernels of its attention are precompiled binaries it reads from its kernel-binary
+# package (samples/models/requirements-flashinfer-cubin.txt), never built and never fetched by a run (the family README
+# of a sample: "What the first run does").
 # Validated with: flashinfer-python 0.7.2.post1
 flashinfer-python>=0.7.2.post1

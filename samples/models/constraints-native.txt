@@ -2,7 +2,11 @@
 # The versions the launch records of a family's kernel census were recorded with (kernel_census.json: validated.recorded).
 # The library's own pick of a kernel is data of these versions, so the adapters run on a validated version alone.
 # The maintainers of this area own this list: a version joins it with a recorded run, never with an update of a pin alone.
+# The one pin that is not a version of that record is the library's kernel-binary package, the last line: the record's
+# runs read kernel binaries the library had fetched, and the package joined when its files were held byte for byte to
+# those files and a run on it launched the recorded kernels in the recorded launch shapes (validated.kernel_binaries).
 torch==2.14.0
 nvidia-cutlass-dsl==4.8.0
 flashinfer-python==0.7.2.post1
 apache-tvm-ffi==0.1.11
+flashinfer-cubin==0.7.2.post1

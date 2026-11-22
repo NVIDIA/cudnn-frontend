@@ -8763,12 +8763,16 @@ def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypa
         ), (wrong.__name__, adapter)
 
 
-def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(monkeypatch):
+def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(monkeypatch, tmp_path):
     """FlashInfer is an optional package of the stack ``native`` alone, at validated versions.  The version check reads the
     distribution's metadata and names the version, the command and the stack that runs without the package.  The
     requirement file is a lower bound at the validated version; the constraints file pins what the census was recorded
-    with; the adapter's list is the same; none of them names Triton.  And the sentences that state this policy are in the
-    area's guide and READMEs as they were agreed."""
+    with; the adapter's list is the same; none of them names Triton.  The library's kernel-binary package has a
+    requirement file of its own, a lower bound without an index line, and is the one pin that is no version of the
+    record: the census names it under a key of its own, at the library's version.  A run never lets the library fetch a
+    kernel binary: every adapter reaches the library through one import, and the library's download is switched off
+    before it -- where the environment does not hold the variable and where it holds it empty; a text that is set
+    stays.  And the sentences that state this policy are in the area's guide and READMEs as they were agreed."""
     from model_samples import providers
     from model_samples.providers import ENTRY_NAMES, KEYS, flashinfer_calls
     from model_samples.qwen_dense import QwenDense
@@ -8806,8 +8810,37 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     pins = dict(line.split("==") for line in constraints if not line.startswith("#"))
     census_versions = QwenDense.target().data["validated"]["recorded"]
     recorded = {name: version for name, version in census_versions.items() if name != "triton"}
-    assert "triton" in census_versions and pins == recorded, "the constraints are the versions the census was recorded with, without Triton: nothing calls it"
+    # ... and the one pin that is no version of that record: the library's kernel-binary package, under a key of its own
+    binaries = QwenDense.target().data["validated"]["kernel_binaries"]
+    package = {name: version for name, version in binaries.items() if name != "joined"}
+    assert package == {flashinfer_calls.BINARIES_DISTRIBUTION: VALIDATED_LIBRARY} and flashinfer_calls.BINARIES_DISTRIBUTION not in census_versions
+    assert set(binaries["joined"]) == {"date", "gpu", "files", "run"}, "the key names what the package joined the list on"
+    assert "triton" in census_versions and pins == {
+        **recorded,
+        **package,
+    }, "the constraints: the recorded versions without Triton, which nothing calls, and the package"
     assert pins["flashinfer-python"] == VALIDATED_LIBRARY and not any("triton" in line.lower() for line in requirements + constraints)
+    binaries_file = (root / flashinfer_calls.BINARIES_REQUIREMENTS).read_text().splitlines()
+    assert [line for line in binaries_file if not line.startswith("#")] == [
+        f"flashinfer-cubin>={VALIDATED_LIBRARY}"
+    ], "a lower bound, never a pin, and no index line"
+    assert f"# Validated with: flashinfer-cubin {VALIDATED_LIBRARY}" in binaries_file and f"#   {flashinfer_calls.BINARIES_INSTALL}" in binaries_file
+    assert flashinfer_calls.BINARIES_INSTALL == (
+        "pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt"
+    ), "the index is named on the command, for this one package"
+    # the refusal, through the adapters' own import of a package of the library's name that notes what it finds at its import
+    package = tmp_path / "flashinfer"
+    package.mkdir()
+    (package / "__init__.py").write_text(f"import os\nFOUND = os.environ.get({flashinfer_calls.NO_DOWNLOAD!r})\n")
+    (package / "autotuner.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for held, found in ((None, "1"), ("", "1"), ("0", "0")):
+        for name in ("flashinfer", "flashinfer.autotuner"):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+        monkeypatch.delenv(flashinfer_calls.NO_DOWNLOAD, raising=False)
+        if held is not None:
+            monkeypatch.setenv(flashinfer_calls.NO_DOWNLOAD, held)
+        assert flashinfer_calls.LibraryBlock._library(None).FOUND == found, f"the variable {held!r} in the environment: the library finds {found!r}"
     # the keys of the library's rows, and what the list of keys says about itself
     assert set(ENTRY_NAMES) == set(KEYS) and {key: entry for key, entry in ENTRY_NAMES.items() if "flashinfer" in key} == {
         "flashinfer.mm_fp4": "flashinfer.gemm.mm_fp4",
@@ -8833,6 +8866,23 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
         "update of the pin alone.",
     ):
         assert sentence in guide, sentence
+    # the two exceptions as they were agreed, each directly behind the sentence it is the exception to and once
+    built, fetched = (
+        "A third-party provider may build its own kernels at its first use; a sample makes that first use while the run is planned, before anything "
+        "is loaded, and says so in one line.",
+        "A provider's precompiled kernel binaries are not built: they come from a package of that provider at a pinned version "
+        "(`constraints-native.txt`) or from a directory the user filled beforehand, never from a fetch inside a run -- a sample switches the "
+        "provider's own download off before its first use, and a binary that is not on the machine is a `SKIP` that names what is missing and the fix.",
+    )
+    joined, exception = (
+        "The maintainers of this area own that list; a version joins it with a recorded run, never with an update of the pin alone.",
+        "The one pin that is not a version of that record is the library's kernel-binary package (`requirements-flashinfer-cubin.txt`): the "
+        "record's runs read kernel binaries the library had fetched, and the package joined the list when its files were held byte for byte to "
+        "those files and a run on it launched the recorded kernels in the recorded launch shapes (the census names that run: "
+        "`validated.kernel_binaries`).",
+    )
+    assert f"{built} {fetched} 6. **The stack is explicit.**" in guide and guide.count(fetched) == 1, "rule 5 and its exception, in front of rule 6"
+    assert f"{joined} {exception} 13. **The report's GPU side" in guide and guide.count(exception) == 1, "rule 12 and its exception, in front of rule 13"
     assert (
         "FlashInfer is imported inside the adapters of the rows that call it, on a device, in the stack `native` alone; no other stack and no plan on "
         "stated device facts imports it." in area

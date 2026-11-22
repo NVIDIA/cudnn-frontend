@@ -11,6 +11,7 @@
     "A kernel of a library has two more facts on an entry of a section. 'class': the kernel class the library launched at that call, as the kernel's name carries it -- the 4-bit multiply is served by one of two classes of one module, by the shape of the call and the GPU, as long as nothing has tuned it ('form': TUNED false); it is held with the launch shape, exactly. 'pick': the kernel the library's tuner chose at that call in the recorded run, by name -- the 8-bit multiply; a run prints the kernel it launched beside it, and nothing is gated on it: another process's tuner may choose another kernel, and a process without a tuning store launches the library's first candidate.",
     "An entry whose launch follows a fact of the run beyond the section's row count names it. 'run': the facts of the run that one launch shape -- and, for a kernel of a library, its class -- was recorded with: 'max_model_len', the positions a sequence of the run may reach at most, which a paged attention kernel is told beside its operands. Both are held for a run that states the same value and for no other: at another maximum length the call is still the target's, its launch is held as a member of its kernel's family, and the run says so with both lengths.",
     "The numbers of a section are three, never one: of its launches per step, how many are the target's own compiled kernels (code), how many cuDNN Frontend entries with byte-equal results (port), how many declared stand-ins. They count what a complete stack launches: a port is counted whether or not its entry is called by a stack yet.",
+    "validated: 'recorded' is the package versions the launch records of this file were recorded with. 'kernel_binaries' is the one package of the constraints that is not a version of that record: the kernel-binary package of the library, at the library's own version. The record's runs read kernel binaries the library had fetched; the package joined when its files were held byte for byte to those files and a run on it launched the recorded kernels in the recorded launch shapes, and 'joined' names that run.",
     "A change of a form this file names changes this file in the same commit."
   ],
   "validated": {
@@ -20,6 +21,15 @@
       "flashinfer-python": "0.7.2.post1",
       "nvidia-cutlass-dsl": "4.8.0",
       "apache-tvm-ffi": "0.1.11"
+    },
+    "kernel_binaries": {
+      "flashinfer-cubin": "0.7.2.post1",
+      "joined": {
+        "date": "2026-11-22",
+        "gpu": "compute capability 10.0, 148 SMs",
+        "files": "the manifest, the header and the 13 kernel binaries the recorded runs read: byte for byte the package's files",
+        "run": "the paged decode attention on the package alone, the library's download switched off: one sequence at maximum length 2051, 1 row and 6 rows per sequence, each launched the recorded kernel in the recorded launch shape"
+      }
     }
   },
   "kernels": {
