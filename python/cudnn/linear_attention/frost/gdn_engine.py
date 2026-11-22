@@ -147,7 +147,7 @@ class CompiledGdn:
 
         from .kernel.gdn_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.gdn_warmup_forward_f16 import TAIL_BUFFERS, build_warmup_forward, run_warmup_forward
-        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
+        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, level_plan_shape, level_scheduler_words, max_work_items, split_scratch_rows
         from .common.tail import GATE_WORDS, choose_tail
 
         self.node = node
@@ -247,6 +247,29 @@ class CompiledGdn:
             )
             if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
                 self.tail = None
+        # The levelled table (the kernel's build switch, on its seed-copy form only: level_plan_form): an uncut GDN plan
+        # without a tail or a chain group, whose fp32 state buffer is both the seed and the final state (a cut tile hands
+        # its state over through its row), no checkpoints, every sequence of one length (the shapes can only show a total
+        # that divides), a shape the rule takes.  Everything else keeps the uncut plan.
+        self.level_plan = bool(
+            kernel_module.level_plan_form(K, V)
+            and node.node_type.name == "GDN"
+            and not (self.chain or self.dv_split or self.split or self.batch_invariant)
+            and self.tail is None
+            and not self.ragged_pieces
+            and self.overwrite_initial_state
+            and self.has_final_state
+            and "initial_state" in node.inputs
+            and node.inputs["initial_state"].get_data_type().name == "FLOAT"
+            and "preceding_state_update" not in node.inputs
+            and "composed_initial_state" not in node.inputs
+            and not self.checkpoint
+            and not self.has_state_checkpoints
+            and self.expand_num == 1
+            and B > 0
+            and self.q_rows % B == 0
+            and level_plan_shape(B * HO, -(-(self.q_rows // B) // self.b_t), self.num_sm)
+        )
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=self.q_rows, batch_invariant=self.batch_invariant) if self.chain else B
         self.tinv_pass = self.chain
@@ -319,16 +342,22 @@ class CompiledGdn:
         else:
             self.tensormap_words = tensormap_workspace_bytes(kernel_module, B, self.num_householder) // 8
             regions.append(("tensormaps", layout.add(self.tensormap_words * 8), "int64", (self.tensormap_words,)))
-            regions.append(("scheduler", layout.add(8), "int32", (2,)))
+            # the levelled table: a level word per CTA behind the two ticket words
+            scheduler_words = level_scheduler_words(self.num_sm) if self.level_plan else 2
+            regions.append(("scheduler", layout.add(4 * scheduler_words), "int32", (scheduler_words,)))
             self.n_tiles = B * HO * self.tiles_per_head
             if self.split:
                 self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
                 self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
             else:
                 self.ideal = None
-                self.work_item_rows = self.n_tiles
+                # the levelled table: one more row per share border that cuts a tile, at most num_sm - 1
+                self.work_item_rows = self.n_tiles + (self.num_sm - 1 if self.level_plan else 0)
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
+            if self.level_plan:
+                # the levelled table's order entries, one per work-item row
+                regions.append(("level_order", layout.add(self.work_item_rows * 4), "int32", (self.work_item_rows,)))
             if self.tail is not None or self.ragged_pieces:
                 off_gate = layout.add(4 * GATE_WORDS, align=16)
                 regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
@@ -647,6 +676,7 @@ class CompiledGdn:
             ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
             ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
             ragged_buffers=self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
+            level_order=region.get("level_order"),
         )
         if self.warmup_launch is None:
             tail = self.tail
@@ -678,6 +708,7 @@ class CompiledGdn:
                 scale=self.scale,
                 device=self.device,
                 stream=stream,
+                level_plan=self.level_plan,
             )
         self.run_warmup_forward(*self.warmup_launch, **buffers, checkpoint_every_n_tokens=self.checkpoint, scale=self.scale, stream=stream)
 

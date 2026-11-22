@@ -112,7 +112,17 @@ from ..common.thd import (
     tma_load_family,
     TENSOR_MAP_QWORDS,
 )
-from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
+from ..common.split_k import (
+    ORDER_CAPACITY,
+    ORDER_ELEMENTS,
+    ORDER_THREADS,
+    WORK_ITEM_FINAL_DST,
+    decode_head,
+    decode_work_item,
+    level_closing_body,
+    level_order_body,
+    order_body,
+)
 from ..common.tail import gate_body
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
@@ -195,6 +205,46 @@ STATE_SEED_CALL_BYTES = 32  # bytes per row of one tcgen05.cp.128x256b
 STATE_SEED_DESC_STEP_BYTES = 16  # one step of a tcgen05 shared-memory descriptor
 STATE_SEED_KEY_HEAD = 1 << 20
 STATE_SEED_KEY_NONE = -1  # an empty slot of the final-state keys
+# Build switch, off: the levelled plan of an in-place batch of equal lengths whose (sequence, head) tiles exceed one wave
+# and leave a partial last one (the engine admits it, common/split_k.py: level_plan_shape).  The prologue lays the tiles end
+# to end over the CTAs in balanced shares (level_order_body, level_closing_body); a tile across a share border runs as two
+# items, the second started from the state the first stored; every item, a CTA's first one included, is handed out by the
+# ticket.  Built on the seed-copy form only (STATE_IO_COALESCED, TILE_HANDOVER_EARLY and STATE_SEED_COPY on): every item is
+# then a seeded one, so the second item of a cut tile gets the first one's state through the load warp's seed fills.
+LEVEL_PLAN = False
+
+
+def seed_copy_fills(d_k: int, d_v: int, kq_stage_bytes: int, state_bytes: int, kq_stages: int):
+    """``(seed_box_cols, seed_subtiles_per_fill, seed_fills)`` of the seed copy, or ``None`` where the K + Q ring cannot
+    carry the seed: a seed subtile is ``d_v`` rows x 128 B; a ring stage of ``kq_stage_bytes`` must hold a whole number of
+    them and the seed (``d_k`` columns of ``state_bytes``) a whole number of stages, with two ring stages left beside the
+    seed's."""
+    seed_subtile_bytes = d_v * STATE_SEED_BOX_BYTES
+    seed_box_cols = STATE_SEED_BOX_BYTES // state_bytes
+    if kq_stage_bytes % seed_subtile_bytes != 0 or d_k % seed_box_cols != 0:
+        return None
+    seed_subtiles_per_fill = kq_stage_bytes // seed_subtile_bytes
+    seed_subtiles = d_k // seed_box_cols
+    if seed_subtiles % seed_subtiles_per_fill != 0 or kq_stages < 2 + seed_subtiles // seed_subtiles_per_fill:
+        return None
+    return seed_box_cols, seed_subtiles_per_fill, seed_subtiles // seed_subtiles_per_fill
+
+
+def level_plan_form(d_k: int, d_v: int, io_bytes: int = 2) -> bool:
+    """Whether a level plan can be built at this geometry: ``LEVEL_PLAN`` with the three switches of the seed-copy form on,
+    and a geometry ``build_cfg`` takes the seed copy at for an fp32 state table that is stored back, without checkpoints, a
+    composed seed or sub-token expansion (the caller's own conditions for a level plan).  Every other combination is
+    refused here -- the plan then stays the uncut one -- and ``build_cfg`` raises for a level build without the seed copy."""
+    if not (LEVEL_PLAN and STATE_IO_COALESCED and TILE_HANDOVER_EARLY and STATE_SEED_COPY):
+        return False
+    if d_v != 128 or d_k % 32 != 0:
+        return False
+    return seed_copy_fills(d_k, d_v, 2 * CFG.B_T * d_k * io_bytes, 4, CFG.SMEM_KQ_STAGES) is not None
+
+
+def level_build_key(level_plan: bool):
+    """What a compile is keyed by for the level plan: False, or the flag with the module's build knobs ``build_cfg`` reads."""
+    return (True,) if level_plan else False
 
 
 class GdnPrefillBars(NamedTuple):
@@ -349,15 +399,21 @@ def make_bars(cfg) -> GdnPrefillBars:
 
 @cute.jit
 def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one):
-    """TMA-LDG-warp side: pull the next tile off the global ticket, publish it."""
+    """TMA-LDG-warp side: pull the next tile off the global ticket, publish it.  Level plan: the slot holds the ticket
+    itself (every row of the levelled table comes by the ticket); the elected lane arrives right behind its store of the
+    slot and the warp reads the slot behind that arrive -- no load of the slot is live across the arrive that hands it to
+    the consumers."""
     bars.mb_scheduler_done[scheduler_state.idx].wait(scheduler_state.phase)
     if elect_one:
         fetched = cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu"))
-        sScheduler[scheduler_state.idx] = num_ctas + fetched
+        sScheduler[scheduler_state.idx] = fetched if cutlass.const_expr(cfg.level_plan) else num_ctas + fetched
+        if cutlass.const_expr(cfg.level_plan):
+            bars.mb_scheduler_ready[scheduler_state.idx].arrive()
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
     next_tile = sScheduler[scheduler_state.idx]
-    if elect_one:
-        bars.mb_scheduler_ready[scheduler_state.idx].arrive()
+    if cutlass.const_expr(not cfg.level_plan):
+        if elect_one:
+            bars.mb_scheduler_ready[scheduler_state.idx].arrive()
     return next_tile, advance(scheduler_state, cfg.scheduler_stages)
 
 
@@ -368,6 +424,35 @@ def scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz):
     next_tile = sScheduler[scheduler_state.idx]
     consume_then_arrive(bars.mb_scheduler_done[scheduler_state.idx], next_tile, rz)
     return next_tile, advance(scheduler_state, cfg.scheduler_stages)
+
+
+@cute.jit
+def scheduler_publish_first(cfg, bars, sScheduler, mScheduler, scheduler_state, bidx, num_ctas, elect_one):
+    """TMA-LDG-warp side: the CTA's first tile, its own index or, in a level plan, the first ticket it publishes (one
+    ring step in front of the tile loop: no row of the levelled table belongs to a CTA)."""
+    if cutlass.const_expr(cfg.level_plan):
+        first_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
+    else:
+        first_tile = cutlass.Int32(bidx)
+    return first_tile, scheduler_state
+
+
+@cute.jit
+def scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz):
+    """Consumer side: the CTA's first tile, its own index or, in a level plan, the first published ticket (the ring step
+    every consumer warp owes ``scheduler_publish_first``'s publication, on every path)."""
+    if cutlass.const_expr(cfg.level_plan):
+        first_tile, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
+    else:
+        first_tile = cutlass.Int32(bidx)
+    return first_tile, scheduler_state
+
+
+@cute.jit
+def item_is_seeded(cfg, compute_start):
+    """Whether an item with chunks starts from the stored state rather than from zero: the item that computes chunk 0, and
+    in a level plan every item (a later part of a tile starts from the state the part in front of it stored)."""
+    return cutlass.Boolean(True) if cutlass.const_expr(cfg.level_plan) else compute_start == 0
 
 
 @cute.jit
@@ -398,7 +483,7 @@ def tmastg_warp(
     tidx % cfg.threads_per_warp
 
     elect_one = nvvm.elect_sync()
-    tile_idx = cutlass.Int32(bidx)
+    tile_idx, scheduler_state = scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz)
     bytes_per_element = cfg.io_dtype.width // 8
     box_elems = 128 // bytes_per_element
     sO_tma = SmemTile(
@@ -571,7 +656,7 @@ def gate_warp(
         a = cutlass.Float32(0.0)
     bias = cutlass.Float32(0.0)
     gate_cumsum_slot_uses = cutlass.Int32(0)
-    tile_idx = cutlass.Int32(bidx)
+    tile_idx, scheduler_state = scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz)
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
@@ -948,7 +1033,7 @@ def tcgen05_mma_warp(
         state_free_index = PipelineState.start(phase=1)
 
     scheduler_state = PipelineState.start(phase=0)
-    tile_idx = cutlass.Int32(bidx)
+    tile_idx, scheduler_state = scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz)
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
@@ -963,7 +1048,7 @@ def tcgen05_mma_warp(
             if cutlass.const_expr(cfg.state_seed_copy):
                 # A seeded item's seed fills stand in ring order in front of its first chunk: the look-ahead index passes
                 # them here, the chunk index behind this product.
-                if compute_start == 0:
+                if item_is_seeded(cfg, compute_start):
                     for _fill in cutlass.range_constexpr(cfg.seed_fills):
                         kq_cg0_index = advance(kq_cg0_index, cfg.smem_kq_stages)
             kq_cg0_idx = kq_cg0_index.idx
@@ -975,7 +1060,7 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_cg0_acc_ready[cg0_acc_idx].arrive(cta_group=1)
             if cutlass.const_expr(cfg.state_seed_copy):
-                if compute_start == 0:
+                if item_is_seeded(cfg, compute_start):
                     for _fill in cutlass.range_constexpr(cfg.seed_fills):
                         kq_index = advance(kq_index, cfg.smem_kq_stages)
         if n_local > 1:
@@ -995,7 +1080,7 @@ def tcgen05_mma_warp(
             if n_local > 0:
                 bars.mb_state_free[0].wait(state_free_index.phase)
                 state_free_index = advance(state_free_index, 1)
-                if compute_start == 0:
+                if item_is_seeded(cfg, compute_start):
                     # The seed fills stand seed_fills ring positions behind the chunk index, which has passed them.
                     seed_stages = []
                     for fill in cutlass.range_constexpr(cfg.seed_fills):
@@ -1214,7 +1299,7 @@ def tmaldg_warp(
 
     elect_one = nvvm.elect_sync()
     tidx % cfg.threads_per_warp
-    tile_idx = cutlass.Int32(bidx)
+    tile_idx, scheduler_state = scheduler_publish_first(cfg, bars, sScheduler, mScheduler, scheduler_state, bidx, num_ctas, elect_one)
     bytes_per_element = cfg.io_dtype.width // 8
     box_elems = 128 // bytes_per_element
     bt = cfg.b_t
@@ -1286,7 +1371,7 @@ def tmaldg_warp(
         if write_end > compute_start:
             if cutlass.const_expr(cfg.state_seed_copy):
                 # ---- the seed fills of a seeded item, in ring order in front of its first K + Q fill ----
-                if compute_start == 0:
+                if item_is_seeded(cfg, compute_start):
                     seed_row = batch_idx
                     if cutlass.const_expr(mSeedIndices is not None):
                         seed_row = cutlass.Int32(mSeedIndices[batch_idx])
@@ -1449,7 +1534,7 @@ def compute0_warp_group_gmem(
     ACC_N_FRAGS = cfg.b_t // FRAG_COLS
     ACC_STAGE_COLS = cfg.b_t
     mask_zero = opaque_f32_zero()
-    tile_idx = cutlass.Int32(bidx)
+    tile_idx, scheduler_state = scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz)
 
     nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
@@ -1935,7 +2020,7 @@ def compute0_warp_group(
     mask_zero = opaque_f32_zero()
     chunk_row_lo = warp_id * 16 + lane_idx // 4
     chunk_row_lo + 8
-    tile_idx = cutlass.Int32(bidx)
+    tile_idx, scheduler_state = scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz)
 
     nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
@@ -2198,7 +2283,7 @@ def compute1_warp_group(
             (final_keys + entry).store(cutlass.Int32(STATE_SEED_KEY_NONE))
         final_key_slot = cutlass.Int32(0)
     scheduler_state = PipelineState.start(phase=0)
-    tile_idx = cutlass.Int32(bidx)
+    tile_idx, scheduler_state = scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz)
     if cutlass.const_expr(early_handover):
         # The work item, its seed index and its final-state destination are carried one item ahead: loaded here for the
         # block's first item and at each item's end for the next.  A block that owns no first item reads no table row:
@@ -2237,7 +2322,7 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.use_initial_state):
                 if cutlass.const_expr(cfg.state_table and not early_handover):
                     gState_init = mState_init[None, None, head_o, seed_row]
-                seed_state = compute_start == 0
+                seed_state = item_is_seeded(cfg, compute_start)
                 if seed_state:
                     if cutlass.const_expr(cfg.state_table and not early_handover):
                         seed_vw = 16 // (mState_init.element_type.width // 8)
@@ -3001,10 +3086,17 @@ def frost_gdn_prefill_prologue(
     gate_sms: cutlass.Constexpr[int] = 0,
     gate_chain_pieces: cutlass.Constexpr[int] = 0,
     gate_tail: cutlass.Constexpr[bool] = True,
+    level_blocks: cutlass.Constexpr[int] = 0,
+    mLevelOrder: Optional[cute.Tensor] = None,
 ) -> None:
     """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the
-    scheduler rings via :func:`order_body`, block 1 builds the per-batch
-    TMA-descriptor arrays via :func:`build_descs_body`, one warp per array."""
+    scheduler rings via :func:`order_body` (with ``level_blocks`` > 0 it writes the
+    levelled table for that many main-kernel CTAs and its order entries via
+    :func:`level_order_body` instead, and zeroes the level words with the ticket),
+    block 1 builds the per-batch TMA-descriptor arrays via
+    :func:`build_descs_body`, one warp per array.  With ``level_blocks`` > 0 the
+    launch has a third CTA: block 2 writes the closing parts of the levelled table
+    and the item count via :func:`level_closing_body`."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
@@ -3012,9 +3104,10 @@ def frost_gdn_prefill_prologue(
     widx = tidx // cutlass.Int32(32)
     bidx = cutlass.Int32(cute.arch.block_idx()[0])
     if bidx == cutlass.Int32(0):
-        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
+        # the sort's shared memory: the levelled writer sorts nothing and declares none
+        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16) if cutlass.const_expr(level_blocks == 0) else None
+        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16) if cutlass.const_expr(level_blocks == 0) else None
+        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8) if cutlass.const_expr(level_blocks == 0) else None
         n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= v.shape[2] else v.shape[2])
         if cutlass.const_expr(tiles_per_head > 1):
             n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
@@ -3024,26 +3117,53 @@ def frost_gdn_prefill_prologue(
             n_items = cutlass.Int32(mItemLimit[1])
         if cutlass.const_expr(mTailEnable is not None):
             n_items = n_items if cutlass.Int32(mTailEnable[0]) != cutlass.Int32(0) else cutlass.Int32(0)
-        order_body(
-            order_gen,
-            b_t,
-            ORDER_THREADS,
-            ORDER_ELEMENTS,
-            tidx,
-            n_heads_out,
-            n_items,
-            cu_seqlens,
-            mStaging,
-            mCount,
-            mWorkItems,
-            mScheduler,
-            sKey,
-            sIdx,
-            sSpread,
-            expand_num=expand_num,
-            item_base=item_base,
-        )
+        if cutlass.const_expr(level_blocks > 0):
+            level_order_body(
+                b_t,
+                ORDER_THREADS,
+                level_blocks,
+                tidx,
+                n_heads_out,
+                n_items,
+                cu_seqlens,
+                mWorkItems,
+                mScheduler,
+                expand_num=expand_num,
+                mLevelOrder=mLevelOrder,
+            )
+        else:
+            order_body(
+                order_gen,
+                b_t,
+                ORDER_THREADS,
+                ORDER_ELEMENTS,
+                tidx,
+                n_heads_out,
+                n_items,
+                cu_seqlens,
+                mStaging,
+                mCount,
+                mWorkItems,
+                mScheduler,
+                sKey,
+                sIdx,
+                sSpread,
+                expand_num=expand_num,
+                item_base=item_base,
+            )
     else:
+        if cutlass.const_expr(level_blocks > 0):
+            # A level build launches a third CTA: it ranks the closing parts of the levelled table and writes their rows
+            # and the item count, off the SM that writes the rest of the table.
+            if bidx != cutlass.Int32(1):
+                sRank = cutlass.Array(cutlass.Int32, level_blocks, space=cutlass.AddressSpace.smem, alignment=16)
+                n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= v.shape[2] else v.shape[2])
+                if cutlass.const_expr(tiles_per_head > 1):
+                    n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
+                level_closing_body(
+                    b_t, level_blocks, tidx, n_heads_out, n_items, cu_seqlens, mCount, mWorkItems, sRank, expand_num=expand_num, mLevelOrder=mLevelOrder
+                )
+                widx = cutlass.Int32(ORDER_THREADS)  # past every descriptor array's warp: the guards below pass this CTA by
         build_descs_body(
             widx,
             base_q,
@@ -3102,8 +3222,12 @@ def prologue(
     gate_sms: cutlass.Constexpr[int] = 0,
     gate_chain_pieces: cutlass.Constexpr[int] = 0,
     gate_tail: cutlass.Constexpr[bool] = True,
+    level_blocks: cutlass.Constexpr[int] = 0,
+    level_order: Optional[cute.Tensor] = None,
 ):
-    """One-launch prologue: LPT-order the work items and build the per-(b,h)
+    """One-launch prologue: LPT-order the work items (``level_blocks`` > 0: the
+    levelled table for that many main-kernel CTAs, its order entries into
+    ``level_order``) and build the per-(b,h)
     TMA-descriptor arrays (Q, K, V, O, checkpoints) into
     ``tensormap_workspace``."""
     k = expanded_view(k, k_slots, expand_num)
@@ -3222,7 +3346,9 @@ def prologue(
         gate_sms,
         gate_chain_pieces,
         gate_tail,
-    ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+        level_blocks,
+        level_order,
+    ).launch(grid=(3 if cutlass.const_expr(level_blocks > 0) else 2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 @cute.jit
@@ -3861,6 +3987,7 @@ class GdnPrefillCfg:
     seed_box_cols: int = 0
     seed_subtiles_per_fill: int = 0
     seed_fills: int = 0
+    level_plan: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -3953,11 +4080,14 @@ def build_cfg(
     tiles_per_head: int = 1,
     state_table: Optional[bool] = None,
     has_composed: bool = False,
+    level_plan: bool = False,
 ) -> GdnPrefillCfg:
     """Build the per-compile ``GdnPrefillCfg`` (io_dtype in {Float16, BFloat16}; acc is
     always Float32).  ``tinv_source`` "compute" builds the chunk factor in compute
     group 0; "gmem" bulk-loads the tiles of ``gdn_tinv_f16.py``.  ``tiles_per_head`` > 1 runs every gate head as
-    ``tiles_per_head`` tiles of ``d_v`` value columns each (the d_v split)."""
+    ``tiles_per_head`` tiles of ``d_v`` value columns each (the d_v split).  ``level_plan``: the work-item table is the
+    levelled one, so every item, a CTA's first included, comes by the ticket and starts from the stored state; raises
+    where the build does not take the seed copy (``level_plan_form``)."""
     if tinv_source not in TINV_SOURCES:
         raise ValueError(f"tinv_source must be one of {TINV_SOURCES}, got {tinv_source!r}")
     cfg = GdnPrefillCfg(
@@ -3968,6 +4098,7 @@ def build_cfg(
         use_initial_state=use_initial_state,
         state_table=use_initial_state if state_table is None else bool(state_table),
         has_composed=bool(has_composed),
+        level_plan=bool(level_plan),
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         log_gate=log_gate,
@@ -4029,19 +4160,19 @@ def build_cfg(
     # a whole number of stages; the ring must keep two stages beside the seed's, so that the fill of an item's second
     # chunk, whose product is issued in front of the copies, never waits for a seed stage.
     if STATE_SEED_COPY and cfg.tile_handover_early and tiles_per_head == 1:
-        seed_subtile_bytes = d_v * STATE_SEED_BOX_BYTES
-        kq_stage_bytes = 2 * cfg.b_t * d_k * (io_dtype.width // 8)
-        seed_box_cols = STATE_SEED_BOX_BYTES // (state_dtype.width // 8)
-        if kq_stage_bytes % seed_subtile_bytes == 0 and d_k % seed_box_cols == 0:
-            seed_subtiles_per_fill = kq_stage_bytes // seed_subtile_bytes
-            seed_subtiles = d_k // seed_box_cols
-            if seed_subtiles % seed_subtiles_per_fill == 0 and cfg.smem_kq_stages >= 2 + seed_subtiles // seed_subtiles_per_fill:
-                cfg.state_seed_copy = True
-                cfg.seed_box_cols = seed_box_cols
-                cfg.seed_subtiles_per_fill = seed_subtiles_per_fill
-                cfg.seed_fills = seed_subtiles // seed_subtiles_per_fill
-                # Without a final state nothing of this launch can be a later seed.
-                cfg.seed_alias_guard = bool(store_final_state)
+        fills = seed_copy_fills(d_k, d_v, 2 * cfg.b_t * d_k * (io_dtype.width // 8), state_dtype.width // 8, cfg.smem_kq_stages)
+        if fills is not None:
+            cfg.state_seed_copy = True
+            cfg.seed_box_cols, cfg.seed_subtiles_per_fill, cfg.seed_fills = fills
+            # Without a final state nothing of this launch can be a later seed.
+            cfg.seed_alias_guard = bool(store_final_state)
+    if level_plan and not (cfg.state_seed_copy and store_final_state):
+        raise ValueError(
+            "level_plan runs a tile as two items that hand the fp32 state over through its stored row, read back by the seed "
+            "copy: it needs STATE_IO_COALESCED, TILE_HANDOVER_EARLY and STATE_SEED_COPY on and a build they act on (an fp32 "
+            "state table that is stored back at d_v 128 with the factor built in the kernel, no checkpoints, no composed "
+            "state, no sub-token expansion, one tile per head)"
+        )
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
     cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_cg0 + n_cg1)
