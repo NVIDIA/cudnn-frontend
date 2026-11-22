@@ -693,7 +693,11 @@ def _render(tmp_path, arch):
         if ln.startswith("REJECTED "):
             _, table, text = ln.split(" ", 2)
             rejected[table] = text
-    return compiler, {table: (open(files["ptx"]).read(), files["cubin"]) for table, files in kept.items()}, rejected
+    texts = {}
+    for table, files in kept.items():
+        with open(files["ptx"]) as text:
+            texts[table] = (text.read(), files["cubin"])
+    return compiler, texts, rejected
 
 
 def _statements(ptx):

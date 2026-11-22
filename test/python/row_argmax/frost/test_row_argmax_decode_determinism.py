@@ -84,7 +84,7 @@ def wave_edges(dev, below=MAX_ROWS):
     return list(range(sms, below, sms))
 
 
-@pytest.mark.parametrize("table, rows", (("none", 1), ("int32", 17), ("int64", 300), ("int64", MAX_ROWS)), ids=lambda v: str(v))
+@pytest.mark.parametrize("table, rows", (("none", 1), ("int32", 17), ("int64", 300), ("int64", MAX_ROWS)), ids=str)
 def test_replay(table, rows):
     """Eight executions into fresh vectors under side-stream contention: every byte of the result matches the first execution;
     then the independent reference."""
