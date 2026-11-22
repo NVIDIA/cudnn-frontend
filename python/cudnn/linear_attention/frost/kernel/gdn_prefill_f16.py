@@ -139,6 +139,7 @@ from cudnn.frost.tile_dsl.barrier import (
     Producer,
     PipelineState,
     advance,
+    timer_sleep,
     wait_on_dependent_grids,
 )
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile, tma_slice_runtime_desc
@@ -230,6 +231,15 @@ LEVEL_PLAN = False
 #      base for measuring what 1 costs, never a served build.
 LEVEL_WAIT = 1
 LEVEL_WAITS = (0, 1)
+# Test-only delays of a level plan, off: (row, cta, n_ctas, units).  The item of work-item row ``row`` sleeps about ``units``
+# microseconds in front of its final-state store, and the load warps of CTAs ``cta`` .. ``cta + n_ctas - 1`` sleep as long
+# in front of their first ticket; a negative ``row`` or ``cta`` leaves that delay out.  For the stress of the order between
+# the two items of a cut tile; () emits nothing.
+LEVEL_STRESS = ()
+# Test only, off (LEVEL_WAIT 1 builds): every thread of compute group 1 that loads a seed again at the start of an item that
+# continues a cut tile adds 1 to the level word of border 0, which no row sets or is held for.  A probe reads the word back
+# to see that the reload ran on such an item; False emits nothing.
+LEVEL_RELOAD_COUNT = False
 
 
 def seed_copy_fills(d_k: int, d_v: int, kq_stage_bytes: int, state_bytes: int, kq_stages: int):
@@ -269,9 +279,19 @@ def level_wait(level_plan: bool) -> int:
     return int(LEVEL_WAIT)
 
 
+def level_stress(level_plan: bool) -> tuple:
+    """The delays of ``LEVEL_STRESS`` a level plan is built with: ``()`` or four ints; raises on another shape."""
+    if not level_plan or not LEVEL_STRESS:
+        return ()
+    stress = tuple(int(value) for value in LEVEL_STRESS)
+    if len(stress) != 4 or stress[2] < 1 or stress[3] < 1:
+        raise ValueError(f"LEVEL_STRESS is () or (row, cta, n_ctas >= 1, units >= 1), got {LEVEL_STRESS!r}")
+    return stress
+
+
 def level_build_key(level_plan: bool):
     """What a compile is keyed by for the level plan: False, or the flag with the module's build knobs ``build_cfg`` reads."""
-    return (True, level_wait(True)) if level_plan else False
+    return (True, level_wait(True), level_stress(True), bool(LEVEL_RELOAD_COUNT)) if level_plan else False
 
 
 def level_set_lanes(cfg) -> int:
@@ -1413,6 +1433,9 @@ def tmaldg_warp(
 
     elect_one = nvvm.elect_sync()
     tidx % cfg.threads_per_warp
+    if cutlass.const_expr(len(cfg.level_stress) > 0 and cfg.level_stress[1] >= 0):
+        if (cutlass.Int32(bidx) >= cutlass.Int32(cfg.level_stress[1])) and (cutlass.Int32(bidx) < cutlass.Int32(cfg.level_stress[1] + cfg.level_stress[2])):
+            timer_sleep(cfg.level_stress[3])
     tile_idx, scheduler_state = scheduler_publish_first(cfg, bars, sScheduler, mScheduler, scheduler_state, bidx, num_ctas, elect_one, total_tiles, mLevelOrder)
     bytes_per_element = cfg.io_dtype.width // 8
     box_elems = 128 // bytes_per_element
@@ -2461,6 +2484,9 @@ def compute1_warp_group(
                             for entry in cutlass.range_constexpr(guard_items):
                                 seed_stale = seed_stale or ((final_keys + entry).load() == seed_key)
                             if seed_stale:
+                                if cutlass.const_expr(cfg.level_reload_count):
+                                    if level_order_entry(tile_idx, mLevelOrder) < cutlass.Int32(0):
+                                        nvvm.atomicrmw("add", level_word(mScheduler, cutlass.Int32(0)), cutlass.Int32(1), mem_order="relaxed", syncscope="gpu")
                                 fresh_pieces = coalesced_state_loads(
                                     mState_init[None, None, head_o, seed_row], xfer_gmem_row, xfer_rows, xfer_gmem_col, v_offset, num_ldtms, ldtm_width
                                 )
@@ -3001,6 +3027,9 @@ def compute1_warp_group(
                         final_key_slot = cutlass.Int32(0) if final_key_slot == cutlass.Int32(guard_items - 1) else final_key_slot + 1
                     state_vw = 16 // (mState_out.element_type.width // 8)
                     state_dst = (gState_out.iterator + gState_out.layout((state_gmem_row + v_offset, 0))).raw_ptr()
+                    if cutlass.const_expr(len(cfg.level_stress) > 0 and cfg.level_stress[0] >= 0):
+                        if tile_idx == cutlass.Int32(cfg.level_stress[0]):
+                            timer_sleep(cfg.level_stress[3])
                     if cutlass.const_expr(cfg.state_io_coalesced and mState_out.element_type == cutlass.Float32):
                         # Round by round: each thread's row into the scratch, 8 rows x 64 B out of it per global store.
                         final_rows = [
@@ -4139,6 +4168,8 @@ class GdnPrefillCfg:
     seed_fills: int = 0
     level_plan: bool = False
     level_wait: int = 0
+    level_stress: Tuple[int, ...] = ()
+    level_reload_count: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -4238,8 +4269,8 @@ def build_cfg(
     group 0; "gmem" bulk-loads the tiles of ``gdn_tinv_f16.py``.  ``tiles_per_head`` > 1 runs every gate head as
     ``tiles_per_head`` tiles of ``d_v`` value columns each (the d_v split).  ``level_plan``: the work-item table is the
     levelled one, so every item, a CTA's first included, comes by the ticket and starts from the stored state; such a
-    build takes the module's ``LEVEL_WAIT`` (what orders the two items of a cut tile) and raises where it does not take
-    the seed copy (``level_plan_form``)."""
+    build takes the module's ``LEVEL_WAIT`` (what orders the two items of a cut tile) and its test-only knobs
+    (``LEVEL_STRESS``, ``LEVEL_RELOAD_COUNT``) and raises where it does not take the seed copy (``level_plan_form``)."""
     if tinv_source not in TINV_SOURCES:
         raise ValueError(f"tinv_source must be one of {TINV_SOURCES}, got {tinv_source!r}")
     cfg = GdnPrefillCfg(
@@ -4252,6 +4283,8 @@ def build_cfg(
         has_composed=bool(has_composed),
         level_plan=bool(level_plan),
         level_wait=level_wait(bool(level_plan)),
+        level_stress=level_stress(bool(level_plan)),
+        level_reload_count=bool(level_plan and LEVEL_RELOAD_COUNT and level_wait(True) == 1),
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         log_gate=log_gate,
