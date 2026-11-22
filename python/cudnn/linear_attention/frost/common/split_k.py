@@ -54,6 +54,15 @@ With ``split=False`` scan and walk never launch and the prologue kernel
 synthesizes the uncut item per (batch, head) from ``cu_seqlens`` alone: that
 no-cuts table serves batch-invariant mode and checkpoint cadences a cut may
 not cross.
+
+The levelled table (:func:`level_order_body`, admitted by :func:`level_plan_shape`)
+is a second exact form for a batch of equal lengths whose state lives in one
+buffer: the (batch, head) chains are laid end to end and shared out to the
+CTAs in balanced runs of chunks, and a chain that crosses a share border runs
+as two items, the first storing the state the second starts from.  An order
+table beside it names, per row, the level word the row sets behind its state
+store or is held for until it is set; the level words follow the
+scheduler's ticket words (:data:`LEVEL_WORD_BASE`).
 """
 
 import math
@@ -98,6 +107,49 @@ ORDER_CAPACITY = ORDER_THREADS * ORDER_ELEMENTS  # sort capacity (32 KB SMEM); p
 
 DEFAULT_LOG2_THRESHOLD = -10.0 / math.log(2.0)  # e^-10, in log2 units
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the scan's log2 domain
+
+LEVEL_LAUNCH_US = 10.41  # cost model of the levelled table's admission: the launch in front of the items,
+LEVEL_ITEM_US = 7.95  # a work item beside its chunks,
+LEVEL_CHUNK_US = 1.793  # and a chunk, of the uncut prefill with every SM busy
+LEVEL_MIN_GAIN = 0.05  # modelled gain below which the uncut table stays
+LEVEL_MIN_CHUNKS = 16  # chunks per chain below which the uncut table stays: shorter chains measured slower levelled than uncut
+LEVEL_FORCE = False  # experiments only: lay out every shape the levelled table can take, whatever the model says
+LEVEL_WORD_BASE = 2  # a levelled plan's scheduler region: the two ticket words, then one level word per CTA (word b at BASE + b)
+
+
+def level_scheduler_words(num_sms: int) -> int:
+    """int32 words of the scheduler region of a levelled plan on ``num_sms`` CTAs: the ticket words and a level word per
+    share border ``b`` in ``[0, num_sms)`` (border 0 cuts nothing; its word keeps the index of a border its own)."""
+    return LEVEL_WORD_BASE + int(num_sms)
+
+
+def level_plan_gain(n_tiles: int, chunks: int, num_sms: int) -> float:
+    """Modelled gain of the levelled table over the uncut one for ``n_tiles`` chains of ``chunks`` chunks each on ``num_sms``
+    CTAs.  The uncut plan runs ``ceil(n_tiles / num_sms)`` rounds of a whole chain; the levelled plan gives CTA ``b`` the
+    line slots ``[b * q + min(b, rem), (b + 1) * q + min(b + 1, rem))`` of the ``n_tiles * chunks`` chunks laid end to end
+    (``q``, ``rem`` their quotient and remainder by ``num_sms``) and pays one item overhead per chain a share touches."""
+    q, rem = divmod(n_tiles * chunks, num_sms)
+    levelled = 0.0
+    for b in range(num_sms):
+        lo = b * q + min(b, rem)
+        hi = (b + 1) * q + min(b + 1, rem)
+        items = (hi - 1) // chunks - lo // chunks + 1
+        levelled = max(levelled, items * LEVEL_ITEM_US + (hi - lo) * LEVEL_CHUNK_US)
+    uncut = -(-n_tiles // num_sms) * (LEVEL_ITEM_US + chunks * LEVEL_CHUNK_US)
+    return (LEVEL_LAUNCH_US + uncut) / (LEVEL_LAUNCH_US + levelled) - 1.0
+
+
+def level_plan_shape(n_tiles: int, chunks: int, num_sms: int) -> bool:
+    """Whether ``n_tiles`` chains of ``chunks`` chunks each take the levelled table on ``num_sms`` CTAs: more chains than CTAs
+    (a share is then at least one chain long, so two share borders never fall into one chain and no chain is cut twice; a
+    share may still hold two parts and no whole chain), a partial last round to level, a prologue thread per CTA
+    (:func:`level_order_body` writes border ``b``'s rows in thread ``b``), chains of at least ``LEVEL_MIN_CHUNKS`` chunks
+    and a modelled gain of at least ``LEVEL_MIN_GAIN``; ``LEVEL_FORCE`` drops the chain-length bound and the model and keeps
+    the layout conditions."""
+    n_tiles, chunks, num_sms = int(n_tiles), int(chunks), int(num_sms)
+    if chunks < 1 or num_sms > ORDER_THREADS or n_tiles <= num_sms or n_tiles % num_sms == 0:
+        return False
+    return bool(LEVEL_FORCE) or (chunks >= LEVEL_MIN_CHUNKS and level_plan_gain(n_tiles, chunks, num_sms) >= LEVEL_MIN_GAIN)
 
 
 def compute_ideal_chunks(total_tokens: int, n_heads_out: int, num_sms: int, b_t: int) -> int:
@@ -1185,6 +1237,161 @@ def order_body(
                         item_base,
                         first_slot,
                     )
+
+
+@cute.jit
+def write_level_item(n_heads_out, mCuSeqlens, mWorkItems, dst, chain, chunk_start, chunk_end, expand_num: cutlass.Constexpr[int] = 1):
+    """Levelled-table row ``dst``: chunks ``[chunk_start, chunk_end)`` of chain ``chain = batch * n_heads_out + head``, started
+    from the sequence's state row and stored back to it."""
+    batch_idx = chain // n_heads_out
+    mWorkItems[dst, 0] = batch_idx
+    mWorkItems[dst, 1] = chain - batch_idx * n_heads_out
+    mWorkItems[dst, 2] = chunk_start
+    mWorkItems[dst, 3] = chunk_end
+    mWorkItems[dst, 4] = chunk_start
+    mWorkItems[dst, 5] = chunk_end
+    mWorkItems[dst, 6] = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx)
+    mWorkItems[dst, 7] = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + cutlass.Int32(1))
+    mWorkItems[dst, WORK_ITEM_FINAL_DST] = batch_idx
+    mWorkItems[dst, WORK_ITEM_DSTATE_DST] = batch_idx if chunk_start == cutlass.Int32(0) else cutlass.Int32(-1)
+
+
+@cute.jit
+def level_borders_below(x, q, rem, num_ctas: cutlass.Constexpr[int]):
+    """How many of the share borders ``b * q + min(b, rem)``, ``b`` in ``[0, num_ctas)``, lie below line slot ``x``."""
+    wide = q + cutlass.Int32(1)
+    low = (x + q) // wide
+    high = (x - rem + q - cutlass.Int32(1)) // q
+    high = high if high < cutlass.Int32(num_ctas) else cutlass.Int32(num_ctas)
+    return low if x <= rem * wide else high
+
+
+@cute.jit
+def level_order_body(
+    b_t: cutlass.Constexpr[int],
+    n_threads: cutlass.Constexpr[int],
+    num_ctas: cutlass.Constexpr[int],
+    tidx,
+    n_heads_out: cutlass.Int32,
+    n_tiles: cutlass.Int32,
+    mCuSeqlens: cute.Tensor,
+    mWorkItems: cute.Tensor,
+    mScheduler: cute.Tensor | None,
+    *,
+    expand_num: cutlass.Constexpr[int] = 1,
+    mLevelOrder: cute.Tensor | None = None,
+):
+    """The levelled work-item table of ``n_tiles`` chains of ONE length (sequence 0's chunk count) for ``num_ctas`` CTAs,
+    every row in closed form, in place of :func:`order_body`'s no-cuts table.  The chains lie end to end on a line of
+    ``n_tiles * chunks`` slots in table order; CTA ``b`` owns the slots from border ``b * q + min(b, rem)`` to the next one.
+    A chain's line slots ``[a, e)`` are its chunks ``[chunks - e, chunks - a)``, so of a chain across border ``b`` the
+    FIRST chunks open share ``b`` and the LAST chunks close share ``b - 1``.  Rows::
+
+        [0, num_ctas)                    share b's opening item: a whole chain, or the first chunks of the chain across border b
+        [num_ctas, n_tiles)              every other whole chain, table order
+        [n_tiles, n_tiles + cuts)        the closing parts, longest first, ties in chain order
+
+    so that the ticket hands every opening part out in front of every closing part.  Every part names its sequence as
+    ``final_dst``: it starts from the sequence's state row and stores its exit state there; only the part that owns chunk 0
+    names it as ``dstate_dst``.  The table has ``n_tiles + cuts`` rows, at most ``n_tiles + num_ctas - 1``.  Requires
+    ``n_tiles > num_ctas`` (a share is then at least one chain long: no chain is cut twice), ``num_ctas <= n_threads``
+    (thread ``b`` writes the rows of border ``b``), every sequence of sequence 0's chunk count and that count at least 1
+    (the caller's admission: the count divides and no sequence is read but the first), and a main kernel that starts every
+    part from the state row.  ``mLevelOrder``, when passed, receives one entry per row written here: ``+b`` for the
+    opening part of the chain across border ``b`` (it sets level word ``b`` behind its state store) and 0 for a whole chain;
+    that chain's closing part gets ``-b`` (it is held until level word ``b`` is set) from :func:`level_closing_body`.
+    Thread 0 also zeroes every word of the scheduler region it is passed -- the ticket and, in a region of
+    :func:`level_scheduler_words` words, the level words -- on every call.
+
+    This body writes rows ``[0, n_tiles)`` and their order entries; the closing parts' rows, their order entries and the
+    item count are :func:`level_closing_body`'s, which runs in another CTA of the same launch (the rows of the two are
+    disjoint and every thread of either forms its border's cut from the same closed form).  No CTA barrier inside."""
+    if cutlass.const_expr(mScheduler is not None):
+        if tidx == 0:
+            si = cutlass.Int32(0)
+            while si < mScheduler.shape[0]:
+                mScheduler[si] = cutlass.Int32(0)
+                si = si + cutlass.Int32(1)
+
+    shares = cutlass.Int32(num_ctas)
+    _, _, _, _, chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, cutlass.Int32(0), expand_num)
+    slots = n_tiles * chunks
+    q = slots // shares
+    rem = slots - q * shares
+
+    # ---- thread b owns border b: share b's opening item ---------------------------------------------------
+    if tidx < shares:
+        border = tidx * q + (tidx if tidx < rem else rem)
+        cut_chain = border // chunks
+        cut_off = border - cut_chain * chunks
+        write_level_item(n_heads_out, mCuSeqlens, mWorkItems, tidx, cut_chain, cutlass.Int32(0), chunks - cut_off, expand_num)
+        if cutlass.const_expr(mLevelOrder is not None):
+            mLevelOrder[tidx] = tidx if cut_off != cutlass.Int32(0) else cutlass.Int32(0)
+
+    # ---- the whole chains that open no share ---------------------------------------------------------------
+    item = tidx
+    while item < n_tiles:
+        below = level_borders_below(item * chunks, q, rem, num_ctas)
+        through = level_borders_below((item + cutlass.Int32(1)) * chunks, q, rem, num_ctas)
+        if through == below:
+            write_level_item(n_heads_out, mCuSeqlens, mWorkItems, shares + item - below, item, cutlass.Int32(0), chunks, expand_num)
+            if cutlass.const_expr(mLevelOrder is not None):
+                mLevelOrder[shares + item - below] = cutlass.Int32(0)
+        item = item + cutlass.Int32(n_threads)
+
+
+@cute.jit
+def level_closing_body(
+    b_t: cutlass.Constexpr[int],
+    num_ctas: cutlass.Constexpr[int],
+    tidx,
+    n_heads_out: cutlass.Int32,
+    n_tiles: cutlass.Int32,
+    mCuSeqlens: cute.Tensor,
+    mCount: cute.Tensor,
+    mWorkItems: cute.Tensor,
+    sRank,
+    *,
+    expand_num: cutlass.Constexpr[int] = 1,
+    mLevelOrder: cute.Tensor | None = None,
+):
+    """The closing parts of :func:`level_order_body`'s table -- rows ``[n_tiles, n_tiles + cuts)``, longest first, ties
+    in chain order -- their order entries (``-b``) and the item count ``n_tiles + cuts`` into ``mCount``, for a CTA of
+    its own in the same launch.  Thread ``b`` owns border ``b`` (the same closed form as in the other body).
+
+    The row of a closing part is its rank among the closing parts.  Thread ``b`` leaves border ``b``'s key in word ``b``
+    of ``sRank`` (the caller's, ``num_ctas`` Int32 of shared memory, written once): the closing part's length times
+    ``num_ctas`` plus ``num_ctas - b``, so that a larger key is a longer part or an equal one of an earlier border.
+    Behind ONE CTA-wide barrier it counts the borders with a larger key, one load and one compare each.  Every thread
+    of the calling CTA must reach that barrier."""
+    shares = cutlass.Int32(num_ctas)
+    _, _, _, _, chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, cutlass.Int32(0), expand_num)
+    slots = n_tiles * chunks
+    q = slots // shares
+    rem = slots - q * shares
+
+    cut_chain = cutlass.Int32(0)
+    cut_off = cutlass.Int32(0)
+    key = cutlass.Int32(0)
+    if tidx < shares:
+        border = tidx * q + (tidx if tidx < rem else rem)
+        cut_chain = border // chunks
+        cut_off = border - cut_chain * chunks
+        key = cut_off * shares + (shares - tidx)
+        sRank[tidx] = key
+    nvvm.barrier_cta_sync()
+
+    if tidx < shares:
+        ahead = cutlass.Int32(0)
+        for other in cutlass.range_constexpr(1, num_ctas):
+            ahead = ahead + (cutlass.Int32(1) if sRank[other] > key else cutlass.Int32(0))
+        if cut_off != cutlass.Int32(0):
+            write_level_item(n_heads_out, mCuSeqlens, mWorkItems, n_tiles + ahead, cut_chain, chunks - cut_off, chunks, expand_num)
+            if cutlass.const_expr(mLevelOrder is not None):
+                mLevelOrder[n_tiles + ahead] = cutlass.Int32(0) - tidx
+        if tidx == 0:
+            # border 0 cuts nothing: exactly the cut borders have a larger key, so its count is their number
+            mCount[0] = n_tiles + ahead
 
 
 @cute.jit
