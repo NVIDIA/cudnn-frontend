@@ -4264,12 +4264,12 @@ gates the goldens.
 | `test_replay` | L0 | (table, rows) = (none, 1) / (int32, 17) / (int64, 300) / (int64, 1024); eight executions into fresh vectors under side-stream contention; then the reference | 4 |
 | `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | two entries, two identical 24-row operand sets built afresh | 1 |
 | `test_launch_on_a_side_stream_writes_the_same_result` | L0 | 17 rows under a side stream (ordered after the operands' producer stream) vs the current stream | 1 |
-| `test_batch_invariance` | L0 | table int64 / none; one 1024-row operand set: the 1024-row call replayed three times and checked against the reference; every row alone (a one-row call) vs inside that call, vs the first 2 / 3 / 8 / 17 / 64 / 295 / 296 / 297 / 303 / 304 / 305 / 591 / 592 / 593 / 607 / 608 / 609 rows as one call (both sides of the scheduling-wave edges of a 148-SM and a 152-SM part), vs the reversed batch | 2 |
+| `test_batch_invariance` | L0 | table int64 / none; one 1024-row operand set: the 1024-row call replayed three times and checked against the reference; every row alone (a one-row call) vs inside that call, vs the first 2 / 3 / 8 / 17 / 64 rows and the rows around the part's first four scheduling-wave edges (one to four times its SM count) as one call, vs the reversed batch | 2 |
 | `test_insertion_removal_and_reordering` | L0 | a 130-row call, then a row inserted at position 5, rows 3 / 11 / 129 removed, a permutation: every row keeps its result, the inserted row writes its alone result | 1 |
-| `test_duplicated_row_and_neighbour_isolation` | L0 | a row twice in one call (both copies = alone); the row at position 5 among 63 and at position 296 among 399 redrawn neighbours | 1 |
+| `test_duplicated_row_and_neighbour_isolation` | L0 | a row twice in one call (both copies = alone); the row at position 5 among 63 redrawn neighbours and, in a call 104 rows taller than twice the part's SM count, at the first position behind that edge | 1 |
 | `test_inputs_are_unmodified` | L0 | table kind x rows 1 / 17 / 1024, caller-owned and entry-owned outputs (18 launches): `x` and the tables hold their bytes | 1 |
 | `test_one_element_moves_one_row` | L0 | one element raised above its row's maximum (the first, a middle and the last column; the first, a middle and the last row: 9 changes): its row's result becomes that column and no other row's result moves | 1 |
-| `test_the_row_ceiling_call` | L0 | eight executions at 1024 rows; rows 0 / 511 / 512 / 1023 and the rows on both sides of every scheduling-wave edge below 1024 alone vs inside; the wave count of the call is reported in the run's `measured` section, not asserted | 1 |
+| `test_the_row_ceiling_call` | L0 | eight executions at 1024 rows; rows 0 / 511 / 512 / 1023 and the rows on both sides of every scheduling-wave edge below 1024 (every multiple of the part's SM count: an edge whether one thread block occupies an SM or two share it) alone vs inside; the number of rows compared is reported in the run's `measured` section, not asserted | 1 |
 | `test_row_ceiling_and_the_empty_call_are_typed_declines` | L0 | 1025 rows is a `NotImplementedError`, zero rows a `ValueError`; never a launch (a sentinel-filled output keeps its bytes), never another provider | 1 |
 | `test_golden` | L0 | four cases: three executions, the reference, the saved hashes of the inputs and of the result | 4 |
 
@@ -4281,8 +4281,8 @@ API -- `random-rows1-none` (one random row, the column as int32), `special-rows8
 of both signs, a row of -inf, through an int32 table), `rule-rows27-int64` (the rows that state the rule one sentence at a time:
 ties inside a vector, across a thread's passes, across threads and across warps, the maximum in the first and in the last column,
 zeros of both signs, infinities, the most negative and the largest finite value, a subnormal, NaN beside values, rows of NaN and of
--inf, through an int64 table) and `ties-rows300-int64` (300 rows that hold their maximum thousands of times, past a
-scheduling-wave edge of a 148-SM part).  The op is exact: the result hashes are the same on every part, and a change of one is a
+-inf, through an int64 table) and `ties-rows300-int64` (300 rows that hold their maximum thousands of times, more than twice
+the SM count of a 148-SM part).  The op is exact: the result hashes are the same on every part, and a change of one is a
 change of the rule.  The runtime key still names one runtime, so a run on another runtime has no set to check against.
 
 GPU coverage: cc 10.0 (replay, batch invariance and goldens).  cc 10.3 and cc 10.7 have not been run on a device: the entry admits

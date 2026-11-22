@@ -45,9 +45,12 @@ PASS_WIDTH = VEC * THREADS
 #: the widths the entry serves
 SERVED_WIDTH: Tuple[int, ...] = (65536,)
 #: the served row ceiling per call (the ceiling of the other row decode steps of this library).  Whether a call of this many rows
-#: crosses a scheduling wave depends on the part: one wave holds ``CTAS_PER_SM`` x the SM count rows.
+#: crosses a scheduling wave depends on the part: one wave holds at most ``CTAS_PER_SM`` x the SM count rows.
 MAX_ROWS = 1024
-#: threads one SM holds: ``SM_THREADS // THREADS`` thread blocks co-reside
+#: threads one SM holds: AT MOST ``SM_THREADS // THREADS`` thread blocks co-reside.  The thread limit's bound, not a count: the
+#: registers of the compiled kernel decide too (two blocks of 1024 threads fit an SM's register file only up to 32 registers per
+#: thread).  On compute capability 10.0 the driver's occupancy answer for the compiled kernel IS this bound, two thread blocks
+#: per SM; no other part was asked.
 SM_THREADS = 2048
 #: the kinds of id table a call binds: none (the result is the column), or a table of that integer dtype.  The kind is a load and
 #: a store width of the kernel, so each kind is one compiled kernel.
@@ -89,7 +92,8 @@ class Cfg:
 
     @property
     def CTAS_PER_SM(self) -> int:
-        """Thread blocks of this form one SM holds: what one scheduling wave runs per SM."""
+        """Thread blocks of this form one SM holds AT MOST (the thread limit; the compiled kernel's registers decide too): the
+        most one scheduling wave runs per SM."""
         return SM_THREADS // self.THREADS
 
     def __str__(self) -> str:

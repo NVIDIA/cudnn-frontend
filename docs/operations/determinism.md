@@ -633,8 +633,9 @@ for replay, batch-invariance, and stress-test results.
   run, so SM103 and SM107 are unverified: the entry admits compute capability
   10.x, the kernel's rendering is checked for the `sm_100a`, `sm_103a` and
   `sm_107a` targets, and cc 10.7 needs the DSL's CUDA 13 compiler flavour.
-  SM90 and SM120 are declined by type. A call of more than 296 rows crosses a
-  scheduling wave on a 148-SM part (424 rows on a 212-SM part); the kernel
+  SM90 and SM120 are declined by type. On cc 10.0 the driver reports two
+  thread blocks of the kernel per SM, so a call of more than 296 rows crosses
+  a scheduling wave on a 148-SM part (no other part was asked); the kernel
   holds no state between thread blocks. No backward entry point exists.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active

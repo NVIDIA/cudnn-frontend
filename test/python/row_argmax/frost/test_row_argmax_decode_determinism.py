@@ -4,7 +4,7 @@
 """Determinism of the row argmax decode step (``cudnn.RowArgmaxDecode``), raw bytes throughout: bitwise replay into fresh
 buffers under side-stream contention at 1, 17, 300 and 1024 rows; a fresh entry on fresh identical operands; a launch on a side
 stream; batch invariance of every row -- alone (a one-row call) against the same row inside the first 2 .. 1024 rows of ONE
-operand set (on both sides of the scheduling-wave edges of a 148-SM and a 152-SM part), inside the reversed batch, after an
+operand set (on both sides of the part's first four scheduling-wave edges), inside the reversed batch, after an
 insertion, a removal and a permutation of its neighbours, duplicated inside one call, and with every other row redrawn; the
 inputs unmodified by a launch; a change of ONE element moving the result of its row and of no other; the row ceiling call; the
 row ceiling and the empty call as typed declines; and the goldens (four small cases, recorded with
@@ -48,9 +48,8 @@ pytestmark = [pytest.mark.L0]
 
 MAX_ROWS = kcfg.MAX_ROWS
 SENTINEL = -0x5A5A5A5A
-#: the row counts a batch-invariance cell runs as ONE call besides the row ceiling: 295 .. 297 and 303 .. 305 are the edge of the
-#: first scheduling wave on a 148-SM and on a 152-SM part (two thread blocks per SM), 591 .. 593 and 607 .. 609 of the second
-INSIDE = (2, 3, 8, 17, 64, 295, 296, 297, 303, 304, 305, 591, 592, 593, 607, 608, 609)
+#: the row counts a batch-invariance cell runs as ONE call besides the row ceiling and the part's scheduling-wave edges
+INSIDE = (2, 3, 8, 17, 64)
 
 
 def run(k, x, ids):
@@ -75,6 +74,14 @@ def pick(results, order):
     """The rows ``order`` of per-row results."""
     index = torch.tensor(order, dtype=torch.long, device=results["out"].device)
     return {name: t[index] for name, t in results.items()}
+
+
+def wave_edges(dev, below=MAX_ROWS):
+    """The row counts below ``below`` at which a scheduling wave of this part can end: every multiple of its SM count.  A wave runs
+    one thread block per SM or two -- the compiled kernel's registers decide, not the config (on compute capability 10.0 the
+    driver reports two) -- and an edge of either is such a multiple."""
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    return list(range(sms, below, sms))
 
 
 @pytest.mark.parametrize("table, rows", (("none", 1), ("int32", 17), ("int64", 300), ("int64", MAX_ROWS)), ids=lambda v: str(v))
@@ -119,8 +126,9 @@ def test_launch_on_a_side_stream_writes_the_same_result():
 @pytest.mark.parametrize("table", ("int64", "none"))
 def test_batch_invariance(table):
     """ONE operand set of 1024 rows.  Every row alone (a one-row call) writes the result it writes inside the 1024-row call,
-    inside every shorter call that holds it (on both sides of the scheduling-wave edges) and inside the reversed batch.  What
-    changes between "alone" and "inside" is the grid, the row's thread block and the scheduling wave it runs in."""
+    inside every shorter call that holds it (the first 2 .. 64 rows and the rows around this part's first four scheduling-wave
+    edges) and inside the reversed batch.  What changes between "alone" and "inside" is the grid, the row's thread block and
+    the scheduling wave it runs in."""
     dev = _device_or_skip()
     k = make_entry(dev)
     x = make_rows(MAX_ROWS, dev, seed=300, kind="special")
@@ -130,7 +138,8 @@ def test_batch_invariance(table):
     singles = [rows_of(k, x[r : r + 1], ids) for r in range(MAX_ROWS)]
     alone = dict(out=torch.cat([one["out"] for one in singles]))
     assert_bitwise(alone, full, f"every row alone vs inside {MAX_ROWS} rows")
-    for inside in INSIDE:
+    around = {n for edge in wave_edges(dev)[:4] for n in (edge - 1, edge, edge + 1) if 1 < n < MAX_ROWS}
+    for inside in sorted({*INSIDE, *around}):
         batch = rows_of(k, x[:inside], ids)
         assert_bitwise(batch, dict(out=alone["out"][:inside]), f"the first {inside} rows as one call vs each row alone")
     reverse = list(range(MAX_ROWS - 1, -1, -1))
@@ -161,8 +170,8 @@ def test_insertion_removal_and_reordering():
 
 def test_duplicated_row_and_neighbour_isolation():
     """A row twice in one call: both copies equal its alone result.  The same row among REDRAWN neighbours -- other values
-    around it, another position, a taller call: at position 5 of 64 rows and at position 296 of 400 rows (the first row behind
-    a scheduling-wave edge of a 148-SM part) -- keeps its result."""
+    around it, another position, a taller call: at position 5 of 64 rows and, in a call 104 rows taller than the part's second
+    scheduling-wave edge (twice its SM count), at the first position behind that edge -- keeps its result."""
     dev = _device_or_skip()
     k = make_entry(dev)
     x = make_rows(8, dev, seed=400, kind="ties")
@@ -171,7 +180,8 @@ def test_duplicated_row_and_neighbour_isolation():
     got = rows_of(k, take(x, [0, 1, 2, 2, 3, 4, 5, 6, 7]), ids)
     assert_bitwise(pick(got, [2]), alone, "a duplicated row, first copy")
     assert_bitwise(pick(got, [3]), alone, "a duplicated row, second copy")
-    for position, others in ((5, 63), (296, 399)):
+    edge = wave_edges(dev)[1]
+    for position, others in ((5, 63), (edge, edge + 103)):
         other = make_rows(others, dev, seed=401 + others)
         mixed = torch.cat([other[:position], x[2:3], other[position:]]).contiguous()
         got = rows_of(k, mixed, ids)
@@ -217,28 +227,25 @@ def test_one_element_moves_one_row():
 
 def test_the_row_ceiling_call():
     """The 1024-row call, eight executions under side-stream contention, and rows alone against the same rows inside it: the
-    rows on both sides of every scheduling-wave edge below the ceiling (one wave holds ``CTAS_PER_SM`` thread blocks per SM:
-    296 rows on a 148-SM part, 304 on 152 SMs, 424 on 212 SMs), and rows 0, 511, 512 and 1023 on every part.  Whether the call
-    crossed a wave on this part is one line of the run's "measured" section, never an assertion: the kernel holds no state
-    between thread blocks, so nothing depends on it."""
+    rows on both sides of every scheduling-wave edge of this part below the ceiling (every multiple of its SM count: an edge
+    whether one thread block occupies an SM or two share it), and rows 0, 511, 512 and 1023 on every part.  How many rows were
+    compared is one line of the run's "measured" section, never an assertion: the kernel holds no state between thread blocks."""
     dev = _device_or_skip()
     import frost_routing
 
     k = make_entry(dev)
-    sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    wave = k.cfg.CTAS_PER_SM * sms
     x = make_rows(MAX_ROWS, dev, seed=900, kind="ties")
     ids = make_table("int64", dev, seed=900)
     full = assert_replays(lambda: run(k, x, ids), repeats=8)
     assert_rule(full["out"], x, ids, "the row ceiling call")
-    edges = {r for edge in range(wave, MAX_ROWS, wave) for r in (edge - 1, edge, edge + 1) if 0 <= r < MAX_ROWS}
+    edges = {r for edge in wave_edges(dev) for r in (edge - 1, edge, edge + 1) if 0 <= r < MAX_ROWS}
     rows = sorted(edges | {0, 511, 512, MAX_ROWS - 1})
     alone = dict(out=torch.cat([rows_of(k, x[r : r + 1], ids)["out"] for r in rows]))
-    assert_bitwise(alone, pick(full, rows), f"rows {rows} alone vs inside {MAX_ROWS} rows ({wave} thread blocks per wave)")
-    waves = -(-MAX_ROWS // wave)
+    assert_bitwise(alone, pick(full, rows), f"rows {rows} alone vs inside {MAX_ROWS} rows")
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
     frost_routing.measured(
         "row argmax, the row ceiling call",
-        f"scheduling waves of the {MAX_ROWS}-row call: {waves} (wave = {wave} thread blocks on {sms} SMs; rows compared alone: {len(rows)})",
+        f"rows compared alone against the {MAX_ROWS}-row call: {len(rows)} (rows 0, 511, 512, {MAX_ROWS - 1} and both sides of every multiple of {sms} SMs)",
     )
 
 
@@ -278,7 +285,7 @@ def _golden_operands(case, rows, dev):
 def test_golden(case, rows, table):
     """Four small cases -- one random row without a table, eight rows with NaN, infinities and zeros of both signs through an
     int32 table, the rows that state the rule one sentence at a time and 300 rows that hold their maximum thousands of times
-    (past a scheduling-wave edge of a 148-SM part) through an int64 table: three executions, the independent reference, then
+    (more than twice the SM count of a 148-SM part) through an int64 table: three executions, the independent reference, then
     the saved hashes of the inputs and of the result.  Recorded into a NEW directory with ``CUDNN_DETERMINISM_RECORD`` only
     after the replay and reference cells pass.  The op is exact: these hashes are the same on every part, and a change of one
     is a change of the rule."""

@@ -123,7 +123,7 @@ nothing is released; the kernel has no other synchronization object.
 | question | answer |
 | --- | --- |
 | device | compute capability 10.x; validated on cc 10.0. The kernel's rendering is checked for the `sm_100a`, `sm_103a` and `sm_107a` targets, and from the kernel's entry on the `sm_103a` and `sm_107a` renderings are the `sm_100a` text: cc 10.3 and cc 10.7 are admitted on that basis and have not run on a device, and any other 10.x minor is admitted by the range alone. 9.0 and 12.x are declined by type |
-| rows | 1 .. 1024 per call (runtime argument); 1025 and up declined by name. Two thread blocks of 1024 threads share an SM, so one scheduling wave holds 296 rows on a 148-SM part and 424 on a 212-SM part: a call above that crosses waves. The kernel holds no state between thread blocks |
+| rows | 1 .. 1024 per call (runtime argument); 1025 and up declined by name. At most two thread blocks of 1024 threads share an SM, and the compiled kernel's registers decide whether two do: on cc 10.0 the driver reports two thread blocks of this kernel per SM (30 registers per thread under both compiler flavours of CuTe DSL 4.8.0), so one scheduling wave holds 296 rows on a 148-SM part and a call above that crosses waves. No other part was asked. The kernel holds no state between thread blocks |
 | width | 65536, fixed at construction; another multiple of 8 up to 65536 is declined by name |
 | forms | one kernel body; three table kinds (none, int32, int64), one compiled kernel each |
 | dtypes | bf16 `x`; int32 or int64 `ids`; `out` int32 without a table, else the table's dtype |
