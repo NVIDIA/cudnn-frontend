@@ -723,19 +723,27 @@ library's own version, else from its cache directory -- and a file it does not f
 lets it. Before the library is first reached the run switches that download off for its process and for every process
 it starts (`FLASHINFER_NO_DOWNLOAD`), and says so in a line of its own, `[00] planning: first use of the paged decode
 attention of FlashInfer <version>: ...`: a kernel binary comes from the package or from a directory filled
-beforehand, never from a fetch inside a run. At its first use the library builds a launcher with the installed CUDA
-compiler and ninja, once per machine and kernel-binary directory, and reads a manifest, a header and the kernel
-binaries of a step shape. Which binaries a step reads follows the sequences, the tokens per sequence, the run's
-maximum length and the GPU, so the plan makes one scratch call per step shape of the run -- its sequences and one
-sequence alone, at the tokens per sequence of each of its plans, at the run's maximum length -- and every binary of
-the run is read, or reported, before anything is loaded. What a run does by what the installation holds:
+beforehand, never from a fetch inside a run. The library does not always refuse a binary it lacks: where the missing
+file is not the first one its kernel selection reads, it raises nothing, prints lines of its own with a path of its
+installation and launches another kernel of the set. So the sample does not rely on the refusal. Before its first
+call of the attention it reads the manifest and the header of the library's kernel set, holds the manifest to the
+SHA-256 the library itself names for it, and holds every kernel binary
+the header's table names for this call -- the data types, the head width, the paging and the page -- on the GPU's
+class to the SHA-256 the manifest lists for it: 44 binaries on compute capability 10.0, more than a run reads, because
+which of them a step reads is the library's selection and the sample models none of it. A binary that is missing or
+is not the manifest's file, or a manifest that is not the library's, ends the run in `[00] SKIP` before the library's
+attention is called, so a run that passes
+cannot meet a missing binary at a later step. Then the library builds a launcher with the installed CUDA compiler and
+ninja, once per machine and kernel-binary directory, and the plan makes one scratch call per step shape of the run --
+its sequences and one sequence alone, at the tokens per sequence of each of its plans, at the run's maximum length.
+What a run does by what the installation holds:
 
 | the installation | the run |
 |---|---|
-| the package at the library's version, the directory variable unset | reads the package |
-| neither the package nor the variable, and no such file in the library's cache directory | `[00] SKIP`: the package is not installed, with its command |
-| the variable set, no package, and the directory without the files of this GPU and step shape | `[00] SKIP`: the directory does not hold them; fill it, or install the package |
-| the package at the library's version, without a binary for this GPU and step shape | `[00] SKIP` that names the step shape and the maximum length, and no command: none would bring the file |
+| the package at the library's version, the directory variable unset | holds the package's files, then reads them |
+| neither the package nor the variable, and the library's cache directory without a file of the set | `[00] SKIP`: the package is not installed, with its command |
+| the variable set, no package, and the directory without a file of the set, or with a manifest that is not the library's | `[00] SKIP`: the directory does not hold them -- how many are missing or changed, or that its manifest is not there or is not the library's --; fill it, or install the package |
+| the package at the library's version, with a binary of the set missing or changed, or a manifest that is not the library's | `[00] SKIP` that says how many of the set are missing or changed, or that the manifest is not the file the library names, and no command: the line above leaves an installed package as it is. Install it anew, with `--force-reinstall` added to that line |
 | the package at another version than the library's | `[00] SKIP` at plan time with both versions and the command: the library would ignore the package |
 | the variable set while the package is installed | `[00] SKIP` at plan time that names the variable and the package: take one of the two away |
 | the package's metadata without its module, or its module without the metadata | `[00] SKIP` at plan time that says which |
@@ -745,8 +753,9 @@ library is not imported. Where the package cannot be installed, fill a directory
 `FLASHINFER_CUBIN_DIR`, on a machine without the package: with the library's own command `flashinfer download-cubin`,
 which fetches every file of every kernel set of the library (this page has not run it), or by copying such a directory
 from a machine with the same GPU model -- the binaries are per architecture, and the choice among them follows the
-SM count. The run then reads that directory with the download switched off, and a file that is missing there is the
-`SKIP` of the table.
+SM count. The run then holds and reads that directory with the download switched off, and a file of the set that is
+missing there is the `SKIP` of the table: a directory that holds only what earlier runs of the library fetched for
+their own steps does not hold the set.
 
 On compute capability 12.x neither the gate entry nor the norm entry serves; both blocks then stay on their reference
 chains (`not yet (reference chain)`) in both stacks, and the census has no section for that class. The row of the

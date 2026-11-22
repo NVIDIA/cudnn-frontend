@@ -19,6 +19,7 @@ implies no fallback row and a recorded basis", the adapter of the attention gate
 its twin and its band on stated tensors, and ``main()`` with ``--stack native`` to its last line.  No GPU, no weights, no
 profiler."""
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -160,6 +161,18 @@ ATTENTION_SHAPE = ((5, 4, 1), (512, 1, 1), 178456)
 ATTENTION_ENTRY = "flashinfer.decode.trtllm_batch_decode_with_kv_cache"
 #: the maximum length the scripts default to and the census was recorded with
 RECORDED_LENGTH = 2051
+#: the table of the stand-in library's attention kernel set, as (architecture, kernel): the two kernels its call reads at
+#: a step, one of the same geometry for compute capability 10.0 alone and one for 10.3 alone, and one of another head width
+ATTENTION_CONTEXT = "Kernel_QkvBfloat16OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContext"
+ATTENTION_SET = (
+    ("kSM_100f", FI_ATTENTION),
+    ("kSM_100f", FI_ATTENTION_OTHER),
+    ("kSM_100", "fmhaSm100a" + ATTENTION_CONTEXT),
+    ("kSM_103", "fmhaSm103a" + ATTENTION_CONTEXT),
+    ("kSM_100f", FI_ATTENTION.replace("H256", "H128")),
+)
+#: the kernel-binary directory the stand-in library reads where a test names none: every file of its set (built at its first use)
+ATTENTION_BINARIES = []
 #: what the stand-in of the library's attention was handed, per call: every argument by name, as the objects it was handed
 ATTENTION_CALLS = []
 #: what the stand-in of the library was called with, per call: (function, backend, rows of the activation, shape of the weight as it was
@@ -1405,6 +1418,35 @@ def _prepare_entry(calls, launch=None, defect="", decline=None, shape=None):
     return Prepare
 
 
+def _kernel_binaries(directory, kernels=ATTENTION_SET, without=(), changed=(), unlisted=(), misnamed=(), manifest=True, header=None):
+    """A kernel-binary directory of the stand-in library at ``directory``, laid out as the library's: the folder of the
+    attention kernel set, named as the backend, with a manifest (a line per file: SHA-256, name), a header whose table
+    names ``kernels`` with their architecture and SHA-256, and a binary per kernel.  ``without``: kernels whose binary is
+    left out; ``changed``: files one byte of which differs from what the manifest lists (a kernel, or the header);
+    ``unlisted``: kernels the manifest has no line for; ``misnamed``: kernels whose SHA-256 in the header is another
+    file's; ``manifest`` false: no manifest; ``header``: another text in the header's place.  Returns ``directory``."""
+    from model_samples.providers import flashinfer_calls
+
+    folder = Path(directory) / "2d6a" / "fmha" / flashinfer_calls.DECODE_ATTENTION_BACKEND
+    (folder / "include").mkdir(parents=True)
+    digests = {name: hashlib.sha256(f"the binary of {name}".encode()).hexdigest() for _, name in kernels}
+    named = {name: hashlib.sha256(b"another file").hexdigest() if name in misnamed else digest for name, digest in digests.items()}
+    records = "\n".join(f'{{ 8, {architecture}, "{name}", 178456, "{named[name]}"}},' for architecture, name in kernels)
+    declared = (
+        "struct KernelMetaInfo\n{\n    int mTileSizeQ;\n    int mSM;\n    const char* mFuncName;\n    int mSharedMemBytes;\n    const char* sha256;\n};\n"
+    )
+    if header is None:
+        header = f"#pragma once\n\n{declared}\nstatic const KernelMetaInfo sKernelMetaInfos[] = {{\n{records}\n}};\n"
+    (folder / "include" / "flashInferMetaInfo.h").write_bytes(header.encode() + (b"\n" if "include/flashInferMetaInfo.h" in changed else b""))
+    for _, name in kernels:
+        if name not in without:
+            (folder / f"{name}.cubin").write_bytes(f"the binary of {name}".encode() + (b"." if name in changed else b""))
+    lines = [f"{digest}  {name}.cubin" for name, digest in digests.items() if name not in unlisted]
+    if manifest:
+        (folder / "checksums.txt").write_text("\n".join([*lines, f"{hashlib.sha256(header.encode()).hexdigest()}  include/flashInferMetaInfo.h"]) + "\n")
+    return Path(directory)
+
+
 def _stand_ins(
     monkeypatch,
     step_launches=None,
@@ -1428,6 +1470,7 @@ def _stand_ins(
     library_defect="",
     library_installed=VALIDATED_LIBRARY,
     library_binaries=(VALIDATED_LIBRARY, True),
+    kernel_binaries=None,
     attention_defect="",
     prepare_defect="",
     prepare_serves=None,
@@ -1498,8 +1541,8 @@ def _stand_ins(
     every other step), ``"other"`` (the 8-bit call launches a kernel of neither family), ``"twin"`` (the 8-bit call
     launches the same CUTLASS multiply on 4-bit operands: another kernel, whose name differs from the library's own far
     from its start), ``"refuses"`` (the library refuses the operands of its first use), ``"mistyped"`` (the same, as a
-    ``TypeError``), ``"build"`` (it cannot build its kernel at its first use) or ``"import"`` (the package is installed
-    and cannot be imported).  Every call of the stand-in is written to ``LIBRARY_CALLS`` with the backend it was handed
+    ``TypeError``), ``"build"`` (it cannot build its kernel at its first use), ``"import"`` (the package is installed
+    and cannot be imported) or ``"paths"`` (its artifact paths name no folder of the attention kernel set) or ``"checksums"`` (its checksums name no manifest of that set).  Every call of the stand-in is written to ``LIBRARY_CALLS`` with the backend it was handed
     -- its defaults are the library's own, which are not the rows' --, its row count and the shape of its weight.
 
     The library's paged decode attention is the same stand-in's ``decode`` call, under the REAL adapter
@@ -1510,7 +1553,13 @@ def _stand_ins(
     chain's, every one inside the band) in the buffer it was handed; it launches the
     kernel the census records, in its shape for the tokens of the call, for one sequence at a maximum length of 2,051,
     and another variant of that kernel elsewhere.  ``library_binaries`` is the kernel-binary package as the installation
-    has it: (the version its metadata states, whether its module can be found).  ``attention_defect`` makes the call:
+    has it: (the version its metadata states, whether its module can be found).  ``kernel_binaries`` is the kernel-binary
+    directory the library resolved (:func:`_kernel_binaries`; left out: one that holds every file); the SHA-256 the
+    library names for the manifest of its kernel set is that of the directory's manifest as the stand-in finds it.  The call reads two
+    binaries of it, as the library does at the recorded step: first the variant it launches elsewhere, then the kernel
+    it launches.  Without the first, or with one that is not the file the header names, it raises the library's
+    refusal of a kernel binary; without the second it raises nothing, writes lines of its own with a local path to
+    standard error and launches the first.  ``attention_defect`` makes the call:
     ``"variant"`` (the other variant where the recorded one belongs), ``"shape"`` (the recorded variant in another
     grid), ``"fill"`` or ``"multiply"`` (one PyTorch launch in front of the kernel), ``"behind"`` (a second kernel of
     the library behind it), ``"width"`` (the kernel of another head width), ``"page"`` (of another page), ``"element"`` (one wrong element per call),
@@ -1940,6 +1989,20 @@ def _stand_ins(
         return tensor.contiguous().view(-1).view(torch.int32)[:count].view(*shape)
 
     kernel_set = f"2d6a/fmha/{flashinfer_calls.DECODE_ATTENTION_BACKEND}"  # the folder of the attention kernel set, as the library's artifact path names it
+    if kernel_binaries is None:
+        if not ATTENTION_BINARIES:
+            import tempfile
+
+            ATTENTION_BINARIES.append(_kernel_binaries(Path(tempfile.mkdtemp(prefix="kernel_binaries_")) / "cubins"))
+        kernel_binaries = ATTENTION_BINARIES[0]
+
+    published = Path(kernel_binaries) / kernel_set / "checksums.txt"  # the manifest the stand-in library names: the directory's, as it stands now
+    manifest_digest = hashlib.sha256(published.read_bytes()).hexdigest() if published.is_file() else ""
+
+    def on_the_machine(name):
+        """Whether the library's loader finds the binary of ``name``: the file is there and is the one the header names."""
+        binary = Path(kernel_binaries) / kernel_set / f"{name}.cubin"
+        return binary.is_file() and binary.read_bytes() == f"the binary of {name}".encode()
 
     def loader_callback(name):
         """The library's loader callback for a kernel binary that is not on the machine: it raises where only the
@@ -1956,11 +2019,24 @@ def _stand_ins(
         ctypes.CFUNCTYPE(None)(get_cubin_callback)()
 
     class Library:
-        """The stand-in of the library: the two multiplies and the attention the adapters call, its tuner, and the one size
-        function the attention's adapter asks."""
+        """The stand-in of the library: the two multiplies and the attention the adapters call, its tuner, the one size
+        function the attention's adapter asks, the kernel-binary directory it resolved and its artifact paths."""
 
         class autotuner:
             AutoTuner = Tuner
+
+        class jit:
+            env = SimpleNamespace(FLASHINFER_CUBIN_DIR=Path(kernel_binaries))
+
+        class artifacts:
+            @dataclasses.dataclass(frozen=True)
+            class ArtifactPath:
+                MULTIPLY: str = "7b1f/gemm/"
+                ATTENTION: str = ("2d6a/fmha/another" if library_defect == "paths" else kernel_set) + "/"
+                ARCHS: tuple = ("sm_100a", "sm_103a")
+
+            class CheckSumHash:
+                map_checksums = {} if library_defect == "checksums" else {f"{kernel_set}/checksums.txt": manifest_digest}
 
         class utils:
             @staticmethod
@@ -2001,7 +2077,7 @@ def _stand_ins(
                         f"Artifact not found locally: {kernel_set}//checksums.txt (looked at /a/local/path/cubins/{kernel_set}/checksums.txt). "
                         "FLASHINFER_NO_DOWNLOAD is set \u2014 refusing to download. This means flashinfer-cubin is missing this file."
                     )
-                if attention_defect == "binary":
+                if attention_defect == "binary" or not on_the_machine(FI_ATTENTION_OTHER):  # the binary the selection reads first
                     loader_callback(FI_ATTENTION_OTHER)
                     raise RuntimeError(f"Failed to load cubin for {FI_ATTENTION_OTHER}")
                 tokens = q_len_per_req
@@ -2009,6 +2085,9 @@ def _stand_ins(
                 recorded = sequences == 1 and max_seq_len == RECORDED_LENGTH
                 grid = ((5 * tokens, 4, sequences), (512, 1, 1))
                 name, shape = (FI_ATTENTION, (*grid, 178456)) if recorded else (FI_ATTENTION_OTHER, (*grid, 145168))
+                if not on_the_machine(FI_ATTENTION):  # the binary it would launch: no error, lines of its own, the other kernel
+                    sys.stderr.write("CUDA Error: CUDA_ERROR_NOT_FOUND /a/local/path/site-packages/flashinfer/data/include/fmhaKernels.cuh 1365\n")
+                    name, shape = FI_ATTENTION_OTHER, (*grid, 145168)
                 if attention_defect == "variant":
                     name = FI_ATTENTION_OTHER
                 if attention_defect == "shape":
@@ -2121,6 +2200,7 @@ def _stand_ins(
     monkeypatch.setattr(flashinfer_calls, "binaries_package", lambda: tuple(library_binaries))
     monkeypatch.delenv(flashinfer_calls.BINARIES_DIRECTORY, raising=False)  # the library's directory variable: a test that sets it says so
     monkeypatch.setattr(flashinfer_calls, "_WORKSPACES", {})  # the workspaces of this device: none of an earlier one's
+    monkeypatch.setattr(flashinfer_calls, "_HELD", {})  # ... and nothing an earlier one held of its kernel binaries
     over_copies = OverCopies
     stand_ins = {
         "flashinfer.mm_fp4": over_library(flashinfer_calls.MmFp4Block),
@@ -3987,18 +4067,22 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     assert code == 1 and lines[-1] == "[00] FAIL" and core.endswith("[band: attention_bf16_weights]  FAIL") and "; 0 outside their bound; " not in core, core
     assert _kernel_lines(lines)[0].endswith("    PASS")
 
-    # kernel binaries that are not on the machine: the library's refusal at the first use is a SKIP before anything is loaded,
-    # in the sample's own words -- no path of the library's text, no line behind it
+    # kernel binaries that are not on the machine as their manifest lists them -- no manifest; the binary the library would
+    # launch, in whose place it would launch another kernel and print a path -- are a SKIP before anything is loaded,
+    # in the sample's own words: the library is not called, no line follows, no path is printed
     for defect, binaries, sentence in (
-        ("manifest", (None, False), f"{ATTENTION_ENTRY} needs the kernel-binary package flashinfer-cubin 0.7.2.post1, which is not installed: "),
+        ({"manifest": False}, (None, False), f"{ATTENTION_ENTRY} needs the kernel-binary package flashinfer-cubin 0.7.2.post1, which is not installed: "),
         (
-            "binary",
+            {"without": [FI_ATTENTION]},
             (VALIDATED_LIBRARY, True),
-            f"{ATTENTION_ENTRY}: the installed flashinfer-cubin 0.7.2.post1 holds no kernel binary for this GPU and step shape ",
+            f"{ATTENTION_ENTRY}: the installed flashinfer-cubin 0.7.2.post1 does not hold the kernel binaries the library's table names for this call's "
+            "data types, head width, paging and page on this GPU's class ",
         ),
     ):
-        code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], attention_defect=defect, library_binaries=binaries)
+        directory = _kernel_binaries(tmp_path / f"binaries_{len(defect)}_{binaries[1]}", **defect)
+        code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], kernel_binaries=directory, library_binaries=binaries)
         assert code == 0 and lines[-1].startswith(f"[00] SKIP {sentence}") and "/a/local/path" not in "\n".join(lines), lines[-1]
+        assert ATTENTION_CALLS == [], "the library's attention was not called"
         assert lines[-1].endswith("--stack fe-entries runs the cuDNN Frontend rows of this stack without the package") and not any(
             line.startswith(("checks", "[00] stage")) for line in lines
         ), "nothing was loaded and nothing checked"
@@ -8895,7 +8979,8 @@ def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypa
     assert notes[1].startswith(
         "first use of the paged decode attention of FlashInfer 0.7.2.post1: this sample switches the library's download of kernel binaries off for the "
         "process (FLASHINFER_NO_DOWNLOAD), so they are read from its kernel-binary package or from a directory filled beforehand and never fetched; "
-    ), "and one for the attention, which says what the sample does to the library's download"
+        "it holds the kernel binaries of this GPU to their manifest, and the library then builds its launcher"
+    ), "and one for the attention, which says what the sample does to the library's download and to its kernel binaries"
     assert "### What the first run does" in (MODELS / "qwen_dense" / "README.md").read_text(), "the section the sentence names"
     for block in (down, head, out):
         block.first_use(1, 1)
@@ -11141,15 +11226,15 @@ def test_rule_8_states_its_one_exception_word_for_word_and_so_do_the_places_that
 # library, on the CPU -- what it hands the library, what it declines, its first use, and the kernel check on its kernel.
 # ---------------------------------------------------------------------------------------------------------------------------
 def _attention_plans(monkeypatch, **stand_in):
-    """``planned(sequences, tokens, max_model_len, table)``: the attention core's block in a plan of the stack ``native`` on
-    compute capability 10.0, for the tiny geometry and ONE set of stand-ins (``stand_in``: its options): every block it
-    returns is an adapter of the same device."""
+    """``planned(sequences, tokens, max_model_len, table, cc)``: the attention core's block in a plan of the stack ``native``
+    on compute capability ``cc`` (10.0 where none is named), for the tiny geometry and ONE set of stand-ins (``stand_in``:
+    its options): every block it returns is an adapter of the same process."""
     from model_samples import blocks
 
     model, build = _tiny_model(), _stand_ins(monkeypatch, **stand_in)
-    facts = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
 
-    def planned(sequences=1, tokens=1, max_model_len=RECORDED_LENGTH, table=None):
+    def planned(sequences=1, tokens=1, max_model_len=RECORDED_LENGTH, table=None, cc=(10, 0)):
+        facts = blocks.DeviceFacts(cc, "stated device", 148, 180 * GIB, 80 * GIB)
         options = {"reference_precision": "fp64", "device": "cpu", "max_model_len": max_model_len}
         plan = blocks.plan(table or model.provider_table, model.regimes, facts, sequences, tokens, "native", model=model, options=options, factories=build)
         return plan["attention.core"]
@@ -11291,9 +11376,15 @@ def test_the_attention_adapter_declines_what_the_library_would_misread(monkeypat
     assert torch.equal(planned(1, 1)(one, small, start).view(torch.int16), right.view(torch.int16)), "one sequence of one page: the defect, and the right bytes"
 
 
-def test_the_first_use_of_the_librarys_attention_and_the_kernel_binaries_it_never_fetches(monkeypatch):
+def test_the_first_use_of_the_librarys_attention_and_the_kernel_binaries_it_never_fetches(monkeypatch, tmp_path, capsys):
     """The first use of the paged decode attention: one scratch call per form the run calls -- its sequences and one
-    sequence alone, at each plan's tokens per sequence -- at the run's maximum length.  A file the library does not
+    sequence alone, at each plan's tokens per sequence -- at the run's maximum length.  In front of the first call the
+    adapter holds every kernel binary the library's table names for the call's data types, head width, paging and page
+    on the GPU's class to the manifest of the kernel set: a
+    binary that is missing -- the one a step launches or the one its selection reads first --, one changed byte, a
+    line the manifest lacks, a header that is not the manifest's, no manifest or a manifest that is not the file the
+    library names is a ``SKIP`` with the library not called, and a library that would print a path and launch another kernel is never reached in that state.  The set
+    is the class's own and is held once per process.  A file the library itself does not
     find with its download refused is a ``SKIP`` in the sample's words, by what the installation holds, with no path
     of the library's text; the states of the package in
     which the library's import would print a path are declined at plan time, before the library is reached.  A check
@@ -11302,6 +11393,7 @@ def test_the_first_use_of_the_librarys_attention_and_the_kernel_binaries_it_neve
     library's loader stays off the streams during the first use; every other report reaches the hook that was there."""
     from types import SimpleNamespace
 
+    from model_samples import census
     from model_samples.providers import flashinfer_calls
 
     planned = _attention_plans(monkeypatch)
@@ -11313,27 +11405,116 @@ def test_the_first_use_of_the_librarys_attention_and_the_kernel_binaries_it_neve
     made = [(call["query"].shape[0], call["q_len_per_req"], call["max_seq_len"], tuple(call["block_tables"].shape)) for call in ATTENTION_CALLS]
     assert made == [(2, 1, 2051, (2, 36)), (1, 1, 2051, (1, 36)), (12, 6, 2051, (2, 36)), (6, 6, 2051, (1, 36))], "four forms, each at the maximum length"
 
-    # a file the library did not find, by what the installation holds: (the package's metadata and module, the directory variable)
+    # the kernel binaries, held before the first call: what the set's header names for the GPU's class, each as the manifest lists it
     install = "pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt"
     without = "--stack fe-entries runs the cuDNN Frontend rows of this stack without the package"
     filled = 'fill it (the family README, "What the first run does") or install the package'
+    anew = 'install it anew (the family README, "What the first run does")'
+    lacks = (
+        "does not hold the kernel binaries the library's table names for this call's data types, head width, paging and page on this GPU's class "
+        "as their manifest lists them"
+    )
+    one, header = "1 of 3 missing or changed", "include/flashInferMetaInfo.h"
+    held = (
+        ("the binary a step launches is missing", {"without": [FI_ATTENTION]}, one),
+        ("the binary the selection reads first is missing", {"without": [FI_ATTENTION_OTHER]}, one),
+        ("one byte of a binary differs", {"changed": [FI_ATTENTION]}, one),
+        ("the manifest has no line for a binary", {"unlisted": [FI_ATTENTION]}, one),
+        ("the header names another SHA-256 than the binary's", {"misnamed": [FI_ATTENTION]}, one),
+        ("a binary of this class that no step of the run reads is missing", {"without": [ATTENTION_SET[2][1]]}, one),
+        ("no manifest", {"manifest": False}, "their manifest is not there"),
+        ("one byte of the header differs", {"changed": [header]}, "the header of the kernel set is not the file their manifest lists"),
+        ("a header without the table", {"header": "#pragma once\n"}, "the header of the kernel set is not the table of kernels this adapter reads"),
+        ("a table without a kernel of this call", {"kernels": ATTENTION_SET[4:]}, "the header of the kernel set names no kernel of this call for this GPU"),
+    )
+    reports = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda unraisable: reports.append(type(unraisable.exc_value).__name__))
+    for number, (case, defect, found) in enumerate(held):
+        directory = _kernel_binaries(tmp_path / f"held_{number}", **defect)
+        block = _attention_plans(monkeypatch, kernel_binaries=directory)(2, 6)
+        capsys.readouterr()
+        with pytest.raises(NotImplementedError) as skipped:
+            block.first_use(2, 6)
+        assert str(skipped.value) == f"{ATTENTION_ENTRY}: the installed flashinfer-cubin 0.7.2.post1 {lacks} ({found}); {anew}; {without}", case
+        assert ATTENTION_CALLS == [] and capsys.readouterr() == ("", ""), f"{case}: the library was not called and nothing was printed"
+        if FI_ATTENTION_OTHER in defect.get("without", ()):  # behind a hold that skipped, a step is a step: the library's error is raised as it is
+            with pytest.raises(RuntimeError, match="Failed to load cubin for"):
+                block(*next(block._scratches(torch.device("cpu"), 1, 1)))
+            assert reports == ["RuntimeError"], "and the interpreter's report is the interpreter's"
+            del reports[:], ATTENTION_CALLS[:]
+    # the set is the class's own, and it is held once per process: a kernel of another 10.x class alone is not held on
+    # this one and is on that one; what a process held of a class it does not read again
+    other_class = _kernel_binaries(tmp_path / "other_class", without=[ATTENTION_SET[3][1]])
+    planned = _attention_plans(monkeypatch, kernel_binaries=other_class)
+    planned(2, 6).first_use(2, 6)
+    with pytest.raises(NotImplementedError, match=re.escape(f"{lacks} ({one})")):
+        planned(2, 6, cc=(10, 3)).first_use(2, 6)
+    (other_class / "2d6a" / "fmha" / flashinfer_calls.DECODE_ATTENTION_BACKEND / "checksums.txt").unlink()
+    planned(1, 1).first_use(1, 1)
+    with pytest.raises(NotImplementedError, match="their manifest is not there"):
+        _attention_plans(monkeypatch, kernel_binaries=other_class)(1, 1).first_use(1, 1)
+    # the manifest is held as well, to the SHA-256 the library names for it: one that lists every binary of the set as it
+    # is and is another file than the library's -- a line more, of a file of another kernel set -- is the SKIP, with the
+    # library not called (the library would say so itself, at its first read, in a line that holds a local path)
+    other_manifest = _kernel_binaries(tmp_path / "other_manifest")
+    block = _attention_plans(monkeypatch, kernel_binaries=other_manifest)(2, 6)
+    with (other_manifest / "2d6a" / "fmha" / flashinfer_calls.DECODE_ATTENTION_BACKEND / "checksums.txt").open("a") as manifest:
+        manifest.write(f"{'0' * 64}  a_binary_of_another_kernel_set.cubin\n")
+    capsys.readouterr()
+    with pytest.raises(NotImplementedError, match=re.escape(f"{lacks} (their manifest is not the file the library names); {anew}; {without}")):
+        block.first_use(2, 6)
+    assert ATTENTION_CALLS == [] and capsys.readouterr() == ("", ""), "the library was not called and nothing was printed"
+    # the sentence by what the installation holds: (the package's metadata and module, the directory variable)
+    launched_missing = _kernel_binaries(tmp_path / "by_installation", without=[FI_ATTENTION])
+    for binaries, variable, sentence in (
+        ((None, False), False, f" needs the kernel-binary package flashinfer-cubin 0.7.2.post1, which is not installed: {install}; {without}"),
+        ((None, False), True, f": the directory FLASHINFER_CUBIN_DIR names {lacks} ({one}); {filled}: {install}; {without}"),
+    ):
+        planned = _attention_plans(monkeypatch, library_binaries=binaries, kernel_binaries=launched_missing)
+        if variable:
+            monkeypatch.setenv(flashinfer_calls.BINARIES_DIRECTORY, "/a/local/path/cubins")
+        block = planned(2, 6)  # without the package the directory variable declines nothing at the plan: the directory is the library's to read
+        with pytest.raises(NotImplementedError) as skipped:
+            block.first_use(2, 6)
+        assert str(skipped.value) == ATTENTION_ENTRY + sentence and ATTENTION_CALLS == []
+    # one verdict per folder of a process: a folder that holds is not the answer for one that does not
+    folders = [
+        str(directory / "2d6a" / "fmha" / flashinfer_calls.DECODE_ATTENTION_BACKEND) for directory in (_kernel_binaries(tmp_path / "whole"), launched_missing)
+    ]
+    family = dict(census.FAMILIES)["fi_decode_attention"]
+    assert [flashinfer_calls.hold_binaries(folder, family, (10, 0)) for folder in folders] == ["", one]
+    # what the hold stands in front of: with it out of the way, a library that lacks the binary it would launch raises
+    # nothing, writes a line of its own with a local path and launches the kernel its selection read first
+    block = _attention_plans(monkeypatch, kernel_binaries=launched_missing)(1, 1)
+    monkeypatch.setattr(type(block), "_hold", lambda self: None)
+    capsys.readouterr()
+    block.first_use(1, 1)
+    assert len(ATTENTION_CALLS) == 1 and "/a/local/path" in capsys.readouterr().err, "no error: a path on standard error, and another kernel"
+    # a library the hold cannot ask -- it cannot be imported, its artifact paths name no such kernel set, or its checksums no
+    # manifest of that set -- is the installation's
+    for defect in ("import", "paths", "checksums"):
+        with pytest.raises(
+            NotImplementedError, match=rf"{ATTENTION_ENTRY}: FlashInfer could not make its first use on this installation \((Import|Lookup)Error\); "
+        ):
+            _attention_plans(monkeypatch, library_defect=defect)().first_use(1, 1)
+        assert ATTENTION_CALLS == []
+    # the table of a header: a record that has not the fields of its type is no such table
+    family = re.compile("^a_kernel")
+    table = 'struct Meta\n{\n    int mSM;\n    const char* mFuncName;\n    const char* sha256;\n};\nstatic const Meta all[] = {\n{ kSM_100f, "a_kernel", "00"},\n%s};\n'
+    assert flashinfer_calls.kernel_set(table % "", family, (10, 0)) == {"a_kernel": "00"} and flashinfer_calls.kernel_set(table % "", family, (12, 0)) == {}
+    with pytest.raises(ValueError, match="a record of the header's table has 2 values, its type 3 fields"):
+        flashinfer_calls.kernel_set(table % '{ kSM_100f, "a_kernel_of_two_values"},\n', family, (10, 0))
+
+    # a file the library itself did not find, by what the installation holds
     missing = (
         ((None, False), False, "manifest", f" needs the kernel-binary package flashinfer-cubin 0.7.2.post1, which is not installed: {install}; {without}"),
-        (
-            (None, False),
-            True,
-            "manifest",
-            f": the directory FLASHINFER_CUBIN_DIR names does not hold the kernel binaries of this GPU and step shape; {filled}: {install}; {without}",
-        ),
         (
             (VALIDATED_LIBRARY, True),
             False,
             "binary",
-            f": the installed flashinfer-cubin 0.7.2.post1 holds no kernel binary for this GPU and step shape (2 x 6 rows at maximum length 2051); {without}",
+            f": the installed flashinfer-cubin 0.7.2.post1 {lacks} (the library found a file missing at 2 x 6 rows at maximum length 2051); {anew}; {without}",
         ),
     )
-    reports = []
-    monkeypatch.setattr(sys, "unraisablehook", lambda unraisable: reports.append(type(unraisable.exc_value).__name__))
     for binaries, directory, defect, sentence in missing:
         block = _attention_plans(monkeypatch, attention_defect=defect, library_binaries=binaries)(2, 6)
         if directory:

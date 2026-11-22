@@ -515,7 +515,10 @@ def test_the_native_stack_with_an_empty_kernel_binary_directory_is_a_skip_that_n
     verdict = [line for line in out.splitlines() if line.startswith("[00] ")][-1]
     frost_routing.measured("model sample qwen_dense 00_decode --stack native, an empty kernel-binary directory", verdict)
     if importlib.util.find_spec("flashinfer_cubin") is None:
-        sentence = "the directory FLASHINFER_CUBIN_DIR names does not hold the kernel binaries of this GPU and step shape; "
+        sentence = (
+            "the directory FLASHINFER_CUBIN_DIR names does not hold the kernel binaries the library's table names for this call's data types, head width, "
+            "paging and page on this GPU's class as their manifest lists them ("
+        )
     else:
         sentence = "FLASHINFER_CUBIN_DIR is set and the kernel-binary package flashinfer-cubin is installed, "
     assert code == 0 and verdict.startswith("[00] SKIP ") and sentence in verdict, out[-6000:]

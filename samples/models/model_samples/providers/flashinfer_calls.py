@@ -51,8 +51,15 @@ validated (``VALIDATED``: the versions the launch records of the census were rec
 files: from the directory ``FLASHINFER_CUBIN_DIR`` names, else from its kernel-binary package (``BINARIES_DISTRIBUTION``)
 where that has the library's own version, else from a cache directory -- and it downloads a file it does not find.  These
 adapters switch that download off for the process before they reach the library (``refuse_downloads``, in the one method
-every row reaches it through), so a binary that is not on the machine is the library's refusal at the first use, and
-the ``SKIP`` that names what is missing and the fix (``missing_binaries``).  Two states of the installation make the library
+every row reaches it through).  The library itself does not always refuse a file it lacks: where the missing binary is
+not the first one its kernel selection reads, it prints lines with a path of its installation from its own code and
+launches another kernel.  So the attention's adapter does not rely on the refusal: before its first call it holds every
+kernel binary the library's table names for the call's data types, head width, paging and page on the GPU's class --
+the table in the header of the library's own kernel set, never a list of this module, and more binaries than the
+library's selection can reach for the call -- to the SHA-256 of that set's manifest, and the manifest to the SHA-256
+the library itself names for it (``hold_binaries``): a file that is missing or is not the manifest's, or a manifest
+that is not the library's, is the ``SKIP`` that names what is missing and the fix (``missing_binaries``).  Two states
+of the installation make the library
 print a local path at its import -- the package at another version than the library's, and the directory variable beside
 the package -- and one more is undecidable from the metadata: each is a ``SKIP`` at plan time, before the library is
 imported (``check_binaries``).
@@ -60,25 +67,28 @@ imported (``check_binaries``).
 **First use is part of the plan.**  The library builds what a call needs when it is first made: its CuTe DSL kernels in the
 process, its CUTLASS multiply as a module compiled with the installed CUDA compiler and ninja (minutes, once per machine).
 The 4-bit kernel is built per range of row counts.  The attention builds a launcher with the same compiler and reads
-its kernel binaries at the first call of every step shape.  So an adapter makes the call on scratch operands while the run is
-planned (``first_use``) -- at the run's row count and, for a run of several sequences, at the rows of one sequence, which
-is what the batch-invariance check calls -- after the memory sentence has held and before anything is loaded, and a sample
-announces it (``first_use_note``).  A refusal of the operands this adapter built is a ``ValueError`` -- an ``ERROR``,
-because a faulty adapter must not read as an unsupported installation; whatever else keeps the LIBRARY from importing,
-building or launching there is the installation's, and the ``SKIP``.  A fault of this adapter's own code is neither: it
-is raised as it is.
+kernel binaries at the first call of every step shape, the adapter having held them all before the first.  So an
+adapter makes the call on scratch operands while the run is planned (``first_use``) -- at the run's row count and, for a
+run of several sequences, at the rows of one sequence, which is what the batch-invariance check calls -- after the
+memory sentence has held and before anything is loaded, and a sample announces it (``first_use_note``).  A refusal of
+the operands this adapter built is a ``ValueError`` -- an ``ERROR``, because a faulty adapter must not read as an
+unsupported installation; whatever else keeps the LIBRARY from importing, building or launching there is the
+installation's, and the ``SKIP``.  A fault of this adapter's own code is neither: it is raised as it is.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import hashlib
 import importlib.metadata as metadata
 import importlib.util
 import os
+import re
 import sys
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-from ..census import Kernel
+from ..census import FAMILIES, Kernel
 from ..state import PagedKvCache, PageTable
 from ..weights import BLOCK, BlockScaledTensor, Dequantized, ScaledTensor, TiledBlockScaledTensor, TiledBlockScaledWeight, Unquantized, tile_scales
 from . import PYTORCH_CHAIN, BlockBase
@@ -102,7 +112,7 @@ BMM_FP8_FORM = ("BACKEND",)
 #: the field a row of the paged decode attention names: the layout of the two pool halves, as the target passes it
 DECODE_ATTENTION_FORM = ("KV_LAYOUT",)
 #: the value of that call's ``backend`` argument: the library's own backend for these GPU classes, whose kernels are
-#: precompiled binaries.  Every call passes it: the library's default
+#: precompiled binaries, and the name of the folder its kernel set stands in.  Every call passes it: the library's default
 #: chooses a backend by the GPU, and an explicit value does not move with a release of the library
 DECODE_ATTENTION_BACKEND = "trtllm-gen"
 #: the library's kernel-binary package: its distribution, the module the library looks for, its requirement file and the
@@ -124,6 +134,11 @@ NO_DOWNLOAD = "FLASHINFER_NO_DOWNLOAD"
 #: goes on with a local path
 MISSING_FILE, MISSING_KERNEL = "Artifact not found locally", "Failed to load cubin for"
 LOADER = "flashinfer.jit.cubin_loader"
+#: the files of a kernel set, in its folder under the library's kernel-binary directory: the manifest (a line per file:
+#: its SHA-256 and its name), the header whose table names every kernel of the set, and the binary of a kernel
+BINARIES_MANIFEST, BINARIES_HEADER, BINARY = "checksums.txt", "include/flashInferMetaInfo.h", "{}.cubin"
+#: (folder of a kernel set, kernel family, compute capability) -> what ``hold_binaries`` found there, once per process
+_HELD: dict = {}
 #: the workspace the paged decode attention is handed: the size the target hands it and the size the launch records of
 #: the census were made with.  The library makes no size check of it, and a smaller one has not been run
 WORKSPACE_BYTES = 394 * 1024 * 1024
@@ -189,7 +204,7 @@ def check_binaries(entry: str) -> None:
       warning.
 
     With neither the metadata nor the module nothing is declined here: the library then reads the directory the variable
-    names, or its cache directory, and what is missing there is its refusal at the first use (``missing_binaries``)."""
+    names, or its cache directory, and what is missing there is found before the first call (``hold_binaries``)."""
     version, found = binaries_package()
     validated = " or ".join(VALIDATED)
     if version is None and found:
@@ -214,23 +229,111 @@ def check_binaries(entry: str) -> None:
         )
 
 
-def missing_binaries(entry: str, sequences: int, tokens: int, max_model_len: int) -> str:
-    """The sentence of a SKIP for a kernel binary, a manifest or a header the library did not find with its download
-    refused: it names the fix that is still to be made, decided from what the installation holds -- the package that is
-    not installed; the directory the variable names; or, with the package installed at the library's version, the GPU
-    and the step shape it holds no binary for (no command would bring one)."""
-    version, found = binaries_package()
-    if found and version in VALIDATED:
-        return (
-            f"{entry}: the installed {BINARIES_DISTRIBUTION} {version} holds no kernel binary for this GPU and step shape ({sequences} x {tokens} rows "
-            f"at maximum length {max_model_len}); {WITHOUT}"
-        )
+def missing_binaries(entry: str, found: str) -> str:
+    """The sentence of a SKIP for kernel binaries that are not on the machine as their manifest lists them (``found``: what
+    is missing, in words without a path).  It names the fix that is still to be made, decided from what the
+    installation holds: the package that is not installed; the directory the variable names; or, with the package
+    installed at the library's version, that package itself, to be installed anew -- the command that installs a
+    missing package leaves an installed one as it is, so the sentence names none."""
+    version, module = binaries_package()
+    lacks = (
+        f"does not hold the kernel binaries the library's table names for this call's data types, head width, paging and page on this GPU's class "
+        f"as their manifest lists them ({found})"
+    )
+    if module and version in VALIDATED:
+        return f'{entry}: the installed {BINARIES_DISTRIBUTION} {version} {lacks}; install it anew (the family README, "What the first run does"); {WITHOUT}'
     if os.environ.get(BINARIES_DIRECTORY):
         return (
-            f"{entry}: the directory {BINARIES_DIRECTORY} names does not hold the kernel binaries of this GPU and step shape; fill it (the family "
-            f'README, "What the first run does") or install the package: {BINARIES_INSTALL}; {WITHOUT}'
+            f'{entry}: the directory {BINARIES_DIRECTORY} names {lacks}; fill it (the family README, "What the first run does") or install the '
+            f"package: {BINARIES_INSTALL}; {WITHOUT}"
         )
     return f"{entry} needs the kernel-binary package {BINARIES_DISTRIBUTION} {' or '.join(VALIDATED)}, which is not installed: {BINARIES_INSTALL}; {WITHOUT}"
+
+
+def kernel_set(header: str, family: "re.Pattern", cc: Tuple[int, int]) -> Dict[str, str]:
+    """``{kernel name: SHA-256 of its binary}`` for the kernels of ``family`` that the table of a kernel set's header offers
+    a GPU of compute capability ``cc``.  The header declares one record type and lists one record per kernel in the
+    order of that type's fields; three fields are read, each found by its name: the architecture (``mSM``), the
+    kernel's name (``mFuncName``) and the SHA-256 (``sha256``).  A kernel serves a GPU whose architecture is its own
+    (``kSM_<major><minor>``) or the family of its major class (``kSM_<major>0f``): the rule of the library's launcher on
+    the 10.x classes.  ``ValueError`` for a text that is no such table."""
+    declared = re.search(r"struct\s+\w+\s*\{(.*?)\}\s*;", header, re.S)
+    fields = [line.split()[-1].rstrip(";") for line in declared.group(1).splitlines() if line.strip()] if declared else []
+    architecture, name, digest = (fields.index(field) for field in ("mSM", "mFuncName", "sha256"))  # ValueError: no such field
+    serves = (f"kSM_{cc[0]}{cc[1]}", f"kSM_{cc[0]}0f")
+    kernels = {}
+    for line in header[declared.end() :].splitlines():
+        if line.startswith("{"):
+            record = [value.strip().strip('"') for value in line.strip().strip("{},").split(", ")]
+            if len(record) != len(fields):
+                raise ValueError(f"a record of the header's table has {len(record)} values, its type {len(fields)} fields")
+            if record[architecture] in serves and family.match(record[name]):
+                kernels[record[name]] = record[digest]
+    return kernels
+
+
+def hold_binaries(folder: str, family: "re.Pattern", cc: Tuple[int, int], manifest: Optional[str] = None) -> str:
+    """Hold the kernel binaries in ``folder``, the folder of a kernel set, that the table of the set's header names for the
+    kernel family ``family`` -- a call's data types, head width, paging and page -- on a GPU of compute capability
+    ``cc``: the header is the file the set's manifest lists; every kernel the header's table names for them
+    (``kernel_set``) has a line in the manifest that states the table's SHA-256; and its binary is in the folder with
+    that SHA-256.  Returns ``""`` where all of it holds, else what does not, in words that name no path.  The set is
+    more than a run reads, and more than the library's selection can reach for the call -- which of these kernels a
+    step shape reads is the library's selection, which nothing here models -- so that no call of a run can meet a
+    binary that is not there.  The manifest itself is held to ``manifest``, the SHA-256 the library names for it, where
+    one is given: the library holds it to the same constant when it first reads it, and reports a difference in a line
+    that holds a local path.  Read once per process: the manifest, the header and the binaries (46 files and 28 MB at
+    the published widths on compute capability 10.0)."""
+    key = (folder, family.pattern, tuple(cc), manifest)
+    if key not in _HELD:
+        _HELD[key] = _held_binaries(folder, family, cc, manifest)
+    return _HELD[key]
+
+
+def _held_binaries(folder: str, family: "re.Pattern", cc: Tuple[int, int], named: Optional[str]) -> str:
+    def read(name: str) -> Optional[bytes]:
+        try:
+            with open(os.path.join(folder, name), "rb") as file:
+                return file.read()
+        except OSError:
+            return None
+
+    manifest = read(BINARIES_MANIFEST)
+    if manifest is None:
+        return "their manifest is not there"
+    listed = dict(reversed(line.split(None, 1)) for line in manifest.decode("utf-8", "replace").splitlines() if len(line.split(None, 1)) == 2)
+    header = read(BINARIES_HEADER)
+    if header is None or hashlib.sha256(header).hexdigest() != listed.get(BINARIES_HEADER):
+        return "the header of the kernel set is not the file their manifest lists"
+    try:
+        kernels = kernel_set(header.decode("utf-8", "replace"), family, cc)
+    except ValueError:
+        return "the header of the kernel set is not the table of kernels this adapter reads"
+    if not kernels:
+        return "the header of the kernel set names no kernel of this call for this GPU"
+    wrong = 0
+    for name, digest in kernels.items():
+        binary = read(BINARY.format(name))
+        wrong += binary is None or not (hashlib.sha256(binary).hexdigest() == listed.get(BINARY.format(name)) == digest)
+    if wrong:
+        return f"{wrong} of {len(kernels)} missing or changed"
+    if named is not None and hashlib.sha256(manifest).hexdigest() != named:
+        return "their manifest is not the file the library names"
+    return ""
+
+
+def _kernel_set_folder(library) -> Tuple[str, str]:
+    """Where the library reads the kernel set of the paged decode attention, and the SHA-256 it names for that set's
+    manifest, by its own answer: the kernel-binary directory it resolved at its import; among its artifact paths, the one
+    that ends in the backend's folder; and, among its checksums, the one of the manifest in that folder."""
+    paths = [getattr(library.artifacts.ArtifactPath, field.name) for field in dataclasses.fields(library.artifacts.ArtifactPath)]
+    found = [path for path in paths if isinstance(path, str) and path.strip("/").endswith(f"fmha/{DECODE_ATTENTION_BACKEND}")]
+    if len(found) != 1:
+        raise LookupError(f"the library names {len(found)} folders of its attention kernel set")
+    named = getattr(library.artifacts.CheckSumHash, "map_checksums", {}).get(f"{found[0].rstrip('/')}/{BINARIES_MANIFEST}")
+    if not isinstance(named, str):
+        raise LookupError("the library names no SHA-256 for the manifest of its attention kernel set")
+    return os.path.join(str(library.jit.env.FLASHINFER_CUBIN_DIR), found[0]), named
 
 
 @contextlib.contextmanager
@@ -327,11 +430,13 @@ class LibraryBlock(BlockBase):
         the kernel of the 4-bit multiply per range of row counts).  ``ValueError`` (an ERROR) where the library refuses the
         operands this adapter built; ``NotImplementedError`` (a SKIP) for whatever else keeps the library itself from
         importing, building or launching on this installation (``_call``).  The scratch operands and everything else of
-        this adapter's own code are outside that: a fault there is raised as it is, never read as the installation's."""
+        this adapter's own code are outside that: a fault there is raised as it is, never read as the installation's.
+        In front of the first call a row holds what it needs of the installation (``_hold``: the attention's kernel binaries)."""
         import torch
 
         if not self._launches_here():
             return
+        self._hold()
         device = torch.device(self.options["device"])
         for operands in self._scratches(device, sequences, tokens):
             self._first = True
@@ -343,6 +448,9 @@ class LibraryBlock(BlockBase):
             finally:
                 self._first = False
                 self._served = None  # a first use is no call of a step: the call log starts empty
+
+    def _hold(self) -> None:
+        """What a row holds of the installation in front of its first call: nothing, for a row whose kernels the library builds."""
 
     def _call(self, name: str, *operands, **passed):
         """The library call ``flashinfer.<module>.<name>`` itself, and the fields of the row's form as it was passed them by
@@ -549,8 +657,8 @@ class DecodeAttentionBlock(LibraryBlock):
         return (
             f"first use of the paged decode attention of FlashInfer {installed() or '(not installed)'}: this sample switches the library's download "
             f"of kernel binaries off for the process ({NO_DOWNLOAD}), so they are read from its kernel-binary package or from a directory filled "
-            "beforehand and never fetched; the library builds its launcher now with the installed CUDA compiler and ninja, and reads the kernel "
-            'binaries of every step shape of the run (the family README, "What the first run does")'
+            "beforehand and never fetched; it holds the kernel binaries of this GPU to their manifest, and the library then builds its launcher with "
+            'the installed CUDA compiler and ninja and reads those of every step shape of the run (the family README, "What the first run does")'
         )
 
     def twin(self, reference):
@@ -651,11 +759,27 @@ class DecodeAttentionBlock(LibraryBlock):
             pool = torch.zeros((count * pages, g.attn_kv_heads, page, 2 * g.attn_head_dim), dtype=torch.bfloat16, device=device)
             yield torch.zeros((count * tokens, g.attn_heads, g.attn_head_dim), dtype=torch.bfloat16, device=device), PagedKvCache(pool, pages, table, tokens), 0
 
+    def _hold(self) -> None:
+        """Before this adapter's first call of the library: the kernel binaries the library's table names for this
+        call's data types, head width, paging and page on the GPU's class are on the machine as their manifest lists
+        them, and the manifest is the file the library names (``hold_binaries``; the family is this block's kernel in
+        the census, the class the plan's), or the run is the ``SKIP`` of ``missing_binaries``.  The library is
+        imported for it and nothing of it is called: a run that passes cannot meet a missing binary later."""
+        self._first = True
+        try:
+            folder, manifest = self._reach(lambda: _kernel_set_folder(self._library()))
+        finally:
+            self._first = False
+        found = hold_binaries(folder, dict(FAMILIES)[self.kernels[0].id], tuple(self.facts.cc), manifest)
+        if found:
+            raise NotImplementedError(missing_binaries(self.entry, found))
+
     def _unavailable(self, error: Exception) -> str:
         """A file the library did not find with its download refused is the SKIP that names what is missing and the fix;
         whatever else kept it from its first use is the installation's, as for every row."""
         if type(error) is RuntimeError and str(error).startswith((MISSING_FILE, MISSING_KERNEL)):
-            return missing_binaries(self.entry, *self._step)
+            sequences, tokens, limit = self._step
+            return missing_binaries(self.entry, f"the library found a file missing at {sequences} x {tokens} rows at maximum length {limit}")
         return super()._unavailable(error)
 
     def __call__(self, q, cache, position):
