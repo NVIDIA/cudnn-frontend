@@ -166,9 +166,10 @@ def test_a_trail_only_row_leads_where_a_generated_entry_says_so(monkeypatch, ent
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_sm80_d128_gqa_long_kv_chunks_lead(s_kv):
-    """Study sm80_dense_d128_gqa_v4_split_20261117 (A100): bf16 dense d128 GQA causal prefill leads with few query rows / tiles over a
-    long cache (llama3.1-tp8 b 1 long-KV chunks ran the backend at 3.7-3.8x); many rows, f16 or another part trail, and on the KV
-    tile so does a short cache."""
+    """Studies sm80_dense_d128_gqa_v4_split_20261117 and sm80_dense_d128_split_key_v2_20261122 (A100): bf16 dense d128 GQA causal
+    prefill leads with few query rows / tiles over a long cache; many rows, f16 or another part trail. A short cache that k_prefetch
+    still splits 4 ways is the split class's and leads too."""
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     row, impl = (next(s for s in ENGINE_SPECS if s.name == n) for n in ("sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch"))
@@ -179,7 +180,9 @@ def test_sm80_d128_gqa_long_kv_chunks_lead(s_kv):
     assert placement.place(row, f()) == placement.LEAD
     assert placement.place(impl, f()) == placement.LEAD
     assert placement.place(row, f(b=8, h_q=64, h_kv=8, s_q=2048)) == placement.TRAIL  # many query rows
-    assert placement.place(row, f(s_kv=1024 + s_kv % 2)) == (placement.TRAIL if s_kv % 2 == 0 else placement.LEAD)  # a short cache
+    short = f(s_kv=1024 + s_kv % 2)
+    assert placement_table.matched_entry("sdpa_fwd_prefill_sm80", short).study == "sm80_dense_d128_split_key_v2_20261122"
+    assert placement.place(row, short) == placement.LEAD
     assert placement.place(row, f(dtype=cudnn.data_type.HALF)) == placement.TRAIL
     assert placement.place(row, f(device_cc=(8, 6))) == placement.TRAIL
 

@@ -881,6 +881,36 @@ def test_two_condition_entry_leads_only_where_both_hold():
 
 
 @pytest.mark.L0
+def test_sm80_dense_split_class_reads_the_planner_and_follows_its_study():
+    """A100 dense d128 GQA causal prefill that k_prefetch splits SM80_DENSE_SPLIT_KEY_MIN or more ways keys `gqa_split`, read from the
+    planner itself; study sm80_dense_d128_split_key_v2_20261122 owns that class, and v4 keeps every graph split fewer ways."""
+    from cudnn.sdpa.fwd import heuristics
+
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=1, h_q=32, h_kv=4, s_q=512, s_kv=131072, d_qk=128, d_v=128, causal=True, bottom_right=True)
+        base.update(device_cc=(8, 0), has_paged_kv=False, device_sm_count=108)
+        base.update(over)
+        return _facts(**base)
+
+    shapes = [dict(), dict(b=2, h_kv=8), dict(b=4, h_kv=8, s_q=1024), dict(b=8, h_kv=8, s_q=2048, s_kv=2048, bottom_right=False), dict(s_q=64, s_kv=4096)]
+    for over in shapes:
+        x = f(**over)
+        split = heuristics.sm80_dense_split_choice(x) >= pt.SM80_DENSE_SPLIT_KEY_MIN
+        assert pt.class_key(row, x)[8] == ("gqa_split" if split else "gqa"), over
+    assert {pt.class_key(row, f(**over))[8] for over in shapes} == {"gqa", "gqa_split"}
+
+    for kv in (131072, 131073):
+        assert pt.matched_entry(row, f(s_kv=kv)).study == "sm80_dense_d128_split_key_v2_20261122"
+    assert pt.lookup(row, f()) is True and pt.lookup(row, f(s_kv=131073)) is True  # llama3.1-tp2, b 1, a 128k cache
+    assert pt.lookup(row, f(b=2, h_kv=8)) is False  # split, past the launch-tile ceiling
+    assert pt.matched_entry(row, f(b=4, h_kv=8, s_q=1024)).study == "sm80_dense_d128_gqa_v4_split_20261117"  # a 2-way split
+    assert pt.class_key(row, f(device_sm_count=None))[8] == "gqa"  # the planner splits nothing without the SM count
+    assert pt.class_key(row, f(s_q=8))[4:9:4] == ("verify", "gqa")  # spec-decode verify keeps its own classes
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_sm80_dense_chunk_follows_its_study(s_kv):
     """Study sm80_dense_chunk_20261117 (A100): dense d256 GQA causal prefill leads past a cost floor, so qwen3.5's b 1 long-KV chunks
