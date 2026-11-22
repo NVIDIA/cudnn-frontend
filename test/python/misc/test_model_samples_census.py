@@ -10613,7 +10613,8 @@ def test_the_line_of_the_library_attention_band_names_an_element_where_every_ele
     ``attention_bf16_weights`` then names the chain and the spread of an element of the first judged call -- its first --
     and never figures that belong to no element.  A later call that is on its chain too leaves them; the first call that
     is off its chain takes their place, and a later call on its chain does not take that back.  A call that cannot be
-    compared is no judged call: it keeps nothing, and the call behind it is the first."""
+    compared is no judged call: it keeps nothing, and the call behind it is the first.  An element whose chain and
+    spread are both zero is an element like any other: kept as the first judged call's, and kept with the largest share."""
     from model_samples import tie_out
     from model_samples.providers import torch_ref
     from model_samples.state import KvCache
@@ -10656,6 +10657,20 @@ def test_the_line_of_the_library_attention_band_names_an_element_where_every_ele
     assert not behind.ok and (behind.elements, behind.outside, behind.worst_at) == (0, 1, (0.0, 0.0)), "two outputs: nothing is compared and nothing kept"
     tie_out.BlockTap._judge(behind, (ref,), (ref,), [], [], 0, twin)
     assert not behind.ok and (behind.elements, behind.outside, behind.worst_share, behind.worst_at) == (512, 1, 0.0, (-0.75, 0.75)), "the first judged call"
+    # an element whose chain and spread are both zero (its attended value is zero) is kept like any other: as the first judged call's ...
+    null_twin, null_ref = one_row(0.0)
+    stats = _judged_attention(null_ref, null_twin, null_ref)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (512, 0.0, (0.0, 0.0)), "the first judged call's first element: a chain of zero"
+    tie_out.BlockTap._judge(stats, (ref,), (ref,), [], [], 0, twin)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (1024, 0.0, (0.0, 0.0)), "a later call on its chain: a chain of zero stays too"
+    # ... and with the largest share: a later call with a smaller share does not take its place
+    off = null_ref.clone()
+    off[0, 0] = 2.0**-10  # an output that is not zero where every attended value is: its bound is one spacing at the smallest normal fp32 value
+    stats = _judged_attention(off, null_twin, null_ref)
+    assert not stats.ok and (stats.outside, stats.worst_share, stats.worst_at) == (1, 2.0**123, (0.0, 0.0)), "outside, with its share, at a chain of zero"
+    tie_out.BlockTap._judge(stats, (_model_extreme(0.9),), (extreme_ref,), [], [], 0, extreme_twin)
+    kept = (stats.elements, stats.outside, stats.worst_share, stats.worst_at)
+    assert not stats.ok and kept == (1024, 1, 2.0**123, (0.0, 0.0)), "a later call with a smaller share does not take its place"
 
 
 def test_every_control_arm_of_the_library_attention_band_fails_and_what_the_band_cannot_see_is_pinned(monkeypatch):
