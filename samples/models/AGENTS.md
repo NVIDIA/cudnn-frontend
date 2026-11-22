@@ -594,3 +594,21 @@ The attention core of `native` is a library's paged decode attention, a kernel t
 - A control arm through a run needs a run that can fail it: two table columns that name one page are no arm.
 - The first use makes one scratch call per step shape of the run: its sequences and one sequence alone, at the tokens
   per sequence of each plan.
+
+## What the output head's quantise row taught
+
+The 4-bit operand of the output head is a block of the wiring, `output_head.quantize`, served on the target stacks by
+`cudnn.RowQuantizeFp4Decode` (`providers/fe.py`: `RowQuantizeFp4DecodeBlock`).
+
+- A launch of the target that lives inside a serving engine is a block like any other once an entry reproduces it: a
+  block of the wiring in every stack, the entry's row on the target stacks, the reference chain everywhere else.
+- A block whose reference chain cannot be its twin is told by the chain's own bytes against the entry's contract:
+  judge them on the host first. Here the chain drops the sign of a zero that the kernel keeps.
+- A port whose grid is its own records no launch shape in the census: it is held to the shape its entry states and
+  counted by membership, and `differences` names the grid first.
+- An operand handed on whose value equals another's on the seeded model is held by identity through the tap, and once
+  on a model where the two differ: no byte of a seeded run tells them apart.
+- An exact cell is stated against the exact quotient with ties to the even code, written out in the test, never against
+  a twin's low code: at a tie a bracket holds two codes.
+- A block more in the wiring moves every stack's tables and its count of block calls, never a count of launches of
+  another stack. Block calls and target launches are two counts.
