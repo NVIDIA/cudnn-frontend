@@ -84,7 +84,7 @@ call will use it. The buffer is allocated on torch's current stream of the entry
 that moment and that stream can still write it (torch fills it under deterministic algorithms; a recycled block can
 carry a write the stream still owes it): every launch that writes its bytes, by default or as a view passed back as
 `out`, by this entry or by another entry that orders its launches the same way (today `AddNormQuantDecode`,
-`AttentionPrepareDecode` and `AttentionGateQuantDecode`), is ordered behind that work on whatever stream it runs. The
+`AttentionPrepareDecode`, `AttentionGateQuantDecode` and `RowQuantizeFp8Decode`), is ordered behind that work on whatever stream it runs. The
 launch stream waits for an event recorded behind the allocation, without a host wait and without synchronizing a
 stream or the device (on the allocating stream itself the event is already behind the launch and the wait is free; a
 stream that was given the raw handle of a destroyed allocating stream waits like any other); a captured call that

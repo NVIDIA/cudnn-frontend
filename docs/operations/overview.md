@@ -38,6 +38,7 @@ The experimental API catalog includes:
 - [SwiGLU FP4 Gate / Up Product for Decode Rows (SM100-class)](/operations/Matmul/gemm_fusions/swiglu_fp4_decode) — the gate / up product of a block-scaled FP4 (NVFP4) MLP with SiLU(gate) x up and the FP4 re-quantization of the result at decode-time row counts (1 .. 64) as one FROST launch, with the weight stream ahead of the dependent-launch wait; no numerics knob, bitwise repeatable and batch-invariant
 - [Attention Preparation Decode Step (SM100-class)](/operations/Attention/attention_prepare_decode) — per token of a decode step the RMSNorm of every query and key head row, the rotation of its rotary part by the token's position (one or three position rows), the gate rows copied beside the queries and the keys and values written into paged pools at the token's slot, at decode-time token counts (1 .. 1024), as one FROST launch (bf16 in and out), bitwise repeatable and batch-invariant
 - [FP4 Row Quantization Decode Step (SM100-class)](/operations/BlockScaling/row_quantize_fp4_decode) — the block-scaled FP4 (NVFP4) quantization of bf16 rows under a global scale (E2M1 codes, one E4M3 block scale per sixteen elements in the 128 x 4 scale layout) at decode-time row counts (1 .. 1024) as one FROST launch; no numerics knob, bitwise repeatable and batch-invariant
+- [FP8 Row Quantization Decode Step (SM100-class)](/operations/Pointwise/row_quantize_fp8_decode) — the dynamic FP8 (E4M3) quantization of bf16 rows, each under its own scale (the row maximum over 448 with a floor; E4M3 codes and one fp32 scale per row), at decode-time row counts (1 .. 1024) as one FROST launch; every step exactly specified, no numerics knob, bitwise repeatable and batch-invariant
 - [LayerNorm and RMSNorm in JAX](/operations/Normalizations/norm_jax) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/normalizations/norm_jax.md))
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
@@ -91,6 +92,7 @@ The experimental API catalog includes:
 - [Fused Conv3D + Bias + Residual + RMSNorm + SiLU](/operations/Convolutions/conv3d_postops)
 - [NVFP4 Block-Scale Conversion](/operations/BlockScaling/nvfp4_block_scale_conversion)
 - [FP4 Row Quantization Decode Step (SM100-class)](/operations/BlockScaling/row_quantize_fp4_decode)
+- [FP8 Row Quantization Decode Step (SM100-class)](/operations/Pointwise/row_quantize_fp8_decode)
 - [DSv4.1 mHC projection/RMS backward](/operations/Matmul/gemm_fusions/mhc_projection_bwd)
 
 - [Ragged grouped GEMM training](/operations/gemm_fusions/ragged_grouped_gemm)
