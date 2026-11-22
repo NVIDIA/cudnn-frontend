@@ -496,6 +496,54 @@ def test_a100_backward_window_entries_lift_only_square_sm80_graphs(monkeypatch):
         assert order(s_q=kv, s_kv=kv, device_cc=(8, 6), **common) == trails
 
 
+def test_rubin_d256_backward_entries_lead_thd_and_full_length_bshd(monkeypatch):
+    """cc 10.7 d256 bf16 backward (study sm107_d256_bwd_20261122): the trail-only sm107 row's d256 body leads the backend on every
+    class the study shipped, THD graphs included (the graph analyzer marks every THD graph padded). A BSHD graph of the same class with
+    runtime lengths keeps trailing, as do f16, windowed and deterministic graphs, which the study did not time."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block, is_last_resort
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.bwd import heuristics
+
+    tag = lambda p: "backend" if is_backend_block(p) else "last_resort" if is_last_resort(p) else "frost"
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    eid = _OFFERED["sdpa_bwd_sm107_d256_f16_4x1"]
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
+    facts = lambda **over: _facts(**{"device_cc": (10, 7), "dtype": cudnn.data_type.BFLOAT16, "d_qk": 256, "d_v": 256, **over})
+    order = lambda **over: [tag(p) for p in heuristics.propose("A", facts(**over), _OFFERED)]
+    trails = ["backend", "last_resort", "frost"]
+
+    entries = [k for k, e in pt.TABLE.items() if e.study == "sm107_d256_bwd_20261122"]
+    assert entries
+    for key in entries:
+        layout, mask, group, off_tile = key[5], key[6], key[8], key[9]
+        s = 8192 + (1 if off_tile else 0)  # long enough to pass every floor the study fitted
+        shape = dict(b=4, h_q=32, h_kv=8 if group == "gqa" else 32, s_q=s, s_kv=s, causal=mask == "causal_br")
+        if layout != "dense":
+            shape.update(thd=True, padded=True, max_total_seq_len_q=4 * s if layout == "thd" else 2 * s)
+        assert pt.class_key("sdpa_bwd_sm107", facts(**shape)) == key
+        assert order(**shape)[0] == "frost", key
+        if layout == "dense":  # the key does not see per-batch lengths; the guard does
+            assert order(**shape, padded=True) == trails, key
+            assert order(**shape, seq_q_trim=True) == trails, key
+        assert order(**shape, dtype=cudnn.data_type.HALF) == trails, key
+        assert order(**shape, window_left=1024, bottom_right=True) == trails, key
+        assert order(**shape, deterministic=True) == trails, key
+
+    # The Rubin nightly's d256 backward shapes: context-parallel THD chunks and ragged THD squares lead.
+    nightly = (
+        dict(b=64, h_q=32, h_kv=8, s_q=1024, s_kv=8192, bottom_right=True, thd=True, padded=True, max_total_seq_len_q=64 * 1024),
+        dict(b=64, h_q=8, h_kv=2, s_q=8192, s_kv=8192, thd=True, padded=True, max_total_seq_len_q=32 * 8192),
+    )
+    for shape in nightly:
+        assert pt.matched_entry("sdpa_bwd_sm107", facts(**shape)).study == "sm107_d256_bwd_20261122", shape
+        assert order(**shape)[0] == "frost", shape
+    # Dense causal classes failed the study's holdout off the tile, so neither twin has an entry.
+    for s in (8192, 8193):
+        assert pt.matched_entry("sdpa_bwd_sm107", facts(b=1, h_q=32, h_kv=2, s_q=s, s_kv=s)) is None
+        assert order(b=1, h_q=32, h_kv=2, s_q=s, s_kv=s) == trails
+
+
 @pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("mask", ["none", "causal", "window"])
