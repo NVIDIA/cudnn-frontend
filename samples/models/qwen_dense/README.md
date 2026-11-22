@@ -722,6 +722,18 @@ that cost. A call the library refuses for the operands the adapter built ends th
 keeps the library itself from importing, building or launching there ends it in `[00] SKIP`, with the type of the
 exception and nothing loaded. A fault of the adapter's own code is neither: it is raised as it is.
 
+Of that first use a run prints its own lines and none of the library's informational ones. FlashInfer logs through
+loggers of its own, at the level the variable `FLASHINFER_LOGGING_LEVEL` names when the library is imported, and at
+`info` where the variable names none: at that level it prints a line on standard error for every module it builds with
+the CUDA compiler (the 8-bit multiply's and the launcher of the attention among them) and two for every kernel of the
+4-bit multiply it compiles and keeps, the second with a path of its cache directory. Before it imports the library a run
+sets that variable to `warning` for its process and for every process it starts, where the environment names no level
+-- the variable unset, empty, or blanks alone --, so none of those lines is printed; the library's warnings and errors
+still reach standard error. A level that is set in the environment stays: with `FLASHINFER_LOGGING_LEVEL=info` the
+library prints its lines, some with a path of its cache directory. A text there that is no level name of Python's
+logging module ends the run in `[00] ERROR` while it is planned, before the library is imported, in a line that names
+the variable: the library's import would raise on it.
+
 The kernels of the attention core are not built: they are precompiled binaries the library reads from files -- from
 the directory `FLASHINFER_CUBIN_DIR` names, else from its kernel-binary package `flashinfer-cubin` where that has the
 library's own version, else from its cache directory -- and a file it does not find it would download. A sample never

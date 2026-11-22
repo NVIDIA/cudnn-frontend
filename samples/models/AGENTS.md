@@ -567,6 +567,11 @@ The attention core of `native` is a library's paged decode attention, a kernel t
 
 - Switch a provider's own download off in the process before the provider is imported, also where the variable is
   set and empty. Hold it with a package of the provider's name that notes what it finds at its import.
+- A provider's own logger is part of what a run prints: its informational lines can hold a path of its cache. Set
+  its level before the provider is imported, where the environment names none; a level that is set there stays, and
+  the README says what the provider then prints. A text there that names no level is declined while the run is
+  planned, in a sentence that names the variable: the provider's import raises on it, and a first use would report
+  that as a refusal of the adapter's operands.
 - Decide at plan time, with nothing imported, the states of an installation in which the provider's import prints a
   path: ask the distribution's metadata and the module both, and decline where they disagree.
 - A refusal that holds a local path is told by its first words and never printed. The `SKIP` names what is missing and

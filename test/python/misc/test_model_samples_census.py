@@ -2641,7 +2641,15 @@ def _sample_run(monkeypatch, capsys, arguments, cc=(10, 0), sms=148, **stand_in)
         plan_options = {"reference_precision": made.reference_precision, "device": "cpu", "check_kernels": made.check_kernels}
         plan_options["max_model_len"] = made.max_model_len
         table, regimes = model.provider_table, model.regimes
-        made.plan = blocks.plan(table, regimes, stated, made.sequences, 1, made.stack, made.overrides, model=model, options=plan_options, factories=build)
+
+        def resolve():  # where the sample asks the session for its plan: what a plan declines is then a line of the run
+            if made.plan is None:
+                made.plan = blocks.plan(
+                    table, regimes, stated, made.sequences, 1, made.stack, made.overrides, model=model, options=plan_options, factories=build
+                )
+            return made.plan
+
+        made.resolve = resolve
         return made
 
     session.real = real_session
@@ -9094,7 +9102,10 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     record: the census names it under a key of its own, at the library's version.  A run never lets the library fetch a
     kernel binary: every adapter reaches the library through one import, and the library's download is switched off
     before it -- where the environment does not hold the variable and where it holds it empty; a text that is set
-    stays.  And the sentences that state this policy are in the area's guide and READMEs as they were agreed."""
+    stays.  The level of the library's own lines is set before that import the same way, to ``warning``: where the
+    environment names none, and where it names an empty one or blanks alone, on which the library's import raises; a
+    level that is set stays; and a process the run starts finds both variables.  And the sentences that state this policy are in
+    the area's guide and READMEs as they were agreed."""
     from model_samples import providers
     from model_samples.providers import ENTRY_NAMES, KEYS, flashinfer_calls
     from model_samples.qwen_dense import QwenDense
@@ -9150,19 +9161,33 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     assert flashinfer_calls.BINARIES_INSTALL == (
         "pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt"
     ), "the index is named on the command, for this one package"
-    # the refusal, through the adapters' own import of a package of the library's name that notes what it finds at its import
+    # the refusal and the level of the library's own lines, through every library adapter's import of a package of the
+    # library's name: it notes what it finds at its import and makes a logger at the level the variable names, as the
+    # library does -- "info" where the variable names none, and an error where its text is no level name
+    refusal, level = flashinfer_calls.NO_DOWNLOAD, "FLASHINFER_LOGGING_LEVEL"
     package = tmp_path / "flashinfer"
     package.mkdir()
-    (package / "__init__.py").write_text(f"import os\nFOUND = os.environ.get({flashinfer_calls.NO_DOWNLOAD!r})\n")
+    (package / "__init__.py").write_text(
+        f"import logging\nimport os\nFOUND = os.environ.get({refusal!r})\nLEVEL = os.getenv({level!r}, 'info')\nlogging.Logger('flashinfer.jit').setLevel(LEVEL.upper())\n"
+    )
     (package / "autotuner.py").write_text("")
     monkeypatch.syspath_prepend(str(tmp_path))
-    for held, found in ((None, "1"), ("", "1"), ("0", "0")):
-        for name in ("flashinfer", "flashinfer.autotuner"):
-            monkeypatch.delitem(sys.modules, name, raising=False)
-        monkeypatch.delenv(flashinfer_calls.NO_DOWNLOAD, raising=False)
-        if held is not None:
-            monkeypatch.setenv(flashinfer_calls.NO_DOWNLOAD, held)
-        assert flashinfer_calls.LibraryBlock._library(None).FOUND == found, f"the variable {held!r} in the environment: the library finds {found!r}"
+    adapters = {key: factory for key, factory in providers.factories().items() if "flashinfer" in key}
+    child = [sys.executable, "-c", f"import os; print(os.environ.get({refusal!r}), os.environ.get({level!r}))"]
+    for held, found in (((None, None), ("1", "warning")), (("", ""), ("1", "warning")), (("0", "  "), ("0", "warning")), (("0", "debug"), ("0", "debug"))):
+        for key, adapter in adapters.items():
+            for name in ("flashinfer", "flashinfer.autotuner"):
+                monkeypatch.delitem(sys.modules, name, raising=False)
+            for variable, text in zip((refusal, level), held):
+                monkeypatch.setenv(variable, "")  # what the adapter sets is then taken back behind the case
+                if text is None:
+                    monkeypatch.delenv(variable)
+                else:
+                    monkeypatch.setenv(variable, text)
+            library = adapter._library(None)
+            assert (library.FOUND, library.LEVEL) == found, f"{key}, {held!r} in the environment: the library finds {found!r} at its import"
+        started = subprocess.run(child, capture_output=True, text=True, timeout=120)
+        assert tuple(started.stdout.split()) == found, f"{held!r} in the environment: a process this one starts finds {found!r}"
     # the keys of the library's rows, and what the list of keys says about itself
     assert set(ENTRY_NAMES) == set(KEYS) and {key: entry for key, entry in ENTRY_NAMES.items() if "flashinfer" in key} == {
         "flashinfer.mm_fp4": "flashinfer.gemm.mm_fp4",
@@ -9261,6 +9286,102 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
         "Version updates come through the `pip` entry for `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers.",
     ):
         assert sentence in (area + family + guide).replace(" # ", " "), sentence
+
+
+def test_the_level_of_the_librarys_own_lines_through_a_run_and_a_text_that_names_no_level(monkeypatch, capsys, tmp_path):
+    """The level of the library's own lines through ``main()`` on the stack ``native``: the stand-in adapters reach a
+    package of the library's name through the adapters' one import, and that package does at its import what the
+    library does with the variable -- it upper-cases the text and hands it to ``setLevel`` of a logger.  Where the
+    environment names no level -- the variable unset, empty, or blanks alone -- the run sets ``warning`` before the
+    import and ends in ``PASS``; a level that is named stays as it was written.  A text that names no level ends the
+    run in ``[00] ERROR`` while it is planned, before the library is imported, in a sentence of its own that names the
+    variable and not its text -- never as operands an adapter built and the library declined.  What is declined is
+    what the library's import raises on and nothing it takes: a level name in either case passes, a name with a blank
+    beside it does not.  A plan on stated device facts asks nothing of the environment."""
+    import importlib
+    import os
+
+    from model_samples import blocks
+    from model_samples.providers import flashinfer_calls
+
+    refusal, level = "FLASHINFER_NO_DOWNLOAD", "FLASHINFER_LOGGING_LEVEL"
+    package = tmp_path / "flashinfer"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        f"import logging\nimport os\nLEVEL = os.getenv({level!r}, 'info')\nlogging.Logger('flashinfer.jit').setLevel(LEVEL.upper())\n"
+    )
+    (package / "autotuner.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    found = []  # the level the package found at every import an adapter made of it
+    built_by_the_area = _stand_ins
+
+    def stand_ins(patch, **options):
+        built = built_by_the_area(patch, **options)
+        for key, stand_in in list(built.items()):
+            if "flashinfer" in key:  # the stand-in library, behind the adapters' own import of the package
+
+                def _library(self, stand_in=stand_in):
+                    found.append(flashinfer_calls.LibraryBlock._library(self).LEVEL)
+                    return stand_in._library(self)
+
+                built[key] = type(stand_in.__name__, (stand_in,), {"_library": _library})
+        return built
+
+    def fresh(text):
+        """The environment names ``text`` (``None``: nothing), and the package is not imported yet."""
+        for name in ("flashinfer", "flashinfer.autotuner"):
+            sys.modules.pop(name, None)
+        del found[:]
+        monkeypatch.setenv(level, "" if text is None else text)
+        if text is None:
+            monkeypatch.delenv(level)
+
+    monkeypatch.setattr(sys.modules[__name__], "_stand_ins", stand_ins)
+    for variable in (refusal, level):  # what an adapter sets in the environment is taken back behind this case
+        monkeypatch.setenv(variable, "")
+        monkeypatch.delenv(variable)
+    for name in ("flashinfer", "flashinfer.autotuner"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    run = ["--stack", "native", "--sequences", "1"]
+    try:
+        for text, expected in ((None, "warning"), ("", "warning"), ("  ", "warning"), ("debug", "debug")):
+            fresh(text)
+            code, lines = _sample_run(monkeypatch, capsys, run)
+            assert code == 0 and lines[-1] == "[00] PASS", (text, lines[-3:])
+            assert (
+                found and set(found) == {expected} and os.environ[level] == expected
+            ), f"{text!r} in the environment: the library finds {expected!r} at its import"
+        # a text that names no level: the run's ERROR, in a sentence of its own, while it is planned -- the library not imported
+        fresh("loud")
+        code, lines = _sample_run(monkeypatch, capsys, run)
+        sentence = (
+            f": the environment's {level} names no level of Python's logging module, and FlashInfer takes its text for one when it is imported; "
+            "name a level there (debug, info, warning, error or critical), or unset the variable and this sample sets it to warning"
+        )
+        assert code == 1 and lines[-1].startswith("[00] ERROR flashinfer.") and lines[-1].endswith(sentence), lines[-1]
+        assert "loud" not in lines[-1].lower() and not any("declined the operands" in line for line in lines), "the variable is named, its text is not"
+        assert found == [] and "flashinfer" not in sys.modules and os.environ[level] == "loud", "the library was not imported, and the text stays"
+        assert (
+            LIBRARY_CALLS == [] and ATTENTION_CALLS == [] and not any(line.startswith(("checks", "[00] stage")) for line in lines)
+        ), "nothing was called or loaded"
+        # a plan on stated device facts makes no first use and asks nothing of the environment: the same text, and the row is planned
+        model, stated = _tiny_model(), blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
+        rows = blocks.plan(model.provider_table, model.regimes, stated, 1, 1, "native", model=model, options={"device": "cpu"}).rows
+        assert rows["attention.core"].key == "flashinfer.decode_attention" and "flashinfer" not in sys.modules, "the table is stated, nothing is imported"
+        # what is declined is what the library's import raises on, and nothing it takes
+        for text, taken in (("WARN", True), ("Critical", True), ("notset", True), (" info", False), ("info ", False), ("10", False)):
+            fresh(text)
+            if taken:
+                flashinfer_calls.check_level("an entry")
+                assert importlib.import_module("flashinfer").LEVEL == text
+            else:
+                with pytest.raises(ValueError, match=f"an entry: the environment's {level} names no level of Python's logging module"):
+                    flashinfer_calls.check_level("an entry")
+                with pytest.raises(ValueError, match="Unknown level"):
+                    importlib.import_module("flashinfer")
+    finally:
+        for name in ("flashinfer", "flashinfer.autotuner"):
+            sys.modules.pop(name, None)
 
 
 def _ignored_by_dependabot(text: str, ecosystem: str, directory: str) -> list:

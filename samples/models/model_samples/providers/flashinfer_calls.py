@@ -64,6 +64,16 @@ print a local path at its import -- the package at another version than the libr
 the package -- and one more is undecidable from the metadata: each is a ``SKIP`` at plan time, before the library is
 imported (``check_binaries``).
 
+**The library's own lines.**  The library logs through loggers of its own, at the level its variable
+``FLASHINFER_LOGGING_LEVEL`` names when it is imported and at ``info`` where the variable names none: a first build then
+prints lines of the library on standard error, some of them with a path of its cache directory.  These adapters set the
+variable to ``warning`` for the process before they import the library, in the same method as the refusal of a download
+and where the environment names no level -- the variable unset, empty, or blanks alone (``warnings_only``).  A level
+the environment names stays, and the library then prints those lines.  Its warnings and errors reach the streams either
+way.  A text there that names no level is not the sample's to correct: the library's import raises on it, so a plan
+declines it before the library is imported, in a sentence that names the variable (``check_level``: a ``ValueError``,
+the run's ``ERROR``, and never the sentence of operands an adapter built).
+
 **First use is part of the plan.**  The library builds what a call needs when it is first made: its CuTe DSL kernels in the
 process, its CUTLASS multiply as a module compiled with the installed CUDA compiler and ninja (minutes, once per machine).
 The 4-bit kernel is built per range of row counts.  The attention builds a launcher with the same compiler and reads
@@ -83,6 +93,7 @@ import dataclasses
 import hashlib
 import importlib.metadata as metadata
 import importlib.util
+import logging
 import os
 import re
 import sys
@@ -124,10 +135,12 @@ BINARIES_REQUIREMENTS = "samples/models/requirements-flashinfer-cubin.txt"
 BINARIES_INDEX = "https://flashinfer.ai/whl"
 #: the command that installs that package at the validated version: the index is named for this one command alone
 BINARIES_INSTALL = f"pip install --no-deps --index-url {BINARIES_INDEX} -c {CONSTRAINTS} -r {BINARIES_REQUIREMENTS}"
-#: the two variables of the library these adapters read or set: the directory it reads kernel binaries from in the place
-#: of its package, and its switch against downloading one (any text that is not empty refuses)
+#: the three variables of the library these adapters read or set: the directory it reads kernel binaries from in the
+#: place of its package, its switch against downloading one (any text that is not empty refuses), and the level of its
+#: own loggers, which it reads once, when it is imported (the name of a level of the interpreter's logging module)
 BINARIES_DIRECTORY = "FLASHINFER_CUBIN_DIR"
 NO_DOWNLOAD = "FLASHINFER_NO_DOWNLOAD"
+LOGGING_LEVEL = "FLASHINFER_LOGGING_LEVEL"
 #: how the library's refusal of a file that is not on the machine begins -- the manifest or the header at the first use of
 #: its launcher, a kernel binary at the first call of a step shape -- and the module of its loader, whose callback raises
 #: the first where no caller can catch it.  Read to tell that refusal from any other failure, never printed: each text
@@ -176,6 +189,35 @@ def refuse_downloads() -> None:
     a file that is not there is the library's refusal, never a fetch."""
     if not os.environ.get(NO_DOWNLOAD):
         os.environ[NO_DOWNLOAD] = "1"
+
+
+def warnings_only() -> None:
+    """Keep the library's informational lines off the streams of this process and of every process it starts: the level
+    of the library's own loggers, which it reads from this variable when it is imported, set to ``warning`` where the
+    environment names none.  An empty text and a text of blanks alone name none: the library takes the text for the
+    name of a level, and its import raises on either.  A level that is named there stays -- the library then prints
+    lines of its own at a first build, some with a path of its cache directory.  Its warnings and errors reach the
+    streams either way.  A text that names no level does not come here: a plan declines it (``check_level``)."""
+    if not os.environ.get(LOGGING_LEVEL, "").strip():
+        os.environ[LOGGING_LEVEL] = "warning"
+
+
+def check_level(entry: str) -> None:
+    """At plan time, before the library is imported: the text of the library's logging-level variable, where it is
+    neither empty nor blanks alone.  The library upper-cases that text and hands it to ``setLevel`` of a logger of its
+    own when it is imported, and that raises on a text that is no level name of the interpreter's ``logging`` module.
+    The same call on a logger of this function's own decides here, so every text the library takes is taken.
+    ``ValueError`` (an ERROR: the text was set outside the sample) that names the variable and never its text."""
+    text = os.environ.get(LOGGING_LEVEL, "")
+    if not text.strip():
+        return
+    try:
+        logging.Logger(LOGGING_LEVEL).setLevel(text.upper())
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{entry}: the environment's {LOGGING_LEVEL} names no level of Python's logging module, and FlashInfer takes its text for one when it is "
+            "imported; name a level there (debug, info, warning, error or critical), or unset the variable and this sample sets it to warning"
+        ) from None
 
 
 def binaries_package() -> Tuple[Optional[str], bool]:
@@ -376,8 +418,10 @@ class LibraryBlock(BlockBase):
 
     def _library(self):
         """The library, imported on a device only (a plan on stated device facts never comes here) -- and never before its
-        download of kernel binaries is switched off for the process: the one place every row reaches the library."""
+        download of kernel binaries is switched off for the process and the level of its own lines is set: the one place
+        every row reaches the library."""
         refuse_downloads()
+        warnings_only()
         import flashinfer
         import flashinfer.autotuner  # noqa: F401 -- the tuner's state is read through the package (``_tuned``)
 
@@ -404,6 +448,7 @@ class LibraryBlock(BlockBase):
         self._form()
         if self._launches_here():
             check_package(self.entry)
+            check_level(self.entry)
 
     @property
     def first_use_note(self) -> str:
