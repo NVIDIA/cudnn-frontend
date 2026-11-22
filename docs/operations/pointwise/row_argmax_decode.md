@@ -66,7 +66,8 @@ restored afterwards. There is no workspace; a warm call allocates nothing and re
 | `ids` (optional) | int32 or int64 | `[width]` | read only; contiguous; aligned to its element |
 | `out` (optional) | int32 without `ids`, else the dtype of `ids` | `[>= rows]` | contiguous; aligned to its element; elements past `rows` are never written |
 
-Every operand lives on the entry's device, and `out` may not share a byte with `x` or `ids`.
+Every operand lives on the entry's device, and the results a call writes -- the first `rows` elements of `out` -- may not share a
+byte with `x` or `ids`.
 
 **Output ownership.** An `out` the caller passes is the caller's and is returned as given. Without it the entry returns its own
 vector of the row count and the result's dtype: per row count one int32 and one int64 vector of `rows` elements, allocated
@@ -88,11 +89,11 @@ its own `out`.
 Everything the entry does not serve is declined by name: `TypeError` for a non-tensor, a dtype (`x` bf16; `ids` int32 or int64;
 `out` the result's dtype) or a `width` or a `rows` of `compile` / `outputs` that is not an `int`; `ValueError` for a width outside
 the kernel's structure (a multiple of 8 in 8 .. 65536), a shape, a row stride of `x` that is not whole 16-byte vectors, an
-alignment, a device mismatch, an `out` that overlaps `x` or `ids`, or an empty call; `NotImplementedError` for a structurally
-valid width other than 65536, a row count above 1024, an operand that is not contiguous where the kernel addresses flat, a
-compute capability outside 10.x, and the CuTe DSL gates (not installed, below 4.8.0, without the part's target, or with a compiler
-that cannot assemble it). The operand checks import no DSL module and run before every launch; the architecture gate and the DSL
-gates run before the kernel module is imported.
+alignment, a device mismatch, an `out` whose first `rows` elements overlap `x` or `ids`, or an empty call;
+`NotImplementedError` for a structurally valid width other than 65536, a row count above 1024, an operand that is not
+contiguous where the kernel addresses flat, a compute capability outside 10.x, and the CuTe DSL gates (not installed, below
+4.8.0, without the part's target, or with a compiler that cannot assemble it). The operand checks import no DSL module and run
+before every launch; the architecture gate and the DSL gates run before the kernel module is imported.
 
 ## Launch facts
 
@@ -126,7 +127,7 @@ nothing is released; the kernel has no other synchronization object.
 | width | 65536, fixed at construction; another multiple of 8 up to 65536 is declined by name |
 | forms | one kernel body; three table kinds (none, int32, int64), one compiled kernel each |
 | dtypes | bf16 `x`; int32 or int64 `ids`; `out` int32 without a table, else the table's dtype |
-| layouts | `x` with a free row stride of whole 16-byte vectors; contiguous `ids` and `out`; `out` overlapping neither `x` nor `ids` |
+| layouts | `x` with a free row stride of whole 16-byte vectors; contiguous `ids` and `out`; the first `rows` elements of `out` overlapping neither `x` nor `ids` |
 | determinism | bitwise replay and batch invariance (the [status page](/operations/determinism)); the result is exact, so it is the same on every part |
 | DSL | nvidia-cutlass-dsl >= 4.8.0. On cc 10.0 / 10.3 both compiler flavours of the DSL (CUDA 12.9 and CUDA 13.4) assemble the kernel and are served; on cc 10.0 both ran under CuTe DSL 4.8.0 and gave the same results, and CuTe DSL 4.8.1 ran with CUDA 13.4. On cc 10.7 the compiler must be CUDA 13.4 or later (the CUDA 12.9 flavour rejects the `sm_107a` target and is declined by name before JIT). Other DSL versions are served unverified |
 

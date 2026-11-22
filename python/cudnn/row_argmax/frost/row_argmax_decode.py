@@ -26,8 +26,9 @@ Served (declined otherwise, by name): ``width`` 65536; ``rows`` 1 .. 1024 (a RUN
 width]``, a row contiguous, the row stride free in whole 16-byte vectors (a view of a wider slab binds as it is), 16-byte
 aligned; ``ids`` absent, or int32 / int64 ``[width]``, contiguous, aligned to its element; ``out`` ``[>= rows]`` of the result's
 dtype (int32 without a table, else the table's), contiguous, aligned to its element; every operand on the entry's device;
-``out`` sharing no byte with ``x`` or ``ids``; a compute capability 10.x part; a CuTe DSL >= 4.8.0 that holds the part's target
-and compiles it (cc 10.7: the CUDA 13 toolchain flavour).  Nothing is checked on the host about a VALUE (Rule 3).
+the results a call writes (the first ``rows`` elements of ``out``) sharing no byte with ``x`` or ``ids``; a compute capability
+10.x part; a CuTe DSL >= 4.8.0 that holds the part's target and compiles it (cc 10.7: the CUDA 13 toolchain flavour).  Nothing
+is checked on the host about a VALUE (Rule 3).
 
 THE TABLE KIND IS A FACT OF THE CALL: no table, an int32 table or an int64 table.  It is a load and a store width of the kernel,
 so each kind is one compiled kernel under one compile key ``(config, kind)``.  :meth:`RowArgmaxDecode.compile` needs no operand
@@ -209,9 +210,9 @@ def _check_overlap(rows: int, tensors: Dict[str, Any], what: str = "") -> None:
 def check_binding(cfg: Cfg, x, ids=None, out=None, device=None) -> int:
     """The binding checks of a call, run before every launch (compile-cache hits included).  ``TypeError`` for a non-tensor or a
     dtype (``x`` bf16; ``ids`` int32 or int64; ``out`` the result's dtype: int32 without a table, else the table's);
-    ``ValueError`` for an inconsistent device, shape, row stride or alignment, an empty call, or an ``out`` that overlaps ``x`` or
-    ``ids``; ``NotImplementedError`` for a row count above the served ceiling or an operand that is not contiguous where the
-    kernel addresses flat.  Returns ``rows = x.shape[0]``.  ``device`` (an entry's: a concrete CUDA ordinal) requires every
+    ``ValueError`` for an inconsistent device, shape, row stride or alignment, an empty call, or an ``out`` whose first ``rows``
+    elements overlap ``x`` or ``ids``; ``NotImplementedError`` for a row count above the served ceiling or an operand that is not
+    contiguous where the kernel addresses flat.  Returns ``rows = x.shape[0]``.  ``device`` (an entry's: a concrete CUDA ordinal) requires every
     operand on exactly that device; without it the operands must share ``x``'s.  Host-only metadata arithmetic, no device work:
     no operand's VALUE is read.  The checks see the operands they are given: an output that is not passed is resolved by the
     entry, whose call checks its own vector against these operands."""
@@ -375,9 +376,11 @@ class RowArgmaxDecode:
 
     def _check_entry_owned(self, rows: int, table: str, x, ids) -> None:
         """The overlap check of :func:`check_binding` for a call that passes no ``out``: the launch writes the entry's own
-        vector of ``rows`` in its place, and a tensor an earlier call returned can come back as an operand.  ``ValueError`` when
-        that vector overlaps ``x`` or ``ids``.  Before the row count's pair exists there is nothing to check -- what the call
-        then allocates is fresh memory, disjoint from every live tensor.  Host-only pointer arithmetic; allocates nothing."""
+        vector of ``rows`` in its place, so that vector is held to the rule of a passed one.  ``ValueError`` when that vector
+        overlaps ``x`` or ``ids`` (a vector the entry allocated is a separate allocation of at most 1024 integers and cannot be
+        bound as ``x`` or ``ids``: the check is the same rule on whatever the entry's table holds).  Before the row count's pair
+        exists there is nothing to check -- what the call then allocates is fresh memory, disjoint from every live tensor.
+        Host-only pointer arithmetic; allocates nothing."""
         owned = self.buffers.get(rows)
         if owned is None:
             return
