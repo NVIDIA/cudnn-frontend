@@ -2363,10 +2363,13 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
         with pytest.raises(ValueError, match="attention.core in the plan of 3 sequences"):
             refused()
     assert unpaged.state is None and unpaged.weights is None, "named before anything is read or built"
-    ahead = Session(tiny, text, **common)  # ... and where it is a session behind the first one's: named with the first one's plan
+    ahead = Session(tiny, text, **common)  # ... and where it is a session behind the first one's, on its weights: named when the first one plans
+    later = Session(tiny, text, share=ahead, **common)
+    with _a_block_asks_for_a_page(page=None, key="torch_ref.attention", tables=True):
+        later.resolve()
     with pytest.raises(ValueError, match="attention.core in the plan of 3 sequences"):
-        ahead.plan_table([unpaged])
-    assert ahead.state is None and ahead.weights is None
+        ahead.plan_table([later])
+    assert ahead.state is None and ahead.weights is None and later.state is None
     # the family's arithmetic is the state's own size, with the tables and without, at every case of the layout
     for sequences, tokens, capacity, pages, longest, width in TABLE_CASES:
         state = DecodeState(kinds, sequences, capacity, shapes, "cpu", tokens, page=PAGE, pages=pages, max_model_len=longest)
