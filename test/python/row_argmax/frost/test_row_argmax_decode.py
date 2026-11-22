@@ -232,13 +232,40 @@ def test_binding_check_requires_every_operand_on_the_given_device():
     assert entry.check_binding(entry.make_cfg(WIDTH), ops["x"], ops["ids"], ops["out"], device="cpu") == 3
 
 
+def test_a_call_requires_its_operands_on_the_entrys_device():
+    """Operands that agree with each other but not with the entry are declined by name, in front of the compile and the launch:
+    the kernel takes addresses, and an address of another device is not one the entry's device can read."""
+    k = make_entry("cpu")
+    x = torch.zeros(3, WIDTH, dtype=BF16, device="meta")
+    ids = torch.zeros(WIDTH, dtype=I64, device="meta")
+    out = torch.zeros(3, dtype=I64, device="meta")
+    for operands in ((x, ids, out), (x, ids), (x,)):
+        with pytest.raises(ValueError, match="one device"):
+            k(*operands)
+    assert not k.compiled and not k.buffers
+
+
+def test_the_overlap_check_is_over_the_results_a_call_writes():
+    """Half-open byte ranges over the first ``rows`` results of ``out``: an ``out`` that ends where ``ids`` begins is served, and
+    so is a longer ``out`` whose elements past the call's rows lie over ``ids`` (a launch never writes them); the call's last
+    result on the table's first element is declined."""
+    cfg = entry.make_cfg(WIDTH)
+    x = torch.zeros(3, WIDTH, dtype=BF16)
+    buffer = torch.zeros(WIDTH + 8, dtype=I64)
+    ids = buffer[8:]
+    assert entry.check_binding(cfg, x, ids, buffer[5:8]) == 3
+    assert entry.check_binding(cfg, x, ids, buffer[5:12]) == 3
+    with pytest.raises(ValueError, match=r"\bout\b"):
+        entry.check_binding(cfg, x, ids, buffer[6:9])
+
+
 def test_declines_an_unserved_compute_capability_and_host_operands():
     ops = _host_operands()
     for cc in ((9, 0), (8, 0), (8, 9), (11, 0), (12, 0), (12, 1)):
         with pytest.raises(NotImplementedError, match="compute capability"):
             _check(ops, device_cc=cc)
         assert not entry.cc_supported(cc)
-    assert all(entry.cc_supported(cc) for cc in ((10, 0), (10, 3), (10, 7))) and not entry.cc_supported(None)
+    assert all(entry.cc_supported(cc) for cc in ((10, 0), (10, 3), (10, 7), (10, 9))) and not entry.cc_supported(None)
     with pytest.raises(NotImplementedError, match="CUDA tensors"):
         _check(ops)
 
@@ -281,6 +308,19 @@ def test_compile_key_holds_the_config_and_the_table_kind():
         k.key("int16")
     with pytest.raises(NotImplementedError, match="rows"):
         k.cfg_for(kcfg.MAX_ROWS + 1)
+
+
+def test_a_row_count_that_is_not_an_int_is_declined_by_type():
+    """``cfg_for``, ``outputs`` and ``compile`` take a row count that is an ``int``: any other type is a ``TypeError`` in front of
+    the device, the part and the allocation (the launch facts answer a malformed row count with their own ``ValueError``)."""
+    k = make_entry("cpu")
+    for rows in (1.0, "1", True):
+        for attempt in (k.cfg_for, k.outputs, k.compile):
+            with pytest.raises(TypeError, match="rows"):
+                attempt(rows)
+    with pytest.raises(TypeError, match="rows"):
+        k.outputs(None)
+    assert not k.buffers and not k.compiled
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -504,6 +544,36 @@ def test_a_call_orders_its_launch_behind_a_pending_record_over_the_out_it_writes
     assert got == alone == s.calls, "without a record: the launch alone"
 
 
+def test_a_call_without_out_declines_an_entry_owned_vector_that_lies_over_an_operand(monkeypatch):
+    """The overlap check on the RESOLVED operands, on a stand-in pair (an allocation of the entry never lies inside an operand, so
+    the case puts a pair there): a call that passes no ``out`` and would write a vector that shares bytes with ``ids`` is declined
+    by name and neither orders nor launches; the same call with a caller-owned ``out`` is served."""
+    s = stand_ins(monkeypatch)
+    k = make_entry("cpu")
+    k.compiled[k.key("int64")] = lambda *args: s.calls.append(("launch",))
+    ops = _host_operands(table="int64")
+    k.buffers[3] = dict(int32=torch.zeros(3, dtype=I32), int64=ops["ids"][7:10])
+    s.calls.clear()
+    with pytest.raises(ValueError, match=r"\bout\b"):
+        k(ops["x"], ops["ids"])
+    assert not s.calls, "a declined call ordered or launched"
+    assert k(ops["x"], ops["ids"], ops["out"]) is ops["out"]
+    assert [c for c in s.calls if c[0] == "launch"] == [("launch",)]
+
+
+def test_a_call_takes_the_current_stream_of_the_entrys_device(monkeypatch):
+    """The launch stream is torch's current stream OF THE ENTRY'S DEVICE, asked for by device: the caller's current device can be
+    another one (on stand-ins; the device case of an entry on a second device needs two devices)."""
+    s = stand_ins(monkeypatch)
+    asked = []
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: asked.append(device) or s.current)
+    k = make_entry("cpu")
+    k.compiled[k.key("none")] = lambda *args: s.calls.append(("launch",))
+    ops = _host_operands(table="none")
+    assert k(ops["x"], None, ops["out"]) is ops["out"]
+    assert asked == [k.device], asked
+
+
 def test_a_declined_call_compile_or_outputs_allocates_nothing_and_leaves_no_record(monkeypatch):
     """A decline touches nothing, on stand-ins (no device).  Whatever declines a call, a ``compile`` or an ``outputs`` -- a part
     the kernel does not serve, a DSL gate, a binding check, the row count, a host device -- runs IN FRONT of the pair's
@@ -640,7 +710,8 @@ def test_rendering_holds_the_rule(arch, cc, tmp_path):
     a target whose warp maximum is one reduction instruction.  The reduction: ONE thread-block barrier, two shared stores in
     front of it and two shared loads behind it, two integer warp reductions; the warp maximum as two reduction instructions on a
     compute-capability 10.x target and as butterfly shuffles elsewhere.  The result: the table kind's one load and one store.
-    No dependent-launch instruction, no mbarrier, no copy group; every branch goes forward (no loop).  1024 threads; the form
+    No dependent-launch instruction, no mbarrier, no copy group; every branch goes forward (no loop), and one of them, behind the
+    block's reduction, skips the result's load and store (thread 0 alone writes a row's result).  1024 threads; the form
     inside the first 100 characters of a cuDNN symbol.  Where a disassembler decodes the cubin: no access to local memory (every
     value stays in a register).  ``sm_120a`` is rendered although the entry declines that class: the kernel assembles for it.
     A DSL below the entry's floor or without the target SKIPS with the gate's text; a compiler flavour that rejects a claimed
@@ -696,6 +767,10 @@ def test_rendering_holds_the_rule(arch, cc, tmp_path):
         labels = {tokens[0][:-1]: position for position, tokens in enumerate(statements) if tokens[0].endswith(":")}
         branches = [(position, tokens[-1]) for position, tokens in enumerate(statements) if tokens[0].startswith("bra")]
         assert branches and all(labels[target] > position for position, target in branches), f"{what}: a backward branch (a loop)"
+        reduced = max(position for position, tokens in enumerate(statements) if tokens[0] == "redux.sync.min.s32")
+        stored = next(position for position, tokens in enumerate(statements) if tokens[0].startswith("st.global"))
+        skipped = [target for position, target in branches if reduced < position < stored and labels[target] > stored]
+        assert skipped, f"{what}: no branch between the block's reduction and the result's store (every thread stores the row's result)"
         sass = _sass(cubin)
         if sass is not None:
             assert not [ln for ln in sass if " STL" in ln or " LDL" in ln], f"{what}: the compiled kernel accesses local memory"
