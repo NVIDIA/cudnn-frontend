@@ -2236,7 +2236,7 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_bwd_sm80", (8, 0), "f16", (64, 64), "prefill", "dense", "window", False, "mha", True): Entry("always", None, "sm80_bwd_square_f16_20261108"),
     # study sm107_d256_bwd_20261122: the sm107 row's d256 body on Rubin, bf16 non-deterministic backward, BSHD and THD, mask-free and
     # causal (top-left squares, bottom-right chunks). cuDNN 9.24.0.43 builds no backend plan for these graphs there, so the classes were
-    # decided on a newer development build. Dense causal graphs failed the holdout off the tile and keep trailing, on the tile too.
+    # decided on a newer development build. Dense causal graphs are the next study's.
     ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "none", False, "gqa", False): Entry("always", None, "sm107_d256_bwd_20261122"),
     ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "none", False, "gqa", True): Entry("ge", 6.5, "sm107_d256_bwd_20261122", "q"),
     ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "none", False, "mha", False): Entry("ge", 7.5, "sm107_d256_bwd_20261122", "kv"),
@@ -2261,4 +2261,18 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "thd_ragged", "none", False, "gqa", True): Entry("always", None, "sm107_d256_bwd_20261122"),
     ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "thd_ragged", "none", False, "mha", False): Entry("always", None, "sm107_d256_bwd_20261122"),
     ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "thd_ragged", "none", False, "mha", True): Entry("always", None, "sm107_d256_bwd_20261122"),
+    # study sm107_d256_bwd_causal_v2_20261122: the dense causal classes, which failed sm107_d256_bwd_20261122's holdout off the tile, re-fit
+    # with train cells at short-query chunks pooled with that study's. Off the tile, small work and few query tokens keep the backend.
+    ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_d256_bwd_causal_v2_20261122"
+    ),
+    ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 33.002, "sm107_d256_bwd_causal_v2_20261122"
+    ),
+    ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm107_d256_bwd_causal_v2_20261122"
+    ),
+    ("sdpa_bwd_sm107", (10, 7), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "mha", True): Entry(
+        "ge", 31.503, "sm107_d256_bwd_causal_v2_20261122", "cost", ("ge", 9.001, "q")
+    ),
 }
