@@ -559,3 +559,33 @@ rule (`fe.SOURCE_FILES`); an override by key takes the row of the run's stack wh
   census holds what it lists.
 - When a figure moves, read every passage that states it, in every text, and reword the dated ones as sentences of
   their day.
+
+## What the attention core's library row taught
+
+The attention core of `native` is a library's paged decode attention, a kernel that comes as precompiled binaries
+(`providers/flashinfer_calls.py`: `DecodeAttentionBlock`).
+
+- Switch a provider's own download off in the process before the provider is imported, also where the variable is
+  set and empty. Hold it with a package of the provider's name that notes what it finds at its import.
+- Decide at plan time, with nothing imported, the states of an installation in which the provider's import prints a
+  path: ask the distribution's metadata and the module both, and decline where they disagree.
+- A refusal that holds a local path is told by its first words and never printed. The `SKIP` names what is missing and
+  the fix still to be made: no install command where the package is installed.
+- A provider that lacks a file may refuse nothing: this one prints a path from its own code and launches another kernel
+  where the missing binary is not the first it reads. Do not rely on the refusal. Before the first call, hold every
+  binary the provider's own table names for the call's data types, head width, paging and page on the GPU's class to
+  its manifest, and the manifest to the checksum the provider names for it: the set read from the provider's own files,
+  never a list of the sample and never a model of the provider's selection; a missing or changed file is the `SKIP`.
+- A provider's identifier stands where its interface is called and nowhere else: one constant for a value the call
+  passes, and prose that says what it is.
+- The class a row names is where the table selects it. Say in the texts which class ran; on a device the census has no
+  section for, a run judges its blocks and claims no identity.
+- The interpreter's report of an exception inside a provider's callback is dropped for that one exception, during the
+  first use alone; every other report goes to the hook that was there.
+- A kernel whose launch follows a fact of the run is recorded with that fact: held by class and shape at the recorded
+  fact, by membership elsewhere, and the run prints the kernel that was launched.
+- A library that checks nothing of a table it reads has its checks in the adapter, each naming the operand. Hold a
+  defect at the smallest shape that shows it, and pin the shape that hides it.
+- A control arm through a run needs a run that can fail it: two table columns that name one page are no arm.
+- The first use makes one scratch call per step shape of the run: its sequences and one sequence alone, at the tokens
+  per sequence of each plan.
