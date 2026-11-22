@@ -10673,6 +10673,11 @@ def test_the_line_of_the_library_attention_band_names_an_element_where_every_ele
     tie_out.BlockTap._judge(stats, (_model_extreme(0.9),), (extreme_ref,), [], [], 0, extreme_twin)
     kept = (stats.elements, stats.outside, stats.worst_share, stats.worst_at)
     assert not stats.ok and kept == (1024, 1, 2.0**123, (0.0, 0.0)), "a later call with a smaller share does not take its place"
+    # the count beside the share is of BYTES: an output of -0 where the chain's byte is +0 is on its chain, and another byte
+    signed = null_ref.clone()
+    signed[0, 0] = -0.0
+    stats = _judged_attention(signed, null_twin, null_ref)
+    assert stats.ok and (stats.other_value, stats.worst_share) == (1, 0.0), "an output of -0 at a chain of +0: inside, and another byte than the chain's"
 
 
 def test_every_control_arm_of_the_library_attention_band_fails_and_what_the_band_cannot_see_is_pinned(monkeypatch):
