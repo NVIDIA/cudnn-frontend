@@ -370,7 +370,6 @@ def run_gemm_glu_quant_ref(
 
 
 def run_gemm_glu_ref(a_ref, b_ref, alpha, **glu):
-    ab12_ref, c_ref = None, None
     if a_ref.dtype in {torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2}:
         ab12_ref = alpha * torch.einsum("mkl,nkl->mnl", (a_ref).cpu(), (b_ref).cpu())
     else:
