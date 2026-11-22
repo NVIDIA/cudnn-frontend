@@ -91,7 +91,18 @@
         "on the host: typed declines and binding checks before every launch, outputs the caller owns, 1 to 64 rows per call, the weight's shape a field of the form (served here: hidden 5120, intermediate 17408)"
       ]},
     "fi_mm_fp4": {"what": "4-bit multiply: MLP down, output head", "origin": "FlashInfer", "relation": "target", "kind": "code", "entry": "flashinfer.gemm.mm_fp4", "form": {"BACKEND": "cute-dsl", "TUNED": false}},
-    "fi_fp4_quantize": {"what": "4-bit quantise of the final hidden rows in front of the output head", "origin": "FlashInfer", "relation": "stand-in", "entry": null}
+    "row_quantize_fp4": {"what": "4-bit quantise of the final hidden rows in front of the output head", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": "cudnn.RowQuantizeFp4Decode", "form": {"WIDTH": 5120, "PDL": true, "PDL_RELEASE": true},
+      "tie_out": "Compared when the entry was written: the two kernels in separate processes on identical operand bytes. With outputs the entry owns, every byte of the codes and of the whole block-scale buffer -- the live rows and the padded rows -- against the target kernel's; with outputs the caller owns, the live bytes against the target kernel's, and every other byte still what the caller had put there. 2,424 cells -- random rows at every row count from 1 to 64, structured rows and edge rows under eleven global scales, every finite bf16 magnitude as a block maximum under each of them, the whole code domain under five -- and 44 more at 128, 129, 160 and 1024 rows and 11 on rows with NaN or infinity, none of which differs; under four compilers (two versions of the CuTe DSL, each in both compiler flavours); for one x86 build of the target kernel, on compute capability 10.0 -- no differing byte. No such comparison is recorded for another compute capability. It needs the target's kernel and is not a test of this repository. In the repository: the entry's numerics contract (docs/operations/block_scaling/row_quantize_fp4_decode.md) and its suites (test/python/row_quantize/frost/).",
+      "differences": [
+        "one thread block per row; the target kernel launches whole bands of 128 rows, and its thread blocks step through the rows of a band",
+        "it writes the block scales of the live rows; the target kernel also writes a zero into every scale byte of the padded rows of a band in every launch (the entry's own scale buffers are zero-filled once, when they are allocated)",
+        "two 128-bit loads per thread where the target kernel has one 256-bit load",
+        "the block maximum is taken on the values widened to fp32; the target kernel takes it on 16-bit pairs. The same value for every input without a NaN",
+        "the global scale is read in front of the dependent-launch wait; the target kernel reads it behind the wait",
+        "two launch flags where the target kernel has none: it always carries the attribute, waits and releases at its entry, the form this file names",
+        "the form is readable in the kernel's symbol",
+        "on the host: typed declines, outputs the caller may own one by one, 1 to 1024 rows per call, the row width a field of the form (served: 5120)"
+      ]}
   },
   "layers": {"linear_attention": "linear_attention_layer", "full_attention": "attention_layer"},
   "configurations": {
@@ -108,7 +119,7 @@
           "max_model_len": 2051
         },
         "geometry": {"hidden": 5120, "mlp": 17408, "la_key_heads": 16, "la_value_heads": 48, "la_head_dim": 128, "attn_heads": 24, "attn_kv_heads": 4, "attn_head_dim": 256, "rotary_dim": 64, "rotary_section": [11, 11, 10]},
-        "numbers": {"launches": 484, "code": 194, "port": 289, "stand_in": 1},
+        "numbers": {"launches": 484, "code": 194, "port": 290, "stand_in": 0},
         "rows": {
           "1": {
             "prologue": [
@@ -139,7 +150,7 @@
               ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": true, "QUANT": null}, "launch": [[1, 1, 1], [640, 1, 1], 80]}]
             ],
             "after_step": [
-              ["output_head.quantize", "fi_fp4_quantize", {}],
+              ["output_head.quantize", "row_quantize_fp4", {}],
               ["output_head", "fi_mm_fp4", {"class": "Sm100BlockScaledPersistentDenseGemmKernel", "launch": [[1, 1, 148], [192, 1, 1], 231424], "at": {"vocab": 248320}}]
             ]
           }
@@ -161,7 +172,7 @@
           "max_model_len": 2051
         },
         "geometry": {"hidden": 5120, "mlp": 17408, "la_key_heads": 16, "la_value_heads": 48, "la_head_dim": 128, "attn_heads": 24, "attn_kv_heads": 4, "attn_head_dim": 256, "rotary_dim": 64, "rotary_section": [11, 11, 10]},
-        "numbers": {"launches": 484, "code": 146, "port": 337, "stand_in": 1},
+        "numbers": {"launches": 484, "code": 146, "port": 338, "stand_in": 0},
         "rows": {
           "6": {
             "prologue": [
@@ -192,7 +203,7 @@
               ["add_norm_quantize", "add_norm_quant", {"form": {"ADD": true, "STORE_RESIDUAL": false, "BF16_OUT": true, "QUANT": null}, "launch": [[6, 1, 1], [640, 1, 1], 80]}]
             ],
             "after_step": [
-              ["output_head.quantize", "fi_fp4_quantize", {}],
+              ["output_head.quantize", "row_quantize_fp4", {}],
               ["output_head", "fi_mm_fp4", {"class": "Sm100BlockScaledPersistentDenseGemmKernel", "launch": [[1, 1, 148], [192, 1, 1], 231424], "at": {"vocab": 248320}}]
             ]
           }

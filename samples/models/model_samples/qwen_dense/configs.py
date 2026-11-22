@@ -130,6 +130,11 @@ PREPARE_FORM = (
     ("PDL_RELEASE", False),
 )
 
+#: the form the target calls the 4-bit quantise in front of the output head in, stated whole: the row width (the model's
+#: hidden width), launched as a dependent of its predecessor, releasing its successor directly behind its own wait.  The
+#: three fields are the entry's whole config; its kernel's symbol carries them
+HEAD_QUANTIZE_FORM = (("WIDTH", 5120), ("PDL", True), ("PDL_RELEASE", True))
+
 #: the fused gate / up kernel of the MLP by row count: the target runs the narrowest of its four token tiles that holds the
 #: rows of a step, so the token tile is a field of the form and the block has one row per tile: (first row count, last
 #: row count, token tile).  A launch record does not show the tile -- the grid and the block are the same at all four,
@@ -180,9 +185,12 @@ def _library_row(block: str, form, band: str = "bf16_rounding", last=None) -> Pr
     order: the library launches its own kernels as dependents of the launch before them (the adapters pass nothing that changes
     it), so behind a launch that releases early -- the fused step or the gate in front of the out-projection, the gate / up
     kernel in front of the down multiply -- the kernel starts early and must wait before it reads that launch's codes.  The
-    kernels of the validated version wait in front of their first load.  A launch behind one that carries the attribute must
+    kernels of the validated version wait in front of their first load.  The 4-bit multiply reads its one scalar in front of
+    that wait (both kernel classes of the validated version): the fp32 product of the two global scales, which the adapter
+    forms on the host once per pair of values -- a constant no launch writes.  A launch behind one that carries the attribute must
     wait before it reads the product (the norm: its row).  In front of the head stands the quantise of its operand, a block
-    of its own, on its reference chain: PyTorch's launches, none of which releases early.
+    of its own: where its entry serves, a launch that releases early, and the head's kernel waits before it reads the codes
+    and the block scales; on its reference chain PyTorch's launches, none of which releases early.
     ``band``: the row's band against the reference; ``last``: the last row count the row claims (left out: any)."""
     key, serves, widths = LIBRARY_ROWS[block]
     # no test of this repository's own lanes runs a row that needs the library's package: printed as unverified in CI
@@ -488,11 +496,36 @@ PROVIDERS = {
     ],
     # the 4-bit operand of the output head, from the final norm's bf16 rows: the target forms it with a launch of its own
     "output_head.quantize": [
+        ProviderRow(
+            ("cc10.x",),  # the classes on which the target makes this launch; the entry has run on a device of compute capability 10.0
+            (1, 1024),
+            (1, None),
+            "fe.row_quantize_fp4_decode",
+            TARGET_STACKS,
+            serves="rows 1-1,024, hidden 5120",
+            band="row_quantize_fp4",
+            batch_invariant=("cc10.0",),
+            # the target's form (``HEAD_QUANTIZE_FORM``).  Launch order: the launch in front is the final norm's, which waits and
+            # releases directly behind its own wait, so this kernel can start while the norm still runs: it loads its one
+            # scale, waits, and only then reads the rows.  The launch before it must not write the scale: the adapter forms
+            # it on the host once per value, a constant no launch writes.  The kernel releases directly behind its own wait,
+            # so the launch behind it can start before the codes are written: the library's head multiply in ``native``, a
+            # dependent launch that waits in front of its first load of the codes and the block scales (its row); in
+            # ``fe-entries`` PyTorch's launches of the multiply over a copy, which carry no attribute and start when this
+            # kernel has ended
+            form=HEAD_QUANTIZE_FORM,
+            rows=(1, 1024),
+            # the row width the entry serves (its page: 5120, the published model's).  A checkpoint of the family with another
+            # hidden width keeps the block on the reference chain below, and its run states no kernel identity
+            widths=(("hidden", 5120),),
+        ),
         ProviderRow(*ANY, "torch_ref.quantize", EVERY, serves="any", fallback="reference chain"),
     ],
     "output_head": [
         # the same multiply, on the vocabulary's weight.  Its operand is what the quantise block in front of it hands over, in
         # the layout that block wrote.  Launch order: a dependent of that block's last launch; it waits before its first load
+        # of the codes, the block scales and the weight.  In front of that wait it reads its one scalar, which the launch
+        # before it must not write: the adapter forms it on the host once per pair of values, a constant no launch writes
         _library_row("output_head", MM_FP4_FORM),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 4-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),

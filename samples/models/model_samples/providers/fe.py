@@ -102,6 +102,21 @@ its twin: the preparation at the kernel's rounding points.  Its first use has tw
 nothing of this adapter's (a typed decline there is the entry's answer about the installation), and one call on scratch
 operands, where the entry imports the contract of the paged pools and launches its kernel once.
 
+``fe.row_quantize_fp4_decode`` calls ``cudnn.RowQuantizeFp4Decode``, the 4-bit quantisation of bf16 rows under a static
+global scale (``docs/operations/block_scaling/row_quantize_fp4_decode.md``): the packed codes and the block scales a
+block-scaled 4-bit multiply reads next, in that multiply's 128 x 4 layout, in one launch per call.  The row's form is the
+entry's whole config -- the row width, which the adapter holds to the model's hidden width, and the two launch knobs, each
+passed by name -- and the adapter refuses a row that leaves one of them out.  A call converts nothing: the rows are the
+tensor it is handed, the scale is one fp32 element on the device -- the fp32 reciprocal of the consumer's static scale,
+formed on the host once per value -- and the outputs are buffers of the call's own (the entry's own pair is one per row
+count and is overwritten by its next call), handed on as the kernel wrote them (``weights.TiledBlockScaledTensor``).  The
+scale buffer takes whole bands of 128 rows and is not initialised: the kernel writes the bytes of the live rows, a fill
+would be a launch of its own between two kernels, and nothing reads the other rows.  The entry's build takes no operand,
+so every typed decline of it is the entry's answer about the installation where this adapter can name an unmet
+requirement, and a fault of the table otherwise.  The reference chain divides where the kernel multiplies by reciprocals
+and drops the sign of a zero the kernel keeps, so the adapter names its twin: the quantisation at the kernel's rounding
+points.
+
 A provider row says in which form its entry is called (``row.form``: fields of the entry's own form, under the entry's names).
 An adapter passes exactly those to the entry and nothing else that fixes the kernel, so the row is the whole statement;
 ``launch_facts`` hands the kernel check the entry's own answers for a row count -- the symbols of the kernels it compiled, its
@@ -173,6 +188,9 @@ SOURCE_FILES = (
     "gemm/frost/swiglu_decode/swiglu_fp4_decode.py",
     "gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_config.py",
     "gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_nvfp4.py",
+    "row_quantize/frost/row_quantize_fp4_decode.py",
+    "row_quantize/frost/kernel/row_quantize_fp4_decode_config.py",
+    "row_quantize/frost/kernel/row_quantize_fp4_decode_f16.py",
     # what the files above import at module level, to the fixed point: the package with its probe of the installed CuTe DSL,
     # the buffers an entry exchanges with its kernel, the tile primitives the kernels are written on, and the two helpers of
     # the multiply kernels
@@ -233,9 +251,13 @@ PREPARE_ARGUMENTS = {
     "PDL": "pdl",
     "PDL_RELEASE": "pdl_release",
 }
+#: a field of the form of ``cudnn.RowQuantizeFp4Decode`` a provider row names -> the constructor argument that sets it.  A row
+#: names all three: the row width, and the two launch knobs each by itself -- the release is never left to follow the wait
+ROW_QUANTIZE_ARGUMENTS = {"WIDTH": "width", "PDL": "pdl", "PDL_RELEASE": "pdl_release"}
 #: the entry's three launch facts: what the kernel check reads
 LAUNCH_FACTS = ("kernel_symbols_for", "form_for", "launch_shape_for")
-#: the first cuDNN Frontend version that carries the entries of this module, and the CuTe DSL floor their pages state
+#: the first cuDNN Frontend version that carries an entry of this module, unless its adapter names a later one
+#: (``EntryBlock.first_version``), and the CuTe DSL floor their pages state
 FIRST_VERSION = "1.33.0"
 DSL_FLOOR = (4, 8, 0)
 
@@ -280,6 +302,7 @@ class EntryBlock(BlockBase):
     compiles = True
     name = ""  # the entry, as ``cudnn`` exports it
     what = ""  # what the entry is, for the sentence of an older package
+    first_version = FIRST_VERSION  # the first cuDNN Frontend version that carries the entry, for that sentence
     _served = None  # (entry instance, rows) of the last call -- in place of ``rows`` the step shape, where an entry's form follows one
     _answer = None  # (entry instance, rows, what ``serving`` says of them): asked of an instance once, not once per call
 
@@ -299,7 +322,7 @@ class EntryBlock(BlockBase):
         entry = getattr(cudnn, self.name, None)
         if entry is None:
             raise NotImplementedError(
-                f"needs nvidia-cudnn-frontend with {self.what} (>= {FIRST_VERSION}); this is {cudnn.__version__}: install from the checkout (see README)"
+                f"needs nvidia-cudnn-frontend with {self.what} (>= {self.first_version}); this is {cudnn.__version__}: install from the checkout (see README)"
             )
         if self.options.get("check_kernels") and not all(hasattr(entry, fact) for fact in LAUNCH_FACTS):
             raise NotImplementedError(
@@ -1174,6 +1197,142 @@ class AddNormQuantDecodeBlock(EntryBlock):
         else:  # the form ends at the bf16 rows: no quantised operand
             q = None
         return q, out, residual
+
+
+class RowQuantizeFp4DecodeBlock(EntryBlock):
+    """``cudnn.RowQuantizeFp4Decode``: per block of sixteen elements of a bf16 row the E4M3 block scale ``e4m3(global * (max |x|
+    * fp32(1 / 6)))`` and the E2M1 codes of its elements under that scale, ``global`` the fp32 reciprocal of the consumer's
+    static scale; one launch per call, in the form the row names."""
+
+    name = "RowQuantizeFp4Decode"
+    what = "the 4-bit row quantise decode step"
+    first_version = "1.34.0"
+    kernels = (Kernel("row_quantize_fp4", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per call of the block
+    _twin = None
+    _scales = None  # (value, device) -> the one-element fp32 tensor the kernel reads: built once per value, never inside a later step
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass, a form that leaves one of
+        the three to the entry, or a row width that is not the model's hidden width is a wrong table."""
+        form = dict(self.row.form)
+        unknown = [name for name in form if name not in ROW_QUANTIZE_ARGUMENTS]
+        missing = [name for name in ROW_QUANTIZE_ARGUMENTS if name not in form]
+        if unknown or missing:
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {', '.join(missing)}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form {what}; this adapter passes {', '.join(ROW_QUANTIZE_ARGUMENTS)} to cudnn.RowQuantizeFp4Decode, "
+                "and never leaves one of them to the entry's own default"
+            )
+        hidden = self.model.geometry.hidden
+        if form["WIDTH"] != hidden:
+            raise ValueError(
+                f"provider row {self.row.key}: its form names WIDTH {form['WIDTH']}; the rows this block quantises have the model's hidden width, {hidden}"
+            )
+        return {ROW_QUANTIZE_ARGUMENTS[name]: value for name, value in form.items()}
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if self.facts.total_bytes and "device" in self.options:
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)  # the first use follows the memory sentence
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: on compute capability 10.7 the entry's page asks for a CuTe DSL whose compiler is CUDA 13.4
+        or later (the CUDA 12 flavour lists the target and cannot assemble it)."""
+        if super()._unmet():
+            return True
+        if tuple(self.facts.cc) != (10, 7):
+            return False
+        from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound
+
+        return (int(CUDA_VERSION.major), int(CUDA_VERSION.minor)) < (13, 4)
+
+    def _build(self, device, site: str = ""):  # one form per row: the call site is not read
+        import torch
+
+        device = torch.device(device)
+        key = ("row_quantize_fp4_decode", str(device), tuple(self.row.form))
+        if key not in _ENTRIES:
+            arguments = self._arguments()
+            try:
+                _ENTRIES[key] = self._cudnn().RowQuantizeFp4Decode(device, arguments.pop("width"), **arguments)
+            except (NotImplementedError, TypeError, ValueError) as error:  # the entry declines the width or the form the table hands it
+                raise ValueError(f"the provider table is wrong: {self.entry} declines the width or the form of the row of {self.row.key}: {error}") from None
+        return _ENTRIES[key]
+
+    def _scale(self, value: float, device):
+        """The one-element fp32 tensor the kernel reads its global scale from: the fp32 reciprocal of the consumer's static
+        scale ``value``, correctly rounded.  Formed on the host, once per value and device: a constant no launch writes."""
+        import torch
+
+        if self._scales is None:
+            self._scales = {}
+        key = (float(value), str(device))
+        if key not in self._scales:
+            self._scales[key] = (torch.ones(1, dtype=torch.float32) / torch.tensor([float(value)], dtype=torch.float32)).to(device)
+        return self._scales[key]
+
+    def _outputs(self, rows: int, device) -> tuple:
+        """This call's own buffers for the packed codes and the block scales: never the entry's pair, which is one per row
+        count and is overwritten by its next call.  The block scales take whole bands of 128 rows; the kernel writes the
+        bytes of the live rows, and nothing else of that buffer is read."""
+        import torch
+
+        hidden = self.model.geometry.hidden
+        codes = torch.empty((rows, hidden // 2), dtype=torch.uint8, device=device)
+        scales = torch.empty((-(-rows // TILE_ROWS) * TILE_ROWS, hidden // BLOCK), dtype=torch.float8_e4m3fn, device=device)
+        return codes, scales
+
+    def twin(self, reference):
+        """The reference block this adapter is compared with: the quantisation at the kernel's rounding points."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.QuantizeBracket(reference.row, self.model, self.facts, self.options)
+        return self._twin
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device: build the entry's kernel (the build takes no operand).  Declines
+        as ``EntryBlock.first_use``."""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        try:
+            self._build(self.options["device"]).compile()
+        except NotImplementedError as error:
+            if self._unmet():
+                raise
+            raise ValueError(self._declined(error, "its first use")) from None
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device, rows = torch.device(self.options.get("device", "cuda")), sequences * tokens
+        entry = self._build(device)
+        x = torch.zeros((rows, self.model.geometry.hidden), dtype=torch.bfloat16, device=device)
+        try:
+            entry.compile()  # built while the run was planned (``first_use``): the entry finds its kernel
+            entry(x, self._scale(1.0, device), *self._outputs(rows, device))  # a launch at the run's row count, before the first step
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    def __call__(self, rows, quant):
+        import torch
+
+        if quant is None or quant.fmt != "nvfp4":
+            asked = "no quantised operand" if quant is None else f"{quant.fmt!r}"
+            raise ValueError(f"cudnn.RowQuantizeFp4Decode writes 4-bit codes under a static global scale; this block is asked for {asked}")
+        entry, count = self._build(rows.device), int(rows.shape[0])
+        self._served = (entry, count)  # what the call log of a traced step reads back (``serving``)
+        codes, scales = self._outputs(count, rows.device)
+        try:
+            entry(rows, self._scale(quant.scale, rows.device), codes, scales)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.RowQuantizeFp4Decode declined the operands of this step: {error}") from error
+        return TiledBlockScaledTensor(codes, scales.view(torch.uint8), float(quant.scale))  # what the entry wrote, in its layout
 
 
 class Fp8ProjectionDecodeBlock(EntryBlock):

@@ -219,6 +219,7 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("fp8_projection", re.compile(r"^cudnn_kernel_frost_fp8_projection_decode_")),
     ("swiglu_fp4", re.compile(r"^cudnn_kernel_frost_swiglu_fp4_decode_")),
     ("attention_prepare", re.compile(r"^cudnn_kernel_frost_attention_prepare_")),
+    ("row_quantize_fp4", re.compile(r"^cudnn_kernel_frost_row_quantize_fp4_")),
     ("cudnn_fe", re.compile(r"^cudnn_kernel_frost_")),  # a kernel of cuDNN Frontend that no entry above names: never a family member
     # FlashInfer's multiplies on the stored formats.  The 4-bit multiply launches one of two kernel classes of one module, and
     # the class is in the name (a census entry names it: ``class``).  The 8-bit multiply is served by the kernel the library
@@ -970,8 +971,9 @@ class Claim:
     def compared(self) -> Tuple[int, str, int]:
         """What item 7 holds of a step: ``(launches compared by launch shape, the same as three numbers, launches held by
         membership alone)``.  A target launch is compared by launch shape where the census records one for it; where it
-        records none (a kernel a library's tuner selects, a stand-in) the launch is held as a member of its kernel's
-        family or entry and in no shape."""
+        records none (a kernel a library's tuner selects, a stand-in, a port whose launch shape is its own -- which the
+        check holds to the shape its entry states) the launch is held as a member of its kernel's family or entry and in
+        no shape."""
         held = [identity for identity in self.identities if identity.relation in (TARGET, STAND_IN)]
         shaped = [identity for identity in held if identity.launch]
         stand = sum(identity.relation == STAND_IN for identity in shaped)
