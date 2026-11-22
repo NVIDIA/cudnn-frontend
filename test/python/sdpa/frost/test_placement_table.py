@@ -381,6 +381,35 @@ def test_b300_d192_window_gqa_keeps_default_order(s_kv, monkeypatch):
 
 
 @pytest.mark.L0
+def test_sm107_te_thd_prefill_follows_its_study():
+    """Study sm107_thd_te_prefill_20261122 (Rubin): Transformer Engine's THD form (ragged Q / K / V / O, packed totals declared) owns
+    its causal classes. A context-parallel d256 chunk leads and a short cache trails; ragged-length GQA keeps the hand rule, and
+    FlashInfer's bounded declarations keep their own study."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    row = "sdpa_fwd_prefill_sm107"
+
+    def f(**over):
+        base = dict(b=64, h_q=32, h_kv=8, s_q=512, s_kv=8192, d_qk=256, d_v=256, causal=True, bottom_right=True, has_paged_kv=False, thd=True)
+        base.update(device_cc=(10, 7), max_total_seq_len_q=64 * 512)
+        base.update(over)
+        return _facts(**base)
+
+    chunk = f()
+    assert pt.class_key(row, chunk)[5] == "thd" and pt.matched_entry(row, chunk).study == "sm107_thd_te_prefill_20261122"
+    assert pt.lookup(row, chunk) is True and pt.lookup(row, f(s_kv=8193)) is True
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    assert placement.place(spec, chunk) == placement.LEAD
+    assert pt.lookup(row, f(s_q=128, s_kv=256)) is False  # a short cache
+    ragged = f(max_total_seq_len_q=64 * 384)
+    assert pt.class_key(row, ragged)[5] == "thd_ragged" and pt.matched_entry(row, ragged) is None
+    assert pt.matched_entry(row, f(h_q=8, max_total_seq_len_q=64 * 384)).study == "sm107_thd_te_prefill_20261122"  # ragged MHA
+    assert pt.class_key(row, f(shape_overrides=True))[5] == "thd_bounded"
+    assert pt.matched_entry(row, f(shape_overrides=True)).study == "sm107_thd_prefill_20261111"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("window_left", [None, 127], ids=["causal", "window"])
 def test_sm107_dense_d64_sink_prefill_follows_its_study(window_left):
     """Study sm107_d64_sink_prefill_20261112 (Rubin): dense d64 prefill with a sink leads off the 128-key tile at any length and on the
@@ -1744,7 +1773,7 @@ def test_sm107_thd_prefill_bounded_declarations_follow_the_study():
     (S_q 128) leads at d64 / D192 causal / d256, where the backend's short-row engine ran 1.5-6.5x behind FROST; at d128 it
     keeps the backend from 64 query heads (FROST runs that declaration unpacked) and leads on the small bounded classes. The long
     envelope leads at d64; at d128 the holdout dropped the entry, so the hand rules decide. An exact graph of the same shape
-    is another class."""
+    is another class, Transformer Engine's (sm107_thd_te_prefill_20261122)."""
     row = "sdpa_fwd_prefill_sm107"
     study = "sm107_thd_prefill_20261111"
     for d in ((64, 64), (192, 128), (256, 256)):
@@ -1757,7 +1786,7 @@ def test_sm107_thd_prefill_bounded_declarations_follow_the_study():
     assert pt.lookup(row, _fi_ragged((64, 64), 32, 8, s_q=65536)) is True
     assert pt.lookup(row, _fi_ragged((128, 128), 32, 8, s_q=65536)) is None
     exact = _fi_ragged((256, 256), 32, 8, b=4, s_q=96, s_kv=4000, total=384, shape_overrides=False)
-    assert pt.class_key(row, exact)[5] == "thd" and pt.lookup(row, exact) is None
+    assert pt.class_key(row, exact)[5] == "thd" and pt.matched_entry(row, exact).study == "sm107_thd_te_prefill_20261122"
     assert pt.lookup(row, _fi_ragged((256, 256), 32, 8, dtype=cudnn.data_type.HALF)) is None
 
 
