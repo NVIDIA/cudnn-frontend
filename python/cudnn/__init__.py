@@ -422,6 +422,7 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "SwigluFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "AttentionPrepareDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "RowQuantizeFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "RowArgmaxDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -462,6 +463,10 @@ _LAZY_OPTIONAL_IMPORTS = {
     # block scale per sixteen elements in the 128 x 4 scale layout -- in one launch, SM100-class parts): a direct-call entry like the
     # steps above (also `cudnn.row_quantize.frost.RowQuantizeFp4Decode`)
     "RowQuantizeFp4Decode": (".row_quantize.frost.row_quantize_fp4_decode", "RowQuantizeFp4Decode"),
+    # the row argmax decode step (per row of a bf16 slab the lowest column of the row maximum, or the entry of an id table at that
+    # column, in one launch, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.row_argmax.frost.RowArgmaxDecode`)
+    "RowArgmaxDecode": (".row_argmax.frost.row_argmax_decode", "RowArgmaxDecode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
