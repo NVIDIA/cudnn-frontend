@@ -10223,8 +10223,8 @@ def test_the_twin_of_a_library_attention_kernel_is_the_reference_chain_and_keeps
     weighted magnitude of the attended values -- always in fp64, equal to the terms written out from the definition row by
     row and head by head: token ``t`` of a sequence attends to the positions up to its own, never to a later token's or to a
     row behind the step.  It reads the cache through its accessors with the host integer it is handed: a state whose
-    tables are shifted leaves its bytes and its terms as they were, and it writes nothing.  The terms it keeps are those
-    of its LAST call: one twin serves every call here."""
+    tables are shifted -- the positions and the slots, the page table and the lengths -- leaves its bytes and its terms
+    as they were, and it writes nothing.  The terms it keeps are those of its LAST call: one twin serves every call here."""
     from model_samples.providers import torch_ref
     from model_samples.qwen_dense import QwenDense
     from model_samples.state import DecodeState, KvCache, PagedKvCache
@@ -10257,7 +10257,7 @@ def test_the_twin_of_a_library_attention_kernel_is_the_reference_chain_and_keeps
         chain, spread = (torch.stack([terms[part] for terms in defined]) for part in (0, 1))
         kept = {}
         for layout, page in (("plain", None), ("paged", 64)):
-            state = DecodeState(g.layer_kinds, sequences, capacity, model.state_shapes(), "cpu", tokens, page=page)
+            state = DecodeState(g.layer_kinds, sequences, capacity, model.state_shapes(), "cpu", tokens, page=page, max_model_len=capacity if page else None)
             cache = state.layers[layer]
             assert isinstance(cache, PagedKvCache if page else KvCache) and cache.tokens == tokens
             for at in range(capacity):  # every position holds a drawn row: also the later tokens' of the step and the rows behind it
@@ -10287,9 +10287,11 @@ def test_the_twin_of_a_library_attention_kernel_is_the_reference_chain_and_keeps
                 assert torch.equal(kept[layout, "fp64"][term], kept[layout, "ieee-fp32"][term]), (sequences, tokens, position, layout)
             assert torch.equal(bits(kept[layout, "fp64"][0]), bits(kept[layout, "fp64"][1].bfloat16())), "in fp64 the bytes are the kept chain, rounded once"
             moved[tokens > 1] += int((bits(kept[layout, "fp64"][0]) != bits(kept[layout, "ieee-fp32"][0])).sum())
-            if page:  # a state whose tables are shifted: the twin never reads them
+            if page:  # a state whose tables are shifted, its page table and its lengths among them: the twin never reads them
                 state.table.positions += 1
                 state.table.slots += 1
+                state.table.blocks += 1  # every entry names the next page
+                state.table.lengths -= 1  # every sequence one position short
                 shifted = torch_ref.AttentionBound(None, None, None, {})
                 again = shifted(query, cache, position)
                 assert torch.equal(bits(again), bits(kept[layout, "fp64"][0])) and all(
