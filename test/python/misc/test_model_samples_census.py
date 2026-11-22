@@ -9297,8 +9297,11 @@ def test_the_level_of_the_librarys_own_lines_through_a_run_and_a_text_that_names
     run in ``[00] ERROR`` while it is planned, before the library is imported, in a sentence of its own that names the
     variable and not its text -- never as operands an adapter built and the library declined.  What is declined is
     what the library's import raises on and nothing it takes: a level name in either case passes, a name with a blank
-    beside it does not.  A plan on stated device facts asks nothing of the environment."""
+    beside it does not.  A plan on stated device facts asks nothing of the environment, and where the library is not
+    installed the run is the ``SKIP`` of the missing package whatever the text.  The check sets no logger of the
+    process."""
     import importlib
+    import logging
     import os
 
     from model_samples import blocks
@@ -9313,6 +9316,7 @@ def test_the_level_of_the_librarys_own_lines_through_a_run_and_a_text_that_names
     (package / "autotuner.py").write_text("")
     monkeypatch.syspath_prepend(str(tmp_path))
     found = []  # the level the package found at every import an adapter made of it
+    root = logging.getLogger().level
     built_by_the_area = _stand_ins
 
     def stand_ins(patch, **options):
@@ -9344,7 +9348,7 @@ def test_the_level_of_the_librarys_own_lines_through_a_run_and_a_text_that_names
         monkeypatch.delitem(sys.modules, name, raising=False)
     run = ["--stack", "native", "--sequences", "1"]
     try:
-        for text, expected in ((None, "warning"), ("", "warning"), ("  ", "warning"), ("debug", "debug")):
+        for text, expected in ((None, "warning"), ("", "warning"), (" \t", "warning"), ("debug", "debug")):  # blanks: a blank and a tab
             fresh(text)
             code, lines = _sample_run(monkeypatch, capsys, run)
             assert code == 0 and lines[-1] == "[00] PASS", (text, lines[-3:])
@@ -9364,6 +9368,14 @@ def test_the_level_of_the_librarys_own_lines_through_a_run_and_a_text_that_names
         assert (
             LIBRARY_CALLS == [] and ATTENTION_CALLS == [] and not any(line.startswith(("checks", "[00] stage")) for line in lines)
         ), "nothing was called or loaded"
+        # every row of the library asks, not the attention's alone: with the attention core on the chain a multiply's row declines it
+        code, lines = _sample_run(monkeypatch, capsys, [*run, "--provider", "attention.core=torch_ref.attention"])
+        assert code == 1 and lines[-1].endswith(sentence) and not any("declined the operands" in line for line in lines), lines[-1]
+        assert "flashinfer" not in sys.modules and LIBRARY_CALLS == []
+        # where the library is not installed nothing would import it, so its level is not asked: the SKIP of the missing package
+        fresh("loud")
+        code, lines = _sample_run(monkeypatch, capsys, run, library_installed=None)
+        assert code == 0 and lines[-1].startswith("[00] SKIP flashinfer.") and "which is not installed" in lines[-1], lines[-1]
         # a plan on stated device facts makes no first use and asks nothing of the environment: the same text, and the row is planned
         model, stated = _tiny_model(), blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
         rows = blocks.plan(model.provider_table, model.regimes, stated, 1, 1, "native", model=model, options={"device": "cpu"}).rows
@@ -9373,6 +9385,7 @@ def test_the_level_of_the_librarys_own_lines_through_a_run_and_a_text_that_names
             fresh(text)
             if taken:
                 flashinfer_calls.check_level("an entry")
+                assert logging.getLogger().level == root, "the check decides on a logger of its own: the root logger is where it was"
                 assert importlib.import_module("flashinfer").LEVEL == text
             else:
                 with pytest.raises(ValueError, match=f"an entry: the environment's {level} names no level of Python's logging module"):
