@@ -877,7 +877,7 @@ TABLE: Dict[Tuple, Entry] = {
         "always", None, "sm107_thd_prefill_20261111"
     ),
     # study sm107_thd_te_prefill_20261122: Transformer Engine's THD form on Rubin (ragged Q / K / V / O, packed totals declared),
-    # causal. FROST leads past a cache or query floor; ragged-length GQA keeps the hand rule.
+    # causal. FROST leads past a cache or query floor; ragged-length GQA is the next study's (d256) or the hand rule's (d128).
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "thd", "causal_br", False, "gqa", False): Entry(
         "le", 7.5, "sm107_thd_te_prefill_20261122", "tiles", ("ge", 7.5, "q")
     ),
@@ -913,6 +913,14 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "mha", True): Entry(
         "ge", 8.504, "sm107_thd_te_prefill_20261122", "kv"
+    ),
+    # study sm107_thd_ragged_gqa_v2_20261122: the ragged-length d256 GQA twin the study above dropped, re-fit with small squares at many
+    # sequences in train; few query tokens per sequence keep the backend off the tile.
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", False): Entry(
+        "le", 12.5, "sm107_thd_ragged_gqa_v2_20261122", "q", ("ge", 10.5, "kv")
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", True): Entry(
+        "ge", 26.014, "sm107_thd_ragged_gqa_v2_20261122", "cost", ("ge", 6.5, "q")
     ),
     # study sm107_dense_d128_nc_mha_v2_20261117 (208-SM Rubin, cuDNN 9.30.0.4, FE 50a9943c0; dense d128 MHA non-causal: chunks S_q 5-65536
     # over KV 4k-128k, squares 32-65536 and DiT-style cross-attention S_q 2k-64k over KV 256-1024, b 1-8, heads 8-48; 342 train cells,

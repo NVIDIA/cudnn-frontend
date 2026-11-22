@@ -382,9 +382,9 @@ def test_b300_d192_window_gqa_keeps_default_order(s_kv, monkeypatch):
 
 @pytest.mark.L0
 def test_sm107_te_thd_prefill_follows_its_study():
-    """Study sm107_thd_te_prefill_20261122 (Rubin): Transformer Engine's THD form (ragged Q / K / V / O, packed totals declared) owns
-    its causal classes. A context-parallel d256 chunk leads and a short cache trails; ragged-length GQA keeps the hand rule, and
-    FlashInfer's bounded declarations keep their own study."""
+    """Studies sm107_thd_te_prefill_20261122 and sm107_thd_ragged_gqa_v2_20261122 (Rubin): Transformer Engine's THD form (ragged
+    Q / K / V / O, packed totals declared) owns its causal classes. A context-parallel d256 chunk leads at equal and ragged lengths
+    and a short cache trails; d128 ragged-length GQA keeps the hand rule, and FlashInfer's bounded declarations keep their own study."""
     from cudnn.sdpa.fwd import placement
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
@@ -403,7 +403,10 @@ def test_sm107_te_thd_prefill_follows_its_study():
     assert placement.place(spec, chunk) == placement.LEAD
     assert pt.lookup(row, f(s_q=128, s_kv=256)) is False  # a short cache
     ragged = f(max_total_seq_len_q=64 * 384)
-    assert pt.class_key(row, ragged)[5] == "thd_ragged" and pt.matched_entry(row, ragged) is None
+    assert pt.class_key(row, ragged)[5] == "thd_ragged" and pt.matched_entry(row, ragged).study == "sm107_thd_ragged_gqa_v2_20261122"
+    assert pt.lookup(row, ragged) is True
+    assert pt.lookup(row, f(s_q=64, s_kv=65, max_total_seq_len_q=64 * 40)) is False  # off the tile, few query tokens per sequence
+    assert pt.matched_entry(row, f(d_qk=128, d_v=128, max_total_seq_len_q=64 * 384)) is None  # d128 ragged GQA
     assert pt.matched_entry(row, f(h_q=8, max_total_seq_len_q=64 * 384)).study == "sm107_thd_te_prefill_20261122"  # ragged MHA
     assert pt.class_key(row, f(shape_overrides=True))[5] == "thd_bounded"
     assert pt.matched_entry(row, f(shape_overrides=True)).study == "sm107_thd_prefill_20261111"
