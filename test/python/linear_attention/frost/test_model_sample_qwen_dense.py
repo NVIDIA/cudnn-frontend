@@ -138,16 +138,17 @@ def speculative(monkeypatch):
     yield from _loaded(monkeypatch, SPECULATIVE)
 
 
-FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2"
-#: with the gate entry, the norm entry, the fused gate / up entry and the attention preparation entry (compute capability 10.x) four
-#: more blocks are cuDNN Frontend's: three reference chains and one multiply over a copy fewer are fallbacks
-FE_ENTRIES = "by provider: cuDNN FE 5 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
+FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 9 (cuBLAS over copies 4, PyTorch chains 5) | PyTorch 2"
+#: with the gate entry, the norm entry, the fused gate / up entry, the attention preparation entry and the entry of the head's
+#: quantise (compute capability 10.x) five more blocks are cuDNN Frontend's: four reference chains and one multiply over a copy
+#: fewer are fallbacks
+FE_ENTRIES = "by provider: cuDNN FE 6 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
 #: on compute capability 10.0 the in-projection is the FP8 projection entry's as well; the out-projection stays a multiply over a copy
-FE_ENTRIES_CC100 = "by provider: cuDNN FE 6 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
+FE_ENTRIES_CC100 = "by provider: cuDNN FE 7 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
 #: the stack native on compute capability 10.x: the three multiplies and the attention core FlashInfer serves are no fallbacks,
 #: and no lane of this repository runs them
-NATIVE = "by provider: cuDNN FE 5 | FlashInfer 4 | fallbacks 1 (cuBLAS over copies 1) | PyTorch 2 | unverified in CI: 4"
-NATIVE_CC100 = "by provider: cuDNN FE 6 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4"
+NATIVE = "by provider: cuDNN FE 6 | FlashInfer 4 | fallbacks 1 (cuBLAS over copies 1) | PyTorch 2 | unverified in CI: 4"
+NATIVE_CC100 = "by provider: cuDNN FE 7 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4"
 
 
 CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles of both sequence counts and the run, far above what they take
@@ -225,7 +226,7 @@ def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, un
 @pytest.mark.L0
 def test_default_run_passes_its_own_checks(sample, capsys):
     out = _run(sample, capsys, [])
-    assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "20 block calls per step" in out
+    assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "21 block calls per step" in out
 
 
 @pytest.mark.L0
@@ -271,6 +272,12 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         assert fused in out, "the fused gate / up entry, the kernel stated whole: 1 and 4 rows run the 8-token tile"
         assert out.count("[band: swiglu_fp4]  PASS") == 2, "judged against its twin at both sequence counts"
         assert "mlp.gate_up equal (gated)" in out or "REPORTED" in out
+        assert "cudnn.RowQuantizeFp4Decode [WIDTH 5120, PDL True, PDL_RELEASE True]" in out, "the entry of the head's quantise, its whole config"
+        quantised = [line for line in out.splitlines() if line.split()[:1] == ["output_head.quantize"] and "calls" in line and "[band: " in line]
+        assert len(quantised) == 2 and all(
+            line.endswith("; 0 outside  [band: row_quantize_fp4]  PASS") for line in quantised
+        ), "the head's quantise was judged against its twin at both sequence counts"
+        assert "output_head.quantize equal (gated)" in out or "REPORTED" in out
         assert (
             "cudnn.AttentionPrepareDecode [POSITIONS 3d, SECTION (11, 11, 10), PAGE_SIZE 64, POSITION_DTYPE int64, SLOT_DTYPE int64, PDL False, PDL_RELEASE False]"
             in out
@@ -312,6 +319,7 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         ), "the checks' part of the sentence is of the rows alone"
         assert "\n  stored weights " not in out, "and the reference reads the copies of the load: no stored bytes to hold"
         assert "cudnn.SwigluFp4Decode" not in out and "cudnn.AttentionPrepareDecode" not in out, "the rows claim compute capability 10.x only"
+        assert "cudnn.RowQuantizeFp4Decode" not in out, "and so does the row of the head's quantise"
         assert any(line.split()[:1] == ["mlp.gate_up"] and line.endswith("fallback: bf16 copy of 4-bit weights") for line in out.splitlines())
     multiply = [line for line in out.splitlines() if line.split()[:1] == ["projection.fp8.in"] and "calls" in line and "[band: " in line]
     assert len(multiply) == 2 and all(line.endswith("[band: bf16_rounding]  PASS") for line in multiply), "the in-projection was judged at both sequence counts"
@@ -464,6 +472,10 @@ def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
     for block in ("projection.fp8.out", "mlp.down", "output_head"):
         judged = [line for line in out.splitlines() if line.split()[:1] == [block] and "calls" in line and "[band: " in line]
         assert len(judged) == 2 and all(line.endswith("[band: bf16_rounding]  PASS") for line in judged), f"{block} was judged at both sequence counts"
+    quantised = [line for line in out.splitlines() if line.split()[:1] == ["output_head.quantize"] and "calls" in line and "[band: " in line]
+    assert len(quantised) == 2 and all(
+        line.endswith("; 0 outside  [band: row_quantize_fp4]  PASS") for line in quantised
+    ), "the head's quantise, whose codes the library's head multiply reads as they are, was judged at both sequence counts"
     down = [
         line for line in out.splitlines() if line.strip().startswith("mlp.down: flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False], 2 launches per step")
     ]
@@ -480,7 +492,9 @@ def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
     held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
     assert len(held) == 2 and all(line.startswith(f"  stored weights    {count} of {count} weights") and line.endswith("    PASS") for line in held)
     if cc100 and torch.cuda.get_device_properties(0).multi_processor_count == 148:  # the class the census has a section for, at 1 sequence
-        assert "19 of 20 launches of a step are target kernels (8 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)" in out
+        whole = "20 launches per step = 8 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins"
+        assert f"kernel identity, as planned: {whole}" in out, "every launch of a step of this model is a target kernel"
+        assert "16 launches of a step compared by launch shape" in out and "each in the recorded one; 4 more by membership alone" in out
         assert sum("in the kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records" in line for line in down) == 1
         assert (
             f"    {served} (1 call x 1 per call); fi_decode_attention by name, and in the kernel class " in out
@@ -709,6 +723,193 @@ def test_the_librarys_attention_on_drawn_operands_is_inside_its_band_and_every_c
         frost_routing.measured(f"model sample qwen_dense: the library's attention on drawn operands, {selected}: kernels", "; ".join(kernels))
 
 
+QUANTISE_PROGRAM = """
+import faulthandler, os, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+os.environ.setdefault("KINETO_LOG_LEVEL", "6")  # as the sample's scripts set it: the profiler's own lines stay off standard error
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import tie_out, timing
+from model_samples.providers import Quant, torch_ref
+from model_samples.qwen_dense import QwenDense
+from model_samples.weights import tile_scale_index
+
+DEVICE, BF16, WIDTH = "cuda:0", torch.bfloat16, 5120
+model = QwenDense.reduced()
+failed = []
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+def hold(name, held, text):
+    say(f"  {{name:<44}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+def planned(stack, rows):
+    # a session of `rows` sequences on `stack` and the block of the head's quantise in its plan, its first use made
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    session = model_samples.Session(model, text, sequences=rows, stack=stack, device=DEVICE, capacity=8)
+    block = session.resolve()["output_head.quantize"]
+    block.first_use(rows, 1)
+    return session, block
+
+
+def traced(block, x, quant):
+    # one call of the block under the profiler: what it returned, and the records of its entry's kernel
+    outputs, records = [], []
+
+    def step(index):
+        outputs.append(block(x, quant))
+        outputs[0].codes.sum().item()  # the host read a traced step ends in
+
+    timing.trace_steps(step, 1, DEVICE, records=records)
+    if not outputs:  # no kernel activity records on this build: the call alone
+        step(0)
+    return outputs[0], [record for record in records if record.name.startswith("cudnn_kernel_frost_row_quantize_fp4_")]
+
+
+def drawn(rows):
+    # drawn rows under the seeded model's head scale and under one whose reciprocal is rounded: the block against the
+    # quantisation at the kernel's rounding points, in the band of its row; and the launch against what the entry states
+    _, block = planned("fe-entries", rows)
+    facts = block.launch_facts(rows)
+    for seed, scale in ((7, 8.0 / (448.0 * 6.0)), (11, 0.0205544)):
+        x = (torch.randn((rows, WIDTH), generator=torch.Generator("cpu").manual_seed(seed + rows)) * 1.7).to(BF16).to(DEVICE)
+        quant = Quant("nvfp4", scale)
+        out, launches = traced(block, x, quant)
+        twin = torch_ref.QuantizeBracket(None, None, None, {{}})
+        expected = twin(x, quant)
+        stats = tie_out.BlockStats("row_quantize_fp4")
+        tie_out.BlockTap._judge(stats, out.tensors(), expected.tensors(), [], [], 0, twin)
+        hold(f"{{rows}} rows, scale {{scale:.6g}}: the band", stats.ok and stats.outside == 0, stats.line())
+        if launches:
+            (launch,) = launches
+            same = launch.name in facts.symbols and tuple(launch.shape) == tuple(facts.shape)
+            hold(f"{{rows}} rows, scale {{scale:.6g}}: the launch", same, f"{{launch.name}} in grid {{launch.shape[0]}}, block {{launch.shape[1]}}, shared memory {{launch.shape[2]}} B")
+        else:
+            hold(f"{{rows}} rows, scale {{scale:.6g}}: the launch", True, "kernel not observed")
+
+
+def exact():
+    # a power-of-two scale and power-of-two block scales, rows that hold every rounding tie of the code grid at both signs:
+    # the entry's codes are e2m1 of the exact quotient with ties to the even code, its block scales those powers of two
+    rows, scale = 4, 2.0**-5
+    even = {{0.25: 0, 0.75: 2, 1.25: 2, 1.75: 4, 2.5: 4, 3.5: 6, 5.0: 6}}  # the even code of the two around each midpoint
+    x, want = torch.zeros((rows, WIDTH)), torch.zeros((rows, WIDTH), dtype=torch.uint8)
+    bytes_wanted, ties = torch.zeros((rows, WIDTH // 16), dtype=torch.uint8), 0
+    for r in range(rows):
+        for block in range(WIDTH // 16):
+            exponent = (block + r) % 9 - 6
+            unit, first = 2.0**exponent, block * 16
+            bytes_wanted[r, block] = (exponent + 5 + 7) * 8  # the E4M3 byte of unit x 32: a power of two, mantissa zero
+            x[r, first], want[r, first] = 6.0 * unit, 7
+            x[r, first + 1], want[r, first + 1] = 3.0 * unit, 5
+            for j, middle in enumerate(even):
+                for sign, at in ((1.0, 2 + 2 * j), (-1.0, 3 + 2 * j)):
+                    x[r, first + at], want[r, first + at] = sign * middle * unit, even[middle] + (8 if sign < 0 else 0)
+                    ties += 1
+    _, block = planned("fe-entries", rows)
+    out = block(x.to(BF16).to(DEVICE), Quant("nvfp4", scale))
+    codes, scales = (tensor.cpu() for tensor in out.tensors())
+    nibbles = torch.stack((codes & 0xF, codes >> 4), dim=-1).flatten(-2)
+    off = int((nibbles != want).sum())
+    hold("exact cells: the codes", off == 0 and ties == rows * (WIDTH // 16) * 14, f"{{ties:,}} ties judged, {{off:,}} codes not e2m1 of the exact quotient with ties to even")
+    hold("exact cells: the block scales", torch.equal(scales, bytes_wanted), f"{{int((scales != bytes_wanted).sum()):,}} of {{scales.numel():,}} not their power of two")
+
+
+def handover():
+    # the two blocks of a session on the stack native, block by block: the head's logits with the padded rows of the scale
+    # buffer as the quantise returned them, set to zero, and set to a pattern that is no finite value
+    for rows in (1, 129):
+        text = model_samples.TextIO.synthetic(model.geometry.vocab)
+        session = model_samples.Session(model, text, sequences=rows, stack="native", device=DEVICE, capacity=8)
+        session.plan_table()
+        session.load()
+        quantise, head, weights = session.plan["output_head.quantize"], session.plan["output_head"], session.weights
+        x = (torch.randn((rows, WIDTH), generator=torch.Generator("cpu").manual_seed(100 + rows)) * 1.7).to(BF16).to(DEVICE)
+        q = quantise(x, weights.head_quant)
+        padded = torch.ones(q.tiled_scales.numel(), dtype=torch.bool, device=DEVICE)
+        padded[tile_scale_index(rows, WIDTH // 16, DEVICE)] = False
+        as_returned = head(q, weights.head).clone()
+        results = []
+        for pattern in (0x00, 0x7F):
+            q.tiled_scales.view(-1)[padded] = pattern
+            results.append(head(q, weights.head).clone())
+        same = all(torch.equal(as_returned.view(torch.int16), other.view(torch.int16)) for other in results)
+        finite = bool(torch.isfinite(as_returned.float()).all())
+        hold(f"{{rows}} rows: the head behind the quantise", same and finite, f"{{int(padded.sum()):,}} padded scale bytes as returned, at zero and at 0x7F: {{as_returned.numel():,}} logits, the same bytes" if same else "the logits moved with the padded rows of the scale buffer")
+
+
+try:
+    selected = {selected!r}
+    if selected.startswith("drawn"):
+        drawn(int(selected.split()[1]))
+        if selected == "drawn 1":
+            exact()
+    else:
+        handover()
+except NotImplementedError as error:
+    say(f"[quantise] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[quantise] {{model_samples.check_environment().header()}}")
+say("[quantise] FAIL" if failed else "[quantise] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.parametrize(
+    "selected", [pytest.param("drawn 1", marks=pytest.mark.L0), pytest.param("drawn 6", marks=pytest.mark.L1), pytest.param("drawn 1024", marks=pytest.mark.L1)]
+)
+def test_the_head_quantise_on_drawn_operands_is_inside_its_band_and_launches_what_its_entry_states(selected):
+    """The block of the output head's quantise on its entry, called on drawn operands (``QUANTISE_PROGRAM``, a fresh
+    interpreter): at 1, 6 and 1,024 rows, under the seeded model's head scale and under one whose reciprocal is rounded,
+    every block scale the byte of the kernel's rule and every code inside its bracket, and the one launch of a call in
+    the shape and under the symbol the entry states.  In the cell of 1 row also the exact cells: under a power-of-two
+    scale with power-of-two block scales, on four rows that hold every rounding tie of the code grid at both signs, the codes are
+    ``e2m1`` of the exact quotient with ties to the even code -- written out in the program, not taken from the twin,
+    whose low code is another byte at three of the seven midpoints."""
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the row of the output head's quantise claims compute capability 10.x")
+    out = _program(
+        QUANTISE_PROGRAM,
+        "[quantise]",
+        f"model sample qwen_dense: the head's quantise on drawn operands, {selected}",
+        "run of the head's quantise",
+        selected=selected,
+    )
+    held = [line for line in out.splitlines() if line.startswith("  ") and line.endswith(("    PASS", "    FAIL"))]
+    assert len(held) == (6 if selected == "drawn 1" else 4) and all(line.endswith("    PASS") for line in held), out[-6000:]
+    if selected == "drawn 1":
+        assert "17,920 ties judged, 0 codes not e2m1 of the exact quotient with ties to even" in out, "every tie of the built rows was judged"
+    # what the profiler recorded under each call, or that it recorded nothing: a launch that was not observed is uncovered, and the record says so
+    launches = sorted({line.split(": the launch", 1)[1].rsplit("    ", 1)[0].strip() for line in held if ": the launch" in line})
+    frost_routing.measured(f"model sample qwen_dense: the head's quantise on drawn operands, {selected}: the launch", "; ".join(launches))
+
+
+@pytest.mark.L0
+def test_the_heads_logits_do_not_move_with_the_padded_rows_of_the_scale_buffer():
+    """The hand-over of the stack ``native``, block by block: the quantise's entry writes the block scales of the live rows
+    into a buffer of whole bands of 128 rows that the adapter does not initialise, and the library's head multiply is
+    handed that buffer as it is.  At 1 row and at 129 rows the head's logits are the same bytes with the padded rows as
+    the adapter returned them, set to zero, and set to a pattern that is no finite value: nothing reads them."""
+    _needs_the_library()
+    out = _program(
+        QUANTISE_PROGRAM, "[quantise]", "model sample qwen_dense: the head behind the quantise's scale buffer", "run of the hand-over", selected="handover"
+    )
+    held = [line for line in out.splitlines() if line.startswith("  ") and line.endswith(("    PASS", "    FAIL"))]
+    assert len(held) == 2 and all(line.endswith("    PASS") for line in held), out[-6000:]
+
+
 @pytest.mark.L1
 def test_the_memory_sentence_holds_what_a_run_of_85_sequences_takes(sample):
     """``--stack fe-entries --sequences 85`` in a fresh interpreter, on compute capability 10.x: a run of many sequences holds,
@@ -769,7 +970,7 @@ def test_the_memory_sentence_holds_what_a_run_of_85_sequences_takes(sample):
 @pytest.mark.L1
 def test_four_layer_run_passes_its_own_checks(sample, capsys):
     out = _run(sample, capsys, ["--layers", "4"])
-    assert "4 of 64 layers (3 linear-attention + 1 attention)" in out and "34 block calls per step" in out
+    assert "4 of 64 layers (3 linear-attention + 1 attention)" in out and "35 block calls per step" in out
 
 
 VERIFY_PROGRAM = """
@@ -919,13 +1120,13 @@ def test_a_verify_step_on_the_fe_entries_stack_is_the_decode_steps_of_its_tokens
     compared with the decode step of its token, the state of the kept tokens with the decode steps' state, the verify
     entry token by token with reference decode steps, and every launch of the traced verify steps with the plan.  Six
     rows are a row of the FP8 projection entry for the linear-attention layer's out-projection on compute capability
-    10.x: where the census holds the run, 14 launches of a step are target kernels."""
+    10.x: where the census holds the run, 15 launches of a step are target kernels."""
     out = _verify(1, 6)
     _verify_asserts(out, 1, 6)
     assert "tokens kept behind the first: 0, 1, 2, 3, 4, 5" in out, "every number of tokens is kept once"
     assert "batch invariance  not applicable at 1 sequence" in out
     if "kernel identity, as planned: " in out:  # a GPU the census has a section for: what the plan reaches of the target, with its split
-        reached = "14 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results)"
+        reached = "15 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 13 cuDNN Frontend entries with byte-equal results)"
         assert f"kernel identity, as planned: {reached}; not yet: mlp.down 2, attention.core 1, projection.fp8.out 1, output_head 1" in out
 
 
@@ -1459,7 +1660,7 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert any(
         line.startswith("first token ") and "each but the first behind one pass of the drafter over the position in front of it" in line for line in lines
     )
-    assert any(line.startswith("steps (10) ") and line.endswith(" | 110 block calls per step") for line in lines), "five passes of 18 calls and the model's 20"
+    assert any(line.startswith("steps (10) ") and line.endswith(" | 111 block calls per step") for line in lines), "five passes of 18 calls and the model's 21"
     assert any(line.startswith("bytes per step ") and " + drafter 5 x " in line for line in lines[:against])
     assert any(line.startswith("text out              32 tokens in 10 steps (seeded weights: not language): ") for line in lines[:against])
     # the comparison with decode steps of the same tokens: every line of it, and the script's own line of the ids
@@ -1532,7 +1733,7 @@ def test_the_speculative_run_on_the_fe_entries_stack_passes_its_kernel_check(cap
     traced = [line for line in lines if line.startswith("traced pass (")]
     assert not traced or traced[0].endswith(" | behind the prompt's 26 decode steps, replayed untraced")
     if "kernel identity, as planned: " in out:  # a GPU the census has a section for: the verify plan's share of the target, with its split
-        reached = "14 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results)"
+        reached = "15 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 13 cuDNN Frontend entries with byte-equal results)"
         assert f"kernel identity, as planned: {reached}; not yet: mlp.down 2, attention.core 1, projection.fp8.out 1, output_head 1" in out
     observed = [line for line in lines if line.startswith("  kernels  ")]
     assert len(observed) == 1, "the kernel check of the traced steps ran, or said why it could not look"
