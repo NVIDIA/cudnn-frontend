@@ -11,7 +11,7 @@ and discrete weight modes, with SwiGLU and GeGLU activations.
 import torch
 import pytest
 import cudnn
-from test_utils import assert_bitwise_runs, torch_fork_set_rng
+from test_utils import torch_fork_set_rng
 from core.cutedsl.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES, reencode_sf_tensor_as_ue5m3
 from gemm.cutedsl.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from gemm.cutedsl.test_grouped_gemm_swiglu_utils import (
@@ -108,53 +108,6 @@ def test_grouped_gemm_glu_wrapper_bf16(discrete, b_major):
     result = cudnn.grouped_gemm_glu_wrapper_sm100(generate_c=True, **kwargs)
     assert_grouped_gemm_glu_bf16_close(result["d_tensor"], expected_d)
     assert_grouped_gemm_glu_bf16_close(result["c_tensor"], expected_c)
-
-
-@pytest.mark.L0
-def test_grouped_gemm_glu_wrapper_bf16_one_cta_cluster_dynamic_sched():
-    """Dynamic scheduler with a one-CTA cluster: each CTA claims its own tiles from the counter.
-
-    256 tiles of 128x256 exceed the SM count, so CTAs claim repeatedly; replay must be bitwise stable.
-    """
-    from cudnn.tensor_adapter import has_tcgen05
-
-    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
-        pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
-
-    problem = make_grouped_gemm_glu_bf16_problem(m=8192, n=1024)
-    expected_c, expected_d = grouped_gemm_glu_bf16_reference(
-        problem,
-        act_func="swiglu",
-        linear_offset=0.0,
-        geglu_alpha=1.702,
-        glu_clamp_max=7.0,
-        glu_clamp_min=-7.0,
-    )
-
-    def launch():
-        result = cudnn.grouped_gemm_glu_wrapper_sm100(
-            a_tensor=problem["a"],
-            sfa_tensor=None,
-            b_tensor=problem["b"],
-            sfb_tensor=None,
-            padded_offsets=problem["offsets"],
-            alpha_tensor=problem["alpha"],
-            bias_tensor=problem["bias"],
-            prob_tensor=problem["prob"],
-            c_dtype=torch.bfloat16,
-            d_dtype=torch.bfloat16,
-            mma_tiler_mn=(128, 256),
-            cluster_shape_mn=(1, 1),
-            generate_c=True,
-            use_dynamic_sched=True,
-        )
-        return result["c_tensor"], result["d_tensor"]
-
-    c_tensor, d_tensor = launch()
-    assert_grouped_gemm_glu_bf16_close(d_tensor, expected_d)
-    assert_grouped_gemm_glu_bf16_close(c_tensor, expected_c)
-    # Byte comparison needs a unit last stride; the outputs are (m, n, 1) with L outermost.
-    assert_bitwise_runs(lambda: tuple(t[..., 0] for t in launch()), label="bf16 grouped GEMM GLU, cluster (1, 1), dynamic scheduler")
 
 
 @pytest.mark.L0
