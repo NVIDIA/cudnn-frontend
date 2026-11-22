@@ -2621,10 +2621,10 @@ def test_the_kernel_table_is_printed_before_the_load_and_a_decline_is_a_skip(mon
     assert code == 0 and out.splitlines()[-1].startswith(skip) and out.splitlines()[-1].endswith("or run without --check-kernels"), out
 
 
-def _sample_run(monkeypatch, capsys, arguments, **stand_in):
-    """``main()`` of the sample script to its LAST line, on the CPU: stated device facts (compute capability 10.0), the tiny
-    geometry, and the stand-in providers and stand-in profiler of :func:`_stand_ins` (``stand_in``: its options).  Returns
-    ``(exit code, the lines the run printed)``."""
+def _sample_run(monkeypatch, capsys, arguments, cc=(10, 0), sms=148, **stand_in):
+    """``main()`` of the sample script to its LAST line, on the CPU: stated device facts (compute capability ``cc`` with
+    ``sms`` SMs), the tiny geometry, and the stand-in providers and stand-in profiler of :func:`_stand_ins` (``stand_in``:
+    its options).  Returns ``(exit code, the lines the run printed)``."""
     import importlib.util
 
     from model_samples import blocks, census
@@ -2633,7 +2633,7 @@ def _sample_run(monkeypatch, capsys, arguments, **stand_in):
     model_samples = importlib.import_module("model_samples")  # the package as an object: its names are patched below
     build = _stand_ins(monkeypatch, **stand_in)
     monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
-    stated = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+    stated = blocks.DeviceFacts(cc, "stated device", sms, 180 * GIB, 80 * GIB)
     real_session = getattr(model_samples.Session, "real", model_samples.Session)  # of a second run of one test: not the first run's wrapper
 
     def session(model, text, **options):  # the sample's session on the CPU, planned on the stated facts and the stand-ins
@@ -11586,7 +11586,9 @@ def test_the_kernel_check_holds_the_librarys_attention_kernel_and_every_control_
     recorded with, another variant of the kernel fails by its class and the recorded kernel in another grid by its
     launch shape; a kernel of another head width or of another page is no member of the family; a fill or a multiply in front of the
     kernel and a kernel behind it each fail with their own sentence; a pool byte the call changed fails the block.  At
-    another maximum length the row is held by membership: both variants pass and the lines say what is held.  Then the
+    another maximum length the row is held by membership: both variants pass and the lines say what is held.  On a
+    GPU class the census has no section for, the run judges the block, holds the kernel by its family's name and
+    states no identity.  Then the
     control arms of a run, through ``main()``, in a run of more than one page per sequence: the lengths one too long
     and one too short, the first two page-table columns exchanged, the scores at the library's default scale -- each
     must FAIL; in a run of one page per sequence the two columns name the same page and that arm cannot fail."""
@@ -11630,6 +11632,14 @@ def test_the_kernel_check_holds_the_librarys_attention_kernel_and_every_control_
         )
         claim = _line(checks, "target census")
         assert "no recorded launch shape of attention.core for this run: max_model_len 4096 (recorded 2051)" in claim and "4 more by membership alone" in claim
+    # the row's class says where the table selects it, not where the census has a record: on another 10.x class a run
+    # judges the block in its band, holds the kernel by its family's name -- either variant -- and claims no identity
+    unstated = "kernel identity: not stated for this run (no recorded section for cc 10.3 / 148 SMs: recorded is cc 10.0 / 148 SMs)"
+    for defect in ("", "variant"):
+        code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], cc=(10, 3), attention_defect=defect)
+        assert code == 0 and lines[-1] == "[00] PASS" and unstated in [line.strip() for line in lines], defect
+        assert any(line.strip().startswith("attention.core ") and line.endswith("[band: attention_bf16_weights]  PASS") for line in lines), defect
+        assert any(line.strip().endswith("fi_decode_attention by name (no launch shape is declared for it)") for line in lines), defect
 
     # the control arms of a run: 26 prompt tokens and 48 new ones, 74 positions -- a full page and ten rows of a second
     attended, call = PagedKvCache.attended, flashinfer_calls.LibraryBlock._call
