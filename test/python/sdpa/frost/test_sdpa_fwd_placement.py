@@ -1665,14 +1665,16 @@ def test_sm100_fp8_decode_gap_classes_follow_the_study():
     assert place(**unpacked, window_left=2047, s_kv=placement.SM100_FP8_D64_WIN_UNPACKED_MAX_KV + 1) == placement.TRAIL
     assert place(**unpacked, window_left=2047, s_q=1, causal=True, s_kv=16384) == placement.TRAIL
     # windowed paged d128: packed leads from a KV-token floor, both parts (step37 b 128 leads, step37-tp4 b 1 keeps the backend);
-    # unpacked leads on cc 10.0 up to S_q 12
+    # unpacked leads on cc 10.0 up to S_q 12, and on cc 10.3 from enough KV units at any S_q (sm103_fp8_d128_win_unpacked_20261122)
     d128 = dict(d_qk=128, d_v=128, window_left=511)
     for cc in ((10, 0), (10, 3)):
         assert place(**d128, h_q=64, h_kv=8, device_cc=cc) == placement.LEAD
         assert place(**d128, h_q=16, h_kv=2, b=1, device_cc=cc) == placement.TRAIL
     assert place(**d128, h_q=80, h_kv=8, s_q=8) == placement.LEAD
     assert place(**d128, h_q=80, h_kv=8, s_q=16) == placement.TRAIL
-    assert place(**d128, h_q=80, h_kv=8, s_q=8, device_cc=(10, 3)) == placement.TRAIL
+    for s_q in (8, 16):  # ripple_swa b 128 leads on cc 10.3, its b 1 row keeps the backend
+        assert place(**d128, h_q=80, h_kv=8, s_q=s_q, device_cc=(10, 3)) == placement.LEAD
+        assert place(**d128, h_q=80, h_kv=8, s_q=s_q, b=1, device_cc=(10, 3)) == placement.TRAIL
     # dense d192 x 128 (mimo): packed leads; its windowed sink twin leads from enough KV tokens in flight
     d192 = dict(d_qk=192, d_v=128, has_paged_kv=False, padded=False, page_size=0, s_q=8)
     assert place(**d192, h_q=64, h_kv=4) == placement.LEAD

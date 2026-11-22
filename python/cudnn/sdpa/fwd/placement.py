@@ -184,7 +184,9 @@ windowed sink twin leads from 1616 KV tokens in flight. Unpacked, windowed d64 M
 (holdout up to 1.15-1.90). Study sm100_fp8_decode_v3_20261122 adds the paged spec-decode (S_q 2-16) classes: windowed d128 packed
 leads from 1048 KV tokens in flight (below it, a few units over a short window lose on GB200 / GB300 hardware, which B200 and B300
 do not reproduce, so the floor was selected against those nightlies); paged d192 x 128 leads packed; its windowed sink twin leads
-packed from 24 KV units and, on cc 10.0 only, unpacked from 6464 tokens. cuDNN 9.24 builds no FP8 plan for dense or paged d192 x
+packed from 24 KV units and, on cc 10.0 only, unpacked from 6464 tokens. Study sm103_fp8_d128_win_unpacked_20261122 gives cc 10.3
+its own windowed d128 unpacked rule, from 12 KV units (b * h_kv), fit on B300 and selected against GB300 for the same reason as the
+packed floor. cuDNN 9.24 builds no FP8 plan for dense or paged d192 x
 128 or paged d256, so there FROST is the only plan either way.
 Short prefill (s_q 17-512, s_kv 64-8192, b 1/8; GPU replay and eager back-to-back submission): FROST
 submits in ~16-18 us against the backend's ~13 us, so a single-wave launch with a cache below 1k is
@@ -719,6 +721,7 @@ SM100_FP8_D192_SINK_UNPACKED_MIN_TOKENS = 1059
 SM100_FP8_D128_WIN_PACKED_MIN_TOKENS = 1048  # windowed paged d128, packed: b * h_kv * keys per row
 SM100_FP8_D192_PAGED_SINK_PACKED_MIN_UNITS = 24  # windowed paged d192 x 128 + sink, packed: b * h_kv
 SM100_FP8_D192_PAGED_SINK_UNPACKED_MIN_TOKENS = 6464  # the same, unpacked (cc 10.0): b * h_kv * keys per row
+SM103_FP8_D128_WIN_UNPACKED_MIN_UNITS = 12  # cc 10.3 windowed paged d128, unpacked: b * h_kv (study sm103_fp8_d128_win_unpacked_20261122)
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
 SM100_PAGED_D128_PREFIX_MAX_B = 64  # SM100 paged bf16 d128 GQA prefix lead: measured bounds (module docstring)
@@ -1297,9 +1300,14 @@ def _sm100_fp8_decode_gap(caps: Capabilities, facts) -> Optional[str]:
     elif facts.s_q == 1:
         return None
     elif shape == (128, 128) and facts.has_paged_kv and window and not facts.has_sink:
-        # unpacked failed GB300's gate, so it leads on cc 10.0 only
+        # unpacked: cc 10.0 keeps its S_q bound; cc 10.3 was fit on B300 against GB300, whose few-unit rows lose
         tokens = facts.b * facts.h_kv * keys
-        lead = tokens >= SM100_FP8_D128_WIN_PACKED_MIN_TOKENS if packed else facts.device_cc == (10, 0) and facts.s_q <= SM100_FP8_D128_WIN_UNPACKED_MAX_S_Q
+        if packed:
+            lead = tokens >= SM100_FP8_D128_WIN_PACKED_MIN_TOKENS
+        elif facts.device_cc == (10, 0):
+            lead = facts.s_q <= SM100_FP8_D128_WIN_UNPACKED_MAX_S_Q
+        else:
+            lead = facts.b * facts.h_kv >= SM103_FP8_D128_WIN_UNPACKED_MIN_UNITS
     elif shape == (192, 128) and not window and not facts.has_sink:
         lead = packed  # dense or paged; unpacked failed its holdout in both
     elif shape == (192, 128) and not facts.has_paged_kv and window and facts.has_sink:
