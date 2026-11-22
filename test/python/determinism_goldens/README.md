@@ -993,6 +993,7 @@ pytest core/test_determinism_utils.py
 | --- | --- | --- | --- |
 | `conv/cutedsl/test_conv3d_postops_determinism.py` | Conv3D raw, norm/SiLU, prepared norm/SiLU, residual/spatial pad, C12 causal input, standalone norm/SiLU preparation | Output, cache, residual, padding and exposed workspace bytes | Unsupported (inference only) |
 | `gemm/cutedsl/test_grouped_gemm_wgrad_empty.py` | `grouped_gemm_wgrad_wrapper_sm100`, cold-empty compilation | — | exact-zero overwrite and unchanged accumulated dW bytes; nonempty reuse, mixed empty experts and CUDA Graph replay |
+| `gemm/cutedsl/test_grouped_gemm_dglu_activation.py` | `grouped_gemm_dglu_wrapper_sm100` and `GroupedGemmDgluSm100`, `activation_tensor` with `dgeglu` and `dswiglu` | — | activation and D_row: replay under concurrent work, expert reorder, duplicate and neighbor isolation; dSwiGLU activation byte-equal to the BF16 GLU forward D; dprob numerical only |
 | `gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py` | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | saved C, D in both directions, both scale planes | — |
 | `gemm/cutedsl/test_grouped_gemm_dglu_gate_then_up.py` | `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | — | D in both directions, both scale planes, dprob; dbias numerical reference |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_layout.py` | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | C, D, pre/post-RHT amax | — |
