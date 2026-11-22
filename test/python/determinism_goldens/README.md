@@ -4292,6 +4292,38 @@ pytest run per command on one visible device, from `test/python`; `<suite>` = `r
 `<module>` = `row_quantize/frost/test_row_quantize_fp8_decode.py`.  The device is a shared development part: these are correctness runs,
 and no timing was taken.
 
+cc 10.0 record (2026-11-22 UTC): a cc 10.0 part with 148 SMs (the device reports the name `NVIDIA Graphics Device`; x86 host, Python
+3.10) with torch 2.13.0+cu130, CUDA 13.0, driver API 13010, cuDNN 92700, nvidia-cutlass-dsl 4.8.0 (compiling with CUDA 13.4), tvm-ffi
+0.1.13.post3 (the `runtime` block of the goldens in `c84dd9abaee769b4/`).  The set was recorded into a new directory
+(`CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -q -ra` -> 17 passed) after the functional module's device cases had
+passed on the same part; the two files were copied unchanged, and the sha256 of the independent reference's codes and scales for the
+two operand sets, computed on the host, are the output hashes the files hold.  Strict check and the functional module, from a clean
+tree that holds the set: `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 17 passed, 0 skipped:
+`test_replay` 4, `test_replay_on_a_fresh_entry_and_fresh_operands` 1, `test_launch_on_a_side_stream_writes_the_same_bytes` 3,
+`test_batch_invariance` 1, `test_insertion_removal_and_reordering` 1, `test_duplicated_row_and_neighbour_isolation` 1,
+`test_inputs_are_unmodified` 1, `test_one_element_moves_only_its_own_row` 1, `test_the_row_ceiling_call` 1 (measured: the 1024-row
+call ran in 4 scheduling waves; one wave holds 296 thread blocks on 148 SMs; 13 rows compared alone),
+`test_row_ceiling_is_the_typed_decline` 1, `test_golden` 2.
+`pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 140 passed, 1 skipped: the module 135 passed and 1
+skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices are required" -- one
+device is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the symbol-prefix test 5
+passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 9 of 9 cells (one kernel
+per call; grid `(rows, 1, 1)`, block `(1024, 1, 1)`, 128 B of shared memory).  The module's case behind a predecessor that released
+early (`test_wait_holds_every_read_behind_a_predecessor_that_released_early`) compared 8 of 8 launches of the step equal to the plain
+step, behind its positive control: a dependent without a wait read other bytes than the written ones in 4 of 4 eager launches and 4
+of 4 replays.  On a part where that control does not reproduce the case skips -- a coverage gap, not a pass.  The reference cases
+found no differing byte: every code and every scale bit of the random and structured rows at 1 .. 1024 rows, and the scale and the
+codes of all 32,640 finite bf16 magnitudes as a row maximum.  Rows with a NaN or an infinity are outside the status; what they held
+on this run is reported by the module, not asserted: a row with an infinity had an infinite scale, the codes of signed zeros and the
+code `0x7E` at the infinity; a row of NaN had the floor scale and the code `0x7E` in every element; the rows beside them were
+unchanged.
+
+CUDA 12.9 compiler flavour on the same part and runtime (the CuTe DSL 4.8.0 install without its CUDA 13 toolchain libraries, so the
+DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL compatibility and is not a
+CUDA 12 runtime): the strict check -> 17 passed against the SAME golden set (the compiler flavour is not part of the runtime key, and
+the bytes are equal); the functional module with the symbol-prefix test -> 139 passed, 2 skipped (the two-device case, and the
+`sm_107a` rendering case: that flavour does not assemble the target, which is the entry's own typed decline on cc 10.7).
+
 ### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE
