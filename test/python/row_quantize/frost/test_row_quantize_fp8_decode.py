@@ -1625,11 +1625,12 @@ def test_launch_facts_equal_the_profilers_record_of_a_launch(rows, arm, arm_id):
     assert k.form_for(rows) == asdict(k.cfg)
 
 
-def test_thread_blocks_per_sm_bound_is_this_parts_thread_limit():
-    """``CTAS_PER_SM`` is the bound this part's thread limit sets: that many thread blocks of the entry's form fit the threads of
-    one SM and one more does not.  It is a bound, not the number that co-reside: the compiled kernel's registers can bind first."""
+def test_thread_blocks_per_sm_bound_holds_on_this_part():
+    """``CTAS_PER_SM`` bounds the thread blocks of the entry's form that one SM holds on every served part: this part's thread
+    limit fits at least one and never more than the bound.  A part whose SM holds fewer threads holds fewer blocks, and the
+    compiled kernel's registers can bind before either."""
     dev = _device_or_skip()
     cfg = _cfg()
     limit = torch.cuda.get_device_properties(dev).max_threads_per_multi_processor
-    fits = cfg.CTAS_PER_SM * cfg.THREADS <= limit < (cfg.CTAS_PER_SM + 1) * cfg.THREADS
-    assert fits, f"{cfg.CTAS_PER_SM} thread blocks of {cfg.THREADS} threads against {limit} threads per SM"
+    fit = limit // cfg.THREADS
+    assert 1 <= fit <= cfg.CTAS_PER_SM, f"{fit} thread blocks of {cfg.THREADS} threads fit this part's {limit} threads per SM; the bound is {cfg.CTAS_PER_SM}"

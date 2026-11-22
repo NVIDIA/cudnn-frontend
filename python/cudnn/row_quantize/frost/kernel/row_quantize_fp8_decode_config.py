@@ -45,9 +45,10 @@ SERVED_WIDTH: Tuple[int, ...] = (17408,)
 #: the served row ceiling per call (the ceiling of the other row decode steps of this library).  Above the rows one scheduling
 #: wave holds on the served parts (at most ``CTAS_PER_SM`` x the SM count), so a call of this many rows crosses waves.
 MAX_ROWS = 1024
-#: threads one SM holds: AT MOST ``SM_THREADS // THREADS`` thread blocks co-reside.  The thread limit's bound, not a count: the
-#: registers of the compiled kernel bind first when it holds more than 32 per thread at 1024 threads (two such blocks need more
-#: than an SM's register file), and then ONE thread block occupies an SM.
+#: the most threads one SM of a served part holds: AT MOST ``SM_THREADS // THREADS`` thread blocks co-reside.  A bound over the
+#: served parts, not a count: a part whose SM holds fewer threads holds fewer blocks, and the registers of the compiled kernel
+#: bind first when it holds more than 32 per thread at 1024 threads (two such blocks need more than an SM's register file),
+#: and then ONE thread block occupies an SM.
 SM_THREADS = 2048
 ELEMENT_BYTES = 2  # bf16
 SCALE_BYTES = 4  # one fp32 scale per row
