@@ -355,7 +355,7 @@ def test_a_verify_step_is_that_many_decode_steps_on_the_reference_stack(sequence
     assert own.lines[1].endswith("byte-identical on a second run from a fresh state    PASS")
     assert f"{rows} of {rows} greedy tokens equal to the reference stack's" in own.text()
     if sequences > 1:  # one sequence alone runs with its T rows, on its own slots
-        assert f"one sequence alone vs among {sequences} (step t: sequence t mod {sequences})" in own.text() and "12 of 12 blocks equal" in own.text()
+        assert f"one sequence alone vs among {sequences} (step t: sequence t mod {sequences})" in own.text() and "13 of 13 blocks equal" in own.text()
     assert own.kernels == "" and census.configuration_of(verify.plan) == "verify" and census.configuration_of(decode.plan) == "plain"
 
 
@@ -559,7 +559,7 @@ def test_two_sessions_on_one_load_keep_two_states_and_a_verify_session_reports_n
     assert "rate                  not printed for verify steps (6 tokens per sequence a step; how many of them a run keeps is its caller's)" in lines
     assert "bytes per step        not stated for a verify step (the arithmetic of a step is the decode step's)" in lines
     steps = [line for line in lines if line.startswith("steps (4) ")]
-    assert len(steps) == 1 and steps[0].endswith("| 27 block calls per step"), "its own steps are timed as steps"
+    assert len(steps) == 1 and steps[0].endswith("| 28 block calls per step"), "its own steps are timed as steps"
     assert not any(word in line for line in lines for word in ("prefill route", "tokens per second", " GB (")), "no line of a decode step"
     verify.new_report()
     assert verify.report().tokens == 6, "a fresh report is still a verify session's"
@@ -820,16 +820,16 @@ def test_the_census_of_a_verify_step_and_its_three_numbers():
     parts = section["rows"]["6"]
     assert (
         target.numbers(parts, Geometry().layer_kinds)
-        == (484, 146, 337, 1)
+        == (484, 146, 338, 0)
         == tuple(section["numbers"][name] for name in ("launches", "code", "port", "stand_in"))
     )
-    assert target.numbers(parts, QwenDense.reduced().geometry.layer_kinds) == (20, 7, 12, 1)
+    assert target.numbers(parts, QwenDense.reduced().geometry.layer_kinds) == (20, 7, 13, 0)
     plain = target.data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]
     assert target.numbers(plain, Geometry().layer_kinds) == (
         484,
         194,
-        289,
-        1,
+        290,
+        0,
     ), "the decode step's section: the same kernels but the two this step has others for"
     # per layer kind what differs from the decode step: the fused step is the verify kernel, and the out-projection of a
     # linear-attention layer is a kernel of cuDNN Frontend there
@@ -859,44 +859,43 @@ def test_the_census_of_a_verify_step_and_its_three_numbers():
     for model, whole, reached, entries_reached, entries_not_yet, vocab in (
         (
             QwenDense(),
-            "484 launches per step = 146 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results + 1 declared stand-in",
-            "483 of 484 launches of a step are target kernels (146 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results)",
-            "386 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results)",
+            "484 launches per step = 146 the target's own compiled kernels + 338 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins",
+            "484 launches of a step, every one a target kernel",
+            "387 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 338 cuDNN Frontend entries with byte-equal results)",
             "mlp.down 64, attention.core 16, projection.fp8.out 16, output_head 1",
             [],
         ),
         (
             QwenDense.reduced(),
-            "20 launches per step = 7 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results + 1 declared stand-in",
-            "19 of 20 launches of a step are target kernels (7 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results)",
-            "14 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results)",
+            "20 launches per step = 7 the target's own compiled kernels + 13 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins",
+            "20 launches of a step, every one a target kernel",
+            "15 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 13 cuDNN Frontend entries with byte-equal results)",
             "mlp.down 2, attention.core 1, projection.fp8.out 1, output_head 1",
             [other_vocab],
         ),
     ):
         plan, _ = _plan(1, 6, model=model)
         claim = target.claim(plan, model, census.configuration_of(plan), installed=RECORDED)
-        assert claim.coverage() == [
-            WHOLE + whole,
-            f"kernel identity, as planned: {reached}; 1 declared stand-in (not yet: output_head.quantize)",
-        ]
+        numbers = claim.numbers()
+        assert claim.coverage() == [f"kernel identity, as planned: {whole}"], "one line: the stack launches the whole set of its step"
+        assert f"{numbers['target_code'] + numbers['target_port']} launches of a step, every one a target kernel" == reached and numbers["stand_ins"] == 0
         assert claim.name == "target census verify / cc 10.0 / 148 SMs (recorded 2026-11-12)" and claim.of("linear_attention.step") == "target"
         if not vocab:  # the published model: the line of the family README's verify section is the plan's own
-            assert claim.coverage()[1] in (MODELS / "qwen_dense" / "README.md").read_text(), "the coverage line of a verify plan of native"
+            assert claim.coverage()[0] in (MODELS / "qwen_dense" / "README.md").read_text(), "the coverage line of a verify plan of native"
         # the out-projection: the target's kernel at both call sites -- the FP8 projection entry at the linear-attention layers'
         # call, the library's 8-bit multiply at the attention layers' (its kernel the library's choice: held by membership)
         assert claim.of("projection.fp8.out") == "target"
         assert claim.of("projection.fp8.out", "linear_attention.out") == claim.of("projection.fp8.out", "full_attention.out") == "target"
-        assert claim.reasons == [*vocab, "the plan has no block for output_head.quantize"], "no fallback row is left in a verify plan of native"
+        assert claim.reasons == (
+            vocab or ["the census does not claim this class yet"]
+        ), "no fallback row is left in a verify plan of native, and no block is missing"
         # the cuDNN Frontend rows alone (fe-entries): the library's blocks are not yet, the attention layers' out-projection among them
         entries_plan, _ = _plan(1, 6, "fe-entries", model=model)
         entries = target.claim(entries_plan, model, census.configuration_of(entries_plan), installed=RECORDED)
-        assert entries.coverage()[1] == (
-            f"kernel identity, as planned: {entries_reached}; not yet: {entries_not_yet}; 1 declared stand-in (not yet: output_head.quantize)"
-        )
+        assert entries.coverage()[1] == (f"kernel identity, as planned: {entries_reached}; not yet: {entries_not_yet}; 0 declared stand-ins")
         assert entries.of("projection.fp8.out") == "target; not yet (bf16 copy of 8-bit weights)"
         assert entries.of("projection.fp8.out", "full_attention.out") == "not yet (bf16 copy of 8-bit weights)"
-        assert entries.reasons == ["fallback rows present", "the plan has no block for output_head.quantize"]
+        assert entries.reasons == ["fallback rows present"]
         step_call = claim.blocks.index("linear_attention.step")
         assert claim.recorded[step_call] == VERIFY_SHAPE, "item 7: the recorded launch shape of the verify kernel"
         out_calls = [
@@ -1136,26 +1135,26 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     target = QwenDense.target()
     plan, model = _plan(1, 6, model=QwenDense())
     reached_native = target.claim(plan, model, census.configuration_of(plan), installed=RECORDED).numbers()
-    assert (reached_native["launches"], reached_native["target_code"], reached_native["target_port"]) == (484, 146, 337), "with the library's 97 calls"
+    assert (reached_native["launches"], reached_native["target_code"], reached_native["target_port"]) == (484, 146, 338), "with the library's 97 calls"
     # the texts below state what the cuDNN Frontend entries serve: the rows of fe-entries, which native shares
     plan, model = _plan(1, 6, "fe-entries", model=QwenDense())
     numbers = target.claim(plan, model, census.configuration_of(plan), installed=RECORDED).numbers()
     assert (numbers["launches"], numbers["code"], numbers["port"], numbers["stand_ins"], numbers["target_code"], numbers["target_port"]) == (
         484,
         146,
-        337,
-        1,
+        338,
+        0,
         49,
-        337,
+        338,
     )
     family = (MODELS / "qwen_dense" / "README.md").read_text(encoding="utf-8")
     area = (MODELS / "README.md").read_text(encoding="utf-8")
     guide = (MODELS / "AGENTS.md").read_text(encoding="utf-8")
     section = " ".join(family.split("## The verify step", 1)[1].split("\n## ", 1)[0].split())
-    whole = "484 launches per step = 146 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results + 1 declared stand-in"
-    reached = "386 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results)"
+    whole = "484 launches per step = 146 the target's own compiled kernels + 338 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins"
+    reached = "387 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 338 cuDNN Frontend entries with byte-equal results)"
     assert whole in section and reached in section, "the family README: the verify step's target and what is reached of it, each with its split"
-    assert "the whole is 146 + 337 + 1 where the decode step's is 194 + 289 + 1" in section and "126,512 B at six tokens and one sequence" in section
+    assert "the whole is 146 + 338 + 0 where the decode step's is 194 + 290 + 0" in section and "126,512 B at six tokens and one sequence" in section
     assert "Session.verify" in " ".join(area.split()) and "verify.verify(ids, accept)" in family and "`fe.gdn_verify_fused`" in section
     entries = numbers["target_code"] - 1  # without PyTorch's gather: the launches of the cuDNN Frontend entries
     assert (
@@ -1176,18 +1175,18 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
 
     decode_blocks, verify_blocks = on_target(1), on_target(6)
     decode_entries, verify_entries = ({entry for _, entry in found} for found in (decode_blocks, verify_blocks))
-    assert len(decode_entries) == len(verify_entries) == 6 and len(decode_entries & verify_entries) == 5
+    assert len(decode_entries) == len(verify_entries) == 7 and len(decode_entries & verify_entries) == 6
     assert (decode_entries - verify_entries, verify_entries - decode_entries) == ({"cudnn.GdnDecodeFused"}, {"cudnn.GdnVerifyFused"})
-    # ... and one of the six serves a second block in a verify step: the 8-bit projection entry, the out-projection
+    # ... and one of the seven serves a second block in a verify step: the 8-bit projection entry, the out-projection
     assert {name for name, entry in decode_blocks if entry == "cudnn.Fp8ProjectionDecode"} == {"projection.fp8.in"}
     assert {name for name, entry in verify_blocks if entry == "cudnn.Fp8ProjectionDecode"} == {"projection.fp8.in", "projection.fp8.out"}
     assert (
-        "six entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other five the same, the 8-bit projection entry there for the "
+        "seven entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other six the same, the 8-bit projection entry there for the "
         "out-projection of the linear-attention layers as well -- serve "
-        "385 of the 484 launches of a verify step, 48 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results "
-        "(with PyTorch's gather: 386 = 49 + 337)" in " ".join(area.split())
+        "386 of the 484 launches of a verify step, 48 the target's own compiled kernels + 338 cuDNN Frontend entries with byte-equal results "
+        "(with PyTorch's gather: 387 = 49 + 338)" in " ".join(area.split())
     ), "the entries are named beside the count they serve, and the count carries its split"
-    assert "the same six entries" not in " ".join(area.split()), "the fused decode entry does not serve a verify step"
+    assert "the same seven entries" not in " ".join(area.split()), "the fused decode entry does not serve a verify step"
     # the form the entry takes between the step shapes at the ends of a row's range -- one thread block per SM, which a host
     # entry keeps at every step shape (it has no SM count to pick another by): its shared memory at six and at eight
     # tokens as the family README states them, and eight tokens as the most that form holds, the last count of the rows
@@ -1232,16 +1231,16 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     )
     six, six_model = _plan(1, 6)
     held = QwenDense.target().claim(six, six_model, census.configuration_of(six), installed=RECORDED)
-    # (the plan of today holds two launches more than that run of 2026-11-18 did: the attention preparation's, on its entry,
-    # and the attention core's, on the library)
-    assert (held.numbers()["target_code"], held.numbers()["target_port"], len(held.recorded)) == (7, 12, 17)
+    # (the plan of today holds three launches more than that run of 2026-11-18 did: the attention preparation's, on its entry,
+    # the attention core's, on the library, and the head's quantise, on its entry -- for which the census records no launch shape)
+    assert (held.numbers()["target_code"], held.numbers()["target_port"], len(held.recorded)) == (7, 13, 17)
     # ... and what is not here is what no stack has: the calls of the library are rows of `native`
     library = {label: row.key for label, _, _, row, _ in _plan(1, 6)[0].parts() if "flashinfer." in row.key}
     assert library == {
         "projection.fp8.out at full_attention.out": "flashinfer.bmm_fp8",
         "mlp.down": "flashinfer.mm_fp4",
         "attention.core": "flashinfer.decode_attention",
-        "output_head": "torch_ref.quantize+flashinfer.mm_fp4",
+        "output_head": "flashinfer.mm_fp4_head",
     }
     assert not any("flashinfer." in row.key for _, _, _, row, _ in _plan(1, 6, "fe-entries")[0].parts())
     assert (
@@ -1284,14 +1283,14 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert "with 13 launches of a step in the shapes the census records (2 the target's own compiled kernels + 11 cuDNN Frontend entries" in section
     assert "Today three kinds of row do that" in " ".join(family.split()) and "its forms are kept per call site" in " ".join(family.split())
     # ... and the by-provider sentence of a verify plan: the plan's own line on compute capability 10.0 and on another 10.x class
-    counted = "cuDNN Frontend 6; fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1)"
-    for cc, sms, tokens, frontend in (((10, 0), 148, 6, 6), ((10, 0), 148, 1, 6), ((10, 3), 152, 6, 6), ((10, 3), 152, 1, 5), ((10, 7), 212, 6, 6)):
+    counted = "cuDNN Frontend 7; fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1)"
+    for cc, sms, tokens, frontend in (((10, 0), 148, 6, 7), ((10, 0), 148, 1, 7), ((10, 3), 152, 6, 7), ((10, 3), 152, 1, 6), ((10, 7), 212, 6, 7)):
         line = _plan(1, tokens, "fe-entries", cc=cc, sms=sms, model=QwenDense())[0].by_provider()
         assert line == f"by provider: cuDNN FE {frontend} | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2", (cc, tokens)
         assert " | FlashInfer 4 | " in _plan(1, tokens, cc=cc, sms=sms, model=QwenDense())[0].by_provider(), "native: the library's four rows beside them"
     assert f"a verify plan of `fe-entries` with such a row counts what the decode plan counts on compute capability 10.0 -- {counted} --" in section
     assert "A plan of `native` counts FlashInfer 4 beside them at either step shape, and one fallback row fewer per library row." in section
-    assert "makes the verify plan cuDNN Frontend 6 where the decode plan is cuDNN Frontend 5, with the same fallbacks" in section
+    assert "makes the verify plan cuDNN Frontend 7 where the decode plan is cuDNN Frontend 6, with the same fallbacks" in section
     assert "was short from about 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step --" in " ".join(
         family.split()
     )
@@ -1367,10 +1366,10 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     two = target.claim(small, small_model, census.configuration_of(small), installed=RECORDED).numbers()
     # (the runs of the three sentences below were made before the attention preparation had its row: one launch of a two-layer
     # step fewer than today's plans, 16 of the published model's)
-    assert (two["launches"], two["target_code"], two["target_port"]) == (20, 2, 12)
+    assert (two["launches"], two["target_code"], two["target_port"]) == (20, 2, 13)
     with_library, _ = _plan(1, 6)
     more = target.claim(with_library, small_model, census.configuration_of(with_library), installed=RECORDED).numbers()
-    assert (more["launches"], more["target_code"], more["target_port"]) == (20, 7, 12), "native: the five calls of the library on top"
+    assert (more["launches"], more["target_code"], more["target_port"]) == (20, 7, 13), "native: the five calls of the library on top"
     assert (
         "with 17 of 20 launches of a verify step target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)"
         in section
@@ -1380,9 +1379,9 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         in section
     )
     dated = "370 of 484 launches of a verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)"
-    assert "with " + dated in section and reached.startswith("386 of 484 launches of a step are target kernels (49 ")
+    assert "with " + dated in section and reached.startswith("387 of 484 launches of a step are target kernels (49 ")
     today, then = (int(sentence.split(" of 484 launches of a ", 1)[0]) for sentence in (reached, dated))  # the counts as the two sentences state them
-    assert today - then == 16, "the dated run: one launch per attention layer of the published model fewer than a step reaches today"
+    assert today - then == 16 + 1, "the dated run: one launch per attention layer of the published model, and the head's quantise, fewer than today"
     # what the two runs asked for is the tree's arithmetic at their capacities: a plain session and such a session on one load, one
     # state of six tokens per sequence beside the plain session's (prompt + 32 new tokens + two windows of five drafted tokens)
     kept, alone = ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up"), ("projection.fp8.in", "mlp.gate_up")
@@ -1615,13 +1614,15 @@ def test_the_rows_of_the_out_projection_of_a_verify_step():
         LA_OUT: f"{LA_OUT} 1 cuDNN FE cudnn.Fp8ProjectionDecode rows 2-8 of 2-16 of a step of several tokens per sequence, the linear-attention layers' weight 5120 x 6144 none",
         FA_OUT: f"{FA_OUT} 1 FlashInfer flashinfer.gemm.bmm_fp8 any row count, weight 5120 x 6144 none; unverified in CI",
     }
-    assert plan.by_provider() == "by provider: cuDNN FE 6 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4"
+    assert plan.by_provider() == "by provider: cuDNN FE 7 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4"
     other_class = "by provider: cuDNN FE {} | FlashInfer 4 | fallbacks 1 (cuBLAS over copies 1) | PyTorch 2 | unverified in CI: 4"
-    assert _plan(1, 6, cc=(10, 3), sms=152)[0].by_provider() == other_class.format(6)
-    assert _plan(1, 1, cc=(10, 3), sms=152)[0].by_provider() == other_class.format(5)
+    assert _plan(1, 6, cc=(10, 3), sms=152)[0].by_provider() == other_class.format(7)
+    assert _plan(1, 1, cc=(10, 3), sms=152)[0].by_provider() == other_class.format(6)
     entries = "by provider: cuDNN FE {} | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
-    assert _plan(1, 6, "fe-entries")[0].by_provider() == _plan(1, 6, "fe-entries", cc=(10, 3), sms=152)[0].by_provider() == entries.format(6)
-    assert _plan(1, 1, "fe-entries", cc=(10, 3), sms=152)[0].by_provider() == entries.format(5), "the cuDNN Frontend rows alone are the lines they were"
+    assert _plan(1, 6, "fe-entries")[0].by_provider() == _plan(1, 6, "fe-entries", cc=(10, 3), sms=152)[0].by_provider() == entries.format(7)
+    assert _plan(1, 1, "fe-entries", cc=(10, 3), sms=152)[0].by_provider() == entries.format(
+        6
+    ), "the cuDNN Frontend rows alone: the entry of the head's quantise among them"
     full = _plan(1, 6, model=QwenDense())[0]
     assert (full.calls[LA_OUT], full.calls[FA_OUT]) == ("48", "16"), "the calls of a step of the 64-layer model at each call site"
     kernels = census.table(plan, QwenDense.target().claim(plan, model, "verify", installed=RECORDED))
@@ -1631,14 +1632,14 @@ def test_the_rows_of_the_out_projection_of_a_verify_step():
         LA_OUT: f"{LA_OUT} 1 cuDNN FE cudnn.Fp8ProjectionDecode {form} fp8_projection 1 name and launch shape, as the entry states them target",
         FA_OUT: f"{FA_OUT} 1 FlashInfer flashinfer.gemm.bmm_fp8 [BACKEND auto] cublaslt_fp8_gemm, cublas 1 name target",
     }, "the part of a call site prints its form whole"
-    assert "per step: 19 launches on 12 exact rows, checked one by one in the wiring order; the launches of 0 fallback calls " in kernels
+    assert "per step: 20 launches on 13 exact rows, checked one by one in the wiring order; the launches of 0 fallback calls " in kernels
     entries_plan, _ = _plan(1, 6, "fe-entries")
     entries_kernels = census.table(entries_plan, QwenDense.target().claim(entries_plan, model, "verify", installed=RECORDED))
     entries_lines = [" ".join(line.split()) for line in entries_kernels.splitlines()]
     assert (
         f"{FA_OUT} 1 cuBLAS torch.matmul over a bf16 copy cublas, pytorch -- by family not yet (bf16 copy of 8-bit weights)" in entries_lines
     ), "fe-entries: the attention layers' call on its copy"
-    assert "per step: 14 launches on 8 exact rows, checked one by one in the wiring order; the launches of 5 fallback calls" in entries_kernels
+    assert "per step: 15 launches on 9 exact rows, checked one by one in the wiring order; the launches of 5 fallback calls" in entries_kernels
     assert "projection.fp8.out at linear_attention.out:" not in kernels, "no line of forms by call site under the table: the part's line has it"
 
     # a step of one token per sequence has one row at both call sites, on every stack: the library's multiply in native, the
@@ -2168,7 +2169,7 @@ def test_a_session_with_draft_tokens_feeds_its_prompt_through_decode_steps_and_v
     assert printed == session._tables(), "no memory sentence on the CPU: the two tables under their line"
     assert session.state.tokens == tokens and len(session.state.decode_layers) == len(session.state.layers), "ONE state, of the verify steps' layout"
     stages = session.stages.line()  # the load warmed up both kinds of step, each a stage of its own
-    assert "warm-up, the prompt's decode step" in stages and stages.count("warm-up") == 2 and session.report().calls_per_step == 27
+    assert "warm-up, the prompt's decode step" in stages and stages.count("warm-up") == 2 and session.report().calls_per_step == 28
     # the method that is called selects the plan: a prompt step is served by the blocks of the decode plan, a verify step by the verify plan's
     served = []
     session.tap = lambda name, layer, block, operands: block(*operands) if served.append((name, block)) is None else None
@@ -2710,7 +2711,7 @@ def test_the_report_of_a_session_with_draft_tokens():
     assert "rate                  not printed: the drafted tokens of these steps are their caller's (6 tokens per sequence a step)" in lines
     assert "bytes per step        not stated for a verify step (the arithmetic of a step is the decode step's)" in lines
     steps = [line for line in lines if line.startswith("steps (8) ")]
-    assert len(steps) == 1 and steps[0].endswith("| 27 block calls per step"), "a step is a verify step: one launch mark, one host read"
+    assert len(steps) == 1 and steps[0].endswith("| 28 block calls per step"), "a step is a verify step: one launch mark, one host read"
     assert "traced pass           not available: needs a recorded step on a CUDA device" in lines, "the CPU has no kernel activity records"
     assert not any("not stated: a session of" in line or "not printed for verify steps" in line for line in lines)
     report.trace, report.trace_missing = Trace(8, 1.0, 0.5, 100, 2, 2.0), ""
@@ -2875,12 +2876,12 @@ def test_a_speculative_step_drafts_verifies_and_keeps_what_the_comparison_says()
     assert session.draft_plan not in session._plans() and session._first_used()[-1] is session.draft_plan and session.draft_plan.first_used
     # the load: the drafter with the model's table, no second copy; a warm-up step that is a whole step
     assert session.draft_weights.embedding is session.weights.embedding and session.draft_weights.copies is not None
-    assert session.report().calls_per_step == 27 + drafted * calls, "the block calls of a step: the model's and the drafter's passes"
+    assert session.report().calls_per_step == 28 + drafted * calls, "the block calls of a step: the model's and the drafter's passes"
     assert (session.state.hidden, session.state.greedy, session.state.position) == (None, None, 0), "the warm-up left nothing"
     assert tuple(session.state.draft.k.shape) == (1, 1, session.capacity, 8) and not session.state.draft.k.any()
     # the prompt: N decode steps, and N - 1 passes of the drafter (15 block calls each) in front of every step but the first
     first = session.read(session.prefill(prompts))
-    assert session._calls == 5 * 27 + 4 * 15 and first == [stream[0][0]]
+    assert session._calls == 5 * 28 + 4 * 15 and first == [stream[0][0]]
     cache = session.state.draft
     assert cache.k[:, :, :4].abs().sum() > 0 and not cache.k[:, :, 4:].any(), "positions 0 to 3 are written; the last prompt position waits for its token"
     assert tuple(session.state.hidden.shape) == (1, 64) and session.state.hidden.dtype == torch.bfloat16 and session.state.greedy.tolist() == first
@@ -2890,7 +2891,7 @@ def test_a_speculative_step_drafts_verifies_and_keeps_what_the_comparison_says()
     assert tuple(pair.shape) == (1, 2, tokens) and pair.dtype == torch.int32
     assert pair[0, 0].tolist() == [first[0], *force[0].tolist()] and torch.equal(pair[0, 1], session.state.greedy)
     assert tuple(session.state.hidden.shape) == (tokens, 64) and session.state.position == 5, "the count stays open: the position has not moved"
-    assert session._calls == 5 * 27 + 4 * 15 + drafted * calls + 27
+    assert session._calls == 5 * 28 + 4 * 15 + drafted * calls + 28
     proposals = session.record.proposals[0]
     assert tuple(session.record.proposals.shape[1:]) == (1, drafted) and not torch.equal(proposals, force), "the drafter's own, not the forced ones"
     assert set(proposals[0].tolist()) <= set(drafter.vocabulary.ids), "it proposes from its listed ids"
@@ -2945,40 +2946,51 @@ def test_a_speculative_step_drafts_verifies_and_keeps_what_the_comparison_says()
 
 def test_a_step_leaves_the_rows_its_output_head_read_and_the_ids_it_chose_by_reference():
     """What a drafter reads of a step is what that step's output head read.  ``state.hidden`` IS the tensor the final
-    norm's call returned -- the call whose quantised rows the head multiplied -- and ``state.greedy`` IS what the token
-    choice returned: the same objects, not a copy, and not another tensor of the step with the same shape (the rows in
-    front of the norm, a layer's normed rows, the residual stream).  The session and the second run of the comparison
-    read the same attribute, so no line of a comparison holds this; the session's tap does: behind a prompt step (one
-    row), behind a verify step (six rows), and on a plain session, whose step leaves them as well."""
+    norm's call returned -- the call whose rows the head's quantise block was handed, and whose codes the head
+    multiplied -- and ``state.greedy`` IS what the token choice returned: the same objects, not a copy, and not another
+    tensor of the step with the same shape (the rows in front of the norm, a layer's normed rows, the residual stream).
+    The last norm of a step is handed no ``Quant`` and returns no quantised operand; the quantise block is handed that
+    norm's rows and the HEAD's ``Quant`` -- the object the weights hold, not an equal one: on the seeded model the head's
+    scale is every layer's MLP scale, so no byte of a run tells a layer's ``Quant`` from the head's --; and the head is
+    handed what the quantise block returned.  The session and the second run of the comparison read the same
+    attributes, so no line of a comparison holds this; the session's tap does: behind a prompt step (one row), behind a
+    verify step (six rows), and on a plain session, whose step leaves them as well."""
     plain, session, prompts, _ = _speculative(1, 5, drafter=_seeded_drafter)
     seen = {}
 
     def tap(name, layer, block, operands):
         out = block(*operands)
         if name == "add_norm_quantize" and operands[-1] == "output_head":
-            seen["quantised"], seen["normed"] = out[0], out[1]
+            seen["norm's quant"], seen["norm's codes"], seen["normed"] = operands[3], out[0], out[1]
+        elif name == "output_head.quantize":
+            seen["quantise read"], seen["quant"], seen["quantised"] = operands[0], operands[1], out
         elif name == "output_head":
             seen["head read"] = operands[0]
         elif name == "token_choice":
             seen["chosen"] = out
         return out
 
-    def held(state, rows):
+    def held(of, rows):
+        state, weights = of.state, of.weights
         assert state.hidden is seen["normed"] and state.greedy is seen["chosen"], "by reference: the tensors the two calls returned"
-        assert seen["head read"] is seen["quantised"], "the head read the quantised rows of that same norm call"
+        assert seen["norm's quant"] is None and seen["norm's codes"] is None, "the last norm is handed no Quant and returns no quantised operand"
+        assert seen["quantise read"] is seen["normed"], "the quantise block read the rows that same norm call returned"
+        assert seen["quant"] is weights.head_quant, "under the head's Quant: the object the weights hold"
+        assert weights.layers[-1].mlp_quant == weights.head_quant and seen["quant"] is not weights.layers[-1].mlp_quant, "an equal one would pass every byte"
+        assert seen["head read"] is seen["quantised"], "the head read what the quantise block returned"
         assert tuple(state.hidden.shape) == (rows, 64) and state.hidden.dtype == torch.bfloat16 and tuple(state.greedy.shape) == (rows,)
 
     session.tap = plain.tap = tap
     session.read(session.prefill(prompts))
-    held(session.state, 1)
+    held(session, 1)
     session.speculate()
-    held(session.state, 6)
+    held(session, 6)
     rows, ids = session.state.hidden, session.state.greedy
     session.accept(3)
     assert session.state.hidden is rows and session.state.greedy is ids, "keeping tokens leaves both where they are: nothing is copied"
     seen.clear()
     plain.read(plain.prefill(prompts))
-    held(plain.state, 1)
+    held(plain, 1)
 
 
 def test_what_a_rejected_draft_left_in_the_drafters_cache_is_not_read():
@@ -3398,7 +3410,7 @@ def test_the_report_of_a_speculative_session():
     assert any(line.startswith(first + "over the position in front of it; not a time to first token of record (") for line in lines)
     assert "acceptance            scheduled, not measured (reduction): 8 steps; kept 1: 2, 2: 2, 3: 1, 4: 1, 5: 1, 6: 1" in lines
     assert "rate                  not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)" in lines
-    assert [line for line in lines if line.startswith("steps (8) ")][0].endswith("| 117 block calls per step"), "the model's 27 and five passes of 18"
+    assert [line for line in lines if line.startswith("steps (8) ")][0].endswith("| 118 block calls per step"), "the model's 28 and five passes of 18"
     assert not any("their caller's" in line or "not stated for a verify step" in line for line in lines), "the sentences of a session without a drafter"
     # behind the comparison, which leaves the session reset with the record of its run, the acceptance lines are still the run's; the bytes
     # of a step follow where the session stands -- position 0 then -- so a run prints its report first
@@ -3845,7 +3857,7 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     # what the two plans of the checkpoint run count and ask for, from the tree: the verify plan's three numbers and where they are held
     # (the census section of one sequence of six tokens), and the memory sentence of the run at its capacity
     # (today's plans: the 16 launches of the attention preparation, on its entry, more than the dated sentences above state)
-    for stack, numbers, compared, by_membership in (("native", (484, 146, 337), 467, 16), ("fe-entries", (484, 49, 337), 386, 0)):
+    for stack, numbers, compared, by_membership in (("native", (484, 146, 338), 467, 17), ("fe-entries", (484, 49, 338), 386, 1)):
         published, published_model = _plan(1, 6, stack, model=QwenDense())
         claim = QwenDense.target().claim(published, published_model, census.configuration_of(published), installed=RECORDED)
         counted = claim.numbers()
@@ -3873,14 +3885,15 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     guide_text = (MODELS / "AGENTS.md").read_text(encoding="utf-8")
     guide = " ".join(guide_text.split())
     sections = [section.split("\n", 1)[0] for section in guide_text.rstrip().split("\n## ")[1:]]
-    assert sections[-6:] == [
+    assert sections[-7:] == [
         "What the speculative step taught",
         "What building the speculative script taught",
         "What the rows a library serves taught",
         "What the attention preparation's row taught",
         "What counting the checks into the memory sentence taught",
         "What the attention core's library row taught",
-    ], "the section, and the script's behind it; the last six sections of the guide, in the order they were built"
+        "What the output head's quantise row taught",
+    ], "the section, and the script's behind it; the last seven sections of the guide, in the order they were built"
     speculative = guide_text.split("\n## What the speculative step taught\n", 1)[1].split("\n## ", 1)[0]
     assert "(`Session._weights_owner`)" in speculative, "the lesson of the drafter's load stands in the speculative step's section, where it was appended"
     lessons = (
@@ -3965,9 +3978,9 @@ def test_the_traced_pass_of_a_session_with_a_drafter_runs_whole_steps(monkeypatc
     assert read == [
         5 + sum(count + 1 for count in scheduled[: index + 1]) for index in range(4)
     ], "behind the replayed prompt, each step from where the last stood"
-    assert (traced.first, len(traced.sites), traced.missing) == (5 * 18, 5 * 18 + 27, "a stand-in ran the steps")
+    assert (traced.first, len(traced.sites), traced.missing) == (5 * 18, 5 * 18 + 28, "a stand-in ran the steps")
     assert [(site.block, site.layer) for site in traced.sites[:90]] == [(block, index) for index in range(5) for block, _ in session.drafter.wiring()]
-    assert [len(calls) for calls in traced.call_log] == [117] * 4 and all(
+    assert [len(calls) for calls in traced.call_log] == [118] * 4 and all(
         [(call.block, call.layer) for call in calls] == [(site.block, site.layer) for site in traced.sites] for calls in traced.call_log
     )
     # the rows of a call: the first pass of the first step behind the prompt at one row, behind a verify step at six; every other pass at one
@@ -4170,7 +4183,7 @@ def test_a_verify_step_on_a_paged_cache_is_that_many_decode_steps_across_a_page_
     assert own.ok and own.lines[1].endswith("byte-identical on a second run from a fresh state    PASS"), own.text()
     assert f"{rows} of {rows} greedy tokens equal to the reference stack's" in own.text()
     if sequences > 1:  # one sequence alone runs on its window of the pool
-        assert f"one sequence alone vs among {sequences} (step t: sequence t mod {sequences})" in own.text() and "12 of 12 blocks equal" in own.text()
+        assert f"one sequence alone vs among {sequences} (step t: sequence t mod {sequences})" in own.text() and "13 of 13 blocks equal" in own.text()
 
 
 def test_the_verify_loop_on_a_paged_cache_keeps_every_count_and_reads_no_rejected_row():

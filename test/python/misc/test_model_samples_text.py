@@ -2658,10 +2658,10 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     assert "tokens per second" not in text and not re.search(r"\d(?:\.\d+)? (?:ms|tokens/s)\b", text), "the section states no speed"
     # what ran, as the runs printed it: a figure of a run is changed with the run, here and there
     for sentence in (
-        "on the 64-layer model 483 of the 484 launches of a verify step are target kernels (146 the target's own compiled kernels + 337 cuDNN Frontend "
-        "entries with byte-equal results), on the two-layer model of the default run 19 of 20 (7 the target's own compiled kernels + 12 cuDNN Frontend "
-        "entries with byte-equal results); on `fe-entries`, without the library rows, 386 of the 484 (49 the target's own compiled kernels + 337 cuDNN "
-        "Frontend entries with byte-equal results) and 14 of 20 (2 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results)",
+        "on the 64-layer model 484 of the 484 launches of a verify step are target kernels (146 the target's own compiled kernels + 338 cuDNN Frontend "
+        "entries with byte-equal results), on the two-layer model of the default run 20 of 20 (7 the target's own compiled kernels + 13 cuDNN Frontend "
+        "entries with byte-equal results); on `fe-entries`, without the library rows, 387 of the 484 (49 the target's own compiled kernels + 338 cuDNN "
+        "Frontend entries with byte-equal results) and 15 of 20 (2 the target's own compiled kernels + 13 cuDNN Frontend entries with byte-equal results)",
         "Nor with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (this section's last runs have three).",
         # a dated run names its rows, and the run of native with the rows a library serves stands beside it with its versions
         "correctness only; `native` on the cuDNN Frontend rows -- the rows it selected when these runs were made and `fe-entries` selects today without the attention preparation's row).",

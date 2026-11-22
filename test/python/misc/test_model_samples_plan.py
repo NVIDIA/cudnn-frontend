@@ -151,9 +151,10 @@ def test_the_drafters_plan_its_table_and_its_keys():
     new = ("torch.argmax+lookup", "torch_ref.pre_fc_norm_quantize", "torch_ref.gate_row_quantize", "torch_ref.silu_mul", "torch_ref.quantize")
     classes = (torch_ref.ListedTokenChoice, torch_ref.PreFcNormQuantize, torch_ref.GateRowQuantize, torch_ref.SiluMul, torch_ref.Quantize)
     assert all(key in providers.KEYS for key in new) and [providers.factories()[key] for key in new] == list(classes)
-    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 27 and set(providers.KEYS) == set(providers.factories())
+    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 28 and set(providers.KEYS) == set(providers.factories())
     used_by_the_model = {row.key for rows in configs.PROVIDERS.values() for row in rows}
-    assert used_by_the_model.isdisjoint(new) and set(providers.KEYS) == used_by_the_model | set(new), "no key that no table names"
+    assert used_by_the_model & set(new) == {"torch_ref.quantize"}, "one key of the pass is a row of the model too: the reference chain of the head's quantise"
+    assert set(providers.KEYS) == used_by_the_model | set(new), "no key that no table names"
     assert all(providers.ENTRY_NAMES[key] == key for key in new[1:]) and providers.ENTRY_NAMES[new[0]] == "torch.argmax + the token id of the chosen row"
 
     # a dry plan in every stack: the same rows, the same table but for the stack's name
@@ -201,9 +202,9 @@ def test_the_drafters_plan_its_table_and_its_keys():
 def test_call_counts_of_a_decode_step():
     from model_samples.qwen_dense import QwenDense
 
-    assert QwenDense().calls_per_step() == 484
-    assert QwenDense.reduced(4).calls_per_step() == 34 and QwenDense.reduced(4).geometry.layer_kinds.count("linear_attention") == 3
-    assert QwenDense.reduced(2).calls_per_step() == 20 and QwenDense.reduced(2).geometry.layer_kinds == ("linear_attention", "full_attention")
+    assert QwenDense().calls_per_step() == 485
+    assert QwenDense.reduced(4).calls_per_step() == 35 and QwenDense.reduced(4).geometry.layer_kinds.count("linear_attention") == 3
+    assert QwenDense.reduced(2).calls_per_step() == 21 and QwenDense.reduced(2).geometry.layer_kinds == ("linear_attention", "full_attention")
     assert QwenDense().calls_text()["projection.fp8.in"] == "48 / 16" and QwenDense().calls_text()["add_norm_quantize"] == "129"
     with pytest.raises(ValueError, match="layers"):
         QwenDense.reduced(0)
@@ -214,7 +215,7 @@ def test_plan_selects_the_first_matching_row_of_the_stack_and_prints_it():
     assert plan.rows["linear_attention.step"].key == "fe.gdn_decode_fused" and plan["linear_attention.step"].provider == "cuDNN FE"
     assert plan.rows["mlp.down"].key == "cublas.bf16_dequantized" and plan.rows["token_choice"].key == "torch.argmax"
     table = plan.table()
-    assert "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2" in table
+    assert "by provider: cuDNN FE 1 | fallbacks 9 (cuBLAS over copies 4, PyTorch chains 5) | PyTorch 2" in table
     assert "cudnn.GdnDecodeFused" in table and "fallback: bf16 copy of 8-bit weights" in table and "declared regime: launch-bound" in table
     reference = _plan(cc=(8, 0), stack="reference")
     assert {row.key.split(".")[0].split("+")[0] for row in reference.rows.values()} <= {"torch_ref", "torch"}
@@ -267,6 +268,8 @@ def test_a_declined_row_is_a_skip_and_a_contract_violation_a_value_error():
         _plan(overrides={"nothing": "torch.argmax"})
     with pytest.raises(ValueError, match="not a declared row"):
         _plan(overrides={"mlp.down": "fe.gdn_decode_fused"})
+    with pytest.raises(ValueError, match="not a declared row"):  # the key that named the quantiser inside the output head's row: no key any more, no alias
+        _plan(stack="native", overrides={"output_head": "torch_ref.quantize+flashinfer.mm_fp4"})
     assert _plan(overrides=parse_overrides(["mlp.down=torch_ref.linear"])).rows["mlp.down"].key == "torch_ref.linear"
     with pytest.raises(ValueError, match="BLOCK=KEY"):
         parse_overrides(["mlp.down"])
@@ -570,7 +573,7 @@ def test_reference_stack_decodes_a_tiny_geometry_on_the_cpu_and_replays_byte_for
     from model_samples.tie_out import bytes_equal
 
     session, text = _tiny_session(sequences=2)
-    assert session.report().calls_per_step == session.model.calls_per_step() == 20
+    assert session.report().calls_per_step == session.model.calls_per_step() == 21
     prompts = [text.encode_chat([{"role": "user", "content": "a"}, {"role": "assistant", "content": str(s)}], add_generation_prompt=False) for s in range(2)]
     assert prompts[0].dtype == torch.int32 and prompts[0].numel() == prompts[1].numel() and int(prompts[1][-1]) == ord("1")
 
@@ -1139,7 +1142,7 @@ def test_a_session_traces_only_what_it_recorded_and_keeps_its_run(monkeypatch):
     assert session._calls == calls
     assert session.report().bytes == session.model.bytes_per_step(1, 3), "the report carries the bytes of a step at the position the run reached"
     session.new_report()
-    assert session.report().trace_missing == "" and session.report().calls_per_step == 20 and not session.report().text_path, "a fresh report per prompt set"
+    assert session.report().trace_missing == "" and session.report().calls_per_step == 21 and not session.report().text_path, "a fresh report per prompt set"
     assert ids.shape == (1,)
 
 
@@ -1217,7 +1220,7 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     table = session.plan_table()
     assert (session.plan.tokens, session.prefill_plan.tokens) == (6, 1) and session.plan.first_used and session.prefill_plan.first_used
     numbers = session.claim().numbers()  # what the session says about the target kernel set is its verify plan's
-    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 146, 337)
+    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 146, 338)
     # in the stack native the library multiplies the out-projection on its stored codes at both call sites of both plans
     stored = alone = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp.down", "output_head")
     assert session.stored_weights() == stored and session.uncopied_weights() == alone
@@ -2043,7 +2046,7 @@ def test_the_checks_of_a_run_on_a_paged_cache_judge_the_block_that_asked_for_it(
     line = next(line for line in checks.lines if line.split()[:1] == ["attention.prepare"])
     assert checks.ok and "1 of 1 provider blocks inside their bands" in checks.text(), checks.text()
     assert "  72 calls  " in line and "STATE DIFFERS" not in line and line.endswith("[band: bitwise]  PASS"), line
-    assert "one sequence alone vs among 3 (step t: sequence t mod 3)" in checks.text() and "12 of 12 blocks equal" in checks.text(), checks.text()
+    assert "one sequence alone vs among 3 (step t: sequence t mod 3)" in checks.text() and "13 of 13 blocks equal" in checks.text(), checks.text()
     assert checks.lines[1].endswith("byte-identical on a second run from a fresh state    PASS")
 
     def one_row_late(cache, position):

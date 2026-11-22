@@ -784,34 +784,38 @@ def test_the_kernels_lines_are_three_numbers_from_the_plan_and_the_census(monkey
         return perf.kernel_facts(session, "PASS")
 
     kernels, native = planned("fe-entries"), planned("native")
-    assert (native["on_target"], native["launches"]) == (483, 484) and (native["code"], native["port"], native["stand_ins"]) == (194, 289, 0)
-    assert native["by_provider"] == {"cuDNN Frontend": 337, "FlashInfer": 145, "PyTorch": 1}
-    assert (native["fallback_calls"], native["absent"]) == (0, 1) and not native["fallback_rows"], "483 + 1 = 484: no block is left on a fallback row"
+    assert (native["on_target"], native["launches"]) == (484, 484) and (native["code"], native["port"], native["stand_ins"]) == (194, 290, 0)
+    assert native["by_provider"] == {"cuDNN Frontend": 338, "FlashInfer": 145, "PyTorch": 1}
+    assert (native["fallback_calls"], native["absent"]) == (0, 0) and not native[
+        "fallback_rows"
+    ], "484 of 484: no block on a fallback row, no launch without a block"
     wide = perf.screen(_data(kernels=native))  # a third provider: the line breaks between two of them
-    at = wide.index("kernels     483 of 484 launches per step are on the target kernel set: cuDNN Frontend 337, FlashInfer 145,")
+    at = wide.index("kernels     484 of 484 launches per step are on the target kernel set: cuDNN Frontend 338, FlashInfer 145,")
     assert wide[at + 1 : at + 3] == [
         " " * 12 + "PyTorch 1",
-        " " * 12 + "= 194 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results",
+        " " * 12 + "= 194 the target's own compiled kernels + 290 cuDNN Frontend entries with byte-equal results",
     ]
-    assert " " * 12 + "not yet: no block calls on fallback rows + 1 launch of the target that has no block yet" in wide
+    assert not any("launch of the target that has no block yet" in line for line in wide), "every launch of the target has its block"
     assert kernels["declared"] and kernels["stated"] and kernels["fallback_rows"]
-    assert (kernels["on_target"], kernels["launches"]) == (338, 484) and (kernels["code"], kernels["port"], kernels["stand_ins"]) == (49, 289, 0)
-    assert kernels["by_provider"] == {"cuDNN Frontend": 337, "PyTorch": 1}
-    assert (kernels["fallback_calls"], kernels["absent"]) == (145, 1), "338 + 145 + the one launch of the target that no block stands for = 484"
+    assert (kernels["on_target"], kernels["launches"]) == (339, 484) and (kernels["code"], kernels["port"], kernels["stand_ins"]) == (49, 290, 0)
+    assert kernels["by_provider"] == {"cuDNN Frontend": 338, "PyTorch": 1}
+    assert (kernels["fallback_calls"], kernels["absent"]) == (
+        145,
+        0,
+    ), "339 + 145 = 484: every launch of the target has a block, on its kernel or on a fallback row"
     assert kernels["kernels_per_step"] is None and "NOT CLAIMED" in kernels["census"], "nothing traced; a fallback row is left"
     data = _data(kernels={**kernels, "kernels_per_step": 2908, "copies_per_step": 200})
     shown = perf.screen(data)
-    at = shown.index("kernels     338 of 484 launches per step are on the target kernel set: cuDNN Frontend 337, PyTorch 1")
-    assert shown[at + 1 : at + 5] == [
-        "            = 49 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results",
+    at = shown.index("kernels     339 of 484 launches per step are on the target kernel set: cuDNN Frontend 338, PyTorch 1")
+    assert shown[at + 1 : at + 4] == [
+        "            = 49 the target's own compiled kernels + 290 cuDNN Frontend entries with byte-equal results",
         "              + 0 declared stand-ins",
-        "            not yet: 145 block calls on fallback rows + 1 launch of the target that has no block yet",
-        "            a step also launches 2,570 kernels and 200 copies",
+        "            not yet: 145 block calls on fallback rows; a step also launches 2,569 kernels and 200 copies",
     ]
     unseen = perf.screen(_data(kernels=kernels))
-    assert "            what a step also launches was not observed" in unseen
+    assert "            not yet: 145 block calls on fallback rows; what a step also launches was not observed" in unseen
     whole = perf.screen(_data(kernels={**kernels, "absent": 0, "fallback_calls": 0, "kernels_per_step": 501, "copies_per_step": 1}))
-    assert "            not yet: no block calls on fallback rows; a step also launches 163 kernels and 1 copy" in whole
+    assert "            not yet: no block calls on fallback rows; a step also launches 162 kernels and 1 copy" in whole
     three = "the target's own compiled kernels, cuDNN Frontend entries with byte-equal results, declared stand-ins"
     _defines("launches_per_step", f"the launches of a step that are on the target kernel set, by provider and as three numbers -- {three}.")
     _says("area", "The `kernels` lines give the launches of a step that are on the target kernel set, by provider and as three numbers, and what else")
@@ -1971,7 +1975,7 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
     sites, claim = _planned(monkeypatch)
     traced, busy = _walked(sites, [_records(sites)], claim)
     rows = perf.kernel_table(traced, busy)["rows"]
-    exact = [(row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows[:11]]
+    exact = [(row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows[:12]]
     assert exact == [
         ("embedding", "exact", 1, 1),
         ("add_norm_quantize", "exact", 129, 129),
@@ -1983,12 +1987,13 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         ("attention.prepare", "exact", 16, 16),
         (f"{ATTENTION_ENTRY}: attention.core"[: perf.LABEL], "library", 16, 16),  # a name wider than the column: cut there
         ("attention.gate_quantize", "exact", 16, 16),
-        ("torch_ref.quantize + flashinfer.gemm.mm_fp4: output_head", "library", 1, 1),
+        ("output_head.quantize", "exact", 1, 1),
+        ("flashinfer.gemm.mm_fp4: output_head", "library", 1, 1),
     ]
-    assert not [row["label"] for row in rows[11:] if row["relation"] in ("exact", "library")]
+    assert not [row["label"] for row in rows[12:] if row["relation"] in ("exact", "library")]
     three = "the target's own compiled kernels + cuDNN Frontend entries with byte-equal results + declared stand-ins"
     numbers = claim.numbers()
-    assert sum(planned for *_, planned in exact) == traced.result.exact == numbers["target_code"] + numbers["target_port"] == 194 + 289 + 0, three
+    assert sum(planned for *_, planned in exact) == traced.result.exact == numbers["target_code"] + numbers["target_port"] == 194 + 290 + 0, three
     assert sum(planned for _, kind, _, planned in exact if kind == "library") == 64 + 64 + 16 + 1, "one launch of the library per call of its four blocks"
     assert rows[8]["blocks"] == [
         {"block": "attention.core", "calls_per_step": 16, "entry": ATTENTION_ENTRY, "identity": "target"}
@@ -2016,8 +2021,9 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         ("mlp.gate_up", 64, 64),
         ("attention.prepare", 16, 16),
         ("attention.gate_quantize", 16, 16),
+        ("output_head.quantize", 1, 1),
     ]
-    assert traced.result.exact == 49 + 289 + 0, three
+    assert traced.result.exact == 49 + 290 + 0, three
     assert rows[-1]["label"] == "host read" and rows[-1]["launches_per_step"] == 1 and rows[-1]["blocks"] == []
     _defines("kernel_launches", "the kernel and copy records of a traced step that the kernel check attributes to the row's blocks; the median per step.")
     _corresponds("kernel_launches", "The kernel census of a traced serving step.")
@@ -2095,24 +2101,35 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     ]
     # the family's plan: the attention preparation is an exact row, and so is the attention core behind it, the library's.  On the stack native
     # four blocks are a library's: what their calls launch beside the library's kernel -- a further launch of the library's choice behind the
-    # out-projection, the reference quantiser in front of the output head's multiply -- is the row of its place in the wiring, and says so
+    # out-projection -- is the row of its place in the wiring, and says so.  The head's quantise is an exact row of its own and the head's
+    # multiply the library's kernel alone: behind it stands the host path
     sites, claim = _planned(monkeypatch)
     table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
     rows = table["rows"]
-    behind = [(row["label"], row["relation"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows[11:]]
+    behind = [(row["label"], row["relation"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows[12:]]
     assert behind == [
         ("beside its kernel: projection.fp8.out", "beside", [64]),
-        ("beside its kernel: output_head", "beside", [1]),
-        ("beside its kernel: output_head + token_choice (one row)", "beside", [1, 1]),
+        ("host path: token_choice", "host", [1]),
         ("host read", "read", []),
     ]
     assert not [label for label, *_ in behind if label.startswith("fallback: ")], "no block of this plan is without a stated identity"
     assert not [row["label"] for row in rows if row["label"].startswith("not yet: ")] and rows[13]["blocks"] == [
-        {"block": "output_head", "calls_per_step": 1, "entry": "torch_ref.quantize + flashinfer.gemm.mm_fp4", "identity": "target"},
         {"block": "token_choice", "calls_per_step": 1, "entry": "torch.argmax", "identity": "host path, not compared"},
     ]
+    assert [(row["label"], row["relation"], row["blocks"]) for row in rows[10:12]] == [
+        (
+            "output_head.quantize",
+            "exact",
+            [{"block": "output_head.quantize", "calls_per_step": 1, "entry": "cudnn.RowQuantizeFp4Decode", "identity": "target"}],
+        ),
+        (
+            "flashinfer.gemm.mm_fp4: output_head",
+            "library",
+            [{"block": "output_head", "calls_per_step": 1, "entry": "flashinfer.gemm.mm_fp4", "identity": "target"}],
+        ),
+    ], "behind the last layer: an exact row of the entry, then the library's entry for the head"
     printed = perf._kernel_lines(table, "")
-    assert printed[15] == f"  {'beside its kernel: output_head':<58}{1:>9}{'--':>11}{0.004:>9.3f}{'0.2 %':>9}", "no time per launch: a chain"
+    assert printed[15] == f"  {'beside its kernel: projection.fp8.out':<58}{128:>9}{'--':>11}{0.550:>9.3f}{'20.8 %':>9}", "no time per launch: a chain"
     assert sum(row["launches_per_step"] for row in rows) == len(_records(sites)), "the rows hold every record of the step, the library's among them"
     # the stack fe-entries: those three blocks are on their fallback rows there, and the census says `not yet` of them
     sites, claim = _planned(monkeypatch, "fe-entries")
@@ -2125,14 +2142,14 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
         ("not yet: output_head + token_choice (one row)", [1, 1]),
         ("host read", []),
     ]
-    assert rows[9]["blocks"][0]["identity"].startswith("not yet (") and rows[10]["blocks"][1] == {
+    assert rows[10]["blocks"][0]["identity"].startswith("not yet (") and rows[11]["blocks"][1] == {
         "block": "token_choice",
         "calls_per_step": 1,
         "entry": "torch.argmax",
         "identity": "host path, not compared",
     }
-    _says("area", "what a block's call launches beside a kernel of its own -- the reference quantiser in front of the output head's multiply,")
-    _says("area", "a further launch of a library's choice -- is the row of its place in the wiring, marked `beside its kernel:` and shared with")
+    _says("area", "what a block's call launches beside a kernel of its own -- a further launch of a library's choice -- is the row of its place in")
+    _says("area", "the wiring, marked `beside its kernel:` and shared with")
     _says("area", "whatever else the wiring has there (the records do not tell them apart), and it prints 0 where nothing was launched;")
     _says("guide", "what a block launches beside a kernel of its own is the row of its place in the wiring and says so.")
     _says("area", "The report file holds every block of every row, with its entry and the identity the census states for it.")
@@ -2311,7 +2328,7 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     )
     labels = [row["label"] for row in data["per_kernel"]["rows"]]
     assert labels == ["embedding", "linear_attention.step", "fallback: add_norm_quantize + projection.fp8.in (one row)", labels[3], "host read"]
-    assert labels[3] == "fallback: projection.fp8.out + 9 more (one row)" and len(data["per_kernel"]["rows"][3]["blocks"]) == 10
+    assert labels[3] == "fallback: projection.fp8.out + 10 more (one row)" and len(data["per_kernel"]["rows"][3]["blocks"]) == 11
     assert [line[2:60].rstrip() for line in lines[head + 3 : head + 8]] == labels and lines[head + 8] == "" and lines[head - 1] == ""
     assert lines[head + 9].startswith("report file           ") and lines[head - 2].startswith(("note   ", " " * 22))
     exact = [row for row in data["per_kernel"]["rows"] if row["relation"] == "exact"]
@@ -2938,12 +2955,12 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
     section = area.split("## The performance mode\n", 1)[1].split("\n## ", 1)[0]
     example = section.split("```text\n", 1)[1].split("```", 1)[0].splitlines()
     # the stack the example names, native: its three numbers and its providers with the rows a library serves (the test of the kernels lines)
-    target = {"stated": True, "declared": True, "on_target": 483, "launches": 484, "code": 194, "port": 289, "stand_ins": 0}
-    target.update(by_provider={"cuDNN Frontend": 337, "FlashInfer": 145, "PyTorch": 1}, fallback_calls=0, kernels_per_step=2908, copies_per_step=200)
+    target = {"stated": True, "declared": True, "on_target": 484, "launches": 484, "code": 194, "port": 290, "stand_ins": 0}
+    target.update(by_provider={"cuDNN Frontend": 338, "FlashInfer": 145, "PyTorch": 1}, fallback_calls=0, kernels_per_step=2908, copies_per_step=200)
     today = ["kernel identity not claimed on this GPU class", "launched from Python"]
     sites, claim = _planned(monkeypatch)  # the family's own plan, 64 layers: the rows of the example's table
     table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
-    form = _checkpoint_form(kernels={**target, "absent": 1}, checks={"positions_text": "0-15, 63, 64, 312, 313"}, record={"reasons": today}, per_kernel=table)
+    form = _checkpoint_form(kernels={**target, "absent": 0}, checks={"positions_text": "0-15, 63, 64, 312, 313"}, record={"reasons": today}, per_kernel=table)
     form["observation"] = _alone()  # the example is a run that had its GPU to itself
     form["memory"].update(weights_gib=37.3, state_gib=0.5, peak_reserved_gib=40.0)
     shown = perf.screen({**form, "report_file": "report-<UTC time>.json"})
