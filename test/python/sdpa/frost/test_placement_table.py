@@ -229,7 +229,7 @@ def test_cc103_d256_backward_thd_entries_are_its_own():
     """cc 10.3's own d256 backward entries answer with no transfer: THD on the 128-key tile (study sm103_d256_bwd_v2_20261031,
     THD half) and off it (study sm103_d256_bwd_thd_offtile_20261031). The same graph on cc 10.0 has no entry, so the
     hand-written box decides there. The mask-free MHA classes split on the cost proxy, at their own threshold off the tile.
-    Dense graphs have no entry: they lost on small-work holdout cases."""
+    Dense graphs belong to study sm100_d256_bwd_dense_20261122, which ships causal classes only on cc 10.3."""
     row = "sdpa_bwd_sm100_d256"
 
     def bwd(b, h_q, h_kv, s, causal=True, **over):
@@ -244,7 +244,9 @@ def test_cc103_d256_backward_thd_entries_are_its_own():
     small, large = bwd(1, 8, 8, 256, causal=False), bwd(1, 16, 16, 1024, causal=False)
     assert pt.log2_work(small) < 28.5 <= pt.log2_work(large)
     assert (pt.lookup(row, small), pt.lookup(row, large)) == (False, True)
-    assert pt.lookup(row, bwd(2, 16, 2, 4096, thd=False, max_total_seq_len_q=None)) is None  # dense: no entry
+    dense = dict(thd=False, max_total_seq_len_q=None)
+    assert pt.matched_entry(row, bwd(2, 16, 2, 4096, **dense)).study == "sm100_d256_bwd_dense_20261122"
+    assert pt.lookup(row, bwd(2, 16, 2, 4096, causal=False, **dense)) is None  # dense mask-free: no entry
     assert pt.lookup(row, bwd(2, 16, 2, 4096, dtype=cudnn.data_type.HALF)) is None  # f16: not measured
     assert pt.lookup(row, bwd(2, 16, 2, 4000)) is True  # off the 128-key tile: THD causal GQA, always
     assert pt.lookup(row, bwd(2, 16, 2, 4000, max_total_seq_len_q=6 * 1000)) is True  # ragged, off the tile
@@ -252,7 +254,8 @@ def test_cc103_d256_backward_thd_entries_are_its_own():
     small, large = bwd(1, 8, 8, 1000, causal=False), bwd(1, 16, 16, 3000, causal=False)
     assert pt.log2_work(small) < 30.374 <= pt.log2_work(large)
     assert (pt.lookup(row, small), pt.lookup(row, large)) == (False, True)
-    assert pt.lookup(row, bwd(2, 16, 2, 4000, thd=False, max_total_seq_len_q=None)) is None  # dense off the tile: no entry
+    assert pt.matched_entry(row, bwd(2, 16, 2, 4000, **dense)).study == "sm100_d256_bwd_dense_20261122"
+    assert pt.lookup(row, bwd(2, 16, 2, 4000, causal=False, **dense)) is None  # dense mask-free off the tile: no entry
 
 
 @pytest.mark.L0
