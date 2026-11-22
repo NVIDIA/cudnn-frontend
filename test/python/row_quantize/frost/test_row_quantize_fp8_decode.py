@@ -811,7 +811,8 @@ def test_rendering_synchronizes_once_and_waits_before_every_global_access(arch, 
     for arm, arm_id in zip(LAUNCH_ARMS, LAUNCH_ARM_IDS):
         cfg = _cfg(arm)
         what = f"{arch} {arm_id}"
-        ptx = open(kept[_spec(arm)]["ptx"]).read()
+        with open(kept[_spec(arm)]["ptx"]) as text:
+            ptx = text.read()
         body = re.sub(r"//[^\n]*", "", ptx[ptx.index(".entry") :])
         assert len(re.findall(r"\bbar\.sync\b", body)) == 1, f"{what}: the one thread-block barrier"
         assert len(re.findall(r"\bst\.shared\b", body)) == 1 and len(re.findall(r"\bld\.shared\b", body)) == 1, f"{what}: one slot store, one slot load"
