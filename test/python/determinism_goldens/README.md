@@ -4297,28 +4297,31 @@ cc 10.0 record (2026-11-22 UTC): a cc 10.0 part with 148 SMs (the device reports
 0.1.13.post3 (the `runtime` block of the goldens in `c84dd9abaee769b4/`).  The set was recorded into a new directory
 (`CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -q -ra` -> 18 passed) after the functional module's device cases
 had passed on the same part; the four files were copied unchanged.  Strict check and the functional module, from a clean tree at
-the commit that adds the set: `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 18 passed, 0
+the commit that carries this record: `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 18 passed, 0
 skipped: `test_replay` 4, `test_replay_on_a_fresh_entry_and_fresh_operands` 1, `test_launch_on_a_side_stream_writes_the_same_result`
 1, `test_batch_invariance` 2, `test_insertion_removal_and_reordering` 1, `test_duplicated_row_and_neighbour_isolation` 1,
-`test_inputs_are_unmodified` 1, `test_one_element_moves_one_row` 1, `test_the_row_ceiling_call` 1 (measured: the 1024-row call ran
-in 4 scheduling waves; one wave holds 296 thread blocks on 148 SMs; 13 rows compared alone),
+`test_inputs_are_unmodified` 1, `test_one_element_moves_one_row` 1, `test_the_row_ceiling_call` 1 (measured: 22 rows compared
+alone against the 1024-row call: rows 0, 511, 512, 1023 and both sides of every multiple of 148 SMs),
 `test_row_ceiling_and_the_empty_call_are_typed_declines` 1, `test_golden` 4.
-`pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 102 passed, 1 skipped: the module 97 passed and 1
+`pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 109 passed, 1 skipped: the module 104 passed and 1
 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "needs two CUDA devices" -- one device
 is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the symbol-prefix test 5
 passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 6 of 6 cells (the
 three table kinds at 3 and at 17 rows: one kernel per call; grid `(rows, 1, 1)`, block `(1024, 1, 1)`, 256 B of shared memory).
 The cases of a warm launch behind an allocation that is pending on another stream passed with the parked work still pending when
-the call returned (4 + 1 + 1 cases, none skipped).
+the call returned (4 + 1 + 1 cases, none skipped).  Asked on the same part on the same day: the driver's occupancy answer for each
+of the three compiled kernels at the launch's 1024 threads and 256 B of shared memory is two thread blocks per SM, and each kernel
+holds 30 registers per thread, under the CUDA 13.4 and under the CUDA 12.9 compiler flavour -- one scheduling wave holds 296 rows
+on this part.
 
 CUDA 12.9 compiler flavour on the same part and runtime (the CuTe DSL 4.8.0 install without its CUDA 13 toolchain libraries, so the
 DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL compatibility and is not a
 deployment that uses CUDA 12 throughout): the strict determinism command -> 18 passed, 0 skipped against the SAME set, whose runtime
-key does not name the compiler flavour; the functional command -> 101 passed, 2 skipped (`test_rendering_holds_the_rule` for
+key does not name the compiler flavour; the functional command -> 108 passed, 2 skipped (`test_rendering_holds_the_rule` for
 `sm_107a`: that compiler rejects the target, and the case skips with the entry's own decline; the two-device case).
 
 CuTe DSL 4.8.1 on the same part (the 4.8.1 wheels put first on the path of the same runtime), compiling with CUDA 13.4: the
-functional command -> 102 passed, 1 skipped (the two-device case); the determinism suite recording into a new directory -> 18 passed
+functional command -> 109 passed, 1 skipped (the two-device case); the determinism suite recording into a new directory -> 18 passed
 (the DSL version is part of the runtime key and no set is committed for that key).  That record holds the input and output hashes
 of the committed 4.8.0 set in 4 of 4 files; it is not committed.
 
@@ -4327,7 +4330,7 @@ assemble for `sm_100a`, `sm_103a`, `sm_107a` and `sm_120a` with the CUDA 13.4 co
 12.9 compiler; the three `sm_100a` cubins the device compiled under each of 4.8.0 / CUDA 13.4, 4.8.0 / CUDA 12.9 and 4.8.1 / CUDA
 13.4 are those host renderings of the same compiler flavour, by hash.  `pytest <module> <suite> row_quantize/frost
 sdpa/frost/test_tile_dsl_rowwise.py core/frost/test_init_order.py core/frost/test_frost_kernel_name_prefix.py
-core/test_import_boundaries.py -m L0 -q -ra` on that host under 4.8.0 with CUDA 13.4: 202 passed, 148 skipped (the device cases).
+core/test_import_boundaries.py -m L0 -q -ra` on that host under 4.8.0 with CUDA 13.4: 209 passed, 148 skipped (the device cases).
 
 ### QSA: 42 cases
 
