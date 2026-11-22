@@ -16,6 +16,11 @@ out[r]  = column                 without an id table   (int32)
 absent, or an int32 or int64 table of `width` elements. The call returns `out`: one result per row, int32 without a table, else
 the table's dtype. Compute capability 10.x; a CuTe DSL >= 4.8.0. Inference only: there is no backward.
 
+It is a decode-step entry. One neighbour of this library does related work and is not the same operation: an argmax written as
+a [custom reduction](/operations/CustomReduction) of the graph API (`cudnn.reduction_modifiers.argmax`) is a graph node with its
+own tie and NaN policy and an index stream as its result. Use it inside a graph; use this entry as a direct call for the rows of
+a decode step, 1 .. 1024 of them, with the id-table lookup in the same launch.
+
 ## Numerics contract
 
 The rule is the contract, and it is exact: compares, selects and bit copies, no arithmetic on a value and no rounding. The result
