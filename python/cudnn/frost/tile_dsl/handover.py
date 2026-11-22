@@ -95,5 +95,5 @@ def acquired_zero(count, adding_lanes: cutlass.Constexpr[int]):
 
     It is 0 only while the ledger holds: the counter is cleared for every launch, exactly ``adding_lanes`` lanes add to it
     and ``poll_then_acquire`` waited for that number.  A counter that reads more moves whatever the zero is added to: a
-    broken ledger shows as a wrong index instead of passing silently."""
+    ledger that does not hold shows as a wrong index instead of passing silently."""
     return count - cutlass.Int32(adding_lanes)
