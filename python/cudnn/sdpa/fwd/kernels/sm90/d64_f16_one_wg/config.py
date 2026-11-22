@@ -35,6 +35,7 @@ def validate_params(params):
         window_left=params.window_left,
         window_right=params.window_right,
         split_kv=params.split_kv,
+        bias=params.has_bias,
     )
     if why is not None:
         raise ValueError(why)

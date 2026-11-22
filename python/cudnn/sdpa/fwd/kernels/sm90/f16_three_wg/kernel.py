@@ -23,6 +23,11 @@ The kernel implements:
 - Causal masks (top-left or bottom-right), sliding windows, right bands, dense per-batch
   lengths, THD (ragged / packed) batches, PackGQA, per-Q-head sinks, and per-row LSE
   (Stats) in natural log or, under ``stats_log2``, base 2.
+- An optional additive bias ``[1|B, 1|H_q, S_q, S_kv]`` on dense, unsplit, unpacked
+  tiles: each WG1 warp stages its 16 rows of the tile's bias in shared memory with
+  ``cp.async`` before QK, and the softmax forms the natural-unit logit
+  ``scale * Q.K + bias`` before masking, anchors the row at its maximum logit and
+  subtracts that anchor before the base-2 conversion.
 
 Storage: Q, K and V/O are single-stage regions of two/four/eight SW128 slabs, V and O
 aliasing one of them. Single-stage K and V mean the producer cannot run a KV tile ahead:
@@ -72,7 +77,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
     thd_origin_maps,
     thd_origins_off,
 )
-from cudnn.sdpa.fwd.kernels.sm90.prepared_host import host as _host, compile_host
+from cudnn.sdpa.fwd.kernels.sm90.prepared_host import compile_host, host as _host, host_bias as _host_bias
 from cudnn.sdpa.fwd.kernels.sm90.thd_origins import ROW_Q, ROW_STATS, build_thd_origin_setup_kernel, origin_row
 from cudnn.sdpa.fwd.kernels.thd_helpers import THD_SETUP_THREADS, build_thd_meta_o_descs_kernel
 from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
@@ -189,6 +194,8 @@ class SM90FusedMultiHeadAttentionForward:
         thd_origins: tuple | None = None,
         split_kv: int = 1,
         page_size: int = 0,
+        has_bias: bool = False,
+        bias_fp32: bool = False,
     ):
         """Initialize the SM90 D512 FMHA prefill kernel configuration.
 
@@ -245,6 +252,12 @@ class SM90FusedMultiHeadAttentionForward:
             buffer. ``None`` keeps the packed layout.
         :param split_kv: Dense-only KV partitions. The producer writes sink-free
             partials; the shared combine folds sinks and the final Stats log base.
+        :param has_bias: Add a ``[1|B, 1|H_q, S_q, S_kv]`` bias to every score: the logit is
+            ``scale * Q.K + bias`` in natural units, formed before masking, and the softmax
+            then anchors each row at its maximum logit with unit scale, whatever the sign of
+            ``scale_mode`` (a zero scale keeps the bias alone). Dense, unsplit and unpacked
+            only. ``False`` binds no ``bias`` operand.
+        :param bias_fp32: Load the bias as FP32 instead of the Q/K/V dtype.
         """
 
         _, h_q, h_kv, _, _ = shape
@@ -284,10 +297,24 @@ class SM90FusedMultiHeadAttentionForward:
         # Split a GQA group into equal subgroups that divide the 64-row tile.
         self.heads_per_tile = pack_gqa_group_size(qh_per_kh, self.Q_TILE, partial=True) if pack_gqa else 1
         self.scale_mode = scale_mode
+        if has_bias and (thd_varlen or page_size or split_kv != 1 or pack_gqa):
+            raise ValueError("prefill_d512_f16_sm90: an additive bias is dense, nonpaged, unsplit and unpacked")
+        self.has_bias = has_bias
+        self.bias_dtype = (cutlass.Float32 if bias_fp32 else in_dtype) if has_bias else None
+        if has_bias and bias_fp32 and self.HEAD_TILE == 512:
+            raise ValueError("prefill_d512_f16_sm90: an FP32 bias tile does not fit beside the D512 storage; bias the D512 tile in the Q/K/V dtype")
+        # The staged bias tile: Q_TILE rows of KV_TILE keys as 128-byte column slabs (one for a
+        # 16-bit bias, two for FP32), each row's 16-byte chunks XOR-swizzled by row % 8.
+        self.bias_elem_bytes = self.bias_dtype.width // 8 if has_bias else 0
+        self.bias_slabs = self.KV_TILE * self.bias_elem_bytes // 128 if has_bias else 0
+        # The softmax's numerical path. Without a bias it is the scale's sign. With one, the
+        # scores reach the softmax as natural-unit logits, so the row runs the positive path at
+        # unit scale (scale_mode then only says how a logit is formed).
+        self.softmax_mode = SCALE_POSITIVE if has_bias else scale_mode
         # The anchor is the raw-score extremum that maximizes the scaled score: the
         # maximum for a non-negative scale, the minimum for a negative one, with the
         # sentinel as its identity.
-        self.anchor_sentinel = -cutlass.Float32.inf if scale_mode >= SCALE_ZERO else cutlass.Float32.inf
+        self.anchor_sentinel = -cutlass.Float32.inf if self.softmax_mode >= SCALE_ZERO else cutlass.Float32.inf
         self.stats_log2 = stats_log2 and split_kv == 1
 
         # Named-barrier ids. The init publish takes barrier_cta_sync's default id 0, so
@@ -513,13 +540,22 @@ class SM90FusedMultiHeadAttentionForward:
         anchors and alpha agree and their complementary sums merge only at finalization.
         ``MASK_NONE`` requires every score in the tile to be valid.
 
+        With a bias, ``softmax_params.bias`` is the shared tile ``stage_bias_tile`` filled for
+        this warp's rows; each score becomes the logit ``scale * score + bias`` first, and the
+        anchor and exponents then use ``softmax_params.scale_log2 = log2(e)``.
+
         :return: ``s_regs``, with this tile's P packed into the consumed score slots.
         """
         work, local_tid = basic_params.work, basic_params.local_tid
         row_anchor, row_sum, alpha = softmax_params.anchor, softmax_params.partial_sum, softmax_params.alpha
         scale_log2, scale_log2_wide = softmax_params.scale_log2, softmax_params.scale_log2_wide
-        extremum, quad_op = (cute.arch.fmax, "max") if cutlass.const_expr(self.scale_mode >= SCALE_ZERO) else (cute.arch.fmin, "min")
+        extremum, quad_op = (cute.arch.fmax, "max") if cutlass.const_expr(self.softmax_mode >= SCALE_ZERO) else (cute.arch.fmin, "min")
         sentinel, zero = cutlass.Float32(self.anchor_sentinel), cutlass.Float32(0.0)
+        if cutlass.const_expr(self.has_bias):
+            # This lane's copies of the warp's bias rows have landed; the warp barrier makes
+            # every lane's copies visible to the lanes that read them.
+            prims.cp_async_wait_group(0)
+            prims.bar_warp_sync(cute.arch.FULL_MASK)
         # A masked-out P stays a runtime value. On a dense unmasked graph the first
         # tile's padding mask folds, and a literal 0.0 would reach fp32_to_fp16's inline
         # PTX as an immediate, which ICEs libNVVM (pointwise.opaque_f32_zero).
@@ -559,8 +595,18 @@ class SM90FusedMultiHeadAttentionForward:
                 # alpha and P are exp2(+-0) = 1 from runtime EX2s. P must stay a runtime
                 # value: a constant would reach fp32_to_fp16's inline PTX as an
                 # immediate, which ICEs libNVVM (pointwise.opaque_f32_zero).
-                s0 = zero if cutlass.const_expr(self.scale_mode == SCALE_ZERO) else s_regs[s_off + s_reg_idx_lo]
-                s1 = zero if cutlass.const_expr(self.scale_mode == SCALE_ZERO) else s_regs[s_off + s_reg_idx_hi]
+                s0 = zero if cutlass.const_expr(self.softmax_mode == SCALE_ZERO) else s_regs[s_off + s_reg_idx_lo]
+                s1 = zero if cutlass.const_expr(self.softmax_mode == SCALE_ZERO) else s_regs[s_off + s_reg_idx_hi]
+                if cutlass.const_expr(self.has_bias):
+                    # The natural-unit logit (SDPA Rule S17): the bias joins the scaled score
+                    # before masking and the extremum. A zero scale keeps the bias alone, so a
+                    # nonfinite raw score cannot reach the row.
+                    b0, b1 = self.read_bias_pair(softmax_params.bias, owned_row(local_tid, row_half), k_frag, local_tid % 4)
+                    if cutlass.const_expr(self.scale_mode == SCALE_ZERO):
+                        s0, s1 = b0, b1
+                    else:
+                        s0 = s0 * softmax_params.qk_scale + b0
+                        s1 = s1 * softmax_params.qk_scale + b1
                 valid0 = cutlass.Boolean(column_mask & cutlass.Uint32(1 << (2 * k_frag)))
                 valid1 = cutlass.Boolean(column_mask & cutlass.Uint32(1 << (2 * k_frag + 1)))
                 validity.append((valid0, valid1))
@@ -574,7 +620,7 @@ class SM90FusedMultiHeadAttentionForward:
                 else:
                     chain = 2 * (k_frag % 2)
                     chains[chain], chains[chain + 1] = extremum(chains[chain], s0), extremum(chains[chain + 1], s1)
-                if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
+                if cutlass.const_expr(self.softmax_mode == SCALE_POSITIVE and not self.has_bias):
                     # A magnitude guard, not a finiteness proof: fmax quiets NaNs.
                     if valid0:
                         local_abs = cute.arch.fmax(local_abs, cute.math.abs(s0))
@@ -597,8 +643,8 @@ class SM90FusedMultiHeadAttentionForward:
             # A positive scale takes them when the launch-uniform term is set, or when a
             # valid score, either anchor or their distance could overflow the FP32
             # products.
-            wide = cutlass.Boolean(self.scale_mode < SCALE_ZERO)
-            if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
+            wide = cutlass.Boolean(self.softmax_mode < SCALE_ZERO)
+            if cutlass.const_expr(self.softmax_mode == SCALE_POSITIVE and not self.has_bias):
                 bound = cute.arch.fmax(cute.arch.fmax(quad_reduce(local_abs, "max"), cute.math.abs(safe_current)), cute.math.abs(safe_old))
                 wide = softmax_params.wide_uniform
                 if bound > softmax_params.wide_floor:
@@ -611,23 +657,31 @@ class SM90FusedMultiHeadAttentionForward:
             # Keeping the branch outside the pairs avoids reconvergence around each
             # exp2, and computing the old anchor's exponent inside it keeps its FP64
             # difference off the narrow path.
-            exponents, old_exponent = scores.vec, zero
-            if wide:
-                old_exponent = cutlass.Float32((cutlass.Float64(old) - cutlass.Float64(current)) * scale_log2_wide)
-                # FP64 differences; the zero-select below discards every invalid slot's
-                # exponent.
-                exponent_pairs = []
-                for k_frag in cutlass.range_constexpr(self.qk_row_slots // 2):
-                    pair = scores[2 * k_frag : 2 * k_frag + 2]
-                    s0, s1 = pair[0], pair[1]
-                    x0 = cutlass.Float32((cutlass.Float64(s0) - cutlass.Float64(current)) * scale_log2_wide)
-                    x1 = cutlass.Float32((cutlass.Float64(s1) - cutlass.Float64(current)) * scale_log2_wide)
-                    exponent_pairs.append(cutlass.Vector.from_elements((x0, x1), cutlass.Float32))
-                exponents = vec_concat(exponent_pairs)
-            else:
+            if cutlass.const_expr(self.has_bias):
+                # SDPA Rule S17: subtract the anchor in natural units, then convert to base 2. The
+                # anchor's own exponent is then exactly 0 and every other one <= 0 at any logit
+                # magnitude; two rounded products would differ at the anchor by their rounding
+                # error, which past ~1e10 exceeds EX2's range.
                 old_exponent = (old - safe_current) * scale_log2
-                # Preserve both products and the existing exponent rounding policy.
-                exponents = (scores * scale_log2 - safe_current * scale_log2).vec
+                exponents = ((scores - safe_current) * scale_log2).vec
+            else:
+                exponents, old_exponent = scores.vec, zero
+                if wide:
+                    old_exponent = cutlass.Float32((cutlass.Float64(old) - cutlass.Float64(current)) * scale_log2_wide)
+                    # FP64 differences; the zero-select below discards every invalid slot's
+                    # exponent.
+                    exponent_pairs = []
+                    for k_frag in cutlass.range_constexpr(self.qk_row_slots // 2):
+                        pair = scores[2 * k_frag : 2 * k_frag + 2]
+                        s0, s1 = pair[0], pair[1]
+                        x0 = cutlass.Float32((cutlass.Float64(s0) - cutlass.Float64(current)) * scale_log2_wide)
+                        x1 = cutlass.Float32((cutlass.Float64(s1) - cutlass.Float64(current)) * scale_log2_wide)
+                        exponent_pairs.append(cutlass.Vector.from_elements((x0, x1), cutlass.Float32))
+                    exponents = vec_concat(exponent_pairs)
+                else:
+                    old_exponent = (old - safe_current) * scale_log2
+                    # Preserve both products and the existing exponent rounding policy.
+                    exponents = (scores * scale_log2 - safe_current * scale_log2).vec
             old_scale = zero
             if cutlass.const_expr(is_first_kv_tile):
                 old_scale = cutlass.Float32(1.0)
@@ -672,6 +726,55 @@ class SM90FusedMultiHeadAttentionForward:
         prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
         prims.barrier_cta_sync(self.bar_v_tail_base + half, thread_count=cute.arch.THREADS_PER_WARPGROUP)
 
+    def bias_offset(self, row, chunk):
+        """Element offset of 16-byte chunk ``chunk`` of tile row ``row`` in the staged bias tile."""
+        chunk_elems = 16 // self.bias_elem_bytes
+        slab, within = chunk // 8, chunk % 8
+        return slab * (self.Q_TILE * 128 // self.bias_elem_bytes) + row * (128 // self.bias_elem_bytes) + (within ^ (row % 8)) * chunk_elems
+
+    @cute.jit
+    def stage_bias_tile(self, work, local_tid, bias, sBias, kv_seq_idx):
+        """Start this warp's ``cp.async`` copies of its 16 bias rows for the tile at ``kv_seq_idx``.
+
+        Warp w owns tile rows 16w..16w+15, the rows its score fragment covers, so the copy
+        and the reads stay within one warp. Lanes copy 16-byte chunks in row order (four
+        rows of one 16-bit tile per warp-wide copy). A row past S_q is zero-filled, and the
+        chunk holding key S_kv-1 reads only the bytes up to it: masked slots, never read as
+        logits. A broadcast batch or head axis reads index 0. The copies join one committed
+        group, which ``online_softmax`` waits for.
+        """
+        lane, warp = local_tid % cute.arch.WARP_SIZE, local_tid // cute.arch.WARP_SIZE
+        elem = self.bias_elem_bytes
+        chunks_per_row = self.KV_TILE * elem // 16
+        bb = cutlass.Int64(cute.math.min(work.batch, cutlass.Int32(bias.shape[0]) - cutlass.Int32(1)))
+        bh = cutlass.Int64(cute.math.min(work.head, cutlass.Int32(bias.shape[1]) - cutlass.Int32(1)))
+        base = bb * cutlass.Int64(bias.stride[0]) + bh * cutlass.Int64(bias.stride[1])
+        for i in cutlass.range_constexpr(16 * chunks_per_row // cute.arch.WARP_SIZE):
+            index = i * cute.arch.WARP_SIZE + lane
+            row = 16 * warp + index // chunks_per_row
+            chunk = index % chunks_per_row
+            q_row = work.q_base + row
+            column = kv_seq_idx + chunk * (16 // elem)
+            live = cute.math.min(cute.math.max((cutlass.Int32(self.s_kv) - column) * elem, cutlass.Int32(0)), cutlass.Int32(16))
+            if q_row >= cutlass.Int32(self.s_q):
+                live = cutlass.Int32(0)
+            # A copy that reads nothing still needs a valid source: the bias base.
+            offset = cutlass.Int64(0)
+            if live > 0:
+                offset = base + cutlass.Int64(q_row) * cutlass.Int64(bias.stride[2]) + cutlass.Int64(column)
+            prims.cp_async_shared_global(sBias.data_ptr() + self.bias_offset(row, chunk), bias.iterator + offset, 16, prims.LoadCacheModifier.CG, cp_size=live)
+        prims.cp_async_commit_group()
+
+    @cute.jit
+    def read_bias_pair(self, sBias, row, k_frag: cutlass.Constexpr, quad):
+        """Read the staged bias of keys 8*k_frag+2*quad+{0,1} in tile row ``row`` as two FP32 values."""
+        elem = self.bias_elem_bytes
+        pair = 8 * k_frag + 2 * quad
+        chunk = pair * elem // 16
+        within = pair % (16 // elem)
+        start = sBias.data_ptr() + self.bias_offset(row, chunk) + within
+        return cutlass.Float32(start.load()), cutlass.Float32((start + 1).load())
+
     @cute.jit
     def compute_one_kv_tile(
         self,
@@ -700,6 +803,12 @@ class SM90FusedMultiHeadAttentionForward:
         bars, work, local_tid = basic_params.bars, basic_params.work, basic_params.local_tid
         sP_xfer_raw, sAlpha_xfer_raw = basic_params.sP_xfer_raw, basic_params.sAlpha_xfer_raw
         kv_seq_idx = (work.kv_right - 1 - kv_step) * self.KV_TILE
+        if cutlass.const_expr(self.has_bias):
+            # Issued ahead of the K wait and QK, so the copies overlap both. The refill follows
+            # this warp's reads of the previous tile, which its P store already depends on
+            # (SDPA Rule S15's stored-result order); the barrier joins the warp's lanes.
+            prims.bar_warp_sync(cute.arch.FULL_MASK)
+            self.stage_bias_tile(work, local_tid, softmax_params.bias_tensor, softmax_params.bias, kv_seq_idx)
         bars.mb_tma_k_full.wait(kv_full_state.phase)
         mma_qk(mma_params, s_regs, ab_dtype=self.storage_dtype, head_tile=self.HEAD_TILE)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
@@ -871,6 +980,8 @@ class SM90FusedMultiHeadAttentionForward:
         batch,
         block_table=None,
         block_table_v=None,
+        bias=None,
+        sBias_raw=None,
     ):
         """Resolve one (Q tile, head, batch) work tile and run this thread's role on it.
 
@@ -1023,10 +1134,15 @@ class SM90FusedMultiHeadAttentionForward:
                 # halves before compute_one_kv_tile publishes them, so alpha needs no
                 # initial store.
                 alpha = cutlass.Array(cutlass.Float32, 2, alignment=8)
-                scale_log2 = scale * cutlass.Float32(LOG2_E)
-                scale_log2_wide = cutlass.Float64(scale) * cutlass.Float64(LOG2_E)
+                # The softmax's natural-unit scale: the host scale, or 1 when a bias makes
+                # the scores logits before the softmax sees them.
+                softmax_scale = scale
+                if cutlass.const_expr(self.has_bias):
+                    softmax_scale = cutlass.Float32(1.0)
+                scale_log2 = softmax_scale * cutlass.Float32(LOG2_E)
+                scale_log2_wide = cutlass.Float64(softmax_scale) * cutlass.Float64(LOG2_E)
                 wide_uniform, wide_floor, wide_limit = cutlass.Boolean(False), cutlass.Float32(0.0), cutlass.Float32(0.0)
-                if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
+                if cutlass.const_expr(self.softmax_mode == SCALE_POSITIVE):
                     # Launch-uniform: decide the scale-only guard once, in WG1 setup.
                     magnitude = cutlass.Float64(cute.math.abs(scale_log2))
                     wide_uniform = magnitude > cutlass.Float64(FLT_MAX_F64)
@@ -1035,17 +1151,21 @@ class SM90FusedMultiHeadAttentionForward:
                         limit = (limit.bitcast(cutlass.Uint32) - cutlass.Uint32(1)).bitcast(cutlass.Float32)
                     wide_floor, wide_limit = cute.arch.fmin(limit, cutlass.Float32(2.0**126)), limit
                 # Natural-log scale for finalization, FP32/FP64 log2 scales for EX2, and
-                # the launch-uniform guard terms for the per-row magnitude test.
+                # the launch-uniform guard terms for the per-row magnitude test. A bias
+                # plan also carries its operand, the staged tile and the QK scale.
                 softmax_params = SimpleNamespace(
                     anchor=anchor,
                     partial_sum=partial_sum,
                     alpha=alpha,
-                    scale=scale,
+                    scale=softmax_scale,
                     scale_log2=scale_log2,
                     scale_log2_wide=scale_log2_wide,
                     wide_uniform=wide_uniform,
                     wide_floor=wide_floor,
                     wide_limit=wide_limit,
+                    bias_tensor=bias,
+                    bias=sBias_raw,
+                    qk_scale=scale,
                 )
                 row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
                 row_lse.store((-cutlass.Float32.inf, -cutlass.Float32.inf))
@@ -1140,9 +1260,11 @@ class SM90FusedMultiHeadAttentionForward:
                     for row_half in cutlass.range_constexpr(2):
                         total = quad_reduce(softmax_params.partial_sum[row_half], "sum")
                         if cutlass.const_expr(self.fold_sink):
-                            inv, value = normalize_sink_row(softmax_params.anchor[row_half], softmax_params.scale, total, logits[row_half], self.scale_mode)
+                            inv, value = normalize_sink_row(softmax_params.anchor[row_half], softmax_params.scale, total, logits[row_half], self.softmax_mode)
                         else:
-                            inv, value = normalize_row(softmax_params.anchor[row_half], softmax_params.scale, softmax_params.scale_log2, total, self.scale_mode)
+                            inv, value = normalize_row(
+                                softmax_params.anchor[row_half], softmax_params.scale, softmax_params.scale_log2, total, self.softmax_mode
+                            )
                         if cutlass.const_expr(self.fold_sink and self.dense_q_lengths):
                             inv = cutlass.Float32(0.0) if trimmed[row_half] else inv
                             value = cutlass.Float32(-cutlass.Float32.inf) if trimmed[row_half] else value
@@ -1272,6 +1394,7 @@ class SM90FusedMultiHeadAttentionForward:
         scale: cutlass.Float32,
         block_table=None,
         block_table_v=None,
+        bias=None,
     ):
         """Run one work tile per CTA: allocate, decode, then run the three roles.
 
@@ -1291,6 +1414,11 @@ class SM90FusedMultiHeadAttentionForward:
         sP_xfer_raw = cutlass.Array(self.storage_dtype, self.P_STAGES * self.p_xfer_elems, alignment=1024, space=cutlass.AddressSpace.smem)
         sAlpha_xfer_raw = cutlass.Array(cutlass.Float32, self.row_factor_elems, alignment=128, space=cutlass.AddressSpace.smem)
         sInvSum_xfer_raw = cutlass.Array(cutlass.Float32, self.row_factor_elems, alignment=128, space=cutlass.AddressSpace.smem)
+        # The staged bias tile (has_bias only): Q_TILE x KV_TILE elements, written by WG1's
+        # cp.async copies and read by the same warp (stage_bias_tile).
+        sBias_raw = None
+        if cutlass.const_expr(self.has_bias):
+            sBias_raw = cutlass.Array(self.bias_dtype, self.Q_TILE * self.KV_TILE, alignment=128, space=cutlass.AddressSpace.smem)
         bars = Bars(
             mb_tma_q_full=MBarrier(
                 cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
@@ -1474,6 +1602,8 @@ class SM90FusedMultiHeadAttentionForward:
             batch,
             block_table,
             block_table_v,
+            bias,
+            sBias_raw,
         )
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1502,6 +1632,7 @@ class SM90FusedMultiHeadAttentionForward:
         stream: cuda_driver.CUstream,
         block_table: Optional[cute.Tensor] = None,
         block_table_v: Optional[cute.Tensor] = None,
+        bias: Optional[cute.Tensor] = None,
     ) -> None:
         """Build the port maps, run the THD setup when packed, and launch the kernel.
 
@@ -1536,6 +1667,8 @@ class SM90FusedMultiHeadAttentionForward:
             ``None`` for a port without them; likewise ``thd_ro_k`` .. ``thd_ro_lse``.
             Each THD view's token extent is then that port's own capacity.
         :param stream: CUDA stream of the THD setup launch and the attention launch.
+        :param bias: ``has_bias`` only: the ``(B_b, H_b, S_q, S_kv)`` additive bias, B_b and
+            H_b each 1 or the full extent, its key dim contiguous. ``None`` otherwise.
         """
 
         # The shared prepared binder validates addresses, extents and Int64 strides.
@@ -1640,6 +1773,15 @@ class SM90FusedMultiHeadAttentionForward:
             raise ValueError("prefill_d512_f16_sm90: sinks must be provided exactly when the kernel is configured with has_sink")
         if cutlass.const_expr(sinks is not None and tuple(sinks.shape) != (self.h_q,)):
             raise ValueError(f"prefill_d512_f16_sm90: sinks must have shape (H_q,) = ({self.h_q},); got {tuple(sinks.shape)}")
+        if cutlass.const_expr(self.has_bias != (bias is not None)):
+            raise ValueError("prefill_d512_f16_sm90: bias must be provided exactly when the kernel is configured with has_bias")
+        # Static bias extents must match the declared plane; the pointer host's are runtime values the binder checked.
+        if cutlass.const_expr(
+            bias is not None and any(isinstance(extent, int) and extent != size for extent, size in zip(bias.shape[2:], (self.s_q, self.s_kv)))
+        ):
+            raise ValueError(
+                f"prefill_d512_f16_sm90: bias must be (1|B, 1|H_q, S_q, S_kv) with (S_q, S_kv) = ({self.s_q}, {self.s_kv}); got {tuple(bias.shape)}"
+            )
         # The declared problem sizes the grid, the KV-head addressing and the Stats
         # store, so each operand must carry it. A THD port is a batch-1 view whose token
         # total has no static extent.
@@ -1658,6 +1800,10 @@ class SM90FusedMultiHeadAttentionForward:
         read_kv_lens = seq_kv_lens if cutlass.const_expr(self.thd_varlen or self.dense_kv_lengths) else None
         if cutlass.const_expr(self.page_size > 0):
             self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, sinks, read_q_lens, read_kv_lens, scale, block_table, block_table_v).launch(
+                grid=grid, block=(self.threads_per_cta, 1, 1), stream=stream
+            )
+        elif cutlass.const_expr(self.has_bias):
+            self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, sinks, read_q_lens, read_kv_lens, scale, None, None, bias).launch(
                 grid=grid, block=(self.threads_per_cta, 1, 1), stream=stream
             )
         else:
@@ -1741,6 +1887,8 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         thd_origins=PARAMS.thd_origins,
         split_kv=PARAMS.split_kv,
         page_size=PARAMS.page_size,
+        has_bias=PARAMS.has_bias,
+        bias_fp32=PARAMS.bias_fp32,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel
@@ -1769,4 +1917,5 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         bool(PARAMS.thd_varlen and lse_stride and lse_stride[2] == 1 and lse_stride[1] != 1),
         _cache_key,
         target,
+        bias_dtype=kernel.bias_dtype,
     )

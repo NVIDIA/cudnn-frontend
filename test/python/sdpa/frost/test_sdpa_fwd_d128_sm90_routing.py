@@ -183,7 +183,17 @@ def test_two_flavor_policy_retains_the_historical_geometry():
 
 # --- The row against config_sm90 (rule 8b': row and adapter read the same constants) -------
 
+
 # Each D128_NOT_SERVED key as an exact (128, 128) graph declares it (facts) or a knob set asks for it (knobs).
+class _HalfBias:
+    """A bias tensor declaration's dtype, the one field the row reads from it."""
+
+    def get_data_type(self):
+        import cudnn
+
+        return cudnn.data_type.HALF
+
+
 _NOT_SERVED_GRAPHS = {
     "thd": (dict(thd=True, padded=True), {}),
     "paged": (dict(has_paged_kv=True, page_size=64, padded=True), {}),
@@ -193,6 +203,7 @@ _NOT_SERVED_GRAPHS = {
     "window_right": (dict(right_band_widening=True, right_bound=4), {}),
     "lengths": (dict(padded=True), {}),
     "pack_gqa": (dict(h_kv=2), dict(pack_gqa=True)),
+    "bias": (dict(has_bias=True, bias_t=_HalfBias(), bias_dim=(1, 1, 512, 512), bias_stride=(512 * 512, 512 * 512, 512, 1)), {}),
 }
 
 
@@ -486,7 +497,7 @@ def test_declared_features_spells_each_flag_once():
     assert c.declared_features() == c.declared_features(window_left=None, window_right=0, split_kv=1) == frozenset()
     assert c.declared_features(window_left=0) == {"window_left"}
     assert c.declared_features(window_right=1) == {"window_right"}
-    named = c.declared_features(thd=True, sink=True, window_left=4, window_right=2, lengths=True, pack_gqa=True, paged=True, split_kv=2)
+    named = c.declared_features(thd=True, sink=True, window_left=4, window_right=2, lengths=True, pack_gqa=True, paged=True, split_kv=2, bias=True)
     assert named == set(c.D128_NOT_SERVED)
 
 
@@ -505,6 +516,7 @@ def test_d128_refusal_and_the_picker_read_one_table():
         pack_gqa=(False, True),
         page_size=(0, 64),
         split_kv=(1, 2),
+        has_bias=(False, True),
     )
     for values in itertools.product(*flags.values()):
         params = dataclasses.replace(c.TemplateParams(), **dict(zip(flags, values)))
@@ -517,6 +529,7 @@ def test_d128_refusal_and_the_picker_read_one_table():
             pack_gqa=params.pack_gqa,
             paged=params.page_size != 0,
             split_kv=params.split_kv,
+            bias=params.has_bias,
         )
         try:
             c.validate_params(params, flavor=c.D128_FLAVOR)
@@ -651,9 +664,13 @@ def test_d128_template_fits_the_shared_sm90_prepared_host():
         functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
         return assigned(method(tree, "__init__"), "self").union(*(assigned(f, "kernel") for f in functions))
 
-    assert ("host", "_host") in host_imports(d512) and host_imports(d128) == host_imports(d512), (host_imports(d128), host_imports(d512))
+    # The D512 body also imports the bias host: an additive bias is its leg alone (D128_NOT_SERVED).
+    bias_only = {("host_bias", "_host_bias")}
+    assert ("host", "_host") in host_imports(d512) and bias_only <= set(host_imports(d512)), host_imports(d512)
+    assert set(host_imports(d128)) == set(host_imports(d512)) - bias_only, (host_imports(d128), host_imports(d512))
     assert exports(d512) and exports(d128) == exports(d512), (exports(d128), exports(d512))
-    assert call_args(d128) == call_args(d512), (call_args(d128), call_args(d512))
+    # The D512 body's __call__ appends the bias operand, which the host passes to a bias tile only.
+    assert call_args(d512) == call_args(d128) + ["bias"], (call_args(d128), call_args(d512))
     head, extra = compile_args(d128)[: len(compile_args(d512))], compile_args(d128)[len(compile_args(d512)) :]
     assert head == compile_args(d512) and set(extra) <= {"persistent_ctas"}, (compile_args(d128), compile_args(d512))
     reads = {n.attr for n in ast.walk(host) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "kernel"}
@@ -782,7 +799,9 @@ def test_d128_causal_claim_is_the_int_0_or_1_on_a_persistent_causal_natural_reco
         c.validate_params(_record(**_CAUSAL_PERSISTENT, causal_claim=claim), flavor=c.D128_FLAVOR)
     with pytest.raises(ValueError, match="^SM90 D512 has no causal claim counter"):
         c.validate_params(_record(causal_claim=1))
-    assert [f.name for f in dataclasses.fields(c.TemplateParams)][-2:] == ["causal_walk", "causal_claim"]
+    # Pinned from the segment, as test_d128_switch_fields_are_appended_last does: fields appended later still pass.
+    names = [f.name for f in dataclasses.fields(c.TemplateParams)]
+    assert names[names.index("causal_walk") + 1] == "causal_claim", names
     assert c.TemplateParams().causal_claim == c.D128_CLAIM_OFF == 0 and c.D128_CLAIM_WORKSPACE_BYTES == 128
 
 
