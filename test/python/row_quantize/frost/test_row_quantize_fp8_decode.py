@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 
 import pytest
@@ -278,6 +279,22 @@ def test_only_the_live_rows_of_an_output_count_as_written():
         entry.check_binding(_cfg(), x, codes, scales_live)
 
 
+def test_operands_that_only_touch_are_served():
+    """The overlap rule is one of half-open byte ranges: an output that starts at the byte where another operand ends shares no
+    byte with it.  ``x``, ``codes`` and ``scales`` laid back to back in ONE buffer bind; the same ``scales`` moved one row down
+    into the live codes is declined."""
+    rows = 3
+    raw = torch.zeros(rows * WIDTH * 2 + rows * WIDTH + 4 * rows, dtype=U8)
+    x = raw[: rows * WIDTH * 2].view(BF16).reshape(rows, WIDTH)
+    codes = raw[rows * WIDTH * 2 : rows * WIDTH * 3].view(E4M3).reshape(rows, WIDTH)
+    scales = raw[rows * WIDTH * 3 :].view(FP32).reshape(rows, 1)
+    assert x.data_ptr() + 2 * x.numel() == codes.data_ptr() and codes.data_ptr() + codes.numel() == scales.data_ptr()
+    assert entry.check_binding(_cfg(), x, codes, scales) == rows
+    inside = raw[rows * WIDTH * 3 - 4 : rows * WIDTH * 3 + 8].view(FP32).reshape(rows, 1)
+    with pytest.raises(ValueError, match="must not overlap"):
+        entry.check_binding(_cfg(), x, codes, inside)
+
+
 def test_binding_check_requires_every_operand_on_the_given_device():
     ops = _host_operands()
     with pytest.raises(ValueError, match="every operand must live on one device.*x is on cpu"):
@@ -433,16 +450,49 @@ def test_a_declined_call_compile_or_outputs_allocates_nothing_and_leaves_no_reco
     assert [c[0] for c in s.calls] == ["empty", "empty", "enter", "record", "leave"] and len(k._pending) == 1 and set(k.buffers) == {3}
 
 
+def test_compile_and_launch_run_under_the_entrys_device(monkeypatch):
+    """The device is implicit state like the stream: the trace-compile, and a call's whole launch step -- the entry-owned pair, the
+    launch stream, the order behind a pending allocation, the launch -- run inside the scope of the ENTRY's device and leave it
+    again.  On stand-ins, with the compile and the launch intercepted (no device): an entry for a CUDA ordinal nobody made
+    current."""
+    cute = pytest.importorskip("cutlass.cute")
+    s = stand_ins(monkeypatch)
+    dev = torch.device("cuda", 5)
+    host_allocations(monkeypatch, dev, s.calls)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    monkeypatch.setattr(entry, "_dsl_error", lambda cc: None)
+
+    @contextmanager
+    def scope(device):
+        s.calls.append(("scope in", device))
+        try:
+            yield
+        finally:
+            s.calls.append(("scope out", device))
+
+    monkeypatch.setattr(entry, "device_context", scope)
+    monkeypatch.setattr(cute, "compile", lambda *args, **kwargs: s.calls.append(("compile",)) or (lambda *launch: s.calls.append(("launch",))))
+    k = make_entry(dev)
+    (x,) = on_device(dev, _host_operands(own=False)["x"])
+    steps = ("scope in", "compile", "empty", "wait_event", "launch", "scope out")
+    k.compile()
+    assert [c for c in s.calls if c[0] in steps] == [("scope in", dev), ("compile",), ("scope out", dev)]
+    s.calls.clear()
+    k(x)
+    assert [c[0] for c in s.calls if c[0] in steps] == ["scope in", "empty", "empty", "wait_event", "launch", "scope out"]
+    assert {c[1] for c in s.calls if c[0] in ("scope in", "scope out")} == {dev}
+
+
 # ---------------------------------------------------------------------------------------------------------------------------
 # host-only: the compute-capability gate, the compile key, the launch facts
 # ---------------------------------------------------------------------------------------------------------------------------
 def test_declines_an_unserved_compute_capability_by_name():
     ops = _host_operands()
-    for cc in ((9, 0), (8, 0), (8, 9), (12, 0), (12, 1), (11, 0)):
+    for cc in ((9, 0), (9, 9), (8, 0), (8, 9), (12, 0), (12, 1), (11, 0)):
         with pytest.raises(NotImplementedError, match=rf"compute capability 10\.x.*this device is {cc[0]}\.{cc[1]}"):
             _check(ops, device_cc=cc)
         assert not entry.cc_supported(cc)
-    assert all(entry.cc_supported(cc) for cc in ((10, 0), (10, 3), (10, 7))) and not entry.cc_supported(None)
+    assert all(entry.cc_supported(cc) for cc in ((10, 0), (10, 3), (10, 7), (10, 9))) and not entry.cc_supported(None)
 
 
 def test_declines_cpu_operands_when_no_capability_is_given():
@@ -1207,6 +1257,83 @@ def test_wait_holds_every_read_behind_a_predecessor_that_released_early():
     text = f"{compared - len(differing)} of {compared} launches of the step equal the plain step; {seen_text}"
     frost_routing.measured(key, ("COMPARED, equal: " if not differing else "FAILED: ") + text)
     assert not differing, f"behind the early-releasing writer {len(differing)} of {compared} launches differ from the plain step:\n" + "\n".join(differing)
+
+
+def test_release_reaches_a_dependent_while_the_predecessor_still_runs():
+    """``pdl=True`` is a fact of the LAUNCH as well as of the kernel: the launch carries the programmatic-stream-serialization
+    attribute, so the step starts when its stream predecessor releases, and the step's own release -- its first statement -- lets
+    ITS dependent start while that predecessor still runs.  On a device: a predecessor that releases first and only then writes a
+    slab (``pdl_dependent_copy.EarlyReleaseWriter``), the release + wait step on another operand, then a dependent WITHOUT a
+    wait that copies the slab's last row.  That copy reads other bytes than the written ones only when the step started before
+    the predecessor finished and released in front of its own wait; behind a step launched without the attribute it starts
+    after the predecessor and reads the written bytes every time.
+
+    The positive control comes first (the same copy directly behind the writer); where the early start does not reproduce at
+    all the cell SKIPS -- a coverage gap, not a pass.  Eager launches are warm ones, and the chain is also replayed from a CUDA
+    graph.  The step's own bytes are those of the plain step throughout."""
+    dev = _device_or_skip()
+    import frost_routing
+    from pdl_dependent_copy import DependentCopy, EarlyReleaseWriter
+
+    rows = 296
+    new = make_operands(rows, dev, seed=77)
+    stale = make_operands(rows, dev, seed=78)
+    slab = stale.clone()
+    x = make_operands(8, dev, seed=79)  # the step's own operand: nobody writes it
+    want = _snap(_entry(dev), x)
+    writer, unwaited = EarlyReleaseWriter(dev), DependentCopy(dev, wait=False)
+    seen = torch.zeros(WIDTH, dtype=BF16, device=dev)
+    k = _entry(dev, (True, None))
+    k.compile()
+    outs = _outs(8, dev)
+
+    def control():
+        writer(new, slab)
+        unwaited(slab[-1], seen)  # no wait: it reads whatever the last row holds when it starts
+
+    def chain():
+        writer(new, slab)  # releases at its entry, then writes the slab
+        k(x, **outs)  # starts at that release, releases as its first statement, then waits for the writer
+        unwaited(slab[-1], seen)  # the STEP's dependent: it starts at the step's release
+
+    def early_starts(run, runs=4):
+        """How many runs copied other bytes than the written ones (the copy started in front of the writer's last pass)."""
+        count = 0
+        for _ in range(runs):
+            slab.copy_(stale)
+            seen.view(torch.int16).fill_(0)
+            torch.cuda.synchronize()  # an idle stream: the writer is the only work in flight
+            run()
+            torch.cuda.synchronize()
+            assert torch.equal(slab.view(torch.int16), new.view(torch.int16)), "the writer leaves the written bytes"
+            count += int(not torch.equal(seen.view(torch.int16), new[-1].view(torch.int16)))
+        return count
+
+    def eager_and_captured(run):
+        run()  # compiles on first use; the first launch of a compiled kernel does not start early
+        torch.cuda.synchronize()
+        eager = early_starts(run)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                run()
+            captured = early_starts(graph.replay)
+        finally:
+            graph.reset()
+        return eager, captured
+
+    key = "FP8 row quantization decode step, the release in front of the wait reaches a dependent"
+    controls = eager_and_captured(control)
+    if sum(controls) == 0:
+        frost_routing.measured(key, "NOT COMPARED: the control (a dependent without a wait behind the writer) never started early on this device")
+        pytest.skip("the early start did not reproduce on this device (a coverage gap, not a pass)")
+    through = eager_and_captured(chain)
+    torch.cuda.synchronize()
+    _assert_same(outs, want, "the step between the writer and the dependent")
+    text = f"behind the step the dependent started early in {through[0]} of 4 eager launches and {through[1]} of 4 replays"
+    text += f"; the control in {controls[0]} and {controls[1]}"
+    frost_routing.measured(key, ("COMPARED: " if sum(through) else "FAILED: ") + text)
+    assert sum(through) > 0, f"the step's release never reached its dependent while the predecessor ran ({text})"
 
 
 def test_one_compile_serves_every_row_count_and_binds_no_operand(monkeypatch):
