@@ -347,7 +347,9 @@ def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
 FP4_SIXTH_BITS = 0x3E2AAAAB
 #: the relative bound of the encode scale of ``cudnn.AddNormQuantDecode``'s NVFP4 codes, which goes through two approximate
 #: reciprocals: one unit in the last place each, doubled, and one fp32 unit for the two multiplications -- the bound the
-#: entry's own suite holds its codes to (``test/python/norm/frost/add_norm_quant_utils.py``)
+#: entry's own suite holds its codes to (``test/python/norm/frost/add_norm_quant_utils.py``).  ``cudnn.RowQuantizeFp4Decode``
+#: writes the same codes by the same chain, and its page states the same bound
+#: (``docs/operations/block_scaling/row_quantize_fp4_decode.md``)
 NVFP4_ENCODE_BOUND = 5 * 2.0**-23
 
 
@@ -577,6 +579,28 @@ class PreFcNormQuantize(_Reference):
 class Quantize(_Reference):
     def __call__(self, rows, quant):
         return quantize(rows, quant)
+
+
+class QuantizeBracket(_Reference):
+    """The 4-bit quantisation of bf16 rows at the rounding points of a kernel that scales a block by ``fp32(1 / 6)`` of its
+    largest magnitude under the global scale and encodes through two approximate reciprocals
+    (``cudnn.RowQuantizeFp4Decode``).  The reference chain (``quantize``) divides where that kernel multiplies by
+    reciprocals and writes the code 0 for a negative value that rounds to zero, where the kernel keeps the sign: its own
+    codes are not inside the entry's contract.  This block is the twin of that entry's adapter, not a row of any table:
+    per block of sixteen it writes the block-scale byte of the kernel's rule (:func:`nvfp4_block_scales`) and the LOW code
+    of every element's bracket under that byte (:func:`nvfp4_code_bracket`), and keeps of the last call what the band of
+    the entry is judged with (``tie_out``: ``row_quantize_fp4``): ``bracket`` = the low and the high code of every element,
+    one nibble each.  At an exact rounding tie the bracket holds the two codes around the midpoint, and the low one is
+    not always the kernel's."""
+
+    entry = "torch_ref.quantize at the kernel's rounding points"
+    bracket = None
+
+    def __call__(self, rows, quant):
+        scales = nvfp4_block_scales(rows.float().abs().unflatten(-1, (-1, BLOCK)).amax(-1), quant.scale)
+        low, high = nvfp4_code_bracket(rows, scales, quant.scale)
+        self.bracket = (low, high)
+        return BlockScaledTensor(low[..., 0::2] | (low[..., 1::2] << 4), scales, float(quant.scale))
 
 
 class SiluMul(_Reference):

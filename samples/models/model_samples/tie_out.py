@@ -81,7 +81,7 @@ Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one b
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
 ``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``swiglu_fp4`` = see below; ``attention_prepare`` = see below;
-``same`` = the provider is the reference chain, nothing to compare.
+``row_quantize_fp4`` = see below; ``same`` = the provider is the reference chain, nothing to compare.
 ``attention_bf16_weights`` = see below: the bound of a stated model, for a library kernel that documents no contract.
 
 **What a provider block is compared with.**  The reference block of the same name -- unless the provider's kernel rounds at
@@ -120,6 +120,22 @@ values around it.  Per output of a call, whatever the form of its call site writ
 
 Every value finite.  The line prints how many elements took the other bf16 value, and how many codes are not the ones
 of the nearest value; anything outside these sets is a failure, never a share.
+
+``row_quantize_fp4``, the band of the 4-bit row quantise entry, is that entry's documented numerics contract
+(``docs/operations/block_scaling/row_quantize_fp4_decode.md``).  Its kernel scales a block of sixteen by ``fp32(1 / 6)`` of
+its largest magnitude under the global scale, rounds that once to E4M3, and encodes every element through two approximate
+reciprocals; the twin writes the block-scale byte of that rule and keeps, per element, the two adjacent codes the
+reciprocals' bound admits under it (``torch_ref.nvfp4_code_bracket``).  Per call:
+
+* every block-scale byte is the twin's byte;
+* every code is one of the two codes of its element's bracket, under the twin's block scale.
+
+Every block scale finite.  The line prints how many block scales and codes were judged and how many codes are the second
+code of their bracket (printed, not gated); anything else is outside and a failure, never a share.  Where the bracket
+holds one code the judge is byte for byte.  Two things this band cannot see.  It holds the kernel to its rule, not to the
+target kernel set's kernel: byte equality with that one is the entry's own record.  And at an exact rounding tie the
+bracket holds the two codes around the midpoint, also where the scale and the block scale are powers of two and the
+page states the even code: there the band takes either, and the tie rule is the entry's own suite's to hold.
 
 ``swiglu_fp4``, the band of the fused 4-bit gate / up entry, is that entry's documented numerics contract as well
 (``docs/operations/gemm_fusions/swiglu_fp4_decode.md``), and it is an interval, not a bracket.  The kernel accumulates the
@@ -285,6 +301,11 @@ BANDS = {
         "the normed rows the kernel wrote, or of one of the two bf16 values where it wrote codes alone; 4-bit block scales those of a block maximum the "
         "two values admit, 4-bit codes inside the bracket of the kernel's two approximate reciprocals under its own block scale; every value finite"
     ),
+    "row_quantize_fp4": (
+        "against the quantisation at the kernel's rounding points: every block-scale byte that of e4m3(global x (largest x fp32(1/6))) for the largest "
+        "magnitude of its block, every 4-bit code one of the two adjacent codes the kernel's two approximate reciprocals admit under that block scale; "
+        "every block scale finite"
+    ),
     "swiglu_fp4": (
         "against the gate / up multiply with SiLU x up evaluated in fp64 on the dequantised operands, with the error bound of the kernel's contract: "
         "every block-scale byte inside the interval of bytes that bound admits for the largest magnitude of its block, every 4-bit code within half "
@@ -383,12 +404,15 @@ class BlockStats:
     conv_equal: bool = True
     null_equal: bool = True
     state_equal: bool = True  # of a band without a rule for state: what the call updated, byte for byte
-    outside: int = 0  # gate_fp8, add_norm_quant: bytes (elements) that are the code of neither bf16 value around the judged value
+    #: gate_fp8, add_norm_quant: bytes (elements) that are the code of neither bf16 value around the judged value; row_quantize_fp4: block
+    #: scales that are not the twin's byte and codes outside their bracket
+    outside: int = 0
     off_nearest: int = 0  # gate_fp8, add_norm_quant: bytes off the nearest value's code although the judged value is beyond the margin
     other_value: int = 0  # add_norm_quant: normed elements that are the other bf16 value around the normalised value (inside the margin)
     not_of_out: int = 0  # add_norm_quant: 8-bit codes that are not those of the normed rows the same call wrote
-    blocks: int = 0  # swiglu_fp4: block scales judged, and those of them that are the byte of the fp64 chain
+    blocks: int = 0  # swiglu_fp4: block scales judged, and those of them that are the byte of the fp64 chain; row_quantize_fp4: of the twin
     blocks_equal: int = 0
+    second_codes: int = 0  # row_quantize_fp4: codes that are the second code of their bracket and not its first
     worst_share: float = 0.0  # swiglu_fp4: the largest distance of a code's value from the fp64 value, as a share of its bound
     keys_outside: int = 0  # attention_prepare: key elements at the positions of a call outside their band (``outside``: query elements)
     gates_equal: bool = True  # attention_prepare: the gate rows, byte for byte
@@ -432,6 +456,11 @@ class BlockStats:
                 f"bf16 value around the normalised value; {self.total_bytes:,} codes and block scales, {loose:,} of them not those of the nearest value; "
                 f"{self.not_of_out:,} 8-bit codes not those of the normed rows of their call; {self.off_nearest:,} off the nearest value more than "
                 f"{NORM_MARGIN_ULP32:g} fp32 units from the midpoint; {self.outside:,} outside{loud}"
+            )
+        if self.band == "row_quantize_fp4":
+            return (
+                f"{self.blocks:,} block scales, {self.blocks - self.blocks_equal:,} of them not the twin's byte; {self.total_bytes:,} codes, "
+                f"{self.second_codes:,} of them the second code of their bracket (printed, not gated); {self.outside:,} outside{loud}"
             )
         if self.band == "swiglu_fp4":
             return (
@@ -572,6 +601,11 @@ class BlockTap:
         if stats.band == "add_norm_quant":
             _judge_norm(stats, out, ref, twin)
             return
+        if stats.band == "row_quantize_fp4":
+            _judge_row_quantize(stats, out, ref, twin)
+            stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)  # the call updates nothing
+            stats.ok = stats.ok and stats.state_equal
+            return
         if stats.band == "swiglu_fp4":
             _judge_swiglu(stats, out, ref, twin)
             stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)
@@ -710,6 +744,31 @@ def _judge_norm(stats: BlockStats, out, ref, twin) -> None:
         stats.outside += int((~same & ~second).sum())
         stats.off_nearest += int((~same & second & ~loose).sum())
     stats.ok = stats.finite and stats.outside == 0 and stats.off_nearest == 0 and stats.not_of_out == 0 and stats.state_equal
+
+
+def _judge_row_quantize(stats: BlockStats, out, ref, twin) -> None:
+    """One call of the 4-bit row quantise entry against its twin (band ``row_quantize_fp4``): ``out`` / ``ref`` are the packed
+    codes and the block scales of the two, row by row; the twin keeps the two codes of every element's bracket under its
+    own block scales.  A block scale is the twin's byte or outside; a code is one of the two of its bracket or outside."""
+    bracket = getattr(twin, "bracket", None)
+    if bracket is None:  # a table that names this band for a block whose twin is another chain
+        raise ValueError("the band row_quantize_fp4 is judged against the quantisation at the kernel's rounding points: the block's twin keeps no bracket")
+    low, high = bracket
+    if len(out) != 2 or len(ref) != 2 or out[1].shape != ref[1].shape or 2 * out[0].numel() != low.numel():
+        stats.outside += 1  # other outputs than the packed codes and the block scales of the call's rows: nothing can be compared
+        stats.ok = False
+        return
+    (packed, scales), of_twin = out, ref[1]
+    codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)  # one nibble per element, the even element first
+    first, second = codes == low, codes == high
+    stats.finite = stats.finite and bool(((scales & 0x7F) != 0x7F).all())  # E4M3 has no infinity; these two codes are its NaN
+    stats.blocks += scales.numel()
+    stats.blocks_equal += int((scales == of_twin).sum())
+    stats.total_bytes += codes.numel()
+    stats.equal_bytes += int(first.sum())
+    stats.second_codes += int((~first & second).sum())
+    stats.outside += int((scales != of_twin).sum()) + int((~first & ~second).sum())
+    stats.ok = stats.finite and stats.outside == 0
 
 
 def _judge_prepare(stats: BlockStats, out, ref, state, ref_state, twin) -> None:
