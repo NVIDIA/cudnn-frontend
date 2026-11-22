@@ -10793,8 +10793,8 @@ def test_every_control_arm_of_the_library_attention_band_fails_and_what_the_band
 def test_rule_8_states_its_one_exception_word_for_word_and_so_do_the_places_that_state_the_rule():
     """Rule 8 of the area's guide says that a band is the kernel's own contract against a twin at the kernel's rounding points.
     The band of a library kernel that documents no contract is the one exception, and the guide states it in one
-    sentence, as it was agreed, behind the sentence it is the exception to -- which stands as it stood, and so does the
-    sentence behind it.  The two places of the helper layer that state the rule state the exception too, and each says
+    sentence, word for word and once, directly behind the sentence it is the exception to and in front of the bullet
+    that follows it.  The two places of the helper layer that state the rule state the exception too, and each says
     what the band is derived from: a stated model of the kernel's arithmetic, never the kernel's arithmetic itself."""
     from model_samples import providers, tie_out
 
@@ -10812,11 +10812,11 @@ def test_rule_8_states_its_one_exception_word_for_word_and_so_do_the_places_that
         "an element outside it is a finding, and the family README says beside the row that the row is not within one bf16 unit of the chain."
     )
     behind = "- A band names the outputs it applies to; an unnamed output is judged by its dtype, and updated state byte for byte."
-    assert f"{rule} {exception} {behind}" in guide, "rule 8 as it stood, its one exception as agreed, and the sentence behind it as it stood"
+    assert f"{rule} {exception} {behind}" in guide, "rule 8 up to the sentence of the twin, its one exception word for word, and the bullet behind it"
     assert guide.count("The one exception is a library kernel") == 1 and guide.count("never a width covering the distance between two chains.") == 1
     for name, text in (("tie_out", tie_out.__doc__), ("BlockBase.twin", providers.BlockBase.twin.__doc__)):
         stated = " ".join((text or "").split())
-        assert "a band is never widened to cover a chain that rounds elsewhere." in stated, f"{name}: the rule as it stood"
+        assert "a band is never widened to cover a chain that rounds elsewhere." in stated, f"{name}: the rule"
         assert (
             "a library kernel that documents no numerics contract and whose rounding points are not established: its twin is the reference chain itself, "
             in stated
