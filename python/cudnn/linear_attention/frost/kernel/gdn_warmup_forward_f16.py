@@ -355,6 +355,7 @@ def warmup_forward_host(
         scale,
         workspace,
         stream,
+        level_order,
     )
     if cutlass.const_expr(tail_summary_cfg is not None):
         gdn_chain_forward_f16.chain_forward_host(
