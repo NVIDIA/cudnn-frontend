@@ -22,7 +22,7 @@ that multiply's layout -- in one launch.  ``scale`` is the GLOBAL scale the mult
 reciprocal of the multiply's static input scale.  The bytes are those of the block-scale convention with a global scale that the
 repository implements as ``cudnn.frost.tile_dsl.pointwise.nvfp4_block_scale_global``: the NVFP4 form of ``cudnn.AddNormQuantDecode``
 writes the same codes and the same block scales for the same bf16 values.  For the conversion of whole 128-row bands with a caller
-workspace and another rounding rule use ``cudnn.ops.nvfp4_block_scale_quantize``.
+workspace and another rounding rule use ``cudnn.ops.nvfp4_block_scale_quantize_forward``.
 
 Served (declined otherwise, by name): ``width`` 5120; ``rows`` 1 .. 1024 (a RUNTIME kernel argument); ``x`` bf16 ``[rows, width]``;
 ``scale`` one fp32 element (0-d or ``[1]``; by contract a finite positive value in ``2**-100 .. 2**100`` -- its value is never read
