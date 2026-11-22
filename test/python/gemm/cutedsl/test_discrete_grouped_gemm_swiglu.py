@@ -10,7 +10,7 @@ activation (SwiGLU/GeGLU) for MoE (Mixture of Experts) workloads.
 
 import torch
 import pytest
-from test_utils import torch_fork_set_rng
+from test_utils import assert_bitwise_runs, torch_fork_set_rng
 from core.cutedsl.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from gemm.cutedsl.test_discrete_grouped_gemm_swiglu_utils import (
     discrete_grouped_gemm_init,
@@ -322,6 +322,9 @@ def _test_discrete_grouped_gemm_wrapper(
     request,
     b_major="k",
     enable_bias=False,
+    use_dynamic_sched=False,
+    cfg_overrides=None,
+    replay=False,
 ):
     try:
         from cudnn import discrete_grouped_gemm_swiglu_wrapper_sm100
@@ -345,6 +348,9 @@ def _test_discrete_grouped_gemm_wrapper(
         act_func,
         b_major=b_major,
     )
+    if cfg_overrides:
+        cfg.update(cfg_overrides)
+        cfg["l"] = len(cfg["group_m_list"])
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -361,34 +367,38 @@ def _test_discrete_grouped_gemm_wrapper(
         enable_bias=enable_bias,
     )
 
+    def launch():
+        return discrete_grouped_gemm_swiglu_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_ptrs=inputs["b_ptrs_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_ptrs=inputs["sfb_ptrs_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            bias_tensor=inputs.get("bias_tensor"),
+            n=cfg["n"],
+            b_dtype=inputs["b_list"][0].dtype,
+            norm_const_tensor=inputs.get("norm_const_tensor"),
+            prob_tensor=inputs.get("prob_tensor"),
+            acc_dtype=cfg["acc_dtype"],
+            c_dtype=cfg["c_dtype"],
+            d_dtype=cfg["d_dtype"],
+            cd_major=cfg["cd_major"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            vector_f32=cfg["vector_f32"],
+            m_aligned=cfg["m_aligned"],
+            discrete_col_sfd=cfg["discrete_col_sfd"],
+            act_func=cfg["act_func"],
+            b_major=cfg["b_major"],
+            use_dynamic_sched=use_dynamic_sched,
+            current_stream=stream,
+        )
+
     try:
         for _ in range(2):  # Run twice to test caching path
-            outputs = discrete_grouped_gemm_swiglu_wrapper_sm100(
-                a_tensor=inputs["a_tensor"],
-                b_ptrs=inputs["b_ptrs_tensor"],
-                sfa_tensor=inputs["sfa_tensor"],
-                sfb_ptrs=inputs["sfb_ptrs_tensor"],
-                padded_offsets=inputs["padded_offsets_tensor"],
-                alpha_tensor=inputs["alpha_tensor"],
-                bias_tensor=inputs.get("bias_tensor"),
-                n=cfg["n"],
-                b_dtype=inputs["b_list"][0].dtype,
-                norm_const_tensor=inputs.get("norm_const_tensor"),
-                prob_tensor=inputs.get("prob_tensor"),
-                acc_dtype=cfg["acc_dtype"],
-                c_dtype=cfg["c_dtype"],
-                d_dtype=cfg["d_dtype"],
-                cd_major=cfg["cd_major"],
-                mma_tiler_mn=cfg["mma_tiler_mn"],
-                cluster_shape_mn=cfg["cluster_shape_mn"],
-                sf_vec_size=cfg["sf_vec_size"],
-                vector_f32=cfg["vector_f32"],
-                m_aligned=cfg["m_aligned"],
-                discrete_col_sfd=cfg["discrete_col_sfd"],
-                act_func=cfg["act_func"],
-                b_major=cfg["b_major"],
-                current_stream=stream,
-            )
+            outputs = launch()
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 
@@ -397,6 +407,44 @@ def _test_discrete_grouped_gemm_wrapper(
         outputs,
         cfg,
         skip_ref=cfg["skip_ref"],
+    )
+    if replay:
+
+        def replay_outputs():
+            out = launch()
+            # Byte comparison needs a unit last stride; C and D are (m, n, 1) with L outermost.
+            tensors = [out["c_tensor"][..., 0], out["d_tensor"][..., 0]]
+            if out["amax_tensor"] is not None:
+                tensors.append(out["amax_tensor"])
+            return tuple(tensors)
+
+        assert_bitwise_runs(replay_outputs, label=f"discrete SwiGLU, cluster {cfg['cluster_shape_mn']}, dynamic={use_dynamic_sched}")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_discrete_grouped_gemm_wrapper_one_cta_cluster_dynamic_sched(request):
+    """Dynamic scheduler with a one-CTA cluster: each CTA claims its own tiles from the counter.
+
+    192 tiles of 128x256 exceed the SM count, so CTAs claim repeatedly; replay must be bitwise stable.
+    """
+    _test_discrete_grouped_gemm_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(128, 256),
+        cluster_shape_mn=(1, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="swiglu",
+        request=request,
+        use_dynamic_sched=True,
+        cfg_overrides=dict(n=1024, group_m_list=[1536] * 4),
+        replay=True,
     )
 
 
