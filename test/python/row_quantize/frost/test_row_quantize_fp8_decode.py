@@ -1451,10 +1451,10 @@ def test_warm_call_allocates_nothing_and_never_synchronizes():
 # The cells below warm an entry with CALLER-OWNED outputs (it has no pair yet), park a side stream behind a delay kernel, let
 # ``outputs(rows)`` / ``compile(rows)`` allocate the pair on it and launch from the original stream while that work is still
 # queued (``init_order_schedules`` says what every such cell must do).
-def _warm_entry_without_a_pair(dev, rows, seed):
-    """``(entry, x, want)``: the entry warmed by a real launch into caller-owned outputs, whose bytes -- held to the reference --
-    are ``want``."""
-    k = make_entry(dev)
+def _warm_entry_without_a_pair(dev, rows, seed, arm=(None, None)):
+    """``(entry, x, want)``: the entry of launch arm ``arm`` warmed by a real launch into caller-owned outputs, whose bytes -- held
+    to the reference -- are ``want``."""
+    k = make_entry(dev, arm)
     x = make_operands(rows, dev, seed=seed)
     want = _snap(k, x)
     assert_reference(want["codes"], want["scales"], x, label=f"rows {rows}: caller-owned outputs")
@@ -1513,10 +1513,11 @@ def test_warm_launch_waits_for_what_the_allocating_stream_still_owes_the_entry_o
 @pytest.mark.usefixtures("settled_records")
 def test_pair_allocated_by_compile_is_ordered_like_one_allocated_by_outputs():
     """The entry's OTHER allocating route: ``compile(rows)`` on the parked side stream (under deterministic algorithms), then a
-    call by default on the original stream."""
+    call by default on the original stream.  The entry is the release + wait arm: a launch that carries the
+    programmatic-stream-serialization attribute is ordered behind the pending work like a plain one."""
     dev = _device_or_skip()
     rows = 7
-    k, x, want = _warm_entry_without_a_pair(dev, rows, 136)
+    k, x, want = _warm_entry_without_a_pair(dev, rows, 136, arm=(True, None))
     pending = _park_the_pairs_allocation(dev, k, rows, "the fill torch adds under deterministic algorithms", allocate=lambda: k.compile(rows))
     assert set(k.buffers) == {rows}, "compile(rows) did not allocate the pair"
     codes, scales = k(x)
