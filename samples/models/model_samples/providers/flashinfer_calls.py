@@ -19,9 +19,9 @@ come row by row, and bringing them into the layout is this block's own launch.  
 with its block scales in that layout (``weights.TiledBlockScaledWeight``), built once per weight at load
 (``stored_layout``) and kept as the weight's one stored form; the loader holds it to the bytes it was made from.
 
-``torch_ref.quantize+flashinfer.mm_fp4`` is the same multiply for a block whose operand reaches it as bf16 rows -- the
-output head, whose operand the target quantises with a launch of its own.  The block quantises them with the reference
-quantiser when it reads them (PyTorch's launches, declared as that family) and multiplies with the library.
+``flashinfer.mm_fp4_head`` is the same call for the output head: the same kernel module on the vocabulary's weight, whose
+shape the scratch call of its first use needs.  Its operand is what the quantise block in front of it hands over; the
+adapter reads it as the down multiply's does and launches nothing in front of the library's kernel.
 
 ``flashinfer.bmm_fp8`` calls ``flashinfer.gemm.bmm_fp8(backend="auto")``, the multiply of an 8-bit activation by an 8-bit
 weight on the stored codes of both.  Which kernel serves it is the choice of the library among its own: its tuner's where
@@ -101,8 +101,8 @@ from typing import Dict, Optional, Tuple
 
 from ..census import FAMILIES, Kernel
 from ..state import PagedKvCache, PageTable
-from ..weights import BLOCK, BlockScaledTensor, Dequantized, ScaledTensor, TiledBlockScaledTensor, TiledBlockScaledWeight, Unquantized, tile_scales
-from . import PYTORCH_CHAIN, BlockBase
+from ..weights import BLOCK, BlockScaledTensor, Dequantized, ScaledTensor, TiledBlockScaledTensor, TiledBlockScaledWeight, tile_scales
+from . import BlockBase
 
 #: the distribution these adapters import, and the versions of it this area has validated: those the launch records of the
 #: family's kernel census were recorded with.  ``samples/models/constraints-native.txt`` pins the same; a host test holds
@@ -613,19 +613,14 @@ class MmFp4Block(LibraryBlock):
         return out
 
 
-class QuantizeMmFp4Block(MmFp4Block):
-    """The same multiply for a block whose operand reaches it as bf16 rows without codes: the output head.  The block
-    quantises them with the reference quantiser when it reads them -- PyTorch's launches, this block's own -- and
-    multiplies with the library: one launch of the library's kernel per call behind them."""
-
-    kernels = (*PYTORCH_CHAIN, *MmFp4Block.kernels)
+class MmFp4HeadBlock(MmFp4Block):
+    """The same multiply for the output head: one launch of the library's kernel per call, on the 4-bit operand the quantise
+    block in front of it hands over.  What differs from the down multiply is the weight's shape."""
 
     def _shape(self) -> tuple:
+        """``(out features, in features)`` of the weight this block multiplies: the output head's."""
         g = self.model.geometry
         return g.vocab, g.hidden
-
-    def _operand(self, qx) -> tuple:
-        return super()._operand(qx.quantized() if isinstance(qx, Unquantized) else qx)
 
 
 class BmmFp8Block(LibraryBlock):

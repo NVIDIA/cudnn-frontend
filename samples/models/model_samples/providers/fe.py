@@ -44,9 +44,9 @@ of its site.  It decides nothing: a call whose operands do not fit the form the 
 the form starts the stream, codes of another format than the consumer reads) is a ``ValueError``.  The kernel updates the
 residual stream in place, as the form says; the adapter hands it buffers of its own for everything else it writes, per
 call.  What a consumer on a fallback row needs beyond the kernel's bytes is that consumer's to launch: the block scales
-stay in the kernel's 128 x 4 layout (``weights.TiledBlockScaledTensor``), and where the form of a site ends at the bf16 rows
-the consumer's quantised operand is handed over unquantised (``weights.Unquantized``).  The kernel normalises in fp32 and
-rounds once, so the adapter names its twin: the norm at the kernel's rounding points.
+stay in the kernel's 128 x 4 layout (``weights.TiledBlockScaledTensor``).  Where the form of a site ends at the bf16 rows
+the call returns no quantised operand, and a step that asks for one there is a ``ValueError``.  The kernel normalises in
+fp32 and rounds once, so the adapter names its twin: the norm at the kernel's rounding points.
 
 ``fe.fp8_projection_decode`` calls ``cudnn.Fp8ProjectionDecode``, the multiply of an 8-bit activation by an 8-bit weight on
 the stored codes of both (``docs/operations/gemm_fusions/fp8_projection_decode.md``): one launch per call.  An entry is one
@@ -1138,28 +1138,20 @@ class AddNormQuantDecodeBlock(EntryBlock):
     def _served_form(self) -> tuple:
         return tuple(self.row.site_form(self._site))
 
-    def compared(self, out):
-        """What the tie-out compares of a call: the codes the kernel wrote (with their block scales, row by row), the normed
-        rows where the form writes them, and the residual stream.  A quantised operand the consumer forms itself
-        (``Unquantized``) is not the kernel's output and is left out."""
-        from ..weights import Unquantized
-
-        q, normed, residual = out
-        return (None if isinstance(q, Unquantized) else q, normed, residual)
-
     def __call__(self, branch, residual, weight, quant, site=""):
         import torch
 
-        from ..weights import TiledBlockScaledTensor, Unquantized
+        from ..weights import TiledBlockScaledTensor
 
         entry, form = self._build(branch.device, site), dict(self.row.site_form(site))
         rows, device, where = int(branch.shape[0]), branch.device, f" at {site}" if site else ""
         self._served, self._site = (entry, rows), site  # what the call log of a traced step reads back (``serving``)
         if quant is not None and quant.fmt not in NORM_QUANT:
             raise ValueError(f"cudnn.AddNormQuantDecode writes static 8-bit or 4-bit codes; this block is asked for {quant.fmt!r}")
-        if form["QUANT"] is not None and (quant is None or NORM_QUANT[quant.fmt] != form["QUANT"]):
+        if (form["QUANT"] is None) != (quant is None) or (quant is not None and NORM_QUANT[quant.fmt] != form["QUANT"]):
             asked = "no quantised operand" if quant is None else f"a {quant.fmt} operand"
-            raise ValueError(f"provider row {self.row.key}: its form{where} writes {form['QUANT']} codes; the step asks for {asked} there")
+            writes = f"{form['QUANT']} codes" if form["QUANT"] is not None else "no codes"
+            raise ValueError(f"provider row {self.row.key}: its form{where} writes {writes}; the step asks for {asked} there")
         starts = residual is None
         if bool(form["ADD"]) == starts or (starts and not form.get("STORE_RESIDUAL")):
             has = "no residual stream yet" if starts else "a residual stream"
@@ -1179,8 +1171,8 @@ class AddNormQuantDecodeBlock(EntryBlock):
             q = ScaledTensor(codes.view(torch.uint8), float(quant.scale))
         elif form["QUANT"] == "nvfp4":
             q = TiledBlockScaledTensor(codes, scales.view(torch.uint8), float(quant.scale))
-        else:  # the form ends at the bf16 rows: a consumer that reads a quantised operand quantises them itself
-            q = None if quant is None else Unquantized(out, quant.fmt, float(quant.scale))
+        else:  # the form ends at the bf16 rows: no quantised operand
+            q = None
         return q, out, residual
 
 

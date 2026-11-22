@@ -70,7 +70,8 @@ EVERY = (*BOTH, *TARGET_STACKS)
 #: next block reads.  A layer's input norm writes the 8-bit operand of the in-projection, and the normed bf16 rows too where
 #: the mixer reads them (the linear-attention step does, the attention layer does not); the norm in front of an MLP writes
 #: 4-bit codes alone; the final norm writes bf16 rows alone, and the output head's 4-bit operand is quantised from them by a
-#: launch of its own.  Six forms; a model of 48 + 16 layers calls five of them, 1 / 47 / 16 / 64 / 1 times a step
+#: launch of its own (the block ``output_head.quantize``).  Six forms; a model of 48 + 16 layers calls five of them,
+#: 1 / 47 / 16 / 64 / 1 times a step
 NORM_FORMS = (
     ("linear_attention.first", (("ADD", False), ("STORE_RESIDUAL", True), ("BF16_OUT", True), ("QUANT", "e4m3_static"))),
     ("full_attention.first", (("ADD", False), ("STORE_RESIDUAL", True), ("BF16_OUT", False), ("QUANT", "e4m3_static"))),
@@ -149,7 +150,7 @@ VERIFY_STEPS = tuple((tokens, 16 if tokens < 6 else 4) for tokens in range(2, 9)
 #: attention the sequences, the tokens per sequence and the run's maximum length
 LIBRARY_ROWS = {
     "mlp.down": ("flashinfer.mm_fp4", "any row count, hidden 5120, intermediate 17408", (("hidden", 5120), ("mlp", 17408))),
-    "output_head": ("torch_ref.quantize+flashinfer.mm_fp4", "any row count, hidden 5120", (("hidden", 5120),)),
+    "output_head": ("flashinfer.mm_fp4_head", "any row count, hidden 5120", (("hidden", 5120),)),
     "projection.fp8.out": (
         "flashinfer.bmm_fp8",
         "any row count, weight 5120 x 6144",
@@ -180,7 +181,8 @@ def _library_row(block: str, form, band: str = "bf16_rounding", last=None) -> Pr
     it), so behind a launch that releases early -- the fused step or the gate in front of the out-projection, the gate / up
     kernel in front of the down multiply -- the kernel starts early and must wait before it reads that launch's codes.  The
     kernels of the validated version wait in front of their first load.  A launch behind one that carries the attribute must
-    wait before it reads the product (the norm: its row).  In front of the head stand PyTorch's launches: no early release.
+    wait before it reads the product (the norm: its row).  In front of the head stands the quantise of its operand, a block
+    of its own, on its reference chain: PyTorch's launches, none of which releases early.
     ``band``: the row's band against the reference; ``last``: the last row count the row claims (left out: any)."""
     key, serves, widths = LIBRARY_ROWS[block]
     # no test of this repository's own lanes runs a row that needs the library's package: printed as unverified in CI
@@ -484,10 +486,13 @@ PROVIDERS = {
         ),
         ProviderRow(*ANY, "torch_ref.gate_quantize", EVERY, serves="any", fallback="reference chain"),
     ],
+    # the 4-bit operand of the output head, from the final norm's bf16 rows: the target forms it with a launch of its own
+    "output_head.quantize": [
+        ProviderRow(*ANY, "torch_ref.quantize", EVERY, serves="any", fallback="reference chain"),
+    ],
     "output_head": [
-        # the same multiply.  Its operand is the final norm's bf16 rows: the target quantises them with a launch of its own,
-        # which no row serves yet (the census's ``output_head.quantize``), so this block quantises them when it reads them.
-        # Launch order: behind PyTorch's launches of that quantiser, none of which releases early
+        # the same multiply, on the vocabulary's weight.  Its operand is what the quantise block in front of it hands over, in
+        # the layout that block wrote.  Launch order: a dependent of that block's last launch; it waits before its first load
         _library_row("output_head", MM_FP4_FORM),
         ProviderRow(*ANY, "cublas.bf16_dequantized", PROVIDER_STACKS, serves="any", fallback="bf16 copy of 4-bit weights", band="bf16_rounding"),
         ProviderRow(*ANY, "torch_ref.linear", "reference", serves="any", fallback="reference"),
@@ -554,6 +559,7 @@ BLOCK_TITLES = {
     "attention.prepare": "attention preparation",
     "attention.core": "attention core",
     "attention.gate_quantize": "gate + quantise",
+    "output_head.quantize": "4-bit quantise of the output head's operand",
     "output_head": "output head",
     "token_choice": "token choice",
 }

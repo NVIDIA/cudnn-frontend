@@ -15,11 +15,10 @@ bytes a kernel on the stored formats would see.  :func:`dequantize` returns the 
 an E4M3 code has a 4-bit significand and an E2M1 code times its E4M3 block scale at most 6 bits, so both are exact in bf16
 (8 bits), and a multiply over these copies applies the scales to its result.
 
-Two more containers carry what a kernel on the stored formats hands to a block that is not one yet.
+One more container carries what a kernel on the stored formats hands to a block that is not one yet.
 :class:`TiledBlockScaledTensor` is a 4-bit activation with its block scales in the 128 x 4 layout such a kernel writes
-(:func:`tile_scale_index`); :class:`Unquantized` is bf16 rows whose producer wrote no codes, with the quantisation the
-consumer's operand has.  :func:`dequantize` reads both, so the gather out of the layout and the quantisation are launched by
-the block that consumes the operand, never by the one that produced it.
+(:func:`tile_scale_index`).  :func:`dequantize` reads it, so the gather out of the layout is launched by the block that
+consumes the operand, never by the one that produced it.
 
 A weight is held in the forms the blocks of a run read it in (:class:`Dequantized`): its bf16 copy where a block reads
 one, and its stored form where a block multiplies on that -- the merged 8-bit codes with their one scale, or the packed
@@ -269,38 +268,6 @@ class InterleavedBlockScaledTensor:
 
 
 @dataclass
-class Unquantized:
-    """bf16 rows on their way to a block that reads a quantised operand, with the quantisation that operand has (``fmt``:
-    ``"fp8"`` or ``"nvfp4"``; ``scale``: its static scale).  The producer wrote no codes -- a kernel whose form at this call
-    site ends at the bf16 rows -- so the consumer quantises them itself: ``quantized()`` is what :func:`dequantize` and
-    every comparison read, and its launches are the consumer's."""
-
-    data: torch.Tensor
-    fmt: str
-    scale: float
-
-    @property
-    def shape(self):
-        return self.data.shape
-
-    def quantized(self):
-        if self.fmt == "fp8":
-            return quantize_fp8(self.data, self.scale)
-        if self.fmt == "nvfp4":
-            return quantize_nvfp4(self.data, self.scale)
-        raise ValueError(f"unknown quantisation format {self.fmt!r}")
-
-    def rows(self, start: int, stop: int) -> "Unquantized":
-        return Unquantized(self.data[start:stop], self.fmt, self.scale)
-
-    def clone(self) -> "Unquantized":
-        return Unquantized(self.data.clone(), self.fmt, self.scale)
-
-    def tensors(self):
-        return self.quantized().tensors()
-
-
-@dataclass
 class Dequantized:
     """A weight as a multiply is handed it, in the forms the plans of a run read: ``data`` is the bf16 copy of its code
     values (exact), ``scale`` the scale a multiply applies to its result (a float or one scale per row), ``stored`` the
@@ -545,12 +512,10 @@ def quantize_nvfp4(x: torch.Tensor, scale: float, rows_per_chunk: int = 2048) ->
 def dequantize(t, rows_per_chunk: int = 2048) -> Dequantized:
     """The code values of a stored tensor as a bf16 copy, without the outer scale (exact: see the module docstring), and that
     scale.  A plain tensor is returned as it is with scale 1.  An operand a kernel on the stored formats handed over is
-    brought to the stored form first, here, by the block that reads it: bf16 rows without codes are quantised
-    (:class:`Unquantized`), block scales in the 128 x 4 layout are gathered (:class:`TiledBlockScaledTensor`).  A merged
+    brought to the stored form first, here, by the block that reads it: block scales in the 128 x 4 layout are gathered
+    (:class:`TiledBlockScaledTensor`).  A merged
     gate / up weight kept in a fused kernel's layout (:class:`InterleavedBlockScaledTensor`) gives its copy in the
     checkpoint's row order."""
-    if isinstance(t, Unquantized):
-        t = t.quantized()
     if isinstance(t, TiledBlockScaledTensor):
         t = t.row_major()
     if isinstance(t, ScaledTensor):

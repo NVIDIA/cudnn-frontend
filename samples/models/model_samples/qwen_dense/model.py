@@ -19,6 +19,7 @@ attention.gate_quantize attention output, gate, ``Quant``                8-bit `
 projection.fp8.out     8-bit operand, weight copy, site                  ``[rows, hidden]`` bf16
 mlp.gate_up            4-bit operand, merged gate / up weight, ``Quant``  4-bit ``[rows, 17408]``
 mlp.down               4-bit operand, weight copy                        ``[rows, hidden]`` bf16
+output_head.quantize   final-norm rows, the head's ``Quant``             4-bit ``[rows, hidden]``
 output_head            4-bit operand, weight copy                        logits ``[rows, vocabulary]`` bf16
 token_choice           logits                                            ids ``[rows]`` int32
 ====================== ================================================= ==============================================
@@ -29,7 +30,8 @@ in-projection is called with another weight shape in each kind of layer, and its
 (``IN_PROJECTION_SITES``).  The out-projection has one weight shape, and its site names the layer's kind too
 (``OUT_PROJECTION_SITES``): the target kernel set serves the two kinds with two kernels in a step of several tokens per
 sequence, so a provider row may serve one of them and hand the other on.  A reference chain and a multiply over a copy
-ignore the site.
+ignore the site.  The last norm of a step is handed no ``Quant`` and returns no quantised operand: the 4-bit operand of
+the output head is formed from its rows by a block of its own, as the target kernel set forms it with a launch of its own.
 
 A step feeds one token per sequence -- the decode step -- or, on a state built for several (``DecodeState(tokens=T)``),
 ``T`` tokens per sequence at once: the verify step of speculative decoding.  Its rows are sequence by sequence (``rows =
@@ -345,6 +347,7 @@ class QwenDense:
             "attention.prepare": (at,),
             "attention.core": (at,),
             "attention.gate_quantize": (at,),
+            "output_head.quantize": (1,),
             "output_head": (1,),
             "token_choice": (1,),
         }
@@ -365,7 +368,7 @@ class QwenDense:
             else:
                 calls += [("attention.prepare", i), ("attention.core", i), ("attention.gate_quantize", i)]
             calls += [("projection.fp8.out", i), ("add_norm_quantize", i), ("mlp.gate_up", i), ("mlp.down", i)]
-        calls += [("add_norm_quantize", len(kinds)), ("output_head", -1), ("token_choice", -1)]
+        calls += [("add_norm_quantize", len(kinds)), ("output_head.quantize", -1), ("output_head", -1), ("token_choice", -1)]
         return tuple(calls)
 
     def sites(self) -> Tuple[str, ...]:
@@ -899,7 +902,8 @@ class QwenDense:
             branch = call("projection.fp8.out", i, mixed, layer.out_proj, OUT_PROJECTION_SITES[layer.kind])
             q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant, "mlp")
             branch = call("mlp.down", i, call("mlp.gate_up", i, q, layer.gate_up, layer.down_quant), layer.down)
-        q, normed, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
+        _, normed, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, None, "output_head")
+        q = call("output_head.quantize", -1, normed, weights.head_quant)
         logits = call("output_head", -1, q, weights.head)
         next_ids = call("token_choice", -1, logits)
         # what a drafter reads of this step, by reference: the final-norm rows and, for each of them, the token that follows it
