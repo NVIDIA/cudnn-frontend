@@ -159,6 +159,29 @@ def test_served_operands_pass_the_host_checks(table):
     assert _check(dict(x=slab[1:3, 16 : WIDTH + 16], ids=None, out=None), device_cc=(10, 7)) == 2
 
 
+@pytest.mark.parametrize("past", (4, 1), ids=lambda past: f"stride-width-plus-{past}")
+def test_a_one_row_view_binds_whatever_its_row_stride(past):
+    """A launch of one row never uses the row stride (the kernel multiplies it by row 0): a one-row view of a slab whose row
+    stride is not whole 16-byte vectors is served, and its launch arguments carry that stride as it is.  The same slab at two
+    and at three rows is declined by name, and a one-row view whose first element is off a 16-byte address stays declined."""
+    cfg = entry.make_cfg(WIDTH)
+    slab = torch.zeros(9, WIDTH + past, dtype=BF16)
+    out = torch.zeros(4, dtype=I32)
+    assert (2 * slab.stride(0)) % 16, "the slab's row stride is whole vectors"
+    aligned = [row for row in range(9) if slab[row].data_ptr() % 16 == 0]
+    assert 0 in aligned and len(aligned) < 9
+    for row in aligned:
+        view = slab[row : row + 1, :WIDTH]
+        assert entry.check_binding(cfg, view, None, out) == 1 == entry.check_support(cfg, view, None, out, device_cc=(10, 0))
+        assert entry.launch_arguments(1, view, None, out) == (view.data_ptr(), 2 * (WIDTH + past), 0, out.data_ptr(), 1)
+    for rows in (2, 3):
+        with pytest.raises(ValueError, match="stride"):
+            entry.check_binding(cfg, slab[:rows, :WIDTH], None, out)
+    off = next(row for row in range(9) if row not in aligned)
+    with pytest.raises(ValueError, match="aligned"):
+        entry.check_binding(cfg, slab[off : off + 1, :WIDTH], None, out)
+
+
 def _misaligned(dtype, elements):
     """A 1-D tensor of ``dtype`` whose first element sits half an element behind an address aligned to the element."""
     size = torch.empty((), dtype=dtype).element_size()
@@ -841,8 +864,9 @@ def test_columns_are_those_of_torch_argmax_on_rows_without_a_nan():
 
 def test_slab_views_bind_as_they_are():
     """``x`` as a view of a wider slab (a row stride of whole vectors that is not the width; a column offset of whole vectors),
-    as every second row of a slab, and as one stored row expanded to several (a row stride of zero): the rule on each view's own
-    rows, with nothing copied."""
+    as every second row of a slab, as one stored row expanded to several (a row stride of zero), and as ONE row of a slab whose
+    row stride is not whole vectors (a launch of one row uses no row stride): the rule on each view's own rows, with nothing
+    copied."""
     dev = _device_or_skip()
     k = make_entry(dev)
     ids = make_table("int64", dev, seed=5)
@@ -854,6 +878,12 @@ def test_slab_views_bind_as_they_are():
     for name, view in views.items():
         assert not view.is_contiguous(), name
         assert_rule(k(view, ids, _fresh_out(view.shape[0], "int64", dev)), view, ids, name)
+    odd = torch.full((3, WIDTH + 4), 3.0e38, dtype=BF16, device=dev)  # behind every row: four elements above every value of the draw
+    odd[:, :WIDTH] = make_rows(3, dev, seed=78, kind="random")
+    one = odd[2:3, :WIDTH]
+    assert one.stride(0) == WIDTH + 4 and (2 * one.stride(0)) % 16 and one.data_ptr() % 16 == 0
+    assert_rule(k(one, ids, _fresh_out(1, "int64", dev)), one, ids, "one row of a slab whose row stride is not whole vectors")
+    assert_rule(k(one, ids), one, ids, "the same view into the entry-owned vector")
 
 
 def test_output_ownership():

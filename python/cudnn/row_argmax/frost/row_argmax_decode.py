@@ -23,12 +23,13 @@ and in any evaluation order.  A NaN is never chosen and never hides another elem
 column wins).  On rows without a NaN the column is ``torch.argmax``'s.
 
 Served (declined otherwise, by name): ``width`` 65536; ``rows`` 1 .. 1024 (a RUNTIME kernel argument); ``x`` bf16 ``[rows,
-width]``, a row contiguous, the row stride free in whole 16-byte vectors (a view of a wider slab binds as it is), 16-byte
-aligned; ``ids`` absent, or int32 / int64 ``[width]``, contiguous, aligned to its element; ``out`` ``[>= rows]`` of the result's
-dtype (int32 without a table, else the table's), contiguous, aligned to its element; every operand on the entry's device;
-the results a call writes (the first ``rows`` elements of ``out``) sharing no byte with ``x`` or ``ids``; a compute capability
-10.x part; a CuTe DSL >= 4.8.0 that holds the part's target and compiles it (cc 10.7: the CUDA 13 toolchain flavour).  Nothing
-is checked on the host about a VALUE (Rule 3).
+width]``, a row contiguous, the row stride free in whole 16-byte vectors (a view of a wider slab binds as it is; a one-row
+call uses no row stride, so its ``x`` binds whatever stride the view carries), 16-byte aligned; ``ids`` absent, or int32 /
+int64 ``[width]``, contiguous, aligned to its element; ``out`` ``[>= rows]`` of the result's dtype (int32 without a table,
+else the table's), contiguous, aligned to its element; every operand on the entry's device; the results a call writes (the
+first ``rows`` elements of ``out``) sharing no byte with ``x`` or ``ids``; a compute capability 10.x part; a CuTe DSL >= 4.8.0
+that holds the part's target and compiles it (cc 10.7: the CUDA 13 toolchain flavour).  Nothing is checked on the host about a
+VALUE (Rule 3).
 
 THE TABLE KIND IS A FACT OF THE CALL: no table, an int32 table or an int64 table.  It is a load and a store width of the kernel,
 so each kind is one compiled kernel under one compile key ``(config, kind)``.  :meth:`RowArgmaxDecode.compile` needs no operand
@@ -210,12 +211,13 @@ def _check_overlap(rows: int, tensors: Dict[str, Any], what: str = "") -> None:
 def check_binding(cfg: Cfg, x, ids=None, out=None, device=None) -> int:
     """The binding checks of a call, run before every launch (compile-cache hits included).  ``TypeError`` for a non-tensor or a
     dtype (``x`` bf16; ``ids`` int32 or int64; ``out`` the result's dtype: int32 without a table, else the table's);
-    ``ValueError`` for an inconsistent device, shape, row stride or alignment, an empty call, or an ``out`` whose first ``rows``
-    elements overlap ``x`` or ``ids``; ``NotImplementedError`` for a row count above the served ceiling or an operand that is not
-    contiguous where the kernel addresses flat.  Returns ``rows = x.shape[0]``.  ``device`` (an entry's: a concrete CUDA ordinal) requires every
-    operand on exactly that device; without it the operands must share ``x``'s.  Host-only metadata arithmetic, no device work:
-    no operand's VALUE is read.  The checks see the operands they are given: an output that is not passed is resolved by the
-    entry, whose call checks its own vector against these operands."""
+    ``ValueError`` for an inconsistent device, shape, row stride (of a call of two or more rows: a one-row launch never uses
+    the stride, so it is not held to whole vectors there) or alignment, an empty call, or an ``out`` whose first ``rows``
+    elements overlap ``x`` or ``ids``; ``NotImplementedError`` for a row count above the served ceiling or an operand that is
+    not contiguous where the kernel addresses flat.  Returns ``rows = x.shape[0]``.  ``device`` (an entry's: a concrete CUDA
+    ordinal) requires every operand on exactly that device; without it the operands must share ``x``'s.  Host-only metadata
+    arithmetic, no device work: no operand's VALUE is read.  The checks see the operands they are given: an output that is
+    not passed is resolved by the entry, whose call checks its own vector against these operands."""
     import torch
 
     width = cfg.WIDTH
@@ -248,10 +250,10 @@ def check_binding(cfg: Cfg, x, ids=None, out=None, device=None) -> int:
     row_stride, element_stride = (int(s) for s in x.stride())
     if element_stride != 1:
         raise NotImplementedError(f"{NAME} needs x contiguous along a row (a row is addressed flat; no copy is made); got strides {tuple(x.stride())}")
-    if (row_stride * ELEMENT_BYTES) % ALIGN_BYTES:
+    if rows > 1 and (row_stride * ELEMENT_BYTES) % ALIGN_BYTES:  # one row: the kernel multiplies the stride by row 0
         raise ValueError(
             f"{NAME}: x stride[0] = {row_stride} elements ({row_stride * ELEMENT_BYTES} bytes) must be a multiple of {ALIGN_BYTES} bytes "
-            f"(a row is whole 16-byte vectors)"
+            f"for a call of {rows} rows (every row starts on a 16-byte vector)"
         )
     for name in ("ids", "out"):
         if name in tensors and int(tensors[name].stride(0)) != 1:
