@@ -1018,6 +1018,7 @@ pytest core/test_determinism_utils.py
 | `norm/frost/test_add_norm_quant_decode_determinism.py` | `AddNormQuantDecode` (the add + RMSNorm + quantize decode step, hidden 5120, rows 1 .. 1024) | the updated BF16 residual, BF16 output `out`, FP8 E4M3 or packed E2M1 `codes`, the NVFP4 E4M3 block `scales` | — (inference-only step kernel; no backward) |
 | `attention_prepare/frost/test_attention_prepare_decode_determinism.py` | `AttentionPrepareDecode` (the attention preparation decode step, 24 query and 4 key/value heads of width 256, tokens 1 .. 1024) | BF16 `q_out` and `gate_out`, the K and V rows of the paged cache | — (inference-only step kernel; no backward) |
 | `row_quantize/frost/test_row_quantize_fp4_decode_determinism.py` | `RowQuantizeFp4Decode` (the FP4 row quantization decode step, width 5120, rows 1 .. 1024) | packed E2M1 `codes`, the E4M3 block `scales` in the 128 x 4 layout | — (inference-only step kernel; no backward) |
+| `row_quantize/frost/test_row_quantize_fp8_decode_determinism.py` | `RowQuantizeFp8Decode` (the FP8 row quantization decode step, width 17408, rows 1 .. 1024) | E4M3 `codes`, one FP32 scale per row (`scales`) | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 | `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_backward_metadata` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
@@ -4241,6 +4242,55 @@ bytes differing), and on a recycled block a pending write of the block's previou
 4.8.1 with CUDA 12.9 ran the functional command again -> 146 passed, 3 skipped (the two `sm_107a` cases, each with the entry's own
 decline; the two-device case); the other two compilers of the records above were not run again (the kernel is unchanged).  The host
 command above: 259 passed, 246 skipped.
+
+### FP8 row quantization decode step: replay, batch invariance, locality and goldens
+
+`row_quantize/frost/test_row_quantize_fp8_decode_determinism.py` pins `cudnn.RowQuantizeFp8Decode` (the dynamic FP8 quantization of
+bf16 rows in one launch, each row under its own scale: bf16 `x` `[rows, 17408]`; E4M3 `codes`, one fp32 scale per row; rows
+1 .. 1024).  Forward only: the entry is an inference step with no backward entry point, no gradient and no state, so there is no
+backward case.  Every comparison is raw bytes over both buffers a launch writes.  The entry has ONE kernel body; its three launch
+arms write the same bytes and are compared where a case says so.
+
+What is held fixed: a row's bytes are a function of its values -- the one reduction, the row maximum of magnitudes, never leaves the
+row's thread block and is exact in any order, and every step behind it is exactly specified -- so no split, pick or knob selects
+another association and there is nothing to pin across batch layouts besides the operands.  Operands are built on the host (an
+operand set has the same bytes on every device), once per case; the cases slice and permute them.  Every output is a fresh
+caller-owned buffer filled with a sentinel.  The independent reference is a separate check
+(`row_quantize_fp8_decode_utils.assert_reference`: every code byte and every scale bit against the operation's definition, with each
+fp32 rounding spelled) and gates the goldens.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | rows 1 / 17 / 297 / 1024; eight executions into fresh buffers under side-stream contention; then the reference | 4 |
+| `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | two entries, two identical 24-row operand sets built afresh | 1 |
+| `test_launch_on_a_side_stream_writes_the_same_bytes` | L0 | launch arm (plain, wait, release + wait); 17 rows under a side stream (ordered after the operands' producer stream) vs the current stream | 3 |
+| `test_batch_invariance` | L0 | one 1024-row operand set: the 1024-row call replayed three times and checked against the reference; every row alone (a one-row call) vs inside that call, vs the first 2 / 3 / 8 / 16 / 17 / 64 / 129 / 160 rows and the rows around the part's scheduling-wave edge as one call, vs the reversed batch | 1 |
+| `test_insertion_removal_and_reordering` | L0 | a 40-row call, then a row inserted at position 5, rows 3 / 11 / 39 removed, a permutation: every row keeps its bytes, the inserted row writes its alone bytes | 1 |
+| `test_duplicated_row_and_neighbour_isolation` | L0 | a row twice in one call (both copies = alone); the row at position 5 among 63 and at position 299 among 600 redrawn neighbours; the row between two rows of the largest finite magnitude | 1 |
+| `test_inputs_are_unmodified` | L0 | launch arm x rows 1 / 17 / 1024, caller-owned and entry-owned outputs (18 launches): `x` holds its bytes | 1 |
+| `test_one_element_moves_only_its_own_row` | L0 | one element changed (the first and the last column of each of the kernel's three passes; the first, a middle and the last row: 18 elements, two changes each): below the row maximum its own code byte moves and no other byte of the call; as the new row maximum its row's scale and codes move and no byte of another row | 1 |
+| `test_the_row_ceiling_call` | L0 | eight executions at 1024 rows; rows 0 / 511 / 512 / 1023 and the rows on both sides of every scheduling-wave edge below 1024 alone vs inside; the number of waves the call crossed is reported in the run's `measured` section, not asserted | 1 |
+| `test_row_ceiling_is_the_typed_decline` | L0 | 1025 rows is a `NotImplementedError`, zero rows a `ValueError`; never a launch (sentinel-filled outputs keep their bytes), never another provider | 1 |
+| `test_golden` | L0 | two cases: three executions, the reference, the wait and the release + wait arms on the same operands, the saved hashes of the codes and the scales | 2 |
+
+Collected: 17 cases, all on a device.  Replay executions: `test_replay` 4 x 8 = 32; `test_batch_invariance` 3 of the 1024-row call and
+1,024 of a row alone; `test_the_row_ceiling_call` 8; `test_golden` 2 x 3.
+
+Golden sets: `row-quantize-fp8-decode-w17408-<case>`, two files in `c84dd9abaee769b4/`, the first goldens of this API --
+`random-rows1` (one random row) and `structured-rows8` (a zero row, a row of negative zeros, a row under the floor scale, rows whose
+one dominant element sits in the last column, in the first column, in the last vector of the kernel's second pass and in the first
+vector of its third, and a row of two values of opposite sign).  The launch arms write the default's bytes inside `test_golden` and,
+on more shapes, in `test_row_quantize_fp8_decode.py` (`test_bit_neutral_arms_write_the_default_bytes`; behind a predecessor that
+released its dependents before it wrote the operand, `test_wait_holds_every_read_behind_a_predecessor_that_released_early`), so the
+one set holds for every arm.  Every step of the rounding chain is exactly specified; the hashes are still a record of this runtime
+(the runtime is part of a golden's key).  A new set is owed with a stated reason when the rounding chain changes.
+
+GPU coverage: cc 10.0 (replay, batch invariance and goldens).  cc 10.3 and cc 10.7 have not been run on a device: the entry admits
+compute capability 10.x and the status page reads "SM103: Unverified" and, for SM107, "Unverified"; a run there skips the two golden
+cases (no set for its runtime) -- a coverage gap, not a pass.  cc 9.0 and cc 12.x are declined by type.  Every run below is one
+pytest run per command on one visible device, from `test/python`; `<suite>` = `row_quantize/frost/test_row_quantize_fp8_decode_determinism.py`,
+`<module>` = `row_quantize/frost/test_row_quantize_fp8_decode.py`.  The device is a shared development part: these are correctness runs,
+and no timing was taken.
 
 ### QSA: 42 cases
 
