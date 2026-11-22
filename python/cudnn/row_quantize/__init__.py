@@ -8,6 +8,7 @@ from typing import Any
 
 _LAZY_EXPORTS = {
     "RowQuantizeFp4Decode": ("cudnn.row_quantize.frost.row_quantize_fp4_decode", "RowQuantizeFp4Decode"),
+    "RowQuantizeFp8Decode": ("cudnn.row_quantize.frost.row_quantize_fp8_decode", "RowQuantizeFp8Decode"),
 }
 
 

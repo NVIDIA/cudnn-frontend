@@ -1172,7 +1172,9 @@ store), `row_store8_e4m3(addr, values, inv, clamp=)` (the E4M3 codes of
 adds one `min.xorsign.abs.f32` against 448 per element and changes no code)
 and `fp8_dynamic_row_scale(amax)` (`scale = max(div.rn(amax, 448),
 fp32(1 / (448 * 512)))` and `inv = div.rn(1, scale)`: the per-row FP8 scale
-and its reciprocal, two IEEE divisions).
+and its reciprocal, two IEEE divisions). The FP8 row quantization decode
+kernel (`row_quantize/frost/kernel/row_quantize_fp8_decode_f16.py`) is these
+helpers around one `block_reduce(..., kind="max", order=None)`.
 One helper serves a sixteen-element-per-thread kernel:
 `row_store16_e2m1(addr, values, encode)` (the E2M1 codes of
 `values[j] * encode` as one 64-bit store, the code of `values[j]` in nibble
@@ -1305,7 +1307,8 @@ block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
     of the entry's table. The test is a WARM launch on another stream than the
     allocation's, with that stream held behind pending work
     (`test/python/init_order_schedules.py`). On the helper today:
-    `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`.
+    `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`,
+    `RowQuantizeFp8Decode`.
     Not yet, to follow in a separate change: `GdnDecodeFused`,
     `GdnVerifyFused`, `SharedExpertDecode` (they allocate: record and order),
     `Fp8ProjectionDecode`, `SwigluFp4Decode` (they own nothing: order), and
