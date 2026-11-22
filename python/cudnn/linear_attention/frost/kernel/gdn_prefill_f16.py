@@ -96,7 +96,7 @@ from typing import NamedTuple, Optional, Type, Tuple
 
 import cuda.bindings.driver as cuda
 from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
-from cudnn.frost.tile_dsl.handover import release_add
+from cudnn.frost.tile_dsl.handover import acquired_zero, poll_then_acquire, release_add
 
 import cutlass
 import cutlass.cute as cute
@@ -218,6 +218,11 @@ LEVEL_PLAN = False
 #   1  The first item's CTA adds to the border's level word from every lane of compute group 1 behind their stores of the
 #      state (a release at GPU scope, behind a proxy fence: the second item's seed is read through the async proxy); the
 #      second item's publication is held until the word reads the lane count.  The default.
+#      The load warp holds the ticket it fetched back: every lane polls, as one warp (a loop in the elected lane's branch
+#      would leave the warp's later elects lowered per lane), and takes one acquire load.  The zero of that load goes into
+#      the row the warp itself goes on with -- its seed fills are addressed from that row -- and into the word it
+#      publishes, so the CTA loads nothing of the item in front of the acquire.  The zero is the acquired count minus the
+#      adding lanes: the load warp never reads the kernel's release-zero argument.
 #      An item that hands its state over takes its next ticket BEHIND its set and not in front of its final-state store
 #      as TILE_HANDOVER_EARLY has it: a held publication may be the one that item's CTA takes next, and its set must not
 #      wait for it.
@@ -455,20 +460,54 @@ def level_set(order, mScheduler):
 
 
 @cute.jit
-def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one):
+def level_hold(cfg, row, mLevelOrder, mScheduler):
+    """Level plan: the calling warp holds work-item ``row`` (a row below the item count) until the item in front of it in
+    its tile has stored its state.  A row whose order entry is ``-b`` continues the tile cut at share border ``b``: the
+    lanes poll level word ``b``, as one warp, until it reads the count of the lanes that add to it (``level_set``, by the
+    CTA that ran the first part) and take one acquire load.  Returns 0, computed from that load on a held row
+    (``tile_dsl.handover.acquired_zero``): the caller adds it to the row it goes on with and to the word it publishes,
+    so nothing of the item can be addressed in front of the acquire.  The caller is a whole warp in converged control
+    flow with one ``row``.
+
+    The zero is the acquired count minus ``level_set_lanes`` and not the count masked by the release-zero: the load warp
+    must not read that argument (``LEVEL_WAIT``).  The warp leaves the poll only when every lane has read that count,
+    exactly one row of the table adds to a word and adds exactly that many, the word is cleared in front of the launch
+    and nothing else stores it, so the acquire load behind the poll returns exactly that count in every lane."""
+    hold = cutlass.Int32(0)
+    order = level_order_entry(row, mLevelOrder)
+    if order < cutlass.Int32(0):
+        count = poll_then_acquire(level_word(mScheduler, cutlass.Int32(0) - order), cutlass.Int32(level_set_lanes(cfg)), True)
+        hold = acquired_zero(count, level_set_lanes(cfg))
+    return hold
+
+
+@cute.jit
+def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one, total_tiles=None, mLevelOrder=None):
     """TMA-LDG-warp side: pull the next tile off the global ticket, publish it.  Level plan: the slot holds the ticket
-    itself (every row of the levelled table comes by the ticket); the elected lane arrives right behind its store of the
-    slot and the warp reads the slot behind that arrive -- no load of the slot is live across the arrive that hands it to
-    the consumers."""
+    itself (every row of the levelled table comes by the ticket).  ``LEVEL_WAIT`` 1: the warp holds a row that continues
+    a cut tile back (``level_hold``) between its own read of the ticket and the arrive that releases the consumers; the
+    wait's zero goes into the row the warp returns AND into the slot, which the elected lane writes once more in front of
+    that arrive -- one published row, formed from the acquire load, for the load warp and for the consumers.  The arrive
+    is delayed, never skipped; a ticket at or past ``total_tiles`` names no row and reads no order entry.  ``LEVEL_WAIT``
+    0: the elected lane arrives right behind its store of the slot and the warp reads the slot behind that arrive -- no
+    load of the slot is live across the arrive that hands it to the consumers."""
     bars.mb_scheduler_done[scheduler_state.idx].wait(scheduler_state.phase)
     if elect_one:
         fetched = cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu"))
         sScheduler[scheduler_state.idx] = fetched if cutlass.const_expr(cfg.level_plan) else num_ctas + fetched
-        if cutlass.const_expr(cfg.level_plan):
+        if cutlass.const_expr(cfg.level_plan and not level_orders(cfg)):
             bars.mb_scheduler_ready[scheduler_state.idx].arrive()
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
     next_tile = sScheduler[scheduler_state.idx]
-    if cutlass.const_expr(not cfg.level_plan):
+    if cutlass.const_expr(level_orders(cfg)):
+        hold = cutlass.Int32(0)
+        if next_tile < total_tiles:
+            hold = level_hold(cfg, next_tile, mLevelOrder, mScheduler)
+        next_tile = next_tile + hold
+        if elect_one:
+            sScheduler[scheduler_state.idx] = next_tile
+            bars.mb_scheduler_ready[scheduler_state.idx].arrive()
+    elif cutlass.const_expr(not cfg.level_plan):
         if elect_one:
             bars.mb_scheduler_ready[scheduler_state.idx].arrive()
     return next_tile, advance(scheduler_state, cfg.scheduler_stages)
@@ -484,11 +523,11 @@ def scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz):
 
 
 @cute.jit
-def scheduler_publish_first(cfg, bars, sScheduler, mScheduler, scheduler_state, bidx, num_ctas, elect_one):
+def scheduler_publish_first(cfg, bars, sScheduler, mScheduler, scheduler_state, bidx, num_ctas, elect_one, total_tiles=None, mLevelOrder=None):
     """TMA-LDG-warp side: the CTA's first tile, its own index or, in a level plan, the first ticket it publishes (one
     ring step in front of the tile loop: no row of the levelled table belongs to a CTA)."""
     if cutlass.const_expr(cfg.level_plan):
-        first_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
+        first_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one, total_tiles, mLevelOrder)
     else:
         first_tile = cutlass.Int32(bidx)
     return first_tile, scheduler_state
@@ -1345,6 +1384,7 @@ def tmaldg_warp(
     arr_words,
     mSeedIndices=None,
     state_seed_map=None,
+    mLevelOrder=None,
 ):
     """TMA-LDG warp role (warp 9): persistent scheduler loop + per-chunk
     Q/K/V G->S TMA loads, plus the chunk-factor tile TMA loads at the V
@@ -1373,7 +1413,7 @@ def tmaldg_warp(
 
     elect_one = nvvm.elect_sync()
     tidx % cfg.threads_per_warp
-    tile_idx, scheduler_state = scheduler_publish_first(cfg, bars, sScheduler, mScheduler, scheduler_state, bidx, num_ctas, elect_one)
+    tile_idx, scheduler_state = scheduler_publish_first(cfg, bars, sScheduler, mScheduler, scheduler_state, bidx, num_ctas, elect_one, total_tiles, mLevelOrder)
     bytes_per_element = cfg.io_dtype.width // 8
     box_elems = 128 // bytes_per_element
     bt = cfg.b_t
@@ -1547,7 +1587,7 @@ def tmaldg_warp(
                 tinv_slice = tma_slice_runtime_desc(desc_tinv_slot, cutlass.Int32(0), cutlass.Int32(0), head_o, tinv_row)
                 tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_t_inv_ready[tinv_idx].smem_ptr, acquire=False)
 
-        tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
+        tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one, total_tiles, mLevelOrder)
 
     for _ in range(cfg.smem_kq_stages):
         bars.mb_kq_done[kq_index.idx].wait(kq_index.phase)
@@ -4039,6 +4079,7 @@ def frost_gdn_prefill(
             arr_words=arr_words,
             mSeedIndices=mSeedIndices,
             state_seed_map=state_seed_map,
+            mLevelOrder=mLevelOrder,
         )
 
     if warp_idx == cfg.epilogue_warp_id:
