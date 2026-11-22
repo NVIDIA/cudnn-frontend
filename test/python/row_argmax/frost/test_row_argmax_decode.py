@@ -642,10 +642,24 @@ def test_rendering_holds_the_rule(arch, cc, tmp_path):
     compute-capability 10.x target and as butterfly shuffles elsewhere.  The result: the table kind's one load and one store.
     No dependent-launch instruction, no mbarrier, no copy group; every branch goes forward (no loop).  1024 threads; the form
     inside the first 100 characters of a cuDNN symbol.  Where a disassembler decodes the cubin: no access to local memory (every
-    value stays in a register).  ``sm_120a`` is rendered although the entry declines that class: the kernel assembles for it."""
+    value stays in a register).  ``sm_120a`` is rendered although the entry declines that class: the kernel assembles for it.
+    A DSL below the entry's floor or without the target SKIPS with the gate's text; a compiler flavour that rejects a claimed
+    target must be one the entry declines by name, then the case skips; any other compile failure FAILS."""
+    msg = entry._dsl_version_error() or (entry._dsl_target_error(cc) if cc is not None else None)
+    if msg is not None:
+        pytest.skip(msg)
+    if cc is None:
+        from cutlass.base_dsl.enums import Arch
+
+        try:
+            Arch.from_string(arch)
+        except Exception:
+            pytest.skip(f"this cutlass-dsl has no {arch}")
     compiler, kept, rejected = _render(tmp_path, arch)
     if rejected:
-        assert cc == (10, 7) and compiler < entry.SM107_MIN_COMPILER and all(_UNSERVED in text for text in rejected.values()), rejected
+        assert all(_UNSERVED in text for text in rejected.values()), rejected
+        if cc is None:
+            pytest.skip(f"the installed compiler flavour of the DSL (CUDA {compiler[0]}.{compiler[1]}) does not assemble {arch}")
         monkey = pytest.MonkeyPatch()
         with monkey.context() as patched:
             patched.setattr(entry, "dsl_compiler_cuda_version", lambda: compiler)
@@ -686,7 +700,8 @@ def test_rendering_holds_the_rule(arch, cc, tmp_path):
         if sass is not None:
             assert not [ln for ln in sass if " STL" in ln or " LDL" in ln], f"{what}: the compiled kernel accesses local memory"
     if cc is not None and arch != "sm_100a":
-        _, base, _ = _render(tmp_path, "sm_100a")
+        _, base, declined = _render(tmp_path, "sm_100a")
+        assert not declined, declined
 
         def body(text):
             return text[text.index(".entry") :]
