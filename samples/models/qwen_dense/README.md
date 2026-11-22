@@ -270,10 +270,9 @@ inside a serving engine and gets a declared stand-in.
 
 These are the numbers of the complete stack, not of today's. On compute capability 10.0 this stack launches all 289
 today: the norm entry's 129, the projection entry's 64, the fused gate / up entry's 64, the gate entry's 16 and the
-attention preparation entry's 16. Of
-the 194 it launches 178: the fused step's 48, PyTorch's gather and 129 calls of FlashInfer -- the MLP's 64 down
-multiplies, the 64 out-projections and the multiply of the output head; the 16 it does not launch are the attention
-core's. The
+attention preparation entry's 16. And it launches all 194 of the target's own compiled kernels: the fused step's 48,
+PyTorch's gather and 145 calls of FlashInfer -- the MLP's 64 down multiplies, the 64 out-projections, the multiply of
+the output head and the attention core's 16. The
 numbers are those of the recorded class, compute capability 10.0: the target launches the
 projection kernel for the in-projections there and a library multiply on the other 10.x classes, so on those the
 in-projection of this stack stays on its fallback row. And "byte-equal" is the entry's own record, not something this
@@ -286,10 +285,10 @@ fused gate / up entry it was made on compute capability 10.0; for the attention 
 compute capability 10.0. What this
 sample holds an entry to is its documented numerics contract (the band of its row) and its launch facts.
 
-The stack is built block by block. A block whose target kernel is not served here yet stays on a fallback row -- the
-one it has in `fe-cublas`, or, for the attention core, a row of the two target stacks alone, the same reference chain
-with the reason that holds on a pool of pages -- and a run prints it as `not yet (<fallback reason>)`. Today six
-entries of cuDNN Frontend and three
+The stack is built block by block. A block whose target kernel a stack does not serve stays on a fallback row -- the
+one it has in `fe-cublas`, or, for the attention core in `fe-entries`, a row of the two target stacks alone, the same
+reference chain with the reason that holds on a pool of pages -- and a run prints it as `not yet (<fallback reason>)`.
+Today six entries of cuDNN Frontend and four
 calls of a library, FlashInfer, are on their target forms:
 
 | block | launches per step (64 layers) | what `native` launches | identity |
@@ -304,7 +303,7 @@ calls of a library, FlashInfer, are on their target forms:
 | MLP down | 64 | `flashinfer.gemm.mm_fp4` on the stored 4-bit weight, with the library's CuTe DSL backend and outside any tuning context (`BACKEND cute-dsl`, `TUNED False`): the library's own pick for the shape, its split-K kernel class for this weight; needs FlashInfer; compute capability 10.x | target: the target's own compiled kernel, held to the kernel class and the launch shape the census records |
 | output head | 1 | the reference's 4-bit quantisation of the normed rows, then the same call of `flashinfer.gemm.mm_fp4` on the stored 4-bit weight: the library's persistent kernel class for this weight; needs FlashInfer; compute capability 10.x | target: the target's own compiled kernel, held to the kernel class and the launch shape the census records (the quantisation in front of it is the last row of this table) |
 | attention preparation | 16 | `cudnn.AttentionPrepareDecode` on the layer's cache as a pool of pages, the kernel stated whole: three position rows in the sections of the published rotary width, pages of 64 positions, 64-bit positions and slots, an ordinary launch (`POSITIONS 3d`, `SECTION (11, 11, 10)`, `PAGE_SIZE 64`, `POSITION_DTYPE int64`, `SLOT_DTYPE int64`, `PDL False`, `PDL_RELEASE False`); compute capability 10.x, 1 to 1,024 rows | target: a cuDNN Frontend entry with byte-equal results |
-| attention core | 16 | a fallback row of the target stacks: the reference chain of `fe-cublas`, which reads that pool through the cache's accessors. `--provider attention.core=torch_ref.attention` names the key that both rows have and selects, on each stack, that stack's own row: the same chain and the same bytes, printed with the reason of the stack that runs (an override takes the row of the run's stack where that row names the same call, and the first declared row of its key elsewhere) | not yet |
+| attention core | 16 | `flashinfer.decode.trtllm_batch_decode_with_kv_cache` on the pool of pages the preparation wrote, through the page table and the lengths the state holds for the run's maximum length (`KV_LAYOUT HND`, with the library's own backend for these GPU classes): the library's paged decode attention, whose kernels are precompiled binaries; needs FlashInfer and its kernel-binary package ("The rows a library serves" below); compute capability 10.x, rows 1-1,024. Not within one bf16 unit of the reference chain: its band is the bound of a stated model ("The attention core on the library" below). `--provider attention.core=torch_ref.attention` names the key that both chain rows have and selects, on each stack, that stack's own chain row: the same chain and the same bytes, printed with the reason of the stack that runs (an override takes the row of the run's stack where that row names the same call, and the first declared row of its key elsewhere) | target: the target's own compiled kernel, held to the kernel class and the launch shape the census records for a run of one sequence at the maximum length it was recorded with, by membership at another |
 | the 4-bit quantise in front of the output head | 1 | nothing: this sample has no block for it yet | the target's declared stand-in, not yet |
 
 The norm block is called at five kinds of site in a step, and the target calls its kernel in another form at each: the
@@ -435,7 +434,8 @@ two output buffers of the call's own. Nothing is launched between the in-project
 kernel check holds that on compute capability 10.0, where the in-projection is an exact row (up to 32 rows) and both
 are judged one by one. Where the in-projection is on its fallback row -- on compute capability 10.3 and 10.7, and
 past 32 rows -- its launches are attributed by family, and a PyTorch launch between the two would be counted among
-them. The attention core behind it is still the reference chain. It
+them. The attention core behind it is the library's kernel in `native`, which reads the pool through the state's
+page table and lengths ("The attention core on the library" below). In `fe-entries` it is still the reference chain: it
 reads the pool through the cache's accessors -- the pages of a sequence as one run of positions, by views and host
 integers alone -- as it reads the contiguous cache of the other stacks, and its launches are attributed to its
 families.
@@ -509,7 +509,9 @@ is held by tests, not by a run: by the host case of a session on stand-ins, whos
 the paged cache against the plain one, and by the two cells of the GPU test that read the pool by index arithmetic
 of their own. With the defect planted, the host case of the paged cache failed and so did the cell of the reference
 chains, on compute capability 8.0; the cell of 80 steps reads the pool the same way and was not run with it. A check
-on a device of what the attention core reads comes with the row of the core's own kernel.
+on a device of what the attention core reads is the row of the core's own kernel in `native`: that kernel reads the
+pool through the page table and the lengths, and every call is judged against the reference chain ("The attention
+core on the library" below).
 
 What a consumer needs beyond a kernel's bytes is launched by the consumer, never inside the producer's call. The MLP's
 down multiply reads the codes of the gate / up kernel with their block scales in the layout the kernel writes
@@ -522,7 +524,7 @@ So a run with a checkpoint prints under its kernel table:
 
 ```text
 the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): 484 launches per step = 194 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results + 1 declared stand-in
-kernel identity, as planned: 467 of 484 launches of a step are target kernels (178 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results); not yet: attention.core 16; 1 declared stand-in (not yet: output_head.quantize)
+kernel identity, as planned: 483 of 484 launches of a step are target kernels (194 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results); 1 declared stand-in (not yet: output_head.quantize)
 ```
 
 On `--stack fe-entries`, the cuDNN Frontend rows alone, the second line is
@@ -531,12 +533,15 @@ On `--stack fe-entries`, the cuDNN Frontend rows alone, the second line is
 kernel identity, as planned: 338 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results); not yet: projection.fp8.out 64, mlp.down 64, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)
 ```
 
-and with its checks the census line, `target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12): NOT CLAIMED (fallback
-rows present; ...); 403 launches of a step compared by launch shape (114 the target's own compiled kernels + 289 cuDNN
-Frontend entries with byte-equal results + 0 declared stand-ins): each in the recorded one; 64 more by membership
-alone` -- the 64 are the out-projections, whose kernel the library chooses. The default run on the two-layer model
-counts 18 of 20 (7 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results; the declared
-stand-in not yet), and `fe-entries` 13 of 20 there (2 the target's own compiled kernels + 11 cuDNN Frontend entries with
+and with its checks the census line of `native`, `target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12): NOT
+CLAIMED (the plan has no block for output_head.quantize); 419 launches of a step compared by launch shape (130 the target's
+own compiled kernels + 289 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins): each in the recorded
+one; 64 more by membership alone` -- the 64 are the out-projections, whose kernel the library chooses. The 16 launches
+of the attention core are among the 419 at the maximum length the census was recorded with, 2,051 (the default of
+`--max-model-len`); at another maximum length the library launches another variant of its kernel or another grid, the
+line names the block with both lengths, and the 16 are held by membership as well: 403 and 80. The default run on the
+two-layer model counts 19 of 20 (8 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results;
+the declared stand-in not yet), and `fe-entries` 13 of 20 there (2 the target's own compiled kernels + 11 cuDNN Frontend entries with
 byte-equal results; the declared stand-in not yet). The line always says what was compared: `EQUAL`, once a class is
 claimed, carries the
 number of launches that were held to a recorded launch shape and the number held by membership alone (a kernel a
@@ -545,8 +550,8 @@ library's tuner selects, a stand-in), so it never stands for a comparison that w
 **Nothing is claimed yet.** A GPU class is claimed only when its section of the census says so, and that needs every
 block of a step on its target kernel, a census recorded on that compute capability and SM count, and the package versions
 of the record. Until then the line reads `NOT CLAIMED` with every reason that applies: a row selected with `--provider`
-(`not the target set: <block> selected by --provider`), fallback rows present, a kernel of the target the plan has no
-block for, no recorded section for this compute capability and SM count (the line names both) or for this row count,
+(`not the target set: <block> selected by --provider`), fallback rows present, a launch shape recorded with a width
+or at a maximum length the run does not share, a kernel of the target the plan has no block for, no recorded section for this compute capability and SM count (the line names both) or for this row count,
 versions other than the recorded ones. The census file has one section today: compute capability 10.0 with 148 SMs, at
 1 row, for the layer widths of the published 27B-class model, recorded on 2026-11-12. On another GPU class, another SM
 count, another sequence count or a checkpoint of the family with other layer widths a run says `kernel identity: not
@@ -561,7 +566,8 @@ has a section for the run, the launch shape is the recorded one -- grid (96, 1, 
 shared memory for the fused step, grid (3, 1, 1), block (256, 1, 1) and no shared memory for the gate, grid (1, 1, 1),
 block (640, 1, 1) and 80 B for the norm in every form, grid (128, 1, 1) or (112, 1, 1) by the weight's shape, block
 (256, 1, 1) and 139,520 B for the in-projection, grid (1, 1, 148), block (192, 1, 1) and 231,424 B for the fused
-gate / up step, at 1 row on
+gate / up step, grid (5, 4, 1), block (512, 1, 1) and 178,456 B for the attention core in the kernel class the census
+names, at a maximum length of 2,051, at 1 row on
 compute capability 10.0 with 148 SMs. For the norm block and the in-projection all of it holds per call site. A
 difference fails the run with a sentence that names the block, and for a form the call and its site.
 
@@ -581,7 +587,10 @@ and the two scalars. The kernel signals the launch after it before its last outp
 for that). In `fe-entries` the down multiply behind it is a fallback row, launched without the attribute, and starts
 when the kernel has completed; in `native` it is the library's kernel, which the library launches with programmatic
 dependent launch at its own default and which waits for the launch before it at its start. The library launches its
-8-bit multiply the same way: in `native` it starts on the release of the fused step or of the gate, and waits. Each
+8-bit multiply the same way: in `native` it starts on the release of the fused step or of the gate, and waits. And it
+launches its attention the same way behind the attention preparation's kernel, an ordinary launch that releases nothing
+early: the kernel waits before it reads the queries and the pool; that it waits in front of its read of the page table
+and the lengths is not established, so those two are constants of the state that no launch writes. Each
 row of `configs.py` says what the launch before it must not write and what the launch after it must wait for. With `--provider
 linear_attention.step=fe.gdn_decode_fused` the stack runs the fused step in its `fe-cublas` form instead (no wait, no
 release); the table then prints `not the target (...)` for the block and the census line says why the run is not the
@@ -589,16 +598,19 @@ target set.
 
 `--stack fe-entries` is every cuDNN Frontend row of `native` with each block that a library serves there on its
 fallback row. It needs no package beyond cuDNN Frontend and PyTorch, and it is the stack the GPU test
-of this area runs, so the rows of the entries stay verified wherever that test runs. The two stacks differ in three
-rows: the MLP's down multiply, the output head and the 8-bit out-projection, which `native` hands to FlashInfer and
-`fe-entries` keeps on the multiplies over a copy of `fe-cublas`.
+of this area runs, so the rows of the entries stay verified wherever that test runs. The two stacks differ in four
+rows: the MLP's down multiply, the output head, the 8-bit out-projection and the attention core, which `native` hands
+to FlashInfer; `fe-entries` keeps the three multiplies on the multiplies over a copy of `fe-cublas` and the attention
+core on its reference chain.
 
 ### The rows a library serves
 
 Three blocks of the target kernel set are multiplies of a library on the stored weights, and `native` has a row for
 each on compute capability 10.x: `flashinfer.mm_fp4` for the MLP's down multiply, `torch_ref.quantize+flashinfer.mm_fp4`
 for the output head, and `flashinfer.bmm_fp8` for the out-projection (in a verify step behind the projection entry's
-rows, which keep the linear-attention layers' call). FlashInfer is an optional package of this stack alone. It is
+rows, which keep the linear-attention layers' call). A fourth is the attention core, `flashinfer.decode_attention`: the
+library's paged decode attention over the pool of pages the attention preparation writes ("The attention core on the
+library" below). FlashInfer is an optional package of this stack alone. It is
 imported inside the adapters of the rows that call it, on a device; no other stack and no plan on stated device facts
 imports it. Such a plan is made through the helper layer (`model_samples.blocks.plan` with a `DeviceFacts` of your
 own; the script has no flag for it) and shows these rows without the package -- as `unverified in CI`, because no
@@ -606,17 +618,24 @@ requirement file of this repository's tests names the package. Install it with
 
 ```bash
 pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt
+# the library's kernel-binary package, at the library's own version: published on the library's release index, not on PyPI
+pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt
 ```
 
-The requirement file is a lower bound; the constraints file pins the versions the launch records of the census were
-recorded with -- PyTorch 2.14.0, CuTe DSL 4.8.0, FlashInfer 0.7.2.post1 and apache-tvm-ffi 0.1.11 -- so in an
+The second line installs the kernels of the attention core: precompiled binaries, which a run reads and never fetches
+("What the first run does"). Each requirement file is a lower bound; the constraints file pins the versions the launch
+records of the census were
+recorded with -- PyTorch 2.14.0, CuTe DSL 4.8.0, FlashInfer 0.7.2.post1 and apache-tvm-ffi 0.1.11 -- and, as its one pin
+that is not a version of that record, the kernel-binary package `flashinfer-cubin` 0.7.2.post1, which the library reads
+at its own version alone: it joined the list when its files were held byte for byte to the kernel binaries the record's
+runs had read and a run on it launched the recorded kernels in the recorded launch shapes. So in an
 environment that has another PyTorch the line replaces it, and its cuDNN with it: an environment of its own is the safe
 place for `native`. FlashInfer requires `nvidia-cudnn-frontend` itself; run `pip install -e .` again if pip lists
 that package among what it installed. The adapters hold the version of FlashInfer alone, to a validated one
 (`VALIDATED` in `model_samples/providers/flashinfer_calls.py`); a PyTorch or a CuTe DSL of another version than the
-recorded one is named in the census line of a run. Without the package, or with another version of it, `--stack native`
-on compute capability 10.x ends in `[00] SKIP` before anything is loaded, exit code 0; the line names the version,
-the command above and `--stack fe-entries`, which runs the cuDNN Frontend rows of the stack without the package. On
+recorded one is named in the census line of a run. Without either package, or with another version of one, `--stack native`
+on compute capability 10.x ends in `[00] SKIP` before anything is loaded, exit code 0; the line names what is missing,
+its command above and `--stack fe-entries`, which runs the cuDNN Frontend rows of the stack without them. On
 compute capability 12.x no row of the library serves, and the stack runs without the package.
 
 The 4-bit multiply is held exactly. The library picks the kernel of a call itself, by the shape and the GPU -- one of
@@ -637,6 +656,52 @@ the library launched its own CUTLASS multiply there, not the cuBLASLt kernel the
 those launches are the same call as the target's and another kernel, and a count of target launches that includes
 them says so.
 
+### The attention core on the library
+
+In `native` on compute capability 10.x the attention core is one call of the library per attention layer and step,
+`flashinfer.decode.trtllm_batch_decode_with_kv_cache`, the library's paged decode attention, with the library's own
+backend for these GPU classes and `kv_layout="HND"`: one launch for all rows of the step. The adapter converts nothing and launches nothing. It hands the library the query rows as
+the attention preparation wrote them, the two halves of the pool of pages, the rows of the state's page table and the
+lengths of the step (`state.PagedKvCache.attended`), the run's maximum length, the chain's scale `256 ** -0.5` as a
+number of the host, a workspace, a zero counter buffer of the library's own size and an output buffer of the call's
+own. The page table is `[sequences, width]` of 32-bit entries: the width is the pages of the run's maximum length
+(`--max-model-len`; 2,051 by default, 33 pages) rounded up to a multiple of four, a column past a sequence's own pages
+names its last own page, and a slack row follows the last sequence, so that every entry a kernel could read names a
+page of the pool. The lengths are what each sequence holds after the step. The workspace is 394 MiB, one per device
+and process, and the memory sentence counts it once.
+
+The library checks almost nothing of what it is handed and reads it all the same, so the adapter checks: lengths or a
+page table that are not 32-bit words, a strided view of either, a table of another width than the maximum length's,
+one off a 16-byte boundary or on another device, a strided output and a step past the maximum length are each a
+`ValueError` that names the operand. A table of 64-bit words gives wrong bytes without an error at two sequences and
+the right bytes at one sequence of one page, which is why the host case holds it at two sequences of two pages.
+
+**The row is not within one bf16 unit of the reference chain.** The kernel documents no numerics contract, and its
+rounding points are not established. Its band, `attention_bf16_weights`, is the bound of a stated model of the
+kernel's arithmetic -- every softmax weight and the divisor carry one rounding at eight significant bits, the output
+one rounding to bf16 -- declared before any run of the row and never taken from a measured distance. An element is
+inside when it is finite and within `2**-8 x (spread + |chain|)` plus one spacing of bf16 values at the chain: `chain`
+is the reference chain's value before its rounding, `spread` the weighted magnitude of the values it attends to. A run
+prints the band once and, for the block, the largest share of its bound an element used (printed, not gated); an
+element outside is a finding, never a wider band. The call writes nothing, and the pool is held byte for byte at every
+call. What the band cannot see is one wrong, missing or extra row among thousands whose softmax weight is below the
+band's term: a host case pins a value row off by one slot among 2,051 attended rows as inside.
+
+**Which kernel is launched follows the run.** The library has several kernels for this attention and chooses among
+them, and the grid, by the run's maximum length, the sequences, the tokens per sequence and the GPU's SM count; the
+sample derives none of it. The census records one sequence at a maximum length of 2,051 on 148 SMs, in a decode step
+and in a verify step of six tokens: there the launch is held to the recorded kernel class and launch shape -- grid
+(5 x T, 4, 1) at T tokens per sequence, block (512, 1, 1), 178,456 B of shared memory. At another maximum length or
+another sequence count it is held by the family's name alone, and the census line says so (`no recorded launch shape
+of attention.core for this run: max_model_len ...`). Every run prints the kernel the library launched (`launched by
+the library for attention.core (printed, never gated)`). The order is held as for every exact row: nothing may be
+launched between the preparation's kernel and this one, or between this one and the gate's.
+
+The library states no batch invariance for this call and the sample claims none: the bytes of one sequence alone can
+differ from the same sequence among several, where another kernel or another split of the key rows serves the two. The
+batch line counts the block among those that are equal or differ, gates nothing on it and prints that sentence
+beside it.
+
 ### What the first run does
 
 FlashInfer builds what a call needs when the call is first made: the kernel of a 4-bit multiply is compiled in the
@@ -651,6 +716,37 @@ in one line, `[00] planning: first use of FlashInfer <version>: ...`, and the `p
 that cost. A call the library refuses for the operands the adapter built ends the run in `[00] ERROR`; whatever else
 keeps the library itself from importing, building or launching there ends it in `[00] SKIP`, with the type of the
 exception and nothing loaded. A fault of the adapter's own code is neither: it is raised as it is.
+
+The kernels of the attention core are not built: they are precompiled binaries the library reads from files -- from
+the directory `FLASHINFER_CUBIN_DIR` names, else from its kernel-binary package `flashinfer-cubin` where that has the
+library's own version, else from its cache directory -- and a file it does not find it would download. A sample never
+lets it. Before the library is first reached the run switches that download off for its process and for every process
+it starts (`FLASHINFER_NO_DOWNLOAD`), and says so in a line of its own, `[00] planning: first use of the paged decode
+attention of FlashInfer <version>: ...`: a kernel binary comes from the package or from a directory filled
+beforehand, never from a fetch inside a run. At its first use the library builds a launcher with the installed CUDA
+compiler and ninja, once per machine and kernel-binary directory, and reads a manifest, a header and the kernel
+binaries of a step shape. Which binaries a step reads follows the sequences, the tokens per sequence, the run's
+maximum length and the GPU, so the plan makes one scratch call per step shape of the run -- its sequences and one
+sequence alone, at the tokens per sequence of each of its plans, at the run's maximum length -- and every binary of
+the run is read, or reported, before anything is loaded. What a run does by what the installation holds:
+
+| the installation | the run |
+|---|---|
+| the package at the library's version, the directory variable unset | reads the package |
+| neither the package nor the variable, and no such file in the library's cache directory | `[00] SKIP`: the package is not installed, with its command |
+| the variable set, no package, and the directory without the files of this GPU and step shape | `[00] SKIP`: the directory does not hold them; fill it, or install the package |
+| the package at the library's version, without a binary for this GPU and step shape | `[00] SKIP` that names the step shape and the maximum length, and no command: none would bring the file |
+| the package at another version than the library's | `[00] SKIP` at plan time with both versions and the command: the library would ignore the package |
+| the variable set while the package is installed | `[00] SKIP` at plan time that names the variable and the package: take one of the two away |
+| the package's metadata without its module, or its module without the metadata | `[00] SKIP` at plan time that says which |
+
+Every such `SKIP` comes before anything is loaded, with exit code 0, and names no local path; in the last three the
+library is not imported. Where the package cannot be installed, fill a directory beforehand and name it with
+`FLASHINFER_CUBIN_DIR`, on a machine without the package: with the library's own command `flashinfer download-cubin`,
+which fetches every file of every kernel set of the library (this page has not run it), or by copying such a directory
+from a machine with the same GPU model -- the binaries are per architecture, and the choice among them follows the
+SM count. The run then reads that directory with the download switched off, and a file that is missing there is the
+`SKIP` of the table.
 
 On compute capability 12.x neither the gate entry nor the norm entry serves; both blocks then stay on their reference
 chains (`not yet (reference chain)`) in both stacks, and the census has no section for that class. The row of the
@@ -769,9 +865,10 @@ kept) and 0.33 GiB for the one copy its checks make at a time. A run held 31.4 G
 36.7 GiB, and the device grew by 36.9 GiB: inside the sentence by 0.2 GiB. On the other 10.x classes, where the
 in-projections stay on their copies, its plan asks for about 41.3 GiB; that is arithmetic, not a run. The stack `native`
 keeps the weights of its three library rows on their stored codes as well -- every weight a multiply reads: it holds
-18.8 GiB of weights, and its plan asks for about 27.9 GiB, 2.37 GiB of it for the one copy its checks make at a time
-(the output head's is the largest). A run held 22.4 GiB in PyTorch at its peak, reserved 23.9 GiB, and the device grew
-by 24.1 GiB. On the other 10.x classes its plan asks for about 32.1 GiB; that is arithmetic as well. The working
+18.8 GiB of weights, and its plan asks for about 28.2 GiB, 2.37 GiB of it for the one copy its checks make at a time
+(the output head's is the largest) and 0.38 GiB of it the workspace the library's attention is handed. A run before
+that row, whose plan asked for 27.9 GiB, held 22.4 GiB in PyTorch at its peak, reserved 23.9 GiB, and the device grew
+by 24.1 GiB. On the other 10.x classes its plan asks for about 32.5 GiB; that is arithmetic as well. The working
 memory is an allowance taken from runs, not a bound: the room
 a run took beyond its weights did not shrink with the copies it left out -- 5.3 GiB with every weight as a copy, 6.9 GiB
 with the stored in-projections beside every copy and 6.6 GiB with the stored in-projections alone (two runs of
@@ -1221,7 +1318,8 @@ of six tokens the norm entry, the in-projection entry (compute capability 10.0),
 8-token tile) and the attention gate entry keep their rows; at 16 sequences of five tokens -- 80 rows -- the
 in-projection (rows 1-32) and the gate / up step (rows 1-64) are on their fallback rows, printed with their reasons.
 The attention preparation keeps its row as well, one launch for all `sequences x T` rows of the step, each row at its
-own position and slot; the attention core is a reference chain, called once per token.
+own position and slot; the attention core is the library's kernel in `native`, one launch for all rows of the step,
+and a reference chain in `fe-entries`, called once per token.
 
 **The out-projection.** In a decode step the target runs a library multiply for the out-projection of every layer. In
 a verify step it runs the 8-bit projection kernel for the out-projection of a linear-attention layer -- the kernel of
@@ -1270,8 +1368,8 @@ counts on compute
 capability 10.0 -- cuDNN Frontend 6; fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) -- because the two 8-bit
 projections count as one kind of block per provider and both providers have one there already. On the other 10.x
 classes the in-projection is a multiply over a copy, so the out-projection's row makes the verify plan cuDNN Frontend 6
-where the decode plan is cuDNN Frontend 5, with the same fallbacks. A plan of `native` counts FlashInfer 3
-beside them at either step shape, and one fallback multiply fewer per library row.
+where the decode plan is cuDNN Frontend 5, with the same fallbacks. A plan of `native` counts FlashInfer 4
+beside them at either step shape, and one fallback row fewer per library row.
 
 The kernel multiplies on the stored 8-bit weight, and the load keeps the forms of this block per call site: the
 codes of the linear-attention layers' out-projections for a plan with such a row, the bf16 copies of the attention
@@ -1297,7 +1395,7 @@ attention layers', a library multiply in the target. On `native` that multiply, 
 head are the library's, and the second line reads
 
 ```text
-kernel identity, as planned: 467 of 484 launches of a step are target kernels (130 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results); not yet: attention.core 16; 1 declared stand-in (not yet: output_head.quantize)
+kernel identity, as planned: 483 of 484 launches of a step are target kernels (146 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results); 1 declared stand-in (not yet: output_head.quantize)
 ```
 
 The census section holds
@@ -1463,7 +1561,7 @@ width that differs. `text` is the tokenizer (`TextIO`), `stack` and
 whole run, the drafter in it; `session.plan_table()` prints the session's own three tables. A session with a drafter
 stands alone as well, without `share=`: it then loads the model itself. The loop reads the device once per step.
 `drafter=` needs `draft_tokens=`, and a session with a drafter serves one sequence: one request, as the drafter rows
-are for. On `native` the three library rows serve the decode steps of the prompt and the verify step of such a
+are for. On `native` the four library rows serve the decode steps of the prompt and the verify step of such a
 session as they serve a plain run, and the drafter's passes call none of them: on compute capability 10.x the session
 needs FlashInfer at a validated version, and without it `plan_table` declines before anything is loaded, by the
 sentence of the section "The rows a library serves"; `fe-entries` runs the same session on the cuDNN Frontend rows.
@@ -1491,9 +1589,9 @@ the drafter: what its load and its cache hold (`memory_bytes`) and the working m
 an allowance of twice the largest chunk of a weight a reference multiply converts to fp64 at a time
 (`working_bytes`: 1.33 GiB at the published widths). At the
 published widths with 65,536 ids and 2,051 positions the drafter adds 3.3 GiB: a run of a plain session and such a
-session asks for about 32.4 GiB on `native` (compute capability 10.0, where its library rows keep the weights of the
+session asks for about 32.8 GiB on `native` (compute capability 10.0, where its library rows keep the weights of the
 down multiplies, the out-projections and the output head on their stored codes), about 43.6 GiB on `fe-entries` and
-about 61.2 GiB on `fe-cublas`, where the same run without a drafter asks for about 29.1, 40.2 and 57.9 GiB. These are
+about 61.2 GiB on `fe-cublas`, where the same run without a drafter asks for about 29.5, 40.2 and 57.9 GiB. These are
 arithmetic on stated facts; a measured run is below.
 
 **The checks of a speculative step.** Every block of the drafter but its embedding lookup is a reference chain, so
@@ -1640,7 +1738,7 @@ such a session are not stated either. With a drafter it states the bytes of its 
 kernel check and the coverage line of such a session are about its verify
 steps: the decode steps of its prompt are replayed in front of the traced window and their kernels are not observed,
 which the run says beside its kernel verdict; what they launch was compared with a plain session's step in the runs
-above, by the driver of those runs. The attention core on its target kernel; and, in `fe-entries`, the attention
+above, by the driver of those runs. In `fe-entries`, the attention core, the attention
 layers' out-projection and the MLP's down multiply, which `native` runs on the library's kernels. A captured verify
 step. A verify step of more than eight tokens per sequence, of more than 16 sequences, or of more than 4 at six tokens
 and more: declined by name. The verify step
@@ -1671,7 +1769,7 @@ python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-
 | for the default run | this checkout and a GPU of compute capability 10.x or 12.x: no checkpoint, no extra package |
 | for `--stack native` on compute capability 10.x | also FlashInfer at a validated version (the section "The rows a library serves"): the verify step and the decode steps call its multiplies on the stored weights. Without it the run ends in `[02] SKIP` before anything is loaded, exit code 0; `--stack fe-entries` runs the cuDNN Frontend rows without the package |
 | with `--model` | the packages of `samples/models/requirements.txt`, the checkpoint on local disk (22 GB), and a draft vocabulary: a JSON list of token ids, `--draft-vocab FILE`. The recipe of the section "The checkpoint's drafter" makes one from the files `--dump-tokens` writes, of this script or of `00_decode.py`. Without a list the run ends in one `ERROR` line that names that recipe |
-| GPU memory with the 27B checkpoint | with a list of 65,536 ids and the default context length a run asks for about 61 GiB free on the stack `fe-cublas` (about 64 GiB on compute capability 12.x); on the stack `fe-entries` for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes and about 64 GiB elsewhere; on the stack `native`, whose three library rows need FlashInfer (the section "The rows a library serves"), for about 32 GiB and about 37 GiB there. That is the model as `00_decode.py` holds it, a state of six tokens per sequence, and the drafter with the bf16 copies its reference blocks multiply on. These are arithmetic on stated facts; the runs at the end of this section measured compute capability 10.0 |
+| GPU memory with the 27B checkpoint | with a list of 65,536 ids and the default context length a run asks for about 61 GiB free on the stack `fe-cublas` (about 64 GiB on compute capability 12.x); on the stack `fe-entries` for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes and about 64 GiB elsewhere; on the stack `native`, whose library rows need FlashInfer and its kernel-binary package (the section "The rows a library serves"), for about 33 GiB and about 37 GiB there. That is the model as `00_decode.py` holds it, a state of six tokens per sequence, and the drafter with the bf16 copies its reference blocks multiply on. These are arithmetic on stated facts; the runs at the end of this section measured compute capability 10.0 |
 
 **What a run is.** A prompt of N tokens is N decode steps and N - 1 passes of the drafter before the first token; then
 every step is five draft passes and one verify step of six tokens, and keeps one to six of them. A run says so before it
@@ -1780,9 +1878,9 @@ script's own, and the checks of every run.
 | `native` and `fe-entries`, and any stack with `--check-kernels` | also the kernel check of whole steps: the lookups of the drafter's passes and the verify plan's rows one by one, everything else a pass launches attributed to the drafter's fallback rows |
 
 On `native`, at one sequence of six tokens on compute capability 10.0 with 148 SMs, a run proves what the verify step
-proves -- on the 64-layer model 467 of the 484 launches of a verify step are target kernels (130 the target's own
-compiled kernels + 337 cuDNN Frontend entries with byte-equal results), on the two-layer model of the default run 18 of
-20 (6 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results); on `fe-entries`, without
+proves -- on the 64-layer model 483 of the 484 launches of a verify step are target kernels (146 the target's own
+compiled kernels + 337 cuDNN Frontend entries with byte-equal results), on the two-layer model of the default run 19 of
+20 (7 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results); on `fe-entries`, without
 the library rows, 386 of the 484 (49 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal
 results) and 14 of 20 (2 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results) -- now
 behind a real
@@ -1917,14 +2015,15 @@ Frontend 1; fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4); PyTorch as the
 | MLP gate / up + SiLU x up + quantise | 64 | `fe.swiglu_fp4_decode` | cudnn.SwigluFp4Decode [TOKEN_TILE 8, PREWAIT_STAGES 2, L2_EVICT_FIRST True, MAX_CLUSTERS 148, PDL True] |
 | MLP down | 64 | `flashinfer.mm_fp4` | flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False] |
 | attention preparation | 16 | `fe.attention_prepare_decode` | cudnn.AttentionPrepareDecode [POSITIONS 3d, SECTION (11, 11, 10), PAGE_SIZE 64, POSITION_DTYPE int64, SLOT_DTYPE int64, PDL False, PDL_RELEASE False] |
-| attention core | 16 | `torch_ref.attention` | torch_ref.attention, fallback: reference chain over the attention cache |
+| attention core | 16 | `flashinfer.decode_attention` | flashinfer.decode.trtllm_batch_decode_with_kv_cache [KV_LAYOUT HND] |
 | gate + quantise | 16 | `fe.attention_gate_quant_decode` | cudnn.AttentionGateQuantDecode [THREADS 256, PDL_RELEASE True] |
 | output head | 1 | `torch_ref.quantize+flashinfer.mm_fp4` | torch_ref.quantize + flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False] |
 | token choice | 1 | `torch.argmax` | torch.argmax |
 
-By provider: cuDNN Frontend 6; FlashInfer 3; fallbacks 1 (PyTorch chains 1); PyTorch as the natural provider 2; 3 rows
+By provider: cuDNN Frontend 6; FlashInfer 4; PyTorch as the natural provider 2; 4 rows
 unverified in CI.
-The table is the one of `native`. `fe-entries` has the same rows but FlashInfer's three, which are its
+The table is the one of `native`. `fe-entries` has the same rows but FlashInfer's four, which are the reference chain
+of the attention core over the pool of pages and its
 three multiplies over a copy of `fe-cublas`: cuDNN Frontend 6; fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1);
 PyTorch as the natural provider 2.
 The two 8-bit projections count as one kind of block per provider, and on this class they have two: the in-projection
@@ -1934,8 +2033,8 @@ shapes of the projection row, by call site, are in the section on the stack `nat
 multiply is the one of 1 to 8 rows; three more rows of the same key name the other token tiles: `TOKEN_TILE 16` from 9
 to 16 rows; `TOKEN_TILE 32` from 17 to 32 rows; `TOKEN_TILE 64` from 33 to 64 rows. From 65 rows the block is the
 multiply over a copy of `fe-cublas`. On the other 10.x classes the
-in-projection is the multiply over a copy of `fe-cublas`: cuDNN Frontend 5; FlashInfer 3; fallbacks 2 (cuBLAS over
-copies 1, PyTorch chains 1); 3 rows unverified in CI. On compute capability 12.x no row of the library serves, so the
+in-projection is the multiply over a copy of `fe-cublas`: cuDNN Frontend 5; FlashInfer 4; fallbacks 1 (cuBLAS over
+copies 1); 4 rows unverified in CI. On compute capability 12.x no row of the library serves, so the
 three multiplies are over copies again; the gate / up multiply is over a copy too, and the gate + quantise row, the
 attention preparation row and the norm row are the reference chains of `fe-cublas` as well: cuDNN Frontend 1;
 fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4).
@@ -2197,9 +2296,9 @@ row order and the memory sentence of that plan are unverified. The row of the at
 cache of its plan and the reads of the attention core on that cache are unverified. The rows of the projection entry for
 the
 out-projection of a verify step claim 10.3 and 10.7 as well, in the split the target runs there, and are as
-unverified: the entry's page lists that weight shape as not run on those classes. The three rows a library serves claim
+unverified: the entry's page lists that weight shape as not run on those classes. The four rows a library serves claim
 every 10.x class too and have run on 10.0 alone: on 10.3 and 10.7 the rows are unrun, the census has no section, and
-which kernel the library picks there for either multiply is not recorded. So has the build of the entries' kernels while
+which kernel the library picks there for either multiply or for the attention core is not recorded. So has the build of the entries' kernels while
 a run is
 planned: what a plan prints on a GPU for which the installed CuTe DSL cannot build (a `SKIP` in the entry's own words) is
 held by a host test over a stand-in entry and was seen on a real GPU only with the entry's own toolchain question made to

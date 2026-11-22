@@ -28,10 +28,21 @@ Where the profiler's records cannot be had the sample ends in ``[00] RAN fe-entr
 the cell then passes on the other checks and the recorded line says that the kernels were not observed -- uncovered
 there, not verified.
 
-The ``native`` cell runs the default run on the stack ``native`` itself, which has three rows more: the multiplies the target
-runs on a library, FlashInfer, on the stored weights.  FlashInfer is an optional package of that stack alone, so the cell runs
-where it is installed at a validated version and is skipped elsewhere -- by this module where the package is absent, by the
-sample's own ``[00] SKIP`` line where its version is not validated.  A skipped cell is uncovered, not passing.
+The ``native`` cell runs the default run on the stack ``native`` itself, which has four rows more: the multiplies the target
+runs on a library, FlashInfer, on the stored weights, and the attention core on that library's paged decode attention.
+FlashInfer is an optional package of that stack alone, so the cell runs where it is installed at a validated version with
+its kernel-binary package and is skipped elsewhere -- by this module where the library is absent, by the sample's own
+``[00] SKIP`` line where its version is not validated or a kernel binary is not on the machine.  A skipped cell is
+uncovered, not passing.  A second cell of that stack sets the library's directory variable to an empty directory: the
+run ends in ``[00] SKIP`` before anything is loaded, by one of the sample's own sentences, and neither stream holds a path.
+
+The attention core's cells run no script: a small program in a fresh interpreter takes the block of the stack ``native``
+for a step shape and calls it on a paged cache whose every row is drawn, judged in the row's band the way a run judges
+a call.  One cell holds five drawn cases at one sequence; one runs the control arms, each of which must fail -- a
+masked row let in, the newest row dropped, the last page exchanged with a full one, the scores at the library's default
+scale, a twin that reads a value row from the next slot or lets every row of a step attend to all of them -- and the
+adapter's own decline of 64-bit tables; one (L1) runs a step shape for each kernel form of the library and records the
+kernel's name.
 
 That cell runs the sample in a FRESH INTERPRETER, as a user does.  The kernel check compares the profiler's kernel names
 with the symbols the entries state, and the profiler names a kernel wrongly after a kernel module was unloaded in the same
@@ -133,20 +144,21 @@ FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorc
 FE_ENTRIES = "by provider: cuDNN FE 5 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
 #: on compute capability 10.0 the in-projection is the FP8 projection entry's as well; the out-projection stays a multiply over a copy
 FE_ENTRIES_CC100 = "by provider: cuDNN FE 6 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
-#: the stack native on compute capability 10.x: the three multiplies FlashInfer serves are no fallbacks, and no lane of this
-#: repository runs them
-NATIVE = "by provider: cuDNN FE 5 | FlashInfer 3 | fallbacks 2 (cuBLAS over copies 1, PyTorch chains 1) | PyTorch 2 | unverified in CI: 3"
-NATIVE_CC100 = "by provider: cuDNN FE 6 | FlashInfer 3 | fallbacks 1 (PyTorch chains 1) | PyTorch 2 | unverified in CI: 3"
+#: the stack native on compute capability 10.x: the three multiplies and the attention core FlashInfer serves are no fallbacks,
+#: and no lane of this repository runs them
+NATIVE = "by provider: cuDNN FE 5 | FlashInfer 4 | fallbacks 1 (cuBLAS over copies 1) | PyTorch 2 | unverified in CI: 4"
+NATIVE_CC100 = "by provider: cuDNN FE 6 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4"
 
 
 CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles of both sequence counts and the run, far above what they take
 
 
-def _fresh_interpreter(arguments, script=SCRIPT, tag="[00]"):
+def _fresh_interpreter(arguments, script=SCRIPT, tag="[00]", environment=None):
     """A sample script as a user runs it: in a fresh interpreter, which imports the ``cudnn`` package this process imported.
     Returns ``(exit code, the run's lines, what the run wrote to standard output)``: a sample writes every line of a run
     to standard error and keeps standard output for generated text.  The child arms its own stack dump before the
-    parent's deadline; where the deadline passes, the failure carries what the child had printed."""
+    parent's deadline; where the deadline passes, the failure carries what the child had printed.  ``environment``:
+    variables the child has beside this process's."""
     import cudnn
 
     package_root = str(Path(cudnn.__file__).resolve().parent.parent)
@@ -160,7 +172,8 @@ def _fresh_interpreter(arguments, script=SCRIPT, tag="[00]"):
         f"runpy.run_path({str(script)!r}, run_name='__main__')\n"
     )
     try:
-        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=CHILD_SECONDS)
+        env = None if environment is None else {**os.environ, **environment}
+        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=CHILD_SECONDS, env=env)
     except subprocess.TimeoutExpired as late:
         shown = [part.decode(errors="replace") if isinstance(part, bytes) else (part or "") for part in (late.stdout, late.stderr)]
         pytest.fail(f"the sample did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}")
@@ -429,20 +442,25 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
 def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
     """The stack ``native`` with the rows a library serves, on real launches, where FlashInfer is installed: the MLP's down
     multiply and the output head on ``flashinfer.gemm.mm_fp4`` and the out-projections on ``flashinfer.gemm.bmm_fp8``, each
-    on the stored weight and each inside the band of the reference multiply at both sequence counts; the first use of the
-    library announced while the run is planned; the 4-bit multiply outside any tuning context (``TUNED False`` in the call
-    log, or the kernel check fails); every weight of a multiply on its stored format alone.  On the GPU class the family's
-    census has a section for, the down multiply is held to the recorded kernel class and launch shape, and the kernel the
-    library chose for the out-projection is printed beside the recorded pick.  Skipped where the package is absent."""
-    if not torch.cuda.is_available():  # decided here, before a child is started
-        pytest.skip("needs a CUDA GPU")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("the library rows of the stack native claim compute capability 10.x")
-    if importlib.util.find_spec("flashinfer") is None:  # looked up, not imported: the package is the child's to import
-        pytest.skip("the stack native calls FlashInfer, which is not installed here (samples/models/requirements-flashinfer.txt): uncovered, not passing")
+    on the stored weight and each inside the band of the reference multiply at both sequence counts; the attention core
+    on the library's paged decode attention, inside the band of its own row at both counts, the cache it reads left as
+    it was; the two first uses of the library announced once each while the run is planned; the 4-bit multiply outside
+    any tuning context (``TUNED False`` in the call log, or the kernel check fails); every weight of a multiply on its
+    stored format alone.  On the GPU class the family's census has a section for, the down multiply and the attention
+    core are held to the recorded kernel class and launch shape, the kernel the library chose for the out-projection
+    is printed beside the recorded pick, and the attention kernel the library launched is printed at both counts.
+    Skipped where the library is absent, and by the sample's own line where a kernel binary is."""
+    _needs_the_library()
     cc100 = tuple(torch.cuda.get_device_capability()) == (10, 0)
     out = _run(None, capsys, ["--stack", "native"], "native", NATIVE_CC100 if cc100 else NATIVE, unobserved=True)
     assert "stack native" in out and out.count("[00] planning: first use of FlashInfer ") == 1, "the library's first use is announced once, while the run plans"
+    assert out.count("[00] planning: first use of the paged decode attention of FlashInfer ") == 1, "and so is the first use of its attention"
+    core = [line for line in out.splitlines() if line.split()[:1] == ["attention.core"] and "calls" in line and "[band: " in line]
+    assert len(core) == 2 and all(
+        "; 0 outside their bound; " in line and line.endswith("the cache untouched  [band: attention_bf16_weights]  PASS") for line in core
+    ), "the attention core was judged in the band of its row at both sequence counts"
+    served = "attention.core: flashinfer.decode.trtllm_batch_decode_with_kv_cache [KV_LAYOUT HND], 1 launch per step"
+    assert sum(line.strip().startswith(served) for line in out.splitlines()) == 2, "one launch of the library's kernel per step, at both sequence counts"
     for block in ("projection.fp8.out", "mlp.down", "output_head"):
         judged = [line for line in out.splitlines() if line.split()[:1] == [block] and "calls" in line and "[band: " in line]
         assert len(judged) == 2 and all(line.endswith("[band: bf16_rounding]  PASS") for line in judged), f"{block} was judged at both sequence counts"
@@ -462,11 +480,230 @@ def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
     held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
     assert len(held) == 2 and all(line.startswith(f"  stored weights    {count} of {count} weights") and line.endswith("    PASS") for line in held)
     if cc100 and torch.cuda.get_device_properties(0).multi_processor_count == 148:  # the class the census has a section for, at 1 sequence
-        assert "18 of 20 launches of a step are target kernels (7 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)" in out
+        assert "19 of 20 launches of a step are target kernels (8 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)" in out
         assert sum("in the kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records" in line for line in down) == 1
+        assert (
+            f"    {served} (1 call x 1 per call); fi_decode_attention by name, and in the kernel class " in out
+        ), "at 1 sequence: the recorded kernel and shape"
+        assert out.count("    launched by the library for attention.core (printed, never gated): ") == 2, "the kernel the library launched, at both counts"
         assert out.count("chosen by the library for projection.fp8.out at ") == 2, "the library's pick at both call sites: printed and compared, never gated"
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
     frost_routing.measured("model sample qwen_dense 00_decode --stack native: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
+
+
+def _needs_the_library():
+    """Skips by name where a cell of the library's rows cannot run: no GPU, another class than the rows claim, no library."""
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the library rows of the stack native claim compute capability 10.x")
+    if importlib.util.find_spec("flashinfer") is None:  # looked up, not imported: the package is the child's to import
+        pytest.skip("the stack native calls FlashInfer, which is not installed here (samples/models/requirements-flashinfer.txt): uncovered, not passing")
+
+
+@pytest.mark.L0
+def test_the_native_stack_with_an_empty_kernel_binary_directory_is_a_skip_that_names_no_path(tmp_path):
+    """``--stack native`` with the library's directory variable naming an empty directory: the run ends in ``[00] SKIP``
+    while it is planned, by the sentence of the installation it finds -- with the kernel-binary package installed, that
+    the library would read the directory in the place of the package; without it, that the directory does not hold the
+    kernel binaries.  Exit code 0, standard output empty, nothing loaded, the directory's path on neither stream, and
+    the directory still empty: nothing was fetched into it."""
+    _needs_the_library()
+    empty = tmp_path / "kernel_binaries"
+    empty.mkdir()
+    code, out, written = _fresh_interpreter(["--stack", "native"], environment={"FLASHINFER_CUBIN_DIR": str(empty)})
+    verdict = [line for line in out.splitlines() if line.startswith("[00] ")][-1]
+    frost_routing.measured("model sample qwen_dense 00_decode --stack native, an empty kernel-binary directory", verdict)
+    if importlib.util.find_spec("flashinfer_cubin") is None:
+        sentence = "the directory FLASHINFER_CUBIN_DIR names does not hold the kernel binaries of this GPU and step shape; "
+    else:
+        sentence = "FLASHINFER_CUBIN_DIR is set and the kernel-binary package flashinfer-cubin is installed, "
+    assert code == 0 and verdict.startswith("[00] SKIP ") and sentence in verdict, out[-6000:]
+    assert written == "" and "\n[00] stage " not in out and "\nchecks" not in out, "nothing was loaded and nothing checked"
+    assert str(tmp_path) not in out and list(empty.iterdir()) == [], "no path on either stream, and nothing written into the directory"
+
+
+CORE_PROGRAM = """
+import faulthandler, os, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+os.environ.setdefault("KINETO_LOG_LEVEL", "6")  # as the sample's scripts set it: the profiler's own lines stay off standard error
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from types import SimpleNamespace
+from model_samples import tie_out, timing
+from model_samples.providers import torch_ref
+from model_samples.qwen_dense import QwenDense
+from model_samples.state import DecodeState, KvCache
+
+DEVICE, PAGE, RECORDED, BF16 = "cuda:0", 64, 2051, torch.bfloat16
+model = QwenDense.reduced()
+failed = []
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+def hold(name, held, text):
+    say(f"  {{name:<52}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+def drawn(sequences, tokens, live, limit, pool_seed, query_seed, scale=1.0, pages=None):
+    # the block of the stack native for a step of this shape, drawn queries, a paged cache of `live` positions per sequence
+    # whose every row is drawn, and the position the step starts at
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    session = model_samples.Session(model, text, sequences=sequences, tokens=tokens, stack="native", device=DEVICE, capacity=live, max_model_len=limit)
+    block = session.resolve()["attention.core"]
+    block.first_use(sequences, tokens)
+    shapes, device = model.state_shapes(), torch.device(DEVICE)
+    cache = DecodeState(("full_attention",), sequences, live, shapes, device, tokens=tokens, page=PAGE, pages=pages, max_model_len=limit).layers[0]
+    cache.pool.copy_(torch.randn(cache.pool.shape, generator=torch.Generator("cpu").manual_seed(pool_seed)).to(BF16))
+    rows = sequences * tokens, model.geometry.attn_heads, model.geometry.attn_head_dim
+    queries = torch.randn(rows, generator=torch.Generator("cpu").manual_seed(query_seed)) * scale
+    return block, queries.to(BF16).to(DEVICE), cache, live - tokens
+
+
+def judged(block, queries, cache, position, twin=None):
+    # one call of the block, judged in the band of its row the way a run judges a call; `twin`: a twin with a defect in the
+    # place of the correct one.  With the statistics, the names of the library's attention kernels the profiler recorded
+    correct = torch_ref.AttentionBound(None, None, None, {{}})
+    reference, before, outputs, records = correct(queries, cache, position), cache.pool.clone(), [], []
+
+    def step(index):
+        outputs.append(block(queries, cache, position))
+        outputs[0].float().sum().item()  # the host read a traced step ends in
+
+    timing.trace_steps(step, 1, DEVICE, records=records)
+    if not outputs:  # no kernel activity records on this build: the call alone
+        step(0)
+    names = sorted({{record.name for record in records if record.name.startswith("fmha")}})
+    stats = tie_out.BlockStats("attention_bf16_weights")
+    tie_out.BlockTap._judge(stats, (outputs[0],), (reference,), [cache.pool], [before], 0, twin or correct)
+    return stats, ", ".join(names) or "kernel not observed"
+
+
+def cases():
+    # one sequence at the maximum length the census was recorded with, in a pool of 39 pages: two live rows at a step of one
+    # row -- the queries of the third draw four times as large --, six live rows at a step of six
+    for pool_seed, query_seed, scale, tokens in ((1002, 2002, 1.0, 1), (2002, 4002, 1.0, 1), (3002, 6002, 4.0, 1), (3012, 4012, 1.0, 6), (6012, 8012, 1.0, 6)):
+        live = 2 if tokens == 1 else 6
+        stats, kernel = judged(*drawn(1, tokens, live, RECORDED, pool_seed, query_seed, scale, pages=39))
+        hold(f"1 x {{tokens}} rows, {{live}} live, seeds {{pool_seed}} / {{query_seed}}", stats.ok and stats.worst_share <= 1.0, f"{{stats.line()}}; {{kernel}}")
+
+
+def forms():
+    # a step shape for each kernel form of the library: sequences x tokens per sequence at a maximum length, 100 live rows
+    # per sequence (a full page and 36 rows of a second), 37 where the maximum length is 40
+    for sequences, tokens, limit in ((1, 1, RECORDED), (1, 6, RECORDED), (7, 1, RECORDED), (1, 8, RECORDED), (16, 5, RECORDED), (4, 6, RECORDED), (1, 1, 512), (1, 6, 40)):
+        stats, kernel = judged(*drawn(sequences, tokens, min(100, limit - 3), limit, 7001 + sequences, 9001 + tokens))
+        hold(f"{{sequences}} x {{tokens}} rows at a maximum length of {{limit}}", stats.ok and stats.worst_share <= 1.0, f"{{stats.line()}}; {{kernel}}")
+
+
+def arms():
+    # every arm must FAIL.  One sequence, 100 live rows: a full page and 36 rows of a second
+    live = 100
+    block, queries, cache, position = drawn(1, 1, live, RECORDED, 7001, 9001)
+    stats, kernel = judged(block, queries, cache, position)
+    hold("no defect", stats.ok, f"{{stats.line()}}; {{kernel}}")
+    table, lengths, blocks = cache.table, cache.table.lengths.clone(), cache.table.blocks.clone()
+
+    def longer(by):
+        table.lengths[position] += by
+
+    def exchanged():
+        table.blocks[0, :2] = table.blocks[0, :2].flip(0)
+
+    def unscaled():  # the library's own default for the scale of the scores
+        library = sys.modules["flashinfer"].decode
+        real = library.trtllm_batch_decode_with_kv_cache
+        library.trtllm_batch_decode_with_kv_cache = lambda **passed: real(**{{name: value for name, value in passed.items() if name != "bmm1_scale"}})
+        return lambda: setattr(library, "trtllm_batch_decode_with_kv_cache", real)
+
+    in_the_call = (
+        ("the lengths one too long: a masked row let in", lambda: longer(1)),
+        ("the lengths one too short: the newest row dropped", lambda: longer(-1)),
+        ("the last attended page exchanged with a full one", exchanged),
+        ("the scores at the library's default scale", unscaled),
+    )
+    for name, put in in_the_call:
+        undo = put()
+        stats, _ = judged(block, queries, cache, position)
+        table.lengths.copy_(lengths), table.blocks.copy_(blocks), undo and undo()
+        hold(name, not stats.ok and stats.finite and stats.outside > 0, stats.line())
+
+    def twin_on(rows, values, attended):  # the terms of a twin that reads `values`, row `r` of the step attending to `attended[r]` positions
+        terms = []
+        for row, count in enumerate(attended):
+            twin = torch_ref.AttentionBound(None, None, None, {{}})
+            twin(rows[row : row + 1], KvCache(cache.keys(count, BF16), values[:, :, :count], 1), count - 1)
+            terms.append(twin.bound)
+        return SimpleNamespace(bound=tuple(torch.cat([term[part] for term in terms]) for part in (0, 1)))
+
+    values = cache.values(live + 1, BF16)
+    newest, oldest = values.clone(), values.clone()
+    newest[:, :, live - 1], oldest[:, :, 0] = values[:, :, live], values[:, :, 1]
+    for name, wrong in (("a twin: the newest value row read from the next slot", newest), ("a twin: the value row of position 0 read from slot 1", oldest)):
+        stats, _ = judged(block, queries, cache, position, twin_on(queries, wrong, [live]))
+        hold(name, not stats.ok and stats.finite and stats.outside > 0, stats.line())
+    block, queries, cache, position = drawn(1, 6, live, RECORDED, 7001, 9001)
+    stats, _ = judged(block, queries, cache, position, twin_on(queries, cache.values(live, BF16), [live] * 6))
+    hold("a twin: every row of a step of six attends to all rows", not stats.ok and stats.finite and stats.outside > 0, stats.line())
+    # tables of 64-bit words are the adapter's own decline, at two sequences of two pages: the library would read them as 32-bit words
+    block, queries, cache, position = drawn(2, 1, live, RECORDED, 7001, 9001)
+    for name, wide in (("lengths", dict(lengths=cache.table.lengths.long())), ("blocks", dict(blocks=cache.table.blocks.long()))):
+        kept = {{field: getattr(cache.table, field) for field in wide}}
+        vars(cache.table).update(wide)
+        try:
+            block(queries, cache, position)
+            declined = "no error"
+        except ValueError as error:
+            declined = str(error)
+        vars(cache.table).update(kept)
+        hold(f"{{name}} of 64-bit words", "the kernel reads 32-bit words" in declined, f"the adapter declines: {{declined[:160]}}")
+
+
+try:
+    {{"cases": cases, "forms": forms, "arms": arms}}[{selected!r}]()
+except NotImplementedError as error:
+    say(f"[core] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[core] {{model_samples.check_environment().header()}}")
+say("[core] FAIL" if failed else "[core] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.parametrize(
+    "selected", [pytest.param("cases", marks=pytest.mark.L0), pytest.param("arms", marks=pytest.mark.L0), pytest.param("forms", marks=pytest.mark.L1)]
+)
+def test_the_librarys_attention_on_drawn_operands_is_inside_its_band_and_every_control_arm_fails(selected):
+    """The block of the attention core on the stack ``native``, called on drawn operands and judged in the band of its
+    row (``CORE_PROGRAM``, a fresh interpreter), where the library and its kernel binaries are installed.  ``cases``:
+    five drawn cases at one sequence, each inside the band.  ``arms``: the same call with one thing wrong must be
+    outside it -- in the call: the lengths one too long, one too short, the entry of the last attended page exchanged
+    with a full one's, the scores at the library's default scale; in the twin: a value row read from the next slot, at
+    the newest position and at position 0, and every row of a step of six attending to all rows -- and tables of 64-bit
+    words are declined by the adapter.  ``forms``: a step shape for each kernel form of the library, each inside the
+    band, the kernel the profiler recorded printed beside it."""
+    _needs_the_library()
+    out = _program(
+        CORE_PROGRAM,
+        "[core]",
+        f"model sample qwen_dense: the library's attention on drawn operands, {selected}",
+        "run of the attention core",
+        selected=selected,
+    )
+    held = [line for line in out.splitlines() if line.startswith("  ") and line.endswith(("    PASS", "    FAIL"))]
+    assert len(held) == {"cases": 5, "arms": 10, "forms": 8}[selected] and all(line.endswith("    PASS") for line in held), out[-6000:]
+    if selected != "arms":  # the kernel the profiler recorded under each call, at the end of its line
+        kernels = sorted({line.rsplit("; ", 1)[1].split("    ")[0] for line in held})
+        frost_routing.measured(f"model sample qwen_dense: the library's attention on drawn operands, {selected}: kernels", "; ".join(kernels))
 
 
 @pytest.mark.L1

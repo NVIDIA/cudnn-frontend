@@ -74,6 +74,8 @@ NVJET = "nvjet_sm100_tst_64x8_64x16_2x1_v_bz_splitK_TNT"
 # two kernels a library launches for a row of the stack native: a cuBLASLt kernel of 8-bit operands, and the library's 4-bit multiply
 NVJET_FP8 = "nvjet_sm100_qqtst_64x8_128x16_4x1_v_bz_TNT"
 FI_MM_FP4 = "kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100_splitkSm100BlockScaledSplitKGemmKernel_object_at__TiledMMA_0"
+FI_ATTENTION = "fmhaSm100fKernel_QkvBfloat16OBfloat16H256PagedKvCausalP64MultiCtasKvCgaVarSeqQ8Kv256StaticGroupedSwapsAbForGen"
+ATTENTION_ENTRY = "flashinfer.decode.trtllm_batch_decode_with_kv_cache"
 HOST_READ = "Memcpy DtoH (Device -> Pageable)"
 NO_PROFILER = "this PyTorch build records no kernel activity"
 
@@ -782,15 +784,16 @@ def test_the_kernels_lines_are_three_numbers_from_the_plan_and_the_census(monkey
         return perf.kernel_facts(session, "PASS")
 
     kernels, native = planned("fe-entries"), planned("native")
-    assert (native["on_target"], native["launches"]) == (467, 484) and (native["code"], native["port"], native["stand_ins"]) == (178, 289, 0)
-    assert native["by_provider"] == {"cuDNN Frontend": 337, "FlashInfer": 129, "PyTorch": 1}
-    assert (native["fallback_calls"], native["absent"]) == (16, 1) and native["fallback_rows"], "467 + 16 + 1 = 484: the attention core is left"
+    assert (native["on_target"], native["launches"]) == (483, 484) and (native["code"], native["port"], native["stand_ins"]) == (194, 289, 0)
+    assert native["by_provider"] == {"cuDNN Frontend": 337, "FlashInfer": 145, "PyTorch": 1}
+    assert (native["fallback_calls"], native["absent"]) == (0, 1) and not native["fallback_rows"], "483 + 1 = 484: no block is left on a fallback row"
     wide = perf.screen(_data(kernels=native))  # a third provider: the line breaks between two of them
-    at = wide.index("kernels     467 of 484 launches per step are on the target kernel set: cuDNN Frontend 337, FlashInfer 129,")
+    at = wide.index("kernels     483 of 484 launches per step are on the target kernel set: cuDNN Frontend 337, FlashInfer 145,")
     assert wide[at + 1 : at + 3] == [
         " " * 12 + "PyTorch 1",
-        " " * 12 + "= 178 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results",
+        " " * 12 + "= 194 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results",
     ]
+    assert " " * 12 + "not yet: no block calls on fallback rows + 1 launch of the target that has no block yet" in wide
     assert kernels["declared"] and kernels["stated"] and kernels["fallback_rows"]
     assert (kernels["on_target"], kernels["launches"]) == (338, 484) and (kernels["code"], kernels["port"], kernels["stand_ins"]) == (49, 289, 0)
     assert kernels["by_provider"] == {"cuDNN Frontend": 337, "PyTorch": 1}
@@ -1382,7 +1385,9 @@ def _records(sites, start=0.0, us=4.3, period=0.01, also=()):
     from model_samples.census import FAMILIES, Launch
 
     names = {"embedding_gather": GATHER, "gdn_decode_fused": SYMBOL, "pytorch": ELEMENTWISE, "cublas": NVJET}
-    names.update({"cublaslt_fp8_gemm": NVJET_FP8, "fi_mm_fp4": FI_MM_FP4})  # the exact kernels of the rows a library serves
+    names.update(
+        {"cublaslt_fp8_gemm": NVJET_FP8, "fi_mm_fp4": FI_MM_FP4, "fi_decode_attention": FI_ATTENTION}
+    )  # the exact kernels of the rows a library serves
     names.update({kernel: pattern.pattern.lstrip("^") + "Cfg" for kernel, pattern in FAMILIES if pattern.pattern.startswith("^cudnn_kernel_frost_")})
     records = []
 
@@ -1966,7 +1971,7 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
     sites, claim = _planned(monkeypatch)
     traced, busy = _walked(sites, [_records(sites)], claim)
     rows = perf.kernel_table(traced, busy)["rows"]
-    exact = [(row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows[:10]]
+    exact = [(row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows[:11]]
     assert exact == [
         ("embedding", "exact", 1, 1),
         ("add_norm_quantize", "exact", 129, 129),
@@ -1976,21 +1981,28 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         ("mlp.gate_up", "exact", 64, 64),
         ("flashinfer.gemm.mm_fp4: mlp.down", "library", 64, 64),
         ("attention.prepare", "exact", 16, 16),
+        (f"{ATTENTION_ENTRY}: attention.core"[: perf.LABEL], "library", 16, 16),  # a name wider than the column: cut there
         ("attention.gate_quantize", "exact", 16, 16),
         ("torch_ref.quantize + flashinfer.gemm.mm_fp4: output_head", "library", 1, 1),
     ]
-    assert not [row["label"] for row in rows[10:] if row["relation"] in ("exact", "library")]
+    assert not [row["label"] for row in rows[11:] if row["relation"] in ("exact", "library")]
     three = "the target's own compiled kernels + cuDNN Frontend entries with byte-equal results + declared stand-ins"
     numbers = claim.numbers()
-    assert sum(planned for *_, planned in exact) == traced.result.exact == numbers["target_code"] + numbers["target_port"] == 178 + 289 + 0, three
-    assert sum(planned for _, kind, _, planned in exact if kind == "library") == 64 + 64 + 1, "one launch of the library per call of its three blocks"
+    assert sum(planned for *_, planned in exact) == traced.result.exact == numbers["target_code"] + numbers["target_port"] == 194 + 289 + 0, three
+    assert sum(planned for _, kind, _, planned in exact if kind == "library") == 64 + 64 + 16 + 1, "one launch of the library per call of its four blocks"
+    assert rows[8]["blocks"] == [
+        {"block": "attention.core", "calls_per_step": 16, "entry": ATTENTION_ENTRY, "identity": "target"}
+    ], "the file names the block whole"
+    assert [(shape["symbol"], shape["launches"]) for shape in rows[8]["launch_shapes"]] == [(FI_ATTENTION, 16)]
     assert rows[1]["blocks"] == [{"block": "add_norm_quantize", "calls_per_step": 129, "entry": "cudnn.AddNormQuantDecode", "identity": "target"}]
     assert rows[4]["blocks"] == [{"block": "projection.fp8.out", "calls_per_step": 64, "entry": "flashinfer.gemm.bmm_fp8", "identity": "target"}]
     # the file says which kernel the library launched for its row, by the name the profiler gave it, and how often in a step
     assert [(shape["symbol"], shape["launches"]) for shape in rows[4]["launch_shapes"]] == [(NVJET_FP8, 64)]
-    assert [(shape["symbol"], shape["launches"]) for shape in rows[6]["launch_shapes"]] == [(FI_MM_FP4, 64)] and rows[9]["launch_shapes"][0]["launches"] == 1
+    assert [(shape["symbol"], shape["launches"]) for shape in rows[6]["launch_shapes"]] == [(FI_MM_FP4, 64)] and rows[10]["launch_shapes"][0]["launches"] == 1
     printed = perf._kernel_lines(perf.kernel_table(traced, busy), "")
-    assert printed[9] == f"  {'flashinfer.gemm.mm_fp4: mlp.down':<58}{64:>9}{'4.30':>11}{0.275:>9.3f}{'9.9 %':>9}", "one kernel per launch: its time per launch"
+    assert (
+        printed[9] == f"  {'flashinfer.gemm.mm_fp4: mlp.down':<58}{64:>9}{'4.30':>11}{0.275:>9.3f}{'10.4 %':>9}"
+    ), "one kernel per launch: its time per launch"
     # the stack fe-entries: the cuDNN Frontend rows of native and no library -- no row of that kind, and the exact rows it had before
     sites, claim = _planned(monkeypatch, "fe-entries")
     traced, busy = _walked(sites, [_records(sites)], claim)
@@ -2081,22 +2093,21 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
         ("beside its kernel: both", "beside"),
         ("host read", "read"),
     ]
-    # the family's plan: the attention preparation is an exact row, and the attention core behind it a fallback row of its own.  On the stack native
-    # three blocks are a library's: what their calls launch beside the library's kernel -- a further launch of the library's choice behind the
+    # the family's plan: the attention preparation is an exact row, and so is the attention core behind it, the library's.  On the stack native
+    # four blocks are a library's: what their calls launch beside the library's kernel -- a further launch of the library's choice behind the
     # out-projection, the reference quantiser in front of the output head's multiply -- is the row of its place in the wiring, and says so
     sites, claim = _planned(monkeypatch)
     table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
     rows = table["rows"]
-    behind = [(row["label"], row["relation"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows[10:]]
+    behind = [(row["label"], row["relation"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows[11:]]
     assert behind == [
         ("beside its kernel: projection.fp8.out", "beside", [64]),
-        ("not yet: attention.core", "fallback", [16]),
         ("beside its kernel: output_head", "beside", [1]),
         ("beside its kernel: output_head + token_choice (one row)", "beside", [1, 1]),
         ("host read", "read", []),
     ]
     assert not [label for label, *_ in behind if label.startswith("fallback: ")], "no block of this plan is without a stated identity"
-    assert rows[11]["blocks"][0]["identity"].startswith("not yet (") and rows[13]["blocks"] == [
+    assert not [row["label"] for row in rows if row["label"].startswith("not yet: ")] and rows[13]["blocks"] == [
         {"block": "output_head", "calls_per_step": 1, "entry": "torch_ref.quantize + flashinfer.gemm.mm_fp4", "identity": "target"},
         {"block": "token_choice", "calls_per_step": 1, "entry": "torch.argmax", "identity": "host path, not compared"},
     ]
@@ -2927,9 +2938,9 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
     section = area.split("## The performance mode\n", 1)[1].split("\n## ", 1)[0]
     example = section.split("```text\n", 1)[1].split("```", 1)[0].splitlines()
     # the stack the example names, native: its three numbers and its providers with the rows a library serves (the test of the kernels lines)
-    target = {"stated": True, "declared": True, "on_target": 467, "launches": 484, "code": 178, "port": 289, "stand_ins": 0}
-    target.update(by_provider={"cuDNN Frontend": 337, "FlashInfer": 129, "PyTorch": 1}, fallback_calls=16, kernels_per_step=2908, copies_per_step=200)
-    today = ["fallback rows present", "kernel identity not claimed on this GPU class", "launched from Python"]
+    target = {"stated": True, "declared": True, "on_target": 483, "launches": 484, "code": 194, "port": 289, "stand_ins": 0}
+    target.update(by_provider={"cuDNN Frontend": 337, "FlashInfer": 145, "PyTorch": 1}, fallback_calls=0, kernels_per_step=2908, copies_per_step=200)
+    today = ["kernel identity not claimed on this GPU class", "launched from Python"]
     sites, claim = _planned(monkeypatch)  # the family's own plan, 64 layers: the rows of the example's table
     table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
     form = _checkpoint_form(kernels={**target, "absent": 1}, checks={"positions_text": "0-15, 63, 64, 312, 313"}, record={"reasons": today}, per_kernel=table)

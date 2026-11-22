@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Providers of model blocks: adapters to cuDNN Frontend entries (``fe``), to library kernels (``library``; FlashInfer's
-multiplies on the stored formats: ``flashinfer_calls``) and the plain-PyTorch reference of every block (``torch_ref``).
+multiplies on the stored formats and its attention over the paged cache: ``flashinfer_calls``) and the plain-PyTorch
+reference of every block (``torch_ref``).
 
 ``KEYS`` is the closed list of provider keys a provider table may name; it changes only together with a kernel, with the
 reference chain of a block that a kernel is to serve, or with a declared library entry.  The operand containers below are
@@ -49,6 +50,7 @@ ENTRY_NAMES: Dict[str, str] = {
     "flashinfer.mm_fp4": "flashinfer.gemm.mm_fp4",
     "torch_ref.quantize+flashinfer.mm_fp4": "torch_ref.quantize + flashinfer.gemm.mm_fp4",
     "flashinfer.bmm_fp8": "flashinfer.gemm.bmm_fp8",
+    "flashinfer.decode_attention": "flashinfer.decode.trtllm_batch_decode_with_kv_cache",
     "cublas.bf16_dequantized": "torch.matmul over a bf16 copy",
     "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": "torch.matmul over a bf16 copy + torch_ref.silu_mul_quantize",
     "torch.index_select": "torch.index_select",
@@ -238,6 +240,7 @@ def factories() -> Dict[str, Callable]:
         "flashinfer.mm_fp4": flashinfer_calls.MmFp4Block,
         "torch_ref.quantize+flashinfer.mm_fp4": flashinfer_calls.QuantizeMmFp4Block,
         "flashinfer.bmm_fp8": flashinfer_calls.BmmFp8Block,
+        "flashinfer.decode_attention": flashinfer_calls.DecodeAttentionBlock,
         "cublas.bf16_dequantized": library.CublasLinear,
         "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": library.CublasGateUp,
         "torch.index_select": torch_ref.Embedding,

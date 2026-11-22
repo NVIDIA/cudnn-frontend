@@ -49,11 +49,15 @@ names (``model_samples/qwen_dense/kernel_census.json``), in the form the target 
 served here yet stays on its fallback row and is printed as ``not yet``; the run says how many launches of a step are target
 kernels, always as three numbers, and why its GPU class is ``NOT CLAIMED``.  It always checks its kernels, and it holds the
 launch shape of every target launch against the census.  ``--stack fe-entries`` is every cuDNN Frontend row of ``native`` with
-the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  ``native`` has three rows more: the multiplies the
-target runs on a library, FlashInfer, on the stored weights.  FlashInfer is an optional package of that stack alone
-(``pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt``); without it, or with
-a version this area has not validated, on compute capability 10.x ``--stack native`` is a ``SKIP`` before anything is loaded.
-The library builds its kernels at its first use: the run makes that use while it plans and says so.
+the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  ``native`` has four rows more, calls of a library,
+FlashInfer: the three multiplies the target runs on it, on the stored weights, and the attention core, its paged decode
+attention over the paged attention cache.  FlashInfer is an optional package of that stack alone
+(``pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt``), and the kernels of
+its attention are precompiled binaries of its kernel-binary package (``samples/models/requirements-flashinfer-cubin.txt``
+names the command); without either, or with a version this area has not validated, on compute capability 10.x
+``--stack native`` is a ``SKIP`` before anything is loaded.  The library builds the kernels of its multiplies and the
+launcher of its attention at its first use: the run makes that use while it plans and says so.  A run never lets the
+library fetch a kernel binary: it switches the library's download off before it reaches the library.
 
 ``--check-kernels`` adds a fifth check, against the plan instead of the reference: the run prints which kernels every block
 launches (the kernel table, before the load) and what the entries state about their launches (after it), keeps the profiler's
@@ -163,8 +167,8 @@ With --model: pip install -r samples/models/requirements.txt first.  The checkpo
 fetched); the 27B checkpoint needs 22 GB of disk and about 57 GiB of free GPU memory on the stack fe-cublas, which holds a
 bf16 copy of every weight.  The stacks native and fe-entries keep a weight their kernels multiply on its stored format
 without that copy.  fe-entries: about 37 GiB on compute capability 10.0, about 41 GiB on the other 10.x classes, about 57 GiB elsewhere.
-native, whose three library rows need FlashInfer (pip install -c samples/models/constraints-native.txt -r
-samples/models/requirements-flashinfer.txt; the README: "The rows a library serves"): about 28 GiB and about 32 GiB there.
+native, whose library rows need FlashInfer and its kernel-binary package (pip install -c samples/models/constraints-native.txt
+-r samples/models/requirements-flashinfer.txt; the README: "The rows a library serves"): about 28 GiB and about 32 GiB there.
 The generated text goes to standard output; every other line of a run goes to standard error.
 The checkpoint, the memory, the checks, a request body field by field and every flag: samples/models/qwen_dense/README.md
 """

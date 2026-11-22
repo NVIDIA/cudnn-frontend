@@ -151,7 +151,7 @@ def test_the_drafters_plan_its_table_and_its_keys():
     new = ("torch.argmax+lookup", "torch_ref.pre_fc_norm_quantize", "torch_ref.gate_row_quantize", "torch_ref.silu_mul", "torch_ref.quantize")
     classes = (torch_ref.ListedTokenChoice, torch_ref.PreFcNormQuantize, torch_ref.GateRowQuantize, torch_ref.SiluMul, torch_ref.Quantize)
     assert all(key in providers.KEYS for key in new) and [providers.factories()[key] for key in new] == list(classes)
-    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 26 and set(providers.KEYS) == set(providers.factories())
+    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 27 and set(providers.KEYS) == set(providers.factories())
     used_by_the_model = {row.key for rows in configs.PROVIDERS.values() for row in rows}
     assert used_by_the_model.isdisjoint(new) and set(providers.KEYS) == used_by_the_model | set(new), "no key that no table names"
     assert all(providers.ENTRY_NAMES[key] == key for key in new[1:]) and providers.ENTRY_NAMES[new[0]] == "torch.argmax + the token id of the chosen row"
@@ -1217,7 +1217,7 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     table = session.plan_table()
     assert (session.plan.tokens, session.prefill_plan.tokens) == (6, 1) and session.plan.first_used and session.prefill_plan.first_used
     numbers = session.claim().numbers()  # what the session says about the target kernel set is its verify plan's
-    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 130, 337)
+    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 146, 337)
     # in the stack native the library multiplies the out-projection on its stored codes at both call sites of both plans
     stored = alone = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp.down", "output_head")
     assert session.stored_weights() == stored and session.uncopied_weights() == alone
@@ -1236,7 +1236,11 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     assert line and head == session.plan.table() and rest.startswith(session.prefill_plan.table() + "\n  this stack needs about ")
     assert "stack native, 1 sequence x 6 tokens per sequence, cc 10.0" in head.splitlines()[0] and "stack native, 1 sequence, cc 10.0" in rest.splitlines()[0]
     assert "cudnn.GdnVerifyFused" in head and "cudnn.GdnDecodeFused" not in head and "cudnn.GdnDecodeFused" in rest
-    need = model.memory_bytes(1, 2051, stored=stored, uncopied=alone, tokens=6)
+    # the state is a pool of pages with its tables, and the workspace of the library's attention is counted once
+    from model_samples.providers import flashinfer_calls
+
+    paged, workspace = session._paged(), flashinfer_calls.WORKSPACE_BYTES
+    need = model.memory_bytes(1, 2051, stored=stored, uncopied=alone, tokens=6, **paged) + workspace
     checks = model.check_bytes(alone)
     sentence = (
         f"this stack needs about {need / GIB:.1f} GiB on this GPU for a session of 1 sequence x 6 tokens behind its prompt, "
@@ -1244,8 +1248,11 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     )
     assert table.count("this stack needs about") == 1 and sentence in table, table.splitlines()[-1]
     # one state: two sessions count the decode session's state of one token beside the verify session's
-    both = model.memory_bytes(1, 2051, stored=stored, uncopied=alone) + model.state_bytes(1, 2051, tokens=6)
-    assert both - need == model.state_bytes(1, 2051) and f"needs about {both / GIB:.1f} GiB on this GPU for 1 and 1 sequences, one count after the other" in two
+    both = model.memory_bytes(1, 2051, stored=stored, uncopied=alone, **paged) + model.state_bytes(1, 2051, tokens=6, **paged) + workspace
+    assert (
+        both - need == model.state_bytes(1, 2051, **paged)
+        and f"needs about {both / GIB:.1f} GiB on this GPU for 1 and 1 sequences, one count after the other" in two
+    )
     # a run of a plain session and such a session names the kinds of step; a run without one keeps its words
     plain = new()
     behind = Session(model, text, share=plain, draft_tokens=5, **common)
@@ -1433,11 +1440,11 @@ def test_the_speculative_scripts_help_states_the_memory_the_tree_computes(monkey
     figures = {(stack, cc): asked(stack, cc) for stack in ("fe-cublas", "native", "fe-entries") for cc in ((10, 0), (10, 3), (10, 7), (12, 0))}
     cublas, entries, native = ([figures[(stack, cc)] for cc in ((10, 0), (10, 3), (10, 7), (12, 0))] for stack in ("fe-cublas", "fe-entries", "native"))
     # native keeps the weights of its three library rows on their stored codes on compute capability 10.x; elsewhere it plans as fe-entries
-    assert (cublas, entries, native) == ([61, 61, 61, 64], [44, 48, 48, 64], [32, 37, 37, 64])
+    assert (cublas, entries, native) == ([61, 61, 61, 64], [44, 48, 48, 64], [33, 37, 37, 64])
     said = (
         f"about {cublas[0]} GiB of free GPU memory on the stack fe-cublas (about {cublas[3]} GiB on compute capability 12.x), on the stack fe-entries for "
         f"about {entries[0]} GiB on compute capability 10.0, about {entries[1]} GiB on the other 10.x classes and about {entries[3]} GiB elsewhere, and on "
-        f"the stack native, whose three library rows need FlashInfer (00_decode.py --help has the command), for about {native[0]} GiB and about "
+        f"the stack native, whose library rows need FlashInfer and its kernel-binary package (00_decode.py --help has the command), for about {native[0]} GiB and about "
         f"{native[1]} GiB there"
     )
     assert said in " ".join(sample.EPILOG.split()) and "a list of 65,536 ids and the default context length" in " ".join(sample.EPILOG.split())
@@ -1446,8 +1453,8 @@ def test_the_speculative_scripts_help_states_the_memory_the_tree_computes(monkey
     assert (
         f"with a list of 65,536 ids and the default context length a run asks for about {cublas[0]} GiB free on the stack `fe-cublas` (about "
         f"{cublas[3]} GiB on compute capability 12.x); on the stack `fe-entries` for about {entries[0]} GiB on compute capability 10.0, about "
-        f"{entries[1]} GiB on the other 10.x classes and about {entries[3]} GiB elsewhere; on the stack `native`, whose three library rows need "
-        f'FlashInfer (the section "The rows a library serves"), for about {native[0]} GiB and about {native[1]} GiB there.'
+        f"{entries[1]} GiB on the other 10.x classes and about {entries[3]} GiB elsewhere; on the stack `native`, whose library rows need "
+        f'FlashInfer and its kernel-binary package (the section "The rows a library serves"), for about {native[0]} GiB and about {native[1]} GiB there.'
     ) in readme
 
 
@@ -1869,17 +1876,21 @@ def test_a_paged_cache_takes_the_tables_of_its_own_pool_and_no_others():
 
 
 def test_one_provider_asks_for_a_paged_cache_and_every_other_plan_builds_the_plain_one():
-    """One adapter of the closed list names a page: the one of the attention preparation's entry, whose kernel writes a pool
-    of pages.  So a plan builds a pool where that row serves -- the two target stacks on compute capability 10.x -- and
-    no plan of another stack, GPU class or row count does; the area README says so.  The next adapter that names a page
-    fails this case: its row changes what the runs of its stacks hold, and the README's sentence.  Two more sentences of
+    """Two adapters of the closed list name a page, and the same one: the attention preparation's entry, whose kernel writes a
+    pool of pages, and the library's paged decode attention, whose kernel reads that pool.  So a plan builds a pool where
+    the preparation's row serves -- the two target stacks on compute capability 10.x -- and no plan of another stack, GPU
+    class or row count does; the area README says so.  The next adapter that names a page fails this case: its row
+    changes what the runs of its stacks hold, and the README's sentence.  Two more sentences of
     that README are held here to what they are about: the page of the target kernel set, which is the family's constant
     and the page of every case of this group; and where the GPU cell of the paged cache runs."""
     from model_samples import Session, TextIO, providers
     from model_samples.qwen_dense import QwenDense, configs
 
     asking = {key: factory.cache_page for key, factory in providers.factories().items() if getattr(factory, "cache_page", None) is not None}
-    assert providers.BlockBase.cache_page is None and asking == {"fe.attention_prepare_decode": PAGE}, "the one adapter whose kernel writes a paged pool"
+    assert providers.BlockBase.cache_page is None and asking == {
+        "fe.attention_prepare_decode": PAGE,
+        "flashinfer.decode_attention": PAGE,
+    }, "the adapter whose kernel writes a paged pool, and the adapter whose kernel reads it"
     model = _tiny_model()
     for more in ({}, {"tokens": 4}, {"draft_tokens": 3}):
         assert Session(model, TextIO.synthetic(model.geometry.vocab), sequences=2, stack="reference", device="cpu", capacity=16, **more).cache_page() is None
@@ -2299,9 +2310,9 @@ def test_a_paged_cache_hands_out_its_rows_of_the_two_tables_as_views():
 
 
 def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_reads_them(monkeypatch):
-    """No adapter of the closed list reads the page table and the lengths (``Block.attended_tables``), so no state of a run
-    holds them: its tables, its bytes and the memory sentence of its run do not follow the run's maximum length.  A
-    session whose plans have a block that says so -- in its step's plan or in its prompt's, a part of a block that
+    """One adapter of the closed list reads the page table and the lengths (``Block.attended_tables``): the library's paged
+    decode attention.  A state of a run without such a block holds neither: its tables, its bytes and the memory
+    sentence of its run do not follow the run's maximum length.  A session whose plans have a block that says so -- in its step's plan or in its prompt's, a part of a block that
     several rows serve included -- builds its state with both, for the session's maximum length; the family's
     arithmetic counts them to the byte and the memory sentence holds that count.  Such a block in a session whose
     blocks ask for no pool of pages is a wrong table."""
@@ -2312,7 +2323,7 @@ def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_r
     from model_samples.state import DecodeState
 
     reading = [key for key, factory in providers.factories().items() if getattr(factory, "attended_tables", False)]
-    assert providers.BlockBase.attended_tables is False and blocks.BySite.attended_tables is False and reading == []
+    assert providers.BlockBase.attended_tables is False and blocks.BySite.attended_tables is False and reading == ["flashinfer.decode_attention"]
     tiny = _paged_model()
     text = TextIO.synthetic(tiny.geometry.vocab)
     kinds, shapes = tiny.geometry.layer_kinds, tiny.state_shapes()
@@ -2699,7 +2710,7 @@ def test_the_memory_sentence_counts_what_the_checks_hold_for_every_sequence_beyo
     assert sentence("fe-cublas", 1, 4) == f"this stack needs about 3.9 GiB on this GPU{several}, 0.14 GiB of it for the checks ({beyond}); 200.0 GiB are free"
     both = f"0.47 GiB of it for the checks ({COPY}, and {beyond})"
     assert sentence("fe-entries", 1, 4) == f"this stack needs about 3.7 GiB on this GPU{several}, {both}; 200.0 GiB are free"
-    assert sentence("native", 1, 4) == f"this stack needs about 3.4 GiB on this GPU{several}, {both}; 200.0 GiB are free"
+    assert sentence("native", 1, 4) == f"this stack needs about 3.7 GiB on this GPU{several}, {both}; 200.0 GiB are free"
     assert sentence("reference", 1, 4) == f"this stack needs about 3.7 GiB on this GPU{several}; 200.0 GiB are free", "no checks run on the reference stack"
     assert sentence("reference", 1024) == "this stack needs about 7.0 GiB on this GPU; 200.0 GiB are free", "its state, and nothing of a check"
 
@@ -2820,8 +2831,9 @@ def test_the_plan_hands_the_count_the_sessions_recorded_steps_and_its_references
 def test_an_override_takes_the_row_of_the_runs_stack_where_it_names_the_same_call(monkeypatch, capsys):
     """``--provider BLOCK=KEY`` selects the first declared row of the key that serves the run -- and, where that row is of
     another stack, the row of the run's own stack that names the same call: equal in every field but its stacks and its
-    printed reason.  The attention core has such a pair: on the target stacks the override plans their row, with the
-    reason of a chain that reads the attention cache.  A row of the run's stack that differs in anything else is another
+    printed reason.  The attention core has such a pair: on the target stacks the override plans their chain's row, with
+    the reason of a chain that reads the attention cache -- also on ``native``, whose own plan has the library's row in
+    front of that chain.  A row of the run's stack that differs in anything else is another
     call and is not taken: the fused step selected on a target stack is still the form of ``fe-cublas``."""
     from dataclasses import replace
 
@@ -2831,11 +2843,13 @@ def test_an_override_takes_the_row_of_the_runs_stack_where_it_names_the_same_cal
     model = QwenDense.reduced(2)
     core = model.provider_table["attention.core"]
     pool, plain = "reference chain over the attention cache", "reference chain over a plain per-layer cache"
-    assert [(row.key, row.fallback) for row in core] == [("torch_ref.attention", plain), ("torch_ref.attention", pool)], "one call on two rows"
+    chains = [(row.key, row.fallback) for row in core if row.fallback]
+    assert chains == [("torch_ref.attention", plain), ("torch_ref.attention", pool)], "one call on two rows"
     for stack, reason in (("fe-entries", pool), ("native", pool), ("fe-cublas", plain), ("reference", plain)):
         row = select_row("attention.core", core, _facts(), 1, 1, stack, key="torch_ref.attention", model=model)
         assert row.fallback == reason and stack in row.stacks, f"{stack}: the row of the stack that runs"
-        assert row is select_row("attention.core", core, _facts(), 1, 1, stack, model=model), f"{stack}: the row the stack plans without the override"
+        own = select_row("attention.core", core, _facts(), 1, 1, stack, model=model)
+        assert (own is row) == (stack != "native"), f"{stack}: the row the stack plans without the override is this chain, but where a library serves the block"
         planned = _plan(stack=stack, overrides={"attention.core": "torch_ref.attention"})
         assert planned.rows["attention.core"] is row
         printed = [line for line in planned.table().splitlines() if line.split()[:1] == ["attention.core"]]

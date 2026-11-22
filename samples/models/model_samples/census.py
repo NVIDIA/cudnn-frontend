@@ -81,7 +81,9 @@ one call with several classes of kernel, the census entry names the class (``cla
 kernel it launched beside the recorded pick -- compared, never gated.  Where a kernel's launch follows a fact of the run
 beyond its row count -- the maximum length a paged attention kernel is told -- the entry names the fact it was recorded
 with (``run``), and item 7 holds its launch shape and its class for a run that states the same value alone: at another
-one the launch is held as a member of its kernel's family, and the census line says so.
+one the launch is held as a member of its kernel's family, and the census line says so.  The id of such a kernel stands
+for the variants of one library kernel (``Kernel.variants``): a run prints the names it launched under the id, whatever
+the census holds of them.
 
 A census holds one configuration per kind of step: ``plain`` for the decode step (one token per sequence) and ``verify``
 for the step that feeds several (:func:`configuration_of`); a section of the latter also names the tokens per sequence it
@@ -126,13 +128,16 @@ class Kernel:
     relation: str = "fallback"  # one of RELATIONS
     launches: Optional[int] = None  # per call of the block; None where the number is not a fact of the row (a chain of operators)
     shape: str = ""  # one of SHAPE_SOURCES
+    #: an exact kernel of a library whose id stands for several variants of one kernel, of which a call launches the one the
+    #: library chooses by facts no row names: a run prints the names it launched under the id (``Traced.launched``)
+    variants: bool = False
 
     def __post_init__(self):
         if self.relation not in RELATIONS or self.shape not in SHAPE_SOURCES:
             raise ValueError(f"census entry {self.id}: relation {self.relation!r} / shape source {self.shape!r} is not declared")
         if self.relation == "exact" and (not isinstance(self.launches, int) or self.launches < 1):
             raise ValueError(f"census entry {self.id}: an exact kernel states its launches per call")
-        if self.relation != "exact" and (self.launches is not None or self.shape):
+        if self.relation != "exact" and (self.launches is not None or self.shape or self.variants):
             raise ValueError(f"census entry {self.id}: only an exact kernel states launches per call and a launch shape")
 
 
@@ -226,6 +231,11 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
         "cublaslt_fp8_gemm",
         re.compile(r"^nvjet_sm\d+_qq|^_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalI\w*MainloopSm100TmaUmmaWarpSpecializedI\w*NS_12float_e4m3_tE"),
     ),
+    # FlashInfer's paged decode attention on bf16 queries, keys and values of head width 256 in pages of 64, causal: the head of
+    # the kernel's name carries what the declared call launches (the data types, the head width, the paging, the page).  What
+    # stands behind it is the variant the library chooses by the run's maximum length, the sequences, the tokens per sequence
+    # and the GPU; a census entry names the variant it recorded (``class``), the pattern never does
+    ("fi_decode_attention", re.compile(r"^fmhaSm\d+[a-z]Kernel_QkvBfloat16OBfloat16H256PagedKvCausalP64")),
     # ``torch.index_select`` launches one of three kernels, by the number of rows it gathers and the size of a table row: the
     # small-index kernel up to 16 rows, and from 17 the large-index kernel or PyTorch's vectorized gather (seen on a bf16
     # table of 5120 columns with int32 ids)
@@ -1379,6 +1389,7 @@ class Traced:
                     lines.append(f"{site.row}: {site.entry}{form_text(site.form)}, {count}; {kernel.id} by name (no launch shape is declared for it)")
         lines += self.served()
         lines += self.chosen()
+        lines += self.launched()
         if self.result is not None:
             for family, picks in sorted(self.result.picks.items()):
                 if family == "pytorch":
@@ -1427,6 +1438,21 @@ class Traced:
             launched = ", ".join(f"{_named(name)} x {count}" for name, count in names.most_common(4))
             same = "the pick the census records" if set(names) == {pick} else f"not the pick the census records ({pick}): another kernel of the same entry"
             lines.append(f"chosen by the library for {row} (printed and compared, never gated): {launched} over the traced steps; {same}")
+        return lines
+
+    def launched(self) -> List[str]:
+        """For every block whose kernel id stands for the variants of one library kernel (``Kernel.variants``): the kernels the
+        traced steps launched for it, by name.  Printed, never gated: which variant a call launches is the library's
+        function of facts no row names, and what is held of it is the class and the launch shape the census records for
+        the run -- where it records them."""
+        if self.result is None:
+            return []
+        lines = []
+        for site in {site.row: site for site in self.sites}.values():
+            names = self.result.served.get(site.row)
+            if names and any(kernel.relation == "exact" and kernel.variants for kernel in site.kernels):
+                launched = ", ".join(f"{_named(name, 160)} x {count}" for name, count in names.most_common(4))
+                lines.append(f"launched by the library for {site.row} (printed, never gated): {launched} over the traced steps")
         return lines
 
     def dump(self) -> dict:

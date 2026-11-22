@@ -22,7 +22,8 @@ The stacks:
   kernel the target launches, in the target's form.  A block whose kernel is not served here yet stays on its fallback row,
   and a run prints it as ``not yet``; how a row stands to the target is decided against the census file, not written here.
   Where the target's kernel is a library's, the row calls that library (``LIBRARY_ROWS``: FlashInfer's multiplies on the
-  stored weights), so on the classes of those rows the stack needs the library's package;
+  stored weights and its attention over the paged attention cache), so on the classes of those rows the stack needs the
+  library's package and, for the attention, its kernel-binary package;
 * ``fe-entries`` -- every cuDNN Frontend row of ``native``, with every block a library serves there on its fallback row:
   no package beyond cuDNN Frontend and PyTorch, so the rows of the entries stay verified wherever the area's GPU test
   runs;
@@ -144,7 +145,8 @@ VERIFY_STEPS = tuple((tokens, 16 if tokens < 6 else 4) for tokens in range(2, 9)
 #: the blocks of ``native`` a library serves: block -> (provider key, what the row serves, the layer widths the operand
 #: layout of the call was run with -- the published model's; another width keeps the block on its fallback row).  The target
 #: launches these library kernels on every 10.x class, at every row count.  Nothing here is gated on batch invariance: the
-#: library states none for these calls, and the kernel of the 4-bit multiply follows the row count
+#: library states none for these calls, the kernel of the 4-bit multiply follows the row count, and the kernel of the
+#: attention the sequences, the tokens per sequence and the run's maximum length
 LIBRARY_ROWS = {
     "mlp.down": ("flashinfer.mm_fp4", "any row count, hidden 5120, intermediate 17408", (("hidden", 5120), ("mlp", 17408))),
     "output_head": ("torch_ref.quantize+flashinfer.mm_fp4", "any row count, hidden 5120", (("hidden", 5120),)),
@@ -153,24 +155,36 @@ LIBRARY_ROWS = {
         "any row count, weight 5120 x 6144",
         (("hidden", 5120), ("la_value_heads", 48), ("la_head_dim", 128), ("attn_heads", 24), ("attn_head_dim", 256)),
     ),
+    "attention.core": (
+        "flashinfer.decode_attention",
+        "rows 1-1,024, 24 heads of width 256 on 4 key / value heads, a cache in pages of 64",
+        (("attn_heads", 24), ("attn_kv_heads", 4), ("attn_head_dim", 256)),
+    ),
 }
 #: the form of a row of the library's 4-bit multiply: its CuTe DSL backend, called outside any tuning context -- the
 #: kernel class and the launch shape are then the library's untuned pick for the call, which the census records -- and
 #: of its 8-bit multiply: the backend the library chooses itself (its tuner's pick where one has run: never a row)
 MM_FP4_FORM = (("BACKEND", "cute-dsl"), ("TUNED", False))
 BMM_FP8_FORM = (("BACKEND", "auto"),)
+#: the form of the row of the library's paged decode attention, as the target calls it: on pools whose pages hold the
+#: heads first.  The call names the library's own backend for these GPU classes, whose kernels are precompiled binaries:
+#: a constant of the adapter, no field of the row.  The row claims this call, never a launch shape: which kernel of the
+#: set a call launches is the library's function of the run's maximum length, the sequences, the tokens per sequence and
+#: the GPU, and the census holds it for the run it recorded
+DECODE_ATTENTION_FORM = (("KV_LAYOUT", "HND"),)
 
 
-def _library_row(block: str, form) -> ProviderRow:
+def _library_row(block: str, form, band: str = "bf16_rounding", last=None) -> ProviderRow:
     """The row of ``native`` that serves ``block`` with a library call on the stored weight (:data:`LIBRARY_ROWS`).  Its launch
     order: the library launches its own kernels as dependents of the launch before them (the adapters pass nothing that changes
     it), so behind a launch that releases early -- the fused step or the gate in front of the out-projection, the gate / up
     kernel in front of the down multiply -- the kernel starts early and must wait before it reads that launch's codes.  The
     kernels of the validated version wait in front of their first load.  A launch behind one that carries the attribute must
-    wait before it reads the product (the norm: its row).  In front of the head stand PyTorch's launches: no early release."""
+    wait before it reads the product (the norm: its row).  In front of the head stand PyTorch's launches: no early release.
+    ``band``: the row's band against the reference; ``last``: the last row count the row claims (left out: any)."""
     key, serves, widths = LIBRARY_ROWS[block]
     # no test of this repository's own lanes runs a row that needs the library's package: printed as unverified in CI
-    return ProviderRow(("cc10.x",), (1, None), (1, None), key, "native", serves=serves, band="bf16_rounding", ci=False, form=form, widths=widths)
+    return ProviderRow(("cc10.x",), (1, last), (1, None), key, "native", serves=serves, band=band, ci=False, form=form, rows=(1, last), widths=widths)
 
 
 def _verify_out_rows(stack):
@@ -425,7 +439,7 @@ PROVIDERS = {
             # the target's form (``PREPARE_FORM``).  The kernel is an ordinary launch: it starts when the in-projection's kernel
             # has ended, reads that kernel's rows through four views and writes the queries, the gates and the two halves of
             # the layer's pool; nothing is launched between the two.  The launch after it is the attention core's, which reads
-            # the pool and the queries: a reference chain here, which carries no attribute and starts behind this kernel.
+            # the pool and the queries: the library's kernel in ``native`` (its row), a reference chain in ``fe-entries``.
             # The entry writes a pool of pages, so a session whose plan has this row builds its attention cache as one
             # (the adapter says so: ``cache_page``), with the cos / sin table and the position and slot rows the kernel reads
             form=PREPARE_FORM,
@@ -442,6 +456,15 @@ PROVIDERS = {
     # and the reason of their row holds for either layout
     "attention.core": [
         ProviderRow(*ANY, "torch_ref.attention", BOTH, serves="any", fallback="reference chain over a plain per-layer cache"),
+        # the library's paged decode attention on the pool the preparation's kernel wrote, through the page table and the
+        # lengths the state holds for the run's maximum length; the rows of the preparation's row.  The library documents no
+        # numerics contract for this kernel, so the band is the bound of a stated model against the reference chain, and
+        # nothing is gated on batch invariance: the kernel, and with it the bytes of a sequence, follow the batch.
+        # Launch order: with the library's default the launch is a dependent of the launch before it, the preparation's,
+        # which is an ordinary launch and releases nothing early; the kernel waits before it reads the queries and the
+        # pool.  A wait in front of its read of the page table and the lengths is not established, so those two are
+        # constants of the state that no launch writes.  The launch after it, the gate's, is an ordinary launch
+        _library_row("attention.core", DECODE_ATTENTION_FORM, band="attention_bf16_weights", last=1024),
         ProviderRow(*ANY, "torch_ref.attention", TARGET_STACKS, serves="any", fallback="reference chain over the attention cache"),
     ],
     "attention.gate_quantize": [

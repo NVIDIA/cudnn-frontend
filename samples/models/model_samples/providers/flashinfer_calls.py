@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Library kernels of FlashInfer as providers of model blocks: the multiplies the target kernel set runs on a library, each on
-the stored format of its weight.
+the stored format of its weight, and the attention core over the paged attention cache.
 
 ``flashinfer.mm_fp4`` calls ``flashinfer.gemm.mm_fp4(backend="cute-dsl")``, the multiply of a 4-bit activation by a 4-bit
 weight on the packed codes of both: one launch per call.  The library picks the kernel of a call itself, by the shape and
@@ -28,15 +28,39 @@ weight on the stored codes of both.  Which kernel serves it is the choice of the
 one has run, else its first candidate.  That choice is never a row and never gated; the kernel check holds the launch as
 one of the kernels this call can launch, and prints its name beside the pick the census records.
 
+``flashinfer.decode_attention`` calls ``flashinfer.decode.trtllm_batch_decode_with_kv_cache``, the library's paged decode
+attention, with the library's own backend for these GPU classes (``DECODE_ATTENTION_BACKEND``): the attention of the rows
+of a step over the keys and values of their sequences, on the pool of pages the attention preparation wrote, read
+through the state's page table and lengths (``state.PagedKvCache.attended``).  One launch per call and nothing else: the
+adapter hands the library views and host constants, an output buffer of the call's own, one workspace per device and a
+zero counter buffer, and converts nothing on the device.  The library checks almost none of what it is handed and
+returns other bytes for a table of another dtype, a strided view or a table off its width, so the adapter holds its own
+operands on the host before every call (``ValueError``).  Which kernel the library launches follows the run's maximum
+length, the sequences, the tokens per sequence and the GPU: the row claims the call, the census holds the launch for the
+run it recorded, and a run prints the kernel it launched.  The library documents no numerics contract for this kernel:
+its band is the bound of a stated model, judged against the reference chain with the operand terms of that bound
+(``twin``, ``tie_out``: ``attention_bf16_weights``), and it states no batch invariance (``batch_note``).
+
 **The package.**  FlashInfer is no dependency of cuDNN Frontend and none of the default stack.  It is imported inside the
 functions of this module that run on a device, never at module import and never by a plan on stated device facts.  A plan
 for a CUDA device reads the installed version from the distribution's metadata: a missing package, or a version that is not
 validated (``VALIDATED``: the versions the launch records of the census were recorded with), is a ``NotImplementedError``
 -- a ``SKIP`` before the load that names the version, the requirement file and the stack that runs without the package.
 
+**Kernel binaries are never fetched by a run.**  The attention kernels are precompiled binaries the library reads from
+files: from the directory ``FLASHINFER_CUBIN_DIR`` names, else from its kernel-binary package (``BINARIES_DISTRIBUTION``)
+where that has the library's own version, else from a cache directory -- and it downloads a file it does not find.  These
+adapters switch that download off for the process before they reach the library (``refuse_downloads``, in the one method
+every row reaches it through), so a binary that is not on the machine is the library's refusal at the first use, and
+the ``SKIP`` that names what is missing and the fix (``missing_binaries``).  Two states of the installation make the library
+print a local path at its import -- the package at another version than the library's, and the directory variable beside
+the package -- and one more is undecidable from the metadata: each is a ``SKIP`` at plan time, before the library is
+imported (``check_binaries``).
+
 **First use is part of the plan.**  The library builds what a call needs when it is first made: its CuTe DSL kernels in the
 process, its CUTLASS multiply as a module compiled with the installed CUDA compiler and ninja (minutes, once per machine).
-The 4-bit kernel is built per range of row counts.  So an adapter makes the call on scratch operands while the run is
+The 4-bit kernel is built per range of row counts.  The attention builds a launcher with the same compiler and reads
+its kernel binaries at the first call of every step shape.  So an adapter makes the call on scratch operands while the run is
 planned (``first_use``) -- at the run's row count and, for a run of several sequences, at the rows of one sequence, which
 is what the batch-invariance check calls -- after the memory sentence has held and before anything is loaded, and a sample
 announces it (``first_use_note``).  A refusal of the operands this adapter built is a ``ValueError`` -- an ``ERROR``,
@@ -47,11 +71,15 @@ is raised as it is.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata as metadata
+import importlib.util
 import os
-from typing import Optional
+import sys
+from typing import Optional, Tuple
 
 from ..census import Kernel
+from ..state import PagedKvCache, PageTable
 from ..weights import BLOCK, BlockScaledTensor, Dequantized, ScaledTensor, TiledBlockScaledTensor, TiledBlockScaledWeight, Unquantized, tile_scales
 from . import PYTORCH_CHAIN, BlockBase
 
@@ -71,6 +99,12 @@ FP4_OPERATION = "fp4_gemm"
 #: chosen the kernel (a row says False: the library's untuned pick)
 MM_FP4_FORM = ("BACKEND", "TUNED")
 BMM_FP8_FORM = ("BACKEND",)
+#: the field a row of the paged decode attention names: the layout of the two pool halves, as the target passes it
+DECODE_ATTENTION_FORM = ("KV_LAYOUT",)
+#: the value of that call's ``backend`` argument: the library's own backend for these GPU classes, whose kernels are
+#: precompiled binaries.  Every call passes it: the library's default
+#: chooses a backend by the GPU, and an explicit value does not move with a release of the library
+DECODE_ATTENTION_BACKEND = "trtllm-gen"
 #: the library's kernel-binary package: its distribution, the module the library looks for, its requirement file and the
 #: index its versions are published on.  The library reads a package of its OWN version alone, so the validated version
 #: of the package is the library's (``VALIDATED``); the constraints file pins it beside the library
@@ -84,6 +118,18 @@ BINARIES_INSTALL = f"pip install --no-deps --index-url {BINARIES_INDEX} -c {CONS
 #: of its package, and its switch against downloading one (any text that is not empty refuses)
 BINARIES_DIRECTORY = "FLASHINFER_CUBIN_DIR"
 NO_DOWNLOAD = "FLASHINFER_NO_DOWNLOAD"
+#: how the library's refusal of a file that is not on the machine begins -- the manifest or the header at the first use of
+#: its launcher, a kernel binary at the first call of a step shape -- and the module of its loader, whose callback raises
+#: the first where no caller can catch it.  Read to tell that refusal from any other failure, never printed: each text
+#: goes on with a local path
+MISSING_FILE, MISSING_KERNEL = "Artifact not found locally", "Failed to load cubin for"
+LOADER = "flashinfer.jit.cubin_loader"
+#: the workspace the paged decode attention is handed: the size the target hands it and the size the launch records of
+#: the census were made with.  The library makes no size check of it, and a smaller one has not been run
+WORKSPACE_BYTES = 394 * 1024 * 1024
+#: device -> the one workspace of that device in this process, built at the first plan that needs it and handed by every
+#: adapter of the device
+_WORKSPACES: dict = {}
 
 
 def installed() -> Optional[str]:
@@ -117,13 +163,106 @@ def refuse_downloads() -> None:
         os.environ[NO_DOWNLOAD] = "1"
 
 
+def binaries_package() -> Tuple[Optional[str], bool]:
+    """The kernel-binary package as the installation has it, asked both ways and with nothing imported: the version its
+    distribution's metadata states (``None``: no such distribution), and whether the module the library looks for can be
+    found (the library decides by the module alone)."""
+    try:
+        version = metadata.version(BINARIES_DISTRIBUTION)
+    except metadata.PackageNotFoundError:
+        version = None
+    try:
+        found = importlib.util.find_spec(BINARIES_MODULE) is not None
+    except (ImportError, ValueError):  # a module of that name without a spec: nothing the library could read
+        found = False
+    return version, found
+
+
+def check_binaries(entry: str) -> None:
+    """At plan time, before the library is imported: the states of the kernel-binary package in which the library's import
+    would print a local path, or in which what it will read cannot be told.  ``NotImplementedError`` (a SKIP) that names
+    the state and the fix, never a path and never the variable's value:
+
+    * the distribution's metadata and the module disagree -- one is there without the other;
+    * the package is installed at another version than the library's: the library ignores it with a warning;
+    * the directory variable is set while the package's module can be found: the library takes the directory with a
+      warning.
+
+    With neither the metadata nor the module nothing is declined here: the library then reads the directory the variable
+    names, or its cache directory, and what is missing there is its refusal at the first use (``missing_binaries``)."""
+    version, found = binaries_package()
+    validated = " or ".join(VALIDATED)
+    if version is None and found:
+        raise NotImplementedError(
+            f"{entry}: the module {BINARIES_MODULE} can be imported and no distribution {BINARIES_DISTRIBUTION} is installed, so the version of the "
+            f"kernel binaries the library would read is not stated; install the package: {BINARIES_INSTALL}; {WITHOUT}"
+        )
+    if version is not None and not found:
+        raise NotImplementedError(
+            f"{entry}: the distribution {BINARIES_DISTRIBUTION} {version} is installed and its module {BINARIES_MODULE} cannot be found; install the "
+            f"package again: {BINARIES_INSTALL}; {WITHOUT}"
+        )
+    if version is not None and version not in VALIDATED:
+        raise NotImplementedError(
+            f"{entry} needs the kernel-binary package {BINARIES_DISTRIBUTION} at the library's version, {validated}; this is {version}, which the "
+            f"library ignores: {BINARIES_INSTALL}; {WITHOUT}"
+        )
+    if found and os.environ.get(BINARIES_DIRECTORY):
+        raise NotImplementedError(
+            f"{entry}: {BINARIES_DIRECTORY} is set and the kernel-binary package {BINARIES_DISTRIBUTION} is installed, and the library would read "
+            f"the directory in the place of the package; unset the variable to read the package, or uninstall the package to read the directory; {WITHOUT}"
+        )
+
+
+def missing_binaries(entry: str, sequences: int, tokens: int, max_model_len: int) -> str:
+    """The sentence of a SKIP for a kernel binary, a manifest or a header the library did not find with its download
+    refused: it names the fix that is still to be made, decided from what the installation holds -- the package that is
+    not installed; the directory the variable names; or, with the package installed at the library's version, the GPU
+    and the step shape it holds no binary for (no command would bring one)."""
+    version, found = binaries_package()
+    if found and version in VALIDATED:
+        return (
+            f"{entry}: the installed {BINARIES_DISTRIBUTION} {version} holds no kernel binary for this GPU and step shape ({sequences} x {tokens} rows "
+            f"at maximum length {max_model_len}); {WITHOUT}"
+        )
+    if os.environ.get(BINARIES_DIRECTORY):
+        return (
+            f"{entry}: the directory {BINARIES_DIRECTORY} names does not hold the kernel binaries of this GPU and step shape; fill it (the family "
+            f'README, "What the first run does") or install the package: {BINARIES_INSTALL}; {WITHOUT}'
+        )
+    return f"{entry} needs the kernel-binary package {BINARIES_DISTRIBUTION} {' or '.join(VALIDATED)}, which is not installed: {BINARIES_INSTALL}; {WITHOUT}"
+
+
+@contextlib.contextmanager
+def _first_use_reports():
+    """While a first use reaches the library: the interpreter's report of ONE error is kept off the streams -- the library's
+    ``RuntimeError`` of a file that is not on the machine, raised inside its loader's callback, where the interpreter can
+    only report it as an exception it ignored (the call then raises an error of its own, which the first use turns into
+    the SKIP).  That report holds a local path.  Every other report is handed on to the hook that was there."""
+    previous = sys.unraisablehook
+
+    def hook(unraisable):
+        error, raised_in = unraisable.exc_value, getattr(unraisable.object, "__module__", "")
+        if type(error) is RuntimeError and raised_in == LOADER and str(error).startswith(MISSING_FILE):
+            return
+        previous(unraisable)
+
+    sys.unraisablehook = hook
+    try:
+        yield
+    finally:
+        sys.unraisablehook = previous
+
+
 class LibraryBlock(BlockBase):
-    """An adapter to a FlashInfer multiply on the stored format of its weight: what the three share.  A subclass names the
-    fields of its row's form (``fields``), makes the call (``__call__``; it notes what it passed: ``_served``) and builds
-    scratch operands for the first use (``_scratch``)."""
+    """An adapter to a FlashInfer call: what the rows of the library share.  A subclass names the module of its call
+    (``module``) and the fields of its row's form (``fields``), makes the call (``__call__``; it notes what it passed:
+    ``_served``) and builds scratch operands for the first use (``_scratch``).  The multiplies' adapters multiply on the
+    stored format of their weight."""
 
     provider = "FlashInfer"
     stored_weights = True  # the weight is multiplied on its stored codes: the loader keeps them for this block
+    module = "gemm"  # of the library: where the call of this adapter lives
     fields: tuple = ()
     #: the device types on which the plan makes the first use (a host test names its own device to run it on a stand-in library)
     first_use_devices = ("cuda",)
@@ -176,6 +315,12 @@ class LibraryBlock(BlockBase):
         """Scratch operands of the run's row count, in the layout a step hands the block: the arguments of ``__call__``."""
         raise NotImplementedError
 
+    def _scratches(self, device, sequences: int, tokens: int):
+        """The scratch operands of every call the plan's first use makes, one after the other: at the run's row count and,
+        for a run of several sequences, at the rows of one sequence."""
+        for rows in dict.fromkeys((sequences * tokens, tokens)):
+            yield self._scratch(device, rows)
+
     def first_use(self, sequences: int, tokens: int) -> None:
         """While the run is planned, on a real CUDA device: the call on scratch operands, at the run's row count and -- for a
         run of several sequences -- at the rows of one sequence, which the batch-invariance check calls (the library builds
@@ -188,8 +333,7 @@ class LibraryBlock(BlockBase):
         if not self._launches_here():
             return
         device = torch.device(self.options["device"])
-        for rows in dict.fromkeys((sequences * tokens, tokens)):
-            operands = self._scratch(device, rows)
+        for operands in self._scratches(device, sequences, tokens):
             self._first = True
             try:
                 self(*operands)
@@ -201,21 +345,33 @@ class LibraryBlock(BlockBase):
                 self._served = None  # a first use is no call of a step: the call log starts empty
 
     def _call(self, name: str, *operands, **passed):
-        """The library call ``flashinfer.gemm.<name>`` itself, and what it was passed by keyword (``_passed``: what the call
-        log reads back).  During the plan's first use the import, the build and the launch are the library's first on this
-        installation: whatever keeps it from them, but its own check of the operands, is a ``NotImplementedError``."""
-        self._passed = tuple((key.upper(), value) for key, value in passed.items())
+        """The library call ``flashinfer.<module>.<name>`` itself, and the fields of the row's form as it was passed them by
+        keyword, in the row's order (``_passed``: what the call log reads back)."""
+        stated = {key.upper(): value for key, value in passed.items()}
+        self._passed = tuple((name, stated[name]) for name in self.fields if name in stated)
+        return self._reach(lambda: getattr(getattr(self._library(), self.module), name)(*operands, **passed))
+
+    def _reach(self, use):
+        """``use()``, one use of the library.  During the plan's first use the import, the build and the launch are the
+        library's first on this installation: whatever keeps it from them, but its own check of the operands, is a
+        ``NotImplementedError`` (``_unavailable``), and the interpreter's report of a file the library's loader did not
+        find stays off the streams (``_first_use_reports``).  In a step nothing is renamed."""
         if not self._first:
-            return getattr(self._library().gemm, name)(*operands, **passed)
+            return use()
         try:
-            return getattr(self._library().gemm, name)(*operands, **passed)
+            with _first_use_reports():
+                return use()
         except (TypeError, ValueError, NotImplementedError):
             raise
         except Exception as error:  # noqa: BLE001 -- whatever keeps the library from importing, building or launching: the installation's
-            raise NotImplementedError(
-                f"{self.entry}: FlashInfer could not make its first use on this installation ({type(error).__name__}); it builds its kernels "
-                f'there and needs the CUDA compiler and ninja (the family README, "What the first run does"); {WITHOUT}'
-            ) from None
+            raise NotImplementedError(self._unavailable(error)) from None
+
+    def _unavailable(self, error: Exception) -> str:
+        """The sentence of the SKIP for what kept the library from its first use: the type of the exception, never its text."""
+        return (
+            f"{self.entry}: FlashInfer could not make its first use on this installation ({type(error).__name__}); it builds its kernels "
+            f'there and needs the CUDA compiler and ninja (the family README, "What the first run does"); {WITHOUT}'
+        )
 
     def _scalar(self, device, *values: float):
         """One fp32 element on the device, formed on the host once per value: a scale, or the fp32 product of two."""
@@ -351,3 +507,200 @@ class BmmFp8Block(LibraryBlock):
         out = self._call("bmm_fp8", a, b, self._scalar(device, qx.scale), self._scalar(device, stored.scale), torch.bfloat16, backend=backend)
         self._served = self._passed
         return out.view(qx.codes.shape[0], stored.codes.shape[0])
+
+
+class DecodeAttentionBlock(LibraryBlock):
+    """``flashinfer.decode.trtllm_batch_decode_with_kv_cache``, the library's paged decode attention, with the library's own
+    backend for these GPU classes (``DECODE_ATTENTION_BACKEND``): per row of a step and query head the attention over
+    the keys and values of the row's sequence up to the row's own position, ``[rows, heads x D]`` bf16; one launch per
+    attention layer and step.  The cache is the pool of pages the attention preparation wrote: the adapter
+    hands the library the pool's two halves, and the page-table rows and the lengths of the step as the state holds them
+    for the run's maximum length (``state.PagedKvCache.attended``).  It converts nothing on the device and keeps nothing
+    between two steps but what it built with the plan: the workspace of its device and a zero counter buffer."""
+
+    module = "decode"
+    # one launch per call; the id stands for the variants of one kernel, and which one a call launches is the library's
+    # function of the run's maximum length, the sequences, the tokens per sequence and the GPU: recorded, printed, never derived
+    kernels = (Kernel("fi_decode_attention", "FlashInfer", "exact", launches=1, variants=True),)
+    fields = DECODE_ATTENTION_FORM
+    stored_weights = False  # the block has no weight
+    per_row = (0, 1)
+    state_args = (1,)  # the layer's cache: the call writes nothing, and the tie-out holds the pool byte for byte
+    cache_page = 64  # the positions of a page of the pool this adapter hands the library: the preparation's
+    attended_tables = True  # ... which the kernel reads through the state's page table and lengths
+    batch_note = (
+        "the library states no batch invariance for this call: the kernel it launches follows the sequences, the tokens per sequence and the run's "
+        "maximum length, and the bytes of one sequence alone can differ from the same sequence among several"
+    )
+    workspace_bytes = WORKSPACE_BYTES
+    _twin = None
+    _counters = None  # (device, sequences) -> the zero counter buffer of that sequence count, of the library's size
+    _step = (0, 0, 0)  # (sequences, tokens per sequence, maximum length) of the call that is being made
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        super().check_support(sequences, tokens)
+        if self._launches_here():
+            check_binaries(self.entry)
+
+    @property
+    def first_use_note(self) -> str:
+        if not self._launches_here():
+            return ""
+        return (
+            f"first use of the paged decode attention of FlashInfer {installed() or '(not installed)'}: this sample switches the library's download "
+            f"of kernel binaries off for the process ({NO_DOWNLOAD}), so they are read from its kernel-binary package or from a directory filled "
+            "beforehand and never fetched; the library builds its launcher now with the installed CUDA compiler and ninja, and reads the kernel "
+            'binaries of every step shape of the run (the family README, "What the first run does")'
+        )
+
+    def twin(self, reference):
+        """The block this adapter is compared with: the reference chain itself, which also keeps the operand terms of the
+        band's bound.  One twin per adapter: it keeps the terms of its last call."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.AttentionBound(reference.row, self.model, self.facts, self.options)
+        return self._twin
+
+    def reserve_bytes(self) -> int:
+        """The workspace the library's kernel is handed, for the memory sentence of the plan: one per device and process,
+        so it is counted until it is built (it is then part of what the device reports as used)."""
+        import torch
+
+        if _WORKSPACES and "device" in self.options and _device_key(torch.device(self.options["device"])) in _WORKSPACES:
+            return 0
+        return self.workspace_bytes
+
+    def _workspace(self, device):
+        """The one workspace of ``device`` in this process: zero bytes, built at the first plan that needs it."""
+        import torch
+
+        key = _device_key(device)
+        if key not in _WORKSPACES:
+            _WORKSPACES[key] = torch.zeros(self.workspace_bytes, dtype=torch.uint8, device=device)
+        return _WORKSPACES[key]
+
+    def _counter(self, device, sequences: int):
+        """The counter buffer of a call of ``sequences`` sequences: zero bytes of the library's size for that count, built
+        once per count (the kernel resets its counters at the end of every launch)."""
+        import torch
+
+        if self._counters is None:
+            self._counters = {}
+        key = (_device_key(device), sequences)
+        if key not in self._counters:
+            heads, sms = self.model.geometry.attn_heads, int(self.facts.sm_count)
+            size = self._reach(lambda: self._library().utils.get_trtllm_gen_multi_ctas_kv_counter_bytes(sequences, heads, sms))
+            self._counters[key] = torch.zeros(int(size), dtype=torch.uint8, device=device)
+        return self._counters[key]
+
+    def _output(self, q):
+        """The output buffer of one call, the call's own: ``[rows, heads, D]`` bf16, contiguous."""
+        import torch
+
+        return torch.empty(tuple(q.shape), dtype=torch.bfloat16, device=q.device)
+
+    def _limit(self) -> int:
+        """The run's maximum length, which the kernel is told beside its operands: a constant of the plan's options."""
+        limit = self.options.get("max_model_len")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(
+                f"{self.entry} is told the run's maximum length beside its operands, a whole number of positions; the plan of this block names "
+                f"max_model_len={limit!r}"
+            )
+        return limit
+
+    def _held(self, q, blocks, lengths, pools, out, sequences: int, width: int) -> None:
+        """What the library does not check and reads all the same: ``ValueError`` that names the operand.  The page-table
+        rows and the lengths are int32 on the query's device, contiguous, each starting 16 bytes aligned, of exactly
+        ``[sequences, width]`` and ``[sequences]`` -- the width the state's for the run's maximum length; the output is
+        contiguous; the last axis of both pool halves has stride 1."""
+        import torch
+
+        for name, table, shape in (("the page table", blocks, (sequences, width)), ("the lengths", lengths, (sequences,))):
+            wrong = ""
+            if table.dtype != torch.int32:
+                wrong = f"of dtype {table.dtype}: the kernel reads 32-bit words"
+            elif table.device != q.device:
+                wrong = f"on {table.device}, the query on {q.device}"
+            elif tuple(table.shape) != shape:
+                wrong = f"of shape {tuple(table.shape)}: this call reads {shape}"
+            elif not table.is_contiguous():
+                wrong = "a strided view: the kernel reads adjacent words"
+            elif table.data_ptr() % 16:
+                wrong = "not 16 bytes aligned"
+            if wrong:
+                raise ValueError(f"{self.entry}: {name} of this step is {wrong}")
+        if not out.is_contiguous():
+            raise ValueError(f"{self.entry}: the output buffer of this call is a strided view: the kernel writes adjacent rows")
+        for name, pool in zip(("key", "value"), pools):
+            if pool.stride(-1) != 1:
+                raise ValueError(f"{self.entry}: the {name} half of the pool has stride {pool.stride(-1)} on its last axis: the kernel reads adjacent elements")
+
+    def _scratches(self, device, sequences: int, tokens: int):
+        """One scratch step per form the run calls: its sequences at its tokens per sequence, and one sequence alone, which
+        the batch-invariance check calls -- each at the run's maximum length, on a zero pool of the pages one step holds
+        and the tables of a state of that size."""
+        import torch
+
+        g, page, limit = self.model.geometry, self.cache_page, self._limit()
+        pages = -(-tokens // page)
+        for count in dict.fromkeys((sequences, 1)):
+            cos_sin = torch.zeros((tokens, g.rotary_dim), dtype=torch.bfloat16, device=device)
+            table = PageTable.build(count, tokens, tokens, page, pages, cos_sin, device, limit)
+            pool = torch.zeros((count * pages, g.attn_kv_heads, page, 2 * g.attn_head_dim), dtype=torch.bfloat16, device=device)
+            yield torch.zeros((count * tokens, g.attn_heads, g.attn_head_dim), dtype=torch.bfloat16, device=device), PagedKvCache(pool, pages, table, tokens), 0
+
+    def _unavailable(self, error: Exception) -> str:
+        """A file the library did not find with its download refused is the SKIP that names what is missing and the fix;
+        whatever else kept it from its first use is the installation's, as for every row."""
+        if type(error) is RuntimeError and str(error).startswith((MISSING_FILE, MISSING_KERNEL)):
+            return missing_binaries(self.entry, *self._step)
+        return super()._unavailable(error)
+
+    def __call__(self, q, cache, position):
+        if not isinstance(cache, PagedKvCache) or cache.page != self.cache_page:
+            has = f"pages of {cache.page} positions" if isinstance(cache, PagedKvCache) else type(cache).__name__
+            raise ValueError(
+                f"{self.entry} reads an attention cache that is a pool of pages of {self.cache_page} positions; this block is handed {has}: "
+                "the session's state was built for another plan"
+            )
+        limit, form = self._limit(), self._form()
+        rows, tokens = int(q.shape[0]), cache.tokens
+        sequences = rows // tokens
+        if position + tokens > limit:  # the library neither declines nor cuts a length past the maximum it is told
+            raise ValueError(
+                f"{self.entry}: a step of {tokens} token{'s' if tokens > 1 else ''} at position {position} passes the run's maximum length {limit}"
+            )
+        self._step = (sequences, tokens, limit)
+        blocks, lengths = cache.attended(position)  # the position reaches the kernel as rows of the state's tables, through the cache alone
+        pools, out = (cache.k_pool, cache.v_pool), self._output(q)
+        self._held(q, blocks, lengths, pools, out, sequences, PageTable.width(cache.page, cache.pages, limit))
+        self._call(
+            "trtllm_batch_decode_with_kv_cache",
+            query=q,
+            kv_cache=pools,
+            workspace_buffer=self._workspace(q.device),
+            block_tables=blocks,
+            seq_lens=lengths,
+            max_seq_len=limit,
+            bmm1_scale=int(q.shape[-1]) ** -0.5,  # the chain's scale, as a Python number: a tensor would be a multiply on the device
+            bmm2_scale=1.0,
+            out=out,
+            kv_layout=form["KV_LAYOUT"],
+            backend=DECODE_ATTENTION_BACKEND,
+            q_len_per_req=tokens,
+            multi_ctas_kv_counter_buffer=self._counter(q.device, sequences),
+        )
+        self._served = self._passed  # what the call log of a traced step reads back (``serving``)
+        return out.view(rows, -1)  # the buffer the kernel wrote, as the rows the gate block reads
+
+
+def _device_key(device) -> str:
+    """A device as one name whether or not it states its index: ``cuda`` is the current CUDA device."""
+    import torch
+
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device() if device.type == "cuda" else 0
+    return f"{device.type}:{index}"

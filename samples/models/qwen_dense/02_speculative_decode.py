@@ -111,8 +111,8 @@ With --model: pip install -r samples/models/requirements.txt first, and a draft 
 checkpoint is your own download (nothing is fetched).  With the 27B checkpoint, a list of 65,536 ids and the default
 context length a run asks for about 61 GiB of free GPU memory on the stack fe-cublas (about 64 GiB on compute capability
 12.x), on the stack fe-entries for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes and
-about 64 GiB elsewhere, and on the stack native, whose three library rows need FlashInfer (00_decode.py --help has the
-command), for about 32 GiB and about 37 GiB there: the model as 00_decode.py holds it, a state of six tokens per sequence,
+about 64 GiB elsewhere, and on the stack native, whose library rows need FlashInfer and its kernel-binary package
+(00_decode.py --help has the command), for about 33 GiB and about 37 GiB there: the model as 00_decode.py holds it, a state of six tokens per sequence,
 and the drafter with the bf16 copies its reference blocks multiply on.  Only compute capability 10.0 has run.
 The generated text goes to standard output; every other line of a run goes to standard error.
 What a run proves per stack, the speculative configuration key by key and every flag: samples/models/qwen_dense/README.md
