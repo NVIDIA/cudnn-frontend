@@ -123,7 +123,7 @@ nothing is released; the kernel has no other synchronization object.
 | dtypes | bf16 `x`; int32 or int64 `ids`; `out` int32 without a table, else the table's dtype |
 | layouts | `x` with a free row stride of whole 16-byte vectors; contiguous `ids` and `out`; `out` overlapping neither `x` nor `ids` |
 | determinism | bitwise replay and batch invariance (the [status page](/operations/determinism)); the result is exact, so it is the same on every part |
-| DSL | nvidia-cutlass-dsl >= 4.8.0. On cc 10.0 / 10.3 both compiler flavours of the DSL (CUDA 12.9 and CUDA 13.4) are served; on cc 10.7 the compiler must be CUDA 13.4 or later (the CUDA 12.9 flavour rejects the `sm_107a` target and is declined by name before JIT). Validated under CuTe DSL 4.8.0 with the CUDA 13.4 flavour; other versions and the CUDA 12.9 flavour are served unverified |
+| DSL | nvidia-cutlass-dsl >= 4.8.0. On cc 10.0 / 10.3 both compiler flavours of the DSL (CUDA 12.9 and CUDA 13.4) assemble the kernel and are served; on cc 10.0 both ran under CuTe DSL 4.8.0 and gave the same results, and CuTe DSL 4.8.1 ran with CUDA 13.4. On cc 10.7 the compiler must be CUDA 13.4 or later (the CUDA 12.9 flavour rejects the `sm_107a` target and is declined by name before JIT). Other DSL versions are served unverified |
 
 Tests: `test/python/row_argmax/frost/test_row_argmax_decode.py` (host declines, the config's limits and tables, the launch
 facts, the reference against hand-written rule rows, the order of a launch behind an entry-owned allocation on stand-ins, the

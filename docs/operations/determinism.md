@@ -627,7 +627,9 @@ for replay, batch-invariance, and stress-test results.
   inside a call of up to 1024 rows, at any position and among any neighbours.
   The table kind (none, int32, int64) and the owner of the output change
   nothing but the result's dtype. SM100 is verified on cc 10.0 (148 SMs) with
-  the committed goldens of that one runtime. cc 10.3 and cc 10.7 have not been
+  the committed goldens of that one runtime, recorded under CuTe DSL 4.8.0 and
+  checked under both of its compiler flavours; the suites also ran under CuTe
+  DSL 4.8.1 with the same results. cc 10.3 and cc 10.7 have not been
   run, so SM103 and SM107 are unverified: the entry admits compute capability
   10.x, the kernel's rendering is checked for the `sm_100a`, `sm_103a` and
   `sm_107a` targets, and cc 10.7 needs the DSL's CUDA 13 compiler flavour.
