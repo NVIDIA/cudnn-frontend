@@ -38,11 +38,11 @@ def test_gemm_glu_compile_execute(
     cluster_shape_mn,
     request,
 ):
-    try:
-        from cudnn.gemm.cutedsl.dense.glu.api import GemmGlu
-        from cuda.bindings import driver as cuda
-    except ImportError as e:
-        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+    reason = "Environment not supported: cudnn optional dependencies not installed"
+    cuda = pytest.importorskip("cuda.bindings.driver", reason=reason)
+    GemmGlu = pytest.importorskip(
+        "cudnn.gemm.cutedsl.dense.glu.api", reason=reason
+    ).GemmGlu
     cfg = gemm_glu_init(
         request,
         a_major,
@@ -66,7 +66,9 @@ def test_gemm_glu_compile_execute(
         cfg["a_major"],
         cfg["b_major"],
     )
-    ab12_torch, c_torch, _, _, _ = allocate_output_tensors(cfg["m"], cfg["n"], cfg["l"], cfg["ab12_dtype"], cfg["c_dtype"], cfg["c_major"])
+    ab12_torch, c_torch, _, _, _ = allocate_output_tensors(
+        cfg["m"], cfg["n"], cfg["l"], cfg["ab12_dtype"], cfg["c_dtype"], cfg["c_major"]
+    )
 
     gemm_glu = GemmGlu(
         sample_a=a_torch,
@@ -105,7 +107,11 @@ def test_gemm_glu_compile_execute(
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("tile", [(256, 256), (128, 128), (128, 64)], ids=["multi_group_tile", "persistent_tiles", "persistent_single_group"])
+@pytest.mark.parametrize(
+    "tile",
+    [(256, 256), (128, 128), (128, 64)],
+    ids=["multi_group_tile", "persistent_tiles", "persistent_single_group"],
+)
 def test_gemm_glu_retained_outputs_replay(dtype, tile):
     """Retain every launch's outputs so a later correct store cannot hide a race."""
     from cudnn.tensor_adapter import has_tcgen05
@@ -118,7 +124,9 @@ def test_gemm_glu_retained_outputs_replay(dtype, tile):
     persistent = tile[0] == 128
     m = n = 2048 if persistent else 256
     cluster = (1, 1) if persistent else (2, 2)
-    a, _, b, *_ = allocate_input_tensors(m, n, 512, 2, dtype, "m", "n" if dtype == torch.float8_e4m3fn else "k")
+    a, _, b, *_ = allocate_input_tensors(
+        m, n, 512, 2, dtype, "m", "n" if dtype == torch.float8_e4m3fn else "k"
+    )
     ab12, c, *_ = allocate_output_tensors(m, n, 2, torch.float32, torch.bfloat16, "n")
     plan = GemmGlu(
         sample_a=a,
@@ -140,7 +148,9 @@ def test_gemm_glu_retained_outputs_replay(dtype, tile):
     slots = 4 if persistent else 16
     outputs = [(ab12, c)] + [
         (
-            torch.empty_strided(ab12.shape, ab12.stride(), dtype=ab12.dtype, device=ab12.device),
+            torch.empty_strided(
+                ab12.shape, ab12.stride(), dtype=ab12.dtype, device=ab12.device
+            ),
             torch.empty_strided(c.shape, c.stride(), dtype=c.dtype, device=c.device),
         )
         for _ in range(slots - 1)
@@ -149,7 +159,14 @@ def test_gemm_glu_retained_outputs_replay(dtype, tile):
     def run():
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         for intermediate, result in outputs:
-            plan.execute(a_tensor=a, b_tensor=b, ab12_tensor=intermediate, c_tensor=result, alpha=1.0, current_stream=stream)
+            plan.execute(
+                a_tensor=a,
+                b_tensor=b,
+                ab12_tensor=intermediate,
+                c_tensor=result,
+                alpha=1.0,
+                current_stream=stream,
+            )
 
     run()
     torch.cuda.synchronize()
@@ -168,8 +185,12 @@ def test_gemm_glu_retained_outputs_replay(dtype, tile):
             for _ in range(8):
                 graph.replay()
                 for intermediate, result in outputs:
-                    torch.testing.assert_close(intermediate.cpu(), ref_ab12, atol=0.01, rtol=9e-3)
-                    torch.testing.assert_close(result.cpu(), ref_c, atol=0.01, rtol=9e-3)
+                    torch.testing.assert_close(
+                        intermediate.cpu(), ref_ab12, atol=0.01, rtol=9e-3
+                    )
+                    torch.testing.assert_close(
+                        result.cpu(), ref_c, atol=0.01, rtol=9e-3
+                    )
     finally:
         graph.reset()
 
@@ -195,12 +216,11 @@ def test_gemm_glu_forward(
     cluster_shape_mn,
     request,
 ):
-    try:
-        from cudnn.ops import gemm_glu_forward
-        from cuda.bindings import driver as cuda
-    except ImportError as e:
-        print(f"ImportError: {e}")
-        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+    reason = "Environment not supported: cudnn optional dependencies not installed"
+    cuda = pytest.importorskip("cuda.bindings.driver", reason=reason)
+    pytest.importorskip("cudnn.gemm.cutedsl.dense.glu.api", reason=reason)
+    from cudnn.ops import gemm_glu_forward
+
     cfg = gemm_glu_init(
         request,
         a_major,
@@ -409,11 +429,11 @@ def _test_gemm_glu_compile_execute_quant(
     vector_f32,
     request,
 ):
-    try:
-        from cudnn.gemm.cutedsl.dense.glu.api import GemmGlu
-        from cuda.bindings import driver as cuda
-    except ImportError as e:
-        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+    reason = "Environment not supported: cudnn optional dependencies not installed"
+    cuda = pytest.importorskip("cuda.bindings.driver", reason=reason)
+    GemmGlu = pytest.importorskip(
+        "cudnn.gemm.cutedsl.dense.glu.api", reason=reason
+    ).GemmGlu
     cfg = gemm_glu_init(
         request,
         a_major,
@@ -538,11 +558,11 @@ def _test_gemm_glu_forward_quant(
     vector_f32,
     request,
 ):
-    try:
-        from cudnn.ops import gemm_glu_forward
-        from cuda.bindings import driver as cuda
-    except ImportError as e:
-        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+    reason = "Environment not supported: cudnn optional dependencies not installed"
+    cuda = pytest.importorskip("cuda.bindings.driver", reason=reason)
+    pytest.importorskip("cudnn.gemm.cutedsl.dense.glu.api", reason=reason)
+    from cudnn.ops import gemm_glu_forward
+
     cfg = gemm_glu_init(
         request,
         a_major,
@@ -646,8 +666,14 @@ def skip_unless_tcgen05():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-@pytest.mark.parametrize("ab_dtype", [torch.bfloat16, torch.float32, torch.float8_e4m3fn], ids=["bf16", "fp32", "fp8"])
-@pytest.mark.parametrize("tile,cluster", [((128, 128), (1, 1)), ((256, 256), (2, 2))], ids=["1cta", "2cta"])
+@pytest.mark.parametrize(
+    "ab_dtype",
+    [torch.bfloat16, torch.float32, torch.float8_e4m3fn],
+    ids=["bf16", "fp32", "fp8"],
+)
+@pytest.mark.parametrize(
+    "tile,cluster", [((128, 128), (1, 1)), ((256, 256), (2, 2))], ids=["1cta", "2cta"]
+)
 @pytest.mark.parametrize("c_major", ["m", "n"])
 def test_gemm_glu_forward_geglu(ab_dtype, tile, cluster, c_major):
     skip_unless_tcgen05()
@@ -689,9 +715,13 @@ def test_gemm_glu_forward_geglu(ab_dtype, tile, cluster, c_major):
     ],
     ids=["mxfp8-bf16", "mxfp8-fp32", "mxfp4-bf16-amax", "nvfp4-bf16-amax"],
 )
-@pytest.mark.parametrize("tile,cluster", [((128, 128), (1, 1)), ((256, 256), (2, 2))], ids=["1cta", "2cta"])
+@pytest.mark.parametrize(
+    "tile,cluster", [((128, 128), (1, 1)), ((256, 256), (2, 2))], ids=["1cta", "2cta"]
+)
 @pytest.mark.parametrize("vector_f32", [True, False])
-def test_gemm_glu_forward_geglu_quant(ab_dtype, sf_dtype, sf_vec_size, c_dtype, tile, cluster, vector_f32):
+def test_gemm_glu_forward_geglu_quant(
+    ab_dtype, sf_dtype, sf_vec_size, c_dtype, tile, cluster, vector_f32
+):
     skip_unless_tcgen05()
     from cudnn.ops import gemm_glu_forward
 
@@ -717,7 +747,23 @@ def test_gemm_glu_forward_geglu_quant(ab_dtype, sf_dtype, sf_vec_size, c_dtype, 
             act_func="geglu",
             **glu,
         )
-        check_ref_gemm_glu_quant(a, a_ref, b, b_ref, sfa_ref, sfb_ref, ab12, c, sfc, amax, norm_const, sf_vec_size, alpha=alpha, act_func="geglu", **glu)
+        check_ref_gemm_glu_quant(
+            a,
+            a_ref,
+            b,
+            b_ref,
+            sfa_ref,
+            sfb_ref,
+            ab12,
+            c,
+            sfc,
+            amax,
+            norm_const,
+            sf_vec_size,
+            alpha=alpha,
+            act_func="geglu",
+            **glu,
+        )
 
 
 @pytest.mark.L0
@@ -725,14 +771,22 @@ def test_gemm_glu_forward_rejects_unsupported_activation():
     skip_unless_tcgen05()
     from cudnn.ops import gemm_glu_forward
 
-    a, _, b, *_ = allocate_input_tensors(256, 256, 512, 1, torch.float8_e4m3fn, "k", "k")
+    a, _, b, *_ = allocate_input_tensors(
+        256, 256, 512, 1, torch.float8_e4m3fn, "k", "k"
+    )
     with pytest.raises(NotImplementedError, match="situglu"):
         gemm_glu_forward(a, b, act_func="situglu")
     with pytest.raises(ValueError, match="act_func must be"):
         gemm_glu_forward(a, b, act_func="relu")
     a16, b16 = a.to(torch.float16), b.to(torch.float16)
     with pytest.raises(NotImplementedError, match="float32 acc_dtype"):
-        gemm_glu_forward(a16, b16, ab12_dtype=torch.float16, acc_dtype=torch.float16, act_func="geglu")
+        gemm_glu_forward(
+            a16,
+            b16,
+            ab12_dtype=torch.float16,
+            acc_dtype=torch.float16,
+            act_func="geglu",
+        )
 
 
 @pytest.mark.L0
@@ -741,7 +795,11 @@ def test_dense_swiglu_only_api_is_removed():
 
     import cudnn
 
-    for name in ("GemmSwigluSm100", "gemm_swiglu_wrapper_sm100", "gemm_swiglu_jax_sm100"):
+    for name in (
+        "GemmSwigluSm100",
+        "gemm_swiglu_wrapper_sm100",
+        "gemm_swiglu_jax_sm100",
+    ):
         assert not hasattr(cudnn, name)
     with pytest.raises(ImportError):
         importlib.import_module("cudnn.gemm.cutedsl.dense.swiglu")
