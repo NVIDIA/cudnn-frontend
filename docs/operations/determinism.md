@@ -634,8 +634,9 @@ for replay, batch-invariance, and stress-test results.
   are unverified: the entry admits compute capability 10.x, the kernel
   compiles for the `sm_100a`, `sm_103a` and `sm_107a` targets, and cc 10.7
   needs the DSL's CUDA 13 compiler flavour. SM90 and SM120 are declined by
-  type. The 1024-row call crosses scheduling waves on every served part (four
-  waves on 148 SMs); the kernel holds no state between thread blocks. No
+  type. The 1024-row call crosses scheduling waves on every served part (seven
+  waves on 148 SMs, where one thread block occupies an SM); the kernel holds
+  no state between thread blocks. No
   instruction of the chain is approximate, so the bytes are not expected to
   differ between GPU architectures; that is unverified until a second
   architecture has run, and a golden recorded on one runtime does not qualify

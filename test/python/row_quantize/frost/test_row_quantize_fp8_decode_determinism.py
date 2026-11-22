@@ -81,9 +81,12 @@ def pick(results, order):
     return {name: t[index] for name, t in results.items()}
 
 
-def wave_rows(k, dev):
-    """Rows one scheduling wave of this part holds: the thread blocks of the entry's form that co-reside on its SMs."""
-    return k.cfg.CTAS_PER_SM * torch.cuda.get_device_properties(dev).multi_processor_count
+def wave_edges(dev, below=MAX_ROWS):
+    """The row counts below ``below`` at which a scheduling wave of this part can end: every multiple of its SM count.  A wave runs
+    one thread block per SM or two -- the compiled kernel's registers decide, not the config -- and an edge of either is such a
+    multiple."""
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    return list(range(sms, below, sms))
 
 
 @pytest.mark.parametrize("rows", (1, 17, 297, MAX_ROWS), ids=lambda rows: f"rows{rows}")
@@ -126,7 +129,7 @@ def test_launch_on_a_side_stream_writes_the_same_bytes(arm, arm_id):
 
 def test_batch_invariance():
     """ONE operand set of 1024 rows.  Every row alone (a one-row call) writes the bytes it writes inside the 1024-row call, inside
-    every shorter call that holds it (the first 2 .. 160 rows and the rows around this part's scheduling-wave edge) and inside
+    every shorter call that holds it (the first 2 .. 160 rows and the rows around this part's first two scheduling-wave edges) and inside
     the reversed batch: its codes and its scale.  What changes between "alone" and "inside" is the grid, the row's thread block
     and the scheduling wave it runs in."""
     dev = _device_or_skip()
@@ -137,8 +140,8 @@ def test_batch_invariance():
     singles = [rows_of(k, x[r : r + 1]) for r in range(MAX_ROWS)]
     alone = {name: torch.cat([one[name] for one in singles]) for name in full}
     assert_bitwise(alone, full, f"every row alone vs inside {MAX_ROWS} rows")
-    wave = wave_rows(k, dev)
-    for inside in sorted({*INSIDE, *(n for n in (wave - 1, wave, wave + 1) if 1 < n < MAX_ROWS)}):
+    around = {n for edge in wave_edges(dev)[:2] for n in (edge - 1, edge, edge + 1) if 1 < n < MAX_ROWS}
+    for inside in sorted({*INSIDE, *around}):
         batch = rows_of(k, x[:inside])
         assert_bitwise(batch, {name: t[:inside] for name, t in alone.items()}, f"the first {inside} rows as one call vs each row alone")
     reverse = list(range(MAX_ROWS - 1, -1, -1))
@@ -239,25 +242,24 @@ def test_one_element_moves_only_its_own_row():
 
 def test_the_row_ceiling_call():
     """The 1024-row call, eight executions under side-stream contention, and rows alone against the same rows inside it: the
-    rows on both sides of every scheduling-wave edge of this part below the ceiling (one wave holds ``CTAS_PER_SM`` thread blocks
-    per SM), and rows 0, 511, 512 and 1023 on every part.  How many waves the call crossed on this part is one line of the run's
-    "measured" section, never an assertion: the kernel holds no state between thread blocks, so nothing depends on it."""
+    rows on both sides of every scheduling-wave edge of this part below the ceiling (every multiple of its SM count: an edge
+    whether one thread block occupies an SM or two share it), and rows 0, 511, 512 and 1023 on every part.  How many rows were
+    compared is one line of the run's "measured" section, never an assertion: the kernel holds no state between thread blocks."""
     dev = _device_or_skip()
     import frost_routing
 
     k = make_entry(dev)
-    wave = wave_rows(k, dev)
     x = make_operands(MAX_ROWS, dev, seed=900)
     full = as_bytes(assert_replays(lambda: run(k, x), repeats=8))
-    edges = {r for edge in range(wave, MAX_ROWS, wave) for r in (edge - 1, edge, edge + 1) if 0 <= r < MAX_ROWS}
+    edges = {r for edge in wave_edges(dev) for r in (edge - 1, edge, edge + 1) if 0 <= r < MAX_ROWS}
     rows = sorted(edges | {0, 511, 512, MAX_ROWS - 1})
     singles = [rows_of(k, x[r : r + 1]) for r in rows]
     alone = {name: torch.cat([one[name] for one in singles]) for name in full}
-    assert_bitwise(alone, pick(full, rows), f"rows {rows} alone vs inside {MAX_ROWS} rows ({wave} thread blocks per wave)")
+    assert_bitwise(alone, pick(full, rows), f"rows {rows} alone vs inside {MAX_ROWS} rows")
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     frost_routing.measured(
         "FP8 row quantization, the row ceiling call",
-        f"scheduling waves of the {MAX_ROWS}-row call: {-(-MAX_ROWS // wave)} (one wave = {wave} thread blocks on {sms} SMs; rows compared alone: {len(rows)})",
+        f"rows compared alone against the {MAX_ROWS}-row call: {len(rows)} (rows 0, 511, 512, {MAX_ROWS - 1} and both sides of every multiple of {sms} SMs)",
     )
 
 

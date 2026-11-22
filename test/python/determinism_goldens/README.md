@@ -4264,12 +4264,12 @@ fp32 rounding spelled) and gates the goldens.
 | `test_replay` | L0 | rows 1 / 17 / 297 / 1024; eight executions into fresh buffers under side-stream contention; then the reference | 4 |
 | `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | two entries, two identical 24-row operand sets built afresh | 1 |
 | `test_launch_on_a_side_stream_writes_the_same_bytes` | L0 | launch arm (plain, wait, release + wait); 17 rows under a side stream (ordered after the operands' producer stream) vs the current stream | 3 |
-| `test_batch_invariance` | L0 | one 1024-row operand set: the 1024-row call replayed three times and checked against the reference; every row alone (a one-row call) vs inside that call, vs the first 2 / 3 / 8 / 16 / 17 / 64 / 129 / 160 rows and the rows around the part's scheduling-wave edge as one call, vs the reversed batch | 1 |
+| `test_batch_invariance` | L0 | one 1024-row operand set: the 1024-row call replayed three times and checked against the reference; every row alone (a one-row call) vs inside that call, vs the first 2 / 3 / 8 / 16 / 17 / 64 / 129 / 160 rows and the rows around the part's first two scheduling-wave edges (one and two times its SM count) as one call, vs the reversed batch | 1 |
 | `test_insertion_removal_and_reordering` | L0 | a 40-row call, then a row inserted at position 5, rows 3 / 11 / 39 removed, a permutation: every row keeps its bytes, the inserted row writes its alone bytes | 1 |
 | `test_duplicated_row_and_neighbour_isolation` | L0 | a row twice in one call (both copies = alone); the row at position 5 among 63 and at position 299 among 600 redrawn neighbours; the row between two rows of the largest finite magnitude | 1 |
 | `test_inputs_are_unmodified` | L0 | launch arm x rows 1 / 17 / 1024, caller-owned and entry-owned outputs (18 launches): `x` holds its bytes | 1 |
 | `test_one_element_moves_only_its_own_row` | L0 | one element changed (the first and the last column of each of the kernel's three passes; the first, a middle and the last row: 18 elements, two changes each): below the row maximum its own code byte moves and no other byte of the call; as the new row maximum its row's scale and codes move and no byte of another row | 1 |
-| `test_the_row_ceiling_call` | L0 | eight executions at 1024 rows; rows 0 / 511 / 512 / 1023 and the rows on both sides of every scheduling-wave edge below 1024 alone vs inside; the number of waves the call crossed is reported in the run's `measured` section, not asserted | 1 |
+| `test_the_row_ceiling_call` | L0 | eight executions at 1024 rows; rows 0 / 511 / 512 / 1023 and the rows on both sides of every scheduling-wave edge below 1024 (every multiple of the part's SM count: an edge whether one thread block occupies an SM or two share it) alone vs inside; the number of rows compared is reported in the run's `measured` section, not asserted | 1 |
 | `test_row_ceiling_is_the_typed_decline` | L0 | 1025 rows is a `NotImplementedError`, zero rows a `ValueError`; never a launch (sentinel-filled outputs keep their bytes), never another provider | 1 |
 | `test_golden` | L0 | two cases: three executions, the reference, the wait and the release + wait arms on the same operands, the saved hashes of the codes and the scales | 2 |
 
@@ -4301,8 +4301,8 @@ two operand sets, computed on the host, are the output hashes the files hold.  S
 tree that holds the set: `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 17 passed, 0 skipped:
 `test_replay` 4, `test_replay_on_a_fresh_entry_and_fresh_operands` 1, `test_launch_on_a_side_stream_writes_the_same_bytes` 3,
 `test_batch_invariance` 1, `test_insertion_removal_and_reordering` 1, `test_duplicated_row_and_neighbour_isolation` 1,
-`test_inputs_are_unmodified` 1, `test_one_element_moves_only_its_own_row` 1, `test_the_row_ceiling_call` 1 (measured: the 1024-row
-call ran in 4 scheduling waves; one wave holds 296 thread blocks on 148 SMs; 13 rows compared alone),
+`test_inputs_are_unmodified` 1, `test_one_element_moves_only_its_own_row` 1, `test_the_row_ceiling_call` 1 (measured: 22 rows
+compared alone against the 1024-row call: rows 0, 511, 512, 1023 and both sides of every multiple of 148 SMs),
 `test_row_ceiling_is_the_typed_decline` 1, `test_golden` 2.
 `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 140 passed, 1 skipped: the module 135 passed and 1
 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices are required" -- one

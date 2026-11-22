@@ -153,7 +153,7 @@ written once and read once per launch.
 | question | answer |
 | --- | --- |
 | device | compute capability 10.x; validated on cc 10.0. The kernel compiles for the `sm_100a`, `sm_103a` and `sm_107a` targets with the same synchronization and dependent-launch positions (the suite's rendering cell): cc 10.3 and cc 10.7 are admitted on that basis and have not run on a device, and any other 10.x minor is admitted by the range alone. 9.0 and 12.x are declined by type |
-| rows | 1 .. 1024 per call (runtime argument); 1025 and up declined by name. Two thread blocks of 1024 threads share an SM, so one scheduling wave holds 296 rows on a 148-SM part and 424 on a 212-SM part: the 1024-row call crosses waves on every served part. The kernel holds no state between thread blocks |
+| rows | 1 .. 1024 per call (runtime argument); 1025 and up declined by name. At most two thread blocks of 1024 threads share an SM, and the compiled kernel's registers bind before the threads: on cc 10.0 ONE block occupies an SM, so one scheduling wave holds 148 rows on a 148-SM part. The 1024-row call crosses waves on every served part. The kernel holds no state between thread blocks |
 | width | 17408, fixed at construction; another multiple of 8 up to 24576 is declined by name |
 | forms | one kernel body; three launch arms (plain, wait, release + wait) |
 | dtypes | bf16 `x`; E4M3 `codes`; fp32 `scales`; fp32 arithmetic |
