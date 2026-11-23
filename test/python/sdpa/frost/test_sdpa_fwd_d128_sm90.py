@@ -49,7 +49,7 @@ _L0_CROSS = frozenset({"ring-wrap", "causal-br", "gqa-causal"})
 _L0_WALK = frozenset({"pairs-t10", "middle-light-lone"})
 _L0_STRIDE = frozenset({("t1-tl-mha", 2), ("t1-tl-mha", 3), ("t8-br-gqa", 2), ("t8-br-gqa", 5)})
 _L0_CLAIM = frozenset({"t8-br-gqa", "t32-tl-gqa"})
-_L0_SASS = frozenset({"pc1-causal"})  # carries the claim ring's release-dependence pin
+_L0_SASS = frozenset({"pc1-causal", "pw-causal-bias"})  # carry the claim ring's and the bias slots' release-dependence pins
 _L0_WATCHDOG = frozenset({"pa"})
 
 
@@ -1678,7 +1678,8 @@ _SASS_PROBE = textwrap.dedent(r"""
     fields = case["switches"]
     b, h_q, h_kv, s_q, s_kv = case["shape"]
     order = {"sched_policy": case["sched"]} if "sched" in case else {}
-    params = dataclasses.replace(TemplateParams(dtype_qkv=DTYPE_BF16, causal=case["causal"], has_lse=True, qh_per_kh=h_q // h_kv, **order), **fields)
+    bias = {"has_bias": True} if case.get("bias") else {}
+    params = dataclasses.replace(TemplateParams(dtype_qkv=DTYPE_BF16, causal=case["causal"], has_lse=True, qh_per_kh=h_q // h_kv, **order, **bias), **fields)
     mod = _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", params, tag="sass_sm90_d128")
     print("SWITCHES", *(int(getattr(mod, name.upper())) for name in sorted(fields)))
     if fields.get("causal_walk"):
@@ -1818,7 +1819,15 @@ _SASS_CASES = {
     "pn-causal-snake": ("pw", True),
     "pn-causal-straight": ("pw", True),
     "pc1-causal": ("pc1", True),
+    "v1-bias": ("v1", True),
+    "ov-bias": ("ov", True),
+    "pa-dense-bias": ("pa", False),
+    "pw-causal-bias": ("pw", True),
 }
+# The bias records (has_bias, the bias in the probe's bf16): the one-tile kernels and the persistent loop's dense and
+# paired-walk bodies on the probe's shapes, each held to the rules every case is held to and to the bias slots' Rule 11
+# rendering pin (_assert_bias_release_rendering). A bias record keeps the static schedules (no claim counter).
+_SASS_BIAS = frozenset({"v1-bias", "ov-bias", "pa-dense-bias", "pw-causal-bias"})
 # The NATURAL stride a causal record of the walk's rule keeps below CAUSAL_WALK_MIN_TILES, on the probe's causal body
 # (T 8, NATURAL, TemplateParams' order) under each deal: at 64 CTAs a CTA's two items take one Q tile position under the
 # straight deal, so the rule deals odd rounds in reverse (pn-causal-snake); at 127 CTAs the straight deal is no heavier
@@ -1835,6 +1844,7 @@ _SASS_CTAS = 64
 _SASS_SHAPE = (2, 8, 2, 1024, 1024)
 _SASS_SHAPES = {
     "pw-causal": ((1, 8, 2, 2048, 2048), 64),
+    "pw-causal-bias": ((1, 8, 2, 2048, 2048), 64),
     "pa-causal-t1": ((2, 8, 2, 100, 300), 3),
     "pa-causal-t2": ((8, 24, 8, 256, 2048), 132),
     "pw-causal-chunked": ((8, 24, 8, 1280, 3072), 3),
@@ -1845,7 +1855,7 @@ _SASS_ORDERS = {"pa-causal-t2": SCHED_LPT_L2, "pw-causal-chunked": SCHED_LPT_L2}
 # The walk each paired-walk case compiles (the probe's WALK line: light rows, pairs, middles, lone middle), so that a
 # rule or constant change that moves a case to another branch, or to the stride (-1), fails here instead of pinning
 # another body.
-_SASS_WALKS = {"pw-causal": (0, 8, 0, 0), "pw-causal-chunked": (0, 5, 0, 0), **{case: (-1,) * 4 for case in _SASS_DEALS}}
+_SASS_WALKS = {"pw-causal": (0, 8, 0, 0), "pw-causal-bias": (0, 8, 0, 0), "pw-causal-chunked": (0, 5, 0, 0), **{case: (-1,) * 4 for case in _SASS_DEALS}}
 # The causal persistent cases, held to no FP64 instruction on the narrow path of the compute KV loop (the probe's
 # FP64_KV_LOOP), with the KV loops their bodies keep (KV_LOOPS), so that the count reads the loops it is about: two on
 # pw-causal, three on the one-Q-tile stride, one on the chunked prefill stride (T 2), two on the chunked prefill walk
@@ -1921,6 +1931,27 @@ def _assert_claim_release_rendering(case, switches, dump):
     assert last is not None and all(site.parameter == last for site in helper), f"{case}: the mask is not the kernel's last parameter ({last}):\n{listing}"
 
 
+def _assert_bias_release_rendering(case, dump):
+    """Rule 11's rendering pin for a bias record: the bias slots' EMPTY arrives are the only arrives computed through an
+    ``and`` with the kernel's last parameter (release_zero_arg), and each is computed from all 32 bias words its thread
+    loaded from shared memory (tile_dsl.consume's per-thread form, one site per softmax the body inlines). Q, K and V,
+    read by WGMMA only, keep their plain arrives."""
+    import warm_stress
+
+    ptxs = sorted(dump.rglob("*.ptx"), key=os.path.getmtime)
+    assert ptxs, f"{case}: no PTX dumped into {dump}"
+    ptx = ptxs[-1].read_text(encoding="utf-8", errors="replace")
+    sites = warm_stress.release_dependence(ptx)
+    dependent = [site for site in sites if site.dependent]
+    listing = "\n".join(f"  line {s.line}: dependent={s.dependent} loaded registers={s.loaded_registers} param={s.parameter} :: {s.text}" for s in sites)
+    assert dependent, f"{case}: no bias-slot release computed from the loaded words:\n{listing}"
+    warm_stress.assert_release_dependence(ptx, sites=len(dependent), words=32)
+    entry = re.search(r"\.entry\s+(\w+)", ptx)
+    indices = [int(i) for i in re.findall(rf"\b{re.escape(entry.group(1))}_param_(\d+)\b", ptx)] if entry else []
+    last = f"{entry.group(1)}_param_{max(indices)}" if indices else None
+    assert last is not None and all(site.parameter == last for site in dependent), f"{case}: the mask is not the kernel's last parameter ({last}):\n{listing}"
+
+
 @pytest.mark.parametrize("case", [pytest.param(c, marks=_level(c in _L0_SASS)) for c in _SASS_CASES])
 def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case):
     """The (24, 240, 240) setmaxnreg split survives into SASS (min_blocks_per_mp=1 on the launch;
@@ -1943,10 +1974,13 @@ def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case
     overlap = switches["intra_wg_overlap"]
     shape, ctas = _SASS_SHAPES.get(case, (_SASS_SHAPE, _SASS_CTAS))
     order = {"sched": _SASS_ORDERS[case]} if case in _SASS_ORDERS else {}
-    arg = json.dumps({"switches": switches, "causal": causal, "ctas": ctas, "shape": shape, **order})
+    arg = json.dumps({"switches": switches, "causal": causal, "ctas": ctas, "shape": shape, **order, "bias": case in _SASS_BIAS})
     proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), arg, _ptxas() or "-", *cands], capture_output=True, text=True, timeout=1800)
     assert proc.returncode == 0, f"sm_90a trace-compile of the D128 template ({case}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-    _assert_claim_release_rendering(case, switches, dump)
+    if case in _SASS_BIAS:
+        _assert_bias_release_rendering(case, dump)
+    else:
+        _assert_claim_release_rendering(case, switches, dump)
     out = proc.stdout.splitlines()
     if any(ln.startswith("SKIP") for ln in out):
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))

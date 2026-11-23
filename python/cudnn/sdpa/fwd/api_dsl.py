@@ -5986,7 +5986,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             paged=self.paged,
             split_kv=self.split_kv,
-            bias=self.bias_desc is not None,
+            bias_fp32=self.bias_desc is not None and self.bias_desc.dtype == torch.float32,
         )
         pool = tuple(
             flavor
@@ -6207,7 +6207,9 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         claim = D128_CAUSAL_CLAIM
         if type(claim) is not int or claim not in (_SM90_D128_CLAIM_OFF, _SM90_D128_CLAIM_NATURAL):
             raise ValueError(f"api_dsl.D128_CAUSAL_CLAIM must be 0 or 1; got {claim!r}")
-        if claim and self.params.causal_walk and self.params.sched_policy == SCHED_NATURAL and _sm90_claim_binder_ready():
+        # A bias plan binds through the python dense frame, which has no workspace for the counter: it keeps the static
+        # record.
+        if claim and self.params.causal_walk and self.params.sched_policy == SCHED_NATURAL and self.bias_desc is None and _sm90_claim_binder_ready():
             # A causal persistent record of the walk's rule the route kept, in NATURAL order: past the gate its items go
             # out from the workspace counter instead (D128_CAUSAL_CLAIM); the counter numbers them itself, so the walk's
             # plan is not built.

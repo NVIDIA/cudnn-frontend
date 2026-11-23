@@ -185,13 +185,13 @@ def test_two_flavor_policy_retains_the_historical_geometry():
 
 
 # Each D128_NOT_SERVED key as an exact (128, 128) graph declares it (facts) or a knob set asks for it (knobs).
-class _HalfBias:
+class _Fp32Bias:
     """A bias tensor declaration's dtype, the one field the row reads from it."""
 
     def get_data_type(self):
         import cudnn
 
-        return cudnn.data_type.HALF
+        return cudnn.data_type.FLOAT
 
 
 _NOT_SERVED_GRAPHS = {
@@ -203,7 +203,7 @@ _NOT_SERVED_GRAPHS = {
     "window_right": (dict(right_band_widening=True, right_bound=4), {}),
     "lengths": (dict(padded=True), {}),
     "pack_gqa": (dict(h_kv=2), dict(pack_gqa=True)),
-    "bias": (dict(has_bias=True, bias_t=_HalfBias(), bias_dim=(1, 1, 512, 512), bias_stride=(512 * 512, 512 * 512, 512, 1)), {}),
+    "bias_fp32": (dict(has_bias=True, bias_t=_Fp32Bias(), bias_dim=(1, 1, 512, 512), bias_stride=(512 * 512, 512 * 512, 512, 1)), {}),
 }
 
 
@@ -478,7 +478,7 @@ def test_pick_flavor_without_features_takes_d128_at_exactly_128():
     assert c.FLAVOR_TILES == {c.D512_FLAVOR: (c.TILE_M, c.TILE_N), c.D128_FLAVOR: (128, 128)}
 
 
-@pytest.mark.parametrize("feature", ["thd", "paged", "split_kv", "sink", "window_left", "window_right", "lengths", "pack_gqa"])
+@pytest.mark.parametrize("feature", ["thd", "paged", "split_kv", "sink", "window_left", "window_right", "lengths", "pack_gqa", "bias_fp32"])
 def test_pick_flavor_keeps_each_not_served_feature_on_d512(feature):
     """Decided once, up front: a (128, 128) declaration naming a feature D128 does not serve selects
     D512 directly, with or without other features; one D128 serves selects D128."""
@@ -497,7 +497,7 @@ def test_declared_features_spells_each_flag_once():
     assert c.declared_features() == c.declared_features(window_left=None, window_right=0, split_kv=1) == frozenset()
     assert c.declared_features(window_left=0) == {"window_left"}
     assert c.declared_features(window_right=1) == {"window_right"}
-    named = c.declared_features(thd=True, sink=True, window_left=4, window_right=2, lengths=True, pack_gqa=True, paged=True, split_kv=2, bias=True)
+    named = c.declared_features(thd=True, sink=True, window_left=4, window_right=2, lengths=True, pack_gqa=True, paged=True, split_kv=2, bias_fp32=True)
     assert named == set(c.D128_NOT_SERVED)
 
 
@@ -517,9 +517,12 @@ def test_d128_refusal_and_the_picker_read_one_table():
         page_size=(0, 64),
         split_kv=(1, 2),
         has_bias=(False, True),
+        bias_fp32=(False, True),
     )
     for values in itertools.product(*flags.values()):
         params = dataclasses.replace(c.TemplateParams(), **dict(zip(flags, values)))
+        if params.bias_fp32 and not params.has_bias:
+            continue  # names the dtype of no bias: refused by both flavors (test_sm90_bias_template_refuses_unserved_legs)
         declared = c.declared_features(
             thd=params.thd_varlen,
             sink=params.has_sink,
@@ -529,7 +532,7 @@ def test_d128_refusal_and_the_picker_read_one_table():
             pack_gqa=params.pack_gqa,
             paged=params.page_size != 0,
             split_kv=params.split_kv,
-            bias=params.has_bias,
+            bias_fp32=params.bias_fp32,
         )
         try:
             c.validate_params(params, flavor=c.D128_FLAVOR)
@@ -580,8 +583,9 @@ def test_d512_template_params_messages_are_unchanged():
         (dict(pack_gqa=True, qh_per_kh=2), "PackGQA"),
         (dict(page_size=64, seq_kv_lens_present=True), "paged KV"),
         (dict(split_kv=2), "split-KV"),
+        (dict(has_bias=True, bias_fp32=True, head_tile=128), "an FP32 additive bias"),
     ],
-    ids=["thd", "sink", "swa", "right-band", "lengths", "pack-gqa", "paged", "split"],
+    ids=["thd", "sink", "swa", "right-band", "lengths", "pack-gqa", "paged", "split", "fp32-bias"],
 )
 def test_d128_template_params_refuse_what_d512_keeps(over, feature):
     """validate_params(flavor=D128), one case per refusal; each is a specialization D512 accepts."""
@@ -597,7 +601,15 @@ def test_d128_template_params_accept_the_dense_subset_under_their_own_name():
     from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
     from cudnn.sdpa.fwd import config_sm90 as c
 
-    for over in ({}, dict(causal=True), dict(causal=True, bottom_right=False), dict(has_lse=True, stats_log2=True), dict(scale_mode=c.SCALE_NEGATIVE)):
+    for over in (
+        {},
+        dict(causal=True),
+        dict(causal=True, bottom_right=False),
+        dict(has_lse=True, stats_log2=True),
+        dict(scale_mode=c.SCALE_NEGATIVE),
+        dict(has_bias=True),
+        dict(has_bias=True, causal=True, intra_wg_overlap=True, persistent=True, causal_walk=1),
+    ):
         c.validate_params(dataclasses.replace(c.TemplateParams(), **over), flavor=c.D128_FLAVOR)
     c.validate_params(dataclasses.replace(c.TemplateParams(), qh_per_kh=8, sched_policy=SCHED_LPT_L2), flavor=c.D128_FLAVOR)
     with pytest.raises(ValueError, match=r"^SM90 D128 scale mode must be positive, zero, or negative$"):
@@ -664,13 +676,11 @@ def test_d128_template_fits_the_shared_sm90_prepared_host():
         functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
         return assigned(method(tree, "__init__"), "self").union(*(assigned(f, "kernel") for f in functions))
 
-    # The D512 body also imports the bias host: an additive bias is its leg alone (D128_NOT_SERVED).
-    bias_only = {("host_bias", "_host_bias")}
-    assert ("host", "_host") in host_imports(d512) and bias_only <= set(host_imports(d512)), host_imports(d512)
-    assert set(host_imports(d128)) == set(host_imports(d512)) - bias_only, (host_imports(d128), host_imports(d512))
+    # Both templates take an additive bias, so both import the bias host and append the bias operand to __call__.
+    assert {("host", "_host"), ("host_bias", "_host_bias")} <= set(host_imports(d512)), host_imports(d512)
+    assert host_imports(d128) == host_imports(d512), (host_imports(d128), host_imports(d512))
     assert exports(d512) and exports(d128) == exports(d512), (exports(d128), exports(d512))
-    # The D512 body's __call__ appends the bias operand, which the host passes to a bias tile only.
-    assert call_args(d512) == call_args(d128) + ["bias"], (call_args(d128), call_args(d512))
+    assert call_args(d128) == call_args(d512) and call_args(d512)[-1] == "bias", (call_args(d128), call_args(d512))
     head, extra = compile_args(d128)[: len(compile_args(d512))], compile_args(d128)[len(compile_args(d512)) :]
     assert head == compile_args(d512) and set(extra) <= {"persistent_ctas"}, (compile_args(d128), compile_args(d512))
     reads = {n.attr for n in ast.walk(host) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "kernel"}

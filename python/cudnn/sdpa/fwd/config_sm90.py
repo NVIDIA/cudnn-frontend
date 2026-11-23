@@ -72,7 +72,7 @@ D128_NOT_SERVED = {
     "window_right": "a widened right band",
     "lengths": "per-batch lengths",
     "pack_gqa": "PackGQA",
-    "bias": "an additive bias",
+    "bias_fp32": "an FP32 additive bias",
 }
 NOT_SERVED = {D128_FLAVOR: D128_NOT_SERVED}
 
@@ -374,15 +374,15 @@ def d128_claim_coords(item: int, q_tiles: int, heads: int) -> tuple[int, int, in
 
 
 def declared_features(
-    *, thd=False, sink=False, window_left=None, window_right=None, lengths=False, pack_gqa=False, paged=False, split_kv=1, bias=False
+    *, thd=False, sink=False, window_left=None, window_right=None, lengths=False, pack_gqa=False, paged=False, split_kv=1, bias_fp32=False
 ) -> frozenset[str]:
     """The features one declaration names, in the vocabulary of ``NOT_SERVED``.
 
     ``window_left`` is the sliding-window offset and ``window_right`` a widened right bound,
     each None when absent; a ``window_right`` of 0 is plain causal and names nothing.
     ``lengths`` is any per-batch Q or KV length tensor, ``paged`` a paged K/V pool and
-    ``split_kv`` the KV partition count (1, unsplit, names nothing) and ``bias`` an
-    additive score bias.
+    ``split_kv`` the KV partition count (1, unsplit, names nothing) and ``bias_fp32`` an
+    additive score bias in FP32 (one in the Q/K/V dtype names nothing).
     """
     named = (
         ("thd", thd),
@@ -393,7 +393,7 @@ def declared_features(
         ("window_right", bool(window_right)),
         ("lengths", lengths),
         ("pack_gqa", pack_gqa),
-        ("bias", bias),
+        ("bias_fp32", bias_fp32),
     )
     return frozenset(feature for feature, on in named if on)
 
@@ -477,6 +477,8 @@ def d128_graph_decline(facts, *, pack_gqa: bool = False, split_kv: int = 1) -> s
     declines it for D64 so the row ranks no D128 plan that cannot build. ``facts`` is the graph's
     ``graph_analyzer.SdpaGraphFacts``. It lives here, beside the decline it extends, so the row's placement can ask it
     without importing the engines module."""
+    import cudnn
+
     declared = declared_features(
         thd=facts.thd,
         sink=facts.has_sink,
@@ -493,7 +495,7 @@ def d128_graph_decline(facts, *, pack_gqa: bool = False, split_kv: int = 1) -> s
         pack_gqa=pack_gqa,
         paged=facts.has_paged_kv,
         split_kv=split_kv,
-        bias=facts.has_bias,
+        bias_fp32=bool(facts.has_bias and facts.bias_t is not None and facts.bias_t.get_data_type() == cudnn.data_type.FLOAT),
     )
     why = d128_decline(facts.d_qk, facts.d_v, declared)
     if why is not None:
@@ -596,11 +598,11 @@ class TemplateParams:
     # sets it from api_dsl.D128_CAUSAL_CLAIM on causal persistent records the route keeps, above
     # api_dsl.D128_CLAIM_MIN_ROUNDS rounds of items per CTA. D512 refuses it.
     causal_claim: int = 0
-    # Additive score bias of the D512 body, appended so every earlier specialization keeps its defaults. ``has_bias``
-    # binds one [1|B, 1|H_q, S_q, S_kv] operand (key dim contiguous) whose element is added to scale * Q.K in natural
-    # units before masking and softmax (SDPA Rule S17); ``bias_fp32`` loads it as FP32 instead of the Q/K/V dtype. The
-    # bias leg is dense, nonpaged, unsplit and unpacked, and FP32 only below the 512-column storage (the staged FP32 tile
-    # does not fit beside it); validate_params refuses the rest.
+    # Additive score bias, appended so every earlier specialization keeps its defaults. ``has_bias`` binds one
+    # [1|B, 1|H_q, S_q, S_kv] operand (key dim contiguous) whose element is added to scale * Q.K in natural units before
+    # masking and softmax (SDPA Rule S17); ``bias_fp32`` loads it as FP32 instead of the Q/K/V dtype. The bias leg is
+    # dense, nonpaged, unsplit and unpacked, and FP32 only on the D512 body below its 512-column storage (a staged FP32
+    # tile fits beside neither that storage nor the D128 template's, D128_NOT_SERVED); validate_params refuses the rest.
     has_bias: bool = False
     bias_fp32: bool = False
 
@@ -657,7 +659,7 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
             pack_gqa=params.pack_gqa,
             paged=params.page_size != 0,
             split_kv=params.split_kv,
-            bias=params.has_bias,
+            bias_fp32=params.bias_fp32,
         )
         for feature, label in D128_NOT_SERVED.items():
             if feature in declared:
@@ -705,6 +707,8 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
         raise ValueError(f"{name} additive bias is dense, nonpaged, unsplit and unpacked")
     if params.bias_fp32 and params.head_tile == 512:
         raise ValueError(f"{name} D512 storage leaves no room for an FP32 bias tile; the D512 bias is in the Q/K/V dtype")
+    if params.has_bias and params.causal_claim:
+        raise ValueError(f"{name} additive bias binds through the python dense frame, which has no claim counter; a bias plan keeps the static schedules")
     if type(params.split_kv) is not int or not 1 <= params.split_kv <= 65535:
         raise ValueError("SM90 split_kv must be an integer in [1, 65535]")
     if params.thd_varlen and params.split_kv > 1:

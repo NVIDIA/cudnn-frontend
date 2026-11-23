@@ -3006,8 +3006,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "SM120 bias requires contiguous keys and 16-byte aligned outer pitches"
 
     if facts.has_bias and capabilities.sm_lo == 90:
-        # The D512 body's bias leg (config_sm90.TemplateParams.has_bias): dense, nonpaged, unsplit and unpacked. The
-        # row's own dense_flex checks already cover Q/K/V/O.
+        # The SM90 bias legs (config_sm90.TemplateParams.has_bias) of the D512 body and the D128 template: dense,
+        # nonpaged, unsplit and unpacked. The row's own dense_flex checks already cover Q/K/V/O.
         if facts.thd or facts.has_paged_kv:
             return "SM90 additive bias requires dense, nonpaged Q/K/V"
         if knobs is not None and ((knobs.split_kv or 1) > 1 or knobs.pack_gqa):
@@ -6032,8 +6032,8 @@ def _sm90_spec() -> EngineSpec:
             pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256), (D_TILE, D_TILE)}),
             pack_gqa_d_shapes=frozenset({(128, 128), (256, 256), (D_TILE, D_TILE)}),
             softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
-            # Additive bias on the D512 body only: mismatch's SM90 bias block keeps it dense, nonpaged, unsplit and
-            # unpacked, and the D64 / D128 rows below clear it.
+            # Additive bias: mismatch's SM90 bias block keeps it dense, nonpaged, unsplit and unpacked; the D64 row
+            # below clears it and the D128 row keeps it in the Q/K/V dtype.
             bias=True,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM90),
@@ -6076,7 +6076,9 @@ def _sm90_specs():
                 padded=False,
                 paged_kv=False,
                 sink=False,
-                bias=False,
+                # The dedicated D128 body stages a bias tile in the Q/K/V dtype only; an FP32 bias keeps engine 20540.
+                bias=owner is _sm90_d128_owner,
+                bias_io_dtype_only=owner is _sm90_d128_owner,
                 decode=owner is _sm90_d64_owner,
                 band=None,
                 declaration_check=owner.declaration_mismatch,

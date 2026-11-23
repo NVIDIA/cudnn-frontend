@@ -33,6 +33,11 @@ The kernel implements:
 - A reverse KV walk: boundary tiles mask elements, interior tiles do not.
 - Causal masks (top-left or bottom-right), MHA, GQA and MQA (unpacked), and per-row LSE
   (Stats) in natural log or, under ``stats_log2``, base 2.
+- An optional additive bias ``[1|B, 1|H_q, S_q, S_kv]`` in the Q/K/V dtype (``has_bias``):
+  WG0 loads each compute warpgroup's 64 x 128 bias tile per KV tile by TMA into that
+  warpgroup's own swizzled shared-memory half, the softmax forms the natural-unit logit
+  ``scale * Q.K + bias`` before masking, anchors the row at its maximum logit and subtracts
+  that anchor before the base-2 conversion (SDPA Rule S17).
 - A compile-time speed switch, ``TemplateParams.intra_wg_overlap`` (the adapter sets the
   shipped value). Overlap issues QK(t) and PV(t-1) as two WGMMA groups in flight together
   and runs tile t's softmax while PV(t-1) is still on the tensor cores. Either value
@@ -42,15 +47,17 @@ Storage: Q and each K and V ring stage are 128 x 128 tiles of two 128-row SW128 
 compute warpgroup's QK reads rows 64*w .. 64*w+63 of the Q slabs. O stages through its own
 region as two 64-row halves of two slabs, one per compute warpgroup, so each stores its rows
 alone. 196,704 B in all, and 64 B more for a claim-counter record's two id slots and their
-four mbarriers.
+four mbarriers. A bias record adds one 64 x 128 tile per compute warpgroup (two SW128 slabs
+each, 32,768 B) and its four mbarriers; an FP32 tile would not fit, so the bias is in the
+Q/K/V dtype.
 
 Constraints:
 - FP16/BF16 in, O in the input dtype, FP32 accumulation.
 - D_QK = D_V = 128 exactly; the maps carry the extents, so a partial last Q or KV tile
   zero-fills on load and clips on store.
 - Q/K/V/O keep their declared strides: D contiguous, the rest 16-byte multiples.
-- Dense only. THD, sinks, sliding windows, widened right bands, per-batch lengths and
-  PackGQA run on the D512 template (``config_sm90.D128_NOT_SERVED``).
+- Dense only. THD, sinks, sliding windows, widened right bands, per-batch lengths,
+  PackGQA and an FP32 bias run on the D512 template (``config_sm90.D128_NOT_SERVED``).
 - ``SdpaFwdDslSm90.check_support`` owns the served set.
 
 WGMMA instructions and descriptors live in FROST ``tile_dsl/wgmma.py``, the shared tile
@@ -76,7 +83,7 @@ from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, MASK_CAUSAL, MASK_NONE, MASK_PADDED
 from cudnn.frost.tile_dsl.handles import GmemTileTmaSlice, SmemTile
 from cudnn.frost.tile_dsl.mask import compute_kv_loop_bounds
-from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16, opaque_f32_zero
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, opaque_f32_zero
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.scheduler import SCHED_LPT_L2, SCHED_NATURAL, lpt_l2_tile_coords, lpt_tile_coords
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
@@ -103,7 +110,7 @@ from cudnn.sdpa.fwd.config_sm90 import (  # noqa: F401 (the planner's names stay
     causal_walk_layout,
     causal_walk_plan,
 )
-from cudnn.sdpa.fwd.kernels.sm90.prepared_host import host as _host, compile_host
+from cudnn.sdpa.fwd.kernels.sm90.prepared_host import compile_host, host as _host, host_bias as _host_bias
 from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     FLT_MAX_F64,
     LOG2_E,
@@ -329,6 +336,19 @@ class Bars(NamedTuple):
     of lane 0's arrive is computed from the id lane 0 loaded, through the kernel's
     release-zero argument (python/cudnn/AGENTS.md Rule 11, python/cudnn/sdpa/AGENTS.md
     S15), and the id reaches the other lanes by a register shuffle after the release.
+
+    A bias record (has_bias) adds one bias slot per compute warpgroup, None otherwise:
+
+    - ``mb_bias_full``: 2 slots, one per compute warpgroup; WG0's elected expect-tx arrival
+      plus the TMA bytes of that warpgroup's 64 x 128 bias tile -> its 128 threads.
+    - ``mb_bias_empty``: 2 slots; every thread of the slot's warpgroup arrives once per KV
+      tile (init 128) after loading its 32 bias words, through ``tile_dsl.consume``
+      (``consume_then_arrive``): the arrive's address is computed from every word the thread
+      loaded, through the kernel's release-zero argument, so each load is read in front of the
+      release that lets WG0 refill the slot (python/cudnn/AGENTS.md Rule 11).
+
+    Each slot completes one phase per KV tile and every KV tile also takes one K ring stage, so a
+    slot's phase parity is the K ring state's stage index (``bias_phase``).
     """
 
     mb_tma_q_full: object
@@ -337,6 +357,8 @@ class Bars(NamedTuple):
     mb_tma_k_empty: object
     mb_tma_v_full: object
     mb_tma_v_empty: object
+    mb_bias_full: object = None
+    mb_bias_empty: object = None
 
 
 class SM90FusedMultiHeadAttentionForward:
@@ -380,6 +402,8 @@ class SM90FusedMultiHeadAttentionForward:
         persistent_ctas: int = 0,
         causal_walk: int = 0,
         causal_claim: int = 0,
+        has_bias: bool = False,
+        bias_fp32: bool = False,
     ):
         """Initialize the SM90 D128 FMHA prefill kernel configuration.
 
@@ -410,6 +434,11 @@ class SM90FusedMultiHeadAttentionForward:
         :param causal_claim: A persistent causal record's claim counter (config_sm90.D128_CLAIM_*): 0 off, 1 every
             item after a CTA's first from the workspace counter with a group's Q tiles in NATURAL order. Requires
             causal_walk 0 and sched_policy NATURAL.
+        :param has_bias: Add a ``[1|B, 1|H_q, S_q, S_kv]`` bias in the Q/K/V dtype to every score: the logit is
+            ``scale * Q.K + bias`` in natural units, formed before masking, and the softmax then anchors each row at
+            its maximum logit with unit scale, whatever the sign of ``scale_mode`` (a zero scale keeps the bias alone).
+            ``False`` binds no ``bias`` operand.
+        :param bias_fp32: Refused: an FP32 bias tile does not fit beside this body's storage (the D512 body serves it).
         """
 
         _, h_q, h_kv, _, _ = shape
@@ -428,10 +457,18 @@ class SM90FusedMultiHeadAttentionForward:
         self.kv_loop_bottom_right = self.bottom_right if is_causal else True
         self.qh_per_kh = qh_per_kh
         self.scale_mode = scale_mode
+        if bias_fp32:
+            raise ValueError("prefill_d128_f16_sm90: an FP32 bias tile does not fit beside the D128 storage; the D512 body serves an FP32 bias")
+        self.has_bias = has_bias
+        self.bias_dtype = in_dtype if has_bias else None
+        # The softmax's numerical path. Without a bias it is the scale's sign. With one, the
+        # scores reach the softmax as natural-unit logits, so the row runs the positive path at
+        # unit scale (scale_mode then only says how a logit is formed).
+        self.softmax_mode = SCALE_POSITIVE if has_bias else scale_mode
         # The anchor is the raw-score extremum that maximizes the scaled score: the maximum
         # for a non-negative scale, the minimum for a negative one, with the sentinel as its
         # identity.
-        self.anchor_sentinel = -cutlass.Float32.inf if scale_mode >= SCALE_ZERO else cutlass.Float32.inf
+        self.anchor_sentinel = -cutlass.Float32.inf if self.softmax_mode >= SCALE_ZERO else cutlass.Float32.inf
         self.stats_log2 = stats_log2
         self.intra_wg_overlap = intra_wg_overlap
         self.persistent = persistent
@@ -521,6 +558,14 @@ class SM90FusedMultiHeadAttentionForward:
         self.tma_swizzle_chunks = self.HEAD_TILE // self.swizzle_chunk_elems
         self.tile_slab_elems = self.Q_TILE * self.swizzle_chunk_elems
         self.o_slab_elems = self.WG_ROWS * self.swizzle_chunk_elems
+        # The bias tile (has_bias): each compute warpgroup's WG_ROWS x KV_TILE half in SW128 slabs of 128-byte rows, the
+        # Q/K/V atom, written by WG0's TMA boxes (one per slab) and read by the warpgroup's own lanes. A row's 16-byte
+        # chunk c sits at c ^ (row % 8) inside its slab, so a quad's four 4-byte reads of eight rows hit eight bank groups.
+        # The phase arithmetic (bias_phase) assumes an even K ring.
+        if self.has_bias:
+            assert self.KV_STAGES % 2 == 0
+            self.bias_wg_elems = self.WG_ROWS * self.KV_TILE
+            self.bias_slab_elems = self.WG_ROWS * self.swizzle_chunk_elems
 
     def tma_slice(self, tma_desc, head_idx, seq_coord, batch_idx, tma_order):
         """Return one TMA box at view coordinates ``(batch, head, token, d=0)``.
@@ -569,8 +614,61 @@ class SM90FusedMultiHeadAttentionForward:
         mbar.arrive(n_bytes=tma_desc.global_tx_bytes() * s_dst.tma_loads_per_tile, pred=prims.elect_sync())
         tma_load_tile(s_dst, source, mbar.smem_ptr)
 
+    def bias_phase(self, state, start: int):
+        """The parity a bias slot's wait reads at the KV tile whose K ring state is ``state``: ``start`` (0 for the
+        compute warpgroups' FULL waits, 1 for WG0's EMPTY waits, as every ring here starts) flipped once per KV tile.
+        Every KV tile takes one K stage and one bias phase, and both carry across a persistent CTA's items, so on the
+        even K ring the tile count's parity is the stage index's."""
+        return cutlass.Int32(start) ^ (state.idx % cutlass.Int32(2))
+
     @cute.jit
-    def tmaldg_warp_group(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, work):
+    def load_bias_tile(self, bias, bars, work, kv_seq_idx: cutlass.Int32, kv_empty_state) -> None:
+        """Load both compute warpgroups' bias tiles for the KV tile at ``kv_seq_idx`` (has_bias).
+
+        Warp 0 of WG0, after the tile's K load and before its V load: a slot is free once its warpgroup has read the
+        previous tile's bias (``mb_bias_empty``), which it does at the start of that tile's softmax, earlier than it
+        releases the V stage this step refills, so the copy overlaps the rest of that softmax and the next QK. Each
+        box starts at the warpgroup's first row and the tile's first key, in the bias plane of the work item's batch
+        and Q head (index 0 on a broadcast axis); rows past S_q and keys past S_kv zero-fill and still count toward
+        the expect-tx bytes, as for Q.
+        """
+        phase = self.bias_phase(kv_empty_state, 1)
+        head = cute.math.min(work.head, bias.heads - cutlass.Int32(1))
+        batch = cute.math.min(work.batch, bias.batches - cutlass.Int32(1))
+        for w in cutlass.range_constexpr(2):
+            bars.mb_bias_empty[w].wait(phase)
+            source = GmemTileTmaSlice(bias.tma_desc, (kv_seq_idx, work.q_base + w * self.WG_ROWS, head, batch))
+            bars.mb_bias_full[w].arrive(n_bytes=bias.tma_desc.global_tx_bytes() * bias.tile.tma_loads_per_tile, pred=prims.elect_sync())
+            tma_load_tile(bias.tile[w], source, bars.mb_bias_full[w].smem_ptr)
+
+    @cute.jit
+    def load_bias_words(self, bias, local_tid, phase):
+        """Wait for this warpgroup's bias tile, load this thread's 32 bias words and release the slot (has_bias).
+
+        Word ``2 * k_frag + row_half`` packs the bias of keys ``8 * k_frag + 2 * (lane % 4) + {0, 1}`` in row
+        ``owned_row(local_tid, row_half)``, the keys of C slots ``4 * k_frag + 2 * row_half + {0, 1}``: slab
+        ``k_frag // 8``, 16-byte chunk ``k_frag % 8`` at ``(k_frag % 8) ^ (row % 8)``, and a row's ``row % 8`` is
+        ``lane // 4`` in both halves. The release (``consume_then_arrive``, one arrive per thread) takes every word, so
+        each load is read before WG0 may refill the slot; the softmax reads the words after it.
+
+        :return: The 32 words, as Int32 in that order.
+        """
+        bias.full.wait(phase)
+        lane = local_tid % cute.arch.WARP_SIZE
+        row_bytes = self.swizzle_chunk_elems * self.storage_dtype.bytes
+        base = bias.smem_base + owned_row(local_tid, 0) * row_bytes + (lane % 4) * 4
+        swizzle = lane // 4
+        words = []
+        for k_frag in cutlass.range_constexpr(self.qk_row_slots // 2):
+            chunk = base + (cutlass.Int32(k_frag % 8) ^ swizzle) * 16 + (k_frag // 8) * self.bias_slab_elems * self.storage_dtype.bytes
+            for row_half in cutlass.range_constexpr(2):
+                address = chunk + row_half * 8 * row_bytes
+                words.append(cute.make_ptr(cutlass.Int32, address, cutlass.AddressSpace.smem, assumed_align=4).load())
+        consume_then_arrive(bias.empty, words, bias.rz)
+        return tuple(words)
+
+    @cute.jit
+    def tmaldg_warp_group(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, work, bias=None):
         """Load resident Q once, then the reverse K/V tiles into the two-stage rings.
 
         Warp 0 of producer warpgroup WG0 owns the waits, the reverse walk and the drain.
@@ -578,7 +676,9 @@ class SM90FusedMultiHeadAttentionForward:
         closing waits walk Q's one generation and then the WHOLE K/V ring from the current
         state (never ``min(iterations, KV_STAGES)`` steps): unused stages pass at their
         pre-armed phase and used ones wait their last release, so no TMA payload is in
-        flight at exit.
+        flight at exit. A bias record (``bias``, the kernel's bias bundle) also fills both
+        bias slots in each step, between K and V (load_bias_tile), and its closing waits take
+        each slot's last release.
         """
         tid = cute.arch.thread_idx()[0]
         if (work.q_base < work.q_len) & (work.iterations > 0):
@@ -595,10 +695,15 @@ class SM90FusedMultiHeadAttentionForward:
                     stage = kv_empty_state.idx
                     bars.mb_tma_k_empty[stage].wait(kv_empty_state.phase)
                     self.load_one_kv_tile(sK[stage], tma_k_desc, bars.mb_tma_k_full[stage], work, kv_seq_idx, is_v=False)
+                    if cutlass.const_expr(self.has_bias):
+                        self.load_bias_tile(bias, bars, work, kv_seq_idx, kv_empty_state)
                     bars.mb_tma_v_empty[stage].wait(kv_empty_state.phase)
                     self.load_one_kv_tile(sV[stage], tma_v_desc, bars.mb_tma_v_full[stage], work, kv_seq_idx, is_v=True)
                     kv_empty_state = advance(kv_empty_state, self.KV_STAGES)
                 bars.mb_tma_q_empty.wait(q_empty_state.phase)
+                if cutlass.const_expr(self.has_bias):
+                    for w in cutlass.range_constexpr(2):
+                        bars.mb_bias_empty[w].wait(self.bias_phase(kv_empty_state, 1))
                 for _ in cutlass.range_constexpr(self.KV_STAGES):
                     bars.mb_tma_k_empty[kv_empty_state.idx].wait(kv_empty_state.phase)
                     bars.mb_tma_v_empty[kv_empty_state.idx].wait(kv_empty_state.phase)
@@ -614,6 +719,7 @@ class SM90FusedMultiHeadAttentionForward:
         active_masks: cutlass.Constexpr,
         is_first_kv_tile: cutlass.Constexpr,
         pack_p: cutlass.Constexpr = True,
+        bias_phase=None,
     ):
         """Update this lane's two rows and leave P in the consumed score slots.
 
@@ -637,13 +743,20 @@ class SM90FusedMultiHeadAttentionForward:
         anchors and alpha agree and their complementary sums merge only at finalization.
         ``MASK_NONE`` requires every score in the tile to be valid.
 
+        With a bias, ``bias_phase`` is this tile's ``mb_bias_full`` parity: the softmax first loads and releases the
+        tile's bias words (``load_bias_words``), each score becomes the logit ``scale * score + bias``, and the anchor
+        and exponents use ``softmax_params.scale_log2 = log2(e)``.
+
         :return: ``s_regs``, with this tile's P in the consumed score slots (packed or FP32, per ``pack_p``).
         """
         work, local_tid = basic_params.work, basic_params.local_tid
         row_anchor, row_sum, alpha = softmax_params.anchor, softmax_params.partial_sum, softmax_params.alpha
         scale_log2, scale_log2_wide = softmax_params.scale_log2, softmax_params.scale_log2_wide
-        extremum, quad_op = (cute.arch.fmax, "max") if cutlass.const_expr(self.scale_mode >= SCALE_ZERO) else (cute.arch.fmin, "min")
+        extremum, quad_op = (cute.arch.fmax, "max") if cutlass.const_expr(self.softmax_mode >= SCALE_ZERO) else (cute.arch.fmin, "min")
         sentinel, zero = cutlass.Float32(self.anchor_sentinel), cutlass.Float32(0.0)
+        bias_words = None
+        if cutlass.const_expr(self.has_bias):
+            bias_words = self.load_bias_words(softmax_params.bias, local_tid, bias_phase)
         # A masked-out P stays a runtime value. On a dense unmasked graph the first
         # tile's padding mask folds, and a literal 0.0 would reach fp32_to_fp16's inline
         # PTX as an immediate, which ICEs libNVVM (pointwise.opaque_f32_zero).
@@ -680,8 +793,17 @@ class SM90FusedMultiHeadAttentionForward:
                 # alpha and P are exp2(+-0) = 1 from runtime EX2s. P must stay a runtime
                 # value: a constant would reach fp32_to_fp16's inline PTX as an
                 # immediate, which ICEs libNVVM (pointwise.opaque_f32_zero).
-                s0 = zero if cutlass.const_expr(self.scale_mode == SCALE_ZERO) else s_regs[s_off + s_reg_idx_lo]
-                s1 = zero if cutlass.const_expr(self.scale_mode == SCALE_ZERO) else s_regs[s_off + s_reg_idx_hi]
+                s0 = zero if cutlass.const_expr(self.softmax_mode == SCALE_ZERO) else s_regs[s_off + s_reg_idx_lo]
+                s1 = zero if cutlass.const_expr(self.softmax_mode == SCALE_ZERO) else s_regs[s_off + s_reg_idx_hi]
+                if cutlass.const_expr(self.has_bias):
+                    # The natural-unit logit (SDPA Rule S17): the bias joins the scaled score before masking and the
+                    # extremum. A zero scale keeps the bias alone, so a nonfinite raw score cannot reach the row.
+                    b0, b1 = f16x2_to_f32(bias_words[2 * k_frag + row_half], dtype=self.storage_dtype)
+                    if cutlass.const_expr(self.scale_mode == SCALE_ZERO):
+                        s0, s1 = b0, b1
+                    else:
+                        s0 = s0 * softmax_params.qk_scale + b0
+                        s1 = s1 * softmax_params.qk_scale + b1
                 valid0 = cutlass.Boolean(column_mask & cutlass.Uint32(1 << (2 * k_frag)))
                 valid1 = cutlass.Boolean(column_mask & cutlass.Uint32(1 << (2 * k_frag + 1)))
                 validity.append((valid0, valid1))
@@ -714,31 +836,38 @@ class SM90FusedMultiHeadAttentionForward:
             # exponent's subtrahend) could move the top exponent by more than 1. The
             # anchors bound every score that can carry probability: a score far below its
             # anchor has P = 0 on either path.
-            wide = cutlass.Boolean(self.scale_mode < SCALE_ZERO)
-            if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
-                bound = cute.arch.fmax(cute.math.abs(safe_current), cute.math.abs(safe_old))
-                wide = softmax_params.wide_uniform | (bound > softmax_params.wide_limit)
-            # Resolve the row's numerical path once, for its scores and the old anchor.
-            # Keeping the branch outside the pairs avoids reconvergence around each
-            # exp2, and computing the old anchor's exponent inside it keeps its FP64
-            # difference off the narrow path.
-            exponents, old_exponent = scores.vec, zero
-            if wide:
-                old_exponent = cutlass.Float32((cutlass.Float64(old) - cutlass.Float64(current)) * scale_log2_wide)
-                # FP64 differences; the zero-select below discards every invalid slot's
-                # exponent.
-                exponent_pairs = []
-                for k_frag in cutlass.range_constexpr(self.qk_row_slots // 2):
-                    pair = scores[2 * k_frag : 2 * k_frag + 2]
-                    s0, s1 = pair[0], pair[1]
-                    x0 = cutlass.Float32((cutlass.Float64(s0) - cutlass.Float64(current)) * scale_log2_wide)
-                    x1 = cutlass.Float32((cutlass.Float64(s1) - cutlass.Float64(current)) * scale_log2_wide)
-                    exponent_pairs.append(cutlass.Vector.from_elements((x0, x1), cutlass.Float32))
-                exponents = vec_concat(exponent_pairs)
-            else:
+            if cutlass.const_expr(self.has_bias):
+                # SDPA Rule S17: subtract the anchor in natural units, then convert to base 2. The anchor's own
+                # exponent is then exactly 0 and every other one <= 0 at any logit magnitude; two rounded products
+                # would differ at the anchor by their rounding error, which past ~1e10 exceeds EX2's range.
                 old_exponent = (old - safe_current) * scale_log2
-                # Preserve both products and the existing exponent rounding policy.
-                exponents = (scores * scale_log2 - safe_current * scale_log2).vec
+                exponents = ((scores - safe_current) * scale_log2).vec
+            else:
+                wide = cutlass.Boolean(self.scale_mode < SCALE_ZERO)
+                if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
+                    bound = cute.arch.fmax(cute.math.abs(safe_current), cute.math.abs(safe_old))
+                    wide = softmax_params.wide_uniform | (bound > softmax_params.wide_limit)
+                # Resolve the row's numerical path once, for its scores and the old anchor.
+                # Keeping the branch outside the pairs avoids reconvergence around each
+                # exp2, and computing the old anchor's exponent inside it keeps its FP64
+                # difference off the narrow path.
+                exponents, old_exponent = scores.vec, zero
+                if wide:
+                    old_exponent = cutlass.Float32((cutlass.Float64(old) - cutlass.Float64(current)) * scale_log2_wide)
+                    # FP64 differences; the zero-select below discards every invalid slot's
+                    # exponent.
+                    exponent_pairs = []
+                    for k_frag in cutlass.range_constexpr(self.qk_row_slots // 2):
+                        pair = scores[2 * k_frag : 2 * k_frag + 2]
+                        s0, s1 = pair[0], pair[1]
+                        x0 = cutlass.Float32((cutlass.Float64(s0) - cutlass.Float64(current)) * scale_log2_wide)
+                        x1 = cutlass.Float32((cutlass.Float64(s1) - cutlass.Float64(current)) * scale_log2_wide)
+                        exponent_pairs.append(cutlass.Vector.from_elements((x0, x1), cutlass.Float32))
+                    exponents = vec_concat(exponent_pairs)
+                else:
+                    old_exponent = (old - safe_current) * scale_log2
+                    # Preserve both products and the existing exponent rounding policy.
+                    exponents = (scores * scale_log2 - safe_current * scale_log2).vec
             old_scale = zero
             if cutlass.const_expr(is_first_kv_tile):
                 old_scale = cutlass.Float32(1.0)
@@ -817,7 +946,10 @@ class SM90FusedMultiHeadAttentionForward:
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
             bars.mb_tma_k_empty[stage].arrive()
-        self.online_softmax(basic_params, softmax_params, s_regs, kv_seq_idx, active_masks=active_masks, is_first_kv_tile=is_first_kv_tile)
+        bias_phase = self.bias_phase(kv_full_state, 0) if cutlass.const_expr(self.has_bias) else None
+        self.online_softmax(
+            basic_params, softmax_params, s_regs, kv_seq_idx, active_masks=active_masks, is_first_kv_tile=is_first_kv_tile, bias_phase=bias_phase
+        )
         # RS operand order: word 2*k_frag+row_half is score slot 4*k_frag+2*row_half.
         probability_words = cutlass.Vector.from_elements([s_regs[2 * word] for word in range(self.qk_row_slots)], cutlass.Float32).bitcast(cutlass.Uint32)
         # Loaded here, not inside the correction branch below: sinking it past
@@ -882,7 +1014,17 @@ class SM90FusedMultiHeadAttentionForward:
             if cutlass.const_expr(release_q):
                 if work.iterations == 1:
                     bars.mb_tma_q_empty.arrive()
-        self.online_softmax(basic_params, softmax_params, s_regs, kv_seq_idx, active_masks=self.mask_flags | MASK_PADDED, is_first_kv_tile=True, pack_p=False)
+        bias_phase = self.bias_phase(k_state, 0) if cutlass.const_expr(self.has_bias) else None
+        self.online_softmax(
+            basic_params,
+            softmax_params,
+            s_regs,
+            kv_seq_idx,
+            active_masks=self.mask_flags | MASK_PADDED,
+            is_first_kv_tile=True,
+            pack_p=False,
+            bias_phase=bias_phase,
+        )
         self.pack_probability_words(s_regs, p_words)
         return advance(k_state, self.KV_STAGES)
 
@@ -949,7 +1091,10 @@ class SM90FusedMultiHeadAttentionForward:
             if cutlass.const_expr(release_q):
                 if kv_step == work.iterations - 1:
                     bars.mb_tma_q_empty.arrive()
-        self.online_softmax(basic_params, softmax_params, s_regs, kv_seq_idx, active_masks=active_masks, is_first_kv_tile=False, pack_p=False)
+        bias_phase = self.bias_phase(k_state, 0) if cutlass.const_expr(self.has_bias) else None
+        self.online_softmax(
+            basic_params, softmax_params, s_regs, kv_seq_idx, active_masks=active_masks, is_first_kv_tile=False, pack_p=False, bias_phase=bias_phase
+        )
         # PV(t-1) has retired: O, P(t-1) and V(t-1) are free.
         prims.wgmma_wait_group_sync_aligned(0)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
@@ -1022,12 +1167,13 @@ class SM90FusedMultiHeadAttentionForward:
                         tma_store_wait(0)
 
     @cute.jit
-    def compute_warp_group(self, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, work, w):
+    def compute_warp_group(self, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, work, w, bias=None):
         """Run compute warpgroup ``w`` (0 for WG1, 1 for WG2) on query rows ``64*w ..+63``.
 
         Both compute warpgroups walk the same KV tiles the same number of times, because
         every K and V EMPTY barrier counts both of them: the bounds are the CTA's 128 rows,
-        and rows past ``q_len`` stay in the walk with an empty bitmap.
+        and rows past ``q_len`` stay in the walk with an empty bitmap. ``bias`` is the kernel's
+        bias bundle (has_bias), None otherwise.
         """
         # The compute warpgroups start at threads 128 and 256, so every helper's
         # warpgroup-local index is the global one modulo the warpgroup.
@@ -1060,10 +1206,15 @@ class SM90FusedMultiHeadAttentionForward:
             # (compute_one_kv_tile), overlap one tile later (overlap_kv_step, overlap_drain). The
             # first tile writes both halves, so alpha needs no initial store.
             alpha = cutlass.Array(cutlass.Float32, 2, alignment=8)
-            scale_log2 = scale * cutlass.Float32(LOG2_E)
-            scale_log2_wide = cutlass.Float64(scale) * cutlass.Float64(LOG2_E)
+            # The softmax's natural-unit scale: the host scale, or 1 when a bias makes the scores
+            # logits before the softmax sees them.
+            softmax_scale = scale
+            if cutlass.const_expr(self.has_bias):
+                softmax_scale = cutlass.Float32(1.0)
+            scale_log2 = softmax_scale * cutlass.Float32(LOG2_E)
+            scale_log2_wide = cutlass.Float64(softmax_scale) * cutlass.Float64(LOG2_E)
             wide_uniform, wide_limit = cutlass.Boolean(False), cutlass.Float32(0.0)
-            if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
+            if cutlass.const_expr(self.softmax_mode == SCALE_POSITIVE and not self.has_bias):
                 # Launch-uniform: decide the scale-only guard once, in setup. The row limit is
                 # the smaller of the FP32 overflow bound and 2**24 / |k|: past |anchor * k| =
                 # 2**24 one rounding of anchor * k moves the top exponent by more than 1.
@@ -1080,16 +1231,18 @@ class SM90FusedMultiHeadAttentionForward:
                 wide_uniform = wide_uniform | (limit > cutlass.Float32(2.0**126))
                 wide_limit = limit
             # Natural-log scale for finalization, FP32/FP64 log2 scales for EX2, and the
-            # launch-uniform guard terms for the per-row magnitude test.
+            # launch-uniform guard terms for the per-row magnitude test. A bias record also
+            # carries its warpgroup's bias slot and the QK scale (bias_view).
             softmax_params = SimpleNamespace(
                 anchor=anchor,
                 partial_sum=partial_sum,
                 alpha=alpha,
-                scale=scale,
+                scale=softmax_scale,
                 scale_log2=scale_log2,
                 scale_log2_wide=scale_log2_wide,
                 wide_uniform=wide_uniform,
                 wide_limit=wide_limit,
+                **(dict(bias=self.bias_view(bias, bars, w), qk_scale=scale) if cutlass.const_expr(self.has_bias) else {}),
             )
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             row_lse.store((-cutlass.Float32.inf, -cutlass.Float32.inf))
@@ -1190,7 +1343,7 @@ class SM90FusedMultiHeadAttentionForward:
                 # as the D512 template does.
                 for row_half in cutlass.range_constexpr(2):
                     total = quad_reduce(softmax_params.partial_sum[row_half], "sum")
-                    inv, value = normalize_row(softmax_params.anchor[row_half], softmax_params.scale, softmax_params.scale_log2, total, self.scale_mode)
+                    inv, value = normalize_row(softmax_params.anchor[row_half], softmax_params.scale, softmax_params.scale_log2, total, self.softmax_mode)
                     row_sum_inv[row_half], row_lse[row_half] = inv, value
                 row_sum_inv_values, row_lse_values = row_sum_inv.load(0, 2), row_lse.load(0, 2)
             # Stores: Stats rows, then this warpgroup's O rows through the epilogue.
@@ -1421,19 +1574,28 @@ class SM90FusedMultiHeadAttentionForward:
         unmasked_end = cute.math.min(work.iterations, cute.math.max(masked_end, right - lo))
         return masked_end, unmasked_end
 
+    def bias_view(self, bias, bars, w):
+        """Compute warpgroup ``w``'s side of the bias bundle (has_bias): its slot's FULL and EMPTY barriers, the shared
+        address of its staged tile and the release-zero of its EMPTY arrive (load_bias_words)."""
+        smem_base = bias.tile.base.subview(w * self.bias_wg_elems).data_ptr().toint(cutlass.Int32)
+        return SimpleNamespace(full=bars.mb_bias_full[w], empty=bars.mb_bias_empty[w], smem_base=smem_base, rz=bias.rz)
+
     @cute.jit
-    def softmax_setup(self, scale, anchor, partial_sum, alpha):
+    def softmax_setup(self, scale, anchor, partial_sum, alpha, bias_view=None):
         """compute_warp_group's softmax parameters, once per CTA: the scales and the launch-uniform FP64 guard depend on
-        the launch only."""
-        scale_log2 = scale * cutlass.Float32(LOG2_E)
-        scale_log2_wide = cutlass.Float64(scale) * cutlass.Float64(LOG2_E)
+        the launch only. ``bias_view`` (has_bias) is the warpgroup's bias slot (bias_view)."""
+        softmax_scale = scale
+        if cutlass.const_expr(self.has_bias):
+            softmax_scale = cutlass.Float32(1.0)
+        scale_log2 = softmax_scale * cutlass.Float32(LOG2_E)
+        scale_log2_wide = cutlass.Float64(softmax_scale) * cutlass.Float64(LOG2_E)
         if cutlass.const_expr(self.mask_flags & MASK_CAUSAL):
             # A causal persistent record with two Q tiles had NVVM recompute this product inside the KV loop (the scale
             # reloaded, F2F and DMUL ahead of the wide test, every step), and that FP64 multiply waits behind the other
             # warpgroup's WGMMA. Behind an asm move it stays a per-CTA value the compiler cannot rematerialize.
             scale_log2_wide = opaque_f64(scale_log2_wide)
         wide_uniform, wide_limit = cutlass.Boolean(False), cutlass.Float32(0.0)
-        if cutlass.const_expr(self.scale_mode == SCALE_POSITIVE):
+        if cutlass.const_expr(self.softmax_mode == SCALE_POSITIVE and not self.has_bias):
             # Launch-uniform: decide the scale-only guard once, in setup. The row limit is
             # the smaller of the FP32 overflow bound and 2**24 / |k|: past |anchor * k| =
             # 2**24 one rounding of anchor * k moves the top exponent by more than 1.
@@ -1455,11 +1617,12 @@ class SM90FusedMultiHeadAttentionForward:
             anchor=anchor,
             partial_sum=partial_sum,
             alpha=alpha,
-            scale=scale,
+            scale=softmax_scale,
             scale_log2=scale_log2,
             scale_log2_wide=scale_log2_wide,
             wide_uniform=wide_uniform,
             wide_limit=wide_limit,
+            **(dict(bias=bias_view, qk_scale=scale) if cutlass.const_expr(self.has_bias) else {}),
         )
 
     @cute.jit
@@ -1508,7 +1671,7 @@ class SM90FusedMultiHeadAttentionForward:
         sp = cta.softmax_params
         for row_half in cutlass.range_constexpr(2):
             total = quad_reduce(sp.partial_sum[row_half], "sum")
-            inv, value = normalize_row(sp.anchor[row_half], sp.scale, sp.scale_log2, total, self.scale_mode)
+            inv, value = normalize_row(sp.anchor[row_half], sp.scale, sp.scale_log2, total, self.softmax_mode)
             cta.row_sum_inv[row_half], cta.row_lse[row_half] = inv, value
         return cta.row_sum_inv.load(0, 2), cta.row_lse.load(0, 2)
 
@@ -1530,7 +1693,7 @@ class SM90FusedMultiHeadAttentionForward:
                         lse.iterator[offset] = lse_out
 
     @cute.jit
-    def tmaldg_persistent(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, claim):
+    def tmaldg_persistent(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, claim, bias=None):
         """Persistent producer: this CTA's items in turn, each K(i, 0), Q(i), V(i, 0), then the rest of its
         reverse walk as tmaldg_warp_group's.
 
@@ -1545,6 +1708,10 @@ class SM90FusedMultiHeadAttentionForward:
         Under causal_claim the next item is claimed at the start of each item (claim_issue) and published to the compute
         warpgroups after the item's last loads (publish_claim); the end-of-work id is published the same way, and the
         closing waits are unchanged (an id slot holds no TMA payload).
+
+        A bias record fills both bias slots for every KV tile, after Q(i) for an item's first tile and between K and V
+        for the rest (load_bias_tile); the slots' phases carry across items with the K ring's, and the closing waits take
+        each slot's last release.
         """
         tid = cute.arch.thread_idx()[0]
         if tid < cute.arch.WARP_SIZE:
@@ -1564,6 +1731,8 @@ class SM90FusedMultiHeadAttentionForward:
                 bars.mb_tma_q_empty.wait(q_empty_phase)
                 self.load_q_tile_tma(sQ, tma_q_desc, bars.mb_tma_q_full, work)
                 q_empty_phase = self.next_q_phase(q_empty_phase)
+                if cutlass.const_expr(self.has_bias):
+                    self.load_bias_tile(bias, bars, work, first_seq_idx, kv_empty_state)
                 bars.mb_tma_v_empty[first_stage].wait(kv_empty_state.phase)
                 self.load_one_kv_tile(sV[first_stage], tma_v_desc, bars.mb_tma_v_full[first_stage], work, first_seq_idx, is_v=True)
                 kv_empty_state = advance(kv_empty_state, self.KV_STAGES)
@@ -1572,6 +1741,8 @@ class SM90FusedMultiHeadAttentionForward:
                     stage = kv_empty_state.idx
                     bars.mb_tma_k_empty[stage].wait(kv_empty_state.phase)
                     self.load_one_kv_tile(sK[stage], tma_k_desc, bars.mb_tma_k_full[stage], work, kv_seq_idx, is_v=False)
+                    if cutlass.const_expr(self.has_bias):
+                        self.load_bias_tile(bias, bars, work, kv_seq_idx, kv_empty_state)
                     bars.mb_tma_v_empty[stage].wait(kv_empty_state.phase)
                     self.load_one_kv_tile(sV[stage], tma_v_desc, bars.mb_tma_v_full[stage], work, kv_seq_idx, is_v=True)
                     kv_empty_state = advance(kv_empty_state, self.KV_STAGES)
@@ -1581,6 +1752,9 @@ class SM90FusedMultiHeadAttentionForward:
                 else:
                     item = self.next_item(item)
             bars.mb_tma_q_empty.wait(q_empty_phase)
+            if cutlass.const_expr(self.has_bias):
+                for w in cutlass.range_constexpr(2):
+                    bars.mb_bias_empty[w].wait(self.bias_phase(kv_empty_state, 1))
             for _ in cutlass.range_constexpr(self.KV_STAGES):
                 bars.mb_tma_k_empty[kv_empty_state.idx].wait(kv_empty_state.phase)
                 bars.mb_tma_v_empty[kv_empty_state.idx].wait(kv_empty_state.phase)
@@ -1626,12 +1800,13 @@ class SM90FusedMultiHeadAttentionForward:
                 item = self.next_item(item)
 
     @cute.jit
-    def compute_persistent(self, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, w, claim):
+    def compute_persistent(self, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, w, claim, bias=None):
         """Run compute warpgroup ``w`` (0 for WG1, 1 for WG2) over every item of this CTA (the persistent walk).
 
         Built once per CTA, as compute_warp_group builds them per tile: the register Arrays, the operand descriptors, the
         row state and the launch-uniform scale guard. Then the walk (walk_items). After it, every lane of warp 0 waits for
         this half's last O store to finish reading sO before the CTA exits and frees it (the deferred wait, epilogue).
+        ``bias`` is the kernel's bias bundle (has_bias), None otherwise.
         """
         local_tid = cute.arch.thread_idx()[0] % cute.arch.THREADS_PER_WARPGROUP
         anchor = cutlass.Array(cutlass.Float32, 2, alignment=16)
@@ -1659,33 +1834,33 @@ class SM90FusedMultiHeadAttentionForward:
             q_desc=wgmma_descriptor(sQ.base.subview(w * self.WG_ROWS * self.swizzle_chunk_elems)),
             k_desc=wgmma_descriptor(sK.base),
             v_desc=wgmma_descriptor(sV.base, mn_major=True, slab_rows=self.KV_TILE),
-            softmax_params=self.softmax_setup(scale, anchor, partial_sum, alpha),
+            softmax_params=self.softmax_setup(scale, anchor, partial_sum, alpha, self.bias_view(bias, bars, w) if cutlass.const_expr(self.has_bias) else None),
         )
         self.walk_items(cta)
         if local_tid < cute.arch.WARP_SIZE:
             tma_store_wait(0)
 
     @cute.jit
-    def _run_persistent(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, claim, wg):
+    def _run_persistent(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, claim, wg, bias=None):
         """Persistent walk: _run_unit's register split, once per CTA, then the role over every item.
 
         setmaxnreg is warpgroup-collective, so all four WG0 warps still run it before warps 1 to 3 go idle. ``claim`` is
-        the claim counter's bundle (kernel), None without causal_claim.
+        the claim counter's bundle (kernel), None without causal_claim; ``bias`` the bias bundle, None without has_bias.
         """
         if wg == 0:
             prims.setmaxregister(self.REG_BUDGETS[0], prims.SetMaxRegisterAction.DECREASE)
-            self.tmaldg_persistent(sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, claim)
+            self.tmaldg_persistent(sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, claim, bias)
         else:
             prims.setmaxregister(self.REG_BUDGETS[1], prims.SetMaxRegisterAction.INCREASE)
-            self.compute_persistent(tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg - 1, claim)
+            self.compute_persistent(tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg - 1, claim, bias)
 
     @cute.jit
-    def _run_unit(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch):
+    def _run_unit(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch, bias=None):
         """Resolve one (Q tile, head, batch) work tile and run this thread's role on it.
 
         ``wg`` selects the role -- WG0 load, WG1 and WG2 compute -- and each role sets its
         own register budget first. Nothing persists across units: every pipeline state
-        starts from its own phase.
+        starts from its own phase. ``bias`` is the bias bundle, None without has_bias.
         """
         q_base = tile * self.Q_TILE
         q_len, kv_len = cutlass.Int32(self.s_q), cutlass.Int32(self.s_kv)
@@ -1706,10 +1881,10 @@ class SM90FusedMultiHeadAttentionForward:
         )
         if wg == 0:
             prims.setmaxregister(self.REG_BUDGETS[0], prims.SetMaxRegisterAction.DECREASE)
-            self.tmaldg_warp_group(sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, work)
+            self.tmaldg_warp_group(sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, work, bias)
         else:
             prims.setmaxregister(self.REG_BUDGETS[1], prims.SetMaxRegisterAction.INCREASE)
-            self.compute_warp_group(tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, work, wg - 1)
+            self.compute_warp_group(tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, work, wg - 1, bias)
 
     @cute.kernel
     def kernel(
@@ -1721,6 +1896,9 @@ class SM90FusedMultiHeadAttentionForward:
         lse,
         scale: cutlass.Float32,
         claim_ctr,
+        tma_bias_desc: Optional[cutlass.GridConstant[cuda.TensorMap]],
+        bias_batches,
+        bias_heads,
         release_zero_arg: cutlass.Int32,
     ):
         """Run one work tile per CTA, or under ``persistent`` every item of the CTA's stride (of its units, under the
@@ -1729,11 +1907,14 @@ class SM90FusedMultiHeadAttentionForward:
         Warp 0's elected lane initializes every barrier, and the default CTA barrier (id 0)
         publishes them before any role runs. ``claim_ctr`` is the meta pointer's Int32 view
         (prepared_host's ``seq_kv_lens``), whose word 0 is a claim-counter record's work-item
-        counter in the caller's workspace; None on every other record. ``release_zero_arg`` is
-        tile_dsl.consume's release-zero, the last argument: the host passes the literal 0 and
-        its one use is ``release_zero`` below (python/cudnn/AGENTS.md Rule 11: a compare or a
-        branch on it lets the compiler fold the mask, and the claim ring's loads are unordered
-        again without any error).
+        counter in the caller's workspace; None on every other record. ``tma_bias_desc`` is a
+        bias record's map over the ``(B_b, H_b, S_q, S_kv)`` bias, and ``bias_batches`` /
+        ``bias_heads`` its batch and head extents (1 on a broadcast axis); each is None on every
+        other record. ``release_zero_arg`` is tile_dsl.consume's release-zero, the last argument:
+        the host passes the literal 0 and its one use is ``release_zero`` below
+        (python/cudnn/AGENTS.md Rule 11: a compare or a branch on it lets the compiler fold the
+        mask, and the claim ring's and the bias slots' loads are unordered again without any
+        error).
         """
         rz = release_zero(release_zero_arg)
         # One typed Array per region. The tiles align to 1024 B, one SW128 swizzle atom (8
@@ -1743,6 +1924,27 @@ class SM90FusedMultiHeadAttentionForward:
         sK_raw = cutlass.Array(self.storage_dtype, self.KV_STAGES * self.tile_elems, alignment=1024, space=cutlass.AddressSpace.smem)
         sV_raw = cutlass.Array(self.storage_dtype, self.KV_STAGES * self.tile_elems, alignment=1024, space=cutlass.AddressSpace.smem)
         sO_raw = cutlass.Array(self.storage_dtype, self.tile_elems, alignment=1024, space=cutlass.AddressSpace.smem)
+        # The bias slots (has_bias): one WG_ROWS x KV_TILE tile per compute warpgroup, written by WG0's TMA and read by
+        # that warpgroup's lanes (load_bias_words). Allocated beside the other tiles, ahead of the barriers.
+        sBias_raw = None
+        if cutlass.const_expr(self.has_bias):
+            sBias_raw = cutlass.Array(self.bias_dtype, 2 * self.bias_wg_elems, alignment=1024, space=cutlass.AddressSpace.smem)
+        bias_bars = {}
+        if cutlass.const_expr(self.has_bias):
+            bias_bars = dict(
+                mb_bias_full=MBarrier(
+                    cutlass.Array(cutlass.Int64, 2, alignment=16, space=cutlass.AddressSpace.smem),
+                    stages=2,
+                    init_count=1,
+                    producer=Producer.TMA_LOAD,
+                ),
+                mb_bias_empty=MBarrier(
+                    cutlass.Array(cutlass.Int64, 2, alignment=16, space=cutlass.AddressSpace.smem),
+                    stages=2,
+                    init_count=cute.arch.THREADS_PER_WARPGROUP,
+                    producer=Producer.THREAD,
+                ),
+            )
         bars = Bars(
             mb_tma_q_full=MBarrier(
                 cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
@@ -1780,6 +1982,7 @@ class SM90FusedMultiHeadAttentionForward:
                 init_count=2 * cute.arch.WARPS_PER_WARPGROUP,
                 producer=Producer.THREAD,
             ),
+            **bias_bars,
         )
         # The claim counter's bundle (causal_claim): the workspace counter, the two-slot id ring and its FULL (the
         # producer warp's lane 0) and EMPTY (lane 0 of each of the eight compute warps, through tile_dsl.consume)
@@ -1861,12 +2064,37 @@ class SM90FusedMultiHeadAttentionForward:
                     for slot in cutlass.range_constexpr(self.CLAIM_SLOTS):
                         claim.full[slot].init()
                         claim.empty[slot].init()
+                if cutlass.const_expr(self.has_bias):
+                    for slot in cutlass.range_constexpr(2):
+                        bars.mb_bias_full[slot].init()
+                        bars.mb_bias_empty[slot].init()
         prims.fence_mbarrier_init()
         prims.barrier_cta_sync()
+        # The bias bundle (has_bias): the slots as a two-stage SW128 tile (one stage per compute warpgroup, two 64-key
+        # slabs each, as an O half), the map, the plane extents and the release-zero of the slots' EMPTY arrives.
+        bias = None
+        if cutlass.const_expr(self.has_bias):
+            bias = SimpleNamespace(
+                tile=SmemTile(
+                    base=sBias_raw,
+                    elems_per_stage=self.bias_wg_elems,
+                    leading_byte_offset=0,
+                    stride_byte_offset=0,
+                    layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
+                    tma_loads_per_tile=self.tma_swizzle_chunks,
+                    tma_granu_elems=self.swizzle_chunk_elems,
+                    tma_subtile_stride_elems=self.bias_slab_elems,
+                    stages=2,
+                ),
+                tma_desc=tma_bias_desc,
+                batches=bias_batches,
+                heads=bias_heads,
+                rz=rz,
+            )
         if cutlass.const_expr(self.persistent):
             # Persistent: every role walks this CTA's items (at most one CTA per SM, __call__).
             wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
-            self._run_persistent(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, claim, wg)
+            self._run_persistent(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, claim, wg, bias)
         else:
             # One (Q tile, head, batch) work tile per CTA; the LPT policies unflatten the single
             # grid axis they launch.
@@ -1892,7 +2120,7 @@ class SM90FusedMultiHeadAttentionForward:
             elif cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
                 tile, head, batch = lpt_tile_coords(tile, cutlass.Int32(self.heads), cutlass.Int32(self.b), cutlass.Int32(self.q_tiles))
             wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
-            self._run_unit(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch)
+            self._run_unit(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch, bias)
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -1920,6 +2148,7 @@ class SM90FusedMultiHeadAttentionForward:
         stream: cuda_driver.CUstream,
         block_table: Optional[cute.Tensor] = None,
         block_table_v: Optional[cute.Tensor] = None,
+        bias: Optional[cute.Tensor] = None,
     ) -> None:
         """Build the port maps and launch the kernel.
 
@@ -1942,6 +2171,10 @@ class SM90FusedMultiHeadAttentionForward:
         :param scale: The host softmax scale in natural units; the kernel folds ``log2(e)``
             itself. Its sign must match ``scale_mode``.
         :param stream: CUDA stream of the launch.
+        :param bias: ``has_bias`` only: the ``(B_b, H_b, S_q, S_kv)`` additive bias in the Q/K/V
+            dtype, B_b and H_b each 1 or the full extent, its key dim contiguous, its base and
+            live outer pitches 16-byte aligned (prepared_host.host_bias; the binder checks them).
+            ``None`` otherwise.
         """
 
         def port_tma_desc(tensor, rows, stride_order):
@@ -1964,6 +2197,23 @@ class SM90FusedMultiHeadAttentionForward:
             grid = (self.n_ctas, 1, 1)
         if cutlass.const_expr(sinks is not None):
             raise ValueError("prefill_d128_f16_sm90: a D128 specialization binds no sinks")
+        if cutlass.const_expr(self.has_bias != (bias is not None)):
+            raise ValueError("prefill_d128_f16_sm90: bias must be provided exactly when the kernel is configured with has_bias")
+        # Static bias extents must match the declared plane; the pointer host's are runtime values the binder checked.
+        if cutlass.const_expr(
+            bias is not None and any(isinstance(extent, int) and extent != size for extent, size in zip(bias.shape[2:], (self.s_q, self.s_kv)))
+        ):
+            raise ValueError(
+                f"prefill_d128_f16_sm90: bias must be (1|B, 1|H_q, S_q, S_kv) with (S_q, S_kv) = ({self.s_q}, {self.s_kv}); got {tuple(bias.shape)}"
+            )
+        # A bias record's map: keys innermost, then rows, heads and batches; one box is a compute warpgroup's 64 rows of
+        # one 64-key SW128 slab. A broadcast axis has extent 1 (its coordinate is always 0, load_bias_tile).
+        tma_bias_desc, bias_batches, bias_heads = None, None, None
+        if cutlass.const_expr(bias is not None):
+            tma_bias_desc = cuda.create_tensor_map_tiled_from_view(
+                bias, box_dims=(1, 1, self.WG_ROWS, self.swizzle_chunk_elems), stride_order=(3, 2, 1, 0), swizzle=self.tma_swizzle
+            )
+            bias_batches, bias_heads = cutlass.Int32(bias.shape[0]), cutlass.Int32(bias.shape[1])
         # The declared problem sizes the grid, the KV-head addressing and the Stats store, so
         # each operand must carry it.
         ports = (("Q", q, self.h_q, self.s_q), ("K", k, self.h_kv, self.s_kv), ("V", v, self.h_kv, self.s_kv), ("O", o, self.h_q, self.s_q))
@@ -1977,7 +2227,7 @@ class SM90FusedMultiHeadAttentionForward:
         # (python/cudnn/AGENTS.md: without it ptxas may drop every setmaxnreg silently).
         claim_ctr = seq_kv_lens if cutlass.const_expr(self.causal_claim) else None
         # The release-zero (tile_dsl.consume, kernel's last argument): the literal 0, the only value ever passed.
-        self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, claim_ctr, cutlass.Int32(0)).launch(
+        self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, claim_ctr, tma_bias_desc, bias_batches, bias_heads, cutlass.Int32(0)).launch(
             grid=grid, block=(self.threads_per_cta, 1, 1), stream=stream, min_blocks_per_mp=1
         )
 
@@ -2061,6 +2311,8 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         persistent_ctas=persistent_ctas,
         causal_walk=PARAMS.causal_walk,
         causal_claim=PARAMS.causal_claim,
+        has_bias=PARAMS.has_bias,
+        bias_fp32=PARAMS.bias_fp32,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel
@@ -2073,7 +2325,7 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         order(stride, shape)
         for stride, shape in ((q_stride, (b, h_q, s_q)), (k_stride, (b, h_kv, s_kv)), (v_stride, (b, h_kv, s_kv)), (o_stride, (b, h_q, s_q)))
     )
-    return compile_host(kernel, STORAGE_DTYPE, d_qk, d_v, PARAMS.has_lse, False, _cache_key, target)
+    return compile_host(kernel, STORAGE_DTYPE, d_qk, d_v, PARAMS.has_lse, False, _cache_key, target, bias_dtype=kernel.bias_dtype)
 
 
 SM90FusedMultiHeadAttentionForward.kernel.set_name_prefix("cudnn_sdpa_fwd_sm90_d128_multi_q", remove_cutlass_symbol=True)
