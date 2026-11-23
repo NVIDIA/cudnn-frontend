@@ -789,7 +789,7 @@ _LARGE_COUNTS = (2048, 1500, 1024, 0, 1, 1793, 640, 2047)
 @pytest.fixture(scope="module")
 def wgrad_op_large():
     device = _sm107_device()
-    _require_training_wgrad()
+    _require_training_wgrad(device)
     capacity = 8192
     top_k = 2
     with MoeEp(
