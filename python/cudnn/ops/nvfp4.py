@@ -332,7 +332,7 @@ def _allocate_packed(shape, *, device):
     return carrier.view(fp4_dtype) if fp4_dtype is not None else carrier
 
 
-def nvfp4_block_scale_quantize(input_tensor, encode_scale) -> TupleDict:
+def nvfp4_block_scale_quantize_forward(input_tensor, encode_scale) -> TupleDict:
     """Quantize contiguous BF16 ``[1,M,K]`` into reusable NVFP4 tensors.
 
     ``encode_scale`` is a CUDA FP32 tensor of shape ``[1,1,1]``.  The returned
@@ -343,7 +343,7 @@ def nvfp4_block_scale_quantize(input_tensor, encode_scale) -> TupleDict:
     import torch
 
     if detect_framework(input_tensor) != "torch":
-        raise TypeError("nvfp4_block_scale_quantize currently accepts torch tensors")
+        raise TypeError("nvfp4_block_scale_quantize_forward currently accepts torch tensors")
     shape = get_shape(input_tensor)
     if len(shape) != 3:
         raise ValueError(f"input must have shape [1,M,K]; got {shape}")
@@ -369,7 +369,7 @@ def nvfp4_block_scale_quantize(input_tensor, encode_scale) -> TupleDict:
     return TupleDict(packed_tensor=packed_tensor, scale_tensor=scale_tensor)
 
 
-def nvfp4_block_scale_dequantize(packed_tensor, scale_tensor, decode_scale):
+def nvfp4_block_scale_dequantize_forward(packed_tensor, scale_tensor, decode_scale):
     """Dequantize reusable NVFP4 tensors to contiguous BF16 ``[1,M,K]``.
 
     ``decode_scale`` is multiplied after the per-block E4M3 scale.  Pass a CUDA
@@ -379,7 +379,7 @@ def nvfp4_block_scale_dequantize(packed_tensor, scale_tensor, decode_scale):
     import torch
 
     if detect_framework(packed_tensor) != "torch":
-        raise TypeError("nvfp4_block_scale_dequantize currently accepts torch tensors")
+        raise TypeError("nvfp4_block_scale_dequantize_forward currently accepts torch tensors")
     packed_shape = get_shape(packed_tensor)
     if len(packed_shape) != 3:
         raise ValueError(f"packed_tensor must have physical shape [1,M,K/2]; got {packed_shape}")
@@ -406,8 +406,6 @@ def nvfp4_block_scale_dequantize(packed_tensor, scale_tensor, decode_scale):
 
 
 __all__ = [
-    "Nvfp4BlockScaleDequantizer",
-    "Nvfp4BlockScaleQuantizer",
-    "nvfp4_block_scale_dequantize",
-    "nvfp4_block_scale_quantize",
+    "nvfp4_block_scale_dequantize_forward",
+    "nvfp4_block_scale_quantize_forward",
 ]
