@@ -1071,6 +1071,52 @@ Contract:
   shape that refills the stage (`test/AGENTS.md`).
 
 
+## Handing data to another thread block through global memory: `tile_dsl.handover`
+
+One thread block stores data to global memory with ordinary stores and another
+block of the same grid loads it. Two blocks of a 1 x 1 x 1 cluster share no
+mbarrier, so the pair is ordered through a counter word in global memory.
+
+```python
+from cudnn.frost.tile_dsl.handover import acquired_zero, poll_then_acquire, release_add
+
+# writer: every lane that stored, behind its last store
+release_add(word, async_reader=True)                 # async_reader: the reader is a TMA or bulk copy
+# reader: a whole warp in converged control flow
+count = poll_then_acquire(word, WRITING_LANES, warp_uniform=True)
+row = row + acquired_zero(count, WRITING_LANES)      # what the loads are addressed from
+```
+
+| Form | Emits |
+|---|---|
+| `release_add(word, amount=1, async_reader=False)` | one add with release at GPU scope per lane, the previous value unused; with `async_reader`, `fence.proxy.async.global` in front of it |
+| `poll_then_acquire(word, at_least, warp_uniform=False)` | relaxed loads until the word reads `at_least`, then one acquire load, whose value is returned; `warp_uniform` leaves the loop on a warp vote |
+| `acquired_zero(count, adding_lanes)` | `count - adding_lanes`: 0 while exactly `adding_lanes` lanes add |
+
+Contract:
+
+- **The word is a counter.** It is cleared for every launch by a kernel in
+  front on the same stream, every writing lane adds once and the reader waits
+  for the number of writing lanes. No form elects, masks or counts for the
+  caller: SUM(adding lanes) == the value waited for belongs in the barrier
+  table beside the init counts.
+- **The reader's loads take a value from the acquire load.** Add
+  `acquired_zero` (or `tile_dsl.consume.consumed_zero`) to the address, the
+  index or the stored word the loads are formed from; a TMA load is formed
+  from its coordinates. A load whose address does not depend on the acquired
+  value may be scheduled in front of it.
+- **A writer never waits for its reader.** What the reader polls for is
+  reached by its writer on a path without a poll; the poll has no time limit,
+  so a table that names a reader without its writer hangs the launch.
+- **Keep it off per-chunk paths.** The lanes' adds of one warp become one
+  reduction behind one GPU-scope memory barrier, which drains the SM.
+- **Check a new call site** in the disassembly: the last store, the proxy
+  fence where one is asked for, one GPU-scope barrier and one reduction in
+  that order; one acquire load behind the poll and the loads' address computed
+  from it. `test/python/sdpa/frost/test_tile_dsl_handover.py` pins what the
+  forms compile to.
+
+
 ## Reducing a row over one thread block: `tile_dsl.rowwise`
 
 A row kernel launches one thread block per row -- a normalization, a per-row

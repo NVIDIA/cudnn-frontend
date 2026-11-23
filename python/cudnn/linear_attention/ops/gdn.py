@@ -1526,8 +1526,14 @@ def gated_delta_net(
             into the ``initial_state`` buffer, which is required and
             returned as the final state; the engine runs the chain or the
             uncut schedule and never the split-K cut, so the aliasing is
-            race-free.  Inference only: the in-place op has no autograd
-            formula.
+            race-free.  A prefill kernel built with its levelled plan may
+            run a (sequence, head) tile as two work items on two thread
+            blocks: the second starts from the state the first stored in
+            this buffer and is handed out only behind that store, so the
+            output and the final state stay the uncut schedule's.  A batch
+            whose sequences differ in their chunk count, or whose
+            ``state_indices`` name one row twice, keeps the uncut schedule.
+            Inference only: the in-place op has no autograd formula.
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` inside the kernel.
         allow_neg_eigval: scale the fused beta sigmoid by 2, so the delta-rule
             operator ``I - beta k k^T`` can reach negative eigenvalues
