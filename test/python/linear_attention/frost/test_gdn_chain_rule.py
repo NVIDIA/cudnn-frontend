@@ -75,6 +75,19 @@ def test_faster_rival_delays_the_chain():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("tail", [False, True], ids=["whole_batch_chain", "chain_tail"])
+def test_each_chain_reads_its_own_fixed_part(monkeypatch, tail):
+    """The whole-batch chain and the chain tail each have a fixed part of their own: with one of them at nothing that chain's
+    verdict no longer follows the length, and the other chain's first length does not move."""
+    other = [first_paying(pieces, tail=not tail) for pieces in SLOTS]
+    monkeypatch.setattr(piece_chain, "CHAIN_TAIL_FIXED_TOKENS" if tail else "CHAIN_FIXED_TOKENS", 0)
+    firsts = [first_paying(pieces, tail=tail) for pieces in SLOTS]
+    assert set(firsts) <= {LENGTHS[0], NEVER}
+    assert firsts[-1] == LENGTHS[0]
+    assert [first_paying(pieces, tail=not tail) for pieces in SLOTS] == other
+
+
+@pytest.mark.L0
 def test_chain_group_pays_for_long_batches_of_few_sequences():
     """At every slot count, head count and SM count: a batch that carries the chain group carries it with fewer sequences and
     on more SMs, and with more tokens for as long as the length rule cuts them into as many slots."""
