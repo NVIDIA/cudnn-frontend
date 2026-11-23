@@ -1895,20 +1895,20 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa_unpacked", True): Entry(
         "always", None, "sm90_d64_sink_mtp_20261118"
     ),
-    # study sm100_d192x128_paged_v2_20261118 (B200 1000 W train on cuDNN 9.24.0.43 and 9.30.0.8, the earlier study's cells included;
-    # holdout at fresh head pairs scored once, B200 0.364 / 0.371 and B300 0.297 / 0.313 on / off the tile): mimo full paged d192 x 128
-    # context leads from S_q ~887 at enough work on the tile and from S_q ~362 off it. Graphs below S_q 256 key `gqa_short`
+    # study sm100_d192x128_paged_924_20261123 (B200 1000 W / B300 1100 W, cuDNN 9.24.0.43 only; sm100_d192x128_paged_v2_20261118's 9.24
+    # cells plus a lower-edge supplement as train, holdout at fresh head pairs scored once): mimo full paged d192 x 128 context leads
+    # from S_q 256, on and off the tile; on 9.24 the backend runs eng8 on this class. Graphs below S_q 256 key `gqa_short`
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 34.407, "sm100_d192x128_paged_v2_20261118", "cost", ("ge", 9.792, "q")
+        "always", None, "sm100_d192x128_paged_924_20261123"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
-        "ge", 8.5, "sm100_d192x128_paged_v2_20261118", "q"
+        "always", None, "sm100_d192x128_paged_924_20261123"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 34.407, "sm100_d192x128_paged_v2_20261118", "cost", ("ge", 9.792, "q")
+        "always", None, "sm100_d192x128_paged_924_20261123"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
-        "ge", 8.5, "sm100_d192x128_paged_v2_20261118", "q"
+        "always", None, "sm100_d192x128_paged_924_20261123"
     ),
     # study sm100_d192x128_swa_sink_pack_20261118 (B200 1000 W train on cuDNN 9.24.0.43 and 9.30.0.8, B200 + B300 holdout at fresh head
     # pairs scored once; run-559 gates GB200 11 rows at 0.690, GB300 11 at 0.591): mimo swa dense d192 x 128 with a window and a sink,
