@@ -1097,8 +1097,7 @@ def run_checks(
 
     **With a drafter** the replay runs the drafter's passes again -- over the prompt, and in front of every verify step,
     which is fed the recorded window -- and ``replay`` holds the drafter's proposals of every recorded step beside the
-    ids and logits.  The reference sessions have no drafter: they are fed the recorded windows.  Under the kernel check
-    stands what a run can say about the kernels of the passes: nothing (``DRAFTER_KERNELS``)."""
+    ids and logits.  The reference sessions have no drafter: they are fed the recorded windows."""
     if kernels is None:
         kernels = session.check_kernels
     elif not kernels and session.stack in getattr(session.model, "target_stacks", ()):
@@ -1269,8 +1268,6 @@ def run_checks(
             lines.append(
                 f"    the prompt's decode steps: {fed} replayed in front of the traced window, their kernels not observed (the check is of the verify steps)"
             )
-        if session.drafter is not None:
-            lines.append(f"    {DRAFTER_KERNELS}")
     session.reset(fresh=True)
     ok = replay_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
     return Checks(lines, ok, judged, status, unobserved, cost, tuple(sorted(judged_at or ())))
@@ -1483,13 +1480,6 @@ def verify_checks(session: Session, decode: Session, stream: Optional[Stream] = 
             lines.append(f"    {name}: {block.batch_note}")
     decode.reset(fresh=True)
     return Checks(lines, tokens_ok and state_ok, gated)
-
-
-#: what a run says of the kernels of a drafter's passes: they are attributed like every launch, and held to no census
-DRAFTER_KERNELS = (
-    "kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and the output head behind it; "
-    "no section holds a draft pass)"
-)
 
 
 class _Shadow:

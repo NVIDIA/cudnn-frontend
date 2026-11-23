@@ -509,7 +509,6 @@ def main(argv=None) -> int:
             _say(f"{TAG} planning: {note}", flush=True)
         tables = [plain.plan_table([session]), session.plan.table(), loop.PROMPT_ROWS, session.prefill_plan.table()]
         tables += [loop.DRAFTER_ROWS.format(calls=drafter.calls_per_pass()), session.draft_plan.table()]
-        claim = session.claim()  # of a stack that declares a target: how the verify plan stands to it
     except NotImplementedError as error:
         _say(f"{TAG} SKIP {error}")
         return 0
@@ -531,7 +530,7 @@ def main(argv=None) -> int:
     _say()
     _say("\n".join(tables))
     if session.check_kernels:  # the kernel table of the verify plan, first part: from the plan alone, before the load
-        _say(census.table(session.plan, claim))
+        _say(census.table(session.plan))
     plain.load()
     session.load()  # the drafter is loaded here, with the model's embedding table
     _say(f"{TAG} {plain.stages.line()}")

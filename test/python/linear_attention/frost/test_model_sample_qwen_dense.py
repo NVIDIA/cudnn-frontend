@@ -22,14 +22,14 @@ The ``fe-entries`` cell runs the same default run on the stack ``fe-entries``: e
 entry, the add + RMSNorm + quantise entry in the form of each call site, the fused 4-bit gate / up entry and the attention
 preparation entry, which writes a paged attention cache, each judged against its twin) with every other block on its
 fallback row -- no package beyond cuDNN Frontend and PyTorch.
-That stack always checks its kernels: the profiler's record of every launch of the traced steps is held against the plan,
-the entries' own launch facts and, where the family's kernel census has a section for the GPU, the recorded launch shapes.
+That stack always checks its kernels: the profiler's record of every launch of the traced steps is held against the plan
+and against the entries' own launch facts.
 Where the profiler's records cannot be had the sample ends in ``[00] RAN fe-entries stack (kernels not observed: <reason>)``:
 the cell then passes on the other checks and the recorded line says that the kernels were not observed -- uncovered
 there, not verified.
 
-The ``native`` cell runs the default run on the stack ``native`` itself, which has four rows more: the multiplies the target
-runs on a library, FlashInfer, on the stored weights, and the attention core on that library's paged decode attention.
+The ``native`` cell runs the default run on the stack ``native`` itself, which has four rows more: three multiplies of a
+library, FlashInfer, on the stored weights, and the attention core on that library's paged decode attention.
 FlashInfer is an optional package of that stack alone, so the cell runs where it is installed at a validated version with
 its kernel-binary package and is skipped elsewhere -- by this module where the library is absent, by the sample's own
 ``[00] SKIP`` line where its version is not validated or a kernel binary is not on the machine.  A skipped cell is
@@ -57,8 +57,7 @@ script reaches it, so a small program drives the helper layer in a fresh interpr
 session of the stack ``fe-entries`` on one load of the reduced seeded model; the decode run's token stream through verify
 steps that keep every possible number of tokens once, against the decode steps (``tie_out.verify_checks``); then the
 verify session's own checks with its kernel check (``tie_out.run_checks``).  The fused verify entry is judged, token by
-token, against reference decode steps; its launch against the entry's own facts and, at one sequence of six tokens on a
-GPU the census has a section for, against the recorded launch shape.  The out-projection of the linear-attention layer is
+token, against reference decode steps; its launch against the entry's own facts.  The out-projection of the linear-attention layer is
 the FP8 projection entry's in such a step where a row of the stack holds the step's rows (compute capability 10.0: 2 to
 16 rows; 10.3 and 10.7: 2 to 32), in the split of that row range, and is judged against the reference multiply under the
 name of its call site; the attention layer's out-projection, and both beyond those rows, are the multiply over a copy.
@@ -238,7 +237,7 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
     kernel stated whole) inside their bands against their twins; on compute capability 10.0
     the FP8 projection entry for the in-projections (one instance per weight shape) inside the band of the reference
     multiply, and on every other class that block on its multiply over a copy; the kernel check on every launch of the
-    traced steps; the census line, which claims nothing while a row is a fallback.
+    traced steps, and under each kernel table its count of a step.
     Where an entry that multiplies on the stored format serves both sequence counts -- the fused gate / up entry on
     compute capability 10.x, the projection entry on 10.0 -- the run holds those weights on their stored format alone, so
     the reference of the checks makes its own bf16 copies: the run says that the stored bytes they are made from are those
@@ -254,9 +253,13 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
     by_provider = FE_ENTRIES_CC100 if projection else (FE_ENTRIES if gate else FE_CUBLAS)
     out = _run(None, capsys, ["--stack", "fe-entries"], "fe-entries", by_provider, unobserved=True)
     assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "stack fe-entries" in out
-    assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the fused step in the target's form"
+    assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the fused step in the form of the stack's row"
     assert out.count("\nkernels, planned (decided before the load") == 2 and out.count("\n  kernels  ") == 2, "the kernel check ran at both sequence counts"
-    assert out.count(": NOT CLAIMED (") == 2 and ": EQUAL" not in out, "nothing is claimed while a row of the stack is a fallback"
+    counted = [line for line in out.splitlines() if line.startswith("  per step: ") and " exact row" in line]
+    assert len(counted) == 2 and counted[0] == counted[1], "the count of a step under the kernel table, the same at both sequence counts"
+    if projection:  # every entry row of the stack serves this class: the four blocks a library serves in native are on their fallback rows
+        assert counted[0].startswith("  per step: 14 launches on 8 exact rows, checked one by one in the wiring order; the launches of 6 fallback calls ")
+    assert "; the library launched " not in out, "no row of this stack is a library's"
     if gate:
         assert "cudnn.AttentionGateQuantDecode [THREADS 256, PDL_RELEASE True]" in out
         assert out.count("[band: gate_fp8]  PASS") == 2, "the gate entry was judged against its twin at both sequence counts"
@@ -462,9 +465,8 @@ def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
     on the library's paged decode attention, inside the band of its own row at both counts, the cache it reads left as
     it was; the two first uses of the library announced once each while the run is planned; the 4-bit multiply outside
     any tuning context (``TUNED False`` in the call log, or the kernel check fails); every weight of a multiply on its
-    stored format alone.  On the GPU class the family's census has a section for, the down multiply and the attention
-    core are held to the recorded kernel class and launch shape, the kernel the library chose for the out-projection
-    is printed beside the recorded pick, and the attention kernel the library launched is printed at both counts.
+    stored format alone.  Where the kernels of the traced steps were observed, the line of every row the library serves
+    names the kernel the library launched, at both sequence counts.
     Skipped where the library is absent, and by the sample's own line where a kernel binary is."""
     _needs_the_library()
     cc100 = tuple(torch.cuda.get_device_capability()) == (10, 0)
@@ -499,17 +501,16 @@ def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
     ), "no bf16 copy of a multiply's weight"
     held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
     assert len(held) == 2 and all(line.startswith(f"  stored weights    {count} of {count} weights") and line.endswith("    PASS") for line in held)
-    if cc100 and torch.cuda.get_device_properties(0).multi_processor_count == 148:  # the class the census has a section for, at 1 sequence
-        whole = "20 launches per step = 8 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins"
-        assert f"kernel identity, as planned: {whole}" in out, "every launch of a step of this model is a target kernel"
-        assert "16 launches of a step compared by launch shape" in out and "each in the recorded one; 4 more by membership alone" in out
-        assert sum("in the kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records" in line for line in down) == 1
-        assert (
-            f"    {served} (1 call x 1 per call); fi_decode_attention by name, and in the kernel class " in out
-        ), "at 1 sequence: the recorded kernel and shape"
-        assert out.count("    launched by the library for attention.core (printed, never gated): ") == 2, "the kernel the library launched, at both counts"
-        assert out.count("chosen by the library for projection.fp8.out at ") == 2, "the library's pick at both call sites: printed and compared, never gated"
+    if cc100:  # every row of the stack serves this class: no block call of a step is on a fallback row
+        counted = "  per step: 20 launches on 12 exact rows, checked one by one in the wiring order; the launches of 0 fallback calls "
+        assert sum(line.startswith(counted) for line in out.splitlines()) == 2, "the count of a step under the kernel table, at both sequence counts"
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
+    if len(observed) == 2 and all(line.endswith("    PASS") for line in observed):  # the kernels of the traced steps were observed
+        launched = [line.strip().split(": ", 1)[0] for line in out.splitlines() if "; the library launched " in line]
+        rows = ["projection.fp8.out at linear_attention.out", "mlp.down", "attention.core", "projection.fp8.out at full_attention.out", "output_head"]
+        assert launched == rows * 2, "the line of every row the library serves names the kernel the library launched, at both sequence counts"
+        named = [line for line in out.splitlines() if line.strip().startswith(served) and "; the library launched " in line]
+        assert len(named) == 2 and all(line.endswith(" over the traced steps") and " fi_decode_attention by name; " in line for line in named)
     frost_routing.measured("model sample qwen_dense 00_decode --stack native: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
 
 
@@ -1006,7 +1007,7 @@ verify = model_samples.Session(model, text, sequences={sequences}, tokens={token
 try:
     say(decode.plan_table([verify]))
     say(verify.resolve().table())
-    say(census.table(verify.plan, verify.claim()))
+    say(census.table(verify.plan))
 except NotImplementedError as error:
     say(f"[verify] SKIP {{error}}")
     raise SystemExit(0)
@@ -1078,7 +1079,9 @@ def _verify(sequences, tokens, steps=23, capacity=40):
 def _verify_asserts(out, sequences, tokens):
     several = f"{sequences} sequence{'s' if sequences > 1 else ''} x {tokens} tokens per sequence"
     assert f"stack fe-entries, {several}" in out, "the plan of a step of several tokens per sequence"
-    assert f"cudnn.GdnVerifyFused [PDL True, PDL_RELEASE True, TOKENS {tokens}]" in out, "the fused verify entry in the target's form, its tokens a field of it"
+    assert (
+        f"cudnn.GdnVerifyFused [PDL True, PDL_RELEASE True, TOKENS {tokens}]" in out
+    ), "the fused verify entry in the form of its row, its tokens a field of it"
     assert f"verify against decode ({several}, " in out
     rows = [line for line in out.splitlines() if line.startswith("  tokens  ")]
     assert len(rows) == 2 and all(line.endswith("    PASS") for line in rows), "against the decode steps, and against the reference stack's verify steps"
@@ -1123,19 +1126,18 @@ def _verify_asserts(out, sequences, tokens):
 
 @pytest.mark.L0
 def test_a_verify_step_on_the_fe_entries_stack_is_the_decode_steps_of_its_tokens_and_passes_its_kernel_check():
-    """One sequence of six tokens: the step shape the census of the target has a recorded section for on compute capability
-    10.0 with 148 SMs.  The decode run's 32 tokens go through verify steps that keep 0 to 5 tokens in turn; every row is
+    """One sequence of six tokens.  The decode run's 32 tokens go through verify steps that keep 0 to 5 tokens in turn; every row is
     compared with the decode step of its token, the state of the kept tokens with the decode steps' state, the verify
     entry token by token with reference decode steps, and every launch of the traced verify steps with the plan.  Six
     rows are a row of the FP8 projection entry for the linear-attention layer's out-projection on compute capability
-    10.x: where the census holds the run, 15 launches of a step are target kernels."""
+    10.x: on compute capability 10.0 the kernel table counts 15 launches of a step on exact rows."""
     out = _verify(1, 6)
     _verify_asserts(out, 1, 6)
     assert "tokens kept behind the first: 0, 1, 2, 3, 4, 5" in out, "every number of tokens is kept once"
     assert "batch invariance  not applicable at 1 sequence" in out
-    if "kernel identity, as planned: " in out:  # a GPU the census has a section for: what the plan reaches of the target, with its split
-        reached = "15 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 13 cuDNN Frontend entries with byte-equal results)"
-        assert f"kernel identity, as planned: {reached}; not yet: mlp.down 2, attention.core 1, projection.fp8.out 1, output_head 1" in out
+    if tuple(torch.cuda.get_device_capability()) == (10, 0):  # every entry row of the stack serves this class
+        counted = "  per step: 15 launches on 9 exact rows, checked one by one in the wiring order; the launches of 5 fallback calls and of the host path "
+        assert counted + "are attributed by family\n" in out, "the count of a step under the kernel table of the verify plan"
 
 
 @pytest.mark.L1
@@ -1710,7 +1712,7 @@ def test_the_speculative_default_run_passes_its_own_checks(speculative, capsys):
     lines = out.splitlines()
     assert "stack fe-cublas, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused " in out and "cudnn.GdnDecodeFused " in out
     assert "[PDL " not in out, "an entry's form is printed with the kernel table, which this stack prints on request"
-    assert "\n  kernels  " not in out and "kernel identity" not in out, "the default stack declares no target and its kernels are checked on request"
+    assert "\n  kernels  " not in out and "\nkernels, planned" not in out, "the kernels of the default stack are checked on request"
     stages = next(line for line in lines if line.startswith("[02] the session with the drafter: stage  "))
     forms = [part.strip() for part in stages.split("stage  ", 1)[1].split(" | ") if part.strip().startswith("compile and first launch linear_attention.step ")]
     assert [form.rsplit(" ", 2)[0] for form in forms] == [
@@ -1728,9 +1730,8 @@ def test_the_speculative_run_on_the_fe_entries_stack_passes_its_kernel_check(cap
     held: the cuDNN Frontend rows of ``native`` under the verify step and under the prompt's decode steps, the drafter's
     passes on reference blocks in front of every verify step.  The traced pass holds whole steps behind the replayed
     prompt, and the kernel check holds them: the lookups of the passes and the verify plan's rows one by one, the
-    chains of the passes by family; under it the run says that the prompt's decode steps were not observed and that it
-    states nothing of the drafter's kernels.  Where the census has a section for the GPU, the verify plan's share of
-    the target kernel set is stated with its split."""
+    chains of the passes by family; under it the run says that the prompt's decode steps were not observed.  The
+    kernel table of the verify plan ends in its count of a step."""
     if not torch.cuda.is_available():  # decided here, before a child is started
         pytest.skip("needs a CUDA GPU")
     out = _speculative_run(None, capsys, ["--stack", "fe-entries"], "fe-entries")
@@ -1740,17 +1741,14 @@ def test_the_speculative_run_on_the_fe_entries_stack_passes_its_kernel_check(cap
     assert out.count("\nkernels, planned (decided before the load") == 1, "the kernel table of the verify plan"
     traced = [line for line in lines if line.startswith("traced pass (")]
     assert not traced or traced[0].endswith(" | behind the prompt's 26 decode steps, replayed untraced")
-    if "kernel identity, as planned: " in out:  # a GPU the census has a section for: the verify plan's share of the target, with its split
-        reached = "15 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 13 cuDNN Frontend entries with byte-equal results)"
-        assert f"kernel identity, as planned: {reached}; not yet: mlp.down 2, attention.core 1, projection.fp8.out 1, output_head 1" in out
+    if tuple(torch.cuda.get_device_capability()) == (10, 0):  # every entry row of the stack serves this class
+        counted = "  per step: 15 launches on 9 exact rows, checked one by one in the wiring order; the launches of 5 fallback calls and of the host path "
+        assert counted + "are attributed by family\n" in out, "the count of a step under the kernel table of the verify plan"
     observed = [line for line in lines if line.startswith("  kernels  ")]
     assert len(observed) == 1, "the kernel check of the traced steps ran, or said why it could not look"
-    # the kernel check is of the verify steps: beside its verdict the run says what it did not look at, and what it does not state
+    # the kernel check is of the verify steps: beside its verdict the run says what it did not look at
     assert "    the prompt's decode steps: 26 replayed in front of the traced window, their kernels not observed (the check is of the verify steps)" in lines
-    assert (
-        "    kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and the output head behind it; "
-        "no section holds a draft pass)"
-    ) in lines
+    assert "; the library launched " not in out, "no row of this stack is a library's"
     frost_routing.measured(
         "model sample qwen_dense 02_speculative_decode --stack fe-entries: the kernel check", "; ".join(line.split("    ")[-1] for line in observed)
     )

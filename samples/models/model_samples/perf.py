@@ -927,7 +927,7 @@ def run(
             session.trace_request(step, more)
             if session.traced.steps is not None:  # one traced request: the records and the call logs of both passes
                 both = (first.call_log + session.traced.call_log, first.steps + session.traced.steps)
-                session.traced = census.Traced(first.sites, *both, rows=session.sequences, claim=first.claim)
+                session.traced = census.Traced(first.sites, *both, rows=session.sequences)
         requests.append(traced)
     watch.stop()  # the sampler's loops end and their files are read: behind every request
     watched = watch.section([(made.kind, made.t_request, made.t_token[-1] if made.t_token else made.t_first) for made in requests[1:]])

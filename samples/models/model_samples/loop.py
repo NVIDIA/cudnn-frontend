@@ -19,8 +19,7 @@ sequence by one token; the chosen ids stay on the GPU, and the one host read of 
 sample's own loop -- there is no ``generate()`` here.  ``trace`` replays the first steps of the recorded run under the profiler for the report's GPU-side
 lines (``timing``); it leaves the run's state and record as they were.  Asked for launch records, the same pass also keeps
 what the kernel check needs (``census.Traced``): the sites of a step in wiring order, the log of every block call of the
-traced steps and the profiler's record of every launch -- and, for a stack that declares a target kernel set, what the run can
-say about that set (``claim``).  ``trace_request`` is the other form of a traced pass, for a request that is timed and
+traced steps and the profiler's record of every launch.  ``trace_request`` is the other form of a traced pass, for a request that is timed and
 then traced (``model_samples.perf``): it replays nothing and traces steps of the request that is running, issued by the
 caller's own loop body; such a request starts from ``reset(fresh=False, recorded=False)`` -- the state zeroed in place,
 nothing recorded.
@@ -481,16 +480,6 @@ class Session:
             partly = not site and any(kept_alone.startswith(name + " at ") for kept_alone in uncopied)  # some call sites of this block
             if not on_stored and (names(uncopied, name, site) or partly) and self.on_demand is None:
                 raise ValueError(f"{block.entry} reads a bf16 copy of the weight of {label}, and the load kept its stored format alone: {other}")
-
-    def claim(self) -> Optional[census.Claim]:
-        """What this session's run can say about the target kernel set of its stack -- the identity of every block call, the
-        three numbers, the reasons its GPU class is not claimed (``census.Claim``) -- or ``None`` for a stack that declares no
-        target.  Decided from the plan and the family's census file: before anything is loaded.  ``ValueError`` when that
-        file is not a census of this model."""
-        if self.stack not in getattr(self.model, "target_stacks", ()):
-            return None
-        plan = self.resolve()
-        return self.model.target().claim(plan, self.model, census.configuration_of(plan))
 
     def plan_table(self, later: Sequence["Session"] = (), references: int = 1) -> str:
         """The served-by table and the memory sentence; raises ``NotImplementedError`` (a SKIP) before anything is loaded.
@@ -994,9 +983,8 @@ class Session:
 
         With a drafter a traced step is the step ``speculate`` runs, fed the recorded drafted tokens: the passes, the
         window, the verify step and the pair, ended by the host read of the pair.  The sites of such a step are, for
-        every pass, the drafter's wiring with the pass's number in the place of the layer, then the model's; the claim
-        is the verify plan's and speaks about the model's sites (``census.Traced.first``).  The passes over the prompt
-        run in front of the window, untraced, with the prompt."""
+        every pass, the drafter's wiring with the pass's number in the place of the layer, then the model's.  The passes
+        over the prompt run in front of the window, untraced, with the prompt."""
         if self.on_demand is not None:  # the reference of a run's checks: its calls carry the copies it makes, which no step of a run does
             raise ValueError(
                 "a session that makes bf16 copies of its weights per call (on_demand) is the reference of a run's checks; its steps are not traced"
@@ -1004,7 +992,6 @@ class Session:
         records = self.check_kernels if records is None else bool(records)
         passes = census.passes(self.draft_plan, self.drafter, self.draft_tokens) if records and self.drafter is not None else []
         sites = passes + census.expected(self.plan, self.model) if records else []
-        claim = self.claim() if records else None
         self._closed("a traced pass")
         count = min(steps, self.record.count, self.record.inputs.shape[0])
         if count < 1:
@@ -1012,7 +999,7 @@ class Session:
             if self.draft_tokens is not None:  # the prompt's decode steps are replayed in front of the pass, never traced
                 self._report.trace_missing = "needs a recorded verify step behind the prompt on a CUDA device"
             if records:
-                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences * self.tokens, claim=claim, first=len(passes))
+                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences * self.tokens)
             return
         inputs, accepted, calls = self.record.inputs[:count], list(self.record.accepted[:count]), self._calls
         kept = (self.state, self.record, self.prompt_record)
@@ -1046,7 +1033,7 @@ class Session:
         finally:
             (self.state, self.record, self.prompt_record), self._calls, self._call_log = kept, calls, None
         if records:
-            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens, claim, len(passes))
+            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens)
 
     def trace_request(self, step, steps: int) -> None:
         """The traced steps of a request that is running (the performance mode's traced request): ``step(i)`` for ``i`` in
@@ -1059,7 +1046,7 @@ class Session:
         self._decode_only("Session.trace_request")
         if self.on_demand is not None or self.draft_tokens is not None:  # the reference of a run's checks, as in ``trace``; a session behind a prompt
             raise ValueError("Session.trace_request traces decode steps of a session that runs on its own weights (no on_demand, no draft_tokens)")
-        sites, claim = census.expected(self.plan, self.model), self.claim()
+        sites = census.expected(self.plan, self.model)
         call_log: List[list] = []
         launches: list = []
 
@@ -1072,7 +1059,7 @@ class Session:
             self._report.trace, self._report.trace_missing = trace_steps(logged, steps, self.device, records=launches)
         finally:
             self._call_log = None
-        self.traced = census.Traced.of(sites, call_log, launches, steps, self._report.trace_missing, self.sequences, claim)
+        self.traced = census.Traced.of(sites, call_log, launches, steps, self._report.trace_missing, self.sequences)
 
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""

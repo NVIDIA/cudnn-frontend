@@ -60,8 +60,8 @@ does not hold is printed as not known and ignored, so a new name for one of them
    provider block was judged)`, blocks line `REPORTED`). `PASS` means provider blocks were compared and held.
 7. **Provider selection is data.** A family's `configs.py` holds ordered `ProviderRow`s per block; the first row whose GPU
    classes, sequence range, tokens-per-sequence range and stack contain the run serves the block. An entry that serves
-   some layer widths only names them in its row (`widths`); a model with another width falls to the next row and the run
-   says no kernel identity is stated, never `ERROR`.
+   some layer widths only names them in its row (`widths`); a model with another width falls to the next row, never
+   `ERROR`.
    - To add a provider: add its key to `providers.KEYS` with its factory; place its row above the rows it should win
      against and below any row of the same key that an existing `--provider` command selects; name its tie-out band;
      regenerate the family README tables (`configs.readme_table`). A host test keeps them in agreement.
@@ -118,12 +118,10 @@ does not hold is printed as not known and ignored, so a new name for one of them
     `pip` entry for `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers. A library whose
     kernels a stack calls has a requirement file of its own, a lower bound with its "Validated with" line
     (`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the
-    versions the launch records of the family's census were recorded with. The maintainers of this area own that list; a
-    version joins it with a recorded run, never with an update of the pin alone.
-    The one pin that is not a version of that record is the library's kernel-binary package
-    (`requirements-flashinfer-cubin.txt`): the record's runs read kernel binaries the library had fetched, and the
-    package joined the list when its files were held byte for byte to those files and a run on it launched the recorded
-    kernels in the recorded launch shapes (the census names that run: `validated.kernel_binaries`).
+    versions the stack `native` was last run and checked with. The maintainers of this area own that list; a
+    version joins it with a run of the stack on it, never with an update of the pin alone.
+    The library's kernel-binary package (`requirements-flashinfer-cubin.txt`) is one of the pins, at the library's own
+    version: the one version at which the library reads it.
 13. **The report's GPU side comes from kernel activity records, never from a pair of CUDA events** (a pair spans every
     host wait). The traced pass (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler; a step
     ends at its one host read, and a block that reads the device shows as an extra step, which the pass reports. Only the
@@ -167,25 +165,17 @@ does not hold is printed as not known and ignored, so a new name for one of them
       Every check item holds per call site, found by its place in the wiring (a block can be called twice in a layer). A
       site name belongs to one block; sites of a row may differ in operand shape as well as form. A row may serve only some
       sites, naming the others without fields to hand them to the next row. The plan then holds one part per site
-      (`blocks.BySite`; `Plan.at`, `Plan.parts`), and everything read per call (census entries, form, identity, band,
+      (`blocks.BySite`; `Plan.at`, `Plan.parts`), and everything read per call (census entries, form, band,
       batch invariance statement, stored weight form) reads that site's part. A site no row names is a wrong table.
-16. **A target kernel set is data, and a statement about it is three numbers.** A family's `kernel_census.json` holds the
-    target kernel set of its decode step: per block call the kernel, the target's form, and per GPU class, SM count and row
-    count the recorded launch shape.
-    - A block's standing (`target`, `stand-in`, `not yet`, `not the target`) is decided against that file from the row's
-      kernel and form, never written into an adapter or row.
-    - A count of target launches is always three numbers (the target's own compiled kernels, cuDNN Frontend entries with
-      byte-equal results, declared stand-ins), in every README sentence, table cell and run line. The numbers count a
-      complete stack; a text that gives them says how many entries a stack calls today.
-    - Byte equality is the entry's own record (census `tie_out`, `differences`), never a sample measurement. A form field
-      only the port has: row and census name the value the byte comparison ran with, `differences` lists what the target
-      does, the family README says so.
-    - A section is `claimed` only on a `recorded` basis with no fallback row selected on it; otherwise the run prints
-      `NOT CLAIMED` with every reason. A section of one GPU class, SM count, row count or set of layer widths is never used
-      for another. `EQUAL` says what was compared; a field the reader does not know is refused, never read as "nothing
-      recorded".
-    - A pull request that changes a form the census names updates the census in the same commit. Public text calls it "the
-      target kernel set" and names no product, repository or person for it.
+16. **A sample states what it ran, never how it stands to another stack.** A run prints which kernel serves each
+    block, each block inside its band against the reference, the launches of a step against the plan and, in the
+    performance mode, its rate. No line of a run, no test and no text of this area compares a sample with another stack
+    or states what is held of one.
+    - What is gated is the sample's own: every block against the reference, the plan, the launches of the traced steps
+      against the plan, an entry's kernel by name, order, count and the launch shape the entry itself states, the form a
+      row passes, the row limits.
+    - A kernel of a library has no entry that states its launch. Its row is held by the kernel's name, its count and its
+      place; which kernel the library launched is printed on the row's own line and never gated.
 17. **Standard output is the generated text; every line of a run is standard error.** All `[NN]` lines, tables, report and
     checks go through one function to standard error. The text of sequence 0 of a checkpoint goes to standard output (or
     `--text-out`) and nothing else does: written piece by piece in the loop, flushed, between the host read of a step and
@@ -293,21 +283,17 @@ Each item below once let a wrong provider or a wrong text pass every test; the h
   the same entry: look for an unload first, then for the wrong launch.
 - An entry that returns a view of its own buffer is passed an output buffer per call by its adapter. An operand a kernel
   updates in place is declared state of the block (`state_args`): saved, restored, compared.
-- A recorded section holds for the GPU class, SM count, row count, layer widths and step shape it was recorded with (and
-  any further field a launch shape depends on, named in the section). Never carry kernels across them.
 - Compare versions of what the stack imports, not of what is installed.
 - A decision taken in two places is taken in neither: whether a target stack checks its kernels is the session's, and
   helpers read it there.
-- Refuse a census entry without its launch shape or with a misspelt key; never print `EQUAL` for a comparison not made.
 - An entry gates the installed toolchain where it builds its kernel; its first use belongs to the plan.
-- A row claims the GPU classes on which the target launches the kernel, which may be fewer than the entry serves. A row states the form whole (every
+- A row claims the GPU classes it was decided for, which may be fewer than the entry serves. A row states the form whole (every
   field the entry would otherwise pick); the adapter refuses a row missing one. A row names the widths it serves.
 - Each row of a chain of dependent launches says in a comment what the launch before it must not write and what the
   launch after it must wait for.
 - Family attribution cannot see a stray launch next to a fallback row; while such rows remain, "the adapter launches nothing but its
   entry" is held on the adapter itself (a host test finds the entry's written tensors in what the adapter returns).
-- Give every count of target launches its split and say whose number it is and how much of it exists today. Headings of
-  a per-class table name that class.
+- Headings of a per-class table name that class.
 - What a report says follows the session's own plan (bytes per step count stored-format reads). Test an adapter's
   decline through the session that hands the option over.
 
@@ -363,7 +349,6 @@ The verify step feeds several tokens per sequence in one launch sequence (`Sessi
 - Keeping tokens launches nothing: the kept count is a host number, the kernel reads a row of a constant table.
 - Kernel operands start 16-byte aligned: a sequence run alone gets its own slot tensors; kept-count rows pad to four.
 - A decline names the row for the step asked (the block's row for that tokens count, else its last such row).
-- A census section holds for its tokens per sequence as well as row count, widths and class.
 - Compare two runs on a block's state only where both fed the same rows; elsewhere print, and a line that gated nothing
   is `REPORTED`.
 - A session of another kind of step does not inherit the first kind's report lines; until taught, a line says it is not
@@ -423,7 +408,7 @@ The checkpoint's drafter has its draft pass on reference blocks (`QwenDenseDraft
 - Put a defect into every layer a call goes through: the first defects were in functions, table and pass; eight made inside the classes of the new blocks passed every test. Run a block no check taps yet through the tap in a test.
 - A row of one element states its bf16 value exactly through its scale.
 - An fp32 transcendental differs from the double's by an ulp: judge elements clear of a midpoint and assert their count (on bf16 inputs values repeat, so "one in two thousand" was one in a hundred and sixty.)
-- A count of a pass is a count of block calls, and it is the wiring's: 18, of which the body is 15 and the head 3. State no count of launches of a draft pass: no census holds one.
+- A count of a pass is a count of block calls, and it is the wiring's: 18, of which the body is 15 and the head 3. State no count of launches of a draft pass.
 - A call says which pass it belongs to: `call(block, pass, *operands)`.
 - A reference row names no form; the drafter's sites are data beside the table until a kernel's row takes them.
 - An arm that takes an input away has to take it away. On the checkpoint the pass's first proposal was the model's token at 167 of 207 positions. With the two halves in front of the first multiply exchanged it was 0, with the hidden row replaced by zeros 8 -- and with the hidden row of the position before, 108: a one-position shift is a cost measurement, not a collapse. Run the arm before holding a figure against it.
@@ -446,12 +431,11 @@ A session that is handed the drafter runs the whole step of speculative decoding
 - The window of a step is the session's. An emitted drafted token reaches no comparison line; the run's ids against the
   plain run's do.
 - A traced step is the step the loop runs. It is `speculate`'s own code fed the recorded drafted tokens.
-- Census launch shapes are indexed by wiring site; passes' sites in front shift the index. `Traced.first` shifts it, and the host test holds a launch in another shape at the model's site with both of its sentences.
 - The comparison counts launches of one kernel id without placing them (embedding lookups share an id).
 - An arm that shifts an input is not one that takes it away. On the checkpoint, on the cuDNN Frontend rows, the loop kept 3.22 tokens a step; with zeros in the place of the hidden row 1.04, with the rows of another text 1.05, with the two halves in front of the first multiply exchanged 1.00; with a later pass one position off, 3.25. `draft proposals` is the line that holds later passes' positions.
 - State working memory as arithmetic, then measure: the allowance of a pass is twice the largest such chunk, 1.33 GiB at the published widths (a reference multiply's fp64 chunk). On the checkpoint, on the cuDNN Frontend rows, the run asked for about 43.3 GiB, reserved 40.0 GiB and grew the device by 40.2 GiB, the GPU otherwise empty.
 - The kept counts are part of the record, so the acceptance lines of a report printed behind the comparison are still the run's. Its bytes of a step are not: the comparison leaves the session at position 0, so a run prints its report first. Every step counts in full.
-- No count of the launches of a pass is stated while no census section holds a draft pass; the run says "kernel identity of the drafter's passes: not stated", and a count of block calls -- 18 a pass -- is the wiring's.
+- No count of the launches of a pass is stated; a count of block calls -- 18 a pass -- is the wiring's.
 - What a step hands on by reference is held by identity, where it is handed on. A host test holds through the session's tap that `state.hidden` is the tensor the final norm's call returned, the one whose quantised rows the head read, and `state.greedy` the one the token choice returned.
 - A traced step is held to the recorded step, not to its shape alone. A host test with the profiler stand-in holds the
   window and the proposals against the record.
@@ -484,20 +468,14 @@ Three blocks of the target kernel set are library multiplies; `native` calls Fla
 (`providers/flashinfer_calls.py`).
 
 - A library's kernel pick is a function of the call only until something tunes the operation. The row names the
-  condition (`TUNED False`); the adapter reads the tuner after each call into the call log; the untuned pick's class and
-  launch shape are census data held exactly. A row without such a condition holds its launch by membership and prints
-  the pick (the 8-bit multiply). `TUNED` covers this process's tuner only, not a caller-attached tuning store.
-- A launch held by membership is the same call, not the same kernel: a count of target launches says how many are held to
-  a recorded shape and how many by membership.
-- Class and grid follow the weight shape: a census entry names the widths it was recorded at (`at`); another width says no
-  launch shape is held.
+  condition (`TUNED False`); the adapter reads the tuner after each call into the call log. Which kernel the library
+  launches for the call is printed on the row's line, never gated. `TUNED` covers this process's tuner only, not a caller-attached tuning store.
 - A library that builds kernels at first use makes that use while the run is planned, after the memory sentence and
   before any load, announced in one line: scratch operands at every row count the run calls (including one-sequence rows
   of the batch check). A decline there: adapter operands an `ERROR`; installation a `SKIP` with the exception type, never
   its text. Catch around the library call alone.
 - A mangled library kernel name: the family pattern names what the declared call launches (mainloop, operand type); a
   printed name comes with its length and a digest.
-- Look census records up by call site.
 - A layout a provider builds at load is held to the bytes it was made from, at load (its reference copy goes back through
   the same layout).
 - A library tuner's worker processes re-import the main module: a script calling a sample in a tuning context needs its
@@ -524,8 +502,7 @@ key and the value row of every row of a step into a pool of pages.
   accumulates in.
 - A stand-in entry that computes the twin's own arithmetic shows nothing about a band: run a kernel-like fp32 chain
   (some elements another byte, every one inside) and place each defect alone.
-- Compare a form by value where a census file and a table meet (a list and a tuple are the same sections). A width the
-  kernel bakes into its name is a width of the row.
+- A width the kernel bakes into its name is a width of the row.
 - The first use builds the entry before it allocates anything, and its scratch pool is one page.
 - A pool is whole pages: a row that changes the layout of a state moves the memory sentence, and a row a stack gains
   moves every table that follows the plan (the per-kernel table of the performance mode).
@@ -583,12 +560,11 @@ The attention core of `native` is a library's paged decode attention, a kernel t
   never a list of the sample and never a model of the provider's selection; a missing or changed file is the `SKIP`.
 - A provider's identifier stands where its interface is called and nowhere else: one constant for a value the call
   passes, and prose that says what it is.
-- The class a row names is where the table selects it. Say in the texts which class ran; on a device the census has no
-  section for, a run judges its blocks and claims no identity.
+- The class a row names is where the table selects it. Say in the texts which class ran.
 - The interpreter's report of an exception inside a provider's callback is dropped for that one exception, during the
   first use alone; every other report goes to the hook that was there.
-- A kernel whose launch follows a fact of the run is recorded with that fact: held by class and shape at the recorded
-  fact, by membership elsewhere, and the run prints the kernel that was launched.
+- A kernel whose launch follows a fact of the run is held by its family's name, and the run prints the kernel that was
+  launched.
 - A library that checks nothing of a table it reads has its checks in the adapter, each naming the operand. Hold a
   defect at the smallest shape that shows it, and pin the shape that hides it.
 - A control arm through a run needs a run that can fail it: two table columns that name one page are no arm.
@@ -604,11 +580,8 @@ The 4-bit operand of the output head is a block of the wiring, `output_head.quan
   block of the wiring in every stack, the entry's row on the target stacks, the reference chain everywhere else.
 - A block whose reference chain cannot be its twin is told by the chain's own bytes against the entry's contract:
   judge them on the host first. Here the chain drops the sign of a zero that the kernel keeps.
-- A port whose grid is its own records no launch shape in the census: it is held to the shape its entry states and
-  counted by membership, and `differences` names the grid first.
 - An operand handed on whose value equals another's on the seeded model is held by identity through the tap, and once
   on a model where the two differ: no byte of a seeded run tells them apart.
 - An exact cell is stated against the exact quotient with ties to the even code, written out in the test, never against
   a twin's low code: at a tie a bracket holds two codes.
-- A block more in the wiring moves every stack's tables and its count of block calls, never a count of launches of
-  another stack. Block calls and target launches are two counts.
+- A block more in the wiring moves every stack's tables and its count of block calls.

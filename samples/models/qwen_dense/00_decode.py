@@ -44,14 +44,14 @@ The stack is explicit and never chosen by what is installed.  ``fe-cublas`` is a
 linear-attention step runs on cuDNN Frontend's fused kernel, every multiply on cuBLAS over a bf16 copy of the quantised weights,
 the rest in PyTorch, and every launch is issued from Python.  Timings printed here are for orientation only.
 
-``--stack native`` is the target kernel set of this model's decode step: per block the kernel a recorded census of that set
-names (``model_samples/qwen_dense/kernel_census.json``), in the form the target calls it in.  A block whose kernel is not
-served here yet stays on its fallback row and is printed as ``not yet``; the run says how many launches of a step are target
-kernels, always as three numbers, and why its GPU class is ``NOT CLAIMED``.  It always checks its kernels, and it holds the
-launch shape of every target launch against the census.  ``--stack fe-entries`` is every cuDNN Frontend row of ``native`` with
-the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  ``native`` has four rows more, calls of a library,
-FlashInfer: the three multiplies the target runs on it, on the stored weights, and the attention core, its paged decode
-attention over the paged attention cache.  FlashInfer is an optional package of that stack alone
+``--stack native`` runs every block on a kernel that works on the stored weights: seven entries of cuDNN Frontend and four
+calls of a library, FlashInfer, each in the form its row of the provider table names.  A block no kernel serves on this GPU
+class or at this row count stays on its fallback row, and the tables say so with the reason.  It always checks its kernels:
+every launch of the traced steps against the plan, an entry's kernel by name, order, count and the launch shape the entry
+states, a library's kernel by name, order and count, with the kernel the library launched printed on the row's line.
+``--stack fe-entries`` is every cuDNN Frontend row of ``native`` with the rest on fallback rows: no package beyond cuDNN
+Frontend and PyTorch.  The four rows ``native`` has more are the library's: three multiplies on the stored weights, and
+the attention core, its paged decode attention over the paged attention cache.  FlashInfer is an optional package of that stack alone
 (``pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt``), and the kernels of
 its attention are precompiled binaries of its kernel-binary package (``samples/models/requirements-flashinfer-cubin.txt``
 names the command); without either, or with a version this area has not validated, on compute capability 10.x
@@ -675,7 +675,6 @@ def main(argv=None) -> int:
         for note in dict.fromkeys(note for session, _ in runs for note in session.resolve().announcements()):
             _say(f"{TAG} planning: {note}", flush=True)
         tables = [first.plan_table(later, references=2 if real else 1)] + [session.resolve().table() for session in later]
-        claims = [session.claim() for session, _ in runs]  # of a stack that declares a target: how each run stands to it
     except NotImplementedError as error:
         _say(f"{TAG} SKIP {error}")
         return 0
@@ -709,12 +708,12 @@ def main(argv=None) -> int:
     outcome = None  # of the performance mode
     unobserved, censuses = "", []  # of the kernel check: why the kernels were not observed; the launch records per prompt set
     sink = serving_options.TextSink(args.text_out, streamed=not args.no_stream and not args.perf)  # where the text of sequence 0 goes
-    for number, ((session, prompt_sets), table, claim) in enumerate(zip(runs, tables, claims)):
+    for number, ((session, prompt_sets), table) in enumerate(zip(runs, tables)):
         text_to = sink.later() if number else sink  # a request gets one text: a later sequence count writes none
         _say()
         _say(table)
         if session.check_kernels:  # the kernel table, first part: from the plan alone, before the load
-            _say(census.table(session.plan, claim))
+            _say(census.table(session.plan))
         session.load()
         _say(f"{TAG} {session.stages.line()}")
         if session.check_kernels:  # second part: what the entries, now built, state about their launches
@@ -814,7 +813,7 @@ def main(argv=None) -> int:
         else:
             gpu = {"name": facts.name, "compute_capability": list(facts.cc), "sm_count": facts.sm_count}
             traced_steps = TRACED_STEPS if outcome is None else outcome.data["traced"]["steps"]
-            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=2, gpu=gpu, traced_steps=traced_steps)
+            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=3, gpu=gpu, traced_steps=traced_steps)
         if error:
             unwritten.append(error)
         else:

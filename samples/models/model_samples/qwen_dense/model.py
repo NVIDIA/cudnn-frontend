@@ -59,7 +59,6 @@ tensor is checked for its storage format and shape before anything is read.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -213,19 +212,8 @@ class QwenDense:
     first_launch_reserve = configs.FIRST_LAUNCH_RESERVE
     logits_band_units = configs.LOGITS_BAND_UNITS
     table_source = "model_samples/qwen_dense/configs.py"
-    target_stacks = configs.TARGET_STACKS  # the stacks a run of which is held against the census of the target kernel set
-    attention_page = configs.ATTENTION_PAGE  # positions per page of the target's attention cache: where a timed run is judged
-    _target = None  # that census, read once per process
-
-    @classmethod
-    def target(cls):
-        """The family's census of the target kernel set of a decode step (``kernel_census.json`` beside ``configs.py``):
-        ``model_samples.census.Target``.  ``ValueError`` when the file is not such a census."""
-        if cls._target is None:
-            from ..census import Target
-
-            cls._target = Target.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel_census.json"))
-        return cls._target
+    target_stacks = configs.TARGET_STACKS  # the stacks a run of which always checks its kernels
+    attention_page = configs.ATTENTION_PAGE  # positions per page of the paged attention cache: where a timed run is judged
 
     @classmethod
     def reduced(cls, layers: int = 2, vocab: int = 15520) -> "QwenDense":

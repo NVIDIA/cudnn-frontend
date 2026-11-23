@@ -2364,7 +2364,7 @@ def test_dump_census_schema_2(monkeypatch, capsys, tmp_path):
         assert code == 0 and capsys.readouterr().err.splitlines()[-1] == "[00] PASS"
         written = json.loads((tmp_path / "census.json").read_text(encoding="utf-8"))
         (tmp_path / "census.json").unlink()
-        assert (written["schema"], written["traced_steps"]) == (2, steps) and written["runs"][0]["fields"][-2:] == ["start_ms", "end_ms"]
+        assert (written["schema"], written["traced_steps"]) == (3, steps) and written["runs"][0]["fields"][-2:] == ["start_ms", "end_ms"]
         records = [record for step in written["runs"][0]["steps"] for record in step]
         assert records and all(len(record) == 12 and record[-2] <= record[-1] for record in records)
         assert all([record[-2] for record in step] == sorted(record[-2] for record in step) for step in written["runs"][0]["steps"]), "in start order"

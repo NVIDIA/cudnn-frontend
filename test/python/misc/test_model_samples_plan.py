@@ -1219,8 +1219,10 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     session = new(draft_tokens=5)
     table = session.plan_table()
     assert (session.plan.tokens, session.prefill_plan.tokens) == (6, 1) and session.plan.first_used and session.prefill_plan.first_used
-    numbers = session.claim().numbers()  # what the session says about the target kernel set is its verify plan's
-    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 146, 338)
+    from model_samples import census
+
+    counted = census.table(session.plan).splitlines()[-1]  # the kernel table of the session is its verify plan's
+    assert counted.startswith("  per step: 484 launches on 13 exact rows") and "the launches of 0 fallback calls" in counted
     # in the stack native the library multiplies the out-projection on its stored codes at both call sites of both plans
     stored = alone = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp.down", "output_head")
     assert session.stored_weights() == stored and session.uncopied_weights() == alone
@@ -2860,7 +2862,8 @@ def test_an_override_takes_the_row_of_the_runs_stack_where_it_names_the_same_cal
     with pytest.raises(AssertionError, match="reached a load"):  # ... and through the sample's own main(), to the table it prints
         _sample_main(monkeypatch, capsys, ["--stack", "fe-entries", "--provider", "attention.core=torch_ref.attention"])
     printed = [line for line in capsys.readouterr().err.splitlines() if line.split()[:1] == ["attention.core"] and "fallback: " in line]
-    assert len(printed) == 1 and printed[0].endswith(f"fallback: {pool}"), "the served-by table the run prints before its first load"
+    assert len(printed) == 2 and printed[0].endswith(f"  fallback: {pool}"), "the served-by table the run prints before its first load"
+    assert printed[1].endswith(f"  by family; fallback: {pool}"), "and its kernel table, which this stack always prints"
     # the fused step has the key on a row of fe-cublas and, in another form, on a row of the target stacks: the first declared row wins
     step = model.provider_table["linear_attention.step"]
     for stack in ("native", "fe-entries"):

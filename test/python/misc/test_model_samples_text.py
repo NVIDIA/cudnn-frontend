@@ -858,14 +858,6 @@ def test_the_limit_of_new_tokens_of_a_request_is_held_against_the_context_before
         )
 
 
-def test_the_default_context_length_is_the_one_the_census_of_the_target_kernel_set_was_recorded_with():
-    import serving_options
-
-    census = json.loads((MODELS / "model_samples" / "qwen_dense" / "kernel_census.json").read_text())
-    recorded = [section["recorded"]["max_model_len"] for sections in census["configurations"].values() for section in sections.values()]
-    assert recorded and set(recorded) == {serving_options.MAX_MODEL_LEN}, "--max-model-len defaults to the context length of the recorded sections"
-
-
 def test_the_decoding_rule_is_said_beside_the_checkpoints_own_generation_settings(tmp_path):
     pytest.importorskip("jinja2")
     import serving_options
@@ -2521,7 +2513,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     import shlex
 
     import serving_options
-    from model_samples import blocks, loop, tie_out
+    from model_samples import blocks, loop
     from model_samples.qwen_dense import QwenDense
 
     sample = _sample_script(monkeypatch, "02_speculative_decode.py")
@@ -2564,7 +2556,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     with pytest.raises(ValueError) as refusal:
         serving_options.parse_speculative_config('{"method": "mtp", "num_speculative_tokens": 5}', "--speculative-config")
     assert f"[02] ERROR {refusal.value}\n" in section
-    assert f'"{loop.ONE_SEQUENCE}"' in text and f'"{tie_out.DRAFTER_KERNELS}"' in text
+    assert f'"{loop.ONE_SEQUENCE}"' in text
     assert '"the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"' in text
     source = (FAMILY / "02_speculative_decode.py").read_text()
     assert "the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)" in source
@@ -2612,7 +2604,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     paragraph = (  # about the two texts, word for word; and the blocks it names: where the two kinds of step are served by other kernels
         "Every token of a speculative run after the first is a greedy token of a verify step; the first is the greedy token of the prompt's last "
         "decode step. The drafter decides how many tokens a step keeps, never which. In the stacks `native` and `fe-entries` on compute capability "
-        "10.0 a verify step and a decode step launch different kernels for two blocks (the sections `plain` and `verify` of the kernel census: the "
+        "10.0 a verify step and a decode step launch different kernels for two blocks (the "
         "linear-attention step, and the out-projection of the linear-attention layers up to 16 rows of a step); in `fe-cublas` for one, the "
         "linear-attention step. The speculative run is compared with decode steps of the same tokens at the steps the family's declared band "
         "decides. On a checkpoint, which declares no band, the comparison is reported: there a verify step and a decode step of the same tokens do "
@@ -2639,7 +2631,6 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     assert differing("native", 2, 8) == {"linear_attention.step", "projection.fp8.out"} and differing("native", 3, 6) == {
         "linear_attention.step"
     }, "16 rows, 18 rows"
-    assert set(json.loads((MODELS / "model_samples" / "qwen_dense" / "kernel_census.json").read_text())["configurations"]) >= {"plain", "verify"}
     # what a run reports, and what is not here
     for sentence in (
         "The acceptance length is a figure of this run's prompts and of this draft-vocabulary list; it is not comparable with a figure made with another list.",
@@ -2650,7 +2641,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "ends in `[02] RAN reference stack (no provider checked)`, or in `[02] FAIL`",
         "A prompt of N tokens is N decode steps and N - 1 passes of the drafter before the first token; then every step is five draft passes and one "
         "verify step of six tokens, and keeps one to six of them.",
-        "**What is not here.** The drafter on target kernels: every block of it but its embedding lookup is a reference chain,",
+        "**What is not here.** The drafter on kernels: every block of it but its embedding lookup is a reference chain.",
         "More than one request: `--sequences` is accepted at 1. A rate. A count or a position per sequence. A captured step. `--dump-census`.",
         "Any GPU class but compute capability 10.0: the script has run there only, and a class it has not run on is uncovered, not passing.",
     ):
@@ -2658,20 +2649,13 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     assert "tokens per second" not in text and not re.search(r"\d(?:\.\d+)? (?:ms|tokens/s)\b", text), "the section states no speed"
     # what ran, as the runs printed it: a figure of a run is changed with the run, here and there
     for sentence in (
-        "on the 64-layer model 484 of the 484 launches of a verify step are target kernels (146 the target's own compiled kernels + 338 cuDNN Frontend "
-        "entries with byte-equal results), on the two-layer model of the default run 20 of 20 (7 the target's own compiled kernels + 13 cuDNN Frontend "
-        "entries with byte-equal results); on `fe-entries`, without the library rows, 387 of the 484 (49 the target's own compiled kernels + 338 cuDNN "
-        "Frontend entries with byte-equal results) and 15 of 20 (2 the target's own compiled kernels + 13 cuDNN Frontend entries with byte-equal results)",
+        "on the 64-layer model the 484 block calls of a verify step on kernels, on the two-layer model of the default run 20 of 20; on `fe-entries`, "
+        "without the library rows, 387 of the 484 and 15 of 20",
         "Nor with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (this section's last runs have three).",
         # a dated run names its rows, and the run of native with the rows a library serves stands beside it with its versions
         "correctness only; `native` on the cuDNN Frontend rows -- the rows it selected when these runs were made and `fe-entries` selects today without the attention preparation's row).",
         "With its library rows (2026-11-20; `native` in PyTorch 2.14.0 with FlashInfer 0.7.2.post1; the same GPU class; the attention preparation on its reference chain) the default run on `native` "
         "ended in `[02] PASS` with the same 32 new tokens: ids hash `11bfb9f9bcf5`, the plain run's of its process.",
-        "Every gated line of the table above passed, `acceptance` with 10 of 10 steps on their scheduled count, "
-        "and the kernel check passed over 10 traced steps, "
-        "with 17 of 20 launches of the verify step target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal "
-        "results; the attention layer's out-projection among them held by membership, on the library's own CUTLASS multiply). Three drafted tokens",
-        'Three drafted tokens passed in 13 steps, with "kernel identity: not stated for this run".',
         "The memory sentence of the default run asked for about 5.7 GiB. Without FlashInfer installed the same command ended in `[02] SKIP "
         "flashinfer.gemm.bmm_fp8 needs flashinfer-python 0.7.2.post1, which is not installed: ...` before anything was loaded, exit code 0.",
         # the records of two row sets, and where the last runs with a checkpoint are
@@ -2684,11 +2668,6 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, "
         'the fifth in 10 of 17 -- the counts of the library loop on `native` in the section "The verify step".',
         "`tokens` was reported -- 39 of 45 kept tokens were the decode steps' on the same tokens, the first that differs kept token 17.",
-        "The kernel check passed over 16 traced steps, with "
-        "451 of 484 launches of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal "
-        "results): 435 of them in the launch shape the census records (114 the target's own compiled kernels + 321 cuDNN Frontend entries with "
-        "byte-equal results), the 16 out-projections of the attention layers by membership, on the library's own CUTLASS multiply; nothing is stated "
-        "about the kernels of the passes. The memory sentence asked for about 32.2 GiB.",
         '| for `--stack native` on compute capability 10.x | also FlashInfer at a validated version (the section "The rows a library serves"): the '
         "verify step and the decode steps call its multiplies on the stored weights. Without it the run ends in `[02] SKIP` before anything is loaded, "
         "exit code 0; `--stack fe-entries` runs the cuDNN Frontend rows without the package |",
@@ -2699,8 +2678,6 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "In each of the four the 32 new tokens were the plain run's of the same process (ids hash `11bfb9f9bcf5`, which is also what `00_decode.py "
         "--sequences 1 --force-tokens 32 --stack native` printed), nothing was written to standard output, and every gated line of the table above "
         "passed, `acceptance` with 10 of 10 steps on their scheduled count. `bytes` passed on `reference` and was reported on the other three.",
-        "On `native` and `fe-entries` the kernel check passed over 10 traced steps, with 13 of 20 launches of the verify step target kernels "
-        "(2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results).",
         "eight ended in `[02] SKIP cudnn.GdnVerifyFused serves 8 tokens per sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per "
         "sequence` before anything was loaded. The four-layer model (`--layers 4`, on the default stack) passed.",
         "asked for about 6.3 GiB on `fe-cublas` and `reference` and about 6.1 GiB on `native` and `fe-entries`; PyTorch reserved between 3.8 and 4.6 GiB "
@@ -2713,8 +2690,6 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "the second in 38 of those 49, the third in 27 of 38, the fourth in 18 of 27, the fifth in 8 of 18",
         "on `native` 38 of 46 kept tokens were the decode steps' on the same tokens, the first that differs kept token 13; on `fe-cublas` 43 of 49, the "
         "first kept token 30.",
-        "On `native` the kernel check passed over 16 traced steps, with 370 of 484 launches of the verify step target kernels "
-        "(49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results) and nothing stated",
         "asked for about 43.3 GiB on `native`, where PyTorch reserved 39.8 GiB and the device grew by 40.0 GiB, and for about 61.0 GiB on `fe-cublas`, "
         "where PyTorch reserved 58.5 GiB and the device grew by 58.7 GiB; the GPU was otherwise empty at the start of each.",
     ):

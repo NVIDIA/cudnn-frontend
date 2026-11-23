@@ -35,10 +35,10 @@ updates:
     labels:
       - cat-routine-update
       - area:packaging
-    # The exact pins of samples/models/constraints-native.txt: the versions the kernel census of a model sample was
-    # recorded with. A pin changes only together with a recorded run, never with an update of the pin alone.
-    # The one pin that is not a version of that record is the library's kernel-binary package (flashinfer-cubin): it
-    # joined when its files were held byte for byte to the kernel binaries the record's runs read.
+    # The exact pins of samples/models/constraints-native.txt: the versions the stack `native` of a model sample was
+    # last run and checked with. A pin changes only together with a run of the stack on the new version, never with an
+    # update of the pin alone. The library's kernel-binary package (flashinfer-cubin) is one of them, at the library's
+    # own version.
     ignore:
       - dependency-name: torch
         update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]

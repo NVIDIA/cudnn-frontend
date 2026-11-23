@@ -18,12 +18,10 @@ The stacks:
 
 * ``fe-cublas`` -- the reference path: the fused linear-attention step on its entry's own pick, every multiply on cuBLAS over
   a bf16 copy, the rest in PyTorch;
-* ``native`` -- the target kernel set of this model's decode step (``kernel_census.json`` beside this file): per block the
-  kernel the target launches, in the target's form.  A block whose kernel is not served here yet stays on its fallback row,
-  and a run prints it as ``not yet``; how a row stands to the target is decided against the census file, not written here.
-  Where the target's kernel is a library's, the row calls that library (``LIBRARY_ROWS``: FlashInfer's multiplies on the
-  stored weights and its attention over the paged attention cache), so on the classes of those rows the stack needs the
-  library's package and, for the attention, its kernel-binary package;
+* ``native`` -- every block on a kernel that works on the stored formats: an entry of cuDNN Frontend, or a call of a
+  library (``LIBRARY_ROWS``: FlashInfer's multiplies on the stored weights and its attention over the paged attention
+  cache).  A block no kernel serves for the run stays on its fallback row.  On the classes of the library's rows the
+  stack needs the library's package and, for the attention, its kernel-binary package;
 * ``fe-entries`` -- every cuDNN Frontend row of ``native``, with every block a library serves there on its fallback row:
   no package beyond cuDNN Frontend and PyTorch, so the rows of the entries stay verified wherever the area's GPU test
   runs;

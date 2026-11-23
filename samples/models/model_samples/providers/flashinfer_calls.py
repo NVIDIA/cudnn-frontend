@@ -104,10 +104,9 @@ from ..state import PagedKvCache, PageTable
 from ..weights import BLOCK, BlockScaledTensor, Dequantized, ScaledTensor, TiledBlockScaledTensor, TiledBlockScaledWeight, tile_scales
 from . import BlockBase
 
-#: the distribution these adapters import, and the versions of it this area has validated: those the launch records of the
-#: family's kernel census were recorded with.  ``samples/models/constraints-native.txt`` pins the same; a host test holds
-#: the three to each other.  The one pin that is not a version of that record is the library's kernel-binary package
-#: below: it joined the list when its files were held to the files the record's runs read
+#: the distribution these adapters import, and the versions of it this area has validated: those the stack ``native`` was
+#: last run and checked with.  ``samples/models/constraints-native.txt`` pins the same, and the library's kernel-binary
+#: package below at the library's own version; a host test holds them to each other
 DISTRIBUTION = "flashinfer-python"
 VALIDATED = ("0.7.2.post1",)
 REQUIREMENTS = "samples/models/requirements-flashinfer.txt"
@@ -551,7 +550,9 @@ class MmFp4Block(LibraryBlock):
     the packed 4-bit codes of both operands with their block scales in the 128 x 4 layout; one launch per call, outside
     any tuning context.  This is the row of the MLP's down multiply."""
 
-    kernels = (Kernel("fi_mm_fp4", "FlashInfer", "exact", launches=1),)  # one launch per call; its class and shape are census data
+    # one launch per call; the id stands for the two kernel classes of the library's multiply, and which one a call launches is
+    # the library's function of the operands' shape: printed with the kernel check, never derived
+    kernels = (Kernel("fi_mm_fp4", "FlashInfer", "exact", launches=1, variants=True),)
     fields = MM_FP4_FORM
 
     def _shape(self) -> tuple:
@@ -628,7 +629,8 @@ class BmmFp8Block(LibraryBlock):
     the 8-bit codes of both operands; the kernel is the library's choice among its own (one launch, and a second where a
     split pick of cuBLASLt reduces its slices).  This is the row of a layer's out-projection."""
 
-    kernels = (Kernel("cublaslt_fp8_gemm", "FlashInfer", "exact", launches=1), Kernel("cublas", "cuBLASLt"))
+    # the id stands for the kernels the library chooses among for this call: printed with the kernel check, never derived
+    kernels = (Kernel("cublaslt_fp8_gemm", "FlashInfer", "exact", launches=1, variants=True), Kernel("cublas", "cuBLASLt"))
     fields = BMM_FP8_FORM
 
     def _scratch(self, device, rows: int) -> tuple:
@@ -668,7 +670,7 @@ class DecodeAttentionBlock(LibraryBlock):
 
     module = "decode"
     # one launch per call; the id stands for the variants of one kernel, and which one a call launches is the library's
-    # function of the run's maximum length, the sequences, the tokens per sequence and the GPU: recorded, printed, never derived
+    # function of the run's maximum length, the sequences, the tokens per sequence and the GPU: printed, never derived
     kernels = (Kernel("fi_decode_attention", "FlashInfer", "exact", launches=1, variants=True),)
     fields = DECODE_ATTENTION_FORM
     stored_weights = False  # the block has no weight
