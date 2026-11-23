@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import importlib
 import inspect
 import sys
 import time
@@ -429,6 +430,34 @@ def test_router_uses_independent_exact_physical_data_capacity():
             ProblemDesc({**problem, "data_token_capacity": 128}),
             ImplDesc(implementation),
         )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("module_name", "class_name"),
+    [
+        ("rubin.training.mega.fwd_glu.glu_mxfp8_mega_moe_kernel", "Sm107MegaMoEMxfp8GluKernel"),
+        ("rubin.training.mega.bwd_dglu.dglu_mxfp8_mega_moe_kernel", "Sm107MegaMoEMxfp8DgluKernel"),
+        ("blackwell.training.mega.fwd_glu.glu_mxfp8_mega_moe_kernel", "Sm100MegaMoEMxfp8GluKernel"),
+        ("blackwell.training.mega.bwd_dglu.dglu_mxfp8_mega_moe_kernel", "Sm100MegaMoEMxfp8DgluKernel"),
+    ],
+)
+def test_vendored_mega_kernels_keep_data_token_capacity_overlay(module_name, class_name):
+    # Each architecture's vendored copy carries its own overlay; an upstream
+    # sync that drops one copy must fail here rather than at kernel construction.
+    from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import (
+        require_rubin_cutedsl,
+    )
+
+    try:
+        require_rubin_cutedsl()
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    module = importlib.import_module(f"cudnn.moe_ep._megamoe_backend.cutedsl_src.kernel_src.{module_name}")
+    kernel_class = getattr(module, class_name)
+
+    assert "data_token_capacity" in inspect.signature(kernel_class.from_kwargs).parameters
+    assert "data_token_capacity" in kernel_class.problem_desc_require()
 
 
 @pytest.mark.L0

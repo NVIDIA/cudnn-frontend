@@ -3,7 +3,7 @@
 """Autonomous epilogue for the fused fc1+fc2 swap-AB MegaMoE kernel.
 
 Component boundaries use ``TensorWithContract`` to keep per-thread RMEM layout
-semantics explicit.  See ``megamoe_design.md`` for the epilogue dataflow.
+semantics explicit across transpose, activation, quantization, and store stages.
 """
 
 from typing import Optional, Tuple, Type, Union, Any

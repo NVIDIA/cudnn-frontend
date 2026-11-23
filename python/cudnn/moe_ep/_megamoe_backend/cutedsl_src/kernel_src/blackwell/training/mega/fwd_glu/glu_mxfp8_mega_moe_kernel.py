@@ -61,6 +61,7 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
             "topk": int,
             "max_tokens_per_rank": int,
             "max_recv_size_per_rank": int,
+            "data_token_capacity": OptionalRequirement(int),
             "gate_up_clamp": Optional[float],
         }
 
@@ -223,10 +224,10 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
             fake_arguments["fc1_c"] = None
 
         if self.enable_col_quant:
-            # col_quant_data is logically (token, hidden) with token unit stride;
+            # Local integration ABI: col_quant_data is contiguous (token, hidden);
             # col_quant_sf is flat concat_e [hidden_atom][token_atom] E8M0 bytes.
             fake_arguments["col_quant_data"] = fake_tensor(
-                self.ab_dtype, aux_shapes["col_quant_data"], (0, 1), set(), 16
+                self.ab_dtype, aux_shapes["col_quant_data"], (1, 0), set(), 16
             )
             fake_arguments["col_quant_sf"] = fake_tensor(
                 cutlass.Uint8, aux_shapes["col_quant_sf"], (0,), set(), 16
@@ -274,6 +275,7 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
         hidden: int,
         launch_cluster_count: int,
         drop_on_overflow: bool,
+        data_token_capacity: Optional[int] = None,
         fc2_in_kernel_topk_reduce: bool = False,
         skip_topk_reduce: bool = False,
         token_back_mode: Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] = "epi_warps",
@@ -315,6 +317,11 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
                 "topk": num_topk,
                 "max_tokens_per_rank": max_tokens_per_rank,
                 "max_recv_size_per_rank": max_recv_size_per_rank,
+                **(
+                    {"data_token_capacity": data_token_capacity}
+                    if data_token_capacity is not None
+                    else {}
+                ),
                 "gate_up_clamp": gate_up_clamp,
             }
         )
@@ -372,6 +379,7 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
         max_recv_size_per_rank = min(
             problem_desc["max_recv_size_per_rank"], world_size * max_tokens_per_rank * num_topk
         )
+        data_token_capacity = problem_desc.get("data_token_capacity")
         hidden = problem_desc["hidden_size"]
         gate_up_clamp = problem_desc["gate_up_clamp"]
         combine_format = problem_desc["combine_format"]
@@ -504,6 +512,11 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
                 "topk": num_topk,
                 "max_tokens_per_rank": max_tokens_per_rank,
                 "max_recv_size_per_rank": max_recv_size_per_rank,
+                **(
+                    {"data_token_capacity": data_token_capacity}
+                    if data_token_capacity is not None
+                    else {}
+                ),
                 "hidden_size": hidden,
                 "quant_kind": str(quant_kind),
                 "combine_format": combine_format,
@@ -602,7 +615,8 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
                 token_padding_block=self.token_padding_block,
                 sf_padding_block=self.sf_padding_block,
                 scaled_cvt=False,
-                dst_k_major=True,
+                # Local integration ABI consumed by MoeEP WGrad operands.
+                dst_k_major=False,
             )
 
     def get_aux_output_shapes(self) -> dict:
@@ -876,7 +890,6 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
                 col_quant_data,
                 self.ab_dtype,
                 aux_shapes["col_quant_data"],
-                (1, aux_shapes["col_quant_data"][0]),
             )
             self._validate_fixed_vector(
                 col_quant_sf, cutlass.Uint8, aux_shapes["col_quant_sf"][0]
@@ -997,15 +1010,8 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
                 cute.make_ptr(cutlass.Int32, lw.toint() + Int64(sizes_offset), AddressSpace.gmem, assumed_align=16),
                 cute.make_layout((self.num_experts_per_rank,)),
             )
-            previous_expert_sizes = cute.make_tensor(
-                cute.make_ptr(
-                    cutlass.Int32,
-                    lw.toint() + Int64(dw.offset(self.col_quant_previous_sizes_region)),
-                    AddressSpace.gmem,
-                    assumed_align=16,
-                ),
-                cute.make_layout((self.num_experts_per_rank,)),
-            )
+            # Local integration ABI: retired-row clearing requires K-major output, and
+            # MoeEP leaves the row-major capacity tail unspecified.
             self.col_quant(
                 src_data,
                 src_sf_u8,
@@ -1013,5 +1019,4 @@ class Sm100MegaMoEMxfp8GluKernel(Sm100Mxfp8GluFc12Kernel, KernelClass):
                 col_quant_data,
                 col_quant_sf,
                 stream,
-                previous_expert_token_sizes=previous_expert_sizes,
             )

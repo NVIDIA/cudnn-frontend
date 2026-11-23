@@ -71,6 +71,7 @@ class Sm100MegaMoEMxfp8DgluKernel(Sm100Mxfp8DgluDfc21Kernel, KernelClass):
             "topk": int,
             "max_tokens_per_rank": int,
             "max_recv_size_per_rank": int,
+            "data_token_capacity": OptionalRequirement(int),
             "gate_up_clamp": Optional[float],
         }
 
@@ -296,6 +297,7 @@ class Sm100MegaMoEMxfp8DgluKernel(Sm100Mxfp8DgluDfc21Kernel, KernelClass):
         hidden: int,
         launch_cluster_count: int,
         drop_on_overflow: bool,
+        data_token_capacity: Optional[int] = None,
         fc2_in_kernel_topk_reduce: bool = False,
         token_back_mode: Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] = "epi_warps",
         epi_flag_batch: Optional[Tuple[int, int]] = DGRAD_UNSPECIFIED,
@@ -347,6 +349,11 @@ class Sm100MegaMoEMxfp8DgluKernel(Sm100Mxfp8DgluDfc21Kernel, KernelClass):
                 "topk": num_topk,
                 "max_tokens_per_rank": max_tokens_per_rank,
                 "max_recv_size_per_rank": max_recv_size_per_rank,
+                **(
+                    {"data_token_capacity": data_token_capacity}
+                    if data_token_capacity is not None
+                    else {}
+                ),
                 "gate_up_clamp": gate_up_clamp,
             }
         )
@@ -434,6 +441,7 @@ class Sm100MegaMoEMxfp8DgluKernel(Sm100Mxfp8DgluDfc21Kernel, KernelClass):
         max_recv_size_per_rank = min(
             problem_desc["max_recv_size_per_rank"], world_size * max_tokens_per_rank * num_topk
         )
+        data_token_capacity = problem_desc.get("data_token_capacity")
         hidden = problem_desc["hidden_size"]
         combine_format = problem_desc["combine_format"]
         gate_up_clamp = problem_desc["gate_up_clamp"]
@@ -554,7 +562,7 @@ class Sm100MegaMoEMxfp8DgluKernel(Sm100Mxfp8DgluDfc21Kernel, KernelClass):
         # epilogue, built later in _setup_attributes(), fires the fc2_done counter for
         # the standalone / reuse_dispatch token-back warps.  Without this the dedicated
         # token-back warps spin forever on fc2_done < target and the block-wide
-        # sync_threads() in kernel_tail deadlocks (M09/M10/M14/M15 hang).  epi_warps is
+        # sync_threads() in kernel_tail deadlocks.  epi_warps is
         # unaffected (it peer-writes grad_x directly and never reads fc2_done).
         self.token_back_by_dispatch = token_back_by_dispatch
         self.token_back_standalone = token_back_by_dispatch and token_back_mode == "standalone_warps"
@@ -582,8 +590,7 @@ class Sm100MegaMoEMxfp8DgluKernel(Sm100Mxfp8DgluDfc21Kernel, KernelClass):
         # (17 with standalone token-back), so the
         # per-CTA register file can no longer grant 256 regs to all 4 epilogue warps
         # -- the epilogue warpgroup then stalls forever inside
-        # ``warpgroup_reg_alloc`` and the mma/tmem barrier deadlocks.  Mirror the
-        # legacy mega dGLU (megamoe_kernel_mxfp8_dglu.py:181-184).
+        # ``warpgroup_reg_alloc`` and the mma/tmem barrier deadlocks.
         self.epi_reg_cnt = 168 if self.token_back_standalone else 200
         self.threads_per_cta = 32 * (
             len(self.epilogue_warp_id)  # 4  (warps 0-3)
@@ -632,6 +639,11 @@ class Sm100MegaMoEMxfp8DgluKernel(Sm100Mxfp8DgluDfc21Kernel, KernelClass):
                 "topk": num_topk,
                 "max_tokens_per_rank": max_tokens_per_rank,
                 "max_recv_size_per_rank": max_recv_size_per_rank,
+                **(
+                    {"data_token_capacity": data_token_capacity}
+                    if data_token_capacity is not None
+                    else {}
+                ),
                 "hidden_size": hidden,
                 "quant_kind": str(quant_kind),
                 "combine_format": combine_format,

@@ -73,7 +73,7 @@ def resolve_dgrad_config(problem: Mapping, implementation: Mapping) -> dict:
 
     Omitted options use the preset; explicitly supplied options take precedence
     and are reported in ``dgrad_optimization_overrides`` when they differ.
-    ``dgrad_schedule`` retains the tester's legacy baseline/optimized schedule
+    ``dgrad_schedule`` retains the legacy baseline/optimized schedule
     selection, independently of the more narrowly qualified complete preset.
     Kernel constructors perform their resource-specific checks after resolution.
     """
