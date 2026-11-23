@@ -327,7 +327,7 @@ ADMISSION_REFUSALS = {
     "another_part_of_the_same_sm_count": (dict(compute_capability=(10, 3)), "cell"),
     "another_operand_type": (dict(io_name="float16"), "cell"),
     "the_same_tiles_as_other_sequences_and_heads": (dict(heads_out=96, heads_key=32, num_seqs=8, rows=8 * 16 * B_T), "cell"),
-    "an_unmeasured_batch": (dict(num_seqs=15, rows=15 * 16 * B_T), "cell"),
+    "a_batch_no_line_names": (dict(num_seqs=15, rows=15 * 16 * B_T), "cell"),
     "another_key_width": (dict(dim_k=64), "cell"),
     "one_value_head_per_key_head": (dict(heads_key=48), "cell"),
     "value_heads_not_in_whole_groups": (dict(heads_key=5), "heads"),
@@ -400,7 +400,7 @@ def test_level_form_is_the_build_configs_seed_copy(monkeypatch, level_form):
 
 @pytest.mark.L0
 def test_test_knobs_are_inert_without_the_test_switch(monkeypatch, level_form):
-    """A build without ``LEVEL_TEST`` orders its cut tiles and takes neither a delay, a count nor an unmeasured shape,
+    """A build without ``LEVEL_TEST`` orders its cut tiles and takes neither a delay, a count nor a batch no line names,
     whatever the test knobs say; with the switch they act, and a forced admission still asks the shape rule."""
     import cutlass
 
@@ -417,7 +417,7 @@ def test_test_knobs_are_inert_without_the_test_switch(monkeypatch, level_form):
             level_group=3,
         )
 
-    unmeasured = cell_facts(num_seqs=15, rows=15 * 16 * B_T)
+    unlisted = cell_facts(num_seqs=15, rows=15 * 16 * B_T)
     served_key = gdn_prefill_f16.level_build_key(True, 3)
     served = build()
     assert (served.level_wait, served.level_stress, served.level_reload_count, served.level_group) == (1, (), False, 3)
@@ -427,12 +427,12 @@ def test_test_knobs_are_inert_without_the_test_switch(monkeypatch, level_form):
     monkeypatch.setattr(gdn_prefill_f16, "LEVEL_RELOAD_COUNT", True)
     assert gdn_prefill_f16.level_build_key(True, 3) == served_key
     assert build() == served
-    assert gdn_engine.level_plan_refusal(gdn_prefill_f16, unmeasured) == "cell"
+    assert gdn_engine.level_plan_refusal(gdn_prefill_f16, unlisted) == "cell"
     monkeypatch.setattr(gdn_prefill_f16, "LEVEL_TEST", True)
     tested = build()
     assert (tested.level_wait, tested.level_stress) == (0, (1, 2, 3, 4))
     assert gdn_prefill_f16.level_build_key(True, 3) != served_key
-    assert gdn_engine.level_plan_refusal(gdn_prefill_f16, unmeasured) is None
+    assert gdn_engine.level_plan_refusal(gdn_prefill_f16, unlisted) is None
     # the forced admission lifts the measured cells alone: a batch the table cannot be laid out for is still refused
     assert gdn_engine.level_plan_refusal(gdn_prefill_f16, cell_facts(num_seqs=1, rows=16 * B_T)) == "shape"
     assert build(level_plan=False).level_wait == 0
