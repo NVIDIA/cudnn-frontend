@@ -2879,3 +2879,218 @@ def test_an_override_takes_the_row_of_the_runs_stack_where_it_names_the_same_cal
     assert chosen(first, same, stack="reference") is first, "a stack with no row of the key: the first declared row"
     for field, value in (("form", (("PDL", True),)), ("sequences", (1, 8)), ("band", "bf16_rounding"), ("serves", "rows 1-8"), ("classes", ("cc10.x",))):
         assert chosen(first, replace(same, **{field: value})) is first, f"a row of the stack with another {field}: another call"
+
+
+# ------------------------------------------------------------------------------- the plan of a step, stack by stack
+PREPARE_FORM = "[POSITIONS 3d, SECTION (11, 11, 10), PAGE_SIZE 64, POSITION_DTYPE int64, SLOT_DTYPE int64, PDL False, PDL_RELEASE False]"
+PROJECTION_FORM = "[SPLIT_K 1, MMA_M 128, STAGES 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True"
+SWIGLU_FORM = "[TOKEN_TILE 8, PREWAIT_STAGES 2, L2_EVICT_FIRST True, MAX_CLUSTERS 148, PDL True]"
+ATTENTION_ENTRY = "flashinfer.decode.trtllm_batch_decode_with_kv_cache"
+#: per block the kernel that serves it in the stack ``native`` on compute capability 10.0, by its canonical id
+NATIVE_KERNELS = {
+    "embedding": "embedding_gather",
+    "add_norm_quantize": "add_norm_quant",
+    "projection.fp8.in": "fp8_projection",
+    "linear_attention.step": "gdn_decode_fused",
+    "mlp.gate_up": "swiglu_fp4",
+    "attention.prepare": "attention_prepare",
+    "attention.core": "fi_decode_attention",
+    "attention.gate_quantize": "gate_quant",
+    "projection.fp8.out": "cublaslt_fp8_gemm",
+    "mlp.down": "fi_mm_fp4",
+    "output_head.quantize": "row_quantize_fp4",
+    "output_head": "fi_mm_fp4",
+}
+
+
+def _stated_plan(layers=64, stack="native", tokens=1, cc=(10, 0), sms=148, sequences=1, overrides=None, table=None):
+    """``(plan, model)`` of ``stack`` on stated device facts, at the maximum length the scripts default to."""
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.qwen_dense import QwenDense
+
+    model = QwenDense() if layers == 64 else QwenDense.reduced(layers)
+    facts = DeviceFacts(cc, "stated device", sms, 180 * GIB, 80 * GIB)
+    rows = model.provider_table if table is None else table
+    return plan(rows, model.regimes, facts, sequences, tokens, stack, overrides, model=model, options={"device": "cpu", "max_model_len": 2051}), model
+
+
+def _step_of(planned, model):
+    """What a plan states of one step: ``(launches on exact rows, exact rows, fallback calls)`` as the last line of its kernel
+    table counts them, and ``{block: its calls on a fallback row}`` from the row of every call of the wiring."""
+    from collections import Counter
+
+    from model_samples import census
+
+    served = [(name, planned.at(name, site)[0]) for (name, _), site in zip(model.wiring(), census.call_sites(model))]
+    line = census.table(planned).splitlines()[-1]
+    counted = re.fullmatch(
+        r"  per step: (\d+) launch(?:es)? on (\d+) exact rows?, checked one by one in the wiring order; "
+        r"the launches of (\d+) fallback calls? and of the host path are attributed by family",
+        line,
+    )
+    assert counted, line
+    return tuple(int(n) for n in counted.groups()), dict(Counter(name for name, row in served if row.fallback))
+
+
+def test_the_plan_of_a_step_stack_by_stack():
+    """What the provider table plans for a step, read from the plan alone.  ``native`` on compute capability 10.0 at 148 SMs has
+    every block on a kernel -- no call on a fallback row, at one token per sequence and at six -- and the rows in which
+    ``fe-entries`` differs from it are the library's rows, each on its fallback row there.  Then the kernel of every block,
+    the rows that are gated on batch invariance, the by-provider line of every GPU class, the kernel table row by row, and
+    per stack and kind of step the launches of a step with the blocks that are left on fallback rows."""
+    from collections import Counter
+    from dataclasses import replace
+
+    from model_samples import census
+    from model_samples.qwen_dense import QwenDense, configs
+
+    plan, model = _stated_plan()
+    entries_plan, _ = _stated_plan(stack="fe-entries")
+    # every block of native on a kernel: a row that falls back to a chain or to a multiply over a copy is named here
+    for layers in (64, 2):
+        for tokens in (1, 6):
+            (_, _, chains), fallback = _step_of(*_stated_plan(layers, tokens=tokens))
+            assert fallback == {} and chains == 0, (layers, tokens)
+    assert not any(row.fallback for _, _, _, row, _ in plan.parts()) and "fallback" not in plan.by_provider()
+    assert configs.TARGET_STACKS == QwenDense.target_stacks == ("native", "fe-entries"), "the two stacks whose rows are kernels on the stored formats"
+    # the rows in which the two stacks differ are the library's, and fe-entries has each of them on its fallback row
+    differing = {block for block in plan.rows if plan.rows[block].key != entries_plan.rows[block].key}
+    assert differing == set(configs.LIBRARY_ROWS) == {"projection.fp8.out", "mlp.down", "output_head", "attention.core"}
+    assert all(entries_plan.rows[block].fallback and plan.rows[block].stacks == ("native",) for block in differing)
+    for block in configs.LIBRARY_ROWS:  # the library states no batch invariance for these calls; no lane of this repository runs them
+        band = "attention_bf16_weights" if block == "attention.core" else "bf16_rounding"  # the attention kernel documents no contract: the bound of a model
+        assert plan.rows[block].batch_invariant == () and plan.rows[block].ci is False and plan.rows[block].band == band, block
+    gated = (
+        "add_norm_quantize",
+        "projection.fp8.in",
+        "linear_attention.step",
+        "mlp.gate_up",
+        "attention.prepare",
+        "attention.gate_quantize",
+        "output_head.quantize",
+    )
+    for block in gated:  # the class their forms ran on: 2 or more sequences gate them
+        assert plan.rows[block].batch_invariant == ("cc10.0",), f"{block}: batch invariance of its native row is a gate on compute capability 10.0"
+    assert set(gated) | set(configs.LIBRARY_ROWS) | {"embedding", "token_choice"} == set(plan), "every block is named above"
+    # the kernel of every block, one each; a step of several tokens per sequence has one kernel the decode step has not
+    exact = {name: [kernel.id for kernel in block.kernels if kernel.relation == "exact"] for name, block in plan.items()}
+    assert {name: ids[0] for name, ids in exact.items() if ids} == NATIVE_KERNELS and all(len(ids) <= 1 for ids in exact.values())
+    several, _ = _stated_plan(tokens=6)
+    stepped = {kernel.id for block in several.values() for kernel in block.kernels if kernel.relation == "exact"}
+    assert stepped - set(NATIVE_KERNELS.values()) == {"gdn_verify_fused"}, "the verify step has one kernel the decode step has not"
+    assert plan["output_head"].entry == plan["mlp.down"].entry == "flashinfer.gemm.mm_fp4", "the head's row is the multiply alone: two keys, one call"
+    assert census.form_text(plan.rows["mlp.gate_up"].form).strip() == SWIGLU_FORM
+    forms = Counter(site for (block, _), site in zip(model.wiring(), model.sites()) if block == "add_norm_quantize")
+    assert forms == {"linear_attention.first": 1, "linear_attention": 47, "full_attention": 16, "mlp": 64, "output_head": 1}, "five forms: 1 / 47 / 16 / 64 / 1"
+    shapes = Counter(site for (block, _), site in zip(model.wiring(), model.sites()) if block == "projection.fp8.in")
+    assert shapes == {"linear_attention.qkvz": 48, "full_attention.qkv": 16}, "two weight shapes: 48 / 16"
+
+    # the by-provider line of every class, and the sentences of the family README that state it under the table of the class
+    flat = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split())
+
+    def said(planned, tail=True):
+        line = planned.by_provider().replace("by provider: ", "By provider: ").replace("cuDNN FE ", "cuDNN Frontend ")
+        line, _, unverified = line.partition(" | unverified in CI: ")  # the rows no lane of this repository runs: the library's
+        entries, natural = line.rsplit(" | PyTorch ", 1)
+        more = f"; {unverified} rows unverified in CI" if unverified else ""
+        return entries.replace(" | ", "; ") + (f"; PyTorch as the natural provider {natural}{more}." if tail else more)
+
+    table = configs.readme_table(QwenDense().calls_text(), "native", (10, 0))
+    heading = "## Who serves each block (stacks `native` and `fe-entries`, compute capability 10.0)"
+    assert (
+        " ".join(f"{heading} {table} {said(plan)}".split()) in flat
+    ), "the heading, the table and the by-provider sentence are those of compute capability 10.0"
+    assert said(plan) == "By provider: cuDNN Frontend 7; FlashInfer 4; PyTorch as the natural provider 2; 4 rows unverified in CI."
+    assert said(entries_plan) == "By provider: cuDNN Frontend 7; fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1); PyTorch as the natural provider 2."
+    assert (
+        f"three multiplies over a copy of `fe-cublas`: {said(entries_plan).replace('By provider: ', '')}" in flat
+    ), "the sentence on fe-entries under the table"
+    for cc, sms in (((10, 3), 152), ((10, 7), 212)):
+        other = said(_stated_plan(cc=cc, sms=sms)[0], tail=False).replace("By provider: ", "")
+        assert other == "cuDNN Frontend 6; FlashInfer 4; fallbacks 1 (cuBLAS over copies 1); 4 rows unverified in CI", cc
+        assert f"On the other 10.x classes the in-projection is the multiply over a copy of `fe-cublas`: {other}." in flat, cc
+    tiles = "; ".join(f"`TOKEN_TILE {tile}` from {first} to {last} rows" for first, last, tile in configs.GATE_UP_TILES[1:])
+    assert f"The row of the MLP's gate / up multiply is the one of 1 to 8 rows; three more rows of the same key name the other token tiles: {tiles}." in flat
+    for sequences, (first, last, tile) in ((n, row) for row in configs.GATE_UP_TILES for n in row[:2]):
+        row = _stated_plan(2, sequences=sequences)[0].rows["mlp.gate_up"]
+        assert row.key == "fe.swiglu_fp4_decode" and dict(row.form)["TOKEN_TILE"] == tile and row.rows == (first, last), sequences
+    other = said(_stated_plan(cc=(12, 0), sms=170)[0], tail=False).replace("By provider: ", "")
+    assert f"the reference chains of `fe-cublas` as well: {other}." in flat and other.startswith("cuDNN Frontend 1; fallbacks 9 "), "compute capability 12.x"
+    assert f"35 on the four-layer one. {said(_stated_plan(stack='fe-cublas')[0])}" in flat, "the sentence under the table of the default stack"
+    # compute capability 12.x: no entry row but the fused step's serves there, and every other block stays on its fallback row
+    plan12, _ = _stated_plan(2, cc=(12, 0), sms=170)
+    assert plan12.rows["attention.gate_quantize"].key == "torch_ref.gate_quantize" and plan12.rows["linear_attention.step"].form == (
+        ("PDL", True),
+        ("PDL_RELEASE", True),
+    )
+    assert plan12.rows["add_norm_quantize"].key == "torch_ref.add_norm_quantize" and plan12.rows["add_norm_quantize"].site_form("mlp") == ()
+    assert plan12.rows["projection.fp8.in"].key == "cublas.bf16_dequantized" and plan12.rows["projection.fp8.in"].site_form("full_attention.qkv") == ()
+    assert plan12.rows["mlp.gate_up"].key == "cublas.bf16_dequantized+torch_ref.silu_mul_quantize" and plan12.rows["mlp.gate_up"].form == ()
+    # a row selected with --provider: the fused step in its fe-cublas form is the same kernel in another form
+    selected, _ = _stated_plan(2, overrides={"linear_attention.step": "fe.gdn_decode_fused"})
+    assert selected.overridden == ("linear_attention.step",) and selected.rows["linear_attention.step"].form == (("PDL", False), ("PDL_RELEASE", False))
+
+    # the kernel table of native, row by row: the entry in its form, the kernel, the launches of a step and what is checked
+    small, two = _stated_plan(2)
+    table = census.table(small).splitlines()
+    assert table[0].startswith("kernels, planned (decided before the load from the family's configs.py; stack native,") and table[1].split()[-1] == "checked"
+    row = {line.split()[0]: line for line in table[2:15]}
+    stated = "name and launch shape, as the entry states them"
+    assert row["embedding"].split("torch.index_select")[1].split() == "embedding_gather 1 name".split()
+    assert row["linear_attention.step"].split("cudnn.GdnDecodeFused")[1].split() == f"[PDL True, PDL_RELEASE True] gdn_decode_fused 1 {stated}".split()
+    assert row["attention.gate_quantize"].split("cudnn.AttentionGateQuantDecode")[1].split() == f"[THREADS 256, PDL_RELEASE True] gate_quant 1 {stated}".split()
+    assert row["mlp.down"].split("flashinfer.gemm.mm_fp4")[1].split() == "[BACKEND cute-dsl, TUNED False] fi_mm_fp4 2 name".split()
+    assert row["attention.core"].split(ATTENTION_ENTRY)[1].split() == "[KV_LAYOUT HND] fi_decode_attention 1 name".split()
+    assert row["output_head"].split("flashinfer.gemm.mm_fp4")[1].split() == "[BACKEND cute-dsl, TUNED False] fi_mm_fp4 1 name".split()
+    quantised = f"[WIDTH 5120, PDL True, PDL_RELEASE True] row_quantize_fp4 1 {stated}"
+    assert row["output_head.quantize"].split("cudnn.RowQuantizeFp4Decode")[1].split() == quantised.split(), "the entry's whole config"
+    assert row["projection.fp8.out"].split("flashinfer.gemm.bmm_fp8")[1].split() == "[BACKEND auto] cublaslt_fp8_gemm, cublas 2 name".split()
+    assert (
+        row["attention.prepare"].split("cudnn.AttentionPrepareDecode")[1].split() == f"{PREPARE_FORM} attention_prepare 1 {stated}".split()
+    ), "the kernel stated whole"
+    assert row["token_choice"].rstrip().endswith("host path, not compared")
+    norm = f"[PDL True, PDL_RELEASE True] + one of 6 forms, by call site add_norm_quant 5 {stated}"
+    assert row["add_norm_quantize"].split("cudnn.AddNormQuantDecode")[1].split() == norm.split()
+    assert table[15:21] == [f"  add_norm_quantize at {site}:{census.form_text(fields)}" for site, fields in configs.NORM_FORMS], "the form of every call site"
+    assert table[17] == "  add_norm_quantize at linear_attention: [ADD True, STORE_RESIDUAL False, BF16_OUT True, QUANT e4m3_static]"
+    multiply = f"{PROJECTION_FORM}] + one of 2 forms, by call site fp8_projection 2 {stated}"
+    assert row["projection.fp8.in"].split("cudnn.Fp8ProjectionDecode")[1].split() == multiply.split()
+    assert table[21:23] == [f"  projection.fp8.in at {site}:{census.form_text(fields)}" for site, fields in configs.PROJECTION_SITES], "and the weight's shape"
+    assert (
+        row["mlp.gate_up"].split("cudnn.SwigluFp4Decode")[1].split() == f"{SWIGLU_FORM} swiglu_fp4 2 {stated}".split()
+    ), "the token tile of the row count in it"
+    assert table[-1].startswith("  per step: 20 launches on 12 exact rows") and len(table) == 24
+
+    # per stack and kind of step: the launches of a step on exact rows, and which blocks are left on fallback rows, how often.
+    # A row that falls off its kernel, or a kernel that gains a launch per call, moves a number here
+    library = "cuDNN FE 7 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4"
+    entries = "cuDNN FE 7 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
+    chain_table = {**configs.PROVIDERS, "attention.prepare": configs.PROVIDERS["attention.prepare"][1:]}  # the preparation on its reference chain
+    for layers, stack, tokens, exact, rows, left, provider in (
+        (64, "native", 1, 484, 12, {}, library),
+        (64, "native", 6, 484, 13, {}, library),
+        (64, "fe-entries", 1, 339, 8, {"projection.fp8.out": 64, "mlp.down": 64, "attention.core": 16, "output_head": 1}, entries),
+        (64, "fe-entries", 6, 387, 9, {"mlp.down": 64, "attention.core": 16, "projection.fp8.out": 16, "output_head": 1}, entries),
+        (2, "native", 1, 20, 12, {}, None),
+        (2, "native", 6, 20, 13, {}, None),
+        (2, "fe-entries", 1, 14, 8, {"projection.fp8.out": 2, "mlp.down": 2, "attention.core": 1, "output_head": 1}, None),
+        (2, "fe-entries", 6, 15, 9, {"mlp.down": 2, "attention.core": 1, "projection.fp8.out": 1, "output_head": 1}, None),
+    ):
+        planned, model = _stated_plan(layers, stack, tokens)
+        counted, fallback = _step_of(planned, model)
+        where = (layers, stack, tokens)
+        assert counted == (exact, rows, sum(left.values())) and fallback == left, where
+        assert exact + sum(left.values()) == len(model.wiring()) - 1, f"{where}: one launch per block call, the token choice on the host path"
+        if provider:
+            assert planned.by_provider() == f"by provider: {provider}", where
+        prepare = next(line for line in census.table(planned).splitlines() if line.split()[0] == "attention.prepare")
+        calls = model.geometry.layer_kinds.count("full_attention")  # the launches of the preparation's entry in a step: one per attention layer
+        assert prepare.split("cudnn.AttentionPrepareDecode")[1].split() == f"{PREPARE_FORM} attention_prepare {calls} {stated}".split(), where
+        # the preparation's row moves what a stack launches by the launches of its entry and by nothing else
+        without, on_chain = _step_of(*_stated_plan(layers, stack, tokens, table=chain_table))
+        assert without == (exact - calls, rows - 1, sum(left.values()) + calls) and on_chain == {**left, "attention.prepare": calls}, where
+    # a row that names one position row is the same entry in another form: the row and its entry agree on it
+    row = configs.PROVIDERS["attention.prepare"][0]
+    one_row = replace(row, form=(("POSITIONS", "1d"), ("SECTION", None), *row.form[2:]))
+    planned, model = _stated_plan(2, "fe-entries", table={**configs.PROVIDERS, "attention.prepare": [one_row, *configs.PROVIDERS["attention.prepare"][1:]]})
+    assert census.check_forms(census.expected(planned, model)) == [], "the form is the row's, and the entry states it"

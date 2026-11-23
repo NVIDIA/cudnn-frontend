@@ -2951,20 +2951,6 @@ def test_the_census_file_of_the_target_kernel_set():
     plan, model, _ = _target_plan()
     exact = {name: [kernel.id for kernel in block.kernels if kernel.relation == "exact"] for name, block in plan.items()}
     served = {name: ids[0] for name, ids in exact.items() if ids}
-    assert served == {
-        "embedding": "embedding_gather",
-        "add_norm_quantize": "add_norm_quant",
-        "projection.fp8.in": "fp8_projection",
-        "linear_attention.step": "gdn_decode_fused",
-        "mlp.gate_up": "swiglu_fp4",
-        "attention.prepare": "attention_prepare",
-        "attention.core": "fi_decode_attention",
-        "attention.gate_quantize": "gate_quant",
-        "projection.fp8.out": "cublaslt_fp8_gemm",
-        "mlp.down": "fi_mm_fp4",
-        "output_head.quantize": "row_quantize_fp4",
-        "output_head": "fi_mm_fp4",
-    }
     for block, kernel_id in served.items():
         meta = target.data["kernels"][kernel_id]
         same = "a change of a form the kernel census names updates kernel_census.json in the same commit"
@@ -2976,7 +2962,6 @@ def test_the_census_file_of_the_target_kernel_set():
         }  # a tuple of the table is a list of the file
         assert everywhere == meta.get("form", {}), f"{block}: the form of its native row in configs.py and of {kernel_id} in the census differ; {same}"
         assert plan[block].entry == meta["entry"], f"{block}: the census names the entry the row calls"
-    assert plan["output_head"].entry == plan["mlp.down"].entry == "flashinfer.gemm.mm_fp4", "the head's row is the multiply alone: two keys, one call"
     # the head's quantise: the entry's grid is its own (one thread block per row), so its two section entries record no launch
     # shape -- neither the entry's nor the target kernel's -- and the launch is held by membership; the row's form is the kernel's
     quantise = target.data["kernels"]["row_quantize_fp4"]
@@ -3022,8 +3007,6 @@ def test_the_census_file_of_the_target_kernel_set():
     assert all(tuple(map(tuple, facts["launch"][:2])) + (facts["launch"][2],) == SWIGLU_SHAPE for facts in by_call), "one thread block per SM of a 148-SM part"
     wanted = {**target.data["kernels"]["swiglu_fp4"]["form"], **by_call[0]["form"]}
     assert dict(full_plan.rows["mlp.gate_up"].form) == wanted, f"mlp.gate_up: configs.py and the census differ; {same}"
-    assert census.form_text(full_plan.rows["mlp.gate_up"].form).strip() == SWIGLU_FORM
-    assert configs.TARGET_STACKS == QwenDense.target_stacks == ("native", "fe-entries")
     # which kernels a stack of this repository calls an entry for is said per kernel, and held here: the three numbers count
     # the complete stack, and a reader of the file must be able to tell what exists today
     kernels = target.data["kernels"]
@@ -3031,7 +3014,6 @@ def test_the_census_file_of_the_target_kernel_set():
 
     several = blocks.plan(model.provider_table, model.regimes, plan.facts, 1, 6, "native", model=model)  # the plan of a verify step: six tokens per sequence
     stepped = {kernel.id for block in several.values() for kernel in block.kernels if kernel.relation == "exact"}
-    assert stepped - set(served.values()) == {"gdn_verify_fused"}, "the verify step has one kernel the decode step has not"
     assert {kernel_id for kernel_id, meta in kernels.items() if meta["entry"] is not None} == set(served.values()) | stepped
     assert all("entry" in meta for meta in kernels.values()), "null where no stack calls an entry for the kernel yet"
     for kernel_id, meta in kernels.items():
@@ -3153,10 +3135,6 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
         ": each in the recorded one; 1 more by membership alone"
     ), "the quantise, there too"
     differing = {block for block in plan.rows if plan.rows[block].key != entries_plan.rows[block].key}
-    assert (
-        differing == set(configs.LIBRARY_ROWS) == {"projection.fp8.out", "mlp.down", "output_head", "attention.core"}
-    ), "the rows in which the two stacks differ"
-    assert all(entries_plan.rows[block].fallback and plan.rows[block].stacks == ("native",) for block in differing)
     # every count the two READMEs state of the library rows is the plan's: the area README's sentence with what is held to a
     # recorded launch shape and what by membership; the family README's share of the target's own kernels, its census line,
     # the two-layer model's counts, the launches of each library row in the stack's table, the number of differing rows
@@ -3219,41 +3197,6 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
         f"no declared stand-in), and `fe-entries` {small_entries['target_code'] + small_entries['target_port']} of {small_entries['launches']} "
         f"there ({split.format(small_entries['target_code'], small_entries['target_port'])})" in spaced
     ), "the counts of the two-layer model on both stacks, each with its split, as the plans count them"
-    # the table is rendered for one GPU class: its heading names that class, and the sentence under it is the plan's own
-    # by-provider line there; what the other classes plan instead is said with their plans' counts
-    flat = " ".join(readme.split())
-
-    def said(planned, tail=True):
-        line = planned.by_provider().replace("by provider: ", "By provider: ").replace("cuDNN FE ", "cuDNN Frontend ")
-        line, _, unverified = line.partition(" | unverified in CI: ")  # the rows no lane of this repository runs: the library's
-        entries, natural = line.rsplit(" | PyTorch ", 1)
-        more = f"; {unverified} rows unverified in CI" if unverified else ""
-        return entries.replace(" | ", "; ") + (f"; PyTorch as the natural provider {natural}{more}." if tail else more)
-
-    table = configs.readme_table(QwenDense().calls_text(), "native", (10, 0))
-    heading = "## Who serves each block (stacks `native` and `fe-entries`, compute capability 10.0)"
-    assert (
-        " ".join(f"{heading} {table} {said(plan)}".split()) in flat
-    ), "the heading, the table and the by-provider sentence are those of compute capability 10.0"
-    assert said(plan) == ("By provider: cuDNN Frontend 7; FlashInfer 4; PyTorch as the natural provider 2; 4 rows unverified in CI.")
-    assert said(entries_plan) == "By provider: cuDNN Frontend 7; fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1); PyTorch as the natural provider 2."
-    assert (
-        f"three multiplies over a copy of `fe-cublas`: {said(entries_plan).replace('By provider: ', '')}" in flat
-    ), "the sentence on fe-entries under the table"
-    for cc, sms in (((10, 3), 152), ((10, 7), 212)):
-        other = said(_target_plan(64, cc=cc, sms=sms)[0], tail=False).replace("By provider: ", "")
-        assert other == "cuDNN Frontend 6; FlashInfer 4; fallbacks 1 (cuBLAS over copies 1); 4 rows unverified in CI", cc
-        assert f"On the other 10.x classes the in-projection is the multiply over a copy of `fe-cublas`: {other}." in flat, cc
-    # the table shows the row of 1 to 8 rows of the fused gate / up entry; the sentence under it names the other three
-    tiles = "; ".join(f"`TOKEN_TILE {tile}` from {first} to {last} rows" for first, last, tile in configs.GATE_UP_TILES[1:])
-    assert f"The row of the MLP's gate / up multiply is the one of 1 to 8 rows; three more rows of the same key name the other token tiles: {tiles}." in flat
-    for sequences, (first, last, tile) in ((n, row) for row in configs.GATE_UP_TILES for n in row[:2]):
-        row = _target_plan(2, sequences=sequences)[0].rows["mlp.gate_up"]
-        assert row.key == "fe.swiglu_fp4_decode" and dict(row.form)["TOKEN_TILE"] == tile and row.rows == (first, last), sequences
-    other = said(_target_plan(64, cc=(12, 0), sms=170)[0], tail=False).replace("By provider: ", "")
-    assert f"the reference chains of `fe-cublas` as well: {other}." in flat and other.startswith("cuDNN Frontend 1; fallbacks 9 "), "compute capability 12.x"
-    default = _target_plan(64, stack="fe-cublas")[0]
-    assert f"35 on the four-layer one. {said(default)}" in flat, "the sentence under the table of the default stack"
     shapes = {"embedding": GATHER_SHAPE, "add_norm_quantize": NORM_SHAPE, "linear_attention.step": SHAPE, "attention.gate_quantize": GATE_SHAPE}
     shapes["mlp.gate_up"], shapes["attention.prepare"] = SWIGLU_SHAPE, _prepare_shape(1)
     shapes.update({"mlp.down": DOWN_SHAPE, "output_head": HEAD_SHAPE})  # the library's 4-bit multiply: its two kernel classes, each in its recorded shape
@@ -3278,12 +3221,6 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
         len(claim.classes) == 65 + 16 and set(claim.picks.values()) == {NVJET_FP8} and len(claim.picks) == 64
     ), "and the recorded pick of every out-projection"
     assert configs.readme_sites(QwenDense(), "native") in readme, "regenerate the call-site table of the README from configs.readme_sites()"
-    from collections import Counter
-
-    forms = Counter(site for (block, _), site in zip(model.wiring(), model.sites()) if block == "add_norm_quantize")
-    assert forms == {"linear_attention.first": 1, "linear_attention": 47, "full_attention": 16, "mlp": 64, "output_head": 1}, "five forms: 1 / 47 / 16 / 64 / 1"
-    shapes_called = Counter(site for (block, _), site in zip(model.wiring(), model.sites()) if block == "projection.fp8.in")
-    assert shapes_called == {"linear_attention.qkvz": 48, "full_attention.qkv": 16}, "two weight shapes: 48 / 16"
 
     plan, model, _ = _target_plan(2)
     claim = target.claim(plan, model, installed=RECORDED)
@@ -3299,16 +3236,6 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
         "",
     ) and head.reason == "vocab 15520 (recorded 248320)", "another vocabulary: held by name alone"
     kinds = {block: (identity.relation, identity.kind) for block, identity in zip(claim.blocks, claim.identities)}
-    for block in (
-        "add_norm_quantize",
-        "projection.fp8.in",
-        "linear_attention.step",
-        "mlp.gate_up",
-        "attention.prepare",
-        "attention.gate_quantize",
-        "output_head.quantize",
-    ):  # the class their target forms ran on: 2 or more sequences gate them
-        assert plan.rows[block].batch_invariant == ("cc10.0",), f"{block}: batch invariance of its native row is a gate on compute capability 10.0"
     assert kinds["embedding"] == kinds["linear_attention.step"] == ("target", "code") and kinds["attention.gate_quantize"] == ("target", "port")
     assert kinds["token_choice"] == ("host", "") and kinds["add_norm_quantize"] == ("target", "port")
     assert kinds["mlp.gate_up"] == kinds["attention.prepare"] == ("target", "port")
@@ -3317,9 +3244,6 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     assert (
         kinds["mlp.down"] == kinds["projection.fp8.out"] == kinds["output_head"] == kinds["attention.core"] == ("target", "code")
     ), "the library's own kernels, called as the target calls them"
-    for block in configs.LIBRARY_ROWS:  # the library states no batch invariance for these calls; no lane of this repository runs them
-        band = "attention_bf16_weights" if block == "attention.core" else "bf16_rounding"  # the attention kernel documents no contract: the bound of a model
-        assert plan.rows[block].batch_invariant == () and plan.rows[block].ci is False and plan.rows[block].band == band, block
     table = census.table(plan, claim).splitlines()
     assert table[1].split()[-1] == "identity" and table[0].startswith("kernels, planned (decided before the load from the family's configs.py; stack native,")
     row = {line.split()[0]: line for line in table[2:15]}
@@ -3364,7 +3288,6 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     assert census.table(other, there).splitlines()[-3].startswith("  per step: 14 launches on 8 exact rows")
     # a row selected with --provider: the fused step in its fe-cublas form is the same kernel in another form
     selected, model, _ = _target_plan(2, overrides={"linear_attention.step": "fe.gdn_decode_fused"})
-    assert selected.overridden == ("linear_attention.step",) and selected.rows["linear_attention.step"].form == (("PDL", False), ("PDL_RELEASE", False))
     differs = target.claim(selected, model, installed=RECORDED)
     step = differs.identities[3]
     assert step.text() == "not the target (the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True])" and step.launch is None
@@ -3372,13 +3295,6 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     assert 3 not in differs.recorded and len(differs.recorded) == 15, "no recorded launch shape is held against a call that is not the target's"
     # compute capability 12.x: the gate and the norm entry do not serve there, the blocks stay on their reference chains, and the census has no section
     plan12, model, _ = _target_plan(2, cc=(12, 0), sms=170)
-    assert plan12.rows["attention.gate_quantize"].key == "torch_ref.gate_quantize" and plan12.rows["linear_attention.step"].form == (
-        ("PDL", True),
-        ("PDL_RELEASE", True),
-    )
-    assert plan12.rows["add_norm_quantize"].key == "torch_ref.add_norm_quantize" and plan12.rows["add_norm_quantize"].site_form("mlp") == ()
-    assert plan12.rows["projection.fp8.in"].key == "cublas.bf16_dequantized" and plan12.rows["projection.fp8.in"].site_form("full_attention.qkv") == ()
-    assert plan12.rows["mlp.gate_up"].key == "cublas.bf16_dequantized+torch_ref.silu_mul_quantize" and plan12.rows["mlp.gate_up"].form == ()
     claim12 = target.claim(plan12, model, installed=RECORDED)
     assert not claim12.known and claim12.coverage() == [
         "kernel identity: not stated for this run (no recorded section for cc 12.0 / 170 SMs: recorded is cc 10.0 / 148 SMs)"
@@ -10723,21 +10639,19 @@ def test_the_counts_with_the_attention_preparation_on_its_entry():
             assert section["geometry"][name] == (64 if name == "rotary_dim" else [11, 11, 10]), "a section names the rotary widths it was recorded with"
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
     split = "{} the target's own compiled kernels + {} cuDNN Frontend entries with byte-equal results"
-    library = "cuDNN FE 7 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4"
-    entries = "cuDNN FE 7 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
     decode_left = {"projection.fp8.out": 64, "mlp.down": 64, "attention.core": 16, "output_head": 1}
     options = {"device": "cpu", "check_kernels": True, "max_model_len": RECORDED_LENGTH}  # a run at the maximum length of the record
     chain_table = {**configs.PROVIDERS, "attention.prepare": configs.PROVIDERS["attention.prepare"][1:]}  # the block on its reference chain
     counted = {}  # per plan: the numbers of its claim, and those of the same plan without the row
-    for layers, stack, tokens, code, port, shaped, loose, left, provider in (
-        (64, "native", 1, 194, 290, 419, 65, {}, library),
-        (64, "native", 6, 146, 338, 467, 17, {}, library),
-        (64, "fe-entries", 1, 49, 290, 338, 1, decode_left, entries),
-        (64, "fe-entries", 6, 49, 338, 386, 1, {"mlp.down": 64, "attention.core": 16, "projection.fp8.out": 16, "output_head": 1}, entries),
-        (2, "native", 1, 8, 12, 16, 4, {}, None),
-        (2, "native", 6, 7, 13, 17, 3, {}, None),
-        (2, "fe-entries", 1, 2, 12, 13, 1, {"projection.fp8.out": 2, "mlp.down": 2, "attention.core": 1, "output_head": 1}, None),
-        (2, "fe-entries", 6, 2, 13, 14, 1, {"mlp.down": 2, "attention.core": 1, "projection.fp8.out": 1, "output_head": 1}, None),
+    for layers, stack, tokens, code, port, shaped, loose, left in (
+        (64, "native", 1, 194, 290, 419, 65, {}),
+        (64, "native", 6, 146, 338, 467, 17, {}),
+        (64, "fe-entries", 1, 49, 290, 338, 1, decode_left),
+        (64, "fe-entries", 6, 49, 338, 386, 1, {"mlp.down": 64, "attention.core": 16, "projection.fp8.out": 16, "output_head": 1}),
+        (2, "native", 1, 8, 12, 16, 4, {}),
+        (2, "native", 6, 7, 13, 17, 3, {}),
+        (2, "fe-entries", 1, 2, 12, 13, 1, {"projection.fp8.out": 2, "mlp.down": 2, "attention.core": 1, "output_head": 1}),
+        (2, "fe-entries", 6, 2, 13, 14, 1, {"mlp.down": 2, "attention.core": 1, "projection.fp8.out": 1, "output_head": 1}),
     ):
         model = QwenDense() if layers == 64 else QwenDense.reduced(layers)
         planned = blocks.plan(model.provider_table, model.regimes, facts, 1, tokens, stack, model=model, options=options)
@@ -10755,8 +10669,6 @@ def test_the_counts_with_the_attention_preparation_on_its_entry():
             assert claim.coverage() == [
                 f"kernel identity, as planned: {numbers['launches']} launches per step = {split.format(code, port)} + 0 declared stand-ins"
             ], where
-        if provider:
-            assert planned.by_provider() == f"by provider: {provider}", where
         identity = claim.identities[claim.blocks.index("attention.prepare")]
         assert (identity.relation, identity.kernel, identity.kind, identity.launch) == ("target", "attention_prepare", "port", _prepare_shape(tokens)), where
         core = claim.identities[claim.blocks.index("attention.core")]
@@ -10814,7 +10726,6 @@ def test_the_counts_with_the_attention_preparation_on_its_entry():
         and claim.numbers()["target_port"] == 11
         and "not the target set: attention.prepare" in "; ".join(claim.reasons)
     )
-    assert census.check_forms(census.expected(planned, model)) == [], "the row and its entry agree: the form is the row's, and it is not the census's"
 
 
 def _shifted_tables(monkeypatch, which):
