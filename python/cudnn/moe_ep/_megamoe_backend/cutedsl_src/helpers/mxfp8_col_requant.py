@@ -617,18 +617,16 @@ class Mxfp8ColRequant:
         )
         return cute.select(staged, mode=[0, 1])
 
-    @cute.jit
-    def __call__(
+    def _prepare_kernel_args(
         self,
         src_data: cute.Tensor,
         src_sf_u8: cute.Tensor,
         expert_token_sizes: cute.Tensor,
         dst_data: cute.Tensor,
         dst_sf_u8: cute.Tensor,
-        cuda_stream: cuda.CUstream,
         token_padding_block: cutlass.Constexpr = None,
         previous_expert_token_sizes: cute.Tensor = None,
-    ) -> None:
+    ):
         TOKPAD = cutlass.const_expr(
             self.token_padding_block if token_padding_block is None else token_padding_block
         )
@@ -691,11 +689,42 @@ class Mxfp8ColRequant:
                 cute.make_layout((BOX_T, BOX_H), stride=(BOX_H, 1)),
                 (BOX_T, BOX_H),
             )
-        k = self.ws_kernel(
-            src_data, src_sf_u8, expert_token_sizes, dst_data, dst_sf_u8,
-            tma_atom, tma_tensor, tma_atom_st, tma_tensor_st, TOKPAD,
+        return (
+            src_data,
+            src_sf_u8,
+            expert_token_sizes,
+            dst_data,
+            dst_sf_u8,
+            tma_atom,
+            tma_tensor,
+            tma_atom_st,
+            tma_tensor_st,
+            TOKPAD,
             previous_expert_token_sizes,
         )
+
+    @cute.jit
+    def __call__(
+        self,
+        src_data: cute.Tensor,
+        src_sf_u8: cute.Tensor,
+        expert_token_sizes: cute.Tensor,
+        dst_data: cute.Tensor,
+        dst_sf_u8: cute.Tensor,
+        cuda_stream: cuda.CUstream,
+        token_padding_block: cutlass.Constexpr = None,
+        previous_expert_token_sizes: cute.Tensor = None,
+    ) -> None:
+        kernel_args = self._prepare_kernel_args(
+            src_data,
+            src_sf_u8,
+            expert_token_sizes,
+            dst_data,
+            dst_sf_u8,
+            token_padding_block=token_padding_block,
+            previous_expert_token_sizes=previous_expert_token_sizes,
+        )
+        k = self.ws_kernel(*kernel_args)
         # Validated in __init__, not here: __call__ is DSL-preprocessed and a
         # plain if/raise in a traced body is rejected at trace time.
         _ntid = cutlass.const_expr(self.MaxNTid)
@@ -974,6 +1003,131 @@ class Mxfp8ColRequant:
                 warp_idx - Int32(self.ProducerWarps), lane_idx,
                 tma_atom_st, tma_tensor_st, TOKPAD,
             )
+
+    @cute.jit
+    def run_device(
+        self,
+        src_data: cute.Tensor,
+        src_sf_u8: cute.Tensor,
+        expert_token_sizes: cute.Tensor,
+        dst_data: cute.Tensor,
+        dst_sf_u8: cute.Tensor,
+        tma_atom,
+        tma_tensor,
+        tma_atom_st,
+        tma_tensor_st,
+        *,
+        tidx: Int32,
+        bidx: Int32,
+        grid_dim_x: Int32,
+        warp_idx: Int32,
+        lane_idx: Int32,
+        mbar_full: cute.Pointer,
+        mbar_empty: cute.Pointer,
+        smem_base_1024: cute.Pointer,
+        token_padding_block: cutlass.Constexpr = None,
+    ) -> None:
+        """Execute MXFP8 column requantization in-place inside a persistent CTA."""
+        TOKPAD = cutlass.const_expr(
+            self.token_padding_block if token_padding_block is None else token_padding_block
+        )
+        self._require_token_padding_block(TOKPAD)
+        TOK = cutlass.const_expr(self.TILE_TOK)
+        W = cutlass.const_expr(self.TILE_HID)
+        S = cutlass.const_expr(self.NumStages)
+        SFB = cutlass.const_expr(self.SfTileBytes)
+        NCONS = cutlass.const_expr(self.ConsumerWarps)
+        table_len = cutlass.const_expr(self.num_experts + 1)
+
+        data_bytes = cutlass.const_expr(((self.NumStages * TOK * W + 1023) // 1024) * 1024)
+        data_out_bytes = cutlass.const_expr(
+            ((TOK * W + 127) // 128) * 128 if self.dst_k_major else 0
+        )
+        sf_in_bytes = cutlass.const_expr(((S * SFB + 127) // 128) * 128)
+        sf_out_bytes = cutlass.const_expr(((self.smem_sf_out_bytes + 127) // 128) * 128)
+        tbl_stride_bytes = cutlass.const_expr(((table_len * 4 + 15) // 16) * 16)
+
+        smem_data = cute.recast_ptr(smem_base_1024, dtype=self.quant_dtype)
+        smem_data_out = (
+            cute.recast_ptr(smem_base_1024 + data_bytes, dtype=self.quant_dtype)
+            if cutlass.const_expr(self.dst_k_major)
+            else None
+        )
+        off_sf_in = cutlass.const_expr(data_bytes + data_out_bytes)
+        smem_sf_in = cute.recast_ptr(smem_base_1024 + off_sf_in, dtype=self.sf_dtype)
+        off_sf_out = cutlass.const_expr(off_sf_in + sf_in_bytes)
+        smem_sf_out = cute.recast_ptr(smem_base_1024 + off_sf_out, dtype=self.sf_dtype)
+        off_tbl = cutlass.const_expr(off_sf_out + sf_out_bytes)
+        tbl_vend = cute.make_tensor(
+            cute.recast_ptr(smem_base_1024 + off_tbl, dtype=cutlass.Int32),
+            cute.make_layout((table_len,)),
+        )
+        tbl_data = cute.make_tensor(
+            cute.recast_ptr(
+                smem_base_1024 + cutlass.const_expr(off_tbl + tbl_stride_bytes),
+                dtype=cutlass.Int32,
+            ),
+            cute.make_layout((table_len,)),
+        )
+        tbl_sf = cute.make_tensor(
+            cute.recast_ptr(
+                smem_base_1024 + cutlass.const_expr(off_tbl + 2 * tbl_stride_bytes),
+                dtype=cutlass.Int32,
+            ),
+            cute.make_layout((table_len,)),
+        )
+
+        ALL_REQ_THREADS = cutlass.const_expr(
+            (self.ProducerWarps + self.ConsumerWarps) * 32
+        )
+        if warp_idx < Int32(self.ProducerWarps + self.ConsumerWarps):
+            if tidx == Int32(0):
+                for s in cutlass.range_constexpr(0, S, 1):
+                    cute.arch.mbarrier_init(mbar_full + s, 1)
+                    cute.arch.mbarrier_init(mbar_empty + s, NCONS)
+            cute.arch.mbarrier_init_fence()
+
+            if warp_idx == Int32(0):
+                self.build_prefix_tables(
+                    expert_token_sizes, tbl_vend, tbl_data, tbl_sf, lane_idx, TOKPAD
+                )
+            cute.arch.barrier(barrier_id=2, number_of_threads=ALL_REQ_THREADS)
+
+            if cutlass.const_expr(
+                self.sf_padding_block > self.SfAtomNonK and TOKPAD != self.sf_padding_block
+            ):
+                self._clear_sf_padding_atoms(
+                    dst_sf_u8, tbl_vend, tbl_data, tbl_sf, tidx, bidx, grid_dim_x
+                )
+
+            total_tiles = Int32(tbl_data[self.num_experts]) // Int32(TOK)
+
+            smem_data_base = smem_data.toint()
+            smem_data_out_base = None
+            if cutlass.const_expr(self.dst_k_major):
+                smem_data_out_base = smem_data_out.toint()
+            smem_sf_in_base = smem_sf_in.toint()
+            smem_sf_out_base = smem_sf_out.toint()
+            src_sf_base = src_sf_u8.iterator.toint()
+            dst_sf_base = dst_sf_u8.iterator.toint()
+
+            if warp_idx < Int32(self.ProducerWarps):
+                self.produce(
+                    smem_data_base, smem_sf_in_base, mbar_full, mbar_empty,
+                    tbl_data, tbl_sf, src_sf_base,
+                    bidx, grid_dim_x, total_tiles, lane_idx,
+                    tma_atom, tma_tensor, TOKPAD,
+                )
+            else:
+                self.consume_scaled(
+                    smem_data_base, smem_data_out_base, smem_sf_in_base,
+                    smem_sf_out_base, mbar_full, mbar_empty,
+                    tbl_vend, tbl_data, tbl_sf, dst_sf_base,
+                    bidx, grid_dim_x, total_tiles,
+                    warp_idx - Int32(self.ProducerWarps), lane_idx,
+                    tma_atom_st, tma_tensor_st, TOKPAD,
+                )
+            cute.arch.barrier(barrier_id=2, number_of_threads=ALL_REQ_THREADS)
 
     # -------------------------------------------------------------- producer
     @cute.jit

@@ -111,8 +111,6 @@ class Mxfp8KernelConfig:
     token_back_mode: str
     epi_flag_batch: tuple[int, int]
     flag_batch: int
-    fc2_in_kernel_topk_reduce: bool
-    col_quant_num_ctas: int = 2368
     mma_tiler_mnk: tuple[int, int, int] = (256, 256, 128)
     cluster_shape_mnk: tuple[int, int, int] = MXFP8_CLUSTER_SHAPE_MNK
     launch_cluster_count: int = 1
@@ -152,13 +150,6 @@ class Mxfp8KernelConfig:
             "ds3_ep4_pattern",
         ):
             raise ValueError("dgrad_optimization must be 'baseline', 'rolling', or " f"'ds3_ep4_pattern', got {self.dgrad_optimization!r}")
-        if self.col_quant_num_ctas == -1:
-            if self.dgrad_optimization != "ds3_ep4_pattern" or not self.enable_grad_y2_col_quant:
-                raise ValueError("col_quant_num_ctas=-1 requires ds3_ep4_pattern backward " "grad-y2 column quantization")
-        elif self.col_quant_num_ctas <= 0:
-            raise ValueError("col_quant_num_ctas must be positive")
-        if self.dgrad_optimization == "ds3_ep4_pattern" and self.col_quant_num_ctas != -1:
-            raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires " "col_quant_num_ctas=-1")
         if self.weight_storage_mode not in ("contiguous", "discrete"):
             raise ValueError("weight_storage_mode must be 'contiguous' or 'discrete', " f"got {self.weight_storage_mode!r}")
 
@@ -252,13 +243,10 @@ class Mxfp8KernelConfig:
             token_back_mode=tuning.token_back_mode,
             epi_flag_batch=((4, 2) if ds3 else tuning.epi_flag_batch),
             flag_batch=tuning.token_in_flag_batch,
-            fc2_in_kernel_topk_reduce=tuning.reduce_topk_in_kernel,
             weight_storage_mode=weight_storage_mode,
             cluster_shape_mnk=cluster_shape_mnk,
             launch_cluster_count=launch_cluster_count,
-            col_quant_num_ctas=(-1 if ds3 else 2368),
             load_balance_mode=load_balance_mode,
-            num_sched_stages=(2 if ds3 else None),
             fc2_use_bulk=fc2_use_bulk,
             fc2_tma_stages=fc2_tma_stages,
             dgrad_optimization=dgrad_optimization,
@@ -330,7 +318,6 @@ class Mxfp8KernelConfig:
             self.epi_flag_batch,
             self.flag_batch,
             self.group_hint,
-            self.fc2_in_kernel_topk_reduce,
             self.fc2_use_bulk,
             self.fc2_tma_stages,
             self.load_balance_mode,

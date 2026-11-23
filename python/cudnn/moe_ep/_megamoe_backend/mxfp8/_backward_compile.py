@@ -83,12 +83,33 @@ _COMPILE_CACHE: dict[tuple, CompiledMxfp8BackwardKernel] = {}
 def _dgrad_selector_kwargs(
     config: Mxfp8KernelConfig,
 ) -> dict[str, object]:
-    """Map the public MoeEP profile to upstream selector flags."""
+    """Map the public MoeEP profile to upstream schedule and transport fields.
 
+    Upstream resolves omitted ``schedule_mode`` and ``input_dedup_mode`` with
+    ``"auto"`` defaults, so the profile pins both explicitly.
+    """
+
+    ds3 = config.dgrad_optimization == "ds3_ep4_pattern"
     return {
-        "enable_dgrad_optimizations": (config.dgrad_optimization == "ds3_ep4_pattern"),
-        "dgrad_schedule": ("optimized" if config.dgrad_optimization == "rolling" else None),
+        "schedule_mode": "grouped" if config.dgrad_optimization == "baseline" else "phase_interleave",
+        "input_dedup_mode": "rank" if ds3 else "off",
+        "token_in_async_flags": ds3,
     }
+
+
+# Upstream fields each public profile must resolve to. The phase-interleaved
+# profiles carry upstream's tuned schedule bundle (dfc1_m_group, use_scaled_cvt).
+_RESOLVED_DGRAD_PROFILES = {
+    "baseline": {"schedule_mode": "grouped", "input_dedup_mode": "off", "token_in_async_flags": False, "dfc1_m_group": 1, "use_scaled_cvt": False},
+    "rolling": {"schedule_mode": "phase_interleave", "input_dedup_mode": "off", "token_in_async_flags": False, "dfc1_m_group": 16, "use_scaled_cvt": True},
+    "ds3_ep4_pattern": {
+        "schedule_mode": "phase_interleave",
+        "input_dedup_mode": "rank",
+        "token_in_async_flags": True,
+        "dfc1_m_group": 16,
+        "use_scaled_cvt": True,
+    },
+}
 
 
 def _validate_resolved_dgrad_profile(
@@ -97,23 +118,14 @@ def _validate_resolved_dgrad_profile(
 ) -> None:
     """Reject drift between the MoeEP profile and upstream resolution."""
 
+    expected = _RESOLVED_DGRAD_PROFILES[config.dgrad_optimization]
     resolved_dgrad = kernel.resolved_dgrad_config
-    expected_upstream_profile = {
-        "baseline": "explicit",
-        "rolling": "optimized",
-        "ds3_ep4_pattern": "ds3_ep4_v1",
-    }[config.dgrad_optimization]
-    actual_upstream_profile = resolved_dgrad["dgrad_optimization_profile"]
-    if actual_upstream_profile != expected_upstream_profile:
+    actual = {name: resolved_dgrad[name] for name in expected}
+    if actual != expected:
         raise RuntimeError(
             "Rubin dgrad profile resolution drifted from the MoeEP "
             f"integration contract: requested {config.dgrad_optimization!r}, "
-            f"resolved {actual_upstream_profile!r}, expected "
-            f"{expected_upstream_profile!r}"
-        )
-    if config.dgrad_optimization == "ds3_ep4_pattern" and resolved_dgrad["dgrad_optimization_overrides"]:
-        raise RuntimeError(
-            "Rubin ds3_ep4_v1 profile for ds3_ep4_pattern resolved with " f"unexpected downstream overrides: {resolved_dgrad['dgrad_optimization_overrides']!r}"
+            f"resolved {actual!r}, expected {expected!r}"
         )
 
 
@@ -146,9 +158,6 @@ def prepare_backward_kernel(
             config.intermediate,
             config.hidden,
         ),
-        force_static_sched=config.force_static_sched,
-        clc_bundle_size=config.clc_bundle_size,
-        num_sched_stages=config.num_sched_stages,
         ab_dtype=cutlass.Float8E4M3FN,
         sf_vec_size=config.sf_vec_size,
         world_size=config.world_size,
@@ -160,7 +169,6 @@ def prepare_backward_kernel(
         hidden=config.hidden,
         launch_cluster_count=config.launch_cluster_count,
         drop_on_overflow=config.kernel_drop_on_overflow,
-        fc2_in_kernel_topk_reduce=config.fc2_in_kernel_topk_reduce,
         token_back_mode=config.token_back_mode,
         epi_flag_batch=config.epi_flag_batch,
         flag_batch=config.flag_batch,
@@ -170,7 +178,6 @@ def prepare_backward_kernel(
         dfc2_recompute=config.dfc2_recompute,
         dfc2_col_output=config.dfc2_col_output,
         enable_grad_y2_col_quant=config.enable_grad_y2_col_quant,
-        num_ctas_grad_y2_col_quant=config.col_quant_num_ctas,
         weight_storage_mode=config.weight_storage_mode,
         **_dgrad_selector_kwargs(config),
     )

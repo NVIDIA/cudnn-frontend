@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import importlib.util
 
 RUBIN_CUTEDSL_MIN_VERSION = (4, 8, 0)
 
@@ -53,4 +54,68 @@ def require_rubin_cutedsl() -> None:
         )
 
 
-__all__ = ["RUBIN_CUTEDSL_MIN_VERSION", "require_rubin_cutedsl"]
+def _installed_cutedsl_distributions() -> str:
+    """Name every installed CUTLASS DSL distribution without importing it."""
+
+    found = []
+    for distribution in ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl-internal"):
+        try:
+            found.append(f"{distribution} {importlib.metadata.version(distribution)}")
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return ", ".join(found) if found else "none"
+
+
+def _cutlass_installed() -> bool:
+    """Whether a CUTLASS DSL package is importable, without importing it."""
+
+    return importlib.util.find_spec("cutlass") is not None
+
+
+def rubin_wgrad_cutedsl_error() -> str | None:
+    """Return why the installed DSL cannot build the Rubin WGrad kernel, or None.
+
+    The WGrad kernel issues Rubin TMA descriptor overrides with a residue
+    tensor. The vendored ``helpers/dsl_helpers.py`` builds them from the DSL's
+    override copy traits and its ``atom_make_tma_residue_tensor`` MLIR op, which
+    public 4.8.0 and later ship, so the probe checks those capabilities rather
+    than a version number.
+    """
+
+    try:
+        require_rubin_cutedsl()
+    except RuntimeError as exc:
+        return str(exc)
+    requirement = (
+        f"MoeEp training WGrad requires nvidia-cutlass-dsl>={'.'.join(map(str, RUBIN_CUTEDSL_MIN_VERSION))} "
+        "or another CUTLASS DSL build with Rubin TMA descriptor overrides"
+    )
+    if not _cutlass_installed():
+        return f"{requirement}; no CUTLASS DSL is installed"
+    try:
+        import cutlass._mlir.dialects.cute_nvgpu as cute_nvgpu_ir
+        from cutlass.cute.nvgpu.cpasync.copy import (  # noqa: F401
+            CopyBulkTensorTileG2SOverrideNonExecTrait,
+            CopyBulkTensorTileS2GOverrideNonExecTrait,
+        )
+    except ImportError as exc:
+        return f"{requirement}; the installed DSL lacks the override copy traits ({exc}); found {_installed_cutedsl_distributions()}"
+    if not hasattr(cute_nvgpu_ir, "atom_make_tma_residue_tensor"):
+        return f"{requirement}; the installed DSL lacks the atom_make_tma_residue_tensor op; found {_installed_cutedsl_distributions()}"
+    return None
+
+
+def require_rubin_wgrad_cutedsl() -> None:
+    """Raise unless the installed DSL can build the Rubin WGrad kernel."""
+
+    error = rubin_wgrad_cutedsl_error()
+    if error is not None:
+        raise RuntimeError(error)
+
+
+__all__ = [
+    "RUBIN_CUTEDSL_MIN_VERSION",
+    "require_rubin_cutedsl",
+    "require_rubin_wgrad_cutedsl",
+    "rubin_wgrad_cutedsl_error",
+]

@@ -19,7 +19,7 @@ from ......helpers.utils import ceil_div, round_up
 from ......quant_def import CombineFormat, QuantKind
 from ......communication.nvlink_domain.token_comm_deterministic import TokenCommDeterministic
 from .....schedulers.non_clc_mixed_cga import NonClcMixedCgaConfig
-from .glu_mxfp8_fc12_extension import (
+from ......helpers.discrete_weight import (
     WeightStorageMode,
     discrete_weight_descriptor_workspace_alignment,
     discrete_weight_descriptor_workspace_size,
@@ -97,7 +97,6 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             "fc2_use_bulk": bool,
             "fc2_tma_stages": OptionalRequirement(int),
             "enable_col_quant": OptionalRequirement(bool),
-            "col_quant_num_ctas": OptionalRequirement(int),
             "weight_storage_mode": OptionalRequirement(str),
         }
 
@@ -294,10 +293,6 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         fc2_use_bulk: bool = False,
         fc2_tma_stages: Optional[int] = None,
         enable_col_quant: bool = False,
-        # -1 = let Mxfp8ColRequant derive the grid from the resident-CTA quantum.
-        # A hardcoded CTA count is not generally a multiple of that quantum, which
-        # leaves a fractional resident wave.
-        col_quant_num_ctas: int = -1,
         weight_storage_mode: WeightStorageMode = "contiguous",
     ) -> "Sm107MegaMoEMxfp8GluKernel":
         """Build the ``(ProblemDesc, ImplDesc)`` pair from the legacy flat signature."""
@@ -367,14 +362,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 # OptionalRequirement: present only when set (absent == None).
                 **({"fc2_tma_stages": fc2_tma_stages} if fc2_tma_stages is not None else {}),
                 # Col-quant keys present only when enabled
-                **(
-                    {
-                        "enable_col_quant": True,
-                        "col_quant_num_ctas": col_quant_num_ctas,
-                    }
-                    if enable_col_quant
-                    else {}
-                ),
+                **({"enable_col_quant": True} if enable_col_quant else {}),
             }
         )
         return cls(problem_desc, impl_desc)
@@ -445,7 +433,6 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         fc2_tma_stages = impl_desc.get("fc2_tma_stages")
         weight_storage_mode = impl_desc.get("weight_storage_mode") or "contiguous"
         self.enable_col_quant = bool(impl_desc.get("enable_col_quant") or False)
-        self._col_quant_num_ctas = int(impl_desc.get("col_quant_num_ctas") or -1)
 
         if static_expert_shape is None:
             raise NotImplementedError("Sm107MegaMoEMxfp8GluKernel requires a static_expert_shape.")
@@ -454,15 +441,15 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         token_back_by_dispatch = token_back_mode != "epi_warps"
 
         combine_format = CombineFormat.parse("bf16" if combine_format is None else str(combine_format))
-        if fc2_in_kernel_topk_reduce and (token_back_by_dispatch or combine_format.is_quantized):
-            raise ValueError("fc2_in_kernel_topk_reduce requires epi_warps + non-quantized (bf16) combine.")
+        if fc2_in_kernel_topk_reduce:
+            raise ValueError(
+                "fc2_in_kernel_topk_reduce is unsupported in training GLU: "
+                "the in-kernel reduction is not deterministic."
+            )
         if token_back_mode not in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
             raise ValueError(f"unsupported token_back_mode={token_back_mode!r}.")
         if ab_dtype not in _AB_DTYPE_TO_QUANT_KIND:
             raise ValueError(f"ab_dtype {ab_dtype} has no mxfp8 QuantKind.")
-        # Keep the deterministic training path separate from the in-kernel REDG reduction.
-        if fc2_use_bulk and fc2_in_kernel_topk_reduce:
-            raise ValueError("fc2_use_bulk is not supported with fc2_in_kernel_topk_reduce.")
         fc2_cta_token_tile = mma_tiler_mnk[0] // (2 if use_2cta_instrs else 1)
         if (
             fc2_use_bulk
@@ -659,7 +646,6 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                     * min(self.num_topk, self.num_experts_per_rank)
                 ),
                 quant_type=col_quant_type,
-                num_persistent_ctas=self._col_quant_num_ctas,
                 token_padding_block=self.token_padding_block,
                 sf_padding_block=self.sf_padding_block,
                 # Local integration ABI consumed by MoeEP WGrad operands.

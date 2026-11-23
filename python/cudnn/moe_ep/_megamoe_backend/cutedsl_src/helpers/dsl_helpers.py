@@ -1,9 +1,14 @@
 """General-purpose CuTe DSL helpers."""
 
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional, Union
 
 import cutlass
 import cutlass.cute as cute
+import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
+from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.nvgpu.cpasync import copy as _cpasync_copy
+from cutlass.cute.nvgpu.cpasync.helpers import TmaInfo
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import Pointer
 from cutlass.cutlass_dsl import Boolean, Int16, Int32
 
@@ -112,6 +117,21 @@ def spin_wait(
         while not condition(value):
             nanosleep(sleep_cycles)
             value = cute.arch.load(pointer, pointer.dtype, sem="acquire", scope=scope)
+
+
+class ReadyFlag:
+    """A counter a producer raises to ``target``, read with acquire loads at ``scope`` (see ``wait_ready``)."""
+
+    def __init__(self, pointer: Pointer, target: Union[int, Int32], scope: str = "gpu") -> None:
+        self.pointer = pointer
+        self.target = target
+        self.scope = scope
+
+
+@cute.jit
+def wait_ready(flag: ReadyFlag, sleep_cycles: int = 150) -> None:
+    """Every calling thread polls until the flag reaches its target."""
+    spin_wait(flag.pointer, lambda value: value == Int32(flag.target), scope=flag.scope, sleep_cycles=sleep_cycles)
 
 
 def _tma_multicast_pattern(
@@ -232,10 +252,97 @@ def tma_multicast_mask(
     return Int16(result)
 
 
+def override_load_op(op: Any) -> Any:
+    """The override twin of a ``cluster_shape_to_tma_atom_*`` load operation (same CTA group).
+
+    Guarded or not is a property of the atom (``make_override_tma_atom(no_fully_oob_tile=...)``,
+    ``guarded_override_atom``). A guarded copy checks per issue whether its box lies entirely
+    outside the per-expert view (e.g. the second CTA of an M = 512 tile past a 640-row A) and then
+    issues a plain TMA through the template descriptor with far out-of-bounds coordinates, which
+    zero-fills without touching memory. An unguarded override copy clips a box with its size
+    operands instead, and the TMA then issues the out-of-size requests to a hashed address near the
+    box, which faults when it lands past the allocation. The guard costs a
+    compare, a branch and a second issue path per copy (about 40 of ~110 producer instructions per
+    K tile on the M512 WGrad tile), so the WGrad mainloop checks once per work tile instead.
+    """
+    if isinstance(op, cpasync.CopyBulkTensorTileG2SMulticastOp):
+        return cpasync.CopyBulkTensorTileG2SMulticastOverrideOp(cta_group=op.cta_group)
+    if isinstance(op, cpasync.CopyBulkTensorTileG2SOp):
+        return cpasync.CopyBulkTensorTileG2SOverrideOp(cta_group=op.cta_group)
+    raise TypeError(f"No TMA override variant for {type(op).__name__}.")
+
+
+def make_override_tma_atom(
+    make_atom: Callable, override_op: Any, *args: Any, no_fully_oob_tile: bool = False, **kwargs: Any
+) -> Any:
+    """Build an override TMA atom with any cuTeDSL wheel that ships the override ops.
+
+    ``make_atom`` is ``cpasync.make_tiled_tma_atom`` or ``cute.nvgpu.make_tiled_tma_atom_A/_B``;
+    ``args`` / ``kwargs`` are its remaining arguments. The override atom is the plain atom's
+    descriptor (same MLIR builder, same arguments: the override ops lower to the same TMA kind)
+    wrapped in the override trait. Public wheels carry the override ops, traits and MLIR lowering;
+    this helper and ``make_tma_residue_tensor`` build the atom and the residue tensor from them.
+    ``no_fully_oob_tile`` (unguarded copies, see ``override_load_op``) is set on the trait, where
+    the copy lowering reads it, since the public non-multicast load op has no such field.
+    """
+    if isinstance(override_op, cpasync.CopyBulkTensorTileG2SMulticastOverrideOp):
+        plain_op = cpasync.CopyBulkTensorTileG2SMulticastOp(cta_group=override_op.cta_group)
+        trait_type = _cpasync_copy.CopyBulkTensorTileG2SOverrideNonExecTrait
+    elif isinstance(override_op, cpasync.CopyBulkTensorTileG2SOverrideOp):
+        plain_op = cpasync.CopyBulkTensorTileG2SOp(cta_group=override_op.cta_group)
+        trait_type = _cpasync_copy.CopyBulkTensorTileG2SOverrideNonExecTrait
+    elif isinstance(override_op, cpasync.CopyBulkTensorTileS2GOverrideOp):
+        plain_op = cpasync.CopyBulkTensorTileS2GOp()
+        trait_type = _cpasync_copy.CopyBulkTensorTileS2GOverrideNonExecTrait
+    else:
+        raise TypeError(f"Not a TMA override operation: {type(override_op).__name__}.")
+    plain = make_atom(plain_op, *args, **kwargs)
+    trait = trait_type(plain.atom._trait.value)
+    trait.no_fully_oob_tile = no_fully_oob_tile
+    return TmaInfo(cute.CopyAtom(override_op, trait), plain.tma_tensor, plain.smem_layout)
+
+
+def guarded_override_atom(tma_atom: cute.CopyAtom) -> cute.CopyAtom:
+    """The same override load atom (same descriptor) with the per-copy fully-out-of-bounds guard.
+
+    ``no_fully_oob_tile`` is a Python-side trait flag read when the executable atom is built at
+    each copy, so a guarded twin of a launch-time atom costs nothing until it is used.
+    """
+    trait = type(tma_atom._trait)(tma_atom._trait.value)
+    trait.no_fully_oob_tile = False
+    return cute.CopyAtom(tma_atom.op, trait)
+
+
+@dsl_user_op
+def make_tma_residue_tensor(tma_atom: cute.CopyAtom, gmem_tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    """TMA residue tensor of an override copy."""
+    return _cute_nvgpu_ir.atom_make_tma_residue_tensor(tma_atom._trait.value, gmem_tensor.value, loc=loc, ip=ip)
+
+
+def is_fully_oob_tile(residue_slice: cute.Tensor) -> cutlass.Boolean:
+    """True when one TMA box of an override copy lies entirely outside the tensor.
+
+    ``residue_slice`` is one box of a partitioned TMA residue tensor (``residue[(None, i)]``); its
+    first element holds the remaining extent per TMA mode. A box is fully out of bounds when any
+    remaining extent is <= 0 (e.g. the second CTA of an M = 512 tile past a 640-row tensor).
+    """
+    leaves = cute.flatten_to_tuple(residue_slice[0])
+    fully_oob = Int32(leaves[0]) <= Int32(0)
+    for leaf in leaves[1:]:
+        fully_oob = fully_oob | (Int32(leaf) <= Int32(0))
+    return fully_oob
+
 __all__ = [
+    "ReadyFlag",
+    "is_fully_oob_tile",
+    "guarded_override_atom",
+    "make_override_tma_atom",
+    "make_tma_residue_tensor",
     "mark_alignment",
+    "override_load_op",
     "smem_exclusive_prefix",
     "spin_peek",
     "spin_wait",
     "tma_multicast_mask",
+    "wait_ready",
 ]

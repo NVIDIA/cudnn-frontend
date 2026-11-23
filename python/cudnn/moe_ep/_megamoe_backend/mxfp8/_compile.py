@@ -101,10 +101,7 @@ def _pre_reduced_workspace_metadata(
     config: Mxfp8KernelConfig,
     shared_bytes: int,
 ) -> tuple[int | None, int]:
-    """Describe the standalone combine plane, if this kernel has one."""
-    if config.fc2_in_kernel_topk_reduce:
-        return None, 0
-
+    """Describe the standalone combine plane."""
     region = device_workspace.region(_PRE_REDUCED_ACTIVATION_REGION)
     if region.buffer_space != "shared":
         raise RuntimeError("Rubin pre_reduced_activation must reside in shared workspace")
@@ -138,7 +135,7 @@ def _pre_reduced_sf_workspace_metadata(
     shared_bytes: int,
 ) -> tuple[int | None, int]:
     """Describe the standalone quantized-combine scale plane, if present."""
-    if config.fc2_in_kernel_topk_reduce or config.combine_format == "bf16":
+    if config.combine_format == "bf16":
         return None, 0
 
     region = device_workspace.region(_PRE_REDUCED_ACTIVATION_SF_REGION)
@@ -203,7 +200,6 @@ def prepare_kernel(
         preferred_cluster_count=config.preferred_cluster_count,
         fallback_cluster_count=config.fallback_cluster_count,
         drop_on_overflow=config.kernel_drop_on_overflow,
-        fc2_in_kernel_topk_reduce=config.fc2_in_kernel_topk_reduce,
         token_back_mode=config.token_back_mode,
         epi_flag_batch=config.epi_flag_batch,
         flag_batch=config.flag_batch,
@@ -214,7 +210,6 @@ def prepare_kernel(
         fc2_use_bulk=config.fc2_use_bulk,
         fc2_tma_stages=config.fc2_tma_stages,
         enable_col_quant=config.enable_col_quant,
-        col_quant_num_ctas=config.col_quant_num_ctas,
         weight_storage_mode=config.weight_storage_mode,
     )
     kernel = Sm107MegaMoEMxfp8GluKernel.from_kwargs(**kernel_kwargs)

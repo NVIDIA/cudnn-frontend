@@ -307,12 +307,28 @@ class Mxfp8Backend:
                 architecture=architecture,
             )
             from ._training_resources import _Mxfp8TrainingState
+            from ._wgrad_compile import prepare_wgrad, wgrad_unavailable_reason
 
+            # WGrad is optional: without a DSL that has Rubin TMA overrides,
+            # forward/backward still prepare and training_wgrad reports why.
+            wgrad = None
+            wgrad_reason = wgrad_unavailable_reason()
+            if wgrad_reason is None:
+                wgrad = prepare_wgrad(
+                    self.resolved_config,
+                    pool_rows=backward.pool_token_capacity,
+                    token_padding=backward_kernel_config.token_padding_block,
+                    sf_padding=backward_kernel_config.sf_padding_block,
+                    device=self.device,
+                    architecture=architecture,
+                )
             state = _Mxfp8TrainingState(
                 self.resolved_config,
                 self.device,
                 forward,
                 backward,
+                wgrad=wgrad,
+                wgrad_unavailable_reason=wgrad_reason,
             )
             try:
                 state.prepare()

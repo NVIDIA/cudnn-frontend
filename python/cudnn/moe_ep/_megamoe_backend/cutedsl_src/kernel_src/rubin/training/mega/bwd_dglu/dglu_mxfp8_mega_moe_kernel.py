@@ -22,7 +22,7 @@ from ......helpers.topk_reduce import TopkReduce
 from ......helpers.utils import ceil_div, round_up
 from ......quant_def import CombineFormat, QuantKind
 from ......communication.nvlink_domain.token_comm_deterministic import TokenCommDeterministic
-from ..fwd_glu.glu_mxfp8_fc12_extension import (
+from ......helpers.discrete_weight import (
     WeightStorageMode,
     discrete_weight_descriptor_workspace_alignment,
     discrete_weight_descriptor_workspace_size,
@@ -94,14 +94,10 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             "token_padding_block": int,
             "sf_padding_block": int,
             "load_balance_mode": str,
-            "force_static_sched": bool,
-            "clc_bundle_size": Optional[int],
-            "num_sched_stages": Optional[int],
             "acc_dtype": type,
             "sf_vec_size": int,
             "launch_cluster_count": int,
             "drop_on_overflow": bool,
-            "fc2_in_kernel_topk_reduce": bool,
             "token_back_mode": str,
             "epi_flag_batch": tuple,
             "flag_batch": int,
@@ -123,9 +119,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             # Optional keeps old hand-built ImplDesc objects source-compatible.
             "use_scaled_cvt": OptionalRequirement(bool),
             "enable_grad_y2_col_quant": bool,
-            "num_ctas_grad_y2_col_quant": int,
             "weight_storage_mode": OptionalRequirement(str),
-            "enable_dgrad_optimizations": OptionalRequirement(bool),
             "input_dedup_mode": OptionalRequirement(str),
             "dfc1_m_group": OptionalRequirement(int),
         }
@@ -150,14 +144,10 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             f"pro{self.phase_interleave_prologue_tiles}_"
             f"defer{int(self.phase_interleave_defer_consumers_until_full)}_"
             f"fuse{int(self.phase_interleave_fuse_ready_probe_and_producer_claim)}_"
-            f"extadm{int(self.phase_interleave_defer_linear1_until_input_ready)}_"
-            f"tmapf{int(self.prefetch_tma_descriptors)}_"
-            f"l2pf{self.dfc1_weight_l2_prefetch_depth}_"
             f"scaledcvt{int(self.use_scaled_cvt)}_"
-            f"redtopk{int(self.reduce_topk_in_kernel)}_preactarg1_"
+            f"preactarg1_"
             f"weight{self.weight_storage_mode}"
             + ("_cleary2tail1" if self.clear_grad_y2_stale_tail else "")
-            + (f"_y2ctas{self.num_ctas_grad_y2_col_quant}" if self.num_ctas_grad_y2_col_quant != 2368 else "")
             + (f"_dfc1mg{self.dfc1_m_group}" if self.dfc1_m_group != 1 else "")
             + ("_inputdedup_rank_batched_rows" if self.token_comm.input_dedup_mode != "off" else "")
             + (f"_tpad{self.token_padding_block}_sfpad{self.sf_padding_block}"
@@ -285,80 +275,81 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
 
         return load_module(path, enable_tvm_ffi=True)[_aot_symbol_prefix]
 
-    @staticmethod
-    def _resolve_tuning(problem: Mapping, implementation: Mapping) -> dict:
-        """Expand compatibility switches and validate explicit construction knobs.
+    @classmethod
+    def resolve_schedule(cls, fields: Mapping, *, intermediate: int, mma_tiler_mnk, use_2cta_instrs: bool) -> dict:
+        """Resolve the schedule fields of ``fields``; omitted or "auto" ones take defaults.
 
-        Both from_kwargs and descriptor callers use this host-only step. Explicit
-        values, including False and None, override the selected defaults; requested
-        outputs and problem dimensions remain caller-owned.
+        schedule_mode "auto" picks phase_interleave when the shape fits it (N256 tiles, one
+        ready bit per CTA in a positive Int32) and load balancing is not pinned to static, else
+        grouped. The phase-interleaved defaults are the tuned DeepSeek-V3 schedule.
         """
-        explicit = {k: v for k, v in implementation.items() if v is not _UNSPECIFIED}
-        # Keep legacy disabled spellings readable; active experiments are archived.
-        for key, default in (
-            ("phase_interleave_defer_linear1_until_input_ready", False),
-            ("prefetch_tma_descriptors", False),
-            ("dfc1_weight_l2_prefetch_depth", 0),
-        ):
-            value = explicit.pop(key, default)
-            if type(value) is not type(default):
-                raise TypeError(f"{key} must be {type(default).__name__}")
-            if value != default:
-                raise NotImplementedError(f"{key} is an archived experiment")
-        enabled = explicit.pop("enable_dgrad_optimizations", False)
-        if type(enabled) is not bool:
-            raise TypeError("enable_dgrad_optimizations must be bool")
-        legacy_schedule = explicit.pop("dgrad_schedule", None)
-        if legacy_schedule not in (None, "baseline", "optimized"):
-            raise ValueError(f"unsupported dgrad_schedule={legacy_schedule!r}")
-        if enabled and legacy_schedule == "baseline":
-            raise ValueError("dgrad_schedule='baseline' conflicts with enable_dgrad_optimizations=True")
-
-        rolling = enabled or legacy_schedule == "optimized"
-        resolved = dict(
-            load_balance_mode="atomic_counter" if rolling else "static",
-            force_static_sched=True,
-            clc_bundle_size=None,
-            num_sched_stages=2 if enabled else None,
-            token_back_mode="epi_warps",
-            epi_flag_batch=(4, 2) if enabled else (1, 1),
-            flag_batch=1,
-            token_in_async_flags=enabled,
-            token_in_transfer_warp_count=4,
-            schedule_mode="phase_interleave" if rolling else "grouped",
-            dfc2_subtile_publish=rolling,
-            dfc2_c_pipe_stages=2 if rolling else 1,
-            dfc2_d_pipe_stages=1,
-            dfc2_acc_early_release=rolling,
-            phase_interleave_prologue_tiles=0 if rolling else None,
-            phase_interleave_defer_consumers_until_full=rolling,
-            phase_interleave_fuse_ready_probe_and_producer_claim=rolling,
-            use_scaled_cvt=enabled,
-            num_ctas_grad_y2_col_quant=2368,
-            input_dedup_mode="rank" if enabled else "off",
-            dfc1_m_group=16 if enabled else 1,
+        grouped = dict(
+            load_balance_mode="static",
+            dfc2_subtile_publish=False,
+            dfc2_c_pipe_stages=1,
+            dfc2_acc_early_release=False,
+            phase_interleave_prologue_tiles=None,
+            phase_interleave_defer_consumers_until_full=False,
+            phase_interleave_fuse_ready_probe_and_producer_claim=False,
+            dfc1_m_group=1,
+            use_scaled_cvt=False,
         )
-        preset = {}
-        if enabled:
-            resolved["group_hint"] = explicit["launch_cluster_count"]
-            # Record overrides of the compatibility preset without treating
-            # baseline-only defaults or caller-requested outputs as preset fields.
-            preset = {key: resolved[key] for key in (
-                "load_balance_mode", "schedule_mode", "dfc2_subtile_publish",
-                "dfc2_c_pipe_stages", "dfc2_d_pipe_stages", "dfc2_acc_early_release",
-                "phase_interleave_prologue_tiles", "phase_interleave_defer_consumers_until_full",
-                "phase_interleave_fuse_ready_probe_and_producer_claim", "num_sched_stages",
-                "group_hint", "epi_flag_batch", "flag_batch", "token_in_async_flags",
-                "token_in_transfer_warp_count", "token_back_mode", "input_dedup_mode",
-                "dfc1_m_group", "use_scaled_cvt",
-            )}
-            if explicit.get("enable_grad_y2_col_quant", False):
-                resolved["num_ctas_grad_y2_col_quant"] = -1
-                preset["num_ctas_grad_y2_col_quant"] = -1
+        phase_interleave = dict(
+            load_balance_mode="atomic_counter",
+            dfc2_subtile_publish=True,
+            dfc2_c_pipe_stages=2,
+            dfc2_acc_early_release=True,
+            phase_interleave_prologue_tiles=0,
+            phase_interleave_defer_consumers_until_full=True,
+            phase_interleave_fuse_ready_probe_and_producer_claim=True,
+            dfc1_m_group=16,
+            use_scaled_cvt=True,
+        )
+        explicit = {k: fields[k] for k in ("schedule_mode", *grouped)
+                    if k in fields and fields[k] is not _UNSPECIFIED and fields[k] != "auto"}
+        mode = explicit.get("schedule_mode")
+        if mode is None:
+            tile_n = mma_tiler_mnk[1]
+            bits = 2 if use_2cta_instrs else 1
+            fits = (tile_n == 256 and intermediate > 0 and intermediate % tile_n == 0
+                    and intermediate // tile_n * bits <= 30)
+            mode = "phase_interleave" if fits and explicit.get("load_balance_mode") != "static" else "grouped"
+        defaults = phase_interleave if mode == "phase_interleave" else grouped
+        return {**defaults, **explicit, "schedule_mode": mode}
+
+    @classmethod
+    def _resolve_tuning(cls, problem: Mapping, implementation: Mapping) -> dict:
+        """Fill defaults for omitted knobs and validate the combination.
+
+        Both from_kwargs and descriptor callers use this host-only step. The schedule
+        follows resolve_schedule (phase_interleave with its tuned fields where the shape
+        fits, else grouped); transport fields default to the plain values. A field that
+        is not one of this kernel's knobs is an error.
+        """
+        unknown = sorted(set(implementation) - cls.impl_desc_require().keys())
+        if unknown:
+            raise TypeError(f"{cls.__name__}: unknown implementation field(s) {unknown}")
+        explicit = {k: v for k, v in implementation.items() if v is not _UNSPECIFIED}
+
+        resolved = dict(
+            token_back_mode="epi_warps",
+            epi_flag_batch=(1, 1),
+            flag_batch=1,
+            token_in_async_flags=False,
+            token_in_transfer_warp_count=4,
+            dfc2_d_pipe_stages=1,
+            input_dedup_mode="auto",  # rank dedup when the transport supports it, else off
+        )
         # None is the explicit spelling of the hardware-resident group count.
         if explicit.get("group_hint", _UNSPECIFIED) is None:
             explicit["group_hint"] = explicit["launch_cluster_count"]
         resolved.update(explicit)
+        resolved.update(cls.resolve_schedule(
+            explicit,
+            intermediate=problem["intermediate_gateup_size"],
+            mma_tiler_mnk=resolved["mma_tiler_mnk"],
+            use_2cta_instrs=resolved["use_2cta_instrs"],
+        ))
         resolved["epi_flag_batch"] = tuple(resolved["epi_flag_batch"]) if resolved["epi_flag_batch"] is not None else (1, 1)
 
         if type(resolved["token_in_async_flags"]) is not bool:
@@ -380,23 +371,14 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             raise ValueError("dfc1_m_group must be 1 or 16")
         if resolved["dfc1_m_group"] != 1 and not rolling:
             raise ValueError("M16 traversal requires phase_interleave")
-        if resolved["input_dedup_mode"] not in ("off", "rank"):
-            raise ValueError("input_dedup_mode must be 'off' or 'rank'")
-        if resolved["num_ctas_grad_y2_col_quant"] == -1 and not resolved.get("enable_grad_y2_col_quant", False):
-            raise ValueError("automatic grad_y2 grid requires enable_grad_y2_col_quant=True")
+        if resolved["input_dedup_mode"] not in ("auto", "off", "rank"):
+            raise ValueError("input_dedup_mode must be 'auto', 'off' or 'rank'")
         if resolved["dfc2_subtile_publish"]:
             extent = problem["intermediate_gateup_size"]
             tile_n = resolved["mma_tiler_mnk"][1]
             bits = 2 if resolved["use_2cta_instrs"] else 1
             if extent <= 0 or extent % tile_n or extent // tile_n * bits > 30:
                 raise ValueError("dfc2_subtile_publish requires aligned N and at most 30 ready-mask bits")
-
-        overrides = {k: v for k, v in explicit.items() if k in preset and v != preset[k]}
-        resolved["enable_dgrad_optimizations"] = enabled
-        resolved["dgrad_optimization_profile"] = (
-            "ds3_ep4_v1_custom" if overrides else "ds3_ep4_v1"
-        ) if enabled else (legacy_schedule or "explicit")
-        resolved["dgrad_optimization_overrides"] = overrides
         return resolved
 
     @classmethod
@@ -411,9 +393,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         sf_padding_block: int,
         load_balance_mode: str = _UNSPECIFIED,
         static_expert_shape: Optional[Tuple[int, int, int]] = None,
-        force_static_sched: bool = True,
-        clc_bundle_size: Optional[int] = None,
-        num_sched_stages: Optional[int] = _UNSPECIFIED,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         ab_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
         sf_vec_size: int = 32,
@@ -427,7 +406,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         launch_cluster_count: int,
         drop_on_overflow: bool,
         data_token_capacity: Optional[int] = None,
-        fc2_in_kernel_topk_reduce: bool = False,
         token_back_mode: Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] = "epi_warps",
         epi_flag_batch: Optional[Tuple[int, int]] = _UNSPECIFIED,
         flag_batch: int = 1,
@@ -438,9 +416,8 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         dfc2_recompute: bool = False,
         dfc2_col_output: bool = False,
         enable_grad_y2_col_quant: bool = False,
-        num_ctas_grad_y2_col_quant: int = _UNSPECIFIED,
         use_scaled_cvt: bool = _UNSPECIFIED,
-        schedule_mode: Literal["grouped", "phase_interleave"] = _UNSPECIFIED,
+        schedule_mode: Literal["auto", "grouped", "phase_interleave"] = _UNSPECIFIED,
         dfc2_subtile_publish: bool = _UNSPECIFIED,
         dfc2_c_pipe_stages: int = _UNSPECIFIED,
         dfc2_d_pipe_stages: int = 1,
@@ -448,14 +425,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         phase_interleave_prologue_tiles: Optional[int] = _UNSPECIFIED,
         phase_interleave_defer_consumers_until_full: bool = _UNSPECIFIED,
         phase_interleave_fuse_ready_probe_and_producer_claim: bool = _UNSPECIFIED,
-        phase_interleave_defer_linear1_until_input_ready: bool = False,
-        prefetch_tma_descriptors: bool = False,
-        dfc1_weight_l2_prefetch_depth: int = 0,
         weight_storage_mode: WeightStorageMode = "contiguous",
-        enable_dgrad_optimizations: bool = False,
         input_dedup_mode: str = _UNSPECIFIED,
         dfc1_m_group: int = _UNSPECIFIED,
-        dgrad_schedule: Optional[str] = None,
         token_in_async_flags: bool = _UNSPECIFIED,
     ) -> "Sm107MegaMoEMxfp8DgluKernel":
         """Build the ``(ProblemDesc, ImplDesc)`` pair from the legacy flat signature."""
@@ -496,14 +468,10 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 "token_padding_block": token_padding_block,
                 "sf_padding_block": sf_padding_block,
                 "load_balance_mode": load_balance_mode,
-                "force_static_sched": force_static_sched,
-                "clc_bundle_size": clc_bundle_size,
-                "num_sched_stages": num_sched_stages,
                 "acc_dtype": acc_dtype,
                 "sf_vec_size": sf_vec_size,
                 "launch_cluster_count": launch_cluster_count,
                 "drop_on_overflow": drop_on_overflow,
-                "fc2_in_kernel_topk_reduce": fc2_in_kernel_topk_reduce,
                 "token_back_mode": token_back_mode,
                 "epi_flag_batch": epi_flag_batch,
                 "flag_batch": flag_batch,
@@ -522,19 +490,11 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 "phase_interleave_fuse_ready_probe_and_producer_claim": (
                     phase_interleave_fuse_ready_probe_and_producer_claim
                 ),
-                "phase_interleave_defer_linear1_until_input_ready": (
-                    phase_interleave_defer_linear1_until_input_ready
-                ),
-                "prefetch_tma_descriptors": prefetch_tma_descriptors,
-                "dfc1_weight_l2_prefetch_depth": dfc1_weight_l2_prefetch_depth,
                 "use_scaled_cvt": use_scaled_cvt,
                 "enable_grad_y2_col_quant": enable_grad_y2_col_quant,
-                "num_ctas_grad_y2_col_quant": num_ctas_grad_y2_col_quant,
                 "weight_storage_mode": weight_storage_mode,
-                "enable_dgrad_optimizations": enable_dgrad_optimizations,
                 "input_dedup_mode": input_dedup_mode,
                 "dfc1_m_group": dfc1_m_group,
-                "dgrad_schedule": dgrad_schedule,
             }
         )
         return cls(problem_desc, impl_desc)
@@ -542,7 +502,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         resolved = self._resolve_tuning(problem_desc, impl_desc)
         self.resolved_dgrad_config = MappingProxyType(resolved)
-        self.enable_dgrad_optimizations = resolved["enable_dgrad_optimizations"]
         self.input_dedup_mode = resolved["input_dedup_mode"]
         impl_desc = ImplDesc(resolved)
         self._validate_desc_inputs(problem_desc, impl_desc)
@@ -574,14 +533,10 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         token_padding_block = impl_desc["token_padding_block"]
         sf_padding_block = impl_desc["sf_padding_block"]
         load_balance_mode = impl_desc["load_balance_mode"]
-        force_static_sched = impl_desc["force_static_sched"]
-        clc_bundle_size = impl_desc["clc_bundle_size"]
-        num_sched_stages = impl_desc["num_sched_stages"]
         acc_dtype = impl_desc["acc_dtype"]
         sf_vec_size = impl_desc["sf_vec_size"]
         launch_cluster_count = impl_desc["launch_cluster_count"]
         drop_on_overflow = impl_desc["drop_on_overflow"]
-        fc2_in_kernel_topk_reduce = impl_desc["fc2_in_kernel_topk_reduce"]
         token_back_mode = impl_desc["token_back_mode"]
         epi_flag_batch = impl_desc["epi_flag_batch"]
         flag_batch = impl_desc["flag_batch"]
@@ -601,19 +556,12 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         self.enable_grad_y2_col_quant = impl_desc["enable_grad_y2_col_quant"]
         # Retired rows must be cleared when a captured graph receives fewer tokens.
         self.clear_grad_y2_stale_tail = self.enable_grad_y2_col_quant
-        self.num_ctas_grad_y2_col_quant = impl_desc["num_ctas_grad_y2_col_quant"]
         weight_storage_mode = impl_desc.get("weight_storage_mode") or "contiguous"
 
         if hidden != static_expert_shape[2]:
             raise ValueError(f"hidden ({hidden}) must equal static_expert_shape[2] ({static_expert_shape[2]}).")
         token_back_by_dispatch = token_back_mode != "epi_warps"
         combine_format = CombineFormat.parse("bf16" if combine_format is None else str(combine_format))
-        # in-kernel topk reduce only conflicts with a QUANTIZED combine (no per-topk
-        # reduced-plane accumulation for quantized).  It DOES work with the
-        # standalone/reuse_dispatch token-back modes (the token_comm token_back path
-        # honours token_back_reduce_topk), so those are allowed (mirrors the legacy).
-        if fc2_in_kernel_topk_reduce and combine_format.is_quantized:
-            raise ValueError("fc2_in_kernel_topk_reduce requires a non-quantized (bf16) combine.")
         if token_back_mode not in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
             raise ValueError(f"unsupported token_back_mode={token_back_mode!r}.")
         if type(token_in_transfer_warp_count) is not int or not 1 <= token_in_transfer_warp_count <= 32:
@@ -630,9 +578,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             sf_padding_block=sf_padding_block,
             load_balance_mode=load_balance_mode,
             static_expert_shape=static_expert_shape,
-            force_static_sched=force_static_sched,
-            clc_bundle_size=clc_bundle_size,
-            num_sched_stages=num_sched_stages,
             acc_dtype=acc_dtype,
             ab_dtype=ab_dtype,
             sf_vec_size=sf_vec_size,
@@ -652,7 +597,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 phase_interleave_fuse_ready_probe_and_producer_claim
             ),
             use_scaled_cvt=use_scaled_cvt,
-            fc2_in_kernel_topk_reduce=fc2_in_kernel_topk_reduce,
             act_func=act_func,
             gate_up_clamp=gate_up_clamp,
             weight_storage_mode=weight_storage_mode,
@@ -747,7 +691,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         self.intermediate_downproj = static_expert_shape[1]
         self.intermediate_gateup = self.intermediate_downproj * 2
         self.num_total_experts = world_size * self.num_experts_per_rank
-        self.reduce_topk_in_kernel = fc2_in_kernel_topk_reduce
+        # Training always reduces top-k in the separate deterministic TopkReduce kernel;
+        # the attribute is part of the kernel interface.
+        self.reduce_topk_in_kernel = False
         self.token_back_schedule_mode = load_balance_mode if load_balance_mode == "atomic_counter" else "static"
 
         # --- next Router-push token communication component. ---
@@ -791,13 +737,14 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 "drop_on_overflow": drop_on_overflow,
                 "token_in_flag_batch": flag_batch,
                 "token_in_async_flags": impl_desc["token_in_async_flags"],
-                "input_dedup_mode": self.input_dedup_mode,
                 "token_back_mode": token_back_mode,
                 "token_back_schedule_mode": self.token_back_schedule_mode,
-                "reduce_topk_in_kernel": fc2_in_kernel_topk_reduce,
+                "reduce_topk_in_kernel": False,
             }
         )
-        self.token_comm = TokenCommDeterministic(tc_problem_desc, tc_impl_desc)
+        self.token_comm = self._build_token_comm(tc_problem_desc, tc_impl_desc, self.input_dedup_mode)
+        # The mode actually built: "auto" resolves to "rank" or "off" here.
+        self.input_dedup_mode = self.token_comm.input_dedup_mode
         self.dfc1_m_group = impl_desc["dfc1_m_group"]
         if self.dfc1_m_group not in (1, 16):
             raise ValueError("dfc1_m_group must be 1 or 16")
@@ -827,8 +774,8 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 f"local={sched_local_bytes}, shared={sched_shared_bytes}."
             )
 
-        # --- Post-kernel top-k reduction (skipped under in-kernel reduce). ---
-        self._topk_reduce = None if fc2_in_kernel_topk_reduce else TopkReduce(hidden, num_topk, combine_format)
+        # --- Post-kernel top-k reduction. ---
+        self._topk_reduce = TopkReduce(hidden, num_topk, combine_format)
 
         # --- Device workspace (next model): dGLU pools + token_comm regions. ---
         self._mega_device_workspace = self._build_megamoe_device_workspace()
@@ -845,12 +792,8 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         self.token_padding_block = token_padding_block
         self.sf_padding_block = sf_padding_block
         self.load_balance_mode = load_balance_mode
-        self.force_static_sched = force_static_sched
-        self.clc_bundle_size = clc_bundle_size
-        self.num_sched_stages = num_sched_stages
         self.acc_dtype = acc_dtype
         self.sf_vec_size = sf_vec_size
-        self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self.epi_flag_batch = tuple(epi_flag_batch)
         self.flag_batch = flag_batch
         self.token_in_async_flags = impl_desc["token_in_async_flags"]
@@ -873,11 +816,28 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                     * min(self.num_topk, self.num_experts_per_rank)
                 ),
                 quant_type=col_quant_type,
-                num_persistent_ctas=self.num_ctas_grad_y2_col_quant,
                 token_padding_block=self.token_padding_block,
                 sf_padding_block=self.sf_padding_block,
                 dst_k_major=True,
             )
+
+    @staticmethod
+    def _build_token_comm(problem_desc: ProblemDesc, impl_desc: ImplDesc, dedup_mode: str):
+        """Build the transport; ``auto`` takes rank dedup unless the transport rejects it.
+
+        Rank dedup needs backward routing, a quantized activation, uncapped receive capacity
+        and route-word bounds (see ``_MetadataPushRouter``). If that construction fails, the
+        dedup-free transport is built; an error that is not dedup specific fails there too.
+        """
+        def build(mode):
+            return TokenCommDeterministic(problem_desc, ImplDesc({**impl_desc, "input_dedup_mode": mode}))
+
+        if dedup_mode != "auto":
+            return build(dedup_mode)
+        try:
+            return build("rank")
+        except ValueError:
+            return build("off")
 
     def _smem_misc_budget_bytes(self) -> int:
         """Reserve the token_comm transport + scheduler SMEM on top of the base misc budget."""
@@ -1216,20 +1176,8 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         )
         pool_topk_scores = self.token_comm.fc1_topk_scores_tensor(dw)
 
-        if cutlass.const_expr(self.reduce_topk_in_kernel):
-            # In-kernel top-k reduce (epi_warps + bf16 combine): the epilogue red-adds each
-            # topk grad_x contribution straight into the (pre-zeroed) 2D output.
-            pre_reduced = cute.make_tensor(
-                output_activation.iterator,
-                cute.make_layout(
-                    (output_activation.shape[0], 1, output_activation.shape[1]),
-                    stride=(output_activation.stride[0], output_activation.stride[0], output_activation.stride[1]),
-                ),
-            )
-            pre_reduced_sf = None
-        else:
-            pre_reduced = self.token_comm.pre_reduced_activation_tensor(dw)
-            pre_reduced_sf = self.token_comm.pre_reduced_activation_sf_tensor(dw)
+        pre_reduced = self.token_comm.pre_reduced_activation_tensor(dw)
+        pre_reduced_sf = self.token_comm.pre_reduced_activation_sf_tensor(dw)
 
         if cutlass.const_expr(self.token_comm.token_back_push_data):
             # token_back-by-dispatch: the epilogue writes grad_x to the LOCAL fc2_activation
@@ -1295,8 +1243,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         )
 
         # Post-kernel top-k reduction: dequant + K-sum into the final output.
-        if cutlass.const_expr(not self.reduce_topk_in_kernel):
-            self._topk_reduce(pre_reduced, pre_reduced_sf, output_activation, None, stream)
+        self._topk_reduce(pre_reduced, pre_reduced_sf, output_activation, None, stream)
 
         # Export the routed dfc2 input in token-axis MXFP8 form. The source
         # grad_out pool and its row-wise SF remain resident after reset_tail.

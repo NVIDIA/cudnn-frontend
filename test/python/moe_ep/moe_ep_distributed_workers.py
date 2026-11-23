@@ -13,10 +13,13 @@ import torch.distributed as dist
 
 from moe_ep.moe_ep_test_support import (
     _allocate_stateless_training_outputs,
+    _allocate_training_wgrad_outputs,
     _allocate_training_weight_staging,
     _assert_backward_matches,
     _assert_grouped_wgrads_match_reference,
     _assert_matches_reference,
+    _assert_training_wgrads_match,
+    _assert_wgrad_padding_rows_contribute_zero,
     _assert_wgrads_match_reference,
     _dense_wgrads_from_grouped_kernel,
     _fixed_training_reference,
@@ -30,6 +33,7 @@ from moe_ep.moe_ep_test_support import (
     _poison_training_outputs_for_test,
     _reference_forward,
     _replay_cuda_graph,
+    _run_training_wgrad,
     make_distributed_forward_inputs,
     quantize_mxfp8,
 )
@@ -767,6 +771,11 @@ def _run_backward_reference_case(
             out=backward_out,
         )
         grouped_wgrads = _dense_wgrads_from_grouped_kernel(actual_wgrads)
+        training_wgrads = _run_training_wgrad(
+            op,
+            actual_wgrads,
+            _allocate_training_wgrad_outputs(grouped_wgrads),
+        )
         torch.cuda.synchronize(device)
 
         # No rank may enter a local assertion while a peer is still inside a
@@ -817,6 +826,12 @@ def _run_backward_reference_case(
                 grouped_wgrads,
                 expected_dense_wgrads,
                 reference_name="the independent PyTorch MXFP8 reference",
+            )
+            _assert_wgrad_padding_rows_contribute_zero(actual_wgrads)
+            _assert_training_wgrads_match(
+                training_wgrads,
+                expected_dense_wgrads,
+                grouped=grouped_wgrads,
             )
         except BaseException as error:
             assertion_error = error

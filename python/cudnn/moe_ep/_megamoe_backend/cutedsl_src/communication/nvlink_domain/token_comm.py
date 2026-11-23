@@ -447,6 +447,7 @@ class _MetadataPushRouter(KernelComponent):
         activation: Optional[cute.Tensor] = None,  # (tokens, hidden) FP4 rows, relay payload source
         activation_sf: Optional[cute.Tensor] = None,  # (tokens, hidden // sf_vector) scale factors
         activation_scales: Optional[cute.Tensor] = None,  # (max_tokens_per_rank,) fp32, local
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         """Launch counting-sort DATA, size-exchange HELPER, and metadata PUSH roles."""
         if cutlass.const_expr(self.apply_topk_at_fc1 and topk_scores is None):
@@ -468,6 +469,7 @@ class _MetadataPushRouter(KernelComponent):
             gin_shared_window_offset,
             activation,
             activation_sf,
+            tmp_buffer,
         ).launch(
             grid=[self.router_grid_cta_count, 1, 1],
             block=[self.router_warps_per_cta * 32, 1, 1],
@@ -491,6 +493,7 @@ class _MetadataPushRouter(KernelComponent):
         gin_shared_window_offset,  # Optional[Int64]: None without GIN resources
         activation: Optional[cute.Tensor],
         activation_sf: Optional[cute.Tensor],
+        tmp_buffer: Optional[cute.Pointer],
     ) -> None:
         # First statement on purpose: a by-value NCCL DevComm argument must be materialized where it
         # dominates the whole kernel (see the fused kernel); the base router rejects the handles.
@@ -509,7 +512,7 @@ class _MetadataPushRouter(KernelComponent):
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
 
-        device_workspace.assign_device_members(local_workspace, shared_workspace)
+        device_workspace.assign_device_members(local_workspace, shared_workspace, tmp_buffer)
         self._device_workspace = device_workspace
         self._peer_rank_ptr_mapper = peer_rank_ptr_mapper
         self._router_local_rank = local_rank
@@ -1688,6 +1691,7 @@ class TokenCommNonDeterministic(KernelComponent):
         activation: Optional[cute.Tensor] = None,
         activation_sf: Optional[cute.Tensor] = None,
         activation_scales: Optional[cute.Tensor] = None,
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         self._router.launch_router(
             topk_indices,
@@ -1704,6 +1708,7 @@ class TokenCommNonDeterministic(KernelComponent):
             activation,
             activation_sf,
             activation_scales,
+            tmp_buffer=tmp_buffer,
         )
 
     # Pool-layout hooks. The NVLink-domain component consumes the router's tables directly; the
@@ -1714,6 +1719,15 @@ class TokenCommNonDeterministic(KernelComponent):
     def local_expert_sizes(self, device_workspace: DeviceWorkspace, local_rank: Int32) -> cute.Tensor:
         """This rank's expert token counts in pool order (scheduler tiles, token_in / token_back loops)."""
         return self._router.local_expert_sizes(device_workspace, local_rank)
+
+    @property
+    def sizes_ready_region(self) -> str:
+        """The counter ``wait_for_sizes_ready`` polls at system scope until it reaches ``sizes_ready_target``."""
+        return self._router.sizes_ready_region
+
+    @property
+    def sizes_ready_target(self) -> int:
+        return self._router.ranks_per_node
 
     @cute.jit
     def wait_for_sizes_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
@@ -1867,7 +1881,7 @@ class TokenCommNonDeterministic(KernelComponent):
     @property
     def name_token(self) -> str:
         """Compile-cache token of the communication component. Empty here: the NVLink-domain
-        component is the baseline and its kernel keeps main's compile-cache name."""
+        component is the baseline and its kernel name carries no component token."""
         return ""
 
     @property
@@ -3354,14 +3368,17 @@ class TokenCommNonDeterministic(KernelComponent):
         transfer_warp_idx = self._transfer_warp_idx
         lane_idx = self._lane_idx
         transfer_thread_idx = transfer_warp_idx * Int32(32) + lane_idx
+        # Only a local drain before the reset. Peers write this rank's shared tail counters (sizes,
+        # sizes_ready, metadata_ready) solely from their routers, each push ending in a system-fenced
+        # increment of an exact-count ready flag; token_in acquired both flags at their targets, so no
+        # write of this call is still in flight, and the grid sync carries that to the resetting CTA.
+        # Only the publish below has to cross ranks: the next call's routers add into the reset counters.
         iket.range_push("tail.nvlink_drain")
-        self._nvlink_barrier.arrive_and_wait(
+        self._nvlink_barrier.sync(
             self.transfer_thread_count,
             Int32(self.promised_launchable_sm_count),
             self._linear_cta_idx,
             transfer_thread_idx,
-            prologue_grid_sync=True,
-            epilogue_grid_sync=False,
         )
         iket.range_pop()
         total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
@@ -3383,7 +3400,7 @@ class TokenCommNonDeterministic(KernelComponent):
         if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") == "1"):
             iket.range_push("tail.ncu_finalize")
             self._nvlink_barrier.finalize(
-                2,
+                1,
                 self.transfer_thread_count,
                 Int32(self.promised_launchable_sm_count),
                 self._linear_cta_idx,

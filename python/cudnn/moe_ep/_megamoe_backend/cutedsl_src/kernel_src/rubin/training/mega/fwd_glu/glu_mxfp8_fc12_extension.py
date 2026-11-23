@@ -8,11 +8,11 @@ from typing import ClassVar, List, Literal, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import cute as cute_ir, cute_nvgpu as cute_nvgpu_ir, llvm
-from cutlass.cute.typing import AddressSpace, Pointer
-from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op, extract_mlir_values, new_from_mlir_values
+from cutlass.cute.typing import Pointer
+from cutlass.cutlass_dsl import Boolean, Int32, extract_mlir_values, new_from_mlir_values
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
+from ......helpers.discrete_weight import WeightStorageMode, copy_discrete_weight_descriptor_pointer
 from ......helpers.dsl_helpers import spin_peek, spin_wait
 from .....schedulers.fc12_mapping import BlockPhase, NonSwapAbFc12WorkTileInfo, peek_ready_bit
 from ....custom_mix_cga_helpers import PipelineTmaUmmaMixedCga
@@ -34,111 +34,6 @@ TensorRole = Literal[
     "fc2_weight",
     "fc2_weight_sf",
 ]
-WeightStorageMode = Literal["contiguous", "discrete"]
-
-_descriptor_byte_count = 128
-_discrete_weight_descriptor_roles = (
-    "fc1_weight",
-    "fc1_weight_sf",
-    "fc2_weight",
-    "fc2_weight_sf",
-)
-_discrete_weight_descriptor_slot = {
-    tensor_role: slot_index
-    for slot_index, tensor_role in enumerate(_discrete_weight_descriptor_roles)
-}
-
-
-def discrete_weight_descriptor_workspace_size(
-    expert_count: int, is_mixed_cga: bool = False
-) -> int:
-    """Return storage bytes for four 128-byte TensorMaps per expert and CGA shape."""
-    if (
-        not isinstance(expert_count, int)
-        or isinstance(expert_count, bool)
-        or expert_count <= 0
-    ):
-        raise ValueError("expert_count must be a positive integer.")
-    if not isinstance(is_mixed_cga, bool):
-        raise ValueError(f"is_mixed_cga must be a bool, got {is_mixed_cga!r}.")
-    return (
-        expert_count
-        * (1 + int(is_mixed_cga))
-        * len(_discrete_weight_descriptor_roles)
-        * _descriptor_byte_count
-    )
-
-
-def discrete_weight_descriptor_workspace_alignment() -> int:
-    return _descriptor_byte_count
-
-
-@cute.jit
-def raw_discrete_weight_descriptor_pointer(
-    descriptor_workspace: Pointer,
-    tensor_role: TensorRole,
-    expert_idx: Int32,
-    cluster_variant: Int32 = cutlass.Int32(0),
-    is_mixed_cga: cutlass.Constexpr = False,
-) -> Pointer:
-    """Return the 128-byte-aligned descriptor slot for one expert/cluster operand.
-
-    Layout per expert is ``[preferred roles | fallback roles]`` when
-    ``is_mixed_cga``; uniform launches keep only the preferred roles.
-    """
-    slot_index = _discrete_weight_descriptor_slot[tensor_role]
-    byte_offset = (
-        (
-            expert_idx * Int32(1 + int(is_mixed_cga))
-            + cluster_variant
-        )
-        * Int32(len(_discrete_weight_descriptor_roles))
-        + Int32(slot_index)
-    ) * Int32(_descriptor_byte_count)
-    return (descriptor_workspace + byte_offset).align(_descriptor_byte_count)
-
-
-@dsl_user_op
-def copy_discrete_weight_descriptor_pointer(
-    descriptor_workspace: Pointer,
-    tensor_role: TensorRole,
-    expert_idx: Int32,
-    cluster_variant: Int32,
-    is_mixed_cga: cutlass.Constexpr,
-    *,
-    loc=None,
-    ip=None,
-) -> Pointer:
-    """Convert a raw GMEM descriptor slot to the type accepted by TMA copy."""
-    raw_pointer = raw_discrete_weight_descriptor_pointer(
-        descriptor_workspace,
-        tensor_role,
-        expert_idx,
-        cluster_variant,
-        is_mixed_cga,
-    )
-    generic_llvm_pointer = llvm.addrspacecast(
-        llvm.PointerType.get(AddressSpace.generic),
-        raw_pointer.llvm_ptr,
-        loc=loc,
-        ip=ip,
-    )
-    generic_pointer = cute.make_ptr(
-        raw_pointer.dtype,
-        generic_llvm_pointer,
-        AddressSpace.generic,
-        assumed_align=raw_pointer.alignment,
-        loc=loc,
-        ip=ip,
-    )
-    descriptor_pointer_type = cute_ir.PtrType.get(
-        cute_nvgpu_ir.TmaDescriptorTiledType.get(),
-        generic_pointer.memspace,
-        generic_pointer.alignment,
-    )
-    return cute_ir.recast_iter(descriptor_pointer_type, generic_pointer.value)
-
-
 @cute.jit
 def _rewrite_tensor_shape(tensor: cute.Tensor, new_shape: Tuple) -> cute.Tensor:
     return cute.make_tensor(tensor.iterator, cute.make_layout(new_shape, stride=tensor.stride))
@@ -457,7 +352,6 @@ __all__ = [
     "MixedCgaPipeline",
     "OneShotSchedConsumer",
     "TensorRole",
-    "WeightStorageMode",
     "make_mixed_cga_tma_umma_pipeline",
 ]
 

@@ -2709,4 +2709,3 @@ class GluMxfp8Epilogue:
                 )
 
         flag_tracker.fire()
-

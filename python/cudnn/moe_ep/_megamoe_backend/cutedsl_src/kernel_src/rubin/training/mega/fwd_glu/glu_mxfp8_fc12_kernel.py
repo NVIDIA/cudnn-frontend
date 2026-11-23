@@ -47,14 +47,13 @@ from ....custom_mix_cga_helpers import (
 from .....schedulers.non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
 from .glu_mxfp8_fc12_epilogue import EpiWarpCount, Fc1CTMAStages, GluMxfp8Epilogue
 from .glu_mxfp8_fc12_epilogue_breuse import GluMxfp8BreuseEpilogue
-from .glu_mxfp8_fc12_extension import (
-    GluMxFp8Fc12SchedExtension,
-    OneShotSchedConsumer,
+from .glu_mxfp8_fc12_extension import GluMxFp8Fc12SchedExtension, OneShotSchedConsumer, make_mixed_cga_tma_umma_pipeline
+from ......helpers.discrete_weight import (
     WeightStorageMode,
     discrete_weight_descriptor_workspace_alignment,
     discrete_weight_descriptor_workspace_size,
-    make_mixed_cga_tma_umma_pipeline,
-    raw_discrete_weight_descriptor_pointer,
+    initialize_discrete_weight_descriptors,
+    initialize_mixed_cga_discrete_weight_descriptors,
 )
 
 # The folded mbarrier init in the kernel needs PipelineUmmaAsync.create(defer_init=...), which
@@ -88,19 +87,6 @@ def _make_executable_tma_atom_for_cluster(
 ) -> cute.CopyAtom:
     """Materialize the executable TMA atom of the active runtime cluster."""
     return select_tma_atom_for_cluster(make_executable_tma_atom_or_pair(atom_or_pair), is_fallback_cluster)
-
-
-@cute.jit
-def _int64_pointer_array_tensor(pointer_array: cute.Pointer, element_count: int):
-    return cute.make_tensor(
-        cute.make_ptr(
-            cutlass.Int64,
-            pointer_array.toint(),
-            cute.AddressSpace.gmem,
-            assumed_align=8,
-        ),
-        cute.make_layout((element_count,)),
-    )
 
 
 # =============================================================================
@@ -1205,186 +1191,6 @@ class Sm107Mxfp8GluFc12Kernel:
         """All-warp kernel tail (NVLink release, etc.).  No-op base."""
         pass
 
-    @cute.kernel
-    def _initialize_discrete_weight_descriptors(
-        self,
-        fc1_weight_ptrs: cute.Pointer,
-        fc1_weight_sf_ptrs: cute.Pointer,
-        fc2_weight_ptrs: cute.Pointer,
-        fc2_weight_sf_ptrs: cute.Pointer,
-        fc1_n: cutlass.Int32,
-        fc1_k: cutlass.Int32,
-        fc1_stride_n: cutlass.Int64,
-        fc2_n: cutlass.Int32,
-        fc2_k: cutlass.Int32,
-        fc2_stride_n: cutlass.Int64,
-        descriptor_workspace: cute.Pointer,
-        tiled_mma: cute.TiledMma,
-        tiled_mma_sfb: cute.TiledMma,
-        b_smem_layout,
-        sfb_smem_layout,
-        cluster_layout_vmnk_shape: cutlass.Constexpr,
-        cluster_layout_sfb_vmnk_shape: cutlass.Constexpr,
-        fallback_cluster_layout_vmnk_shape: cutlass.Constexpr,
-        fallback_cluster_layout_sfb_vmnk_shape: cutlass.Constexpr,
-    ) -> None:
-        """Build preferred (and mixCGA fallback) weight TensorMaps per expert."""
-        expert_idx = cute.arch.block_idx()[0]
-        expert_count = self.static_expert_shape[0]
-        singleton = cutlass.Int32(1)
-        zero = cutlass.Int64(0)
-
-        fc1_weight_pointer_values = _int64_pointer_array_tensor(
-            fc1_weight_ptrs, expert_count
-        )
-        fc1_weight_sf_pointer_values = _int64_pointer_array_tensor(
-            fc1_weight_sf_ptrs, expert_count
-        )
-        fc2_weight_pointer_values = _int64_pointer_array_tensor(
-            fc2_weight_ptrs, expert_count
-        )
-        fc2_weight_sf_pointer_values = _int64_pointer_array_tensor(
-            fc2_weight_sf_ptrs, expert_count
-        )
-
-        b_operation = sm100_utils.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-        sfb_operation = sm100_utils.cluster_shape_to_tma_atom_SFB(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-
-        fc1_weight_tensor = cute.make_tensor(
-            cute.make_ptr(
-                self.ab_dtype,
-                fc1_weight_pointer_values[expert_idx],
-                cute.AddressSpace.gmem,
-            ),
-            cute.make_layout(
-                (fc1_n, fc1_k, singleton),
-                stride=(fc1_stride_n, cutlass.Int64(1), zero),
-            ),
-        )
-        fc1_weight_sf_tensor = cute.make_tensor(
-            cute.make_ptr(
-                self.sf_dtype,
-                fc1_weight_sf_pointer_values[expert_idx],
-                cute.AddressSpace.gmem,
-            ),
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (fc1_n, fc1_k, singleton), self.sf_vec_size
-            ),
-        )
-        fc2_weight_tensor = cute.make_tensor(
-            cute.make_ptr(
-                self.ab_dtype,
-                fc2_weight_pointer_values[expert_idx],
-                cute.AddressSpace.gmem,
-            ),
-            cute.make_layout(
-                (fc2_n, fc2_k, singleton),
-                stride=(fc2_stride_n, cutlass.Int64(1), zero),
-            ),
-        )
-        fc2_weight_sf_tensor = cute.make_tensor(
-            cute.make_ptr(
-                self.sf_dtype,
-                fc2_weight_sf_pointer_values[expert_idx],
-                cute.AddressSpace.gmem,
-            ),
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (fc2_n, fc2_k, singleton), self.sf_vec_size
-            ),
-        )
-
-        for cluster_variant in cutlass.range_constexpr(
-            1 + int(self.is_mixed_cga)
-        ):
-            vmnk_shape = cluster_layout_vmnk_shape
-            sfb_vmnk_shape = cluster_layout_sfb_vmnk_shape
-            if cutlass.const_expr(cluster_variant == 1):
-                vmnk_shape = fallback_cluster_layout_vmnk_shape
-                sfb_vmnk_shape = fallback_cluster_layout_sfb_vmnk_shape
-            cluster_variant_i32 = cutlass.Int32(cluster_variant)
-
-            fc1_weight_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
-                b_operation,
-                fc1_weight_tensor,
-                b_smem_layout,
-                self.mma_tiler,
-                tiled_mma,
-                vmnk_shape,
-            )
-            cpasync.copy_tensormap(
-                fc1_weight_atom,
-                raw_discrete_weight_descriptor_pointer(
-                    descriptor_workspace,
-                    "fc1_weight",
-                    expert_idx,
-                    cluster_variant_i32,
-                    self.is_mixed_cga,
-                ),
-            )
-
-            fc1_weight_sf_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
-                sfb_operation,
-                fc1_weight_sf_tensor,
-                sfb_smem_layout,
-                self.mma_tiler_sfb,
-                tiled_mma_sfb,
-                sfb_vmnk_shape,
-                internal_type=cutlass.Uint64,
-            )
-            cpasync.copy_tensormap(
-                fc1_weight_sf_atom,
-                raw_discrete_weight_descriptor_pointer(
-                    descriptor_workspace,
-                    "fc1_weight_sf",
-                    expert_idx,
-                    cluster_variant_i32,
-                    self.is_mixed_cga,
-                ),
-            )
-
-            fc2_weight_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
-                b_operation,
-                fc2_weight_tensor,
-                b_smem_layout,
-                self.mma_tiler,
-                tiled_mma,
-                vmnk_shape,
-            )
-            cpasync.copy_tensormap(
-                fc2_weight_atom,
-                raw_discrete_weight_descriptor_pointer(
-                    descriptor_workspace,
-                    "fc2_weight",
-                    expert_idx,
-                    cluster_variant_i32,
-                    self.is_mixed_cga,
-                ),
-            )
-
-            fc2_weight_sf_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
-                sfb_operation,
-                fc2_weight_sf_tensor,
-                sfb_smem_layout,
-                self.mma_tiler_sfb,
-                tiled_mma_sfb,
-                sfb_vmnk_shape,
-                internal_type=cutlass.Uint64,
-            )
-            cpasync.copy_tensormap(
-                fc2_weight_sf_atom,
-                raw_discrete_weight_descriptor_pointer(
-                    descriptor_workspace,
-                    "fc2_weight_sf",
-                    expert_idx,
-                    cluster_variant_i32,
-                    self.is_mixed_cga,
-                ),
-            )
-
     @cute.jit
     def __call__(
         self,
@@ -1535,11 +1341,11 @@ class Sm107Mxfp8GluFc12Kernel:
                     assumed_align=16,
                 ),
                 cute.make_layout(
-                    (fc1_weight_n, fc1_weight_k, cutlass.Int32(1)),
+                    (fc1_weight_n, fc1_weight_k, 1),
                     stride=(
                         cutlass.Int64(hidden_b),
                         cutlass.Int64(1),
-                        cutlass.Int64(0),
+                        0,
                     ),
                 ),
             )
@@ -1586,7 +1392,7 @@ class Sm107Mxfp8GluFc12Kernel:
             fc1_weight_sf_shape = (
                 fc1_weight_n,
                 fc1_weight_k,
-                cutlass.Int32(1),
+                1,
             )
         fc1_weight_sf_gemm = cute.make_tensor(
             fc1_weight_sf_iterator,
@@ -1629,11 +1435,11 @@ class Sm107Mxfp8GluFc12Kernel:
                     assumed_align=16,
                 ),
                 cute.make_layout(
-                    (fc2_weight_n, fc2_weight_k, cutlass.Int32(1)),
+                    (fc2_weight_n, fc2_weight_k, 1),
                     stride=(
                         cutlass.Int64(intermediate_downproj_b2),
                         cutlass.Int64(1),
-                        cutlass.Int64(0),
+                        0,
                     ),
                 ),
             )
@@ -1696,7 +1502,7 @@ class Sm107Mxfp8GluFc12Kernel:
             fc2_weight_sf_shape = (
                 fc2_weight_n,
                 fc2_weight_k,
-                cutlass.Int32(1),
+                1,
             )
         fc2_weight_sf_gemm = cute.make_tensor(
             fc2_weight_sf_iterator,
@@ -1956,31 +1762,72 @@ class Sm107Mxfp8GluFc12Kernel:
             tma_atom_fc2_weight_sf_fallback = tma_atom_fc2_weight_sf
 
         if cutlass.const_expr(self.weight_storage_mode == "discrete"):
-            self._initialize_discrete_weight_descriptors(
-                fc1_weight,
-                fc1_weight_sf,
-                fc2_weight,
-                fc2_weight_sf,
-                fc1_weight_n,
-                fc1_weight_k,
-                cutlass.Int64(hidden_b),
-                fc2_weight_n,
-                fc2_weight_k,
-                cutlass.Int64(intermediate_downproj_b2),
-                weight_descriptor_workspace,
-                tiled_mma,
-                tiled_mma_sfb,
-                b_smem_layout,
-                sfb_smem_layout,
-                self.cluster_layout_vmnk.shape,
-                self.cluster_layout_sfb_vmnk.shape,
-                self.fallback_cluster_layout_vmnk.shape,
-                self.fallback_cluster_layout_sfb_vmnk.shape,
-            ).launch(
-                grid=(expert_cnt, 1, 1),
-                block=(1, 1, 1),
-                stream=stream,
-            )
+            # The descriptor slot layout must match is_mixed_cga, which also sizes the workspace
+            # and addresses the slots in the consumer: one TensorMap set per expert unless mixed.
+            if cutlass.const_expr(self.is_mixed_cga):
+                initialize_mixed_cga_discrete_weight_descriptors(
+                    fc1_weight,
+                    fc1_weight_sf,
+                    fc2_weight,
+                    fc2_weight_sf,
+                    intermediate_gateup,
+                    hidden_b,
+                    hidden_b,
+                    hidden_b2,
+                    intermediate_downproj_b2,
+                    intermediate_downproj_b2,
+                    weight_descriptor_workspace,
+                    tiled_mma,
+                    tiled_mma_sfb,
+                    b_smem_layout,
+                    sfb_smem_layout,
+                    self.cluster_layout_vmnk.shape,
+                    self.cluster_layout_sfb_vmnk.shape,
+                    self.fallback_cluster_layout_vmnk.shape,
+                    self.fallback_cluster_layout_sfb_vmnk.shape,
+                    self.ab_dtype,
+                    self.sf_dtype,
+                    self.sf_vec_size,
+                    self.cluster_shape_mn,
+                    self.mma_tiler,
+                    self.mma_tiler_sfb,
+                    self.static_expert_shape,
+                ).launch(
+                    grid=(expert_cnt, 1, 1),
+                    block=(1, 1, 1),
+                    stream=stream,
+                )
+            else:
+                initialize_discrete_weight_descriptors(
+                    fc1_weight,
+                    fc1_weight_sf,
+                    fc2_weight,
+                    fc2_weight_sf,
+                    intermediate_gateup,
+                    hidden_b,
+                    hidden_b,
+                    hidden_b2,
+                    intermediate_downproj_b2,
+                    intermediate_downproj_b2,
+                    weight_descriptor_workspace,
+                    tiled_mma,
+                    tiled_mma_sfb,
+                    b_smem_layout,
+                    sfb_smem_layout,
+                    self.cluster_layout_vmnk.shape,
+                    self.cluster_layout_sfb_vmnk.shape,
+                    self.ab_dtype,
+                    self.sf_dtype,
+                    self.sf_vec_size,
+                    self.cluster_shape_mn,
+                    self.mma_tiler,
+                    self.mma_tiler_sfb,
+                    self.static_expert_shape,
+                ).launch(
+                    grid=(expert_cnt, 1, 1),
+                    block=(1, 1, 1),
+                    stream=stream,
+                )
 
         # ── Scheduler params + grid + launch ──
         if cutlass.const_expr(

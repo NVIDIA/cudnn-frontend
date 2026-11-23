@@ -270,14 +270,12 @@ def _prepare_case(
         raise RuntimeError("training graph probe prepared the wrong dgrad profile: " f"{backward.config.dgrad_optimization!r} != " f"{dgrad_optimization!r}")
     if backward.pool_token_capacity != physical_recv_pool_rows:
         raise RuntimeError("training graph probe prepared the wrong physical receive pool: " f"{backward.pool_token_capacity} != {physical_recv_pool_rows}")
-    upstream_profile = backward.kernel.resolved_dgrad_config["dgrad_optimization_profile"]
-    expected_upstream_profile = {
-        "baseline": "explicit",
-        "rolling": "optimized",
-        "ds3_ep4_pattern": "ds3_ep4_v1",
-    }[dgrad_optimization]
-    if upstream_profile != expected_upstream_profile:
-        raise RuntimeError("training graph probe did not select the requested upstream " f"profile: {upstream_profile!r} != " f"{expected_upstream_profile!r}")
+    upstream_dgrad_schedule = backward.kernel.resolved_dgrad_config["schedule_mode"]
+    expected_dgrad_schedule = "grouped" if dgrad_optimization == "baseline" else "phase_interleave"
+    if upstream_dgrad_schedule != expected_dgrad_schedule:
+        raise RuntimeError(
+            "training graph probe did not select the requested upstream " f"schedule: {upstream_dgrad_schedule!r} != " f"{expected_dgrad_schedule!r}"
+        )
     forward = state.forward_prepared
     expected_cluster = (4, 1, 1) if forward_tuning.mixed_cga else (2, 1, 1)
     if forward.config.cluster_shape_mnk != expected_cluster:

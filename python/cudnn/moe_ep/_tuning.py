@@ -86,10 +86,14 @@ class MoeEpTuningConfig:
 
     ``dgrad_optimization`` applies only to training backward. ``baseline``
     preserves the default grouped schedule, ``rolling`` selects the upstream
-    rolling schedule, and ``ds3_ep4_pattern`` selects the upstream preset originally
-    qualified on DS3 EP4 and now supported on additional topology and shape
-    combinations. The DS3 profile owns its preset fields and canonicalizes
-    ``epi_flag_batch`` to ``(4, 2)``.
+    phase-interleaved schedule with its tuned defaults (M16 traversal and
+    scaled FP8 conversion), and ``ds3_ep4_pattern`` additionally enables rank
+    input deduplication and asynchronous token-in flags. It is the preset
+    originally qualified on DS3 EP4 and now supported on additional topology
+    and shape combinations. The DS3 profile owns its preset fields and
+    canonicalizes ``epi_flag_batch`` to ``(4, 2)``. ``rolling`` and
+    ``ds3_ep4_pattern`` require compiling for ``sm_107a``, which is the default
+    when ``CUTE_DSL_ARCH`` is unset.
 
     ``scheduling``, ``fc2_bulk_store`` and ``mixed_cga`` select forward-kernel
     implementations and apply only to inference and training forward; training
@@ -107,7 +111,6 @@ class MoeEpTuningConfig:
     epi_flag_batch: tuple[int, int] = (1, 1)
     token_in_flag_batch: int = 1
     group_hint: int | None = None
-    reduce_topk_in_kernel: bool = False
     dgrad_optimization: Literal[
         "baseline",
         "rolling",
@@ -126,12 +129,8 @@ class MoeEpTuningConfig:
             raise ValueError("token_in_flag_batch must be one of " f"{tuple(sorted(_TOKEN_IN_FLAG_BATCHES))}, got " f"{self.token_in_flag_batch!r}")
         if self.group_hint is not None and (isinstance(self.group_hint, bool) or self.group_hint not in _GROUP_HINTS):
             raise ValueError("group_hint must be None or one of " f"{tuple(sorted(_GROUP_HINTS))}, got {self.group_hint!r}")
-        if not isinstance(self.reduce_topk_in_kernel, bool):
-            raise ValueError("reduce_topk_in_kernel must be a bool, got " f"{self.reduce_topk_in_kernel!r}")
         if not isinstance(self.dgrad_optimization, str) or self.dgrad_optimization not in _DGRAD_OPTIMIZATIONS:
             raise ValueError("dgrad_optimization must be one of " f"{tuple(sorted(_DGRAD_OPTIMIZATIONS))}, got " f"{self.dgrad_optimization!r}")
-        if self.reduce_topk_in_kernel and self.token_back_mode != "epi_warps":
-            raise ValueError("reduce_topk_in_kernel requires " "token_back_mode='epi_warps'")
         if not isinstance(self.scheduling, str) or self.scheduling not in _SCHEDULINGS:
             raise ValueError("scheduling must be one of " f"{tuple(sorted(_SCHEDULINGS))}, got {self.scheduling!r}")
         fc2_bulk_store = self.fc2_bulk_store
@@ -148,8 +147,6 @@ class MoeEpTuningConfig:
             )
         if not isinstance(self.mixed_cga, bool):
             raise ValueError(f"mixed_cga must be a bool, got {self.mixed_cga!r}")
-        if self.fc2_bulk_store != "off" and self.reduce_topk_in_kernel:
-            raise ValueError("fc2_bulk_store requires reduce_topk_in_kernel=False")
         if self.dgrad_optimization != "ds3_ep4_pattern":
             return
         if self.token_back_mode != "epi_warps":
@@ -160,8 +157,6 @@ class MoeEpTuningConfig:
             raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires " "token_in_flag_batch=1")
         if self.group_hint is not None:
             raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires group_hint=None")
-        if self.reduce_topk_in_kernel:
-            raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires " "reduce_topk_in_kernel=False")
         object.__setattr__(self, "epi_flag_batch", (4, 2))
 
 

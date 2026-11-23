@@ -15,6 +15,8 @@ from cutlass.cute.nvgpu.cpasync.copy import (
     CopyBulkTensorTileG2SMulticastNonExecTrait,
     CopyBulkTensorTileG2SMulticastTrait,
     CopyBulkTensorTileG2SNonExecTrait,
+    CopyBulkTensorTileG2SOverrideNonExecTrait,
+    CopyBulkTensorTileG2SOverrideTrait,
     CopyBulkTensorTileG2STrait,
     TMA_DESC_PTR_FIELD_NAME,
     TMA_MBAR_PTR_FIELD_NAME,
@@ -35,6 +37,14 @@ def make_executable_tma_atom(atom: cute.CopyAtom) -> cute.CopyAtom:
     elif cutlass.const_expr(isinstance(atom._trait, CopyBulkTensorTileG2SNonExecTrait)):
         executable_value = _cute_nvgpu_ir.atom_make_exec_tma(atom._trait.value)
         executable_trait = CopyBulkTensorTileG2STrait(executable_value)
+    elif cutlass.const_expr(isinstance(atom._trait, CopyBulkTensorTileG2SOverrideNonExecTrait)):
+        # Override loads (plain and multicast share one trait class): the instruction
+        # carries the per-issue global address / size / stride, see helpers/ptx_helpers.py.
+        executable_value = _cute_nvgpu_ir.atom_make_exec_tma(
+            atom._trait.value, override=True,
+            no_fully_oob_tile=getattr(atom._trait, "no_fully_oob_tile", False),
+        )
+        executable_trait = CopyBulkTensorTileG2SOverrideTrait(executable_value)
     else:
         raise TypeError(f"Unsupported non-executable TMA load trait {type(atom._trait)}.")
     return cute.CopyAtom(atom.op, executable_trait)

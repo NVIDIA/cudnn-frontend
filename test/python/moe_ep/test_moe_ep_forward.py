@@ -575,7 +575,6 @@ def test_dgrad_optimization_public_contract_and_phase_scope():
         {"epi_flag_batch": (2, 2)},
         {"token_in_flag_batch": 2},
         {"group_hint": 64},
-        {"reduce_topk_in_kernel": True},
     )
     for overrides in invalid_ds3:
         with pytest.raises(ValueError, match="ds3_ep4_pattern"):
@@ -623,8 +622,6 @@ def test_forward_kernel_tuning_public_contract_and_phase_scope():
             MoeEpTuningConfig(fc2_bulk_store=invalid)
     with pytest.raises(ValueError, match="mixed_cga must be a bool"):
         MoeEpTuningConfig(mixed_cga=1)
-    with pytest.raises(ValueError, match="fc2_bulk_store requires reduce_topk_in_kernel=False"):
-        MoeEpTuningConfig(fc2_bulk_store="auto", reduce_topk_in_kernel=True)
 
     # The DS3 backward preset is unaffected by the forward-kernel fields.
     assert MoeEpTuningConfig(dgrad_optimization="ds3_ep4_pattern").epi_flag_batch == (4, 2)
@@ -866,24 +863,6 @@ def test_one_operator_switches_mxfp8_and_plain_weight_families():
 
 
 @pytest.mark.L0
-def test_in_kernel_topk_reduce_does_not_accumulate_across_calls():
-    from cudnn import MoeEp, MoeEpTuningConfig
-
-    device = _sm107_device()
-    args = make_forward_inputs(device)
-    expected = _reference_forward(args)
-
-    with MoeEp(
-        _moe_ep_config(
-            **_forward_config(),
-            inference_tuning=MoeEpTuningConfig(reduce_topk_in_kernel=True),
-        )
-    ) as op:
-        _assert_matches_reference(op(*args), expected)
-        _assert_matches_reference(op(*args), expected)
-
-
-@pytest.mark.L0
 def test_nondefault_inference_tuning_reuses_runtime_workspace():
     from cudnn import MoeEp, MoeEpTuningConfig
 
@@ -921,7 +900,6 @@ def test_nondefault_inference_tuning_reuses_runtime_workspace():
             (4, 2),
             4,
             64,
-            False,
             False,
             None,
             "static",
@@ -1237,50 +1215,6 @@ def test_forward_kernel_tuning_inference_matches_reference_and_replays(case_name
     )
 
 
-# In-kernel top-k reduction composes with the forward scheduling knobs (only bulk store excludes it).
-_IN_KERNEL_REDUCE_TUNING_CASES = {
-    "atomic": {"scheduling": "atomic"},
-    "phase-mixed": {"scheduling": "phase_interleave", "mixed_cga": True},
-}
-
-
-def _in_kernel_reduce_tuning_inference_worker(case_name: str) -> None:
-    from cudnn import MoeEp, MoeEpTuningConfig
-
-    device = torch.device("cuda", 0)
-    torch.cuda.set_device(device)
-    args = make_forward_inputs(device)
-    expected = _reference_forward(args)
-
-    with MoeEp(_moe_ep_config(**_forward_config(), inference_tuning=MoeEpTuningConfig(reduce_topk_in_kernel=True))) as op:
-        static_output = op(*args).clone()
-        torch.cuda.synchronize(device)
-
-    tuning = MoeEpTuningConfig(reduce_topk_in_kernel=True, **_IN_KERNEL_REDUCE_TUNING_CASES[case_name])
-    with MoeEp(_moe_ep_config(**_forward_config(), inference_tuning=tuning)) as op:
-        outputs = [op(*args).clone() for _ in range(3)]
-        torch.cuda.synchronize(device)
-        # BF16 atomics make the reduction order-dependent: check each call against the reference.
-        for output in outputs:
-            _assert_matches_reference(output, expected)
-        prepared = op._execution_state.backend._prepared_kernel
-        assert prepared.config.cluster_shape_mnk == ((4, 1, 1) if tuning.mixed_cga else (2, 1, 1))
-    identical = all(torch.equal(output.view(torch.int16), static_output.view(torch.int16)) for output in outputs)
-    print(f"in-kernel reduce inference {case_name}: byte-identical to static scheduling: {identical}")
-
-
-@pytest.mark.L1
-@pytest.mark.gpu_exclusive
-@pytest.mark.parametrize("case_name", sorted(_IN_KERNEL_REDUCE_TUNING_CASES))
-def test_in_kernel_topk_reduce_with_forward_scheduling_matches_reference(case_name):
-    _sm107_device()
-    _run_isolated(
-        _in_kernel_reduce_tuning_inference_worker,
-        (case_name,),
-        what=f"in-kernel top-k reduce inference case {case_name}",
-    )
-
-
 _MIXED_CGA_INFERENCE_TUNINGS = {
     "mixed": {"mixed_cga": True},
     "mixed-phase-bulk": {"mixed_cga": True, "scheduling": "phase_interleave", "fc2_bulk_store": "auto"},
@@ -1480,7 +1414,6 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
         top_k=top_k,
         generate_c=False,
         enable_col_quant=False,
-        fc2_in_kernel_topk_reduce=True,
         combine_format="bf16",
     )
     resources = SimpleNamespace(
@@ -1499,8 +1432,8 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
         config,
         local_workspace_zero_bytes=0,
         shared_workspace_zero_bytes=0,
-        pre_reduced_activation_offset=None,
-        pre_reduced_activation_bytes_per_token=0,
+        pre_reduced_activation_offset=0,
+        pre_reduced_activation_bytes_per_token=top_k * hidden * 2,
         pre_reduced_activation_sf_offset=None,
         pre_reduced_activation_sf_bytes_per_token=0,
         col_quant_data_rows=0,
@@ -1512,10 +1445,8 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
     assert launch.overflow_ok is not None
     assert launch.overflow_ok.dtype is torch.bool
     assert launch.overflow_ok.data_ptr() == local["overflow_ok"].data_ptr()
-    # The in-kernel reduction accumulates into output_data: the active rows start from zero, the rest is left alone.
-    output_bytes = symmetric["output_data"].view(capacity, hidden * 2)
-    assert (output_bytes[: request.token_count] == 0).all()
-    assert (output_bytes[request.token_count :] == 0xAB).all()
+    # The standalone top-k reduction writes the output itself: staging leaves output_data untouched.
+    assert (symmetric["output_data"] == 0xAB).all()
 
 
 @pytest.mark.L0

@@ -147,8 +147,7 @@ absolute magnitude. The config-only API rejects negatives; callers must pass
 the intended non-negative magnitude explicitly.
 
 The three phase tuning fields are independent. Training backward accepts only
-`token_back_mode="epi_warps"` with
-`reduce_topk_in_kernel=False`. `dgrad_optimization` is a backward-only tuning
+`token_back_mode="epi_warps"`. `dgrad_optimization` is a backward-only tuning
 choice; inference and training forward require its default value,
 `"baseline"`. Conversely, `scheduling`, `fc2_bulk_store`, and `mixed_cga`
 select forward-kernel implementations: inference and training forward accept
@@ -160,9 +159,14 @@ them, and training backward requires their defaults.
 dgrad configurations:
 
 - `"baseline"` preserves the grouped schedule and all existing defaults;
-- `"rolling"` selects the upstream rolling/phase-interleaved schedule;
+- `"rolling"` selects the upstream phase-interleaved schedule with its tuned
+  defaults (M16 traversal and scaled FP8 conversion);
 - `"ds3_ep4_pattern"` selects the upstream preset named for its original DS3
-  EP4 workload.
+  EP4 workload. It adds rank input deduplication and asynchronous token-in
+  flags to the `"rolling"` schedule.
+
+`"rolling"` and `"ds3_ep4_pattern"` require compiling for `sm_107a`, which is
+the default when `CUTE_DSL_ARCH` is unset.
 
 For example:
 
@@ -185,8 +189,8 @@ kernel resource, layout, output, full-route-capacity, and MXFP8 constraints.
 Both contiguous and discrete native backward weights are supported.
 
 DS3 owns its scheduling and transport preset fields. It requires
-`token_back_mode="epi_warps"`, `token_in_flag_batch=1`, `group_hint=None`, and
-`reduce_topk_in_kernel=False`. The default `epi_flag_batch=(1, 1)` is treated
+`token_back_mode="epi_warps"`, `token_in_flag_batch=1`, and `group_hint=None`.
+The default `epi_flag_batch=(1, 1)` is treated
 as handing that field to the preset and is canonicalized to `(4, 2)`;
 explicit `(4, 2)` is equivalent. Other values are rejected instead of
 creating a custom DS3 variant.
@@ -216,7 +220,7 @@ messages name:
   128-byte peer copies under `token_back_mode="epi_warps"`, and TMA stores
   into the local FC2 buffer under the dispatch token-back modes, whose
   token-back warps then send the rows to the source ranks. They require
-  `hidden_size` divisible by 256 and `reduce_topk_in_kernel=False`. An
+  `hidden_size` divisible by 256. An
   explicit depth is limited to 4 stages (BF16 combine) or 2 stages (MXFP8
   combine) under `epi_warps`, and to 8 stages under the dispatch modes.
   `"auto"` uses one stage for peer copies and up to four stages, bounded by
@@ -324,9 +328,7 @@ matching forward outside timing to create saved tensors, then times only
 backward.
 
 The current `MoeEpTuningConfig` is prepended as a baseline, duplicate values
-are removed, and the normalized list is limited to 32 candidates. Autotuning
-keeps `reduce_topk_in_kernel` fixed because that flag changes where top-k
-reduction is performed. Each timed iteration is reduced with rank MAX and the
+are removed, and the normalized list is limited to 32 candidates. Each timed iteration is reduced with rank MAX and the
 candidate score is the median of those slow-rank samples. Equal scores select
 the earlier candidate. `MoeEpAutotuneResult` reports `winner`, per-candidate
 `latency_ms` and `samples_ms` as `MoeEpAutotuneCandidateResult` entries, and
@@ -621,17 +623,78 @@ capacity, not the model's top-k value:
 
 The fixed tensor extent is storage capacity, not a promise that every row is
 defined. For local expert `e`, let `begin` be zero when `e == 0` and
-`expert_offsets[e - 1]` otherwise. Only
-`[begin, begin + valid_route_counts[e])` is valid. The remainder of that
-expert's padded segment, and the capacity tail after `expert_offsets[-1]`,
-hold unspecified data and scale values. Consumers must use both metadata
-tensors: `expert_offsets` locates each physical segment and
-`valid_route_counts` limits the rows read from it.
+`expert_offsets[e - 1]` otherwise; the expert's padded segment is
+`[begin, expert_offsets[e])`, a multiple of 128 rows.
 
-The existing grouped WGrad API derives its GEMM K extent from adjacent
-`expert_offsets` and therefore reads complete padded segments. Under this
-validity contract MoeEP operands are **not** guaranteed to be directly
-consumable by that API.
+- The first `valid_route_counts[e]` rows of the segment carry routed data.
+- The remaining rows of the segment are zero-contribution padding: their E4M3
+  payload is zero and every scale byte of the segment is finite (never the
+  E8M0 NaN encoding `0xFF`). A consumer may therefore reduce over the whole
+  padded segment.
+- The capacity tail after `expert_offsets[-1]` holds unspecified data and
+  scale values and must not be read.
+
+`MoeEp.training_wgrad` (below) and the grouped WGrad API both derive each
+expert's K extent from adjacent `expert_offsets`, so both consume these
+operands directly.
+
+### Training WGrad
+
+```python
+from cudnn import MoeEpTrainingWgradOutputs
+
+op.training_wgrad(
+    operands,
+    out=MoeEpTrainingWgradOutputs(
+        fc1=grad_w1.transpose(1, 2),  # grad_w1: contiguous (E_local, 2I, H)
+        fc2=grad_w2.transpose(1, 2),  # grad_w2: contiguous (E_local, H, I)
+    ),
+    accumulate=False,
+)
+```
+
+`training_wgrad` computes `dW1[e] = fc1_a[e]^T @ fc1_b[e]` and
+`dW2[e] = fc2_a[e]^T @ fc2_b[e]` for every local expert with the Rubin MXFP8
+WGrad kernel, one launch per GEMM on the current stream. It reads the
+`operands` returned by `training_backward` in place: no operand is copied,
+transposed, re-padded, or rescaled, and no other kernel runs.
+
+- `operands` must be the caller-owned buffers in the exact shapes, strides,
+  dtypes, and alignments that `prepare_training()` returned; any other layout
+  is rejected.
+- `out` is a `MoeEpTrainingWgradOutputs` of BF16 or FP32 tensors in GEMM
+  orientation: `fc1` is `(E_local, H, 2I)` and `fc2` is `(E_local, I, H)`.
+  Each is either row-major in that shape (`MoeEpWgradLayout.GEMM_ROW_MAJOR`)
+  or the transpose of a contiguous weight-oriented buffer
+  (`WEIGHT_ROW_MAJOR`), as in the example. dW1 columns keep `fc1_b`'s
+  32-column gate/up interleave, which matches the `GATE_UP_INTERLEAVED_32`
+  source weights that training requires.
+- `out` may instead be a `MoeEpTrainingDiscreteWgradOutputs` with CUDA
+  `int64[E_local]` pointer tables `fc1_ptrs` and `fc2_ptrs`, one `dtype`, and
+  one `layout`. Each pointer addresses one expert's dense `(H, 2I)` / `(I, H)`
+  buffer (`GEMM_ROW_MAJOR`) or `(2I, H)` / `(H, I)` buffer
+  (`WEIGHT_ROW_MAJOR`, the default), 16-byte aligned. Strict validation reads
+  the tables once eagerly, like discrete weights, before graph capture.
+- `accumulate=False` overwrites `out`; an expert without routed tokens gets
+  zeros. `accumulate=True` adds the gradient to `out` (gradient accumulation
+  across micro-batches); an expert without routed tokens is left unchanged.
+- Each `(dtype, layout, storage, accumulate)` combination compiles once per
+  process, at its first eager call. Run every combination eagerly before CUDA
+  Graph capture; a first use during capture raises.
+- Results are bitwise identical to the grouped WGrad API on the same
+  operands, are bitwise reproducible across replays, and an expert's bytes do
+  not depend on the other experts' routes.
+
+The kernel issues Rubin TMA descriptor overrides with a residue tensor. Every
+supported CUTLASS DSL, public `nvidia-cutlass-dsl` 4.8.0 and later, provides
+them. If an installed DSL lacks them, `prepare_training()` still succeeds for
+forward and backward, and `training_wgrad` raises `RuntimeError` naming the
+missing capability; the grouped WGrad API remains available as the consumer
+of `operands`.
+
+The K tile equals the 128-row token padding, so no expert's reduction reads
+past its segment, and every M and N tile is complete, so no TMA box is
+clipped.
 
 ### Ownership and lifetime
 
@@ -644,7 +707,8 @@ consumable by that API.
   matching backward; cuDNN has no private preactivation fallback or workspace
   alias.
 - Forward WGrad outputs, segment metadata, and backward WGrad outputs remain
-  live until the independent grouped WGrad consumer completes.
+  live until their WGrad consumer (`training_wgrad` or the grouped WGrad API)
+  completes. `training_wgrad` destinations are caller-owned.
 - cuDNN owns one set of local and NVSHMEM symmetric instance storage; only the documented
   input and final-output views are exposed to the caller.
 - One `MoeEp` instance does not support overlapping GPU work. Prepare, warmup,
@@ -703,10 +767,11 @@ consumed.
 1. Collectively call `prepare_training`.
 2. Allocate every capture binding from the returned requirements.
 3. Materialize or provide native weights at stable addresses.
-4. Run ordinary forward/backward warmups for every captured specialization.
+4. Run ordinary forward/backward warmups for every captured specialization,
+   and one eager `training_wgrad` per captured WGrad output combination.
 5. Capture calls using every caller-owned destination returned by
    `prepare_training()`, including primary outputs, saved forward state, and
-   forward/backward WGrad tensors.
+   forward/backward WGrad tensors, plus the `training_wgrad` destinations.
 6. Keep all captured input, output, saved-state, staging, and native-pack
    addresses stable until every referencing graph executable is destroyed.
 
@@ -746,6 +811,9 @@ new operator preparation; caller-address changes require recapture.
   routing metadata stores the source token index in 16 bits.
 - An expert-parallel group size no greater than 256. The routing metadata
   stores the source rank in 8 bits.
+- `training_wgrad` uses Rubin TMA descriptor overrides, which public
+  `nvidia-cutlass-dsl` 4.8.0 and later provide. On a DSL without them the
+  method raises and the rest of training remains available.
 
 The stateless training CUDA Graph path has hardware acceptance through EP32 when
 all ranks are in one direct-P2P MNNVL peer-access domain. Beyond the 256-rank

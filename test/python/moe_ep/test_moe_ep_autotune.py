@@ -108,14 +108,6 @@ def test_autotune_core_contracts(monkeypatch):
         with pytest.raises(ValueError, match=message):
             normalize(baseline, [baseline], **arguments)
 
-    with pytest.raises(ValueError, match="does not sweep reduce_topk_in_kernel"):
-        normalize(
-            baseline,
-            [MoeEpTuningConfig(reduce_topk_in_kernel=True)],
-            warmup_iters=0,
-            timed_iters=1,
-            max_candidates=32,
-        )
     with pytest.raises(ValueError, match="exceeding max_candidates=1"):
         normalize(
             baseline,
@@ -294,14 +286,14 @@ def test_autotune_api_transactions(monkeypatch):
         resolved_config=state.resolved_config,
         backend=active_backend,
     )
-    with pytest.raises(ValueError, match="does not sweep reduce_topk_in_kernel"):
+    with pytest.raises(ValueError, match="candidates must not be empty"):
         op.autotune_inference(
             None,
             None,
             None,
             None,
             None,
-            candidates=[MoeEpTuningConfig(reduce_topk_in_kernel=True)],
+            candidates=[],
             warmup_iters=0,
             timed_iters=1,
         )

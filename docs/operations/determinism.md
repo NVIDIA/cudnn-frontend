@@ -60,7 +60,8 @@ The block-sparse attention (BSA) APIs `block_sparse_attention_forward`,
 `block_sparse_attention_backward` and `block_sparse_attention_backward_metadata`
 are in `cudnn.ops`; their rows cover the blk64 kernels (`sparse_block_size=64`).
 `MoeEp` (expert-parallel MoE, `cudnn.MoeEp`) has an inference entry (`__call__`)
-and stateless training entries (`training_forward`, `training_backward`).
+and stateless training entries (`training_forward`, `training_backward`,
+`training_wgrad`).
 The required settings below apply to this table. The `pygraph.custom_reduction`
 rows describe only the named reducer bodies and consumed graph outputs, not
 arbitrary user callbacks.
@@ -81,6 +82,7 @@ arbitrary user callbacks.
 | `MoeEp.__call__` (expert-parallel MoE inference) | fprop | MXFP8 activation and weights; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
 | `MoeEp.training_forward` | fprop | MXFP8 compute; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
 | `MoeEp.training_backward` | bprop | MXFP8 compute; FP32 dprob | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_wgrad` | wgrad | MXFP8 operands; BF16 or FP32 dW | Unsupported | Unsupported | Supported (replay, expert invariance and warm stress; no golden) |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
 | `AddNormQuantDecode` (add + RMSNorm + quantize decode step) | fprop (inference step) | BF16 in; BF16, FP8 E4M3 or NVFP4 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
@@ -393,14 +395,26 @@ a row alone and inside a batch under the entry's own picks.
   comparison is not covered there. SM90 and SM120 are declined by type.
 - Expert-parallel MoE (`MoeEp`): no deterministic mode and no determinism
   suite yet, so SM107 is unverified; SM90, SM100/103 and SM120 are declined by
-  the capability check. Known order-dependent reductions:
-  `reduce_topk_in_kernel=True` adds the top-k expert outputs with BF16
-  bulk-reduce stores, and training backward adds per-tile dprob partials with
-  FP32 atomics. Training forward and backward route tokens in a fixed
-  sequence; inference token communication does not. The functionality tests
-  check that the forward tuning fields write the default tuning's output bytes
-  when `reduce_topk_in_kernel=False`, and that repeated calls do not
+  the capability check. Known order-dependent reduction: training backward
+  adds per-tile dprob partials with FP32 atomics. Training forward and
+  backward route tokens in a fixed sequence; inference token communication
+  does not. The functionality tests check that the forward tuning fields write
+  the default tuning's output bytes, and that repeated calls do not
   accumulate. Neither check qualifies replay or batch invariance.
+  `training_wgrad` is the exception: each output tile is reduced by one CTA
+  over its expert's whole padded segment, with no split-K and no atomics.
+  `test_moe_ep_wgrad.py` checks the following on raw bytes, also on a shape
+  that spans more than one wave of clusters and up to 16 K tiles per expert:
+  - replay with fresh outputs under concurrent work, for dense and discrete
+    destinations and for `accumulate=True` from the same starting value;
+  - that an expert's bytes survive new neighbors, reordering and duplication;
+  - that every output layout and storage form stores the same FP32
+    accumulator;
+  - a warm and poisoned stress against the grouped WGrad API's bytes.
+
+  `accumulate=True` adds to the destination once per element, so its bytes
+  also depend on the destination's prior contents. The bytes equal the
+  grouped WGrad API's on the same operands. No golden is recorded.
 - Attention gate + quantize decode step (`AttentionGateQuantDecode`): no
   determinism switch and no numerics knob. The kernel has no reduction, so a
   row's bytes are a function of its own operand values and of the scale: a
