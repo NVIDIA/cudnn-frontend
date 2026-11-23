@@ -567,6 +567,7 @@ class ArriveSite:
     parameter: str = ""  # the parameter symbol of the mask
     loaded_registers: int = 0  # distinct shared/TMEM destination registers the masked value is computed from
     loads: int = 0  # shared/TMEM load instructions among them
+    count: int | None = None  # arrival count when known from the PTX
 
 
 def release_dependence(ptx_text: str) -> List[ArriveSite]:
@@ -640,6 +641,21 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
         match = re.search(r"\[([^\]]+)\]", text)
         address = _REGISTER.findall(match.group(1)) if match else []
         site = ArriveSite(number, text, False)
+        if match:
+            count_operand = text[match.end() :].strip().removesuffix(";").strip().removeprefix(",").strip()
+            if not count_operand:
+                site.count = 1
+            else:
+                count_defs = definitions.get(count_operand, ())
+                if len(count_defs) == 1:
+                    def_line, predicate, _, _, _, _, count_def = instructions[count_defs[0]]
+                    mov = re.fullmatch(r"mov\.[bsu]32\s+%r\d+,\s*(\S+)\s*;", count_def)
+                    if def_line < number and not predicate and mov:
+                        count_operand = mov[1]
+                try:
+                    site.count = int(count_operand, 0)
+                except ValueError:
+                    pass  # Dynamic or otherwise unknown count.
         for index in sorted(closure(address)):
             _, _, and_opcode, _, and_sources, _, _ = instructions[index]
             if not and_opcode.startswith("and.") or len(and_sources) != 2:
