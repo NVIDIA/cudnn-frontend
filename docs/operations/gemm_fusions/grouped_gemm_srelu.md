@@ -175,6 +175,12 @@ result = grouped_gemm_srelu_wrapper_sm100(
 
 ### Class API
 
+The constructor records the configuration; backend selection and validation happen in
+`check_support()` (also called by `compile()` and the workspace-size query). Existing positional
+parameters keep their order. The facade exposes the documented methods; backend tensor-descriptor
+attributes are not forwarded. Call `check_support()` explicitly when validation must happen before
+compilation or execution.
+
 ```python
 from cudnn import GroupedGemmSreluSm100
 
