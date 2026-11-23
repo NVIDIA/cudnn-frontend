@@ -999,6 +999,7 @@ pytest core/test_determinism_utils.py
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D/RHT payloads and scales, including standard GEMM-blocked column scales | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py` | `GroupedGemmGluHadamardQuantSm100` and its wrapper, natural tensor ranks with either GLU branch order | C, D/RHT payloads and scales; legacy-rank equality, replay, batch invariance and graph replay | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
+| `gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` | `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel with `deterministic=True` | — | dprob and D_row: replay under concurrent work (both activations, dense/discrete, static/dynamic scheduler, ragged and empty experts), expert reorder, duplicate and neighbor isolation in both GLU orders; launch-stream ordering; D_row equal to the atomic path |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -9288,3 +9289,74 @@ no communication barrier. Each rendering check covers 15 forms/launch arms
 for one of SM100, SM103 and SM107, including instruction and SASS checks;
 rendering another target does not establish GPU execution on that target.
 The model report suite on current develop also passes: 51 passed, 35.16 s.
+
+### Grouped BF16 dGLU deterministic dprob — SM100, 2026-11-23 UTC
+
+`grouped_gemm_dglu_wrapper_sm100(..., deterministic=True)` now covers the
+SM100-family BF16 kernel as well as the block-scaled one. Each
+(token, N-tile) dprob partial gets its own FP32 slot, and the slots are
+summed in a fixed order on the launch stream. The new
+`gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` (18 cases: 16 L0,
+plus two L1 cases at scale) checks the following:
+
+- Replay: eight runs on fresh outputs with concurrent work on another
+  stream compare dprob and `D_row` as raw bytes. This covers both
+  activations, dense and discrete weights, and the static and dynamic
+  schedulers. The shape is N=1024 (four N-tiles), K=256 and experts of
+  512/0/256/768 tokens plus 256 rows of capacity.
+- Expert reorder, solo, duplicate and changed-neighbor runs: they keep each
+  expert's dprob and `D_row` bytes, with natural-rank tensors in both GLU
+  orders.
+- `D_row` is byte-equal to the atomic path.
+- dprob matches the atomic path within 1e-4 and the independent Torch
+  reference within the BF16 tolerance. Rows past the last offset stay zero.
+- Slot zero-fill and reduction run on the launch stream, both when the
+  current stream is busy and when the launch stream is busy.
+- dbias and JAX inputs are rejected.
+
+The one skip is dGeGLU with `gate_then_up`, which the BF16 kernel does not
+support.
+
+Runtime: NVIDIA GB200 (cc 10.0, 152 SMs, aarch64), driver 595.71.05,
+PyTorch 2.14.1+cu130, CuTe DSL 4.8.0 (CUDA 13.4 compiler), tvm-ffi 0.1.16,
+at `2b98a25d` plus this change. The source tree was imported with a stubbed
+compiled core, so no cuDNN backend was involved.
+
+```
+pytest -m "L0 or L1" gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py  # 17 passed, 1 skipped
+pytest -m L0 <the dGLU suites below>   # new tree: 602 passed, 426 skipped, 2 failed of 1030
+```
+
+The dGLU suites are `test_grouped_gemm_dglu{,_bf16_determinism,_bf16_training,_activation,_gate_then_up,_workspace}.py`,
+`test_grouped_dgeglu_autograd.py`, `test_grouped_gemm_backward_canonical.py`
+and `gemm/jax/test_grouped_gemm_dglu_jax.py`. The two failures,
+`test_dglu_activation_caller_workspace_and_first_capture[False/True]`, fail
+the same way on develop in this environment: the stubbed core's
+`make_operand_buffer` has no `__dlpack__`.
+
+The suite fails against develop: 17 failed, 1 skipped (BF16 rejects the
+flag). It also fails against three mutations:
+
+- All N-tiles write slot 0: replay and batch-invariance cases fail with
+  156-373 differing bytes.
+- Reduction on torch's current stream: the busy-launch-stream case fails.
+- Zero-fill on torch's current stream: the busy-current-stream case fails.
+
+At the suite's shape, the atomic dprob changed in 29 of 29 replays for each
+of the eight activation/weight/scheduler cases, in up to 645 of 1792 rows.
+The deterministic dprob changed in 0 of 29.
+
+At the FC2 shapes, with 20 runs, fixed inputs and EP4/EP8, the atomic dprob
+changed in 19 of 19 replays. That was up to 32152/65536 rows for DeepSeek-V3
+(N=2048) and up to 55320/98304 for Qwen3-2.4T. The deterministic dprob
+changed in 0 of 19, and `D_row` never changed on either path. Non-default
+tiles and clusters ((256, 256)/(2, 2) at N=768, (128, 256)/(1, 1) at N=800
+and (256, 128)/(2, 1) at N=544) replay bitwise and stay within 4e-7 of the
+atomic path.
+
+compute-sanitizer 2026.1.1 reports 0 errors under memcheck and 0 hazards
+under racecheck. Memcheck ran three suite cases, including `gate_then_up`,
+and four direct launches: two at the default tile, one with the (2, 2)
+cluster and one with the (128, 256) tile. Racecheck ran the two default-tile
+launches. SM103 and SM107 were not run, only compiled: ptxas 13.4.92 reports
+0 spills for the deterministic configurations, 26 on sm_100a and 24 on sm_107a.

@@ -139,6 +139,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         glu_clamp_min: float = -7.0,
         round_dgrad_to_input_dtype: bool = False,
         glu_layout: str = "interleaved_32",
+        deterministic: bool = False,
     ):
         # Validate FIX_PAD_SIZE compatibility with tile size
         mma_tile_m = mma_tiler_mn[0]
@@ -220,6 +221,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         self.glu_clamp_max = glu_clamp_max
         self.glu_clamp_min = glu_clamp_min
         self.round_dgrad_to_input_dtype = round_dgrad_to_input_dtype
+        # dprob is (valid_m, n_slots, 1), one slot per N-tile, which the caller reduces in a fixed order.
+        self.deterministic = deterministic
 
     def _setup_attributes(self):
         """Set up input-dependent BF16 GEMM attributes."""
@@ -2025,8 +2028,13 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
 
                 if cutlass.const_expr(self.generate_dprob):
                     real_dprob, _ = epi_ext.get_gmem_tensor("dprob", dprob, padded_offsets, epi_work_tile_info)
+                    if cutlass.const_expr(self.deterministic):
+                        # One writer per (token, tile_n) slot; the atomic is uncontended, kept for one store path.
+                        dprob_slot = real_dprob[(mPosition, epi_work_tile_info.tile_n_idx, None)]
+                    else:
+                        dprob_slot = real_dprob[(mPosition, None, None)]
                     _ = atomic_add_float32(
-                        ptr=real_dprob[(mPosition, None, None)].iterator.llvm_ptr,
+                        ptr=dprob_slot.iterator.llvm_ptr,
                         value=dProbVal,
                     )
 
