@@ -4,6 +4,21 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### BF16 grouped GEMM sReLU forward
+
+`gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py` checks BF16 C/D replay,
+batch invariance and independent references for plain and clamped sReLU, with
+both `act_input="acc"` and `"saved"`. Six existing goldens under
+`da1753675488f6a3` are retained byte for byte from PR #2737; they pin distinct
+activation and rounding paths. Normal checks never regenerate them.
+
+Historical evidence: PR #2737 run H (`f0a7d2b8`, GB300/SM103, CuTe DSL 4.8.0
+cu13) reported 13 forward determinism passes, including six strict golden
+checks; run I (`3c5c77fe`, cu12 compiler flavor) reported seven non-golden
+passes. These measurements precede the split and are not results for its new
+commits. SM100 is unverified. BF16 backward is provided by the dependent
+dSReLU change; this forward slice does not claim backward coverage.
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution
@@ -991,6 +1006,7 @@ pytest core/test_determinism_utils.py
 
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
+| `gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py` | `grouped_gemm_srelu_wrapper_sm100`, BF16 backend (plain and tanh-clamped; acc/saved) | BF16 C and D | Unsupported in this forward-only slice |
 | `conv/cutedsl/test_conv3d_postops_determinism.py` | Conv3D raw, norm/SiLU, prepared norm/SiLU, residual/spatial pad, C12 causal input, standalone norm/SiLU preparation | Output, cache, residual, padding and exposed workspace bytes | Unsupported (inference only) |
 | `gemm/cutedsl/test_grouped_gemm_wgrad_empty.py` | `grouped_gemm_wgrad_wrapper_sm100`, cold-empty compilation | — | exact-zero overwrite and unchanged accumulated dW bytes; nonempty reuse, mixed empty experts and CUDA Graph replay |
 | `gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py` | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | saved C, D in both directions, both scale planes | — |

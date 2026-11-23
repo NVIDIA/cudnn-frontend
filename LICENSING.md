@@ -16,6 +16,13 @@ SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 Third-party attributions are in [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt).
 
+The accurate tanh polynomial and range split in
+`python/cudnn/gemm/cutedsl/grouped/srelu/moe_grouped_gemm_srelu.py` are adapted
+from Stephen L. Moshier's [Cephes `tanhf.c`](https://github.com/jeremybarnes/cephes/blob/master/single/tanhf.c).
+They retain the upstream permission notice as `LicenseRef-Cephes`, reproduced
+in [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt). NVIDIA's implementation
+changes are Apache-2.0, so that file uses `Apache-2.0 AND LicenseRef-Cephes`.
+
 ## Apache-2.0 modifications to existing licensed code
 
 The OSS warning cleanup licenses its NVIDIA modifications under Apache-2.0,

@@ -54,7 +54,7 @@ def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-class GroupedGemmSreluSm100(APIBase):
+class GroupedGemmSreluBlockScaledAPI(APIBase):
     """Unified API for grouped GEMM SReLU operation on SM100+ GPUs.
 
     This kernel performs block-scaled grouped GEMM with output SReLU output quantization
