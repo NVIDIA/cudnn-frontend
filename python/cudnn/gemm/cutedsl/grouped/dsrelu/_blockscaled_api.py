@@ -146,7 +146,7 @@ def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-class GroupedGemmDsreluSm100(APIBase):
+class GroupedGemmDsreluBlockScaledAPI(APIBase):
     """Unified API for grouped GEMM dSReLU backward operation on SM100+ GPUs.
 
     This kernel performs block-scaled grouped GEMM with dSReLU activation

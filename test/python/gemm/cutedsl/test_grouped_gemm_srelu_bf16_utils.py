@@ -1,15 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fixtures and Torch references for the BF16 grouped GEMM squared-ReLU forward API (srelu).
+"""Fixtures and Torch references for the BF16 grouped GEMM squared-ReLU APIs (srelu and dsrelu).
 
 Every output is compared three ways:
 
 * the candidate, from the BF16 kernels under test;
 * an FP32 reference: the same BF16 operands upcast to FP32, GEMMs in FP32 with TF32 off, the
-  activation in FP32, nothing rounded in between;
+  activation and its derivative in FP32, nothing rounded in between;
 * the native path, what a model computes without the fusion: ``Z = bf16(A @ B^T)`` from a BF16
-  GEMM with FP32 accumulation followed by the eager PyTorch activation of ``float(Z)``.
+  GEMM with FP32 accumulation followed by the eager PyTorch activation of ``float(Z)``, and in the
+  backward ``dH`` rounded to BF16 before the eager activation backward.
 
 The fused kernels must not be less accurate than the native path, measured against the FP32
 reference. Rows at or past the routed total are never written by the kernels and are left out.
@@ -18,11 +19,12 @@ same criterion with no allowance; every such comparison prints the measured rati
 ``APPROX_RATIO <test-id> <output> <ratio>`` line (see :func:`report_approx_ratio`).
 
 Exact-valued problems (``make_problem(..., exact=True)``, :func:`ternary_weights`,
-:func:`exact_prob`) hold small integers and signed powers of two, so every GEMM and
-the plain squared-ReLU are exact in FP32 in any evaluation order and the one
-rounding to BF16 is the same everywhere: :func:`exact_forward_reference` is an independent float64 reference for exact comparisons.
+:func:`exact_prob`, :func:`exact_z`) hold small integers and signed powers of two, so every GEMM,
+the plain squared-ReLU and its derivative are exact in FP32 in any evaluation order and the one
+rounding to BF16 is the same everywhere: :func:`exact_forward_reference` and
+:func:`exact_backward_reference` are independent float64 references for exact comparisons.
 
-The class-API helpers (:func:`srelu_api` and :func:`srelu_execute`) build the
+The class-API helpers (:func:`srelu_api`, :func:`dsrelu_api` and their ``*_execute``) build the
 public facades over caller-owned outputs; ``execute()`` takes caller-owned scratch of
 ``scratch_workspace_bytes()`` bytes as ``workspace=`` (recipe R2), see ``gemm/cutedsl/_workspace.py``.
 """
@@ -50,6 +52,7 @@ SMALL_K_SHAPE = {"experts": 8, "k": 512, "n": 3584}
 NATIVE_MARGIN = 0.05
 # Near-native BF16 outputs: at most one BF16 ulp apart, on at most this fraction of the elements.
 NEAR_NATIVE_FRACTION = 1e-3
+FP32_UNIT_ROUNDOFF = 2.0**-24
 # Pass as tanh_mode to leave the argument out of the call, so the public default is what runs.
 PUBLIC_DEFAULT = object()
 # The process-wide switch of the debug-only host checks of offset / pointer-table values.
@@ -273,6 +276,19 @@ def exact_prob(rows: int, *, seed: int, positive: bool = False) -> torch.Tensor:
     return magnitude * (torch.randint(0, 2, (rows, 1, 1), generator=generator, device="cuda").float() * 2 - 1)
 
 
+def make_z(rows: int, n: int, *, seed: int, scale: float = 4.0) -> torch.Tensor:
+    """BF16 pre-activations ``(M, N, 1)`` uniform in ``[-5, 5] * scale``."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    z = ((torch.rand((rows, n), generator=generator, device="cuda") * 10.0 - 5.0) * scale).to(torch.bfloat16)
+    return mn1(z)
+
+
+def exact_z(rows: int, n: int, *, seed: int, positive: bool = False) -> torch.Tensor:
+    """BF16 saved pre-activations ``(M, N, 1)`` in {-3, ..., 3}, or {1, 2, 3} with ``positive``."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    return mn1(torch.randint(1 if positive else -3, 4, (rows, n), generator=generator, device="cuda").to(torch.bfloat16))
+
+
 def srelu_fp32(z: torch.Tensor, clamp_scale: Optional[float]) -> torch.Tensor:
     """``relu(z)**2`` or ``(s * tanh(relu(z) / s))**2`` with unfused ops in ``z``'s dtype."""
     if clamp_scale is None:
@@ -290,6 +306,22 @@ def eager_forward(z: torch.Tensor, prob: torch.Tensor, clamp_scale: Optional[flo
         return ((r * r) * prob).to(torch.bfloat16)
     clamped = clamp_scale * torch.tanh(torch.relu(zf) / clamp_scale)
     return (torch.pow(clamped, 2) * prob).to(torch.bfloat16)
+
+
+def eager_backward(dh: torch.Tensor, z: torch.Tensor, prob: torch.Tensor, clamp_scale: Optional[float]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The native activation backward from BF16 ``dh`` and ``z``: ``(dz BF16, dprob FP32 [M])``."""
+    zf = z.float()
+    g = dh.float()
+    if clamp_scale is None:
+        r = torch.relu(zf)
+        dz = ((g * prob) * 2) * r
+        dprob = torch.sum((r * r) * g, dim=-1)
+        return dz.to(torch.bfloat16), dprob
+    t = torch.tanh(torch.relu(zf) / clamp_scale)
+    clamped = clamp_scale * t
+    dz = (1 - torch.pow(t, 2)) * (2 * clamped) * g * prob
+    dprob = torch.sum(torch.pow(clamped, 2) * g, dim=-1)
+    return dz.to(torch.bfloat16), dprob
 
 
 def grouped_matmul(problem: Dict[str, Any], dtype: torch.dtype) -> torch.Tensor:
@@ -316,6 +348,36 @@ def native_forward(problem: Dict[str, Any], prob: torch.Tensor, clamp_scale: Opt
     return z, eager_forward(z, prob[:, :, 0], clamp_scale)
 
 
+def reference_backward(problem: Dict[str, Any], z_save: torch.Tensor, prob: torch.Tensor, clamp_scale: Optional[float]) -> Dict[str, torch.Tensor]:
+    """FP32 ``dH = G @ B^T`` (never rounded) and the activation backward at ``float(Z_save)``.
+
+    ``problem["a"]`` is ``G``. Returns ``dh``, ``dz``, ``dprob`` and ``h`` (the forward at
+    ``Z_save``), FP32.
+    """
+    with fp32_highest_precision():
+        dh = grouped_matmul(problem, torch.float32)
+    z = z_save[:, :, 0].float()
+    p = prob[:, :, 0]
+    if clamp_scale is None:
+        r = torch.relu(z)
+        dz = 2.0 * r * dh * p
+    else:
+        t = torch.tanh(torch.relu(z) / clamp_scale)
+        dz = (1.0 - t * t) * (2.0 * clamp_scale * t) * dh * p
+    a = srelu_fp32(z, clamp_scale)
+    return {"dh": dh, "dz": dz, "dprob": (a.double() * dh.double()).sum(dim=-1).float(), "h": a * p}
+
+
+def native_backward(problem: Dict[str, Any], z_save: torch.Tensor, prob: torch.Tensor, clamp_scale: Optional[float]) -> Dict[str, torch.Tensor]:
+    """BF16 ``dH = bf16(G @ B^T)`` and the eager backward and forward at ``Z_save``."""
+    with bf16_gemm_fp32_reduction():
+        dh = grouped_matmul(problem, torch.bfloat16)
+    z = z_save[:, :, 0]
+    p = prob[:, :, 0]
+    dz, dprob = eager_backward(dh, z, p, clamp_scale)
+    return {"dh": dh, "dz": dz, "dprob": dprob, "h": eager_forward(z, p, clamp_scale)}
+
+
 def exact_grouped_matmul(a: torch.Tensor, b_logical: torch.Tensor, counts: Sequence[int]) -> torch.Tensor:
     """``A_e @ B_e^T`` per expert in float64 over the routed rows: ``(sum(counts), N)``."""
     a64 = a[:, :, 0].double()
@@ -335,6 +397,26 @@ def exact_forward_reference(a: torch.Tensor, b_logical: torch.Tensor, counts: Se
     p = prob[: acc.shape[0], 0, 0].double()[:, None]
     r = torch.relu(acc)
     return acc.float().to(torch.bfloat16), ((r * r) * p).float().to(torch.bfloat16)
+
+
+def exact_backward_reference(
+    a: torch.Tensor, b_logical: torch.Tensor, counts: Sequence[int], z_save: torch.Tensor, prob: torch.Tensor
+) -> Dict[str, torch.Tensor]:
+    """The plain squared-ReLU backward of an exact-valued problem (``a`` is ``G``), float64 until one rounding.
+
+    ``d_row`` and ``d_srelu`` BF16 ``(routed, N)``; ``dprob`` FP32 ``(routed,)``, an integer sum below
+    ``2**24``, so every FP32 reduction order gives it exactly.
+    """
+    dh = exact_grouped_matmul(a, b_logical, counts)
+    routed = dh.shape[0]
+    z = z_save[:routed, :, 0].double()
+    p = prob[:routed, 0, 0].double()[:, None]
+    r = torch.relu(z)
+    return {
+        "d_row": (((dh * p) * 2.0) * r).float().to(torch.bfloat16),
+        "d_srelu": ((r * r) * p).float().to(torch.bfloat16),
+        "dprob": ((r * r) * dh).sum(dim=-1).float(),
+    }
 
 
 def rel_l2(candidate: torch.Tensor, reference: torch.Tensor) -> float:
@@ -430,6 +512,34 @@ def assert_near_native(name: str, candidate: torch.Tensor, native: torch.Tensor,
     assert differing <= limit, f"{name}: {differing} elements differ from native (allowed {limit})"
 
 
+def dprob_sum_bound(z_save: torch.Tensor, dh: torch.Tensor, clamp_scale: Optional[float], tanh_mode: str) -> torch.Tensor:
+    """Per-row bound on the difference of two FP32 sums of the same ``N`` terms ``A(z) * dh``.
+
+    ``(4 sqrt(N) u + term_rel) * sum_n |A * dh|`` with ``u = 2^-24``: the summation-order term plus a
+    per-term allowance for the tanh implementation (32 u for the accurate tanh, 2^-9 for MUFU
+    tanh.approx).
+    """
+    z = z_save.reshape(z_save.shape[0], -1).float()
+    terms = srelu_fp32(z, clamp_scale) * dh.reshape(dh.shape[0], -1).float()
+    n_terms = z.shape[1]
+    term_rel = 32.0 * FP32_UNIT_ROUNDOFF if tanh_mode == "accurate" else 2.0**-9
+    return terms.abs().sum(dim=-1) * (4.0 * math.sqrt(n_terms) * FP32_UNIT_ROUNDOFF + term_rel)
+
+
+def assert_dprob_within_bound(name: str, candidate: torch.Tensor, reference: torch.Tensor, bound: torch.Tensor, *, routed: int) -> None:
+    candidate = candidate.reshape(-1)[:routed].double()
+    reference = reference.reshape(-1)[:routed].double()
+    bound = bound.reshape(-1)[:routed].double()
+    for label, values in (("candidate", candidate), ("reference", reference), ("bound", bound)):
+        assert bool(torch.isfinite(values).all()), f"{name}: non-finite {label} values"
+    assert bool((bound >= 0).all()), f"{name}: negative summation bound"
+    error = (candidate - reference).abs()
+    over = error > bound
+    assert not bool(
+        over.any()
+    ), f"{name}: {int(over.sum())} rows over the FP32 summation bound, worst ratio {float((error / bound.clamp_min(1e-30)).max()):.3f}"
+
+
 # --------------------------------------------------------------------------- class API
 
 
@@ -475,6 +585,69 @@ def srelu_execute(api, problem: Dict[str, Any], prob: torch.Tensor, c: torch.Ten
     api.execute(**kwargs)
 
 
+def dsrelu_api(
+    problem: Dict[str, Any],
+    z_save: torch.Tensor,
+    prob: torch.Tensor,
+    d_row: torch.Tensor,
+    dprob: torch.Tensor,
+    *,
+    d_srelu: Optional[torch.Tensor] = None,
+    dprob_workspace: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    **config,
+):
+    """``GroupedGemmDsreluSm100`` over ``problem`` (``a`` is ``G``) and caller-owned outputs (not checked or compiled)."""
+    import cudnn
+
+    return cudnn.GroupedGemmDsreluSm100(
+        sample_a=problem["a"],
+        sample_c=z_save,
+        sample_d_row=d_row,
+        sample_d_srelu=d_srelu,
+        sample_padded_offsets=problem["offsets"],
+        sample_prob=prob,
+        sample_dprob=dprob,
+        sample_dprob_workspace=dprob_workspace,
+        deterministic=deterministic,
+        **_weight_declaration(problem),
+        **config,
+    )
+
+
+def dsrelu_execute(
+    api,
+    problem: Dict[str, Any],
+    z_save: torch.Tensor,
+    prob: torch.Tensor,
+    d_row: torch.Tensor,
+    dprob: torch.Tensor,
+    *,
+    workspace,
+    d_srelu: Optional[torch.Tensor] = None,
+    dprob_workspace: Optional[torch.Tensor] = None,
+    **overrides,
+) -> None:
+    """``api.execute`` on ``problem``'s operands; ``overrides`` replaces any keyword argument."""
+    kwargs = dict(
+        a_tensor=problem["a"],
+        c_tensor=z_save,
+        d_row_tensor=d_row,
+        d_col_tensor=None,
+        sfa_tensor=None,
+        padded_offsets=problem["offsets"],
+        alpha_tensor=None,
+        prob_tensor=prob,
+        dprob_tensor=dprob,
+        d_srelu_tensor=d_srelu,
+        dprob_workspace_tensor=dprob_workspace,
+        workspace=workspace,
+        **_weight_binding(problem),
+    )
+    kwargs.update(overrides)
+    api.execute(**kwargs)
+
+
 def count_wrapper_compiles(monkeypatch, module, facade_name: str, cache_name: str) -> list:
     """Empty a wrapper's plan cache for this test and record every facade ``compile()`` (the compile-count pattern of
     ``test_grouped_gemm_srelu.py``); returns the list the compiles are appended to."""
@@ -489,6 +662,13 @@ def count_wrapper_compiles(monkeypatch, module, facade_name: str, cache_name: st
 
     monkeypatch.setattr(facade, "compile", counted)
     return compiles
+
+
+def dprob_slots(rows: int, n: int, **tiling) -> torch.Tensor:
+    """A zeroed deterministic dprob slot buffer ``dprob_workspace_shape(rows, n)`` FP32."""
+    import cudnn
+
+    return torch.zeros(cudnn.GroupedGemmDsreluSm100.dprob_workspace_shape(rows, n, **tiling), dtype=torch.float32, device="cuda")
 
 
 def aliasing_views(tensor: torch.Tensor, nbytes: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

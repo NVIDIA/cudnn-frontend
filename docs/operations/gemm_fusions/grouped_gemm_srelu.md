@@ -418,8 +418,11 @@ The plain squared-ReLU evaluates no `tanh`: it accepts either value of `tanh_mod
 kernel for both. A NaN pre-activation propagates to `D` in every mode, since the relu is a
 NaN-propagating `max`; the block-scaled kernel maps it to +0 instead.
 
-`C` is always written. With `act_input="saved"` the forward evaluates the activation at exactly
-that saved BF16 value. With `act_input="acc"` (default), `D` comes from the unrounded
+`C` is always written: it is the tensor the
+[dsReLU backward](/operations/Matmul/gemm_fusions/grouped_gemm_dsrelu#bf16-backend) reloads. With
+`act_input="saved"` the forward evaluates the activation at exactly that value, so the backward's
+recomputed activation (`d_srelu_tensor`) equals `D` bit for bit when both use the same
+`tanh_clamp_scale` and `tanh_mode`. With `act_input="acc"` (default), `D` comes from the unrounded
 FP32 accumulator and is slightly more accurate. The plain squared-ReLU with `act_input="saved"` is
 bit for bit `r = torch.relu(c.float()); ((r * r) * prob).to(torch.bfloat16)` of the returned `C`:
 FP32 math on `float(C)`, rounded once. The all-BF16 eager form

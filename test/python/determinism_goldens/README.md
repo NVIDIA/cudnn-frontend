@@ -4,6 +4,25 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### BF16 grouped GEMM dSReLU backward
+
+Split validation (2026-11-23): the CPU numerical-oracle regression suite reports
+11 passed; the preserved original oracle fails 10 of the same checks. The changed
+files pass pre-commit and `git diff --check`. Fern reports zero errors and one
+authentication-related redirect-check warning. GPU execution of the split revision
+has not yet run; the earlier evidence below is not a result for this revision.
+
+`gemm/cutedsl/test_grouped_gemm_dsrelu_bf16_determinism.py` checks BF16 dZ,
+recomputed activation and deterministic FP32 dprob replay, batch invariance,
+CUDA graph replay and independent references. Six original backward goldens
+under `da1753675488f6a3` are retained byte for byte from PR #2737.
+
+Historical evidence: PR #2737 run H (`f0a7d2b8`, GB300/SM103, CuTe DSL 4.8.0
+cu13) reported 18 backward determinism passes, including six strict golden
+checks; run I (`3c5c77fe`, cu12 compiler flavor) reported 12 non-golden passes.
+These results predate the split. SM100 and the split revisions require new GPU
+validation. Atomic dprob is numerically checked but is not claimed deterministic.
+
 ### BF16 grouped GEMM sReLU forward
 
 `gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py` checks BF16 C/D replay,
@@ -1006,7 +1025,8 @@ pytest core/test_determinism_utils.py
 
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
-| `gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py` | `grouped_gemm_srelu_wrapper_sm100`, BF16 backend (plain and tanh-clamped; acc/saved) | BF16 C and D | Unsupported in this forward-only slice |
+| `gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py` | `grouped_gemm_srelu_wrapper_sm100`, BF16 backend (plain and tanh-clamped; acc/saved) | BF16 C and D | Separate BF16 dSReLU suite below |
+| `gemm/cutedsl/test_grouped_gemm_dsrelu_bf16_determinism.py` | `grouped_gemm_dsrelu_wrapper_sm100`, BF16 backend, deterministic reduction (plain and tanh-clamped) | Recomputed BF16 activation | BF16 dZ and FP32 dprob |
 | `conv/cutedsl/test_conv3d_postops_determinism.py` | Conv3D raw, norm/SiLU, prepared norm/SiLU, residual/spatial pad, C12 causal input, standalone norm/SiLU preparation | Output, cache, residual, padding and exposed workspace bytes | Unsupported (inference only) |
 | `gemm/cutedsl/test_grouped_gemm_wgrad_empty.py` | `grouped_gemm_wgrad_wrapper_sm100`, cold-empty compilation | — | exact-zero overwrite and unchanged accumulated dW bytes; nonempty reuse, mixed empty experts and CUDA Graph replay |
 | `gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py` | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | saved C, D in both directions, both scale planes | — |
