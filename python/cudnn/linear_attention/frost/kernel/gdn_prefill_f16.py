@@ -114,7 +114,6 @@ from ..common.thd import (
     TENSOR_MAP_QWORDS,
 )
 from ..common.split_k import (
-    LEVEL_VOTE_WORDS,
     LEVEL_WORD_BASE,
     ORDER_CAPACITY,
     ORDER_ELEMENTS,
@@ -3344,7 +3343,7 @@ def frost_gdn_prefill_prologue(
         if cutlass.const_expr(mTailEnable is not None):
             n_items = n_items if cutlass.Int32(mTailEnable[0]) != cutlass.Int32(0) else cutlass.Int32(0)
         if cutlass.const_expr(level_blocks > 0):
-            sVote = cutlass.Array(cutlass.Int32, LEVEL_VOTE_WORDS, space=cutlass.AddressSpace.smem, alignment=16)
+            sVerdict = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
             level_order_body(
                 b_t,
                 ORDER_THREADS,
@@ -3363,7 +3362,7 @@ def frost_gdn_prefill_prologue(
                 sKey,
                 sIdx,
                 sSpread,
-                sVote,
+                sVerdict,
                 expand_num=expand_num,
                 mLevelOrder=mLevelOrder,
                 mPoolRows=mPoolRows,
@@ -3394,7 +3393,7 @@ def frost_gdn_prefill_prologue(
             # and the item count, off the SM that writes the rest of the table.
             if bidx != cutlass.Int32(1):
                 sRank = cutlass.Array(cutlass.Int32, level_blocks, space=cutlass.AddressSpace.smem, alignment=16)
-                sVote = cutlass.Array(cutlass.Int32, LEVEL_VOTE_WORDS, space=cutlass.AddressSpace.smem, alignment=16)
+                sVerdict = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
                 n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= v.shape[2] else v.shape[2])
                 if cutlass.const_expr(tiles_per_head > 1):
                     n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
@@ -3412,7 +3411,7 @@ def frost_gdn_prefill_prologue(
                     mCount,
                     mWorkItems,
                     sRank,
-                    sVote,
+                    sVerdict,
                     expand_num=expand_num,
                     mLevelOrder=mLevelOrder,
                     mPoolRows=mPoolRows,

@@ -113,7 +113,6 @@ DEFAULT_LOG2_THRESHOLD = -10.0 / math.log(2.0)  # e^-10, in log2 units
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the scan's log2 domain
 
 LEVEL_WORD_BASE = 2  # a levelled plan's scheduler region: the two ticket words, then one level word per CTA (word w at BASE + w)
-LEVEL_VOTE_WORDS = ORDER_THREADS // WARP_SIZE  # shared words of a prologue CTA's vote on the levelled table: one per warp
 
 
 def level_scheduler_words(num_sms: int) -> int:
@@ -1328,54 +1327,76 @@ def level_border_cut(b, q, rem, chunks):
 
 
 @cute.jit
+def level_planned_chunks(b_t: cutlass.Constexpr[int], n_rows, n_batch):
+    """Chunks per chain a levelled plan was admitted for: the batch's ``n_rows`` token rows shared out to its ``n_batch``
+    sequences.  The prologue lays the levelled table out for this count and takes the table only for a batch whose
+    every sequence has it (:func:`level_vote`): cumulative lengths that stop short of the rows are another shape."""
+    return cute.ceil_div(n_rows // (n_batch if n_batch > cutlass.Int32(0) else cutlass.Int32(1)), b_t)
+
+
+@cute.jit
+def level_chunks_fit(shares: cutlass.Constexpr[int], groups, chunks):
+    """:func:`level_plan_shape`'s conditions on the chunk count, on the device: chains of at least two chunks and a share
+    longer than a chain.  Where they hold, every row index of the levelled table of ``groups`` groups of ``chunks`` chunks
+    on ``shares`` shares lies inside the table, whatever the sequences' own lengths are."""
+    return (chunks >= cutlass.Int32(2)) and ((groups * chunks) // cutlass.Int32(shares) > chunks)
+
+
+@cute.jit
 def level_vote(
     b_t: cutlass.Constexpr[int],
     n_threads: cutlass.Constexpr[int],
+    shares: cutlass.Constexpr[int],
     tidx,
-    n_heads_out: cutlass.Int32,
     n_batch: cutlass.Int32,
+    groups,
+    chunks,
     mCuSeqlens: cute.Tensor,
-    sVote,
+    sVerdict,
     *,
     expand_num: cutlass.Constexpr[int] = 1,
     mPoolRows: cute.Tensor | None = None,
 ):
-    """A prologue CTA's vote on the levelled table, in front of ONE CTA-wide barrier of the caller: every thread checks
-    the sequences ``tidx, tidx + n_threads, ...`` -- each has sequence 0's chunk count and, where the state lives in a
-    pool (``mPoolRows``, the row per sequence), a row no sequence in front of it names -- and each warp leaves its
-    verdict in word ``warp`` of ``sVote`` (``LEVEL_VOTE_WORDS`` Int32 of shared memory, the caller's).  A levelled chain
-    is cut where sequence 0's chunk count says, and its second item starts from the row its first item stored: a batch
-    of other lengths, or one whose row another sequence stores, takes the uncut table.  The caller is every thread of
-    the CTA in converged control flow; :func:`level_takes` reads the verdict behind the barrier."""
-    _, _, _, _, chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, cutlass.Int32(0), expand_num)
-    agrees = cutlass.Boolean(True)
-    seq = tidx
-    while seq < n_batch:
-        seq_start = expanded_cu_seqlen(expand_num, mCuSeqlens, seq)
-        seq_end = expanded_cu_seqlen(expand_num, mCuSeqlens, seq + cutlass.Int32(1))
-        agrees = agrees and (cute.ceil_div(seq_end - seq_start, b_t) == chunks)
-        if cutlass.const_expr(mPoolRows is not None):
-            row = mPoolRows[seq]
-            other = cutlass.Int32(0)
-            while other < seq:
-                agrees = agrees and (mPoolRows[other] != row)
-                other = other + cutlass.Int32(1)
-        seq = seq + cutlass.Int32(n_threads)
-    warp_agrees = cutlass.Boolean(nvvm.vote_sync(0xFFFFFFFF, agrees, "all"))
-    sVote[tidx // cutlass.Int32(WARP_SIZE)] = cutlass.Int32(1) if warp_agrees else cutlass.Int32(0)
+    """A prologue CTA's verdict on the levelled table of ``groups`` groups of ``chunks`` chunks on ``shares`` shares, left
+    in ``sVerdict[0]`` (one Int32 of shared memory, the caller's) in front of ONE CTA-wide barrier of the caller;
+    :func:`level_takes` reads it behind that barrier.  The CTA's last warp forms it, the warp with the fewest rows to
+    write: lane ``l`` checks the sequences ``l, l + 32, ...`` -- each has ``chunks`` chunks and, where the state lives in
+    a pool (``mPoolRows``, the row per sequence), a row no sequence in front of it names -- the warp votes, and its
+    first lane stores the vote together with :func:`level_chunks_fit`.  A levelled chain is cut where ``chunks`` says,
+    and its second item starts from the row its first item stored: a batch of other lengths, or one whose row another
+    sequence stores, takes the uncut table.  Every thread of the CTA calls this in converged control flow."""
+    lane = tidx - cutlass.Int32(n_threads - WARP_SIZE)
+    if lane >= cutlass.Int32(0):
+        agrees = cutlass.Boolean(True)
+        # every loop below runs the same turns in every lane: the warp stays converged up to its vote
+        first = cutlass.Int32(0)
+        while first < n_batch:
+            seq = first + lane
+            mine = seq < n_batch
+            at = seq if mine else cutlass.Int32(0)  # a lane without a sequence reads sequence 0's words and drops them
+            seq_start = expanded_cu_seqlen(expand_num, mCuSeqlens, at)
+            seq_end = expanded_cu_seqlen(expand_num, mCuSeqlens, at + cutlass.Int32(1))
+            if cutlass.const_expr(mPoolRows is not None):
+                row = mPoolRows[at]
+            agrees = agrees and ((not mine) or (cute.ceil_div(seq_end - seq_start, b_t) == chunks))
+            if cutlass.const_expr(mPoolRows is not None):
+                last = first + cutlass.Int32(WARP_SIZE - 1)
+                last = last if last < n_batch else n_batch
+                other = cutlass.Int32(0)
+                while other < last:
+                    agrees = agrees and ((not mine) or (other >= seq) or (mPoolRows[other] != row))
+                    other = other + cutlass.Int32(1)
+            first = first + cutlass.Int32(WARP_SIZE)
+        warp_agrees = cutlass.Boolean(nvvm.vote_sync(0xFFFFFFFF, agrees, "all"))
+        if lane == cutlass.Int32(0):
+            sVerdict[0] = cutlass.Int32(1) if (warp_agrees and level_chunks_fit(shares, groups, chunks)) else cutlass.Int32(0)
 
 
 @cute.jit
-def level_takes(n_threads: cutlass.Constexpr[int], shares: cutlass.Constexpr[int], groups, chunks, planned_chunks, sVote):
-    """Whether the batch takes the levelled table of ``groups`` groups of ``chunks`` chunks on ``shares`` shares -- one
-    value for every thread of the CTA, read behind the barrier that follows :func:`level_vote`: every warp agreed,
-    chains of at least two chunks and a share longer than a chain (:func:`level_plan_shape`'s conditions on the lengths
-    the device sees), and the chunk count is ``planned_chunks``, the one the batch's token rows give: the plan was
-    admitted for that shape, and cumulative lengths that stop short of the rows are another one."""
-    takes = (chunks >= cutlass.Int32(2)) and (chunks == planned_chunks)
-    for warp in cutlass.range_constexpr(n_threads // WARP_SIZE):
-        takes = takes and (sVote[warp] != cutlass.Int32(0))
-    return takes and ((groups * chunks) // cutlass.Int32(shares) > chunks)
+def level_takes(sVerdict):
+    """Whether the batch takes the levelled table: the CTA's verdict (:func:`level_vote`), one value for every thread of
+    the CTA, read behind the barrier that follows the vote."""
+    return sVerdict[0] != cutlass.Int32(0)
 
 
 @cute.jit
@@ -1397,21 +1418,22 @@ def level_order_body(
     sKey,
     sIdx,
     sSpread,
-    sVote,
+    sVerdict,
     *,
     expand_num: cutlass.Constexpr[int] = 1,
     mLevelOrder: cute.Tensor | None = None,
     mPoolRows: cute.Tensor | None = None,
 ):
-    """The levelled work-item table of ``n_tiles`` chains of ONE length (sequence 0's chunk count) for ``num_ctas`` CTAs,
-    every row in closed form, in place of :func:`order_body`'s no-cuts table.  The chains form groups of ``group``
-    adjacent ones (the value heads of one key head): a group is cut at one chunk and its chains stand in adjacent rows,
-    so CTAs that become free together draw chains that load the same key rows.  The ``groups = n_tiles // group`` groups
-    lie end to end on a line of ``groups * chunks`` slots in table order, shared out to ``shares = num_ctas // group``
-    shares: share ``b`` owns the slots from border ``b * q + min(b, rem)`` (:func:`level_border_cut`) to the next one.
-    A group's line slots ``[a, e)`` are its chunks ``[chunks - e, chunks - a)``, so of a group across border ``b`` the
-    FIRST chunks open share ``b`` and the LAST chunks close share ``b - 1``.  Rows, each ``group`` times, sibling ``s``
-    of group row ``r`` in row ``group * r + s``::
+    """The levelled work-item table of ``n_tiles`` chains of ONE length -- the chunk count the batch's ``n_rows`` token
+    rows give its ``n_batch`` sequences (:func:`level_planned_chunks`) -- for ``num_ctas`` CTAs, every row in closed
+    form, in place of :func:`order_body`'s no-cuts table.  The chains form groups of ``group`` adjacent ones (the value
+    heads of one key head): a group is cut at one chunk and its chains stand in adjacent rows, so CTAs that become free
+    together draw chains that load the same key rows.  The ``groups = n_tiles // group`` groups lie end to end on a line
+    of ``groups * chunks`` slots in table order, shared out to ``shares = num_ctas // group`` shares: share ``b`` owns
+    the slots from border ``b * q + min(b, rem)`` (:func:`level_border_cut`) to the next one.  A group's line slots
+    ``[a, e)`` are its chunks ``[chunks - e, chunks - a)``, so of a group across border ``b`` the FIRST chunks open share
+    ``b`` and the LAST chunks close share ``b - 1``.  Rows, each ``group`` times, sibling ``s`` of group row ``r`` in row
+    ``group * r + s``::
 
         [0, shares)                      share b's opening group: whole, or the first chunks of the group across border b
         [shares, groups)                 every other whole group, table order
@@ -1427,17 +1449,18 @@ def level_order_body(
     in a region of :func:`level_scheduler_words` words, the level words -- on every call.
 
     The table needs what :func:`level_plan_shape` asks of the shape and a batch that agrees with it, which only the
-    device sees: every thread votes (:func:`level_vote`) and, behind one CTA-wide barrier, the CTA either writes the
-    rows above or -- lengths that differ, a chunk count that is not the one the batch's ``n_rows`` token rows give, a
-    chain of fewer than two chunks, a pool row named twice -- the uncut table
-    through :func:`order_body`, with the order entry 0 for each of its ``n_tiles`` rows and the item count.  Caller owns
-    ``sKey`` / ``sIdx`` / ``sSpread`` (:func:`order_body`'s) and ``sVote``; every thread of the calling CTA must reach
-    the barriers inside.
+    device sees.  The CTA's last warp checks the batch (:func:`level_vote`) while the threads that own rows write them,
+    wherever the chunk count alone allows the table (:func:`level_chunks_fit`: the rows then lie inside ``[0, n_tiles)``
+    for any batch).  Behind one CTA-wide barrier every thread reads the verdict: a batch that takes the table is done;
+    for any other -- lengths that differ or stop short of the token rows, a chain of fewer than two chunks, a pool row
+    named twice -- the CTA writes the uncut table over rows ``[0, n_tiles)`` through :func:`order_body`, with the order
+    entry 0 for each row and the item count.  Caller owns ``sKey`` / ``sIdx`` / ``sSpread`` (:func:`order_body`'s) and
+    ``sVerdict``; every thread of the calling CTA must reach the barriers inside.
 
     On the levelled path this body writes rows ``[0, n_tiles)`` and their order entries; the closing parts' rows, their
-    order entries and the item count are :func:`level_closing_body`'s, which runs in another CTA of the same launch and
-    decides from the same words (the rows of the two are disjoint and every thread of either forms its border's cut from
-    the same closed form)."""
+    order entries and the item count are :func:`level_closing_body`'s, which runs in another CTA of the same launch,
+    decides from the same words and writes nothing in front of its own verdict (the rows of the two are disjoint and
+    every thread of either forms its border's cut from the same closed form)."""
     if cutlass.const_expr(num_ctas // group < 1 or num_ctas > n_threads):
         raise ValueError(f"a levelled table needs a share and a prologue thread per CTA: {num_ctas} CTAs in groups of {group}, {n_threads} threads")
     if cutlass.const_expr(mScheduler is not None):
@@ -1448,12 +1471,12 @@ def level_order_body(
                 si = si + cutlass.Int32(1)
 
     shares = cutlass.Int32(num_ctas // group)
-    _, _, _, _, chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, cutlass.Int32(0), expand_num)
+    chunks = level_planned_chunks(b_t, n_rows, n_batch)
     groups = n_tiles // cutlass.Int32(group)
-    level_vote(b_t, n_threads, tidx, n_heads_out, n_batch, mCuSeqlens, sVote, expand_num=expand_num, mPoolRows=mPoolRows)
-    nvvm.barrier_cta_sync()
+    level_vote(b_t, n_threads, num_ctas // group, tidx, n_batch, groups, chunks, mCuSeqlens, sVerdict, expand_num=expand_num, mPoolRows=mPoolRows)
 
-    if level_takes(n_threads, num_ctas // group, groups, chunks, cute.ceil_div(n_rows // n_batch, b_t), sVote):
+    # ---- the levelled rows, in front of the verdict: the threads that own rows do not wait for the warp that checks the batch ----
+    if level_chunks_fit(num_ctas // group, groups, chunks):
         slots = groups * chunks
         q = slots // shares
         rem = slots - q * shares
@@ -1490,13 +1513,15 @@ def level_order_body(
                     if cutlass.const_expr(mLevelOrder is not None):
                         mLevelOrder[dst] = cutlass.Int32(0)
             item = item + cutlass.Int32(n_threads)
-    else:
-        # ---- the uncut table: no row sets a level word and none is held for one ------------------------------
+
+    nvvm.barrier_cta_sync()
+    if not level_takes(sVerdict):
+        # ---- the uncut table, over the rows above: no row sets a level word and none is held for one ----------
         if cutlass.const_expr(mLevelOrder is not None):
-            item = tidx
-            while item < n_tiles:
-                mLevelOrder[item] = cutlass.Int32(0)
-                item = item + cutlass.Int32(n_threads)
+            entry = tidx
+            while entry < n_tiles:
+                mLevelOrder[entry] = cutlass.Int32(0)
+                entry = entry + cutlass.Int32(n_threads)
         order_body(
             True,
             b_t,
@@ -1532,7 +1557,7 @@ def level_closing_body(
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor,
     sRank,
-    sVote,
+    sVerdict,
     *,
     expand_num: cutlass.Constexpr[int] = 1,
     mLevelOrder: cute.Tensor | None = None,
@@ -1548,10 +1573,10 @@ def level_closing_body(
     The row of a closing part is its rank among the closing parts.  Thread ``b`` leaves border ``b``'s key in word ``b``
     of ``sRank`` (the caller's, ``num_ctas // group`` Int32 of shared memory, written once): the closing part's length
     times the shares plus ``shares - b``, so that a larger key is a longer part or an equal one of an earlier border.
-    Behind ONE CTA-wide barrier it counts the borders with a larger key, one load and one compare each.  Every thread
-    of the calling CTA must reach that barrier."""
+    Behind ONE CTA-wide barrier it reads the verdict (``sVerdict``, the caller's) and counts the borders with a larger
+    key, one load and one compare each.  Every thread of the calling CTA must reach that barrier."""
     shares = cutlass.Int32(num_ctas // group)
-    _, _, _, _, chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, cutlass.Int32(0), expand_num)
+    chunks = level_planned_chunks(b_t, n_rows, n_batch)
     groups = n_tiles // cutlass.Int32(group)
     slots = groups * chunks
     q = slots // shares
@@ -1561,15 +1586,15 @@ def level_closing_body(
     cut_off = cutlass.Int32(0)
     key = cutlass.Int32(0)
     if tidx < shares:
-        # a batch of empty sequences takes no levelled table: its keys are formed, never used
+        # a chunk count the table cannot be laid out for takes no levelled table: its keys are formed, never used
         cut_group, cut_off = level_border_cut(tidx, q, rem, chunks if chunks > cutlass.Int32(0) else cutlass.Int32(1))
         key = cut_off * shares + (shares - tidx)
         sRank[tidx] = key
-    level_vote(b_t, n_threads, tidx, n_heads_out, n_batch, mCuSeqlens, sVote, expand_num=expand_num, mPoolRows=mPoolRows)
+    level_vote(b_t, n_threads, num_ctas // group, tidx, n_batch, groups, chunks, mCuSeqlens, sVerdict, expand_num=expand_num, mPoolRows=mPoolRows)
     nvvm.barrier_cta_sync()
 
-    if level_takes(n_threads, num_ctas // group, groups, chunks, cute.ceil_div(n_rows // n_batch, b_t), sVote):
-        if tidx < shares:
+    if tidx < shares:
+        if level_takes(sVerdict):
             ahead = cutlass.Int32(0)
             for other in cutlass.range_constexpr(1, num_ctas // group):
                 ahead = ahead + (cutlass.Int32(1) if sRank[other] > key else cutlass.Int32(0))
