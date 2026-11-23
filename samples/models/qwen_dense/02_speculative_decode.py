@@ -26,13 +26,13 @@ how many tokens a step kept; that figure belongs to the run's prompts and to its
 a decode step of the same tokens do not choose the same greedy token everywhere, so this script and ``00_decode.py``
 print different texts: each is the greedy text of its own kind of step, and the comparison of the two is reported.
 
-Coming from a serving engine: ``--speculative-config`` takes the JSON object that asks an engine to draft, key by key
+A request and its options: ``--speculative-config`` takes the JSON object that says how tokens are drafted, key by key
 (``serving_options.py``): a key is read, accepted at the value that changes nothing, or refused by name -- none is
 ignored, because each selects what is launched.  ``--messages``, ``--max-tokens`` and ``--max-model-len`` are those of
 ``00_decode.py``.
 
     python samples/models/qwen_dense/02_speculative_decode.py
-    python samples/models/qwen_dense/02_speculative_decode.py --stack native      # the verify step on the target kernel set
+    python samples/models/qwen_dense/02_speculative_decode.py --stack native      # the verify step on the stack's kernels
     python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native \\
         --speculative-config '{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}' \\
         --draft-vocab draft_vocab.json --messages request.json --max-tokens 256 > answer.txt
@@ -131,7 +131,7 @@ def _arguments(argv):
         "--speculative-config",
         default=None,
         metavar="JSON",
-        help="the speculative configuration of a serving engine, as the text of its JSON object; every key is answered: read, accepted "
+        help="the speculative configuration, as the text of a JSON object; every key is answered: read, accepted "
         f"at the value that changes nothing, or an error that names it (default {serving_options.SPECULATIVE_DEFAULT})",
     )
     parser.add_argument(
@@ -189,9 +189,9 @@ def _arguments(argv):
         "--stack",
         default="fe-cublas",
         choices=STACKS,
-        help="the stack of the MODEL's blocks, as in 00_decode.py: fe-cublas (default), native (the target kernel set of the verify "
-        "step and of the prompt's decode steps, as far as it is served here; the kernel check always on), fe-entries, reference (every "
-        "block in PyTorch).  The drafter's blocks are reference chains in every stack",
+        help="the stack of the MODEL's blocks, as in 00_decode.py: fe-cublas (default), native (the verify step and the prompt's decode "
+        "steps on the stack's kernels, a block no kernel serves on its fallback row; the kernel check always on), fe-entries, reference "
+        "(every block in PyTorch).  The drafter's blocks are reference chains in every stack",
     )
     parser.add_argument(
         "--provider",
@@ -213,9 +213,7 @@ def _arguments(argv):
     args.limit_flag = "--max-new-tokens" if any(word.split("=")[0] == "--max-new-tokens" for word in argv) else "--max-tokens"
     args.limit_given = args.max_new_tokens is not None
     if args.dump_census is not None:
-        parser.error(
-            "--dump-census: the launch records of a draft pass have no kernel census to be held against yet; 00_decode.py writes those of a decode step"
-        )
+        parser.error("--dump-census: not in this script; 00_decode.py writes the launch records of a decode step")
     if any(pair.startswith("draft.") for pair in args.provider):
         parser.error("--provider selects a row of a block of the model; a block of the drafter has one row, a reference chain, in every stack")
     if args.check_kernels and args.stack == "reference":

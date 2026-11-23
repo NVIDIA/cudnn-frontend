@@ -1,6 +1,6 @@
 # Sample-only dependency; not part of cudnn-frontend's runtime package and not needed by any default run.
-# Needed only for the stack `native` of a model sample (--stack native): the multiplies the target kernel set runs on a
-# library are calls of FlashInfer on the stored weights. Every other stack runs without it; --stack fe-entries runs the
+# Needed only for the stack `native` of a model sample (--stack native): three multiplies of that stack are calls of
+# FlashInfer on the stored weights. Every other stack runs without it; --stack fe-entries runs the
 # cuDNN Frontend rows of `native` without it.
 # A lower bound, no pin. The adapters run on a validated version alone (samples/models/constraints-native.txt holds the
 # validated versions as exact pins; install with both files):

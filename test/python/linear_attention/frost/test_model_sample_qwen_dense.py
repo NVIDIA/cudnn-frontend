@@ -565,7 +565,7 @@ from model_samples.providers import torch_ref
 from model_samples.qwen_dense import QwenDense
 from model_samples.state import DecodeState, KvCache
 
-DEVICE, PAGE, RECORDED, BF16 = "cuda:0", 64, 2051, torch.bfloat16
+DEVICE, PAGE, DEFAULT_LENGTH, BF16 = "cuda:0", 64, 2051, torch.bfloat16
 model = QwenDense.reduced()
 failed = []
 
@@ -615,18 +615,18 @@ def judged(block, queries, cache, position, twin=None):
 
 
 def cases():
-    # one sequence at the maximum length the census was recorded with, in a pool of 39 pages: two live rows at a step of one
+    # one sequence at the maximum length the scripts default to, in a pool of 39 pages: two live rows at a step of one
     # row -- the queries of the third draw four times as large --, six live rows at a step of six
     for pool_seed, query_seed, scale, tokens in ((1002, 2002, 1.0, 1), (2002, 4002, 1.0, 1), (3002, 6002, 4.0, 1), (3012, 4012, 1.0, 6), (6012, 8012, 1.0, 6)):
         live = 2 if tokens == 1 else 6
-        stats, kernel = judged(*drawn(1, tokens, live, RECORDED, pool_seed, query_seed, scale, pages=39))
+        stats, kernel = judged(*drawn(1, tokens, live, DEFAULT_LENGTH, pool_seed, query_seed, scale, pages=39))
         hold(f"1 x {{tokens}} rows, {{live}} live, seeds {{pool_seed}} / {{query_seed}}", stats.ok and stats.worst_share <= 1.0, f"{{stats.line()}}; {{kernel}}")
 
 
 def forms():
     # a step shape for each kernel form of the library: sequences x tokens per sequence at a maximum length, 100 live rows
     # per sequence (a full page and 36 rows of a second), 37 where the maximum length is 40
-    for sequences, tokens, limit in ((1, 1, RECORDED), (1, 6, RECORDED), (7, 1, RECORDED), (1, 8, RECORDED), (16, 5, RECORDED), (4, 6, RECORDED), (1, 1, 512), (1, 6, 40)):
+    for sequences, tokens, limit in ((1, 1, DEFAULT_LENGTH), (1, 6, DEFAULT_LENGTH), (7, 1, DEFAULT_LENGTH), (1, 8, DEFAULT_LENGTH), (16, 5, DEFAULT_LENGTH), (4, 6, DEFAULT_LENGTH), (1, 1, 512), (1, 6, 40)):
         stats, kernel = judged(*drawn(sequences, tokens, min(100, limit - 3), limit, 7001 + sequences, 9001 + tokens))
         hold(f"{{sequences}} x {{tokens}} rows at a maximum length of {{limit}}", stats.ok and stats.worst_share <= 1.0, f"{{stats.line()}}; {{kernel}}")
 
@@ -634,7 +634,7 @@ def forms():
 def arms():
     # every arm must FAIL.  One sequence, 100 live rows: a full page and 36 rows of a second
     live = 100
-    block, queries, cache, position = drawn(1, 1, live, RECORDED, 7001, 9001)
+    block, queries, cache, position = drawn(1, 1, live, DEFAULT_LENGTH, 7001, 9001)
     stats, kernel = judged(block, queries, cache, position)
     hold("no defect", stats.ok, f"{{stats.line()}}; {{kernel}}")
     table, lengths, blocks = cache.table, cache.table.lengths.clone(), cache.table.blocks.clone()
@@ -677,11 +677,11 @@ def arms():
     for name, wrong in (("a twin: the newest value row read from the next slot", newest), ("a twin: the value row of position 0 read from slot 1", oldest)):
         stats, _ = judged(block, queries, cache, position, twin_on(queries, wrong, [live]))
         hold(name, not stats.ok and stats.finite and stats.outside > 0, stats.line())
-    block, queries, cache, position = drawn(1, 6, live, RECORDED, 7001, 9001)
+    block, queries, cache, position = drawn(1, 6, live, DEFAULT_LENGTH, 7001, 9001)
     stats, _ = judged(block, queries, cache, position, twin_on(queries, cache.values(live, BF16), [live] * 6))
     hold("a twin: every row of a step of six attends to all rows", not stats.ok and stats.finite and stats.outside > 0, stats.line())
     # tables of 64-bit words are the adapter's own decline, at two sequences of two pages: the library would read them as 32-bit words
-    block, queries, cache, position = drawn(2, 1, live, RECORDED, 7001, 9001)
+    block, queries, cache, position = drawn(2, 1, live, DEFAULT_LENGTH, 7001, 9001)
     for name, wide in (("lengths", dict(lengths=cache.table.lengths.long())), ("blocks", dict(blocks=cache.table.blocks.long()))):
         kept = {{field: getattr(cache.table, field) for field in wide}}
         vars(cache.table).update(wide)
@@ -1647,8 +1647,7 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 positions" in header
     load = next(index for index, line in enumerate(lines) if line.startswith("[02] stage "))
     before = (
-        '[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, '
-        "use_local_argmax_reduction true.",
+        '[02] --speculative-config (the default): read: method "mtp", num_speculative_tokens 5, use_local_argmax_reduction true.',
         "[02] draft vocabulary seeded list (seed 0): 3,880 ids of the model's 15,520, in ascending order (3,880 entries listed, none dropped)",
         "[02] prompt of 26 tokens = 26 decode steps and 25 passes of the drafter before the first token; then every step is 5 draft passes and one "
         "verify step of 6 tokens, and keeps 1 to 6 of them",
@@ -1660,7 +1659,7 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert "with its drafter, one after the other" in out and out.count("this stack needs about ") == 1, "one memory sentence, the drafter in it"
     # the report, in front of the comparison: the schedule, no rate, the bytes of a step
     against = lines.index(
-        "speculative against decode (1 sequence x 6 tokens per sequence, 10 engine steps behind a prompt of 26 tokens; "
+        "speculative against decode (1 sequence x 6 tokens per sequence, 10 speculative steps behind a prompt of 26 tokens; "
         "tokens kept behind the first: 0, 1, 2, 3, 4, 5, 0, 1, 2, 3; 2 layers)"
     )
     report = lines.index("acceptance            scheduled, not measured (reduction): 10 steps; kept 1: 2, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1")

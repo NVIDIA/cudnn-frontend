@@ -15,11 +15,10 @@
   verify entry, and a plan of one token per sequence is the plan it was;
 * the adapter of ``cudnn.GdnVerifyFused`` over a stand-in entry: what it is built with, the operands in the entry's order,
   the step shape its facts are asked with, a slot table of another tokens count than the row's;
-* the census of the target kernel set for a verify step: its three numbers, the identity of every call, the coverage line,
-  a section that holds for its tokens per sequence alone;
+* the kernel table of a verify plan and its count of a step, on ``native`` and on ``fe-entries``;
 * the kernel check on constructed launch records of a verify step: the decode kernel under the row's name, another
   tokens count (another shared memory), a call served without the wait, a launch more or less, another shape than the
-  recorded one -- each FAILS with its own sentence.
+  entry states -- each FAILS with its own sentence.
 * the out-projection of a verify step: the rows of the FP8 projection entry for the linear-attention layers' call, keyed on
   the rows of the step, with the attention layers' call handed on to the next row; a provider row that hands a call site
   on and the parts of its block in a plan (``blocks.BySite``); the adapter over a stand-in entry, whose call log states
@@ -132,7 +131,7 @@ def _pair(sequences, tokens, steps=32, page=None):
 
 
 def _plan(sequences=1, tokens=1, stack="native", cc=(10, 0), sms=148, model=None, max_model_len=2051):
-    """A plan on stated device facts for a run of the maximum length ``max_model_len`` (the one the census was recorded with)."""
+    """A plan on stated device facts for a run of the maximum length ``max_model_len`` (the scripts' default)."""
     from model_samples import blocks
     from model_samples.qwen_dense import QwenDense
 
@@ -1061,7 +1060,7 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         "runs were made before the stack had its library rows --, the two-layer seeded model: at every step shape that ran up to 32 rows" in section
     )
     assert "The figures of this paragraph are those of the runs on the cuDNN Frontend rows, above. Up to 32 rows of a step PyTorch reserved" in section
-    # ... and what the stack ran with its library rows: the step shapes, and the counts of the one shape the census has a section for
+    # ... and what the stack ran with its library rows: the step shapes, and the counts of one of them
     assert (
         "With its library rows the stack ran seven of these step shapes on 2026-11-18 (PyTorch 2.14.0, FlashInfer 0.7.2.post1; the attention preparation on its reference chain) -- one sequence of two, "
         "six and eight tokens, two and four sequences of six, four of eight and 16 of two --: every greedy token of the verify steps was the decode "
@@ -1303,14 +1302,14 @@ def _out_parts(sequences, tokens, **where):
 
 
 def test_the_rows_of_the_out_projection_of_a_verify_step():
-    """In a step of several tokens per sequence the target runs the FP8 projection kernel for the out-projection of a
-    linear-attention layer and a library multiply for an attention layer's.  The block has rows of
+    """In a step of several tokens per sequence the FP8 projection kernel serves the out-projection of a
+    linear-attention layer and a library multiply an attention layer's.  The block has rows of
     ``cudnn.Fp8ProjectionDecode`` for such steps alone, keyed on the rows of the step: on compute capability 10.0 two K
     slices and a ring of 11 stages for 2 to 8 rows, four slices and 7 stages for 9 to 16, the multiply over a copy from
     17; on the other 10.x classes four slices at 2 to 32 rows.  Each row names the kernel whole -- the token tile of its
     range too -- serves the linear-attention layers' call site and hands the attention layers' on to the next row.  The
     form a row names is the PUBLIC entry's own at every row count of the row, and equals the entry's pick; the launch it
-    states at six rows is the recorded one.  A step of one token per sequence is the plan it was."""
+    states at six rows has the grid of two K slices.  A step of one token per sequence is the plan it was."""
     import cudnn
     from cudnn.gemm import ProjectionForm, ProjectionGeometry
     from model_samples import blocks, census
@@ -1976,7 +1975,7 @@ def test_a_session_with_draft_tokens_feeds_its_prompt_through_decode_steps_and_v
     assert checks.ok, checks.text()
     kept = ", ".join(str(count) for count in scheduled)
     assert checks.lines[0] == (
-        f"speculative against decode ({sequences} sequence{'s' if sequences > 1 else ''} x {tokens} tokens per sequence, {len(scheduled)} engine steps "
+        f"speculative against decode ({sequences} sequence{'s' if sequences > 1 else ''} x {tokens} tokens per sequence, {len(scheduled)} speculative steps "
         f"behind a prompt of 5 tokens; tokens kept behind the first: {kept}; 3 layers)"
     )
     for name in ("tokens", "kept state", "position", "prompt", "recorded", "bytes", "rejected rows", "acceptance"):
@@ -2606,7 +2605,7 @@ def test_the_decode_adapter_builds_the_layout_the_prompt_launches(monkeypatch):
 
 
 # ---------------------------------------------------------------- the speculative step: draft passes, one verify step, one host read
-def _engine_loop(session, prompts, stream, new=24, scheduled=True, emit=None):
+def _speculative_loop(session, prompts, stream, new=24, scheduled=True, emit=None):
     """The loop a caller writes around a session with a drafter: ``prefill``, then per step ``speculate``, the ONE host read
     of the pair, ``sampling.accepted``, ``accept``.  ``scheduled``: the drafted tokens of every step are those of
     :func:`tie_out.forced_drafts` (``force=``), which a correct step keeps 0, 1, .., ``draft_tokens`` of in turn; else
@@ -2682,7 +2681,7 @@ def test_a_speculative_step_drafts_verifies_and_keeps_what_the_comparison_says()
     assert (session.state.position, session.state.accepted, session.record.accepted_all, session.record.forced) == (8, 2, [2], 1)
     # the scheduled loop
     session.reset(fresh=True)
-    out, scheduled, pairs = _engine_loop(session, prompts, stream, new)
+    out, scheduled, pairs = _speculative_loop(session, prompts, stream, new)
     assert out[:new] == stream[0][:new], "the ids are the plain session's"
     assert session.record.accepted == scheduled == session.record.accepted_all and set(scheduled) == set(range(tokens)), "every count was kept"
     assert session.record.forced == len(scheduled) and all(tuple(pair.shape) == (1, 2, tokens) for pair in pairs)
@@ -2703,14 +2702,14 @@ def test_a_speculative_step_drafts_verifies_and_keeps_what_the_comparison_says()
     assert own.ok, own.text()
     assert "  replay            ids, logits and the drafter's proposals byte-identical on a second run from a fresh state    PASS" in own.lines
     # ... and the replay holds the proposals: a record that says the drafter proposed another token is not the run's
-    _engine_loop(session, prompts, stream, new)
+    _speculative_loop(session, prompts, stream, new)
     session.record.proposals[2, 0, 4] += 1
     other = tie_out.run_checks(session, prompt_tokens=5)
     assert (
         not other.ok and "  replay            ids, logits and the drafter's proposals byte-identical on a second run from a fresh state    FAIL" in other.lines
     )
     # the drafter's own proposals: the step keeps what the comparison says, and the ids are still the plain session's
-    out, _, pairs = _engine_loop(session, prompts, stream, new, scheduled=False)
+    out, _, pairs = _speculative_loop(session, prompts, stream, new, scheduled=False)
     assert out[:new] == stream[0][:new] and session.record.forced == 0 and all(0 <= kept <= drafted for kept in session.record.accepted_all)
     windows = session.record.inputs[: session.record.count].view(-1, tokens)
     assert torch.equal(windows[:, 1:], session.record.proposals[: session.record.count, 0]), "the windows are the drafter's proposals"
@@ -2718,7 +2717,7 @@ def test_a_speculative_step_drafts_verifies_and_keeps_what_the_comparison_says()
     assert unscheduled.ok, unscheduled.text()
     # the line of the proposals is about what the RUN recorded, not what the comparison's replay drafts: a record of another token fails it
     session.reset(fresh=False)  # the comparison left the session with the record of its run: a new prompt set starts with a reset
-    _engine_loop(session, prompts, stream, new, scheduled=False)
+    _speculative_loop(session, prompts, stream, new, scheduled=False)
     ran = session.record.count
     session.record.proposals[1, 0, 2] += 1
     tampered = tie_out.speculative_checks(session, plain)
@@ -2783,7 +2782,7 @@ def test_what_a_rejected_draft_left_in_the_drafters_cache_is_not_read():
     and emits what it did, and the cache in front of its last step is the same bytes.  The control: the position in
     front of that first row is read and never written again, and the same overwrite from there on moves the proposals."""
     plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
-    out, scheduled, _ = _engine_loop(session, prompts, stream)
+    out, scheduled, _ = _speculative_loop(session, prompts, stream)
     steps, began = session.record.count, session.state.position - (session.state.accepted + 1)
     assert scheduled == [0, 1, 2, 3, 4, 5, 0, 1], "all but one step left rejected drafts behind"
     first = (session.record.proposals[:steps].clone(), session.state.draft.k[:, :, :began].clone(), session.state.draft.v[:, :, :began].clone())
@@ -2801,13 +2800,13 @@ def test_what_a_rejected_draft_left_in_the_drafters_cache_is_not_read():
 
     session.reset(fresh=False)
     session.accept = overwriting(0)
-    again, kept, _ = _engine_loop(session, prompts, stream)
+    again, kept, _ = _speculative_loop(session, prompts, stream)
     cache = session.state.draft
     assert again == out and kept == scheduled and torch.equal(session.record.proposals[:steps], first[0]), "nothing of it was read"
     assert torch.equal(cache.k[:, :, :began], first[1]) and torch.equal(cache.v[:, :, :began], first[2]) and bool((cache.k[:, :, began:] == 1.5).all())
     session.reset(fresh=False)
     session.accept = overwriting(1)
-    again, kept, _ = _engine_loop(session, prompts, stream)
+    again, kept, _ = _speculative_loop(session, prompts, stream)
     assert again == out and kept == scheduled, "the drafted tokens were scheduled: the ids are the plain session's all the same"
     assert not torch.equal(session.record.proposals[:steps], first[0]), "the position in front of a step is read by every pass behind it"
 
@@ -2886,7 +2885,7 @@ def test_a_wrong_draft_pass_fails_the_line_that_sees_it(monkeypatch, wrong):
         monkeypatch.setattr(loop.Session, "_fill", lambda self, ids: None if self.state.position == 2 else fill(self, ids))
     elif not of_the_drafter:
         monkeypatch.setattr(loop.Session, "_draft", wrong_draft)
-    out, scheduled, _ = _engine_loop(session, prompts, stream)
+    out, scheduled, _ = _speculative_loop(session, prompts, stream)
     assert out[:24] == stream[0][:24] and session.record.accepted == scheduled, "the verify step and the comparison are right: the ids are the plain session's"
     checks = tie_out.speculative_checks(session, plain, scheduled)
     assert not checks.ok and _line(checks, failing).endswith("    FAIL"), checks.text()
@@ -2908,7 +2907,7 @@ def test_a_drafted_token_the_caller_emits_reaches_no_line_of_the_comparison():
     from model_samples import tie_out
 
     plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
-    out, scheduled, _ = _engine_loop(session, prompts, stream, emit=_emit_the_drafted_token)
+    out, scheduled, _ = _speculative_loop(session, prompts, stream, emit=_emit_the_drafted_token)
     assert out[:24] != stream[0][:24], "the emitted ids are not the plain session's"
     assert session.record.accepted == scheduled and set(scheduled) == set(range(6)), "the session's steps are what they were"
     checks = tie_out.speculative_checks(session, plain, scheduled)
@@ -2921,7 +2920,7 @@ def test_a_second_prompt_set_starts_from_nothing_of_the_first():
     set gives the proposals of a fresh session; ``snapshot`` / ``restore`` carry them, so the steps behind a restored
     state are the steps that were behind it the first time."""
     plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
-    out, _, pairs = _engine_loop(session, prompts, stream, scheduled=False)
+    out, _, pairs = _speculative_loop(session, prompts, stream, scheduled=False)
     steps = session.record.count
     first = (out, session.record.proposals[:steps].clone(), list(session.record.accepted_all), torch.stack(pairs))
     state, cache = session.state, session.state.draft
@@ -2930,7 +2929,7 @@ def test_a_second_prompt_set_starts_from_nothing_of_the_first():
     assert session.state is state and state.draft is cache, "the same allocations"
     assert (state.hidden, state.greedy, state.accepted, state.position, state.verify_steps) == (None, None, 0, 0, 0)
     assert not cache.k.any() and not cache.v.any() and (session.record.accepted_all, session.record.forced, session.record.count) == ([], 0, 0)
-    out, _, pairs = _engine_loop(session, prompts, stream, scheduled=False)
+    out, _, pairs = _speculative_loop(session, prompts, stream, scheduled=False)
     again = (out, session.record.proposals[:steps].clone(), list(session.record.accepted_all), torch.stack(pairs))
     assert again[0] == first[0] and again[2] == first[2] and torch.equal(again[1], first[1]) and torch.equal(again[3], first[3])
     # a snapshot behind the third step, two more steps, the snapshot back, the two steps again
@@ -3118,7 +3117,7 @@ def _behind(links, seed, handed=False, drafted=3, new=12):
     for _ in range(new + drafted - 1):
         ids = chain[0].step(ids)
         stream += chain[0].read(ids)
-    out, _, _ = _engine_loop(chain[-1], prompts, None, new, scheduled=False)
+    out, _, _ = _speculative_loop(chain[-1], prompts, None, new, scheduled=False)
     return chain, stream, out
 
 
@@ -3180,7 +3179,7 @@ def test_the_report_of_a_speculative_session():
     from model_samples.timing import Report
 
     plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
-    _, scheduled, _ = _engine_loop(session, prompts, stream)
+    _, scheduled, _ = _speculative_loop(session, prompts, stream)
     report = session.report()
     assert scheduled == [0, 1, 2, 3, 4, 5, 0, 1]
     assert (report.drafter, report.tokens, report.draft_tokens, report.scheduled, report.accepted) == (True, 6, 5, True, scheduled)
@@ -3203,7 +3202,7 @@ def test_the_report_of_a_speculative_session():
     # the run on the drafter's own proposals is a measurement: the report of the run says how many tokens a step kept
     session.reset(fresh=False)
     session.new_report()
-    _engine_loop(session, prompts, stream, scheduled=False)
+    _speculative_loop(session, prompts, stream, scheduled=False)
     measured = session.report()
     kept = list(session.record.accepted_all)
     assert not measured.scheduled and measured.accepted == kept and measured.drafter
@@ -3248,7 +3247,7 @@ def test_the_report_of_a_speculative_session():
     assert behind["weights"] - alone["weights"] == behind["copies"] - alone["copies"] == 2051 * position
     # the steps of the acceptance lines are the run's, not the record's: a session that records three steps and runs eight reports eight
     _, short, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter, record_steps=3)
-    _, scheduled, _ = _engine_loop(short, prompts, stream)
+    _, scheduled, _ = _speculative_loop(short, prompts, stream)
     assert (short.record.count, short.record.accepted, short.report().accepted) == (8, scheduled[:3], scheduled) and len(scheduled) == 8
     assert "acceptance            scheduled, not measured (reduction): 8 steps; kept 1: 2, 2: 2, 3: 1, 4: 1, 5: 1, 6: 1" in short.report().text().splitlines()
 
@@ -3305,7 +3304,7 @@ def test_the_memory_sentence_with_the_drafter(monkeypatch):
         assert session.draft_plan.first_used and session._tables().endswith(session.draft_plan.table()) and "draft.token_choice" in session._tables()
 
 
-def _engine_step(passes=3, pass_more=(), between=(), fused=(VERIFY_SYMBOL, VERIFY_SHAPE), reads=1):
+def _speculative_step(passes=3, pass_more=(), between=(), fused=(VERIFY_SYMBOL, VERIFY_SHAPE), reads=1):
     """The launch records of one step of speculative decoding as a traced pass has them: per draft pass the gather, the
     chain's kernels and a host-to-device copy of a row quantiser's constant; the concatenation of the window; the model's
     gather, a chain kernel, the fused verify step, the token choice; the stack of the pair; the host read.  ``pass_more``:
@@ -3323,7 +3322,7 @@ def _engine_step(passes=3, pass_more=(), between=(), fused=(VERIFY_SYMBOL, VERIF
     return records + [Launch(HOST_READ, "copy", float(len(names) + n), len(names) + n + 0.5, bytes=48) for n in range(reads)]
 
 
-def test_the_kernel_check_of_an_engine_step_on_constructed_records():
+def test_the_kernel_check_of_a_speculative_step_on_constructed_records():
     """The sites of a step of speculative decoding are, for every pass, the drafter's wiring with the pass's number in the
     place of the layer, then the model's: the check holds the embedding lookups of the passes and the model's in that
     order, attributes the passes' chains and their copies to the drafter's fallback rows, and holds the model's verify
@@ -3348,7 +3347,7 @@ def test_the_kernel_check_of_an_engine_step_on_constructed_records():
         status, lines = traced.judge()
         return traced, status, lines
 
-    traced, status, lines = judged(_engine_step())
+    traced, status, lines = judged(_speculative_step())
     assert (status, lines, len(passes)) == (census.PASS, [], 54)
     result = traced.result
     assert (result.exact, result.launches, result.copies) == (5, [14], [4]), "the exact rows of three passes and of the model; the copies of the chains"
@@ -3365,20 +3364,20 @@ def test_the_kernel_check_of_an_engine_step_on_constructed_records():
     # (the lookups of a step are one kernel id: the comparison counts them and names the surplus one in front of the matching run)
     fails(
         [f"step 0: launched embedding_gather {gather} at the start of the step, where the plan has no such launch: {extra}"],
-        step=_engine_step(pass_more=[(GATHER, ((1, 1, 1), (128, 1, 1), 0))]),
+        step=_speculative_step(pass_more=[(GATHER, ((1, 1, 1), (128, 1, 1), 0))]),
     )
     fails(
         [
             "step 0: draft.embedding (layer 0) did not launch embedding_gather: the step has 3 launch(es) of embedding_gather, the plan 4 = 4 call(s) x 1 per call"
         ],
-        step=_engine_step(passes=2),
+        step=_speculative_step(passes=2),
     )
     # a copy inside a pass is a chain's (the passes above have one each); between two exact rows of the model it is undeclared
     bare = passes + [model_sites[0], *model_sites[2:]]
     bare_log = [[Call(site.block, site.layer, 6, "cudnn.GdnVerifyFused #1" if site.form else "", tuple(site.form)) for site in bare]]
     copy = [("Memcpy HtoD (Pageable -> Device)", None)]
-    clean = census.Traced.of(bare, bare_log, _engine_step(), 1, "", 6).judge()
-    copied = census.Traced.of(bare, bare_log, _engine_step(between=copy), 1, "", 6).judge()
+    clean = census.Traced.of(bare, bare_log, _speculative_step(), 1, "", 6).judge()
+    copied = census.Traced.of(bare, bare_log, _speculative_step(between=copy), 1, "", 6).judge()
     assert clean == (census.PASS, [])
     assert copied == (
         census.FAIL,
@@ -3392,20 +3391,20 @@ def test_the_kernel_check_of_an_engine_step_on_constructed_records():
     # the pair read as two host reads: the records cannot be cut into the traced steps
     fails(
         ["copies: the records show 2 host reads for 1 traced steps: a block reads the device inside a step, and only the one host read of a step is declared"],
-        step=_engine_step(reads=2),
+        step=_speculative_step(reads=2),
     )
     # the fused verify step in another shape than its entry states, at the MODEL's site
     launched = "linear_attention.step (layer 0) launched gdn_verify_fused with grid (96, 1, 1), block (256, 1, 1), shared memory 112,368 B; "
     shape = "grid (96, 1, 1), block (256, 1, 1), shared memory 126,512 B"
-    fails([f"step 0: {launched}cudnn.GdnVerifyFused states {shape}"], step=_engine_step(fused=(VERIFY_SYMBOL, TWO_TOKENS)))
+    fails([f"step 0: {launched}cudnn.GdnVerifyFused states {shape}"], step=_speculative_step(fused=(VERIFY_SYMBOL, TWO_TOKENS)))
     # a step that made the model's calls without the passes in front of them
     fails(
         ["step 0: the step made 4 block calls, the wiring has 58; call 1 is embedding, the wiring has draft.embedding (layer 0) there"],
-        step=_engine_step(),
+        step=_speculative_step(),
         calls=[log[0][54:]],
     )
     # the details name every exact row once, in the order of a step: the lookup of the passes, then the model's lookup and its fused step
-    named = census.Traced.of(sites, log, _engine_step(), 1, "", 6)
+    named = census.Traced.of(sites, log, _speculative_step(), 1, "", 6)
     status, lines = named.judge()
     rows = [line.split(": ", 1)[0] for line in named.details() if " per call)" in line]
     assert (status, lines, rows) == (census.PASS, [], ["draft.embedding", "embedding", "linear_attention.step"])
@@ -3413,7 +3412,7 @@ def test_the_kernel_check_of_an_engine_step_on_constructed_records():
     # what a dump says of a site is the same for a pass's site and for the model's: its block, its call, its kernels
     dumped = named.dump()
     assert len(dumped["sites"]) == 58 and len({tuple(site) for site in dumped["sites"]}) == 1 and "identity" not in dumped["sites"][0]
-    assert isinstance(_engine_step()[2], Launch) and _engine_step()[2].kind == "copy"
+    assert isinstance(_speculative_step()[2], Launch) and _speculative_step()[2].kind == "copy"
 
 
 def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_written():
@@ -3663,10 +3662,12 @@ def test_the_traced_pass_of_a_session_with_a_drafter_runs_whole_steps(monkeypatc
     from model_samples import census, loop, tie_out
 
     plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter, check_kernels=True)
-    _, scheduled, _ = _engine_loop(session, prompts, stream)
+    _, scheduled, _ = _speculative_loop(session, prompts, stream)
     state, record, cache = session.state, session.record, session.state.draft.k.clone()
-    engine, steps, read = loop.Session._engine, [], []
-    monkeypatch.setattr(loop.Session, "_engine", lambda self, force, accept: steps.append((force.clone(), accept)) or engine(self, force, accept))
+    speculative_step, steps, read = loop.Session._speculative_step, [], []
+    monkeypatch.setattr(
+        loop.Session, "_speculative_step", lambda self, force, accept: steps.append((force.clone(), accept)) or speculative_step(self, force, accept)
+    )
 
     def stand_in(step, count, device=None, records=None):
         for index in range(count):
@@ -3822,7 +3823,7 @@ def test_a_chain_of_sessions_with_a_drafter_loads_every_drafter_from_the_owner_o
         stream += plain.read(ids)
     made = []
     for each in chain:
-        out, _, pairs = _engine_loop(each, prompts, None, new, scheduled=False)
+        out, _, pairs = _speculative_loop(each, prompts, None, new, scheduled=False)
         assert out == stream[: len(out)] and each.record.count >= 2, "the plain session's tokens"
         made.append((torch.stack(pairs), each.record.proposals[: each.record.count].clone()))
     assert all(torch.equal(pairs, made[0][0]) and torch.equal(proposals, made[0][1]) for pairs, proposals in made[1:]), "the same steps on each"
@@ -3835,7 +3836,7 @@ def test_a_snapshot_behind_a_step_that_kept_drafted_tokens_gives_the_steps_behin
     that were behind it the first time: the pairs and the drafter's proposals.  A restore that lost the kept count would
     go on from another row: the next window starts with another token."""
     plain, session, prompts, stream = _speculative(1, 5, drafter=_seeded_drafter)
-    _, scheduled, pairs = _engine_loop(session, prompts, stream)
+    _, scheduled, pairs = _speculative_loop(session, prompts, stream)
     counts, steps = list(session.record.accepted_all), session.record.count
     assert counts == scheduled and counts[:5] == [0, 1, 2, 3, 4] and steps >= 5
     forces = session.record.inputs[:steps].view(steps, 1, 6)[:, :, 1:].clone()  # the drafted tokens every step verified

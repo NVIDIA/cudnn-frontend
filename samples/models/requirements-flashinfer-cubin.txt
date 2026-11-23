@@ -1,6 +1,6 @@
 # Sample-only dependency; not part of cudnn-frontend's runtime package and not needed by any default run.
 # Needed only for the stack `native` of a model sample (--stack native) on compute capability 10.x: the attention core of
-# the target kernel set is FlashInfer's paged decode attention, whose kernels are precompiled binaries. This package
+# that stack is FlashInfer's paged decode attention, whose kernels are precompiled binaries. This package
 # holds them. FlashInfer reads it only at its own version, and a sample never lets the library fetch a kernel binary:
 # without the package (and without a directory of kernel binaries filled beforehand) the run is a SKIP that names it.
 # A lower bound, no pin; samples/models/constraints-native.txt holds the validated version as an exact pin. This version

@@ -6,8 +6,8 @@ linear-attention layer a pool of recurrent states and conv histories addressed b
 
 The set of sequences is fixed when the state is built.  Slot 0 of every pool is the null slot (a row whose slot id is 0 is
 padding for the fused step and touches nothing); sequence ``i`` owns slot ``i + 1``.  The conv history is stored tap-major,
-``[slots, taps, channels]``, and handed to a block as the ``[slots, channels, taps]`` view of it: the layout a serving engine
-keeps and the fused step is validated on.
+``[slots, taps, channels]``, and handed to a block as the ``[slots, channels, taps]`` view of it: the layout the fused
+step is validated on.
 
 **A step of several tokens per sequence** (a verify step: ``tokens`` = T > 1) keeps a recurrent state per (sequence, token):
 the state after token ``t`` of sequence ``i`` is written to the slot of that pair, so that the step after it can start from

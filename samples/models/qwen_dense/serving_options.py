@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""What a user of a serving engine brings to the samples of this family, in one module beside the scripts.
+"""A request and its options for the samples of this family, in one module beside the scripts.
 
-A sample is one process with greedy token choice, not a serving engine.  Its user often comes from one, with the request
-body a chat client sends and with the option names of a serving command line.  This module reads that body as it is and
+A sample is one process with greedy token choice.  Its user often brings the request body a chat client sends and the
+option names that go with it (``--max-tokens``, ``--max-model-len``).  This module reads that body as it is and
 answers every field of it:
 
 * **read**: ``messages``, ``tools``, ``chat_template_kwargs``, and the limit of new tokens (``max_tokens`` or its newer name
@@ -22,7 +22,7 @@ answers every field of it:
 
 What a run prints of a body is the names of its fields and the values this module knows: a number, a boolean, a value of
 the table.  It never prints back what somebody else wrote into the body -- a user, metadata -- and of ``model`` it prints
-the last part, which is what it compares: a serving engine that serves a directory is asked for it by its path.
+the last part, which is what it compares: a model that is a directory is named by its path.
 
 It also holds what a run says to that user before anything is loaded -- the decoding rule beside the checkpoint's own
 generation settings (``greedy_line``), how many decode steps a prompt takes before the first new token
@@ -30,8 +30,8 @@ generation settings (``greedy_line``), how many decode steps a prompt takes befo
 generated text goes (``TextSink``: standard output, or a file; as it is generated, or once).
 
 A request body never enters the helper layer (``model_samples``): that layer is handed messages, tool schemas and template
-options.  Field names are those of the public chat-completions request and of the sampling parameters serving engines add
-to it.  This module imports the standard library only; the helper layer is imported where a request is read, after the
+options.  Field names are those of the public chat-completions request and of the sampling parameters commonly sent
+with it.  This module imports the standard library only; the helper layer is imported where a request is read, after the
 sample has imported ``cudnn`` and PyTorch in their order.
 """
 
@@ -46,7 +46,7 @@ from typing import Optional, Sequence
 
 #: new tokens of a request that names no limit
 MAX_TOKENS = 256
-#: the default of ``--max-model-len``: the context length the family's census of the target kernel set was recorded with
+#: the default of ``--max-model-len``: the context length the runs of this area were made at
 MAX_MODEL_LEN = 2051
 
 #: the two names of a request's limit of new tokens
@@ -135,7 +135,7 @@ NEUTRAL = {
 }
 
 
-#: The speculative configuration of a serving engine: the JSON object that asks an engine to draft tokens.  A key of it selects
+#: The speculative configuration: the JSON object that says how tokens are drafted.  A key of it selects
 #: what is launched, so none is printed and ignored: a key is read, accepted at the value that changes nothing, or refused.
 #: The object ``02_speculative_decode.py`` runs when it is given none:
 SPECULATIVE_DEFAULT = '{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}'
@@ -143,7 +143,10 @@ SPECULATIVE_DEFAULT = '{"method": "mtp", "num_speculative_tokens": 5, "use_local
 SPECULATIVE_READ = {
     "method": (("mtp",), "the drafter is the checkpoint's own, the method mtp; no other method is served"),
     "num_speculative_tokens": ((), "it is the number of tokens a step drafts: a whole number from 1"),
-    "use_local_argmax_reduction": ((True,), "the draft token is the largest of the listed rows of the head; without it an engine launches another set"),
+    "use_local_argmax_reduction": (
+        (True,),
+        "the draft token is the largest of the listed rows of the head: the one form of the drafter's head this sample runs",
+    ),
 }
 #: keys that are accepted at the value at which they change nothing, and at ``null``, each with the reason for another value
 SPECULATIVE_NEUTRAL = {
@@ -209,8 +212,8 @@ def _name(name: str) -> str:
 
 def _last_part(model: str) -> tuple:
     """The last part of a model name -- what is compared with the checkpoint directory, and all a run prints of it -- and
-    how a run shows it: with ``.../`` in front where the name had more parts.  A serving engine that serves a directory
-    is asked for it by its path, and a path is never printed."""
+    how a run shows it: with ``.../`` in front where the name had more parts.  A model that is a directory is named by
+    its path, and a path is never printed."""
     name = model.strip().rstrip("/\\")
     last = re.split(r"[/\\]", name)[-1]
     return last, _show(last if last == name else ".../" + last)
@@ -402,7 +405,7 @@ def new_tokens(
 
 def greedy_line(defaults: dict) -> str:
     """The decoding rule of a run beside the checkpoint's own generation settings (``TextIO.generation_defaults``), so that
-    the difference from an engine that applies those settings is never silent."""
+    a run never differs from those settings silently."""
     rule = "greedy decoding: the token of the largest logit at every step"
     if not defaults:
         return f"{rule} (the checkpoint's generation_config.json names no sampling setting)"
@@ -423,7 +426,7 @@ def first_token_line(prompts: Sequence[tuple]) -> str:
 
 
 def parse_speculative_config(text: str, shown: str) -> tuple:
-    """The speculative configuration of a serving engine, as the JSON text of its object: ``(drafted tokens of a step, the
+    """The speculative configuration, as the JSON text of its object: ``(drafted tokens of a step, the
     line a run prints for it)``.  Every key is answered by the three tables above: the keys of ``SPECULATIVE_READ`` must be
     named and are held to what is accepted; a key of ``SPECULATIVE_NEUTRAL`` is accepted at its value and at ``null``,
     which is the key left out; a key of ``SPECULATIVE_REFUSED`` is refused whatever it holds, with its reason; any other
@@ -465,7 +468,7 @@ def parse_speculative_config(text: str, shown: str) -> tuple:
             neutral.append(f"{name} {_show(value)}")
         else:  # a refused key: what it holds is somebody's own -- a model's path, a revision -- and is not printed back
             raise ValueError(f'{shown}: "{name}" is not served: {SPECULATIVE_REFUSED[name]}. Leave the key out')
-    line = f"{shown}: the speculative configuration of a serving engine. Read: " + ", ".join(read) + "."
+    line = f"{shown}: read: " + ", ".join(read) + "."
     if neutral:
         line += " At the value that changes nothing: " + ", ".join(neutral) + "."
     return config["num_speculative_tokens"], line

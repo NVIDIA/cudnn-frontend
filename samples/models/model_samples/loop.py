@@ -164,8 +164,8 @@ class Session:
         model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
         ``record_steps`` bounds the steps whose ids and logits are kept on the GPU for the checks (default: every step).
         ``check_kernels`` says that the run will check its kernels: what that needs of a provider is then part of the plan
-        (a decline is a SKIP before the load), and the traced pass keeps its launch records.  A stack that declares a target
-        kernel set (the family's ``target_stacks``) always checks its kernels: its statement is about them.
+        (a decline is a SKIP before the load), and the traced pass keeps its launch records.  A stack whose rows are kernels
+        on the stored formats (the family's ``checked_stacks``) always checks its kernels.
         ``on_demand`` (``weights.OnDemand``) is for the reference session of a run's checks, which runs on the weights of the
         session it checks: where that load kept a weight on its stored format alone, the blocks of this session get a bf16
         copy of it made for the one call and dropped after it, and the object counts what that cost.  It is refused for
@@ -181,8 +181,8 @@ class Session:
         ``draft_tokens`` and serves one sequence.  It drafts for this session's weights and widths: a checkpoint's
         drafter is refused where the session that loads was handed none (its weights are seeded), one of another
         model's widths by the first width that differs -- each a ``ValueError`` here, before anything is planned.
-        ``max_model_len`` is the positions a sequence of the run may reach at most, the context length a serving engine
-        is started with: a constant of the run, which every block of the session's plans is handed in its options, and
+        ``max_model_len`` is the positions a sequence of the run may reach at most, its context length: a constant of
+        the run, which every block of the session's plans is handed in its options, and
         the state where a block reads the page table and the lengths of a paged cache (``attended_tables``).  Left
         out it is ``capacity``; below ``capacity`` it is a ``ValueError``: no step of the session writes a position past
         it."""
@@ -248,7 +248,7 @@ class Session:
         self.max_model_len = self.capacity if max_model_len is None else max_model_len  # of the run: what a kernel that is told a maximum length is told
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
         self.record_steps = self.capacity if record_steps is None else max(1, min(int(record_steps), self.capacity))
-        self.check_kernels = bool(check_kernels) or stack in getattr(model, "target_stacks", ())
+        self.check_kernels = bool(check_kernels) or stack in getattr(model, "checked_stacks", ())
         self.on_demand = on_demand  # the maker of the bf16 copies this session's blocks read and its weights do not hold
         self.traced: Optional[census.Traced] = None  # of the last traced pass that kept its launch records
         self._call_log: Optional[list] = None  # the block calls of the traced step that is running
@@ -652,7 +652,7 @@ class Session:
                 self._run(plan, self.tokens, torch.zeros(self.sequences * self.tokens, dtype=torch.int32, device=self.device))
             else:  # the step of such a session, behind that prompt step: the drafter's passes, the window, the verify step, the pair
                 self._calls = 0
-                self._engine(None, 0)
+                self._speculative_step(None, 0)
         self._report.calls_per_step = self._calls
         self.reset(fresh=True)
 
@@ -790,7 +790,7 @@ class Session:
         if self.state.hidden is None:
             raise ValueError("the first step of a session with a drafter drafts behind the last prompt position: feed the prompt first (Session.prefill)")
 
-    def _engine(self, force: Optional[torch.Tensor], accept: Optional[int]) -> torch.Tensor:
+    def _speculative_step(self, force: Optional[torch.Tensor], accept: Optional[int]) -> torch.Tensor:
         """One step of speculative decoding: the drafter's passes; the window -- the greedy token the run kept last, then
         the proposals (``force``: these drafted tokens in their place) --; the verify step on it; -> the pair ``[sequences,
         2, tokens]`` of the window and the greedy id after each of its tokens.  The window and the pair are one
@@ -927,7 +927,7 @@ class Session:
         self._behind_prompt()  # a refused step runs nothing and leaves nothing: no pass, no entry of the record, no mark on the report's clock
         self._fits(self.tokens)  # before the passes: a step past the capacity writes nothing, the drafter's cache included
         self._report.clock.mark_launch()
-        pair = self._engine(force, None)
+        pair = self._speculative_step(force, None)
         self._open = True
         self.record.forced += force is not None
         return pair
@@ -1017,7 +1017,7 @@ class Session:
             if self.drafter is None:
                 self._advance(inputs[i], accepted[i]).tolist()
             else:  # the step as ``speculate`` runs it, on the recorded drafted tokens; the host read is the pair's
-                self._engine(inputs[i].view(self.sequences, self.tokens)[:, 1:], accepted[i]).tolist()
+                self._speculative_step(inputs[i].view(self.sequences, self.tokens)[:, 1:], accepted[i]).tolist()
 
         try:  # the device is trace_steps' to decline: what is swapped here is put back whatever it does
             if prompt is not None:  # the prompt of the traced steps, from the zero state: in front of the profiler, in no record of it

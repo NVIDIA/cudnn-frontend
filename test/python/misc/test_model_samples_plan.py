@@ -72,7 +72,7 @@ def test_the_drafters_plan_its_table_and_its_keys():
     drafter = QwenDenseDrafter.seeded(QwenDense.reduced())
     table = configs.DRAFTER_PROVIDERS
     assert drafter.provider_table is table and drafter.regimes is configs.REGIMES and drafter.table_source == "model_samples/qwen_dense/configs.py"
-    assert not hasattr(drafter, "target_stacks"), "the drafter declares no target kernel set: no census section holds a draft pass"
+    assert not hasattr(drafter, "checked_stacks"), "whether a run checks its kernels is the model's statement, not the drafter's"
     assert drafter.geometry.layer_kinds == ("full_attention",) and drafter.norm_eps == QwenDense().norm_eps == 1.0e-6
 
     # one pass: 18 block calls, 15 of the body and 3 of the head; the multiply at five sites, the norm + quantise at two
@@ -1340,7 +1340,7 @@ def test_the_speculative_script_plans_every_kind_of_step_before_its_first_load(m
     assert loop.PROMPT_ROWS in lines and loop.DRAFTER_ROWS.format(calls=18) in lines
     kinds = "a plain session of 1 sequence and a session of 1 sequence x 6 tokens behind its prompt with its drafter, one after the other"
     assert said.count("this stack needs about ") == 1 and f" GiB on this GPU for {kinds}; 80.0 GiB are free" in said, "one memory sentence for the run"
-    assert "[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method" in said
+    assert "[02] --speculative-config (the default): read: method" in said
     assert "[02] draft vocabulary seeded list (seed 0): 3,880 ids of the model's 15,520, in ascending order" in said
     reductions = "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 "
     assert reductions + "positions in turn and by another token behind them | the drafter runs on reference blocks" in lines[0]
@@ -1883,10 +1883,10 @@ def test_a_paged_cache_takes_the_tables_of_its_own_pool_and_no_others():
 def test_one_provider_asks_for_a_paged_cache_and_every_other_plan_builds_the_plain_one():
     """Two adapters of the closed list name a page, and the same one: the attention preparation's entry, whose kernel writes a
     pool of pages, and the library's paged decode attention, whose kernel reads that pool.  So a plan builds a pool where
-    the preparation's row serves -- the two target stacks on compute capability 10.x -- and no plan of another stack, GPU
+    the preparation's row serves -- ``native`` and ``fe-entries`` on compute capability 10.x -- and no plan of another stack, GPU
     class or row count does; the area README says so.  The next adapter that names a page fails this case: its row
     changes what the runs of its stacks hold, and the README's sentence.  Two more sentences of
-    that README are held here to what they are about: the page of the target kernel set, which is the family's constant
+    that README are held here to what they are about: the page of the stack ``native``, which is the family's constant
     and the page of every case of this group; and where the GPU cell of the paged cache runs."""
     from model_samples import Session, TextIO, providers
     from model_samples.qwen_dense import QwenDense, configs
@@ -1916,7 +1916,7 @@ def test_one_provider_asks_for_a_paged_cache_and_every_other_plan_builds_the_pla
         "a session builds the pool where a block of its plans asks for one: the row of the attention preparation's entry does, so a run of the stacks "
         "`native` and `fe-entries` holds the pool on compute capability 10.x, up to 1,024 rows, and every other run the first layout"
     ) in readme
-    assert PAGE == configs.ATTENTION_PAGE and f"(a fixed number of positions each, {PAGE} in the target kernel set; a run of pages per sequence)" in readme
+    assert PAGE == configs.ATTENTION_PAGE and f"(a fixed number of positions each, {PAGE} in the stack `native`; a run of pages per sequence)" in readme
     # the cell is gated: the classes the family serves and compute capability 8.0 (the GPU module holds the condition on stated capabilities)
     assert (
         "one GPU the family serves; L0 runs two layers, L1 four; the cell of the paged cache runs there and on compute capability 8.0, "
@@ -2836,10 +2836,10 @@ def test_the_plan_hands_the_count_the_sessions_recorded_steps_and_its_references
 def test_an_override_takes_the_row_of_the_runs_stack_where_it_names_the_same_call(monkeypatch, capsys):
     """``--provider BLOCK=KEY`` selects the first declared row of the key that serves the run -- and, where that row is of
     another stack, the row of the run's own stack that names the same call: equal in every field but its stacks and its
-    printed reason.  The attention core has such a pair: on the target stacks the override plans their chain's row, with
+    printed reason.  The attention core has such a pair: on ``native`` and ``fe-entries`` the override plans their chain's row, with
     the reason of a chain that reads the attention cache -- also on ``native``, whose own plan has the library's row in
     front of that chain.  A row of the run's stack that differs in anything else is another
-    call and is not taken: the fused step selected on a target stack is still the form of ``fe-cublas``."""
+    call and is not taken: the fused step selected on one of those two stacks is still the form of ``fe-cublas``."""
     from dataclasses import replace
 
     from model_samples.blocks import ProviderRow, select_row
@@ -2864,7 +2864,7 @@ def test_an_override_takes_the_row_of_the_runs_stack_where_it_names_the_same_cal
     printed = [line for line in capsys.readouterr().err.splitlines() if line.split()[:1] == ["attention.core"] and "fallback: " in line]
     assert len(printed) == 2 and printed[0].endswith(f"  fallback: {pool}"), "the served-by table the run prints before its first load"
     assert printed[1].endswith(f"  by family; fallback: {pool}"), "and its kernel table, which this stack always prints"
-    # the fused step has the key on a row of fe-cublas and, in another form, on a row of the target stacks: the first declared row wins
+    # the fused step has the key on a row of fe-cublas and, in another form, on a row of native and fe-entries: the first declared row wins
     step = model.provider_table["linear_attention.step"]
     for stack in ("native", "fe-entries"):
         row = select_row("linear_attention.step", step, _facts(), 1, 1, stack, key="fe.gdn_decode_fused", model=model)
@@ -2955,7 +2955,7 @@ def test_the_plan_of_a_step_stack_by_stack():
             (_, _, chains), fallback = _step_of(*_stated_plan(layers, tokens=tokens))
             assert fallback == {} and chains == 0, (layers, tokens)
     assert not any(row.fallback for _, _, _, row, _ in plan.parts()) and "fallback" not in plan.by_provider()
-    assert configs.TARGET_STACKS == QwenDense.target_stacks == ("native", "fe-entries"), "the two stacks whose rows are kernels on the stored formats"
+    assert configs.CHECKED_STACKS == QwenDense.checked_stacks == ("native", "fe-entries"), "the two stacks whose rows are kernels on the stored formats"
     # the rows in which the two stacks differ are the library's, and fe-entries has each of them on its fallback row
     differing = {block for block in plan.rows if plan.rows[block].key != entries_plan.rows[block].key}
     assert differing == set(configs.LIBRARY_ROWS) == {"projection.fp8.out", "mlp.down", "output_head", "attention.core"}

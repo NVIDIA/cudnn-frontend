@@ -1039,7 +1039,7 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     assert set(data["statistics"]) == set(perf.DEFINITIONS), "one definition per statistic of the file, and no statistic without one"
     for key, (unit, definition) in perf.DEFINITIONS.items():
         entry = data["statistics"][key]
-        assert (entry["unit"], entry["definition"]) == (unit, definition) and len(definition) > 40 and "serving_counterpart" not in entry, key
+        assert (entry["unit"], entry["definition"]) == (unit, definition) and len(definition) > 40, key
         assert "value" in entry and (entry["value"] is not None or entry["reason"]), f"{key}: a value that does not exist is null with a reason"
     assert data["statistics"]["decode_rate"]["value"] is None and data["statistics"]["decode_rate"]["reason"] == "not printed for a reduced model"
     sentences = " ".join(definition for _, definition in perf.DEFINITIONS.values())
@@ -2757,7 +2757,7 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
     """An ordinary run prints what it printed.  Without ``--perf``: the parser's defaults, no line of the mode, no report
     file, the plain report and the plain checks with their kernel line; ``Session.reset`` records as it did; and
     ``tie_out.run_checks`` without judged positions replays and judges every step, and still refuses to leave the kernel
-    check of a target stack out."""
+    check of the stack ``fe-entries`` out."""
     from model_samples import Session, TextIO, tie_out
 
     events = []
@@ -2817,7 +2817,7 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
     with pytest.raises(ValueError, match="judged positions are steps of a decode run"):
         tie_out.run_checks(Session(_tiny_model(), TextIO.synthetic(272), stack="reference", device="cpu", draft_tokens=2), prompt_tokens=0, positions=[0])
     target = Session(_tiny_model(), TextIO.synthetic(272), stack="fe-entries", device="cpu")
-    with pytest.raises(ValueError, match="its kernel check cannot be switched off"):
+    with pytest.raises(ValueError, match="always checks its kernels: the check cannot be switched off"):
         tie_out.run_checks(target, prompt_tokens=0, kernels=False)
     assert tie_out.DEFERRED == "DEFERRED", "the word a caller hands in when it traces after the checks"
 

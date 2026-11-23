@@ -1,17 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Library kernels of FlashInfer as providers of model blocks: the multiplies the target kernel set runs on a library, each on
-the stored format of its weight, and the attention core over the paged attention cache.
+"""Library kernels of FlashInfer as providers of model blocks: three multiplies, each on the stored format of its weight,
+and the attention core over the paged attention cache.
 
 ``flashinfer.mm_fp4`` calls ``flashinfer.gemm.mm_fp4(backend="cute-dsl")``, the multiply of a 4-bit activation by a 4-bit
 weight on the packed codes of both: one launch per call.  The library picks the kernel of a call itself, by the shape and
 the GPU: one of two kernel classes of one module, in a grid of its own choice.  That pick is a function of the call as long
 as nothing has tuned the operation, so the row says ``TUNED False`` and the adapter calls the library outside any tuning
-context; which class and which launch shape the call then gets is data of the family's kernel census, held exactly by
-the kernel check.  ``TUNED`` is a statement about this process: the library's tuner is tuning, or has tuned the operation
-here.  A tuning store the caller attached to the library is not seen by it; a tactic replayed from one is held by the
-kernel class and the launch shape alone, where the census has a section for the run.
+context; which class and which launch shape the call then gets is the library's own, and a run prints the
+kernel that was launched on the row's line.  ``TUNED`` is a statement about this process: the library's tuner is tuning, or has tuned the operation
+here.  A tuning store the caller attached to the library is not seen by it; a tactic replayed from one shows in the
+kernel a run prints, and is not gated.
 
 The operand is the 4-bit output of the block before it: from a kernel on the stored formats it comes with its block
 scales in the 128 x 4 layout this kernel reads and is handed over as it is; from a block that is not a kernel the scales
@@ -26,7 +26,7 @@ adapter reads it as the down multiply's does and launches nothing in front of th
 ``flashinfer.bmm_fp8`` calls ``flashinfer.gemm.bmm_fp8(backend="auto")``, the multiply of an 8-bit activation by an 8-bit
 weight on the stored codes of both.  Which kernel serves it is the choice of the library among its own: its tuner's where
 one has run, else its first candidate.  That choice is never a row and never gated; the kernel check holds the launch as
-one of the kernels this call can launch, and prints its name beside the pick the census records.
+one of the kernels this call can launch, and prints its name on the row's line.
 
 ``flashinfer.decode_attention`` calls ``flashinfer.decode.trtllm_batch_decode_with_kv_cache``, the library's paged decode
 attention, with the library's own backend for these GPU classes (``DECODE_ATTENTION_BACKEND``): the attention of the rows
@@ -36,15 +36,15 @@ adapter hands the library views and host constants, an output buffer of the call
 zero counter buffer, and converts nothing on the device.  The library checks almost none of what it is handed and
 returns other bytes for a table of another dtype, a strided view or a table off its width, so the adapter holds its own
 operands on the host before every call (``ValueError``).  Which kernel the library launches follows the run's maximum
-length, the sequences, the tokens per sequence and the GPU: the row claims the call, the census holds the launch for the
-run it recorded, and a run prints the kernel it launched.  The library documents no numerics contract for this kernel:
+length, the sequences, the tokens per sequence and the GPU: the row is of the call, the kernel check holds the launch by
+the family's name, and a run prints the kernel it launched.  The library documents no numerics contract for this kernel:
 its band is the bound of a stated model, judged against the reference chain with the operand terms of that bound
 (``twin``, ``tie_out``: ``attention_bf16_weights``), and it states no batch invariance (``batch_note``).
 
 **The package.**  FlashInfer is no dependency of cuDNN Frontend and none of the default stack.  It is imported inside the
 functions of this module that run on a device, never at module import and never by a plan on stated device facts.  A plan
 for a CUDA device reads the installed version from the distribution's metadata: a missing package, or a version that is not
-validated (``VALIDATED``: the versions the launch records of the census were recorded with), is a ``NotImplementedError``
+validated (``VALIDATED``: the versions this stack was run and checked with), is a ``NotImplementedError``
 -- a ``SKIP`` before the load that names the version, the requirement file and the stack that runs without the package.
 
 **Kernel binaries are never fetched by a run.**  The attention kernels are precompiled binaries the library reads from
@@ -111,7 +111,7 @@ DISTRIBUTION = "flashinfer-python"
 VALIDATED = ("0.7.2.post1",)
 REQUIREMENTS = "samples/models/requirements-flashinfer.txt"
 CONSTRAINTS = "samples/models/constraints-native.txt"
-#: the stack that runs the cuDNN Frontend rows of the target kernel set without this package: what a decline points to
+#: the stack that runs the cuDNN Frontend rows of ``native`` without this package: what a decline points to
 WITHOUT = "--stack fe-entries runs the cuDNN Frontend rows of this stack without the package"
 #: the name under which the library's tuner keeps the 4-bit multiply
 FP4_OPERATION = "fp4_gemm"
@@ -119,7 +119,7 @@ FP4_OPERATION = "fp4_gemm"
 #: chosen the kernel (a row says False: the library's untuned pick)
 MM_FP4_FORM = ("BACKEND", "TUNED")
 BMM_FP8_FORM = ("BACKEND",)
-#: the field a row of the paged decode attention names: the layout of the two pool halves, as the target passes it
+#: the field a row of the paged decode attention names: the layout of the two pool halves
 DECODE_ATTENTION_FORM = ("KV_LAYOUT",)
 #: the value of that call's ``backend`` argument: the library's own backend for these GPU classes, whose kernels are
 #: precompiled binaries, and the name of the folder its kernel set stands in.  Every call passes it: the library's default
@@ -151,8 +151,8 @@ LOADER = "flashinfer.jit.cubin_loader"
 BINARIES_MANIFEST, BINARIES_HEADER, BINARY = "checksums.txt", "include/flashInferMetaInfo.h", "{}.cubin"
 #: (folder of a kernel set, kernel family, compute capability) -> what ``hold_binaries`` found there, once per process
 _HELD: dict = {}
-#: the workspace the paged decode attention is handed: the size the target hands it and the size the launch records of
-#: the census were made with.  The library makes no size check of it, and a smaller one has not been run
+#: the workspace the paged decode attention is handed: the size every run of this stack was made with.  The library
+#: makes no size check of it, and a smaller one has not been run
 WORKSPACE_BYTES = 394 * 1024 * 1024
 #: device -> the one workspace of that device in this process, built at the first plan that needs it and handed by every
 #: adapter of the device
@@ -176,7 +176,7 @@ def check_package(entry: str) -> str:
         raise NotImplementedError(f"{entry} needs {DISTRIBUTION} {validated}, which is not installed: {fix}; {WITHOUT}")
     if version not in VALIDATED:
         raise NotImplementedError(
-            f"{entry} needs a validated {DISTRIBUTION} ({validated}: the launch records of its kernels are data of that version); this is {version}: {fix}; {WITHOUT}"
+            f"{entry} needs {DISTRIBUTION} {validated}, the version this stack was run and checked with; this is {version}: {fix}; {WITHOUT}"
         )
     return version
 
@@ -804,8 +804,8 @@ class DecodeAttentionBlock(LibraryBlock):
     def _hold(self) -> None:
         """Before this adapter's first call of the library: the kernel binaries the library's table names for this
         call's data types, head width, paging and page on the GPU's class are on the machine as their manifest lists
-        them, and the manifest is the file the library names (``hold_binaries``; the family is this block's kernel in
-        the census, the class the plan's), or the run is the ``SKIP`` of ``missing_binaries``.  The library is
+        them, and the manifest is the file the library names (``hold_binaries``; the family is the kernel this
+        block declares, the class the plan's), or the run is the ``SKIP`` of ``missing_binaries``.  The library is
         imported for it and nothing of it is called: a run that passes cannot meet a missing binary later."""
         self._first = True
         try:

@@ -17,7 +17,7 @@ python samples/models/qwen_dense/00_decode.py                          # 2 layer
 python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
 python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: RAN, never PASS
 python samples/models/qwen_dense/00_decode.py --check-kernels          # also: every launch of the traced steps against the plan
-python samples/models/qwen_dense/00_decode.py --stack native           # the target kernel set, as far as it is served here
+python samples/models/qwen_dense/00_decode.py --stack native           # every block on a kernel that works on the stored weights
 
 # A checkpoint is your own download: the sample fetches nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
 # with about 57 GiB free (about 60 GiB on 12.x); about two and a half minutes for the first run below ("A checkpoint from local disk" has the details).
@@ -39,7 +39,7 @@ produced the same text there.
 |---|---|---|
 | `--model DIR` | -- | a checkpoint directory on local disk; never a hub name; nothing is downloaded |
 | `--prompt TEXT` | `Why is the sky blue?` with `--model` | one user message, rendered by the checkpoint's chat template; repeat the flag for several prompts, run one after the other in one process |
-| `--messages FILE` | -- | a chat request as JSON, from a file or, with `-`, from standard input (once per run): a list of messages; an object with `messages` and optionally `tools` (JSON tool schemas) and `chat_template_kwargs` (options the checkpoint's template understands); or the whole request body a chat client sends, every field of which is answered ("Coming from a serving engine" below). Repeatable |
+| `--messages FILE` | -- | a chat request as JSON, from a file or, with `-`, from standard input (once per run): a list of messages; an object with `messages` and optionally `tools` (JSON tool schemas) and `chat_template_kwargs` (options the checkpoint's template understands); or the whole request body a chat client sends, every field of which is answered ("A request body and its options" below). Repeatable |
 | `--max-tokens N` | `256` | with `--model`: the limit of new tokens of a request that names none of its own: stop after N new tokens unless an end token comes first. `--max-new-tokens N` is the same flag. The limit a request body names rules over it, and a run says so. Without `--model` the flag is an error: the seeded run decodes `--force-tokens` |
 | `--max-model-len N` | `2051` | the positions a prompt and its new tokens share. A limit of new tokens somebody asked for that does not fit beside the prompt, or a prompt that leaves no room, is an `ERROR` before anything is planned or loaded; the default limit of 256 is cut to the room that is left, and the run says so. The default is the context length the runs of this area were made at. The flag bounds a request; the state of a run is sized for the run itself |
 | `--temperature 0` | -- | accepted at 0 and nothing else: token choice is greedy |
@@ -48,10 +48,10 @@ produced the same text there.
 | `--no-stream` | off | with `--model`: the text is written once, after the report of its prompt, instead of piece by piece as it is generated |
 | `--sequences N[,N...]` | `1,4` without `--model`, `1` with it | sequences per run, fixed before the first step; a list repeats the run per count; with `--model` every sequence of a run gets the same prompt, and the text of a prompt is written once, with the first count of the list (a later count reports whether its sequence 0 produced the same text; `--dump-tokens` has the ids of every count) |
 | `--layers N` | `2` | layers of the reduced model: the last N of the published order, so the model ends in an attention layer; not with `--model` |
-| `--stack fe-cublas\|native\|fe-entries\|reference` | `fe-cublas` | `fe-cublas`: cuDNN Frontend + cuBLAS + PyTorch, checked against the reference. `native`: the target kernel set of the decode step ("The stack `native`" below); the kernel check is always on. `fe-entries`: the cuDNN Frontend rows of `native`, everything else on fallback rows. `reference`: every block in PyTorch, nothing checked. Explicit, never chosen by what is installed |
+| `--stack fe-cublas\|native\|fe-entries\|reference` | `fe-cublas` | `fe-cublas`: cuDNN Frontend + cuBLAS + PyTorch, checked against the reference. `native`: every block on a kernel that works on the stored weights ("The stack `native`" below); the kernel check is always on. `fe-entries`: the cuDNN Frontend rows of `native`, everything else on fallback rows. `reference`: every block in PyTorch, nothing checked. Explicit, never chosen by what is installed |
 | `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed. Block names are in the table a run prints, keys in the table below; an unknown block or key is an `ERROR` that lists the declared ones |
 | `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header. `ieee-fp32` sets `torch.backends.cuda.matmul.fp32_precision` for the rest of the process, which ends with the run |
-| `--dump-tokens FILE` | -- | per prompt, the prompt ids and the produced ids of every sequence as JSON, for a comparison made elsewhere |
+| `--dump-tokens FILE` | -- | per prompt, the prompt ids and the produced ids of every sequence as JSON, for use outside the run |
 | `--check-kernels` | off; always on with `--stack native` and `--stack fe-entries` | adds the kernel check: prints the kernel table, keeps the profiler's record of every launch of the traced steps and holds them against the plan ("The kernel check" below). Not with `--stack reference`, which checks nothing |
 | `--dump-census FILE` | -- | the launch records of the traced steps as JSON (per launch its kernel id, name, grid, block, shared memory, registers per thread, and its start and end in milliseconds on the profiler's clock), with the block calls of a step, what the entries state, and per call site the entry instance that served it and the form that instance states (`served`, beside the row's `form`), for use outside the run; implies `--check-kernels` |
 
@@ -93,22 +93,22 @@ and says why on the second line of its report: its blocks are launched from Pyth
 reason of its own, and whatever the run saw of the GPU's other processes and of its clock that a controlled run may
 not have is a reason too.
 
-## Coming from a serving engine
+## A request body and its options
 
-This sample is one process with greedy token choice, not a serving engine: no socket, no queue, no sampling. But the
-inputs of a request are the same, and the sample takes them as they are.
+This sample is one process with greedy token choice: no socket, no queue, no sampling. It takes the inputs of a
+request as they are.
 
 | what you have | what the sample takes | note |
 |---|---|---|
 | the model | `--model DIR`, a directory on local disk | a hub name is not fetched |
 | the request body your chat client sends | `--messages request.json`, or `--messages -` to read it from standard input | every field of the body is answered: the table below |
-| `max_tokens` or `max_completion_tokens` in the request | read from the body; `--max-tokens N` is the limit of a request that names none | default 256. A serving engine that is given no limit generates until the context is full; this sample stops at 256 |
+| `max_tokens` or `max_completion_tokens` in the request | read from the body; `--max-tokens N` is the limit of a request that names none | default 256: a request that names no limit stops at 256 new tokens |
 | the context length (`--max-model-len`) | `--max-model-len N`, default 2051 | a prompt and its new tokens share it; a request beyond it is an `ERROR` before anything is loaded |
-| `temperature`, `top_p`, the checkpoint's generation settings | nothing: token choice is always greedy. `"temperature": 0` and `--temperature 0` are accepted | a serving engine may apply the checkpoint's own generation settings to a request that names no temperature. This sample never does, and every run with a checkpoint says so in one line (below) |
+| `temperature`, `top_p`, the checkpoint's generation settings | nothing: token choice is always greedy. `"temperature": 0` and `--temperature 0` are accepted | the checkpoint's own generation settings are never applied, also to a request that names no temperature, and every run with a checkpoint says so in one line (below) |
 | `"stream": true` | the text of sequence 0 goes to standard output as it is generated; `--no-stream` writes it once; `--text-out FILE` writes it to a file | every other line of the run goes to standard error |
 | concurrent requests | `--sequences N` | a fixed set of sequences that start together, each with the same prompt; nothing is admitted while a step runs |
 | which kernels serve the model | `--stack`, and `--provider BLOCK=KEY` for one block | a kernel choice is a row of the table a run prints before it loads anything |
-| a speculative configuration: the JSON object that asks an engine to draft tokens | `02_speculative_decode.py --speculative-config JSON` | every key of it is answered: read, accepted at the value that changes nothing, or refused by name (the section "Speculative decoding"). `00_decode.py` refuses the flag with the name of that script |
+| a speculative configuration: the JSON object that says how tokens are drafted | `02_speculative_decode.py --speculative-config JSON` | every key of it is answered: read, accepted at the value that changes nothing, or refused by name (the section "Speculative decoding"). `00_decode.py` refuses the flag with the name of that script |
 | a draft vocabulary for the checkpoint's drafter | `02_speculative_decode.py --draft-vocab FILE` | a JSON list of token ids; the section "The checkpoint's drafter" has a recipe |
 | a host, a port, an API key, a served model name, several GPUs, a memory budget | not here | one process on one GPU; the plan prints the memory a run needs before it loads anything |
 
@@ -138,7 +138,7 @@ Every field of a body falls into one of these classes (`serving_options.py`, bes
 | class | fields | what the sample does |
 |---|---|---|
 | read | `messages`, `tools`, `chat_template_kwargs`, `max_tokens`, `max_completion_tokens` | the messages, tool schemas and template options go to the checkpoint's chat template; the limit is the request's own limit of new tokens. Two limits that differ are an `ERROR` |
-| stated | `model` | its last part is printed and compared with the name of the checkpoint directory; what stands in front of it -- an organisation, or a path where a serving engine served a directory -- is not printed (`".../Qwen3.8-27B-NVFP4"`). Another name is not an error: the run decodes the directory it was given, and says so |
+| stated | `model` | its last part is printed and compared with the name of the checkpoint directory; what stands in front of it -- an organisation, or the path of a directory -- is not printed (`".../Qwen3.8-27B-NVFP4"`). Another name is not an error: the run decodes the directory it was given, and says so |
 | not used | `seed`, `stream`, `stream_options`, `user`, `metadata`, `store`, `service_tier`, `parallel_tool_calls` | named with the reason: nothing is drawn under greedy decoding, the text goes where the command line says, one process has no account, no queue and nothing to store, and tool calls in the output are not parsed. The value is printed for `seed` and `stream` only: what somebody wrote into the other fields is not printed back |
 | accepted at the value that changes nothing | the table below | accepted at that value and at `null`; at any other value the run ends in one `ERROR` line before anything is loaded, which names the field, its value, the reason and what is accepted |
 | not known to this sample | any other field | printed by its name and ignored: the sample cannot say whether such a field would change the output. A name that is not a plain word is printed as a JSON string |
@@ -197,7 +197,7 @@ The fields that would change the output, and the values they are accepted at:
 | `reasoning_effort` | `null` | an option of the checkpoint's chat template goes into chat_template_kwargs |
 | `extra_body` | `{}`, `null` | it is how a client library is handed the fields it adds to a request, not a field of the body it sends: its fields go to the top level of the body |
 
-The table holds the fields of the public chat request and of the sampling parameters serving engines add to it that ask
+The table holds the fields of the public chat request and of the sampling parameters commonly sent with it that ask
 for something this sample leaves out: sampling, stop strings, constrained output, a processor of the logits, parsing of
 the output, another prompt than the checkpoint's chat template renders. A field under a name the table does not hold
 is in the last class above: printed and ignored. `extra_body` is in the table because a request file written from
@@ -215,7 +215,7 @@ names; else `--max-tokens N`; else 256. Each request of a run has its own. A lim
 said in a line (`its own "max_tokens": 64 applies, not --max-tokens 32: the flag is the limit of a request that names
 none`).
 
-Two lines of a run with a checkpoint are there for a reader who comes from a serving engine. Both are printed before
+Two lines of a run with a checkpoint say what a request meets here. Both are printed before
 anything is loaded:
 
 ```text
@@ -223,8 +223,8 @@ anything is loaded:
 [00] first token: a prompt goes through the decode step, one step per prompt token (no stack of this sample has a prefill kernel): 58 decode steps before the first new token of the default prompt, as long as 58 new tokens take. No text is written until then; the first token line of the report has the time
 ```
 
-The first states the decoding rule beside what the checkpoint's `generation_config.json` names, so the difference
-from an engine that applies those settings is never silent. The second states what a prompt costs here: no stack of
+The first states the decoding rule beside what the checkpoint's `generation_config.json` names, so a run
+never differs from those settings silently. The second states what a prompt costs here: no stack of
 this sample prefills a prompt with a kernel of its own, so a prompt of N tokens is N decode steps and takes as long as
 N new tokens before the first new token appears. It gives a count and no time, because before the load a run has no
 time of its own to give; the `first token` line of the report has the measured one. In the runs of 2026-11-17 on
@@ -253,7 +253,7 @@ The stack `fe-cublas` is a reference path, not a fast path. The linear-attention
 every multiply runs on cuBLAS over a bf16 copy of the quantised weights, which moves 2 bytes per weight element where the
 stored formats hold 1 or 0.56; the rest runs in PyTorch; and every launch is issued from Python, one block after the other.
 It exists to prove the loader, the loop, the state handling and the tie-out, and it is the correctness oracle of the stacks
-that follow. It claims no number.
+that follow. Its timings are for orientation only.
 
 ## The stack `native`: every block on a kernel
 
@@ -853,7 +853,7 @@ The sample was last run with:
 | packages | tokenizers 0.23.3, jinja2 3.1.6, safetensors 0.8.0; the lower bounds of `samples/models/requirements.txt` (0.21.1, 3.1.6, 0.4.3) pass the host tests of the text and weight readers |
 | run | 2026-11-12, compute capability 10.0 (aarch64), in two environments: PyTorch 2.14.0 with CuTe DSL 4.8.0, and a fresh environment built by the lines of this file with PyTorch 2.15.0 and CuTe DSL 4.8.1. Three prompts at one sequence (two plain user turns, one with a tool schema and the reasoning switched off) and one prompt at two sequences; text out, `[00] PASS` in every run, the token line reported. The run before it was on compute capability 10.3 (2026-11-11) |
 | provider rows | every row of the stack `fe-cublas` ran in that run: `cudnn.GdnDecodeFused` of cuDNN Frontend 1.33.0 from this checkout, cuBLAS through PyTorch 2.14.0 and 2.15.0, the PyTorch chains |
-| a request body, the text on standard output | 2026-11-17, compute capability 10.0 (x86, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0). On the stack `fe-cublas`, the request body of the section "Coming from a serving engine" on standard input, with standard output and standard error on two pipes: `[00] PASS`; the answer arrived on standard output in 39 pieces, one per decode step, the first after the 29 steps of the prompt, and its line break after the last, before the first line of the report; standard output held the text and that line break, standard error every line of the run. On the stack `native`, the default prompt as a request body with its own limit of 32 new tokens, written with `--text-out` and `--no-stream`: `[00] PASS` with the ids hash and the kernel lines of the same prompt given with `--prompt`, the text in the file. On the stack `fe-cublas` again, the same request body at two sequence counts (`--sequences 1,2`): `[00] PASS`; standard output held the one text, written with the first count, and the second count reported the same text for its sequence 0 |
+| a request body, the text on standard output | 2026-11-17, compute capability 10.0 (x86, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0). On the stack `fe-cublas`, the request body of the section "A request body and its options" on standard input, with standard output and standard error on two pipes: `[00] PASS`; the answer arrived on standard output in 39 pieces, one per decode step, the first after the 29 steps of the prompt, and its line break after the last, before the first line of the report; standard output held the text and that line break, standard error every line of the run. On the stack `native`, the default prompt as a request body with its own limit of 32 new tokens, written with `--text-out` and `--no-stream`: `[00] PASS` with the ids hash and the kernel lines of the same prompt given with `--prompt`, the text in the file. On the stack `fe-cublas` again, the same request body at two sequence counts (`--sequences 1,2`): `[00] PASS`; standard output held the one text, written with the first count, and the second count reported the same text for its sequence 0 |
 
 The sample downloads nothing. Fetching the checkpoint is your own step, for example
 `hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4` (the command comes with the packages of the
@@ -949,9 +949,8 @@ preamble. A `--messages` file with its own system turn or with tool schemas has 
 three distinct windows (the preamble, a system turn, a tool schema), not one per prompt, and none of them reaches a
 decode step.
 
-Comparing the produced ids with a serving engine is not part of this sample; `--dump-tokens` writes them for a
-comparison made elsewhere, and greedy decoding is not the checkpoint's own default (its generation settings sample,
-which every run with a checkpoint says in its `greedy decoding` line).
+`--dump-tokens` writes the produced ids for use outside the run. Greedy decoding is not the checkpoint's own default
+(its generation settings sample, which every run with a checkpoint says in its `greedy decoding` line).
 
 ## The checkpoint's drafter
 
@@ -1751,7 +1750,7 @@ checkpoint's drafter", every block of it a reference chain in every stack but it
 
 ```bash
 python samples/models/qwen_dense/02_speculative_decode.py                  # 2 layers, seeded weights, a seeded drafter: self-checking
-python samples/models/qwen_dense/02_speculative_decode.py --stack native   # the verify step and the prompt's decode steps on the target kernel set
+python samples/models/qwen_dense/02_speculative_decode.py --stack native   # the verify step and the prompt's decode steps on the stack's kernels
 
 # with a checkpoint: the packages and the download of the first command block of this page, and a draft vocabulary
 python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native \
@@ -1800,17 +1799,17 @@ is an `ERROR` before the plan; left to its default, the count follows the schedu
 
 | flag | default | meaning |
 |---|---|---|
-| `--speculative-config JSON` | `{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}` | the speculative configuration of a serving engine, as the text of its JSON object; every key is answered (the table below), and a run prints one line for it |
+| `--speculative-config JSON` | `{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}` | the speculative configuration, as the text of a JSON object; every key is answered (the table below), and a run prints one line for it |
 | `--draft-vocab FILE` | -- | with `--model`, required: the JSON list of token ids the drafter proposes from. Without `--model` the flag is an error: the seeded run draws its list from the seed |
 | `--sequences 1` | `1` | accepted at 1 only: this script serves one request. Another count is one `ERROR` line before the plan: "a session with a drafter serves one sequence: one request, as the drafter rows are for" |
 | `--force-tokens N` | `32` without `--model`, or what the schedule needs if that is more; off with it | produce exactly N new tokens, ignoring the end token |
 | `--stack`, `--provider BLOCK=KEY`, `--check-kernels` | as in `00_decode.py` | the stack and the rows of the MODEL's blocks, in both kinds of its steps: a row selected with `--provider` must serve the verify step and the decode step, or the plan declines by that row's sentence. A block of the drafter has one row; naming one in `--provider` is a usage error |
 | `--dump-tokens FILE` | -- | the file of `00_decode.py` with `"sample": "qwen_dense/02_speculative_decode"`, the drafted tokens of a step (`draft_tokens`) and, per prompt, `kept`: the drafted tokens every step kept |
-| `--model`, `--prompt`, `--messages`, `--max-tokens`, `--max-model-len`, `--temperature`, `--text-out`, `--no-stream`, `--layers`, `--reference-precision` | as in `00_decode.py` | the flag table at the top of this page; a request body is answered field by field ("Coming from a serving engine"); under `--max-model-len` the limit of new tokens is held together with the rows the last verify step writes behind the last new token (one fewer than the drafted tokens), so the limit that fits is that many smaller than in `00_decode.py` |
-| `--dump-census FILE` | -- | not in this script: a usage error. The launch records of a draft pass have no kernel census to be held against yet; `00_decode.py` writes those of a decode step |
+| `--model`, `--prompt`, `--messages`, `--max-tokens`, `--max-model-len`, `--temperature`, `--text-out`, `--no-stream`, `--layers`, `--reference-precision` | as in `00_decode.py` | the flag table at the top of this page; a request body is answered field by field ("A request body and its options"); under `--max-model-len` the limit of new tokens is held together with the rows the last verify step writes behind the last new token (one fewer than the drafted tokens), so the limit that fits is that many smaller than in `00_decode.py` |
+| `--dump-census FILE` | -- | not in this script: a usage error. `00_decode.py` writes the launch records of a decode step |
 
-**The speculative configuration of a serving engine.** `--speculative-config` takes the JSON object that asks a
-serving engine to draft, as it is written there. A key of this object selects what is launched, so -- unlike a field of
+**The speculative configuration.** `--speculative-config` takes the JSON object that says how tokens are drafted,
+as a client writes it. A key of this object selects what is launched, so -- unlike a field of
 a request body -- nothing of it is printed and ignored: a key is read, accepted at the value that changes nothing (and
 at `null`, which is the key left out), or refused, each by name (`serving_options.py` holds the three tables as data):
 
@@ -1818,7 +1817,7 @@ at `null`, which is the key left out), or refused, each by name (`serving_option
 |---|---|---|---|
 | `method` | read; must be named | `"mtp"` | the drafter is the checkpoint's own, the method mtp; no other method is served |
 | `num_speculative_tokens` | read; must be named | a whole number from 1 | it is the number of tokens a step drafts: a whole number from 1 |
-| `use_local_argmax_reduction` | read; must be named | `true` | the draft token is the largest of the listed rows of the head; without it an engine launches another set |
+| `use_local_argmax_reduction` | read; must be named | `true` | the draft token is the largest of the listed rows of the head: the one form of the drafter's head this sample runs |
 | `rejection_sample_method` | accepted at the value that changes nothing | `"standard"`, `null` | a drafted token is kept while it equals the greedy token in front of it: nothing is drawn |
 | `draft_sample_method` | accepted at the value that changes nothing | `"greedy"`, `null` | the drafter proposes the token of its largest logit |
 | `enable_adaptive_verification` | accepted at the value that changes nothing | `false`, `null` | every step verifies every token it drafted |
@@ -1834,18 +1833,18 @@ at `null`, which is the key left out), or refused, each by name (`serving_option
 | `moe_backend`, `attention_backend`, `kv_cache_dtype` | refused at any value | `null` | which kernel serves a block is a row of the table a run prints (--stack, --provider) |
 | `disable_eagle_block_drop`, `disable_lookahead_block_hashes`, `prompt_lookup_max`, `prompt_lookup_min`, `suffix_decoding_max_tree_depth`, `suffix_decoding_max_cached_requests`, `suffix_decoding_max_spec_factor`, `suffix_decoding_min_token_prob`, `dspark_draft_topk`, `xpress_topc` | refused at any value | `null` | it is an option of another speculative method, or of a cache keyed by content, which a sample does not have |
 
-A key no row holds is an `ERROR` that names it. The three keys that are read must be named: a serving engine's own
-defaults for them select another method or another launch set. The count of drafted tokens is any whole number from 1 to
+A key no row holds is an `ERROR` that names it. The three keys that are read must be named: this sample has no
+default for a key that selects the method or the launch set. The count of drafted tokens is any whole number from 1 to
 the parser; which counts a stack serves is its rows' answer, at the plan: a provider stack holds a verify step of two to
 eight tokens per sequence, so eight drafted tokens end in a `SKIP` with that row's sentence before anything is loaded,
 and the stack `reference` serves any count (the seeded run as far as the new tokens its schedule needs fit the context
 length). Another count runs the same way, its kernels checked against the plan of its own step shape. The key names and the values of
-this table were read in the public release 0.33.0 of a serving engine (2026-10-31). A run prints one line for the
+this table are those of the public JSON object of this name as it stood on 2026-10-31. A run prints one line for the
 object, with the names of its keys and the values the table knows:
 
 ```text
-[02] --speculative-config: the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, use_local_argmax_reduction true. At the value that changes nothing: draft_sample_method "greedy".
-[02] ERROR --speculative-config: "use_local_argmax_reduction" is not named: the draft token is the largest of the listed rows of the head; without it an engine launches another set. Accepted: true
+[02] --speculative-config: read: method "mtp", num_speculative_tokens 5, use_local_argmax_reduction true. At the value that changes nothing: draft_sample_method "greedy".
+[02] ERROR --speculative-config: "use_local_argmax_reduction" is not named: the draft token is the largest of the listed rows of the head: the one form of the drafter's head this sample runs. Accepted: true
 ```
 
 **What a run reports.** The report of `00_decode.py`, and in the place of its rate two acceptance lines: `kept tokens
@@ -2040,7 +2039,7 @@ head of one sequence in one layer (one block of the step's launch grid, so its n
 than 99 % of the cell's output bytes equal and more than 99.9 % of the cell's state within 1e-4.
 
 The state band has a share and a cap because a state "within 1e-4 everywhere" does not hold against an fp64-accumulated
-reference: the fused step rounds its gates and conv taps to bf16 as a serving chain does, and where its fp32 sum falls on the
+reference: the fused step rounds its gates and conv taps to bf16 as the reference chain does, and where its fp32 sum falls on the
 other side of a rounding midpoint one head's state moves by up to a few 1e-3 while the rest agrees to fp32 rounding. The band
 tolerates such a move of one head at one step. Measured over runs of this sample with two to eight layers, the worst cell of
 a run had about 0.1 % of its output bytes different and about 0.01 % of its state outside 1e-4, a tenth of what the band

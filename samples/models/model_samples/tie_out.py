@@ -132,8 +132,7 @@ reciprocals' bound admits under it (``torch_ref.nvfp4_code_bracket``).  Per call
 
 Every block scale finite.  The line prints how many block scales and codes were judged and how many codes are the second
 code of their bracket (printed, not gated); anything else is outside and a failure, never a share.  Where the bracket
-holds one code the judge is byte for byte.  Two things this band cannot see.  It holds the kernel to its rule, not to the
-target kernel set's kernel: byte equality with that one is the entry's own record.  And at an exact rounding tie the
+holds one code the judge is byte for byte.  One thing this band cannot see: at an exact rounding tie the
 bracket holds the two codes around the midpoint, also where the scale and the block scale are powers of two and the
 page states the even code: there the band takes either, and the tie rule is the entry's own suite's to hold.
 
@@ -207,7 +206,7 @@ writes nothing, so the cache it reads is held byte for byte.  The line prints ho
 elements are not the reference chain's byte, how many are outside their bound, and the largest share of its bound an
 element used with the chain and the spread of that element; the share is printed, not gated.
 
-What this band is and is not.  It is derived from a model and from no measured distance, and it claims nothing about
+What this band is and is not.  It is derived from a model and from no measured distance, and it states nothing about
 what the kernel rounds.  It is the model's bound to first order: one spacing at the chain covers the output's rounding
 wherever the chain is not far below its bound, and where it is, half a spacing at the output is more than one spacing at
 the chain -- there an output of the model itself can use up to ``1 + 2**-8`` of its bound.  So an element outside is a
@@ -224,7 +223,7 @@ and so its natural unit of failure: over the run, more than 99 % of the cell's o
 the cell's state within 1e-4.  The null slot is in no share.
 
 Why the state band has a share and a cap: the fused step rounds its beta / alpha projection, its conv taps and its SiLU to
-bf16 as a serving chain does, and it accumulates them in fp32 in its own order.  Against an fp64-accumulated reference a few of
+bf16 as the reference chain does, and it accumulates them in fp32 in its own order.  Against an fp64-accumulated reference a few of
 those roundings fall on the other side of a midpoint; one such unit moves one head's write gate, its decay or one key column,
 and with it that head's state, by up to a few 1e-3 of the state's largest value, while every other element agrees to fp32
 rounding.  A state "within 1e-4 everywhere" therefore does not hold against this reference (measured by this sample: the
@@ -1066,8 +1065,8 @@ def run_checks(
 
     ``kernels`` adds the kernel check on the traced pass the session made before this call (``Session.trace`` with launch
     records): a failure fails the run; kernels that could not be observed are reported, and ``Checks.unobserved`` says why.
-    Left out, it is the session's own decision (``Session.check_kernels``): a session of a stack that declares a target
-    kernel set is checked without being asked, so no caller can print a verdict for such a run that never looked at its
+    Left out, it is the session's own decision (``Session.check_kernels``): a session of a stack that always checks its
+    kernels (the family's ``checked_stacks``) is checked without being asked, so no caller can print a verdict for such a run that never looked at its
     kernels.  For such a session ``kernels=False`` is refused.  ``kernels=DEFERRED`` is for a caller that traces after
     these checks (the performance mode: no profiler pass comes before its last timed request): no kernel line is printed
     here, ``Checks.kernels`` says ``DEFERRED``, and the caller makes the check itself behind its traced request
@@ -1100,8 +1099,8 @@ def run_checks(
     ids and logits.  The reference sessions have no drafter: they are fed the recorded windows."""
     if kernels is None:
         kernels = session.check_kernels
-    elif not kernels and session.stack in getattr(session.model, "target_stacks", ()):
-        raise ValueError(f"stack {session.stack} declares a target kernel set: its kernel check cannot be switched off")
+    elif not kernels and session.stack in getattr(session.model, "checked_stacks", ()):
+        raise ValueError(f"stack {session.stack} always checks its kernels: the check cannot be switched off")
     if positions is not None and session.draft_tokens is not None:
         raise ValueError("judged positions are steps of a decode run; a session built with draft_tokens= has two kinds of step")
     session._closed("run_checks")
@@ -1709,7 +1708,7 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     band_units = None if band_units is None else float(band_units)
     plural = "s" if S > 1 else ""
     lines = [
-        f"speculative against decode ({S} sequence{plural} x {T} tokens per sequence, {steps} engine steps behind a prompt of {fed} tokens; "
+        f"speculative against decode ({S} sequence{plural} x {T} tokens per sequence, {steps} speculative steps behind a prompt of {fed} tokens; "
         f"tokens kept behind the first: {', '.join(str(count) for count in counts)}; {layers} layers)"
     ]
     near = [False] * steps

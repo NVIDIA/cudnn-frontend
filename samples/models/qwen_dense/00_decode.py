@@ -17,10 +17,10 @@ template turn ``--prompt`` or ``--messages`` into token ids, the model decodes g
 ``samples/models/requirements.txt``, the checkpoint on local disk (your own download) and a GPU with room for a bf16 copy
 of every weight: about 57 GiB free for the 27B checkpoint.
 
-Coming from a serving engine: ``--messages`` takes the request body a chat client sends, from a file or from standard input
+A request and its options: ``--messages`` takes the request body a chat client sends, from a file or from standard input
 (``-``).  Every field of it is answered -- read, printed, accepted at the value at which it changes nothing, or refused by
 name because it would change the output (``serving_options.py`` beside this script has the rules).  ``--max-tokens`` and
-``--max-model-len`` mean what they mean there: the limit of new tokens of a request, and the positions a prompt and its new
+``--max-model-len`` are the limit of new tokens of a request, and the positions a prompt and its new
 tokens share.  The generated text of sequence 0 goes to standard output as it is generated (``--no-stream``: once, after the
 report; ``--text-out FILE``: into a file); every other line of a run -- the ``[00]`` lines, the tables, the report, the
 checks -- goes to standard error, so the text can be piped.  A request gets one text: with a list of sequence counts it
@@ -32,7 +32,7 @@ and no queue: one process, one fixed set of sequences.
     python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
     python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: reports RAN, never PASS
     python samples/models/qwen_dense/00_decode.py --check-kernels          # also: every launch of the traced steps against the plan
-    python samples/models/qwen_dense/00_decode.py --stack native           # the target kernel set, as far as it is served here
+    python samples/models/qwen_dense/00_decode.py --stack native           # every block on a kernel that works on the stored weights
 
     pip install -r samples/models/requirements.txt                         # only for a checkpoint; brings the hf command
     hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4   # your own step: the sample fetches nothing
@@ -246,10 +246,10 @@ def _arguments(argv):
         "--stack",
         default="fe-cublas",
         choices=STACKS,
-        help="fe-cublas (default): cuDNN Frontend + cuBLAS + PyTorch, checked against the reference; native: the target kernel set of the "
-        "decode step, per block the kernel a recorded census names, with the blocks not served yet on fallback rows (printed as not yet) "
-        "and the kernel check always on; fe-entries: the cuDNN Frontend rows of native, everything else on fallback rows; reference: "
-        "every block in PyTorch, on any CUDA GPU, nothing checked.  Explicit: never chosen by what is installed",
+        help="fe-cublas (default): cuDNN Frontend + cuBLAS + PyTorch, checked against the reference; native: every block on a kernel that "
+        "works on the stored weights (entries of cuDNN Frontend and four calls of FlashInfer), a block no kernel serves on this GPU or at "
+        "this row count on its fallback row, and the kernel check always on; fe-entries: the cuDNN Frontend rows of native, everything else "
+        "on fallback rows; reference: every block in PyTorch, on any CUDA GPU, nothing checked.  Explicit: never chosen by what is installed",
     )
     parser.add_argument(
         "--provider",
@@ -259,7 +259,7 @@ def _arguments(argv):
         help="select one declared provider row of a block (an unknown block or key prints the declared ones)",
     )
     parser.add_argument("--reference-precision", default="fp64", choices=("fp64", "ieee-fp32"), help="accumulation of the reference blocks (default fp64)")
-    parser.add_argument("--dump-tokens", metavar="FILE", help="write the prompt ids and the produced ids as JSON, for a comparison made elsewhere")
+    parser.add_argument("--dump-tokens", metavar="FILE", help="write the prompt ids and the produced ids as JSON")
     parser.add_argument(
         "--check-kernels",
         action="store_true",
@@ -272,7 +272,7 @@ def _arguments(argv):
         "--dump-census",
         metavar="FILE",
         help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory, start and end per launch), for a "
-        "comparison made elsewhere; implies --check-kernels",
+        "reader outside of the run; implies --check-kernels",
     )
     _perf_flags(parser)
     for flag, takes in SPECULATIVE_FLAGS:
@@ -451,7 +451,7 @@ def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str
 def _decode(session, text, rule, prompts, tie_out, check, checked_steps, sink=None):
     """One prompt set: prefill, the decode loop (the one host read of a step is here), the traced pass, the report and the
     checks.  Returns ``(passed, provider blocks judged, tokens per sequence)``.  Whether the kernels are checked is the
-    session's decision (``session.check_kernels``: the flag, or a stack that declares a target kernel set) and is read
+    session's decision (``session.check_kernels``: the flag, or a stack that always checks its kernels) and is read
     there, in one place: the traced pass then keeps its launch records and the checks include the kernel check; its
     outcome stays on the session (``session.traced``).
 

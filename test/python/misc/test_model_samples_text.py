@@ -8,7 +8,7 @@ uses (tool schemas, a reasoning block, tool calls and tool results, several turn
 stored strings, and a tokenizer trained in the test, encoded, decoded and streamed.  The requirement file of the area and
 its dependency-update entry are checked as text.  No real tokenizer or template file is committed; no GPU, no weights.
 
-And what a user of a serving engine brings to a sample (``samples/models/qwen_dense/serving_options.py`` and the flags of
+And a request and its options (``samples/models/qwen_dense/serving_options.py`` and the flags of
 ``00_decode.py``): the request body a chat client sends, answered field by field -- every field that is accepted at a
 neutral value, and every refusal by its own sentence; the limit of new tokens of a request against ``--max-model-len``;
 the line that states the decoding rule beside the checkpoint's own generation settings, and the one that says what a
@@ -282,7 +282,7 @@ def test_a_checkpoints_chat_template_renders_tools_reasoning_and_several_turns(t
         text.render_chat([])
     named = _text_directory(tmp_path / "named", template="{{ eos_token }}|{{ pad_token }}|{{ messages[0].content }}")
     assert TextIO.from_checkpoint(str(named)).render_chat(user) == "<|im_end|>|<|endoftext|>|Why is the sky blue?", "a template may name the special tokens"
-    # a tool call as a serving API writes it, with its arguments as one JSON string: the template wants a mapping and says so
+    # a tool call as a chat API writes it, with its arguments as one JSON string: the template wants a mapping and says so
     as_text = {"type": "function", "function": {"name": "weather", "arguments": '{"city": "Paris"}'}}
     with pytest.raises(ValueError, match="chat template refused the messages: "):
         text.render_chat(agent[:2] + [{"role": "assistant", "content": "", "tool_calls": [as_text]}])
@@ -449,7 +449,7 @@ def test_the_requirement_file_has_lower_bounds_a_validated_list_and_an_update_en
         assert "samples/models/requirements.txt" in readme.read_text(), f"{readme.name} names the requirement file"
 
 
-# --------------------------------------------------------------------------- coming from a serving engine
+# --------------------------------------------------------------------------- a request body and its options
 
 CHAT = [{"role": "user", "content": "hi"}]
 #: a request body as a chat client sends it: the fields review of the first design named, and one no sample knows
@@ -515,7 +515,7 @@ REFUSED = {
     "extra_body": {"top_k": 20, "temperature": 0.7},
 }
 #: What the area guide lists as left out of a model sample, and the fields of a request that ask for it: the names of the
-#: public chat request and of the sampling parameters serving engines add to it.  Each is a row of the table.
+#: public chat request and of the sampling parameters commonly sent with it.  Each is a row of the table.
 LEFT_OUT = {
     "sampling": ("temperature", "top_p", "top_k", "min_p", "n", "best_of", "use_beam_search", "length_penalty", "watermarking"),
     "stop strings": ("stop", "include_stop_str_in_output", "stop_token_ids", "repetition_detection"),
@@ -676,7 +676,7 @@ def test_a_field_that_asks_for_what_a_sample_leaves_out_is_a_row_of_the_table_an
 
 
 def test_the_line_of_a_request_body_prints_names_and_the_values_the_table_knows_and_no_path(tmp_path):
-    """What a run prints of a body: of ``model`` the last part (an engine that serves a directory is asked for it by its
+    """What a run prints of a body: of ``model`` the last part (a model that is a directory is named by its
     path); of a field that is not used its name, and its value only where that is a number or a boolean; a name that is
     not a plain word as a JSON string, so that a line break in it cannot put a line of its own into the run."""
     import serving_options
@@ -1121,7 +1121,7 @@ def _sample_script(monkeypatch, script="00_decode.py"):
     return sample
 
 
-def test_the_serving_style_flags_of_the_sample(monkeypatch, capsys):
+def test_the_request_flags_of_the_sample(monkeypatch, capsys):
     """``--max-tokens`` and its older spelling, ``--max-model-len``, ``--temperature``, ``--messages -``, ``--text-out``,
     ``--no-stream``: their defaults, what each applies to, and every refusal by its sentence."""
     import serving_options
@@ -1873,13 +1873,13 @@ def test_the_rows_the_speculative_limit_holds_are_one_fewer_than_the_tokens_the_
 
 
 def test_the_family_readme_says_of_a_request_what_the_data_and_the_run_say():
-    """The section "Coming from a serving engine": the table of fields that would change the output is the data, row for
+    """The section "A request body and its options": the table of fields that would change the output is the data, row for
     row; every other field the sample answers is named; the lines the README quotes are the lines a run prints; and the
     flags of the section are rows of the flag table."""
     import serving_options
 
     readme = (FAMILY / "README.md").read_text()
-    section = readme.split("## Coming from a serving engine", 1)[1].split("\n## ", 1)[0]
+    section = readme.split("## A request body and its options", 1)[1].split("\n## ", 1)[0]
     table = section.split("| field | accepted | another value is refused because |\n|---|---|---|\n", 1)[1].split("\n\n", 1)[0].splitlines()
     rows = []
     for name, (values, reason) in serving_options.NEUTRAL.items():
@@ -1986,7 +1986,7 @@ def test_the_speculative_configuration_is_one_json_object_answered_key_by_key():
     for reason in (*(why for _, why in read.values()), *(why for _, why in neutral.values()), *refused.values()):
         assert reason and reason[0].islower() and not reason.endswith("."), reason
     drafted, line = serving_options.parse_speculative_config(serving_options.SPECULATIVE_DEFAULT, f"{SHOWN} (the default)")
-    said = f'{SHOWN} (the default): the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, '
+    said = f'{SHOWN} (the default): read: method "mtp", num_speculative_tokens 5, '
     assert (drafted, line) == (5, said + "use_local_argmax_reduction true.") and json.loads(serving_options.SPECULATIVE_DEFAULT) == SPECULATIVE
     # the count is any whole number from 1: which counts a stack serves is its rows' answer, at the plan
     assert [_configured(num_speculative_tokens=count)[0] for count in (1, 3, 7, 12)] == [1, 3, 7, 12]
@@ -2040,7 +2040,7 @@ def test_the_speculative_configuration_is_one_json_object_answered_key_by_key():
     # the rule the guide states for such an object, beside the rule for a request body
     guide = " ".join((MODELS / "AGENTS.md").read_text().split())
     assert (
-        "A configuration object of a serving engine that selects what is launched is answered key by key in the same module; "
+        "A configuration object that selects what is launched (`--speculative-config`) is answered key by key in the same module; "
         "a key it does not hold is an `ERROR` that names it."
     ) in guide
 
@@ -2129,7 +2129,7 @@ def test_the_speculative_scripts_flags_say_what_they_apply_to(tmp_path, monkeypa
         ),
         (
             ["--dump-census", "census.json"],
-            "--dump-census: the launch records of a draft pass have no kernel census to be held against yet; 00_decode.py writes those of a decode step",
+            "--dump-census: not in this script; 00_decode.py writes the launch records of a decode step",
         ),
         (["--check-kernels", "--stack", "reference"], "--check-kernels is for a provider stack; --stack reference checks no kernel"),
         (["--sequences", "1,4"], "argument --sequences: invalid int value: '1,4'"),
@@ -2173,7 +2173,7 @@ def test_the_speculative_scripts_flags_say_what_they_apply_to(tmp_path, monkeypa
         (
             ["--speculative-config", '{"method": "mtp", "num_speculative_tokens": 5}'],
             '[02] ERROR --speculative-config: "use_local_argmax_reduction" is not named: the draft token is the largest of the listed rows of the '
-            "head; without it an engine launches another set. Accepted: true",
+            "head: the one form of the drafter's head this sample runs. Accepted: true",
         ),
         (["--dump-tokens", str(tmp_path / "nowhere" / "ids.json")], "[02] ERROR --dump-tokens ids.json: cannot be written there"),
         (["--model", "d", "--text-out", str(tmp_path / "nowhere" / "answer.txt")], "[02] ERROR --text-out answer.txt: cannot be written there"),
@@ -2275,7 +2275,7 @@ def test_the_speculative_sample_runs_to_its_last_line_on_the_cpu(tmp_path, monke
     checkpoint.close()
     # before the load: the configuration key by key, the list, the rule and the counts of a prompt and a step
     said = (
-        '[02] --speculative-config: the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 3, '
+        '[02] --speculative-config: read: method "mtp", num_speculative_tokens 3, '
         'use_local_argmax_reduction true. At the value that changes nothing: draft_sample_method "greedy".'
     )
     listed = "[02] draft vocabulary draft_vocab.json: 136 ids of the model's 272, in ascending order (136 entries listed, none dropped)"
@@ -2322,7 +2322,7 @@ def test_the_speculative_sample_runs_to_its_last_line_on_the_cpu(tmp_path, monke
     )
     # ... on the steps the header names: the comparison on what the run recorded (16 steps), the block check on the first 8 of them
     assert steps > 16, "the seeded drafter of this checkpoint is seldom accepted: twenty tokens are more steps than a run records"
-    assert lines[against].startswith("speculative against decode (1 sequence x 4 tokens per sequence, 16 engine steps behind a prompt of 5 tokens; ")
+    assert lines[against].startswith("speculative against decode (1 sequence x 4 tokens per sequence, 16 speculative steps behind a prompt of 5 tokens; ")
     assert any(
         line.startswith("checks (1 sequence x 4 tokens per sequence, the first 8 verify steps; ") and line.endswith("; behind a prompt of 5 decode steps)")
         for line in lines
@@ -2349,7 +2349,7 @@ def test_the_speculative_sample_runs_to_its_last_line_on_the_cpu(tmp_path, monke
     assert code == 0 and both_out == "" and [(each["prompt"], len(each["prompt_ids"][0])) for each in runs] == [(0, 5), (1, 2)]
     texts = [" ".join(f"w{token}" for token in each["ids"][0] if token != WORDS) + "\n" for each in runs]
     assert target.read_text(encoding="utf-8") == texts[0] + texts[1] and all(len(each["ids"][0]) <= 9 for each in runs)
-    assert "[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method" in both_err
+    assert "[02] --speculative-config (the default): read: method" in both_err
     assert (
         "[02] prompt of 5 tokens (--prompt 1) = 5 decode steps and 4 passes of the drafter before the first token; prompt of 2 tokens (--prompt 2) = "
         "2 decode steps and 1 passes of the drafter before the first token; then every step is 5 draft passes and one verify step of 6 tokens, "
@@ -2368,7 +2368,7 @@ def test_the_speculative_sample_runs_to_its_last_line_on_the_cpu(tmp_path, monke
     code = sample.main(["--model", str(ending), *two[2:], "--prompt", "w3 w1 w4 w1 w5", "--max-tokens", "20"])
     ended = capsys.readouterr().err.splitlines()
     assert code == 0 and "text out              11 tokens in 10 steps, ended at the end token: written to stdout as it was generated" in ended
-    assert any(line.startswith("speculative against decode (1 sequence x 6 tokens per sequence, 10 engine steps behind ") for line in ended)
+    assert any(line.startswith("speculative against decode (1 sequence x 6 tokens per sequence, 10 speculative steps behind ") for line in ended)
     assert _compared(ended, "position").endswith("the session's own run ended there    PASS") and nothing not in ended
 
     # what a user of the script can get wrong about the drafter: one line each, before the plan
@@ -2533,8 +2533,8 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         reasons.setdefault(reason, []).append(f"`{name}`")
     rows += [f"| {', '.join(names)} | refused at any value | `null` | {reason} |" for reason, names in reasons.items()]
     assert table == rows, "the three tables of serving_options.py, in their order, with their values and reasons"
-    assert "The key names and the values of this table were read in the public release 0.33.0 of a serving engine (2026-10-31)." in text
-    assert "**The speculative configuration of a serving engine.**" in section and "A key no row holds is an `ERROR` that names it." in text
+    assert "The key names and the values of this table are those of the public JSON object of this name as it stood on 2026-10-31." in text
+    assert "**The speculative configuration.**" in section and "A key no row holds is an `ERROR` that names it." in text
     # the commands, as they are written: each is parsed by the script, and the object of the third is the default one
     block = section.split("```bash\n", 1)[1].split("```", 1)[0].replace("\\\n", " ")
     commands = [shlex.split(line, comments=True) for line in block.splitlines() if line.startswith("python samples/models/qwen_dense/02_speculative_decode.py")]
@@ -2697,9 +2697,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     # the other documents name the script, and their commands run its first form
     family = (FAMILY / "README.md").read_text()
     assert "| `02_speculative_decode.py` | speculative decoding with the checkpoint's drafter, one request in one process: " in family
-    assert (
-        "| a speculative configuration: the JSON object that asks an engine to draft tokens | `02_speculative_decode.py --speculative-config JSON` | " in family
-    )
+    assert "| a speculative configuration: the JSON object that says how tokens are drafted | `02_speculative_decode.py --speculative-config JSON` | " in family
     area = " ".join((MODELS / "README.md").read_text().split())
     assert "The second sample, `02_speculative_decode.py`, runs that step for one request:" in area and "no script drafts yet" not in area + family
     assert "No block of the drafter is on a kernel yet, and the sample prints no rate." in area

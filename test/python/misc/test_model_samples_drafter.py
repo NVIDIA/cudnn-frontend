@@ -1915,7 +1915,7 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     # ... from the table: every block a reference chain in every stack, but the lookup, which is the gather
     rows = {block: rows[0] for block, rows in configs.DRAFTER_PROVIDERS.items()}
     assert all(row.fallback.startswith("reference chain") and row.stacks == configs.EVERY for block, row in rows.items() if block != "draft.embedding")
-    assert (rows["draft.embedding"].key, rows["draft.embedding"].fallback) == ("torch.index_select", "") and not hasattr(QwenDenseDrafter, "target_stacks")
+    assert (rows["draft.embedding"].key, rows["draft.embedding"].fallback) == ("torch.index_select", "") and not hasattr(QwenDenseDrafter, "checked_stacks")
     # a session takes the drafter and hands its passes the rows of its own state; the drafter knows no session
     loop = (MODELS / "model_samples" / "loop.py").read_text()
     assert not any("Session" in name for name in dir(QwenDenseDrafter)) and "drafter=None," in loop and "state.hidden, state.greedy" in loop

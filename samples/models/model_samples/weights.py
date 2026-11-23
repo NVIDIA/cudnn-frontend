@@ -563,9 +563,9 @@ def _interleaved_values(t: InterleavedBlockScaledTensor, rows_per_chunk: int) ->
 def merge_scaled(parts: Sequence[ScaledTensor], rule: str = "largest_scale") -> ScaledTensor:
     """Merge 8-bit weights along their first dimension (the projections of one multiply: Q, K and V; ``qkv`` and ``z``).
 
-    ``"largest_scale"`` (the default, what the stock serving engine does): every part whose scale is not the largest is
+    ``"largest_scale"`` (the default): every part whose scale is not the largest is
     dequantised and re-quantised at the largest scale, so the merged weight has ONE scale.  ``"own_scale"`` keeps every part's
-    codes and returns one scale per row: closer to the checkpoint, and not comparable with an engine that merges."""
+    codes and returns one scale per row: closer to the checkpoint, and other codes than the default's."""
     if rule not in ("largest_scale", "own_scale"):
         raise ValueError(f'merge rule must be "largest_scale" or "own_scale"; got {rule!r}')
     if not parts or any(not isinstance(p, ScaledTensor) or isinstance(p.scale, torch.Tensor) for p in parts):

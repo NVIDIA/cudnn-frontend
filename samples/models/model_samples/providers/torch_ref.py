@@ -4,8 +4,8 @@
 """Every block of a model in plain PyTorch: the reference of the tie-out, and the provider of the blocks that have no kernel yet
 -- among them every block of a drafter's pass.
 
-The functions keep the quantisation rules and every intermediate cast of a serving chain (a norm output, a SiLU, a gate, the
-conv taps and the core output of the linear-attention step are each rounded to bf16 where the chain rounds them), and they
+The functions keep the quantisation rules and every intermediate cast of the kernels on the stored formats (a norm output,
+a SiLU, a gate, the conv taps and the core output of the linear-attention step are each rounded to bf16 where those round them), and they
 accumulate every multiply and every reduction in ``acc`` -- fp64 by default.  fp64 is deliberate: an fp32 reference changes with
 the matmul precision mode of the environment, and a small accumulation error can cross a bf16 rounding midpoint.
 
@@ -114,7 +114,7 @@ def pre_fc_norm_quantize(embedding: torch.Tensor, hidden: torch.Tensor, weight_e
 
 
 def rope_cos_sin(position: int, rotary_dim: int, theta: float, device):
-    """cos and sin of the rotary angles of one position, rounded to bf16 as a serving chain's table is."""
+    """cos and sin of the rotary angles of one position, rounded to bf16 as the table a kernel reads is."""
     inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim))
     angle = position * inv_freq
     return angle.cos().to(BF16), angle.sin().to(BF16)

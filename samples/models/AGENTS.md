@@ -13,7 +13,7 @@ before the first step. A model sample keeps no state between two prompt sets, ha
 nothing at run time: every provider and route is a row of the printed table. The list of provider keys is closed; it changes
 only together with a kernel, with the reference chain of a block that a kernel is to serve, or with a declared library
 entry. A library's own tuner may choose among that library's kernels for a call a row names; the choice is printed with
-the kernel check and is never a row. A change that needs any of these belongs in a serving engine.
+the kernel check and is never a row. A change that needs any of these does not belong in a model sample.
 
 Also out: a `generate()` method on the helper layer (the loop is in the script), stop strings, constrained output, logit
 processors, tool-call parsing of the output, automatic choice of a stack or a route. A field of a request body that asks
@@ -54,7 +54,7 @@ does not hold is printed as not known and ignored, so a new name for one of them
      -- a sample switches the provider's own download off before its first use, and a binary that is not on the machine
      is a `SKIP` that names what is missing and the fix.
 6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `native` is
-   the target kernel set of the family's census; `fe-entries` is its cuDNN Frontend rows with every other block on a
+   every block on a kernel that works on the stored weights; `fe-entries` is its cuDNN Frontend rows with every other block on a
    fallback row, so it runs without further packages. `--stack reference` reports `[NN] RAN reference stack (no provider
    checked)`, never `PASS`; so does a run whose `--provider` flags leave no provider block to judge (`[NN] RAN (no
    provider block was judged)`, blocks line `REPORTED`). `PASS` means provider blocks were compared and held.
@@ -170,7 +170,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
 16. **A sample states what it ran, never how it stands to another stack.** A run prints which kernel serves each
     block, each block inside its band against the reference, the launches of a step against the plan and, in the
     performance mode, its rate. No line of a run, no test and no text of this area compares a sample with another stack
-    or states what is held of one.
+    or states what is held of one. Detector: `git grep -niE 'target[ _](kernel|census|stack)|kernel[ ]identity|claim[e]d|byte-equal[ ]results|declared[ ]stand-in|census[ ]records|served[ ]rate|serving[ ](engine|benchmark)' -- samples/models
+    'test/python/misc/test_model_samples_*.py' test/python/linear_attention/frost/test_model_sample_qwen_dense.py` finds
+    nothing (a blank of the pattern is in brackets, so the pattern is no line it finds).
     - What is gated is the sample's own: every block against the reference, the plan, the launches of the traced steps
       against the plan, an entry's kernel by name, order, count and the launch shape the entry itself states, the form a
       row passes, the row limits.
@@ -183,20 +185,20 @@ does not hold is printed as not known and ignored, so a new name for one of them
     one text: with several sequence counts the first count writes it and later counts report whether their sequence 0
     matched. No run line goes to standard output even when standard error is closed (`print` with no stream writes to
     standard output). The GPU test of a default run holds both streams, in this process and in a fresh interpreter.
-18. **A request body is answered field by field, beside the script.** A sample that takes a serving engine client's body
-    parses it in one module beside the family's scripts (`serving_options.py`), as data: fields read, fields stated or
+18. **A request body is answered field by field, beside the script.** A sample that takes the request body of a chat
+    client parses it in one module beside the family's scripts (`serving_options.py`), as data: fields read, fields stated or
     unused, and for every output-changing field the values at which it changes nothing.
     - Such a field at another value is an `ERROR` naming the field, value, reason and what is accepted. An unknown field is
       printed and ignored; nothing is dropped silently or decoded otherwise than the table says.
     - The table holds every client name for a feature the tripwire leaves out; the host test names them by feature.
     - The printed line holds field names and values the table knows; it never echoes what others wrote: of `model` the last
       part, of an unused field its name, a name that is not a plain word as a JSON string.
-    - The helper layer gets messages, tool schemas and template options, never a body. A serving-engine option keeps its
-      name and meaning (`--max-tokens`, `--max-model-len`). A new table field comes with its case in
+    - The helper layer gets messages, tool schemas and template options, never a body. An option that carries the name of a
+      client's field keeps that field's meaning (`--max-tokens`, `--max-model-len`). A new table field comes with its case in
       `test/python/misc/test_model_samples_text.py`.
-    - Pre-load lines for serving-engine users (decoding rule beside the checkpoint's generation settings, decode steps
+    - Pre-load lines about a request (decoding rule beside the checkpoint's generation settings, decode steps
       before the first new token) state a rule and a count, never a time.
-    - A configuration object of a serving engine that selects what is launched is answered key by key in the same
+    - A configuration object that selects what is launched (`--speculative-config`) is answered key by key in the same
       module; a key it does not hold is an `ERROR` that names it. Each key is read, accepted at its neutral value, or
       refused with its reason, with its case in the same test module.
 19. **The performance mode states what it observed, never what it assumes.** One definition per statistic, written in the
@@ -284,7 +286,7 @@ Each item below once let a wrong provider or a wrong text pass every test; the h
 - An entry that returns a view of its own buffer is passed an output buffer per call by its adapter. An operand a kernel
   updates in place is declared state of the block (`state_args`): saved, restored, compared.
 - Compare versions of what the stack imports, not of what is installed.
-- A decision taken in two places is taken in neither: whether a target stack checks its kernels is the session's, and
+- A decision taken in two places is taken in neither: whether a stack always checks its kernels is the session's, and
   helpers read it there.
 - An entry gates the installed toolchain where it builds its kernel; its first use belongs to the plan.
 - A row claims the GPU classes it was decided for, which may be fewer than the entry serves. A row states the form whole (every
@@ -446,11 +448,11 @@ A session that is handed the drafter runs the whole step of speculative decoding
 
 ## What building the speculative script taught
 
-`02_speculative_decode.py` runs the speculative step for one request: its own loop, a serving engine's speculative
+`02_speculative_decode.py` runs the speculative step for one request: its own loop, the speculative
 configuration key by key, the comparison with decode steps and the checks of every run.
 
 - A configuration that selects what is launched has no class "printed and ignored". Unknown keys are `ERROR`; keys that
-  are read must be named (an engine default selects another launch set); a refused key's value is not printed.
+  are read must be named (a key left to a default selects another launch set); a refused key's value is not printed.
 - A script that compares where another checks nothing needs the verdict's order. A failed line is `FAIL` on every stack,
   in both scripts; one host test holds both `_verdict` functions to each other and to the README table.
 - What the library's comparison cannot see, the script holds itself. It compares the ids of both arms, with three wrong
@@ -464,7 +466,7 @@ configuration key by key, the comparison with decode steps and the checks of eve
 
 ## What the rows a library serves taught
 
-Three blocks of the target kernel set are library multiplies; `native` calls FlashInfer for them on the stored weights
+Three blocks of `native` are library multiplies; the stack calls FlashInfer for them on the stored weights
 (`providers/flashinfer_calls.py`).
 
 - A library's kernel pick is a function of the call only until something tunes the operation. The row names the
@@ -573,11 +575,11 @@ The attention core of `native` is a library's paged decode attention, a kernel t
 
 ## What the output head's quantise row taught
 
-The 4-bit operand of the output head is a block of the wiring, `output_head.quantize`, served on the target stacks by
+The 4-bit operand of the output head is a block of the wiring, `output_head.quantize`, served on `native` and `fe-entries` by
 `cudnn.RowQuantizeFp4Decode` (`providers/fe.py`: `RowQuantizeFp4DecodeBlock`).
 
-- A launch of the target that lives inside a serving engine is a block like any other once an entry reproduces it: a
-  block of the wiring in every stack, the entry's row on the target stacks, the reference chain everywhere else.
+- An operation that takes a launch of its own is a block like any other: a block of the wiring in every stack, the entry's
+  row on `native` and `fe-entries`, the reference chain everywhere else.
 - A block whose reference chain cannot be its twin is told by the chain's own bytes against the entry's contract:
   judge them on the host first. Here the chain drops the sign of a zero that the kernel keeps.
 - An operand handed on whose value equals another's on the seeded model is held by identity through the tap, and once

@@ -28,10 +28,10 @@ The norm block is called at several sites of a step, and a kernel that serves it
 names the call by what the normed rows feed (``NORM_SITES``; ``sites()`` lists the site of every call of the wiring).  The
 in-projection is called with another weight shape in each kind of layer, and its site says which
 (``IN_PROJECTION_SITES``).  The out-projection has one weight shape, and its site names the layer's kind too
-(``OUT_PROJECTION_SITES``): the target kernel set serves the two kinds with two kernels in a step of several tokens per
+(``OUT_PROJECTION_SITES``): the stack ``native`` serves the two kinds with two kernels in a step of several tokens per
 sequence, so a provider row may serve one of them and hand the other on.  A reference chain and a multiply over a copy
 ignore the site.  The last norm of a step is handed no ``Quant`` and returns no quantised operand: the 4-bit operand of
-the output head is formed from its rows by a block of its own, as the target kernel set forms it with a launch of its own.
+the output head is formed from its rows by a block of its own, which a kernel serves with a launch of its own.
 
 A step feeds one token per sequence -- the decode step -- or, on a state built for several (``DecodeState(tokens=T)``),
 ``T`` tokens per sequence at once: the verify step of speculative decoding.  Its rows are sequence by sequence (``rows =
@@ -87,7 +87,7 @@ STORED_WEIGHTS = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp
 #: site name belongs to one block: a provider reads the sites of its row out of ``sites()`` by name
 IN_PROJECTION_SITES = {"linear_attention": "linear_attention.qkvz", "full_attention": "full_attention.qkv"}
 #: the call sites of the out-projection, by the layer's kind.  The weight has one shape in both kinds (hidden x the
-#: mixer's output width, which the two kinds share); what differs is the kernel the target kernel set launches for it in
+#: mixer's output width, which the two kinds share); what differs is the kernel the stack ``native`` launches for it in
 #: a step of several tokens per sequence, so a provider row serves the calls of one kind and hands the other's on
 OUT_PROJECTION_SITES = {"linear_attention": "linear_attention.out", "full_attention": "full_attention.out"}
 #: block -> its call sites by the layer's kind, for the blocks that multiply a weight and are called at a site per kind:
@@ -212,7 +212,7 @@ class QwenDense:
     first_launch_reserve = configs.FIRST_LAUNCH_RESERVE
     logits_band_units = configs.LOGITS_BAND_UNITS
     table_source = "model_samples/qwen_dense/configs.py"
-    target_stacks = configs.TARGET_STACKS  # the stacks a run of which always checks its kernels
+    checked_stacks = configs.CHECKED_STACKS  # the stacks a run of which always checks its kernels
     attention_page = configs.ATTENTION_PAGE  # positions per page of the paged attention cache: where a timed run is judged
 
     @classmethod
@@ -364,7 +364,7 @@ class QwenDense:
         kind for a layer's input norm, ``"mlp"``, ``"output_head"``), with ``".first"`` behind the first call of a step, which
         has no residual stream to add to; for the in-projection the layer's kind and what its merged weight holds
         (``IN_PROJECTION_SITES``: the weight has another shape in each kind of layer); for the out-projection the layer's
-        kind (``OUT_PROJECTION_SITES``: one weight shape, and two kernels of the target in a step of several tokens per
+        kind (``OUT_PROJECTION_SITES``: one weight shape, and two kernels of ``native`` in a step of several tokens per
         sequence); ``""`` for a block that is called in one form everywhere.  A site name belongs to one block.  ``step``
         hands the same names to the three blocks; a provider row names the form of each, or hands a site on to the next
         row (``ProviderRow.sites``)."""
