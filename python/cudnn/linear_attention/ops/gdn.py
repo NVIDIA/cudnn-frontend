@@ -1533,14 +1533,16 @@ def gated_delta_net(
             blocks: the second starts from the state the first stored in
             this buffer and is handed out only behind that store, so the
             output and the final state stay the uncut schedule's.  A batch
-            whose sequences differ in their chunk count, whose
-            ``cu_seqlens`` stop short of the token rows by a chunk or more,
-            or whose ``state_indices`` name one row twice, keeps the uncut
-            schedule.  Where the engine would otherwise run a batch's last
-            partial wave as a chain of pieces, whose output and final state
-            differ from the uncut schedule's inside the op's tolerance, a
-            levelled plan runs the whole batch and returns the uncut
-            schedule's.
+            whose sequences do not all have the chunk count its token rows
+            give them (the rows shared out evenly to the sequences), or
+            whose ``state_indices`` name one row twice, keeps the uncut
+            schedule.  A last chunk that is not full counts as a chunk, so
+            sequences that end in a partial chunk are levelled as
+            sequences of full chunks are.  Where the engine would otherwise
+            run a batch's last partial wave as a chain of pieces, whose
+            output and final state differ from the uncut schedule's inside
+            the op's tolerance, a levelled plan runs the whole batch and
+            returns the uncut schedule's.
             Inference only: the in-place op has no autograd formula.
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` inside the kernel.
         allow_neg_eigval: scale the fused beta sigmoid by 2, so the delta-rule
