@@ -19,7 +19,6 @@ on both sides of the chain's first length the output and final state match the f
 carries the chain group has the bytes it has with the group carried."""
 
 import pytest
-import torch
 
 from cudnn.linear_attention.frost import gdn_engine
 from cudnn.linear_attention.frost.common import piece_chain
@@ -30,8 +29,6 @@ from cudnn.linear_attention.frost.common.piece_chain import (
     LENGTH_RULE_PIECE_TOKENS,
     chain_group_pays,
     chain_pays,
-    choose_pieces,
-    ragged_pieces,
 )
 from cudnn.linear_attention.frost.common.tail import choose_tail
 from determinism_utils import assert_bitwise, snapshot
@@ -162,7 +159,7 @@ def group_scheme(num_sm, lengths, *, heads, value_heads, **call):
     if plan_scheme(num_sm, lengths, heads=heads, value_heads=value_heads, **call)[0] or call.get("batch_invariant"):
         return 0
     shape = dict(heads_out=max(heads, value_heads), total_tokens=sum(lengths))
-    slots = ragged_pieces(**shape, num_sm=num_sm)
+    slots = piece_chain.ragged_pieces(**shape, num_sm=num_sm)
     by_cost = call.get("in_place", True) and not call.get("context")
     if slots and by_cost and not chain_group_pays(pieces=slots, num_seqs=len(lengths), num_sm=num_sm, **shape):
         return 0
@@ -215,7 +212,7 @@ def group_calls(num_sm, **heads):
     shared rule carries the chain group and of the one from which the forward carries it; and two long sequences of few
     heads, a batch that gains from the group."""
     tokens, sizes = CHAIN_MIN_MEAN_TOKENS // 2, range(1, 64 * CHAIN_MAX_PIECES)
-    shared = [count for count in sizes if ragged_pieces(heads_out=max(heads.values()), num_sm=num_sm, total_tokens=count * tokens)]
+    shared = [count for count in sizes if piece_chain.ragged_pieces(heads_out=max(heads.values()), num_sm=num_sm, total_tokens=count * tokens)]
     carried = [count for count in sizes if group_scheme(num_sm, [tokens] * count, **heads)]
     edges = {count for found in (shared[:1], carried[:1]) for first in found for count in (first - 1, first) if count > 0}
     long = CHAIN_MIN_PIECES * LENGTH_RULE_PIECE_TOKENS // 2 + CHUNK
@@ -226,7 +223,7 @@ def calls_beside_the_group(num_sm):
     """Sequences of the shared rule's first chain length on one head: the largest batch whose plan below the chain carries no
     chain group, and one sequence more."""
     tokens = CHAIN_MIN_MEAN_TOKENS
-    first = next(count for count in range(1, num_sm) if ragged_pieces(heads_out=1, num_sm=num_sm, total_tokens=count * tokens))
+    first = next(count for count in range(1, num_sm) if piece_chain.ragged_pieces(heads_out=1, num_sm=num_sm, total_tokens=count * tokens))
     return [dict(lengths=[tokens] * count, heads=1, value_heads=1) for count in (first - 1, first)]
 
 
@@ -277,12 +274,12 @@ def test_tuning_moves_only_the_cost_ruled_forward(monkeypatch, fixed_tokens):
     tokens, heads = 4 * CHAIN_MIN_MEAN_TOKENS, num_sm // CHAIN_MIN_PIECES
     third = dict(heads=heads, value_heads=heads)
     shape = dict(num_seqs=1, heads_out=heads, num_sm=num_sm, total_tokens=tokens, b_t=CHUNK, cadence_tokens=0)
-    shared = choose_pieces(**shape, batch_invariant=False, expand_num=1)[0]
+    shared = piece_chain.choose_pieces(**shape, batch_invariant=False, expand_num=1)[0]
     assert shared
     for form in (dict(in_place=False), dict(context=True), dict(summary=True), dict(householders=SUB_TOKENS)):
-        slots = choose_pieces(**shape, batch_invariant=False, expand_num=form.get("householders", 1))[0]
+        slots = piece_chain.choose_pieces(**shape, batch_invariant=False, expand_num=form.get("householders", 1))[0]
         assert build_plan([tokens], **third, **form).pieces == slots, form
-    assert build_plan([tokens], **third, batch_invariant=True).pieces == choose_pieces(**shape, batch_invariant=True, expand_num=1)[0]
+    assert build_plan([tokens], **third, batch_invariant=True).pieces == piece_chain.choose_pieces(**shape, batch_invariant=True, expand_num=1)[0]
     assert build_plan([tokens], **third).pieces == (shared if fixed_tokens == 0 else 0)
 
 
@@ -380,7 +377,7 @@ def test_batch_without_the_chain_group_writes_the_bytes_it_writes_with_it(frost_
     group carried, whose five launches find no work."""
     num_sm, tokens = la.sm_count(), CHAIN_MIN_MEAN_TOKENS // 2
     heads = dict(heads=KEY_HEADS, value_heads=VALUE_HEADS)
-    count = next((n for n in range(2, 16 * CHAIN_MIN_PIECES) if ragged_pieces(heads_out=VALUE_HEADS, num_sm=num_sm, total_tokens=n * tokens)), None)
+    count = next((n for n in range(2, 16 * CHAIN_MIN_PIECES) if piece_chain.ragged_pieces(heads_out=VALUE_HEADS, num_sm=num_sm, total_tokens=n * tokens)), None)
     if count is None or group_scheme(num_sm, [tokens] * count, **heads):
         pytest.skip(f"a batch of {tokens}-token sequences carries the chain group at every size on {num_sm} SMs")
     inputs = pack(sequences("gdn", (tokens,) * count, heads=KEY_HEADS, value_heads=VALUE_HEADS, key_dim=WIDTH, value_dim=WIDTH))
