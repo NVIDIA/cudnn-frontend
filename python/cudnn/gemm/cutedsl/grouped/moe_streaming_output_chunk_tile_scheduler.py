@@ -99,9 +99,45 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
 
     @dsl_user_op
     @cute.jit
+    def _exits_early(self, *, loc=None, ip=None) -> Int32:
+        """1 when this is an extra cluster (rank >= ``clusters_beside_consumer``) at or past N chunk 0's last wave, else 0."""
+        # The grid is (cluster shape, clusters), so bidz is this cluster's rank among them.
+        _, _, cluster_rank = cute.arch.block_idx(loc=loc, ip=ip)
+        # N chunk 0's tiles, as ``_get_work_tile_for_linear_idx`` orders them: every M tile times its N tiles.
+        N_TILE_SIZE = const_expr(self.cluster_tile_n)
+        total_M_tiles = self._total_m_tiles()
+        first_n_chunk_tiles = total_M_tiles * cutlass.min(const_expr(self.n_chunk_size // N_TILE_SIZE), ceil_div(self.intermediate, N_TILE_SIZE))
+        # Never below 0: every cluster claims its first tile.
+        early_exit_linear_idx = cutlass.max(first_n_chunk_tiles - self.num_persistent_clusters, 0)
+        exits_early = Int32(0)
+        if cluster_rank >= const_expr(self.clusters_beside_consumer):
+            if self._current_work_linear_idx >= early_exit_linear_idx:
+                exits_early = Int32(1)
+        return exits_early
+
+    @dsl_user_op
+    @cute.jit
+    def _fetch_one_cta_cluster_idx(self, *, loc=None, ip=None) -> Int32:
+        """``_fetch_next_cluster_idx`` at one CTA: the stock elected claim, with no broadcast slot."""
+        exits_early = self._exits_early(loc=loc, ip=ip)
+        claim = cute.make_rmem_tensor((1,), Int32)
+        claim[0] = Int32(0)
+        with cute.arch.elect_one(loc=loc, ip=ip):
+            claim[0] = atomic_add_i32(self._dynamic_state.counter_ptr.llvm_ptr, 1 - exits_early, loc=loc, ip=ip)
+        # The full-mask shuffle needs a converged warp, so elect.sync picked lane 0.
+        cluster_idx = cute.arch.shuffle_sync(claim[0], offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
+        if exits_early == 1:
+            cluster_idx = Int32(2**31 - 1)  # past every tile: invalid, so the CTA exits
+        return cluster_idx
+
+    @dsl_user_op
+    @cute.jit
     def _fetch_next_cluster_idx(self, *, loc=None, ip=None) -> Int32:
         """The stock fetch, but an extra cluster (rank >= ``clusters_beside_consumer``) whose last claim is at or past
         N chunk 0's last wave adds 0 and broadcasts an index past every tile; the leader decides for the cluster."""
+        if const_expr(self.cluster_shape_mn[0] * self.cluster_shape_mn[1] == 1):
+            # No broadcast: the stock ``_release_cluster_idx`` releases no slot at one CTA.
+            return self._fetch_one_cta_cluster_idx(loc=loc, ip=ip)
         dynamic_state = self._dynamic_state
         broadcast_tensor = cute.make_tensor(dynamic_state.broadcast_ptr, cute.make_layout((1,)))
         if dynamic_state.is_leader_cta:
@@ -109,18 +145,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
             full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(dynamic_state.producer_state.index, loc=loc, ip=ip)
             lane_idx = cute.arch.lane_idx()
             cluster_size = const_expr(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
-            # The grid is (cluster shape, clusters), so bidz is this cluster's rank among them.
-            _, _, cluster_rank = cute.arch.block_idx(loc=loc, ip=ip)
-            # N chunk 0's tiles, as ``_get_work_tile_for_linear_idx`` orders them: every M tile times its N tiles.
-            N_TILE_SIZE = const_expr(self.cluster_tile_n)
-            total_M_tiles = self._total_m_tiles()
-            first_n_chunk_tiles = total_M_tiles * cutlass.min(const_expr(self.n_chunk_size // N_TILE_SIZE), ceil_div(self.intermediate, N_TILE_SIZE))
-            # Never below 0: every cluster claims its first tile.
-            early_exit_linear_idx = cutlass.max(first_n_chunk_tiles - self.num_persistent_clusters, 0)
-            exits_early = Int32(0)
-            if cluster_rank >= const_expr(self.clusters_beside_consumer):
-                if self._current_work_linear_idx >= early_exit_linear_idx:
-                    exits_early = Int32(1)
+            exits_early = self._exits_early(loc=loc, ip=ip)
             atomic_idx = Int32(0)
             if lane_idx == 0:
                 atomic_idx = atomic_add_i32(dynamic_state.counter_ptr.llvm_ptr, 1 - exits_early, loc=loc, ip=ip)
