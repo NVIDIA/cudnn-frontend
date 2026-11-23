@@ -2941,7 +2941,7 @@ def test_the_plan_of_a_step_stack_by_stack():
     from collections import Counter
     from dataclasses import replace
 
-    from model_samples import census
+    from model_samples import census, perf
     from model_samples.qwen_dense import QwenDense, configs
 
     plan, model = _stated_plan()
@@ -3065,6 +3065,14 @@ def test_the_plan_of_a_step_stack_by_stack():
     # A row that falls off its kernel, or a kernel that gains a launch per call, moves a number here
     library = "cuDNN FE 7 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4"
     entries = "cuDNN FE 7 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
+    # the launches of a step by provider, as the performance report states them: in a step of several tokens per sequence the
+    # out-projection of the 48 linear-attention layers is the projection entry's, not the library's
+    launched = {
+        (64, "native", 1): {"cuDNN Frontend": 338, "FlashInfer": 145, "PyTorch": 1},
+        (64, "native", 6): {"cuDNN Frontend": 386, "FlashInfer": 97, "PyTorch": 1},
+        (64, "fe-entries", 1): {"cuDNN Frontend": 338, "PyTorch": 1},
+        (64, "fe-entries", 6): {"cuDNN Frontend": 386, "PyTorch": 1},
+    }
     chain_table = {**configs.PROVIDERS, "attention.prepare": configs.PROVIDERS["attention.prepare"][1:]}  # the preparation on its reference chain
     for layers, stack, tokens, exact, rows, left, provider in (
         (64, "native", 1, 484, 12, {}, library),
@@ -3083,6 +3091,9 @@ def test_the_plan_of_a_step_stack_by_stack():
         assert exact + sum(left.values()) == len(model.wiring()) - 1, f"{where}: one launch per block call, the token choice on the host path"
         if provider:
             assert planned.by_provider() == f"by provider: {provider}", where
+        stated_by = perf.planned_launches(planned, model)
+        assert (stated_by["exact_launches_per_step"], stated_by["fallback_calls"], stated_by["fallback_rows"]) == (exact, sum(left.values()), bool(left)), where
+        assert sum(stated_by["by_provider"].values()) == exact and stated_by["by_provider"] == launched.get(where, stated_by["by_provider"]), where
         prepare = next(line for line in census.table(planned).splitlines() if line.split()[0] == "attention.prepare")
         calls = model.geometry.layer_kinds.count("full_attention")  # the launches of the preparation's entry in a step: one per attention layer
         assert prepare.split("cudnn.AttentionPrepareDecode")[1].split() == f"{PREPARE_FORM} attention_prepare {calls} {stated}".split(), where

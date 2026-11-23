@@ -389,17 +389,16 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
         raise AssertionError(f"the report file holds {constant}")
 
     data = json.loads(report.read_text(encoding="utf-8"), parse_constant=refuse)
-    assert data["schema"] == "model-sample-performance/4" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
+    assert data["schema"] == "model-sample-performance/5" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
     assert data["protocol"]["stack"] == stack and str(tmp_path) not in report.read_text(encoding="utf-8"), "no path in the file"
     requests = data["raw"]["requests"]
     assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced"]
     assert requests[2]["ids_sha256"] == requests[3]["ids_sha256"] == requests[0]["ids_sha256"], "every timed request: the checked request's ids"
     assert requests[2]["end_state_sha256"] == requests[3]["end_state_sha256"] == requests[0]["end_state_sha256"], "and its end state, byte for byte"
     assert data["protocol"]["profiler_first_started"] == (None if unobserved else "behind the last timed request, in the traced request")
-    # the record class: every reason, in the order of the conditions; a stack that declares a target kernel set names its identity
-    identity = "no target kernel set declared" if stack == "fe-cublas" else "kernel identity not claimed on this GPU class"
+    # the record class: every reason, in the order of the conditions; both stacks have a block on a fallback row
     observed = ["kernels not observed"] if unobserved else []
-    fixed = ["reduced model", "fallback rows present", identity, "launched from Python", *observed]
+    fixed = ["reduced model", "fallback rows present", "launched from Python", *observed]
     # what the run observed of its GPU: the reasons behind the fixed ones are those of its two verdicts, which the screen prints
     watched = data["observation"]
     seen, clocks = watched["other_compute_processes"], watched["clocks"]
@@ -440,10 +439,19 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
         assert abs(of_gpu - sum(busy) / len(busy)) <= 1e-9 * of_gpu, "the mean of GPU busy of the traced steps"
         assert abs(step["mean"] - (of_gpu + overhead["remainder_ms"] + host["mean"])) <= 1e-9 * step["mean"], "the terms of the step add up"
         assert 0 < data["traced"]["time_resolution_us"] <= 1 and data["per_kernel"]["us_per_launch_printed"] == (data["traced"]["time_resolution_us"] < 1)
-    if kernels["stated"]:  # a target stack on a GPU the census has a section for: the three numbers add up
-        assert kernels["on_target"] == kernels["code"] + kernels["port"] + kernels["stand_ins"] and kernels["launches"] == 20
-    else:
-        assert (stack == "fe-cublas") == (not kernels["declared"]), "fe-cublas declares no target kernel set; fe-entries does"
+    # the launches of a step as the plan states them: on exact rows, by provider, and the block calls on fallback rows -- an exact
+    # row launches once per call, so the two add up to the 20 block calls of a step of the two-layer model that are no host path
+    assert kernels["exact_launches_per_step"] == sum(kernels["by_provider"].values()) and kernels["fallback_rows"]
+    assert kernels["exact_launches_per_step"] + kernels["fallback_calls"] == 20
+    assert kernels["by_provider"] == ({"PyTorch": 1, "cuDNN Frontend": 1} if stack == "fe-cublas" else {"cuDNN Frontend": 13, "PyTorch": 1})
+    at = next(index for index, line in enumerate(screen) if line.startswith("kernels     "))
+    assert screen[at] == f"kernels     {kernels['exact_launches_per_step']} launches per step on exact rows: " + ", ".join(
+        f"{provider} {count}" for provider, count in kernels["by_provider"].items()
+    )
+    assert screen[at + 1].startswith(f"            {kernels['fallback_calls']} block calls on fallback rows; ")
+    assert (
+        "scope       the decode loop of one process: no request queue, no scheduler, no network" in screen[2:5]
+    ), "behind the record class, however many lines that takes"
 
 
 @pytest.mark.L0

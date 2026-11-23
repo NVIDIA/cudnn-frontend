@@ -77,7 +77,7 @@ protocol, every statistic with its definition, the labels and the report file ar
 |---|---|---|
 | `--perf` | off | run the protocol and print the report: one checked request with the reference checks on it (also at four positions of the timed steps), a warm-up request, the timed requests with nothing but the step inside, then one traced request and the kernel check on it. Implies one sequence count and one prompt, the kernel check (as `--check-kernels`), forced steps with the end token ignored, and the text written once, after the report (as `--no-stream`). Not with `--stack reference`, `--max-tokens`, `--force-tokens`, a list of sequence counts or several prompts: each is refused before the load |
 | `--perf-warmup N` | `32` | forced decode steps of the warm-up request |
-| `--perf-steps N` | `256` | timed decode steps of a request, behind its first new token: 257 new tokens and 256 intervals at the default, one token more than a serving request of 256 output tokens. At least 2 |
+| `--perf-steps N` | `256` | timed decode steps of a request, behind its first new token: 257 new tokens and 256 intervals at the default. At least 2 |
 | `--perf-requests N` | `3` | timed requests; the time per output token and the time to first token of a run are the median over them, the token-to-token intervals are pooled |
 | `--perf-report FILE` | `report-<UTC time>.json` in the current directory | the report file: every number, its definition, the protocol, the environment. The default name carries a time stamp, so the same command can be run twice. A file that exists, a file that `--dump-tokens`, `--dump-census` or `--text-out` names too, an empty name or a folder that cannot be written is an `ERROR` before the load: a report file is never written over |
 | `--perf-clock-lock MHZ` | none | the SM clock in MHz that an operator fixed outside the sample: a declaration. The report prints it beside the clock it observed and names it as a reason where a sample lies more than 3 % below or above it; the sample never sets a clock |
@@ -89,9 +89,9 @@ warm-up request `--perf-warmup`, which may be the larger count. A prompt whose t
 forced steps of that longest request do not fit `--max-model-len` is an `ERROR` before the load, like every request
 beyond the context: it says which request is the longest and names every count to take lower (`--perf-steps`,
 `--perf-warmup`). No count is changed to make a run fit. Every run of the mode is `orientation` today
-and says why on the second line of its report: its blocks are launched from Python, a fallback row is left in every
-stack, and whatever the run saw of the GPU's other processes and of its clock that a controlled run may not have
-is a reason too.
+and says why on the second line of its report: its blocks are launched from Python, a block on a fallback row is a
+reason of its own, and whatever the run saw of the GPU's other processes and of its clock that a controlled run may
+not have is a reason too.
 
 ## Coming from a serving engine
 
