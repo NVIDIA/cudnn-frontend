@@ -8,6 +8,7 @@
 // so each V element is dequantized once per tile. q8_0 / q4_0 codes become f16 via the 0x64xx magic-number trick.
 // Softmax runs in the exp2 domain with scale*log2(e) folded into Q. Partials are f16 (normalized) + f32 (m, l);
 // a second kernel combines the splits.
+#include "sm120_family.h"
 #include "decode_q8_q4.h"
 
 #include <cuda_fp16.h>
@@ -722,7 +723,7 @@ make_plan(const cudnn_fe_aot_sm120_decode_params_t* p, Plan* out) {
     if (st != CUDNN_FE_AOT_SM120_DECODE_SUCCESS) return st;
     int dev = 0, sms = 0, cc = 0;
     if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
-    if (cc != 120) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH;
+    if (!cudnn_frontend::aot_sm120::supports_device(cc)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH;
     const int G     = p->n_head / p->n_head_kv;
     const int R     = p->n_q * G;
     const int cfg   = choose_config(p->head_dim, p->kv_type, R);
@@ -775,7 +776,7 @@ cudnn_fe_aot_sm120_decode_status_t
 cudnn_fe_aot_sm120_decode_prewarm(int head_dim, int kv_type) {
     int dev = 0, sms = 0, cc = 0;
     if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
-    if (cc != 120) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH;
+    if (!cudnn_frontend::aot_sm120::supports_device(cc)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH;
     const int first = choose_config(head_dim, kv_type, 1);
     cudaFuncAttributes attr{};
     for (int cfg = first; cfg < first + 3; ++cfg)
@@ -917,7 +918,7 @@ cudnn_fe_aot_sm120_decode_status_string(cudnn_fe_aot_sm120_decode_status_t s) {
         case CUDNN_FE_AOT_SM120_DECODE_ERROR_WORKSPACE_TOO_SMALL:
             return "workspace too small";
         case CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH:
-            return "unsupported device (need compute capability 12.0)";
+            return "unsupported device (need compute capability 12.0 or 12.1)";
         case CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA:
             return "CUDA error";
     }

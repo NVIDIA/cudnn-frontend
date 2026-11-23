@@ -946,9 +946,13 @@ def rope_rotate_half_io(
 
 
 @cute.jit
-def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
-    """Inverse L2 norm, ``rsqrt(sum_sq + L2_NORM_EPS)``; a zero row normalizes to zero."""
-    return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
+def l2norm_inv(sum_sq: cutlass.Float32, eps: cutlass.Float32 = None) -> cutlass.Float32:
+    """Inverse L2 norm, ``rsqrt(sum_sq + eps)``; a zero row normalizes to zero.  Without ``eps`` the constant
+    ``L2_NORM_EPS`` is traced in; a caller that hands its own passes a launch argument, as :func:`rmsnorm_rstd`'s is, so
+    one compiled kernel serves every value."""
+    if cutlass.const_expr(eps is None):
+        return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
+    return cute.math.rsqrt(sum_sq + eps, fastmath=True)
 
 
 @cute.jit

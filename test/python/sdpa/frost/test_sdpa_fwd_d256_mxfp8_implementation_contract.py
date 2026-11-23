@@ -107,12 +107,13 @@ def test_other_native_shape_keeps_its_explicit_owner():
     assert engines.mismatch(SPECS[LEGACY_ROW].capabilities, facts(d_qk=224, d_v=208)) is not None
 
 
-def test_manifest_preserves_opt_in_and_fixed_identity(monkeypatch):
+def test_manifest_offers_it_behind_the_backend_with_fixed_identity(monkeypatch):
     from cudnn.engines import MANIFEST
 
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
-    assert family.slots[NAME].opt_in
-    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    # Default since 2026-11-16, behind the backend (placement.TRAIL_ONLY_ROWS).
+    assert not family.slots[NAME].opt_in and NAME in placement.TRAIL_ONLY_ROWS
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     assert family.offered_ids()[NAME] == 20545
 
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Build libcudnn_frontend_aot_sm120.so: FROST SM120 prefill/combine kernels compiled ahead of time from the in-repo
-templates, the quantized-KV decode kernels, a CUDA runtime shim and the flat C ABI. No GPU is needed (sm_120a is
+templates, the quantized-KV decode kernels, a CUDA runtime shim and the flat C ABI. No GPU is needed (sm_120f is
 cross-compiled); the build host needs the CuTeDSL wheel (nvidia-cutlass-dsl), a CUDA toolkit and a C++17 compiler.
 
     PYTHONPATH=<repo>/python python aot/sm120/build.py --out <dir> [--jobs N] [--cuda /usr/local/cuda]
@@ -12,7 +12,7 @@ Steps (each writes under --out):
   1. selection  FROST's SM120 heuristic over variants.GRID -> per-class knob picks (selection.json)
   2. export     one object + header per (dtype, class, knob set) and per combine (obj/, include/)
   3. codegen    the dispatch registry and selection tables (gen/aot_registry.inc)
-  4. compile    decode .cu (nvcc, sm_120a), C ABI + runtime shim (C++), link lib/libcudnn_frontend_aot_sm120.so
+  4. compile    decode .cu (nvcc, sm_120f), C ABI + runtime shim (C++), link lib/libcudnn_frontend_aot_sm120.so
   5. manifest   manifest.json: every variant, sizes, the FE commit, the CuTeDSL version
 
 ``--runtime cute-dsl`` links the CuTeDSL runtime (libcute_dsl_runtime.so) instead of the in-tree shim; it exists only to
@@ -41,7 +41,7 @@ sys.path.insert(0, str(HERE))
 import variants as V  # noqa: E402
 
 LIB_NAME = "libcudnn_frontend_aot_sm120.so"
-# export_to_c without tvm-ffi and the --gpu-arch sm_120a cross-compile are verified on 4.8.0 (python/cudnn/AGENTS.md Rule 7).
+# export_to_c without tvm-ffi and the --gpu-arch sm_120f cross-compile are verified on 4.8.0 (python/cudnn/AGENTS.md Rule 7).
 AOT_CUTEDSL_MIN_VERSION = (4, 8)
 
 
@@ -86,10 +86,9 @@ def _sel_init(repo_python: str):
 def _candidates(c: V.ShapeClass, g: int, sm: int, units: int, sq: int, skv: int):
     import cudnn
     from cudnn.sdpa.fwd import heuristics as heur
-    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.kernels.sm120 import half_exact_contract
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm120")
     facts = SdpaGraphFacts(
         b=1,
         h_q=units * g,
@@ -108,7 +107,9 @@ def _candidates(c: V.ShapeClass, g: int, sm: int, units: int, sq: int, skv: int)
         device_sm_count=sm,
     )
     out = []
-    for plan in heur.recommend("A", facts, {spec.name: 0}):
+    # TILE_M selects the current owner. Decode proposals can still snap to a compiled prefill tile.
+    offered = {name: i for i, name in enumerate(sorted(half_exact_contract.IMPLEMENTATIONS))}
+    for plan in heur.recommend("A", facts, offered):
         k = plan.knobs
         out.append(V.Knobs(g if k.pack_gqa else 0, int(k.sched_policy), int(k.split_kv), int(k.tile_m), int(k.tile_n)))
     return out
@@ -411,7 +412,7 @@ def compile_and_link(out: Path, objects, cuda: Path, cxx: str, runtime: str, dsl
             "-O3",
             "-std=c++17",
             "-gencode",
-            "arch=compute_120a,code=sm_120a",
+            "arch=compute_120f,code=sm_120f",
             "-Xcompiler",
             "-fPIC,-fvisibility=hidden",
             *inc,
@@ -502,7 +503,7 @@ def main():
     git = lambda *a: subprocess.run(["git", "-C", str(REPO), *a], capture_output=True, text=True).stdout.strip()  # noqa: E731
     fe_commit = git("rev-parse", "--short=12", "HEAD") + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
     n_pre = sum(1 for r in records if r["kind"] == "prefill")
-    build_info = f"cudnn-frontend {fe_commit} cutlass-dsl {getattr(cutlass, '__version__', '?')} sm_120a {n_pre} prefill + {len(records) - n_pre} combine kernels, runtime {args.runtime}"
+    build_info = f"cudnn-frontend {fe_commit} cutlass-dsl {getattr(cutlass, '__version__', '?')} sm_120f {n_pre} prefill + {len(records) - n_pre} combine kernels, runtime {args.runtime}"
     (out / "gen" / "aot_registry.inc").write_text(gen_registry(class_ids, class_knobs, selection, build_info))
 
     dsl_libdir = Path(next(p for p in find_runtime_libraries(enable_tvm_ffi=False) if "cute_dsl_runtime" in p)).parent
@@ -513,7 +514,7 @@ def main():
         "fe_commit": git("rev-parse", "HEAD"),
         "fe_dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
         "cutlass_dsl": getattr(cutlass, "__version__", "?"),
-        "gpu_arch": "sm_120a",
+        "gpu_arch": "sm_120f",
         "runtime": args.runtime,
         "lib_bytes": lib.stat().st_size,
         "object_bytes": sum(r.get("obj_bytes", 0) for r in results.values()),

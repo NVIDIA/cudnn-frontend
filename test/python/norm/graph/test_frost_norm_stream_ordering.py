@@ -260,3 +260,42 @@ def test_explicitly_requested_default_stream_is_entered():
         + ": "
         + detail,
     )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("legacy", [0, 1])
+def test_on_stream_maps_legacy_sentinels_to_the_default_stream(monkeypatch, legacy):
+    """Handles 0 and 1 (cudaStreamLegacy) both mean torch's default stream; neither may become
+    an ExternalStream, which older torch turns into an unordered pool stream."""
+    from cudnn.norm.utils import on_stream
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("on_stream wrapped a legacy default-stream sentinel in ExternalStream")
+
+    monkeypatch.setattr(torch.cuda, "ExternalStream", refuse)
+    with torch.cuda.stream(torch.cuda.Stream()):
+        with on_stream(legacy):
+            assert torch.cuda.current_stream() == torch.cuda.default_stream()
+
+
+@pytest.mark.L0
+def test_on_stream_rejects_the_per_thread_stream():
+    from cudnn.norm.utils import on_stream
+
+    with pytest.raises(ValueError, match="cudaStreamPerThread"):
+        with on_stream(2):
+            pass
+
+
+@pytest.mark.L0
+def test_on_stream_enters_the_stream_on_the_plan_device():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible GPUs")
+    from cudnn.norm.utils import on_stream
+
+    plan_device = 1
+    side = torch.cuda.Stream(device=plan_device)
+    with torch.cuda.device(0):
+        with on_stream(side.cuda_stream, plan_device):
+            assert torch.cuda.current_stream(plan_device).cuda_stream == side.cuda_stream
+        assert torch.cuda.current_stream(plan_device).cuda_stream == torch.cuda.default_stream(plan_device).cuda_stream

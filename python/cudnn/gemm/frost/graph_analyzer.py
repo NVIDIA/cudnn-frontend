@@ -897,7 +897,9 @@ def _require_materialized_block_scale_inputs(
         None,
     )
     if quant is not None:
-        raise NotImplementedError("block-scale matmul requires materialized packed graph inputs; " "call cudnn.ops.nvfp4_block_scale_quantize explicitly")
+        raise NotImplementedError(
+            "block-scale matmul requires materialized packed graph inputs; " "call cudnn.ops.nvfp4_block_scale_quantize_forward explicitly"
+        )
     raise NotImplementedError("block-scale matmul requires its packed data and scale-factor tensors " "to be non-virtual materialized graph inputs")
 
 

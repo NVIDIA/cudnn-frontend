@@ -111,11 +111,17 @@ def test_checkpoint_wave_capacity_policy():
     assert kda_engine._checkpoint_head_divisor(16, 16 * gib, 16, 148) == 2
 
 
-def test_checkpoint_wave_compile_count(monkeypatch):
+def test_checkpoint_wave_compile_count(monkeypatch, tmp_path):
     reason = frost_la_unavailable()
     if reason:
         pytest.skip(reason)
+    from cudnn.frost import compiled_cache
     from cudnn.linear_attention.frost.kernel import kda_chain_backward_f16 as chain
+
+    # Count compiles of this test's own shapes: an earlier test in the worker (the in-process memo)
+    # or another worker (the shared on-disk cache) must not serve them.
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")
+    monkeypatch.setattr(compiled_cache, "_dir_override", tmp_path / "compiled")
 
     original_compile = cute.compile
     calls = []

@@ -4,7 +4,7 @@
  */
 
 /*
- * The flat C ABI of libcudnn_frontend_aot_sm120.so: ahead-of-time compiled attention forward kernels for sm_120a
+ * The flat C ABI of libcudnn_frontend_aot_sm120.so: ahead-of-time compiled attention forward kernels for sm_120f
  * (RTX 50xx, RTX PRO Blackwell). Nothing is compiled at run time. A plan fixes a shape class (head dim, dtypes, mask,
  * sink, GQA ratio); execute() takes the run-time extents, strides and pointers and only launches.
  *
@@ -30,7 +30,7 @@ typedef enum {
     CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT    = 1, /* null pointer, misalignment, bad stride or shape */
     CUDNN_FE_AOT_STATUS_NOT_SUPPORTED       = 2, /* no prebuilt kernel serves this shape class / knob set / extent */
     CUDNN_FE_AOT_STATUS_WORKSPACE_TOO_SMALL = 3,
-    CUDNN_FE_AOT_STATUS_ARCH_MISMATCH       = 4, /* the device is not compute capability 12.0 */
+    CUDNN_FE_AOT_STATUS_ARCH_MISMATCH       = 4, /* the device is not compute capability 12.0 or 12.1 */
     CUDNN_FE_AOT_STATUS_CUDA_ERROR          = 5, /* a module load or launch returned a CUDA error */
     CUDNN_FE_AOT_STATUS_LIBRARY_NOT_LOADED  = 6, /* C++ loader only: dlopen / dlsym failed */
     CUDNN_FE_AOT_STATUS_ABI_MISMATCH = 7, /* C++ loader only: the library's ABI version is older than this header's */

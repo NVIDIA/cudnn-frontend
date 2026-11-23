@@ -71,6 +71,10 @@ the profiler, for one traced request of as many of those steps as ``--perf-trace
 protocol and the environment, into a report file (``--perf-report FILE``; default ``report-<UTC time>.json`` in the
 current directory); the text is written once, after the report.  Without ``--model`` the same protocol runs on the
 reduced seeded model and prints no rate.  ``samples/models/README.md`` has the protocol, the statistics and the labels.
+The report's ``GPU`` lines say what the run observed through the driver's ``nvidia-smi`` tool, in child processes --
+the other compute processes on the GPU, its SM clock, the limit reasons -- or that it could not, with the reason.
+``--perf-clock-lock MHZ`` declares a clock that an operator fixed outside this sample, which sets none: the report
+holds the declaration against the clock it observed.
 
     python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native --perf
 """
@@ -263,8 +267,8 @@ def _arguments(argv):
     parser.add_argument(
         "--dump-census",
         metavar="FILE",
-        help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory per launch), for a comparison "
-        "made elsewhere; implies --check-kernels",
+        help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory, start and end per launch), for a "
+        "comparison made elsewhere; implies --check-kernels",
     )
     _perf_flags(parser)
     for flag, takes in SPECULATIVE_FLAGS:
@@ -340,6 +344,14 @@ def _perf_flags(parser) -> None:
         help="with --perf: the report file (default report-<UTC time>.json in the current directory); a file that exists, or that another flag of "
         "the run writes, is an error before the load",
     )
+    parser.add_argument(
+        "--perf-clock-lock",
+        type=int,
+        default=None,
+        metavar="MHZ",
+        help="with --perf: the SM clock in MHz that an operator fixed outside this sample: a declaration, written into the report and held "
+        "against the clock the run observes. The sample never sets a clock",
+    )
 
 
 def _perf_arguments(parser, args) -> None:
@@ -348,6 +360,7 @@ def _perf_arguments(parser, args) -> None:
     new token and ``--perf-steps`` forced steps), at one sequence count, and checks its kernels."""
     counts = {flag: getattr(args, flag[2:].replace("-", "_")) for flag in PERF_COUNTS}
     given = [flag for flag, value in counts.items() if value is not None] + (["--perf-report"] if args.perf_report is not None else [])
+    given += ["--perf-clock-lock"] if args.perf_clock_lock is not None else []
     if not args.perf:
         if given:
             parser.error(f"{', '.join(given)}: a flag of the performance mode; it needs --perf")
@@ -367,6 +380,8 @@ def _perf_arguments(parser, args) -> None:
         setattr(args, flag[2:].replace("-", "_"), default if counts[flag] is None else counts[flag])
     if args.perf_warmup < 1 or args.perf_steps < 2 or args.perf_requests < 1 or args.perf_trace_records < 1:
         parser.error("--perf-warmup, --perf-requests and --perf-trace-records take positive integers, --perf-steps an integer from 2")
+    if args.perf_clock_lock is not None and args.perf_clock_lock < 1:
+        parser.error("--perf-clock-lock takes the declared SM clock in MHz, a positive integer")
     args.sequences = "1" if args.sequences is None else args.sequences  # one count: the seeded default of an ordinary run is a list
     args.force_tokens = args.perf_steps + 1  # a request: the first new token and that many forced steps
     args.check_kernels = True  # the kernels of the traced steps are one of the three statements of the report's checks
@@ -672,13 +687,18 @@ def main(argv=None) -> int:
         _say(f"{TAG} ERROR {error}")
         return 1
     _say(f"{TAG} {environment.header()}")
-    _say(f"{TAG} clock not locked: timings are for orientation only | reference precision {args.reference_precision}")
+    clock = "clock not locked: timings are for orientation only"
+    if args.perf_clock_lock is not None:  # a declaration of the performance mode: its report holds it against the clock it observes
+        clock = f"clock lock declared: {args.perf_clock_lock} MHz, set outside this sample, which sets no clock"
+    _say(f"{TAG} {clock} | reference precision {args.reference_precision}")
     if real:  # before the load: what a prompt costs before its first new token
         _say(f"{TAG} {serving_options.first_token_line([(request.shown, int(ids.numel())) for request, (ids, _, _) in zip(requests, sets)])}")
 
     if args.perf:  # before the load: what the mode will run, a rule and counts
         protocol = perf.Protocol(args.perf_warmup, args.perf_steps, args.perf_requests, args.perf_trace_records)
         _say(f"{TAG} {protocol.line(int(runs[0][1][0][0][0].numel()))}")
+        observer = perf.observe.Observer(device, args.perf_clock_lock)  # the GPU and the host before the load: the driver is asked, nothing is set
+        observer.read("before the load")
 
     passed, judged, digest, dumped = True, 0, hashlib.sha256(), []
     outcome = None  # of the performance mode
@@ -727,6 +747,7 @@ def main(argv=None) -> int:
                     real=real,
                     source=requests[0].shown if real else "the seeded prompt",
                     text_path=seconds,
+                    observer=observer,
                 )
                 ok, blocks_judged, produced = outcome.passed, outcome.judged, outcome.produced
             else:
@@ -788,7 +809,7 @@ def main(argv=None) -> int:
         else:
             gpu = {"name": facts.name, "compute_capability": list(facts.cc), "sm_count": facts.sm_count}
             traced_steps = TRACED_STEPS if outcome is None else outcome.data["traced"]["steps"]
-            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=1, gpu=gpu, traced_steps=traced_steps)
+            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=2, gpu=gpu, traced_steps=traced_steps)
         if error:
             unwritten.append(error)
         else:

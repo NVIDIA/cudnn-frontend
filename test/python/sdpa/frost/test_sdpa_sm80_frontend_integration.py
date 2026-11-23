@@ -173,7 +173,7 @@ def _check_fwd_engine_strided_stats(d, stats_use_log2=False):
     q_buf, k_buf, v_buf = _buf(d), _buf(d), _buf(d)
     for graph_tensors, stats_buf in ((compact_graph, compact_stats_buf), (strided_graph, strided_stats_buf)):
         graph, q, k, v, o, stats = graph_tensors
-        graph.execute({q: q_buf, k: k_buf, v: v_buf, o: torch.empty_like(q_buf), stats: stats_buf}, None)
+        graph.execute({q: q_buf, k: k_buf, v: v_buf, o: torch.empty_like(q_buf), stats: stats_buf}, _ws(graph))
     torch.cuda.synchronize()
 
     scale = 1.0 / math.sqrt(d)
@@ -364,8 +364,8 @@ def test_engine_execute_does_not_allocate():
     allocator's cumulative allocation COUNTER, which any torch.empty/zeros/
     clone/contiguous on the execute path would advance.  The geometry is
     chosen to cover native forward GQA/strided Stats and the backward's
-    remaining staging. Forward must now report zero workspace: its prepared
-    kernel addresses both layouts directly."""
+    remaining staging. Forward addresses both layouts directly; any workspace it
+    reports is the split-KV partials of the selected plan."""
     H_KV = H // 2
     st_kv = _bshd_stride(B, H_KV, S, D)
     # Strided stats: (B, H, S, 1) declared with a 2-element row gap — the
@@ -381,7 +381,6 @@ def test_engine_execute_does_not_allocate():
     o.set_output(True).set_data_type(_HALF)
     stats.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_stride(stats_stride)
     _native_then_pin(g, half_engine_names("sm80"))
-    assert g.get_workspace_size() == 0, "prepared forward must address GQA and strided Stats without staging"
     torch.manual_seed(0)
     q_buf = _buf()
     k_buf = torch.randn(B, S, H_KV, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)

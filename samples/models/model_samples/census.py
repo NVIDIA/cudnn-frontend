@@ -35,6 +35,12 @@ The kernel check (:func:`check_forms`, :func:`compare`; a sample runs it with ``
 6. Copies are listed.  Declared are the one host read that ends a step and the copies a fallback or host row makes; a copy
    between two exact rows is not.
 
+**The rows of a per-kernel table.**  The walk of items 1 to 4 also says, for every launch record of a traced step, which
+row of a per-kernel table it belongs to (:class:`Row`, ``Comparison.attributed``): the block of an exact kernel; the
+blocks a gap of the wiring has on fallback or host entries, which are one row together; or the host read that ends the
+step.  A row is found by its place in the wiring, never by a kernel's name.  A record the check does not attribute has
+no row, and a pass with such a record has no table.
+
 **An entry that a step calls in several forms.**  A provider row may name the call sites of its block (``ProviderRow.sites``:
 per site the further fields of the entry's form there), and the family names the site of every call of its wiring
 (``model.sites()``).  Every item above then holds per call site: a site carries the form of ITS call, the facts of the entry
@@ -141,6 +147,9 @@ class Launch(NamedTuple):
     registers: Optional[int] = None  # per thread: recorded, never compared (it moves with the compiler)
     graph: Tuple[int, int] = (0, 0)  # (graph id, graph node id): zero for a launch issued from Python
     bytes: Optional[int] = None  # of a copy
+    #: the duration in microseconds as the trace holds it; ``end - start`` is the same time on a clock of milliseconds
+    #: since the profiler's origin, where a double no longer holds the trace's last decimals.  ``None``: not read from a trace
+    duration: Optional[float] = None
 
     @property
     def shape(self) -> tuple:
@@ -201,6 +210,7 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("add_norm_quant", re.compile(r"^cudnn_kernel_frost_add_rms_norm_quant_")),
     ("fp8_projection", re.compile(r"^cudnn_kernel_frost_fp8_projection_decode_")),
     ("swiglu_fp4", re.compile(r"^cudnn_kernel_frost_swiglu_fp4_decode_")),
+    ("attention_prepare", re.compile(r"^cudnn_kernel_frost_attention_prepare_")),
     ("cudnn_fe", re.compile(r"^cudnn_kernel_frost_")),  # a kernel of cuDNN Frontend that no entry above names: never a family member
     # FlashInfer's multiplies on the stored formats.  The 4-bit multiply launches one of two kernel classes of one module, and
     # the class is in the name (a census entry names it: ``class``).  The 8-bit multiply is served by the kernel the library
@@ -322,6 +332,7 @@ def read_trace(path: str, chunk: int = 1 << 20) -> List[Launch]:
                 _integer(arguments.get("registers per thread")),
                 (int(arguments.get("graph id") or 0), int(arguments.get("graph node id") or 0)),
                 _integer(arguments.get("bytes")),
+                float(event.get("dur", 0.0)),
             )
         )
     records.sort(key=lambda record: record.start)
@@ -470,6 +481,46 @@ def check_forms(sites: Sequence[Site], call_log: Sequence[Sequence[Call]] = ()) 
     return failures
 
 
+class Row(NamedTuple):
+    """One row of a per-kernel table: block calls of a step, found by their place in the wiring, whose launch records are
+    one row.  An exact kernel is a row of its block.  The records between two exact kernels belong to the blocks the
+    wiring has there on fallback or host entries: those blocks are one row together, because nothing in the records
+    tells one block's launches from the next one's.  The host read that ends a step is a row of its own."""
+
+    blocks: Tuple[str, ...]  # the block of an exact row; the blocks of a gap in wiring order, each once; none for the host read
+    relation: str  # "exact" | "fallback" (a host block may share the gap) | "host" | "read"
+    sites: Tuple[int, ...]  # the indices, among the sites of a step, of the block calls the row holds
+
+
+def _table(sites: Sequence[Site], anchors: Sequence[Tuple[int, Kernel]]) -> Tuple[List[Row], List[int], List[Optional[int]]]:
+    """``(rows, the row of every exact launch, the row of every gap)`` for the sites of a step and its exact launches
+    (``anchors``: site index and census entry, in wiring order).  A gap that declares no family has no row (``None``):
+    nothing may be launched there.  The rows stand in the wiring order of their first block call -- the exact rows,
+    then the rows of the gaps -- and the host read's row is the last."""
+    keys: Dict[tuple, int] = {}
+    found: List[list] = []
+
+    def row(blocks: tuple, relation: str, members: Sequence[int]) -> int:
+        at = keys.setdefault((blocks, relation), len(found))
+        if at == len(found):
+            found.append([blocks, relation, []])
+        found[at][2] += [index for index in members if index not in found[at][2]]
+        return at
+
+    of_anchor = [row((sites[index].block,), "exact", [index]) for index, _ in anchors]
+    of_gap: List[Optional[int]] = []
+    for gap in range(len(anchors) + 1):
+        low = anchors[gap - 1][0] if gap else -1
+        high = anchors[gap][0] if gap < len(anchors) else len(sites)
+        between = range(max(low, 0), min(high + 1, len(sites))) if low != high else ()
+        members = [index for index in between if any(kernel.relation != "exact" for kernel in sites[index].kernels)]
+        fallback = any(kernel.relation == "fallback" for index in members for kernel in sites[index].kernels)
+        blocks = tuple(dict.fromkeys(sites[index].block for index in members))
+        of_gap.append(row(blocks, "fallback" if fallback else "host", members) if members else None)
+    row((), "read", [])
+    return [Row(blocks, relation, tuple(members)) for blocks, relation, members in found], of_anchor, of_gap
+
+
 @dataclass
 class Comparison:
     """What :func:`compare` found."""
@@ -483,6 +534,10 @@ class Comparison:
     families: Dict[str, List[int]] = field(default_factory=dict)  # family -> attributed launches per step
     picks: Dict[str, Counter] = field(default_factory=dict)  # family -> kernel name -> the most launches in one step
     served: Dict[str, Counter] = field(default_factory=dict)  # exact row whose entry states no launch -> kernel name -> launches over the pass
+    table: List[Row] = field(default_factory=list)  # the rows of a per-kernel table of the pass
+    #: per step, per record of the step in its order: the index of the record's row in ``table``; -1 for a record the
+    #: check did not attribute (it failed there)
+    attributed: List[List[int]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -540,7 +595,8 @@ def compare(
             where = f"between {sites[low].name} and {sites[high].name}"
         gaps.append((declared, where))
     wiring = [(site.block, site.layer) for site in sites]
-    result = Comparison(steps=len(steps), exact=len(anchors))
+    table, of_anchor, of_gap = _table(sites, anchors)
+    result = Comparison(steps=len(steps), exact=len(anchors), table=table)
     fail = result.failures.append
     for index, step in enumerate(steps):
         calls = [(call.block, call.layer) for call in call_log[index]] if index < len(call_log) else wiring
@@ -550,6 +606,8 @@ def compare(
             want = sites[first].name if first < len(sites) else "nothing"
             fail((index, f"the step made {len(calls)} block calls, the wiring has {len(wiring)}; call {first + 1} is {had}, the wiring has {want} there"))
         body = step[:-1] if step and step[-1].name.startswith(HOST_READ) else list(step)
+        rows = [-1] * len(body) + [len(table) - 1] * (len(step) - len(body))  # the row of every record; the host read's is the last
+        result.attributed.append(rows)
         ids = [canonical(record) for record in body]
         result.launches.append(sum(kernel_id != COPY for kernel_id in ids))
         result.copies.append(len(step) - result.launches[-1])
@@ -573,9 +631,12 @@ def compare(
                                 f"an undeclared copy {_short(record.name)} {where}: declared are the one host read of a step and the copies of a fallback row",
                             )
                         )
+                    else:
+                        rows[position] = of_gap[gap]
                     continue
                 family = kernel_id if kernel_id in declared else FAMILY_OF.get(kernel_id, "")
                 if family and family in declared:
+                    rows[position] = of_gap[gap]
                     seen[family] += 1
                     names.setdefault(family, Counter())[record.name] += 1
                 elif not kernel_id:
@@ -596,8 +657,9 @@ def compare(
             picks = result.picks.setdefault(family, Counter())
             for name, count in counts.items():
                 picks[name] = max(picks[name], count)
-        for position, (site_index, kernel) in zip(at, anchors):
+        for position, (site_index, kernel), row in zip(at, anchors, of_anchor):
             record, site = body[position], sites[site_index]
+            rows[position] = row
             target = None if recorded is None else recorded.get(site_index)
             if target is not None:  # item 7: the launch shape the census recorded for the target's kernel at this place
                 if None in record.shape:
@@ -723,11 +785,29 @@ def _class_text(key: str) -> str:
     return f"cc {cc[2:]} / {sms[2:]} SMs"
 
 
-def _other_widths(recorded: Mapping[str, int], geometry) -> str:
+def _plain(value):
+    """A value of a form or of a geometry as it is compared and printed: a JSON file holds a list where a provider table and a
+    geometry hold a tuple (the sections of a rotary width), and the two are one value."""
+    return tuple(_plain(item) for item in value) if isinstance(value, (list, tuple)) else value
+
+
+def _width(value) -> bool:
+    """Whether ``value`` is a layer width as a census section names one: a whole number, or a list of whole numbers (a width
+    that has parts: the sections of a rotary width)."""
+
+    def whole(n):
+        return isinstance(n, int) and not isinstance(n, bool)
+
+    return whole(value) or (isinstance(value, (list, tuple)) and bool(value) and all(whole(n) for n in value))
+
+
+def _other_widths(recorded: Mapping[str, object], geometry) -> str:
     """The fields of a model's geometry that are not the recorded ones, as a run names them: ``hidden 4096 (recorded 5120)``;
     empty where every recorded field is the model's."""
     return ", ".join(
-        f"{name} {getattr(geometry, name, 'none')} (recorded {value})" for name, value in recorded.items() if getattr(geometry, name, None) != value
+        f"{name} {_plain(getattr(geometry, name, 'none'))} (recorded {_plain(value)})"
+        for name, value in recorded.items()
+        if _plain(getattr(geometry, name, None)) != _plain(value)
     )
 
 
@@ -908,7 +988,7 @@ class Target:
     * ``layers``: which entry list of a section a layer kind of the model reads;
     * ``configurations``: per configuration and per ``ccMAJOR.MINOR/smCOUNT`` a section: ``claimed``, its ``basis``
       (``recorded`` or ``planned``), what was recorded, ``geometry`` -- the layer widths of the model it holds for, under
-      the names of the family's geometry -- ``tokens`` -- the tokens per sequence of the step it holds for, where that
+      the names of the family's geometry (a whole number each, or a list of them for a width that has parts) -- ``tokens`` -- the tokens per sequence of the step it holds for, where that
       is more than one -- and per row count the entries of a step as ``[block, kernel id, facts]``,
       before the layers, per layer kind, after the layers, after the step.  The facts of an entry (:data:`ENTRY_FACTS`):
       ``launch`` = ``[grid, block, shared memory]``, ``at`` = further fields of the geometry that this one launch
@@ -960,8 +1040,8 @@ class Target:
                 if section["claimed"] and section["basis"] != "recorded":
                     wrong(f"{where}: claimed on the basis {section['basis']}; only a recorded section can be claimed")
                 geometry = section.get("geometry")
-                if not isinstance(geometry, dict) or not all(isinstance(v, int) and not isinstance(v, bool) for v in geometry.values()):
-                    wrong(f"{where}: a section holds geometry, the layer widths of the model it was taken on (name: whole number)")
+                if not isinstance(geometry, dict) or not all(_width(v) for v in geometry.values()):
+                    wrong(f"{where}: a section holds geometry, the layer widths of the model it was taken on (name: whole number, or a list of them)")
                 if section["claimed"] and not geometry:
                     wrong(f"{where}: claimed without the layer widths it holds for")
                 tokens = section.get("tokens", 1)
@@ -1122,9 +1202,10 @@ class Target:
         if len(exact) != 1 or exact[0].id != kernel_id:
             return Identity(OTHER, kernel_id, kind, f"the row launches {', '.join(kernel.id for kernel in exact)}, the target {kernel_id}")
         # the target's form at this call: the form its kernel has everywhere and, behind it, what the census names for this call
-        want = tuple({**meta.get("form", {}), **facts.get("form", {})}.items())
+        # (a field of several values is a list in the file and a tuple in a provider table: one value)
+        want = tuple((name, _plain(value)) for name, value in {**meta.get("form", {}), **facts.get("form", {})}.items())
         try:
-            have = tuple(row.site_form(site))
+            have = tuple((name, _plain(value)) for name, value in row.site_form(site))
         except ValueError as error:  # the wiring calls the block at a site its row has no form for
             return Identity(OTHER, kernel_id, kind, str(error))
         if dict(have) != dict(want):
@@ -1313,13 +1394,13 @@ class Traced:
     def dump(self) -> dict:
         """The census of this pass as plain data: the sites of a step -- each with the row's form (``form``) and, from the call
         log, the entry instance that served it and the form that instance states (``instance``, ``served``) -- and the launch
-        records of every traced step, names stored once."""
+        records of every traced step, names stored once, each with its start and its end in milliseconds on the
+        profiler's clock."""
         names: Dict[str, int] = {}
         steps = []
         for step in self.steps or []:
-            steps.append(
-                [[names.setdefault(r.name, len(names)), canonical(r), r.kind, r.grid, r.block, r.shared_memory, r.registers, *r.graph, r.bytes] for r in step]
-            )
+            facts = [[r.kind, r.grid, r.block, r.shared_memory, r.registers, *r.graph, r.bytes, r.start, r.end] for r in step]
+            steps.append([[names.setdefault(r.name, len(names)), canonical(r), *rest] for r, rest in zip(step, facts)])
         logged = {(call.block, call.layer): call for calls in self.call_log for call in calls}
         unlogged = Call("", -1, self.rows, "", ())  # of a pass that made no traced step
         first = self.call_log[0] if self.call_log else []
@@ -1357,7 +1438,7 @@ class Traced:
                 for index, site in enumerate(self.sites)
             ],
             "names": list(names),
-            "fields": ["name", "kernel", "kind", "grid", "block", "shared_memory", "registers", "graph_id", "graph_node_id", "bytes"],
+            "fields": ["name", "kernel", "kind", "grid", "block", "shared_memory", "registers", "graph_id", "graph_node_id", "bytes", "start_ms", "end_ms"],
             "steps": steps,
         }
 

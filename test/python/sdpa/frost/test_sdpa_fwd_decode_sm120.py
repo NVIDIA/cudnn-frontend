@@ -477,6 +477,36 @@ def test_sm120_decode_shaped_graphs_lead_on_the_decode_tile(over, lead):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("h_q, h_kv, s_q", [(16, 1, 3), (32, 2, 4), (64, 4, 3), (24, 1, 2), (20, 1, 8), (32, 2, 6)])
+def test_sm120_paged_d256_mtp_past_32_rows_takes_the_decode_tile(h_q, h_kv, s_q):
+    """Paged d256 MTP past 32 packed rows (Qwen3.5 at s_q 3-4) runs the 32-row decode tile over several Q tiles: the prefill body
+    has no paged d256 plan, and the decode tile ran 0.04-0.87 of the backend up to s_q 8 (sm120_paged_d256_multiq_probe /
+    _verify_v2_20261117). Dense graphs, longer queries (non-dividing groups lost at s_q 13-15) and groups past 32 keep the
+    prefill rule."""
+    from cudnn.sdpa.fwd import heuristics
+
+    paged = dict(b=8, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=32768, d_qk=256, d_v=256, has_paged_kv=True, page_size=16, padded=True)
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**paged)) == 32
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**dict(paged, has_paged_kv=False, page_size=0, padded=False))) == 0
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**dict(paged, s_q=9))) == 0
+    assert heuristics._sm120_decode_tile_m(_spec().capabilities, _facts(**dict(paged, h_q=64, h_kv=1, s_q=1))) == 0  # 64 rows: G > 32
+
+
+@pytest.mark.L0
+def test_sm120_paged_d64_verify_takes_the_decode_tile():
+    """Paged d64 verify rows past 32 packed rows (muse_spark at s_q 8) run the decode tile over several Q tiles, 0.37 of the backend
+    (sm120_paged_d64_verify_v2_20261117); d64 MTP (s_q <= 4) and d128 verify keep their measured paths."""
+    from cudnn.sdpa.fwd import heuristics
+
+    caps = _spec().capabilities
+    paged = dict(b=128, h_q=128, h_kv=16, s_q=8, s_kv=131072, d_qk=64, d_v=64, has_paged_kv=True, page_size=16, padded=True)
+    assert heuristics._sm120_decode_tile_m(caps, _facts(**paged)) == 32
+    assert heuristics._sm120_decode_tile_m(caps, _facts(**dict(paged, s_q=5, h_q=40, h_kv=4))) == 32
+    assert heuristics._sm120_decode_tile_m(caps, _facts(**dict(paged, s_q=4, h_q=64, h_kv=4))) == 0  # MTP: 64 rows on the prefill body
+    assert heuristics._sm120_decode_tile_m(caps, _facts(**dict(paged, d_qk=128, d_v=128))) == 0
+
+
+@pytest.mark.L0
 def test_sm120_decode_split_model_anchors():
     """The decode tile's split model, unmocked: a launch that fills the machine stays unsplit, a lone KV stream over
     128K keys splits until the DRAM bound takes over, and a one-stage unit never splits."""
@@ -489,9 +519,31 @@ def test_sm120_decode_split_model_anchors():
     split = choose(units=8, kv_stages=8192, stage_bytes=stage, d_v=128, sm_count=188)
     assert split > 1 and split & (split - 1) == 0, split
     assert choose(units=8, kv_stages=1, stage_bytes=stage, d_v=128, sm_count=188) == 1
+    # One CTA gathering paged KV streams ~6x slower (sm120_decode_split_20261117): 64 units over 8K keys split there, not dense.
+    assert choose(units=64, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188) == 1
+    paged_split = choose(units=64, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188, paged=True)
+    assert paged_split > 1 and paged_split & (paged_split - 1) == 0, paged_split
+    # 512 paged units split in two: unsplit, the paged tile ran 1.34-1.49x the best split (sm120_decode_split_v5_20261117), while many
+    # chunks lost 1.11-1.17x (_v2 verification). Dense keeps them whole.
+    assert choose(units=512, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188, paged=True) == 2
+    assert choose(units=512, kv_stages=512, stage_bytes=stage, d_v=128, sm_count=188) == 1
     # Through the heuristics: b = 1, GQA 4 over 128K keys leads with that split on the packed decode tile.
     lead_set = heuristics._knob_sets(_spec(), _facts(s_kv=131072))[0]
     assert (lead_set.tile_m, lead_set.pack_gqa, lead_set.split_kv) == (16, True, split), lead_set
+
+
+@pytest.mark.L0
+def test_sm120_prefill_split_counts_the_windowed_kv_range():
+    """Study sm120_swa_split_20261117: the SM120 prefill kernels clip the KV loop to the window, so the split model counts the
+    window's tiles, not the whole cache (a 128-key window over 128K keys split 4 ways and ran 2x)."""
+    from cudnn.sdpa.fwd import heuristics
+
+    spec = _spec()
+    chunk = dict(h_q=32, h_kv=4, s_q=1024, s_kv=131072, d_qk=64, d_v=64, causal=True, bottom_right=True)
+    full = heuristics._split_launch(spec.capabilities, _facts(**chunk), 64, 128, 1, 1)
+    windowed = heuristics._split_launch(spec.capabilities, _facts(window_left=128, **chunk), 64, 128, 1, 1)
+    assert full.kv_tiles == 1024
+    assert windowed.kv_tiles <= 3, windowed
 
 
 # --- the kernel through the adapter -----------------------------------------
