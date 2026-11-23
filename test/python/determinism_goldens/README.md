@@ -9296,8 +9296,8 @@ The model report suite on current develop also passes: 51 passed, 35.16 s.
 SM100-family BF16 kernel as well as the block-scaled one. Each
 (token, N-tile) dprob partial gets its own FP32 slot, and the slots are
 summed in a fixed order on the launch stream. The new
-`gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` (18 cases: 17 L0,
-plus an L1 case at scale) checks the following:
+`gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` (18 cases: 16 L0,
+plus two L1 cases at scale) checks the following:
 
 - Replay: eight runs on fresh outputs with concurrent work on another
   stream compare dprob and `D_row` as raw bytes. This covers both
