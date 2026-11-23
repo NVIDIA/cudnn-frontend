@@ -563,13 +563,13 @@ def cell_case(seq_lens=None):
     return make_case("gdn", torch.bfloat16, seq_lens=seq_lens, H=heads_key, HV=heads_key * group, K=d_k, V=d_v, lo=0.9), sms
 
 
-def pooled_forward(backend, case, packed, indices=None):
-    """The op on a fresh pool holding ``packed``: ``(o, pool, indices)``."""
+def pooled_forward(backend, case, packed, indices=None, cu=None):
+    """The op on a fresh pool holding ``packed`` (``cu``: other cumulative lengths over the case's tokens): ``(o, pool, indices)``."""
     pool, table, _ = state_pool(case, packed)
     indices = table if indices is None else indices
     if indices is not table:
         pool[indices.long()] = packed
-    o, final_state = run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=True)
+    o, final_state = run_fwd(backend, case, cu=cu, initial_state=pool, state_indices=indices, output_final_state=True)
     assert final_state is pool
     torch.cuda.synchronize()
     return o, pool, indices
@@ -669,6 +669,30 @@ def test_other_lengths_take_the_uncut_table(monkeypatch, frost, lengths):
     assert not any(order) and not any(words)
     assert_bitwise(f"o[{lengths.__name__}]", o_on, o_off)
     assert_bitwise(f"pool[{lengths.__name__}]", pool_on, pool_off)
+
+
+@pytest.mark.L0
+def test_lengths_short_of_the_token_rows_take_the_uncut_table(monkeypatch, frost):
+    """Cumulative lengths that stop half way through the token rows: the engine admits the cell the rows give, the
+    sequences have another chunk count -- a shape no measured cell names -- and the prologue writes the uncut table.
+    The output rows the lengths name and the pool are the uncut plan's."""
+    backend, built, regions = frost
+    case, sms = cell_case()
+    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: sms)
+    packed = random_state(case)
+    cu = (case.cu // 2).contiguous()
+    rows = int(cu[-1])
+    set_level(monkeypatch, False)
+    o_off, pool_off, _ = pooled_forward(backend, case, packed, cu=cu)
+    _, parts_off, _, _ = device_table(regions, case)
+    set_level(monkeypatch, True)
+    o_on, pool_on, _ = pooled_forward(backend, case, packed, cu=cu)
+    assert any(cfg.level_plan for cfg in built)
+    count, parts, order, words = device_table(regions, case)
+    assert (count, parts) == (case.N * case.HO, parts_off)
+    assert not any(order) and not any(words)
+    assert_bitwise("o[short lengths]", o_on[:rows], o_off[:rows])
+    assert_bitwise("pool[short lengths]", pool_on, pool_off)
 
 
 @pytest.mark.L0

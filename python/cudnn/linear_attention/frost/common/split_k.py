@@ -1366,12 +1366,13 @@ def level_vote(
 
 
 @cute.jit
-def level_takes(n_threads: cutlass.Constexpr[int], shares: cutlass.Constexpr[int], groups, chunks, sVote):
+def level_takes(n_threads: cutlass.Constexpr[int], shares: cutlass.Constexpr[int], groups, chunks, planned_chunks, sVote):
     """Whether the batch takes the levelled table of ``groups`` groups of ``chunks`` chunks on ``shares`` shares -- one
     value for every thread of the CTA, read behind the barrier that follows :func:`level_vote`: every warp agreed,
     chains of at least two chunks and a share longer than a chain (:func:`level_plan_shape`'s conditions on the lengths
-    the device sees)."""
-    takes = chunks >= cutlass.Int32(2)
+    the device sees), and the chunk count is ``planned_chunks``, the one the batch's token rows give: the plan was
+    admitted for that shape, and cumulative lengths that stop short of the rows are another one."""
+    takes = (chunks >= cutlass.Int32(2)) and (chunks == planned_chunks)
     for warp in cutlass.range_constexpr(n_threads // WARP_SIZE):
         takes = takes and (sVote[warp] != cutlass.Int32(0))
     return takes and ((groups * chunks) // cutlass.Int32(shares) > chunks)
@@ -1388,6 +1389,7 @@ def level_order_body(
     n_heads_out: cutlass.Int32,
     n_tiles: cutlass.Int32,
     n_batch: cutlass.Int32,
+    n_rows: cutlass.Int32,
     mCuSeqlens: cute.Tensor,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor,
@@ -1426,7 +1428,8 @@ def level_order_body(
 
     The table needs what :func:`level_plan_shape` asks of the shape and a batch that agrees with it, which only the
     device sees: every thread votes (:func:`level_vote`) and, behind one CTA-wide barrier, the CTA either writes the
-    rows above or -- lengths that differ, a chain of fewer than two chunks, a pool row named twice -- the uncut table
+    rows above or -- lengths that differ, a chunk count that is not the one the batch's ``n_rows`` token rows give, a
+    chain of fewer than two chunks, a pool row named twice -- the uncut table
     through :func:`order_body`, with the order entry 0 for each of its ``n_tiles`` rows and the item count.  Caller owns
     ``sKey`` / ``sIdx`` / ``sSpread`` (:func:`order_body`'s) and ``sVote``; every thread of the calling CTA must reach
     the barriers inside.
@@ -1450,7 +1453,7 @@ def level_order_body(
     level_vote(b_t, n_threads, tidx, n_heads_out, n_batch, mCuSeqlens, sVote, expand_num=expand_num, mPoolRows=mPoolRows)
     nvvm.barrier_cta_sync()
 
-    if level_takes(n_threads, num_ctas // group, groups, chunks, sVote):
+    if level_takes(n_threads, num_ctas // group, groups, chunks, cute.ceil_div(n_rows // n_batch, b_t), sVote):
         slots = groups * chunks
         q = slots // shares
         rem = slots - q * shares
@@ -1524,6 +1527,7 @@ def level_closing_body(
     n_heads_out: cutlass.Int32,
     n_tiles: cutlass.Int32,
     n_batch: cutlass.Int32,
+    n_rows: cutlass.Int32,
     mCuSeqlens: cute.Tensor,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor,
@@ -1564,7 +1568,7 @@ def level_closing_body(
     level_vote(b_t, n_threads, tidx, n_heads_out, n_batch, mCuSeqlens, sVote, expand_num=expand_num, mPoolRows=mPoolRows)
     nvvm.barrier_cta_sync()
 
-    if level_takes(n_threads, num_ctas // group, groups, chunks, sVote):
+    if level_takes(n_threads, num_ctas // group, groups, chunks, cute.ceil_div(n_rows // n_batch, b_t), sVote):
         if tidx < shares:
             ahead = cutlass.Int32(0)
             for other in cutlass.range_constexpr(1, num_ctas // group):

@@ -1531,8 +1531,10 @@ def gated_delta_net(
             blocks: the second starts from the state the first stored in
             this buffer and is handed out only behind that store, so the
             output and the final state stay the uncut schedule's.  A batch
-            whose sequences differ in their chunk count, or whose
-            ``state_indices`` name one row twice, keeps the uncut schedule.
+            whose sequences differ in their chunk count, whose
+            ``cu_seqlens`` stop short of the token rows by a chunk or more,
+            or whose ``state_indices`` name one row twice, keeps the uncut
+            schedule.
             Inference only: the in-place op has no autograd formula.
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` inside the kernel.
         allow_neg_eigval: scale the fused beta sigmoid by 2, so the delta-rule
