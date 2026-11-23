@@ -723,6 +723,28 @@ def test_levelled_plan_keeps_the_uncut_plans_bytes(monkeypatch, frost):
 
 
 @pytest.mark.L0
+def test_levelled_plan_of_partial_last_chunks_keeps_the_uncut_plans_bytes(monkeypatch, frost):
+    """A measured cell's sequences one token short of their last chunk: the same chunk count, so the same line and the
+    same levelled table, and every tile -- a cut tile's second item included -- ends in a chunk that is not full.
+    Output and pool are bitwise the uncut plan's."""
+    backend, built, regions = frost
+    cell = smallest_cell()
+    case, _ = cell_case(cell, seq_lens=[cell.chunks * B_T - 1] * cell.sequences)
+    plan_for(monkeypatch, cell)
+    packed = random_state(case)
+    set_level(monkeypatch, False)
+    o_off, pool_off, _ = pooled_forward(backend, case, packed)
+    set_level(monkeypatch, True)
+    o_on, pool_on, _ = pooled_forward(backend, case, packed)
+    assert any(cfg.level_plan for cfg in built)
+    count, parts, order, _ = device_table(regions, case)
+    host_parts, host_order = split_k.level_table(case.N * case.HO, cell.chunks, cell.sms, case.HO // case.HK)
+    assert (count, parts, order) == (len(host_parts), host_parts, host_order)
+    assert_bitwise("o[partial last chunks]", o_on, o_off)
+    assert_bitwise("pool[partial last chunks]", pool_on, pool_off)
+
+
+@pytest.mark.L0
 def test_levelled_plan_is_taken_on_a_measured_grid_only(monkeypatch, frost):
     """The same batch planned for the device itself: the plan is levelled exactly where the device is a measured cell's
     part -- its compute capability and its SM count -- and output and pool are the uncut plan's either way."""
