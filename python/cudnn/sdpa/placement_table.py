@@ -267,6 +267,25 @@ def _sm80_dense_split(row: str, facts) -> bool:
     return heuristics.sm80_dense_split_choice(facts) >= SM80_DENSE_SPLIT_KEY_MIN
 
 
+SM107_DENSE_SPLIT_KEY_MIN_S_Q = 256  # placement.SM107_D128_CHUNKED_MIN_S_Q: shorter Rubin d128 chunks lost to the backend (1.37x)
+
+
+def _sm100_dense_split(row: str, facts) -> bool:
+    """B200 (cc 10.0) and Rubin dense d128 GQA prefill that the row's planner splits over KV: the same split regime as
+    ``_sm80_dense_split``, from a 2-way split. Rubin keys only the groups its row packs whole, from S_q
+    SM107_DENSE_SPLIT_KEY_MIN_S_Q; its split unpacked groups ran 0.63-1.48 of the backend. cc 10.3 keeps one class, which its
+    generated entry already leads."""
+    if row not in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm107") or facts.device_cc not in ((10, 0), (10, 7)):
+        return False
+    if facts.has_paged_kv or facts.thd or facts.h_q == facts.h_kv or (facts.d_qk, facts.d_v) != (128, 128):
+        return False
+    if row == "sdpa_fwd_prefill_sm107" and (facts.s_q < SM107_DENSE_SPLIT_KEY_MIN_S_Q or _row_pack_group(row, facts) != facts.h_q // facts.h_kv):
+        return False
+    from cudnn.sdpa.fwd import heuristics
+
+    return heuristics.sm100_dense_split_choice(row, facts) >= 2
+
+
 _VERIFY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90"})
 _VERIFY_MAX_S_Q = 16  # placement.DECODE_SHAPED_MAX_S_Q: the spec-decode verify depth
 
@@ -333,7 +352,7 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
     elif _sm90_partial_pack(row, facts):
         group = "gqa_partial"
     else:
-        dense_split = phase == "prefill" and mask == "causal_br" and _sm80_dense_split(row, facts)
+        dense_split = phase == "prefill" and mask == "causal_br" and (_sm80_dense_split(row, facts) or _sm100_dense_split(row, facts))
         group = "gqa_split" if _packed_split(row, facts) or dense_split else "gqa"
     if group == "gqa" and _sm120_paged_body(row, facts):
         group = "gqa_body"
