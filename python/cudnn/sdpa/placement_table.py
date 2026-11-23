@@ -1202,6 +1202,21 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", True): Entry(
         "le", 7.377, "sm80_dense_d128_split_key_v2_20261122", "tiles"
     ),
+    # study dense_d128_split_key_bw_20261123: the same split class on B200 and Rubin (`_sm100_dense_split`). B200 is fit on
+    # sm100_d128_dense_prefill_cc100_20261121's cells (cuDNN 9.24.0.43), Rubin on the sm107_dense_d128_longkv cells; FROST leads below a
+    # cost / tile ceiling on B200 and across Rubin's whole-pack split class. Graphs the row does not split keep the hand rules.
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", False): Entry(
+        "le", 39.452, "dense_d128_split_key_bw_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", True): Entry(
+        "le", 7.065, "dense_d128_split_key_bw_20261123", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", False): Entry(
+        "always", None, "dense_d128_split_key_bw_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", True): Entry(
+        "always", None, "dense_d128_split_key_bw_20261123"
+    ),
     # study sm80_d576_paged_v3_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE b085f3499; paged THD-Q D576 x 512 MQA causal prefill over the
     # whole range, stratified by launch tiles and cache; 120 train cells). On the tile it replaces sm80_d576_prefill_20261117's floor of
     # 2^7.5 tiles, set by one short-cache square, with 2^4.79: kimi_k3-tp8 / tp4 long-KV chunks lead (backend 1.56-1.60x). Holdout at fresh
