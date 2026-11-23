@@ -746,29 +746,33 @@ adjacent codes its two approximate reciprocals admit. The reference chain's own 
 writes the code 0 for a negative value that rounds to zero, where the kernel keeps the sign -- so the block is
 compared with a twin written at the kernel's rounding points, not with the chain.
 
-What ran with this row (2026-11-22; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native` in
+What ran with this row (2026-11-23; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native` in
 PyTorch 2.14.0 with FlashInfer 0.7.2.post1 and its kernel-binary package, every other stack in PyTorch 2.13.0). The
-default run of both scripts on the four stacks, beside the same runs of the tree before the row; every ids hash was
+default run of both scripts on the four stacks, beside the same runs of the tree before the change that brought this
+row. That change also put the attention core of `native` on the library's kernel and counts the checks of the
+sequences beyond the first into the memory sentence, so lines of those two moved with this row's. Every ids hash was
 the one it had been (`1509c0dd53ac`, and `11bfb9f9bcf5` for the speculative script). On `fe-cublas` and `reference`
-every line was the line it had been but these: the environment line's source hash, which now covers the entry's
-files; one row more in every served-by table, `output_head.quantize  1  PyTorch  torch_ref.quantize  any  fallback:
-reference chain`; the by-provider line, `fallbacks 9 (cuBLAS over copies 4, PyTorch chains 5)` where it read
-`fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4)` on `fe-cublas`, and `fallbacks 10 (PyTorch chains 10)` where
-it read `fallbacks 9 (PyTorch chains 9)` on `reference`; the block calls of a step, 21 where they were 20 (111 where
-they were 110 in the speculative script); and the batch-invariance line of `fe-cublas`, which counts and names one
-block more. On `native` the block read 18,240 block scales at one sequence, none another byte than the twin's, and
-291,840 codes, 581 of them the second code of their bracket and none outside (72,960 and 1,167,360 at four sequences,
-2,181 second codes); the head behind the entry was the bytes of its twin, and the kernel check passed: a traced step
-of the two-layer model was 22 kernel launches and 1 copy, where it had been 62 and 4, and 20 of 20 launches of a step
-were target kernels (8 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results), 16 held
-by launch shape and 4 by membership. On `fe-entries` the block read 556 and 2,326 second codes, none outside, and a
-traced step was 93 kernel launches, where it had been 130, with 14 of 20 launches of a step target kernels (2 the
-target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results). No logits line of the plain
-script moved on `native`; on `fe-entries` the head's line read 23.2% of elements one bf16 unit from the reference's at
-four sequences, where it had read 23.3%, at the same largest distance of one unit. In the speculative script the
-head's line of the verify steps read 23.2% on `fe-entries` as well, where it had read 23.3%; and on `native` the
-largest logit distance of the kept tokens from the decode steps of the same tokens read 0.52 bf16 units, where it had
-read 1.00.
+every line was the line it had been but these: the environment line's source hash, which now covers the entry's files;
+one row more in every served-by table, `output_head.quantize  1  PyTorch  torch_ref.quantize  any  fallback: reference
+chain`; the by-provider line, `fallbacks 9 (cuBLAS over copies 4, PyTorch chains 5)` where it read `fallbacks 8
+(cuBLAS over copies 4, PyTorch chains 4)` on `fe-cublas`, and `fallbacks 10 (PyTorch chains 10)` where it read
+`fallbacks 9 (PyTorch chains 9)` on `reference`; the block calls of a step, 21 where they were 20 (111 where they were
+110 in the speculative script); the batch-invariance line of `fe-cublas`, which counts and names one block more; and
+the memory sentence of the plain script on `fe-cublas`, which names the part of the checks and asks for about 3.9 GiB
+where it asked for about 3.7. On `native` the block read 18,240 block scales at one sequence, none another byte than
+the twin's, and 291,840 codes, 581 of them the second code of their bracket and none outside (72,960 and 1,167,360 at
+four sequences, 2,181 second codes); the head behind the entry was the bytes of its twin, and the kernel check passed:
+a traced step of the two-layer model was 22 kernel launches and 1 copy, where it had been 69 and 4 with the attention
+core and this block on their reference chains, and 20 of 20 launches of a step were target kernels (8 the target's own
+compiled kernels + 12 cuDNN Frontend entries with byte-equal results), 16 held by launch shape and 4 by membership,
+where 18 of 20 had been (7 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results). On
+`fe-entries` the block read 556 and 2,326 second codes, none outside, and a traced step was 93 kernel launches, where
+it had been 130, with 14 of 20 launches of a step target kernels (2 the target's own compiled kernels + 12 cuDNN
+Frontend entries with byte-equal results). No logits line of the plain script moved on `native`; on `fe-entries` the
+head's line read 23.2% of elements one bf16 unit from the reference's at four sequences, where it had read 23.3%, at
+the same largest distance of one unit. In the speculative script the head's line of the verify steps read 23.2% on
+`fe-entries` as well, where it had read 23.3%; and on `native` the largest logit distance of the kept tokens from the
+decode steps of the same tokens read 0.52 bf16 units, where it had read 1.00.
 
 The row's range, both sides of its boundary: at 1,024 sequences one launch of grid (1024, 1, 1) quantised the 1,024
 rows of a step -- 298,844,160 codes, 559,695 of them the second code of their bracket on `native` and 595,654 on
@@ -782,26 +786,32 @@ one thing wrong each failed: with the scale handed un-inverted, by the block's o
 scales not the twin's byte); with the scale buffer zero-filled in front of the launch, by the kernel check, which
 named PyTorch's fill kernel between the final norm's launch and the entry's.
 
-The checkpoint, one sequence, the default prompt. On `native` the run passed with the 244 new tokens it had before
-the row (ids hash `7d767f68e358`, ended at the end token): 484 launches of every one of the 32 traced steps on target
-kernels (194 the target's own compiled kernels + 290 cuDNN Frontend entries with byte-equal results), in the wiring
-order, 419 of them in the recorded launch shape and 65 by membership; 486 kernel launches and 2 copies per traced
-step in all, where there had been 526 and 5; the block over 16 calls 5,120 block scales, none another byte than the
+The checkpoint, one sequence, the default prompt. On `native` the run passed with 244 new tokens (ids hash
+`7d767f68e358`, ended at the end token): 484 launches of every one of the 32 traced steps on target kernels (194 the
+target's own compiled kernels + 290 cuDNN Frontend entries with byte-equal results), in the wiring order, 419 of them
+in the recorded launch shape and 65 by membership; 486 kernel launches and 2 copies per traced step in all, where
+there had been 638 and 5 with 467 launches on target kernels (178 the target's own compiled kernels + 289 cuDNN
+Frontend entries with byte-equal results); the block over 16 calls 5,120 block scales, none another byte than the
 twin's, and 81,920 codes, 41 of them the second code of their bracket, none outside; the memory sentence asked for
-about 28.3 GiB and the device grew by 24.48 GiB, as before the row. On `fe-entries` the run passed with the 256 new
-tokens it had before (ids hash `f0c662ba6d0b`): 339 launches of a step on target kernels (49 the target's own
-compiled kernels + 290 cuDNN Frontend entries with byte-equal results), 338 in the recorded launch shape and 1 more
-by membership; 35 second codes, none outside. The performance mode's `kernels` lines read `484 of 484 launches per
-step are on the target kernel set: cuDNN Frontend 338, FlashInfer 145, PyTorch 1 = 194 the target's own compiled
-kernels + 290 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins` on `native` and `339 of 484 ...:
-cuDNN Frontend 338, PyTorch 1 = 49 the target's own compiled kernels + 290 cuDNN Frontend entries with byte-equal
-results + 0 declared stand-ins` on `fe-entries`. The speculative recipe of this page (five
-drafted tokens, its draft vocabulary, 256 new tokens) passed twice on `native` with equal figures, those it had
-before the row -- 2.89 kept tokens per step over 80 steps, ids hash `e40d030b6c26` --, its verify step 484 launches
-on target kernels (146 the target's own compiled kernels + 338 cuDNN Frontend entries with byte-equal results), 467
-in the recorded launch shape and 17 by membership; and once on `fe-entries`, with the figures it had before the row
--- 3.36 kept tokens per step over 76 steps, ids hash `bc7666f08a83` --, its verify step 387 launches on target
-kernels (49 the target's own compiled kernels + 338 cuDNN Frontend entries with byte-equal results).
+about 28.3 GiB and the device grew by 24.48 GiB, where they had been 27.9 and 24.09. The tokens are not those of the
+tree before the change, which decoded 216 to the end token (ids hash `265cd5861efc`): they moved with the attention
+core's library row, whose kernel is inside its band and is not the reference chain's bytes (runs of 2026-11-22, in
+which this row moved no token). On `fe-entries` the run passed with the 256 new tokens it had before (ids hash
+`f0c662ba6d0b`): 339 launches of a step on target kernels (49 the target's own compiled kernels + 290 cuDNN Frontend
+entries with byte-equal results), 338 in the recorded launch shape and 1 more by membership; 35 second codes, none
+outside. The performance mode's `kernels` lines read `484 of 484 launches per step are on the target kernel set: cuDNN
+Frontend 338, FlashInfer 145, PyTorch 1 = 194 the target's own compiled kernels + 290 cuDNN Frontend entries with
+byte-equal results + 0 declared stand-ins` on `native` and `339 of 484 ...: cuDNN Frontend 338, PyTorch 1 = 49 the
+target's own compiled kernels + 290 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins` on
+`fe-entries`. The speculative recipe of this page (five drafted tokens, its draft vocabulary, 256 new tokens) passed
+twice on `native` with equal figures -- 2.89 kept tokens per step over 80 steps, ids hash `e40d030b6c26` --, its
+verify step 484 launches on target kernels (146 the target's own compiled kernels + 338 cuDNN Frontend entries with
+byte-equal results), 467 in the recorded launch shape and 17 by membership, where the tree before the change kept 3.30
+tokens per step over 70 steps of another text with 467 launches of a verify step on target kernels (130 the target's
+own compiled kernels + 337 cuDNN Frontend entries with byte-equal results); and once on `fe-entries`, with the tokens
+and the figures it had before -- 3.36 kept tokens per step over 76 steps, ids hash `bc7666f08a83` --, its verify step
+387 launches on target kernels (49 the target's own compiled kernels + 338 cuDNN Frontend entries with byte-equal
+results).
 
 ### What the first run does
 
