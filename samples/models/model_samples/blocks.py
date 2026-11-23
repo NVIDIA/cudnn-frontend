@@ -60,9 +60,10 @@ class ProviderRow:
     # an entry that is called in several forms: (call site of the model's wiring, the further fields of the entry's form there).
     # ``None`` in place of the fields: the row serves no call at that site and hands it on to the next row that serves the run
     sites: Tuple[Tuple[str, Optional[Tuple[Tuple[str, object], ...]]], ...] = ()
-    # the layer widths the row's entry serves, where it serves some only: (field of the model's geometry, value) pairs.  A
-    # model that differs in one of them is not this row's, and the next row of the block is asked
-    widths: Tuple[Tuple[str, int], ...] = ()
+    # the layer widths the row's entry serves, where it serves some only: (field of the model's geometry, value) pairs -- a
+    # whole number, or the tuple of whole numbers such a field holds (the sections of a rotary width).  A model that
+    # differs in one of them is not this row's, and the next row of the block is asked
+    widths: Tuple[Tuple[str, Union[int, Tuple[int, ...]]], ...] = ()
 
     @property
     def stacks(self) -> Tuple[str, ...]:

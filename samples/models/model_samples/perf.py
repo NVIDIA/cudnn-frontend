@@ -13,7 +13,9 @@ this order:
    (``judged_positions``), the tokens, the stored weights.  A check that fails ends the run: nothing is timed, no file;
 2. a **warm-up request** and the **timed requests**, each from the state zeroed in place -- the device synchronised behind
    the zeroing, which is outside every statistic -- with nothing but the step inside: no recorder, no call log, no
-   profiler, no text;
+   profiler, no text.  A child process samples the GPU beside them (``observe``): this process starts it in front of the
+   warm-up request, reads the GPU's process list once more behind the last timed request, and makes no other call that
+   concerns it before the traced request has ended;
 3. the **traced request**: the prompt untraced, then the first timed positions under the profiler -- the first profiler
    pass of the process starts here, behind the last timed request.  Its first step is traced alone and sizes the rest:
    as many steps as the record budget holds;
@@ -35,7 +37,9 @@ busy of the traced step at the same position and beside its own host time is for
 aggregated; the mean of it is the run's launch overhead (``step_split``), which adds up with the means of the same
 steps: step = GPU busy + launch overhead + host.  It is an estimate -- a timed step has no GPU-side record, and GPU busy
 is the traced request's, taken under the profiler, and is an upper bound -- printed as a term of the ``step`` line, and
-called an estimate there, only where it is larger than the mean GPU busy.  The per-kernel table (``kernel_table``)
+called an estimate there, only where it is larger than the mean GPU busy; the median of the per-step remainders is
+printed under that line and nowhere else, because one stalled step moves their mean: where the step line says that
+the rest is not resolved, no figure of the remainder is printed.  The per-kernel table (``kernel_table``)
 gives every row the time its launches add to the GPU's timeline (``added_ms``): a row is a block, found by its place in
 the wiring by the kernel check's own walk (``census.Row``), and the blocks on fallback rows that no exact kernel
 separates are one row.  A row says what serves it (``_row_kind``): the row of a block a library serves carries the
@@ -47,9 +51,9 @@ time there is not its time inside a captured sequence.
 **What a run may call itself** (``record_class``).  A run is a ``controlled`` run only when it observed every condition
 itself -- a checkpoint, every block on a claimed target kernel, a captured launch sequence, the three statements of its
 ``checks`` lines, no other process on the GPU, the clocks -- and prints ``orientation`` with every reason otherwise.
-Nothing in this module observes the GPU's other processes or its clock yet, and no stack of this area is captured: every
-run is ``orientation``, on the second line of the screen and inside the rate line.  A report holds no speed-up, no
-baseline and no figure of another GPU class.
+The GPU's other processes and its clock are observed through the driver's tool (``observe``) or printed as not observed
+with the reason; no stack of this area is captured, so every run is ``orientation``, on the second line of the screen
+and inside the rate line.  A report holds no speed-up, no baseline and no figure of another GPU class.
 """
 
 from __future__ import annotations
@@ -69,16 +73,14 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import census, tie_out
+from . import census, observe, tie_out
 from .timing import now, step_facts
 
-SCHEMA = "model-sample-performance/3"
+SCHEMA = "model-sample-performance/4"
 WIDTH = 110  # of the screen: no line is wider
 ORIENTATION, CONTROLLED = "orientation", "controlled"
 PASS, FAIL, NOT_OBSERVED = census.PASS, census.FAIL, census.NOT_OBSERVED
 GIB = 2.0**30
-#: why this version states nothing about the GPU's other processes and its clock
-UNOBSERVED = "this version does not observe the GPU"
 NOT_COMPUTED = "the timed requests did not compute the checked request's tokens"
 CLOCK = "time.perf_counter, one process"  # of every statistic that is taken from stamps
 NOT_THE_PLAN = "the kernels of the traced steps are not the plan's"
@@ -93,7 +95,10 @@ FROM_PYTHON = "launched from Python: not the time of a kernel inside a captured 
 OWN_ORIGINS = ("cuDNN FE", "PyTorch")
 #: the kinds of a row of the per-kernel table whose launches are one record of one kind each: the kernel of an entry
 #: of cuDNN Frontend or of an operator of PyTorch (``exact``), a library's kernel (``library``), the host read
-#: (``read``: a copy to the host, not a kernel).  A time per launch is printed for them
+#: (``read``: a copy to the host, not a kernel).  A time per launch is printed for them.  The edge of ``exact``
+#: (``_row_kind``): a block that two library entries serve, and a block call that launches a library's kernel
+#: together with one of cuDNN Frontend or with an operator of PyTorch, are ``exact`` too -- every launch of such a
+#: row is still one kernel
 ONE_KERNEL = ("exact", "library", "read")
 
 #: statistic -> (unit, definition, serving counterpart or None): the sentences the report file carries beside each number
@@ -249,6 +254,8 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
         None,
     ),
 }
+
+DEFINITIONS.update(observe.DEFINITIONS)  # the GPU and the host during the timed requests: defined beside what observes them
 
 
 @dataclass(frozen=True)
@@ -511,14 +518,15 @@ def record_class(
     captured: bool,
     checks: str,
     others: str = "other processes not observed",
-    clocks: str = "clocks not observed",
+    clocks: Sequence[str] = ("clocks not observed",),
 ) -> Tuple[str, List[str]]:
     """``(class, reasons)`` of a run, the reasons in the order of the conditions.  A run is ``controlled`` only when every
     condition was observed by the run itself; each argument is a condition, or the reason it is not met (``""``: met):
     ``reduced`` -- no checkpoint; ``fallback_rows`` -- a block of the plan is on a fallback row; ``identity`` -- why the
     kernels are not a claimed target set on this GPU class; ``captured`` -- the launch sequence is captured, not launched
     from Python; ``checks`` -- why the three statements of the ``checks`` lines do not all hold; ``others`` -- why the run
-    cannot say it had the GPU alone; ``clocks`` -- why it cannot state the clock."""
+    cannot say it had the GPU alone; ``clocks`` -- every reason for which its clocks are not a controlled run's (one
+    reason, or several)."""
     reasons = [
         "reduced model" if reduced else "",
         "fallback rows present" if fallback_rows else "",
@@ -526,7 +534,7 @@ def record_class(
         "" if captured else "launched from Python",
         checks,
         others,
-        clocks,
+        *([clocks] if isinstance(clocks, str) else clocks),
     ]
     reasons = [reason for reason in reasons if reason]
     return (ORIENTATION if reasons else CONTROLLED), reasons
@@ -634,9 +642,9 @@ def screen(data: dict, unwritten: str = "") -> List[str]:
     lines += ["scope       a decode-loop rate, not a served rate: one process, no request queue, no scheduler, no network"]
     sequences = f"{model['sequences']} sequence{'s' if model['sequences'] != 1 else ''}"
     lines += _packed("model", [f"{model['name']}, {model['layers']} layers", sequences, model["decoding"]], 12)
-    seen = f"other compute processes: not observed ({data['observation']['reason_short']})"
+    seen = f"other compute processes: {observe.others_text(data['observation'])}"
     lines += _packed("GPU", [f"{gpu['name']}, compute capability {gpu['compute_capability']}, {gpu['sm_count']} SMs", seen], 12)
-    lines += [" " * 12 + f"clocks observed: no ({data['observation']['reason']})"]
+    lines += _packed("", [f"clocks observed: {observe.clocks_text(data['observation'])}", observe.host_text(data["observation"])], 12)
     calls = f"{kernels['fallback_calls'] or 'no'} block call{'s' if kernels['fallback_calls'] != 1 else ''} on fallback rows"
     if kernels.get("absent"):  # a launch of the target that no block of the plan stands for
         calls += f" + {kernels['absent']} launch{'es' if kernels['absent'] != 1 else ''} of the target that {'have' if kernels['absent'] != 1 else 'has'} no block yet"
@@ -696,9 +704,13 @@ def _step_lines(stats: dict, traced: dict, prefix: str) -> List[str]:
     Measured: the step -- the median -- and its mean taken apart, ``mean = GPU busy + launch overhead + host``, every
     term the mean over the same steps, only where launch overhead is larger than the mean GPU busy, and under it the
     line that calls launch overhead an estimate; otherwise the step, its mean beside the mean GPU busy as the upper
-    bound it is, and that the rest is not resolved.  Under both a line with the traced steps, their positions, their
-    median GPU busy -- what the shares of the per-kernel table are taken of -- and by how much tracing lengthened a
-    step."""
+    bound it is, and that the rest is not resolved.  Under the line that calls launch overhead an estimate, and only
+    there, a line with the median of the per-step remainders, which the file holds beside their mean: one stalled step
+    moves the mean -- the launch overhead of the equation -- and not the median.  Where the rest is not resolved no
+    figure of the remainder is printed, its median neither: under that sentence it would read as the resolved figure
+    the sentence denies (the file holds it in either form).  Under both forms a line with the traced steps, their
+    positions, their median GPU busy -- what the shares of the per-kernel table are taken of -- and by how much tracing
+    lengthened a step."""
     value, busy, overhead = f"{prefix}{stats['step']['value']:.3f}  ms", stats["gpu_busy"]["value"], stats["launch_overhead"]
     one, first, last = traced["steps"] == 1, traced["first_position"], traced["last_position"]
     if busy is None:
@@ -708,7 +720,9 @@ def _step_lines(stats: dict, traced: dict, prefix: str) -> List[str]:
     if overhead["value"] is not None:
         equation = f"mean {mean:.3f} = GPU busy {of_gpu:.3f} + launch overhead {overhead['value']:.3f} + host {stats['host']['mean']:.3f}"
         lines = _packed("step", [value, equation], joint="; ", hang=";") + _wrapped("", f"launch overhead: {overhead['label']}")
-    else:
+        middle = round(overhead["median"], 3) + 0.0  # + 0.0: a median that rounds to zero carries no sign
+        lines += _wrapped("", f"median of the per-step remainders: {middle:.3f} ms (launch overhead is their mean)")
+    else:  # not resolved: no figure of the remainder under that sentence, its median neither (the file holds both)
         bound = f"mean GPU busy {of_gpu:.3f} ms in a traced request (an upper bound: tracing lengthens kernels)"
         lines = _packed("step", [f"{value} (not traced), mean {mean:.3f}", bound, "launch overhead and host together: not resolved by this method"])
     stretch = stats["tracing_stretch"]["value"]
@@ -720,9 +734,10 @@ def _step_lines(stats: dict, traced: dict, prefix: str) -> List[str]:
 def _kernel_lines(table: dict, prefix: str) -> List[str]:
     """The per-kernel table of the screen, from the file's ``per_kernel`` section: per row its launches of a step, the time
     a launch adds to the GPU's timeline, the row's time per step and its share of GPU busy; or the one line that says
-    why there is no table.  ``us/launch`` is printed for a row whose launches are one kernel each (``ONE_KERNEL``), not
-    for a row of fallback or host blocks or of launches beside a kernel (chains of many kernels), nor at all where
-    the profiler's stamps are whole microseconds."""
+    why there is no table.  ``us/launch`` is printed for a row whose launches are one record of one kind each
+    (``ONE_KERNEL``: the kernel of an exact row, a library's kernel, the host read -- a copy to the host, not a
+    kernel), not for a row of fallback or host blocks or of launches beside a kernel (chains of many kernels), nor
+    at all where the profiler's stamps are whole microseconds."""
     if table["rows"] is None:
         return _wrapped("per kernel, per step", f"not printed: {table['reason']}")
     fine = table["us_per_launch_printed"]
@@ -862,16 +877,19 @@ def run(
     real: bool = True,
     source: str = "",
     text_path: Optional[dict] = None,
+    observer: Optional[observe.Observer] = None,
 ) -> Outcome:
     """One run of the mode on a loaded session (the module docstring has the phases).  ``tokenize()`` is the text path of
     the request -- render and tokenize -- and returns one prompt per sequence; ``say`` prints a line of the run;
     ``name`` is the model as the screen names it; ``facts`` the device's; ``environment`` the versions the run stated;
     ``sink`` takes the text of sequence 0 once, behind the report; ``report`` is the report file; ``verdict(passed,
-    judged, unobserved)`` is the script's last line without its tag; ``source`` says where the prompt came from."""
+    judged, unobserved)`` is the script's last line without its tag; ``source`` says where the prompt came from;
+    ``observer`` is the observation of the GPU the caller began before the load (``None``: it begins here)."""
     import torch
 
     model, device, stages = session.model, session.device, session.stages
     cuda = device.type == "cuda"
+    watch = observe.Observer(device) if observer is None else observer
 
     def begin(kind: str) -> Tuple[Request, Callable[[int], None]]:
         """A request up to its first new token, and the loop body of its forced steps."""
@@ -941,6 +959,8 @@ def run(
     if cuda:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
+    watch.read("before the warm-up request")  # the GPU and the host at rest ...
+    watch.start()  # ... and the sampler: a child process, which this process does not touch again before the traced request has ended
     requests = [checked]
     with stages.stage("the warm-up request"):
         requests.append(request("warm-up", protocol.warmup))
@@ -950,6 +970,7 @@ def run(
             requests.append(request("timed", protocol.steps))
     timed, timed_peaks = requests[2:], peaks_now()
     peaks = (max(peaks[0], timed_peaks[0]), max(peaks[1], timed_peaks[1]))
+    watch.read("behind the last timed request")  # the other processes and the host's load again; the sampler goes on beside the traced request
 
     # phase 9: the traced request -- the first profiler pass of the process: one step, whose records size the rest
     zeroed()
@@ -965,6 +986,8 @@ def run(
                 both = (first.call_log + session.traced.call_log, first.steps + session.traced.steps)
                 session.traced = census.Traced(first.sites, *both, rows=session.sequences, claim=first.claim)
         requests.append(traced)
+    watch.stop()  # the sampler's loops end and their files are read: behind every request
+    watched = watch.section([(made.kind, made.t_request, made.t_token[-1] if made.t_token else made.t_first) for made in requests[1:]])
 
     # phase 10: the checks after
     with stages.stage("the checks after"):
@@ -996,7 +1019,8 @@ def run(
     reduced = bool(getattr(model, "reductions", ()))
     rate_missing = f"not printed: {missing}" if held != PASS else (f"not printed: {NOT_THE_PLAN}" if status == FAIL else "")
     rate_missing = rate_missing or ("not printed for a reduced model" if reduced else "")
-    kind, reasons = record_class(reduced, kernels["fallback_rows"], identity_reason(kernels), False, failed)
+    alone, steady = observe.others_reason(watched), observe.clock_reasons(watched)
+    kind, reasons = record_class(reduced, kernels["fallback_rows"], identity_reason(kernels), False, failed, alone, steady)
     weights = model.copy_bytes(session.uncopied_weights()) + model.stored_bytes(session.stored_weights())
     raw = []
     for made in requests:
@@ -1007,6 +1031,7 @@ def run(
     frontend = {"version": env.cudnn_version, "distribution": env.distribution_version, "editable": env.editable, "source_hash": env.source_hash}
     gpu = {"name": facts.name, "compute_capability": f"{facts.cc[0]}.{facts.cc[1]}", "sm_count": facts.sm_count, "memory_gib": facts.total_bytes / GIB}
     host = {"logical_cores": os.cpu_count(), "usable_cores": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None}
+    host["load"] = {made.when: made.load for made in watch.readings}  # the load average over 1, 5 and 15 minutes at every reading
     teardown = {key: os.environ.get(key) for key in ("TEARDOWN_CUPTI", "DISABLE_CUPTI_LAZY_REINIT", "KINETO_LOG_LEVEL")}
     prompt_hash = hashlib.sha256(b"".join(int(i).to_bytes(4, "little") for prompt in prompts for i in prompt.tolist())).hexdigest()
     stats = _statistics(timed, covered, session.sequences, rate_missing, busy, traced, session.report().calls_per_step, unmeasured)
@@ -1032,11 +1057,11 @@ def run(
             "pytorch_cuda": torch.version.cuda,
             "cudnn_frontend": frontend,
             "cute_dsl": env.dsl_version or None,
-            "driver": {"value": None, "reason": f"not observed ({UNOBSERVED})"},
+            "driver": watch.driver(),
             "profiler_teardown": teardown,
             "host": host,
         },
-        "observation": {"source": "none", "reason": UNOBSERVED, "reason_short": "this version", "other_compute_processes": None, "clocks": None},
+        "observation": watched,
         "kernels": kernels,
         "protocol": {
             "stack": session.stack,
@@ -1048,7 +1073,13 @@ def run(
             "intervals_per_request": protocol.steps,
             "profiler_first_started": "behind the last timed request, in the traced request" if covered else None,  # None: no traced step was observed
             "stop_rule": "forced",
-            "in_a_timed_request": {"recorder": "off (a record of 0 steps)", "call_log": "off", "profiler": "not started", "text": "none"},
+            "in_a_timed_request": {
+                "recorder": "off (a record of 0 steps)",
+                "call_log": "off",
+                "profiler": "not started",
+                "text": "none",
+                "sampler": watch.in_a_request(),
+            },
             "restart": "every request starts from the state zeroed in place at position 0, the device synchronised behind the zeroing",
             "prompt": {"tokens": prompt_tokens, "sha256": prompt_hash, "source": source},
             "first_timed_position": prompt_tokens,
@@ -1090,6 +1121,7 @@ def run(
         "startup": {f"{stage}_s": seconds for stage, seconds in stages.seconds.items()},
         "text_path": {f"{what}_s": seconds for what, seconds in {**(text_path or {}), **session.report().text_path}.items()},
     }
+    data["statistics"].update(observe.statistic())
     # phase 11: the file, the screen, the text
     eos = frozenset(getattr(text, "eos_ids", ()))
     ended = next((index for index, token in enumerate(produced[0]) if token in eos), None)

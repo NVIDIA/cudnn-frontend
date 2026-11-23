@@ -9094,6 +9094,29 @@ specific defect. SM103 and untested shapes remain unverified.
 Evidence (logs, XML, provenance, before/after sources and PTX) is under
 `glu_canonical_validation/hadamard_sync_fix_20261119/` in the validation workspace.
 
+### SM107 D256 per-tensor FP8 two-warpgroup body — 2026-11-19
+
+The two-warpgroup D256 per-tensor FP8 body (Q resident in TMEM, one softmax
+warpgroup per KV-step parity) is selected through the standalone adapter
+on an explicit `cga=2` with `softmax_precision=HALF`; the public record keeps
+`cga=1`. `TestMidFp8Implementation` in `sdpa/frost/test_sdpa_fp8_sm107.py`
+gained the admission test (route assertion, declines, default width), the
+fp64 reference + replay cases (odd and even step counts, a zero-Q/K run that
+never rescales O, causal, bottom-right causal with keyless Q tiles handed
+over under the cluster launch control, and window, per-batch length and sink
+masks), batch-isolation cases (a sequence alone, reordered within the batch,
+next to changed neighbors; dense, causal, and bottom-right with a window,
+per-batch lengths and a sink), a PTX pin of the four shared-memory slot
+credits that depend on their loaded words through the release-zero argument
+(eight rendering families covering every input type, mask form, output type
+and Stats / Amax_O setting), and a warm-stress case over the refilled alpha /
+running-max / final-stat slots (2048 CTAs, eight KV steps per tile).
+
+Run on native cc 10.7 (208 SMs) with Torch 2.12.1+cu130, cuDNN 9.30.0 and
+CuTe DSL 4.8.0a0 (CUDA 13.4 compiler): all cases pass; the warm-stress control
+reproduced the unsafe twin's failure on the same device. No goldens were
+recorded.
+
 ## Simplified sparse attention CI failures — 2026-11-20
 
 Audited all 18 `python/misc/cutedsl:be-*-cutedsl-*` jobs in
@@ -9218,3 +9241,50 @@ method, and paged QSA capacity helper while retaining the new tests: **10 failed
 10 passed** in 3.52 s. The corrected versions passed the targeted regression run.
 Mocked capability cases cover SM120 and SM121, but no SM12.x GPU or DSL 4.9
 run was available. Those execution scopes remain unverified.
+
+## MoE MXFP8 scale-row offsets — 2026-11-21
+
+The fused Gate/Up scale loader shifted a blocked scale layout by a signed
+scalar row offset. For CTA 1 of an even FC1 tile, that offset is -128.
+Decomposing it inside the 128-row scale atom under CuTe DSL 4.9 corrupted
+alternate Up tiles. The loader now applies whole-tile offsets to the outer
+row mode, retaining zero coordinates inside the atom.
+
+On one SM100 GPU with 148 SMs, driver 610.11, PyTorch 2.14.0a0,
+CUDA/compiler 13.4 and cuDNN 9.27.0, the original DSL 4.9 forward had relative L1 error 0.367806
+against the independent PyTorch reference. The fixed forward has error
+0.0346925, within the unchanged 0.1 bound. Its output, quantized weights,
+and every saved forward-context tensor match the original DSL 4.8 run
+byte for byte for the fixed seed-40, 1024-token, four-expert case.
+
+`moe_ep/cutemok/test_cutemok.py::test_cuda_graph[mxfp8-False]` now uses
+`determinism_utils.assert_replays`: eight executions with fresh outputs,
+fixed inputs and gradients, and concurrent GPU work. It compares output,
+input and router gradients, and all six routed/shared weight gradients as
+raw bytes. Changed-input and changed-routing graph replay also compares
+raw bytes. The separate `test_forward_backward[mxfp8]` retains its numerical
+reference and error bounds.
+
+Commands from `test/python`, with `CUDNN_TEST_NO_ISOLATION=1`:
+
+```bash
+python -m pytest moe_ep/cutemok/test_cutemok.py -q -rs --tb=short
+python -m pytest attention_prepare/frost/test_attention_prepare_decode.py -k rendering_pins -q --tb=short
+```
+
+The replay scope is one rank. Batch insertion, removal and reordering,
+multiple ranks, warm-stress qualification, and SM103 execution remain
+unverified. The API support row remains unverified.
+
+Measured from `ad170f52` plus this fix:
+
+| CuTe DSL | Full MoE suite | Cross-target rendering checks |
+| --- | --- | --- |
+| 4.8.0 | 30 passed, 1 skipped; 80.13 s | 3 passed; 18.67 s |
+| 4.9.0a0+20261120230000.ecb3b50 | 30 passed, 1 skipped; 75.60 s | 3 passed; 19.21 s |
+
+The skip is the existing multi-rank barrier-wrap case: one rank launches
+no communication barrier. Each rendering check covers 15 forms/launch arms
+for one of SM100, SM103 and SM107, including instruction and SASS checks;
+rendering another target does not establish GPU execution on that target.
+The model report suite on current develop also passes: 51 passed, 35.16 s.

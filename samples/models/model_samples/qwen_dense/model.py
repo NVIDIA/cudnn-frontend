@@ -113,9 +113,16 @@ def _names(among: Sequence[str], block: str, kind: Optional[str] = None) -> bool
     return block in among or (site is not None and scoped(block, site) in among)
 
 
+#: the sections of the rotary width of an attention layer: how many of its rotary index pairs follow each of the three position
+#: rows a position has in this architecture -- of the published model.  A text position is one number, so the three rows are
+#: equal and no byte depends on the sections; the form a kernel that takes three position rows is called in does
+ROTARY_SECTION = (11, 11, 10)
+
+
 @dataclass(frozen=True)
 class Geometry:
-    """Layer widths of the published dense 27B-class model; ``layer_kinds`` in order."""
+    """Layer widths of the published dense 27B-class model; ``layer_kinds`` in order.  ``rotary_section``: the sections of the
+    rotary width (:data:`ROTARY_SECTION`), which a checkpoint's configuration may name."""
 
     layer_kinds: Tuple[str, ...] = PATTERN * 16
     hidden: int = 5120
@@ -131,6 +138,7 @@ class Geometry:
     rotary_dim: int = 64
     rope_theta: float = 1.0e7
     norm_eps: float = 1.0e-6
+    rotary_section: Tuple[int, int, int] = ROTARY_SECTION
 
     @property
     def qkv_channels(self) -> int:
@@ -259,6 +267,9 @@ class QwenDense:
                 raise ValueError(f"{checkpoint.label}: config.json has {key} = {value!r} where {'a whole number' if kind is int else 'a number'} is expected")
             return kind(value)
 
+        section = rope.get("mrope_section", list(ROTARY_SECTION))  # where the configuration names none: the published model's
+        if not isinstance(section, list) or len(section) != 3 or not all(isinstance(part, int) and not isinstance(part, bool) for part in section):
+            raise ValueError(f"{checkpoint.label}: config.json has mrope_section = {section!r} where three whole numbers are expected")
         try:
             kinds = config["layer_types"]
             if not isinstance(kinds, list) or not all(isinstance(name, str) for name in kinds):
@@ -280,6 +291,7 @@ class QwenDense:
                 rotary_dim=int(head_dim * number("partial_rotary_factor", float, rope, default=config.get("partial_rotary_factor", 1.0))),
                 rope_theta=number("rope_theta", float, rope, default=config.get("rope_theta", 10000.0)),
                 norm_eps=number("rms_norm_eps", float),
+                rotary_section=tuple(section),
             )
         except KeyError as error:
             raise NotImplementedError(f"{checkpoint.label}: config.json has no {error.args[0]!r}; not a checkpoint this sample reads") from None

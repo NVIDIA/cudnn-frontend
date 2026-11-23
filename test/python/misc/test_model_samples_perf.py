@@ -17,23 +17,36 @@
   before the last timed request, nothing but the step inside a timed request, the three statements of the ``checks``
   lines, and what a statement that does not hold does to the rate line and to the last line;
 * the screen (no line wider than 110 characters, in every form) and the report file (strict JSON, a definition beside
-  every statistic, no local path; its schema, and a file of another schema refused in one sentence that names both);
+  every statistic, no local path; its schema, and a file of another schema -- one of each of the two before it among
+  them -- refused in one sentence that names both);
 * the sample's flags, each refusal before the load, ``main()`` with ``--perf`` to its last line, and an ordinary run
   that prints what it printed and does not import the mode's module;
 * the session of a run, built for its longest request: a warm-up request longer than the timed one runs to its report,
   the context is held against it before the load, and nothing a request computes moves with the session's size;
 * the public text of the mode: a sentence of the READMEs, of the guide or of the script that says what the mode does is
   held beside the assertion that shows it (``_says``), and so are the definitions the report file carries
-  (``_defines``); the words, the ``stage`` row, the flag table and the example of the report against the code.
+  (``_defines``); the words, the ``stage`` row, the flag table and the example of the report against the code;
+* the observation of the GPU: on constructed samples the cut by the bounds of a request, the own-process test behind
+  ``none seen``, the memory rule, every form of the clock line; through a stand-in for the driver's tool, written by the
+  test, a reading, a tool that fails, and the sampler's child process whose loops end with its pipe; through a session,
+  every call of the observer against the stamps of the requests, and what the file's ``protocol`` says of the sampler.
+  No test asks the driver of the host it runs on.
 
 No GPU, no weights on disk, no profiler."""
 
+import ast
+import contextlib
 import importlib
 import importlib.util
 import json
 import os
 import re
+import shutil
+import signal
 import sys
+import threading
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -276,7 +289,7 @@ def test_judged_positions_from_page_and_request():
     _says("family", "one checked request with the reference checks on it (also at four positions of the timed steps)")
     _says("area", "The judged positions are the first 16 of the request, the two on either side of the first page boundary of the attention cache inside")
     _says("area", f"for the default prompt of 58 tokens, {listed(58, 256).replace(', 313', ' and 313')}.", f"A page is {configs.ATTENTION_PAGE} positions,")
-    _says("area", "the attention blocks of this sample read one contiguous cache today, and the two positions are judged all the same")
+    _says("area", "the attention cache of a run is that pool of pages where the attention preparation's entry serves, one contiguous cache everywhere else,")
     assert tie_out.positions_text([5, 3, 4, 9, 10, 12]) == "3-5, 9, 10, 12" and tie_out.positions_text([]) == ""
 
 
@@ -319,7 +332,8 @@ def test_record_class_reasons_in_the_order_of_the_conditions():
     _says("area", "Otherwise it is `orientation` and the line lists every reason, in that order, and the rate line reads `decode rate (orientation)`.")
     _says("area", "*Record class*: what a run may call its numbers, on the second line of its report: `orientation` with every reason, or a controlled run.")
     _says("family", "Every run of the mode is `orientation` today and says why on the second line of its report")
-    _says("family", "its blocks are launched from Python, a fallback row is left in every stack, and the mode does not observe the GPU's other")
+    _says("family", "its blocks are launched from Python, a fallback row is left in every stack, and whatever the run saw of the GPU's other")
+    _says("family", "whatever the run saw of the GPU's other processes and of its clock that a controlled run may not have is a reason too.")
     _says("area", "and no stack of this area is captured: every run today is `orientation`.")
 
 
@@ -623,6 +637,7 @@ def test_timed_request_has_no_recorder_no_text(monkeypatch, tmp_path):
         "call_log": "off",
         "profiler": "not started",
         "text": "none",
+        "sampler": "none (no CUDA device)",  # this session is on the CPU: no sampler ran beside it, and the file says so
     }
     assert all(request["end_state_sha256"] == outcome.data["raw"]["requests"][0]["end_state_sha256"] for request in outcome.data["raw"]["requests"][2:4])
     # the count the run printed before the load: every decode step of the stack, the replay of the checks among them
@@ -767,32 +782,32 @@ def test_the_kernels_lines_are_three_numbers_from_the_plan_and_the_census(monkey
         return perf.kernel_facts(session, "PASS")
 
     kernels, native = planned("fe-entries"), planned("native")
-    assert (native["on_target"], native["launches"]) == (451, 484) and (native["code"], native["port"], native["stand_ins"]) == (178, 273, 0)
-    assert native["by_provider"] == {"cuDNN Frontend": 321, "FlashInfer": 129, "PyTorch": 1}
-    assert (native["fallback_calls"], native["absent"]) == (32, 1) and native["fallback_rows"], "451 + 32 + 1 = 484: the attention blocks are left"
+    assert (native["on_target"], native["launches"]) == (467, 484) and (native["code"], native["port"], native["stand_ins"]) == (178, 289, 0)
+    assert native["by_provider"] == {"cuDNN Frontend": 337, "FlashInfer": 129, "PyTorch": 1}
+    assert (native["fallback_calls"], native["absent"]) == (16, 1) and native["fallback_rows"], "467 + 16 + 1 = 484: the attention core is left"
     wide = perf.screen(_data(kernels=native))  # a third provider: the line breaks between two of them
-    at = wide.index("kernels     451 of 484 launches per step are on the target kernel set: cuDNN Frontend 321, FlashInfer 129,")
+    at = wide.index("kernels     467 of 484 launches per step are on the target kernel set: cuDNN Frontend 337, FlashInfer 129,")
     assert wide[at + 1 : at + 3] == [
         " " * 12 + "PyTorch 1",
-        " " * 12 + "= 178 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results",
+        " " * 12 + "= 178 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results",
     ]
     assert kernels["declared"] and kernels["stated"] and kernels["fallback_rows"]
-    assert (kernels["on_target"], kernels["launches"]) == (322, 484) and (kernels["code"], kernels["port"], kernels["stand_ins"]) == (49, 273, 0)
-    assert kernels["by_provider"] == {"cuDNN Frontend": 321, "PyTorch": 1}
-    assert (kernels["fallback_calls"], kernels["absent"]) == (161, 1), "322 + 161 + the one launch of the target that no block stands for = 484"
+    assert (kernels["on_target"], kernels["launches"]) == (338, 484) and (kernels["code"], kernels["port"], kernels["stand_ins"]) == (49, 289, 0)
+    assert kernels["by_provider"] == {"cuDNN Frontend": 337, "PyTorch": 1}
+    assert (kernels["fallback_calls"], kernels["absent"]) == (145, 1), "338 + 145 + the one launch of the target that no block stands for = 484"
     assert kernels["kernels_per_step"] is None and "NOT CLAIMED" in kernels["census"], "nothing traced; a fallback row is left"
     data = _data(kernels={**kernels, "kernels_per_step": 2908, "copies_per_step": 200})
     shown = perf.screen(data)
-    at = shown.index("kernels     322 of 484 launches per step are on the target kernel set: cuDNN Frontend 321, PyTorch 1")
+    at = shown.index("kernels     338 of 484 launches per step are on the target kernel set: cuDNN Frontend 337, PyTorch 1")
     assert shown[at + 1 : at + 5] == [
-        "            = 49 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results",
+        "            = 49 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results",
         "              + 0 declared stand-ins",
-        "            not yet: 161 block calls on fallback rows + 1 launch of the target that has no block yet",
-        "            a step also launches 2,586 kernels and 200 copies",
+        "            not yet: 145 block calls on fallback rows + 1 launch of the target that has no block yet",
+        "            a step also launches 2,570 kernels and 200 copies",
     ]
     unseen = perf.screen(_data(kernels=kernels))
     assert "            what a step also launches was not observed" in unseen
-    whole = perf.screen(_data(kernels={**kernels, "absent": 0, "fallback_calls": 0, "kernels_per_step": 485, "copies_per_step": 1}))
+    whole = perf.screen(_data(kernels={**kernels, "absent": 0, "fallback_calls": 0, "kernels_per_step": 501, "copies_per_step": 1}))
     assert "            not yet: no block calls on fallback rows; a step also launches 163 kernels and 1 copy" in whole
     three = "the target's own compiled kernels, cuDNN Frontend entries with byte-equal results, declared stand-ins"
     _defines("launches_per_step", f"the launches of a step that are on the target kernel set, by provider and as three numbers -- {three}.")
@@ -836,12 +851,13 @@ def _checkpoint_form(**changes):
     return _gpu_side(data)
 
 
-def _gpu_side(data, busy=80.0, term=True, host=40.0, stretch=5.0, why="", mean=410.0):
+def _gpu_side(data, busy=80.0, term=True, host=40.0, stretch=5.0, why="", mean=410.0, middle=None):
     """The GPU side of a report's data, set: the median GPU busy in ms (``None``: not measured, and ``why``), whether
     launch overhead is a term of the step, the loop's median host time, tracing's stretch in percent and the mean
     step.  The means of GPU busy and of host are set 2 ms and 1 ms above their medians, and the remainder is what they
-    leave of the mean step: the terms add up, as a run's do.  The defaults are made up for the form -- the parts of a
-    mean step of 410 ms beside a median of 400, the time per block call that of 700 calls -- and are no run's."""
+    leave of the mean step: the terms add up, as a run's do.  ``middle``: the median of the per-step remainders, 2 ms
+    below their mean where it is not given.  The defaults are made up for the form -- the parts of a mean step of
+    410 ms beside a median of 400, the time per block call that of 700 calls -- and are no run's."""
     from model_samples import perf
 
     stats, measured = data["statistics"], busy is not None
@@ -850,6 +866,7 @@ def _gpu_side(data, busy=80.0, term=True, host=40.0, stretch=5.0, why="", mean=4
     stats["gpu_busy"].update(value=busy, mean=busy + 2.0 if measured else None, reason=None if measured else f"GPU busy not measured ({why})")
     stats["host"].update(value=host, mean=host + 1.0)
     stats["launch_overhead"].update(value=remainder if term and measured else None, remainder_ms=remainder, label=perf.ESTIMATE if measured else None)
+    stats["launch_overhead"]["median"] = (remainder - 2.0 if middle is None else middle) if measured else None
     stats["launch_overhead"]["host_time_per_block_call_us"] = remainder * 1e3 / 700 if measured else None
     stats["tracing_stretch"]["value"] = None if busy is None else stretch
     data["traced"].update(gpu_busy_ms=busy, gpu_busy_reason=why or None)
@@ -954,8 +971,8 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
     from model_samples import perf
 
     long_reason = "the profiler's trace could not be exported (" + "a reason that the exporter words at length " * 3 + ")"
-    target = {"stated": True, "declared": True, "on_target": 322, "launches": 484, "code": 49, "port": 273, "stand_ins": 0}
-    target.update(by_provider={"cuDNN Frontend": 321, "PyTorch": 1}, fallback_calls=162, kernels_per_step=2908, copies_per_step=200)
+    target = {"stated": True, "declared": True, "on_target": 338, "launches": 484, "code": 49, "port": 289, "stand_ins": 0}
+    target.update(by_provider={"cuDNN Frontend": 337, "PyTorch": 1}, fallback_calls=146, kernels_per_step=2908, copies_per_step=200)
     forms = [
         _data(),
         _checkpoint_form(),
@@ -991,7 +1008,12 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)  # and the lines a run printed are those of its data
     said = lines[lines.index("cuDNN Frontend model sample: decode performance report") :]
     assert max(len(line) for line in said) <= 110, "the text out line behind the screen too"
-    assert said[: len(perf.screen(outcome.data))] == perf.screen(outcome.data) and 34 <= len(perf.screen(outcome.data)) <= 40
+    screen = perf.screen(outcome.data)
+    assert said[: len(screen)] == screen
+    # the step of this run is the host's, GPU busy the stand-in profiler's fixed figure: where the host leaves a remainder larger
+    # than GPU busy the screen takes the step apart -- one line more under ``step``, and the note of two lines
+    apart = sum(" + launch overhead " in line for line in screen)
+    assert len(screen) == 38 + 3 * apart and sum(line.startswith("note  ") for line in screen) == apart <= 1, "\n".join(screen)
     assert perf.screen(json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))) == perf.screen(outcome.data), "the file's data and nothing else"
     unwritten = perf.screen(outcome.data, "--perf-report late.json: No space left on device")
     assert (
@@ -1018,7 +1040,7 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     assert data == json.loads(json.dumps(outcome.data)) and outcome.unwritten == ""
     sections = "schema kind written_utc report_file record model environment observation kernels protocol checks statistics raw traced per_kernel memory"
     sections += " startup text_path"
-    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/3" and data["kind"] == "run"
+    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/4" and data["kind"] == "run"
     assert "fingerprints" not in data and "report_text" not in data, "of later versions"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", data["written_utc"]) and data["report_file"] == "report.json"
     assert str(tmp_path) not in text and os.sep + "home" + os.sep not in text and str(MODELS) not in text, "a file is named by its own name"
@@ -1080,11 +1102,28 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     _says("area", "in GiB (2^30 bytes), where an ordinary run's `bytes per step` line is in GB")
 
 
+def _schema_3(data):
+    """The report file of the same run as the mode wrote it before it observed the GPU, schema
+    ``model-sample-performance/3``: 18 sections and 16 statistics -- no statistic of the GPU and the host, no load of the
+    host, an ``observation`` section of five entries and a driver entry that say the GPU was not observed, and nothing of
+    a sampler among what a timed request ran with."""
+    import copy
+
+    older = copy.deepcopy(data)
+    older["schema"] = "model-sample-performance/3"
+    unobserved = "this version does not observe the GPU"
+    del older["statistics"]["gpu_and_host"], older["environment"]["host"]["load"], older["protocol"]["in_a_timed_request"]["sampler"]
+    older["environment"]["driver"] = {"value": None, "reason": f"not observed ({unobserved})"}
+    older["observation"] = {"source": "none", "reason": unobserved, "reason_short": "this version", "other_compute_processes": None, "clocks": None}
+    return older
+
+
 def _schema_1(data):
-    """The report file of the same run as the mode wrote it before it took the GPU side of a step from the traced
-    request, schema ``model-sample-performance/1``: 17 sections and 10 statistics -- no ``per_kernel`` section, none of
-    the six statistics of the GPU side, a ``traced`` section of seven entries that says GPU busy was not taken, and the
-    definition of the step with the sentence that said so."""
+    """From a file of schema ``model-sample-performance/2`` (``_schema_2``), the report file of the same run as the mode
+    wrote it before it took the GPU side of a step from the traced request, schema ``model-sample-performance/1``: 17
+    sections and 10 statistics -- no ``per_kernel`` section, none of the six statistics of the GPU side, a ``traced``
+    section of seven entries that says GPU busy was not taken, and the definition of the step with the sentence that
+    said so."""
     import copy
 
     older = copy.deepcopy(data)
@@ -1101,10 +1140,11 @@ def _schema_1(data):
 
 def _schema_2(data):
     """The report file of the same run as the mode wrote it while launch overhead was the median step less the median GPU
-    busy less the median host time, schema ``model-sample-performance/2``: the sections and the statistics of this
-    version, and a ``launch_overhead`` of seven entries -- no label, no count, median, mean, extremes or percentiles
-    of per-step remainders -- whose remainder is the difference of the three medians, under the definition that said
-    so.  The same field names as this version's, and other numbers behind them."""
+    busy less the median host time, schema ``model-sample-performance/2``: the sections and the statistics of the
+    file it is handed (this version's, or those of ``_schema_3``), and a ``launch_overhead`` of seven entries -- no
+    label, no count, median, mean, extremes or percentiles of per-step remainders -- whose remainder is the difference
+    of the three medians, under the definition that said so.  The same field names as that file's, and other numbers
+    behind them."""
     import copy
 
     older = copy.deepcopy(data)
@@ -1123,43 +1163,50 @@ def _schema_2(data):
 
 def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_path):
     """The report file names its schema in its first field, and the screen is rendered from the data of a file of that
-    schema alone.  Handed a file of another schema -- the file of the same run as the mode wrote it before it took the
-    GPU side of a step, read back from disk; the file as it was while launch overhead came from three medians, whose
-    every field name this version reads; a file of this version's own shape under the next name and under a name of
-    something else; a file that names no schema; something that is no report file -- ``perf.screen`` renders nothing and
-    says so in one sentence that names both schemas: a ``ValueError``, never the ``KeyError`` of an entry the other
-    schema does not have."""
+    schema alone.  Handed a file of another schema -- the file of the same run as the mode wrote it before it observed
+    the GPU, as it was while launch overhead came from three medians, and as the mode wrote it before it took the GPU
+    side of a step, each read back from disk; this version's own file with the launch overhead of three medians under
+    that file's name, whose every field name this version reads; a file of this version's own shape under the next
+    name and under a name of something else; a file that names no schema; something that is no report file --
+    ``perf.screen`` renders nothing and says so in one sentence that names both schemas: a ``ValueError``, never the
+    ``KeyError`` or the ``TypeError`` of an entry the other schema does not have."""
     from model_samples import perf
 
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)
     data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
-    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/3"
+    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/4"
     _says("area", f"The file's first field names its schema, `{perf.SCHEMA}`.")
     assert perf.screen(data) == perf.screen(outcome.data) and perf.screen(data)[0] in lines, "a file of this schema is rendered: the screen of its run"
     _says("area", "The screen is rendered from the data of a file of this schema (`screen` in `model_samples/perf.py`);")
-    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/3'"
+    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/4'"
 
     def refused(file):
         with pytest.raises(ValueError) as said:  # a KeyError is not one: it would pass through and fail the test
             perf.screen(file)
         return str(said.value)
 
-    # the file of the version before: written and read back as a file, 17 sections and 10 statistics where this version has 18 and 16
-    older = _schema_1(data)
-    assert (len(older), len(older["statistics"]), len(data), len(data["statistics"])) == (17, 10, 18, 16)
+    # the files of the three versions before, each written and read back as a file: 18 sections and 16 statistics twice, and 17 and 10,
+    # where this version has 18 and 17
+    third = _schema_3(data)
+    second = _schema_2(third)
+    older = _schema_1(second)
+    assert [(len(file), len(file["statistics"])) for file in (older, second, third, data)] == [(17, 10), (18, 16), (18, 16), (18, 17)]
     assert list(older["traced"])[-2:] == ["gpu_busy_ms", "gpu_busy_reason"] and len(older["traced"]) == 7
-    assert perf.write_report(str(tmp_path / "older.json"), older) == ""
-    read = json.loads((tmp_path / "older.json").read_text(encoding="utf-8"))
-    assert read == older and "per_kernel" not in read and "gpu_busy" not in read["statistics"], "what the screen of this version would look for"
-    assert refused(read) == refusal.format("'model-sample-performance/1'")
-    assert refused(read).count("model-sample-performance/") == 2 and "\n" not in refused(read), "one sentence, both names"
+    assert list(third) == list(second) == list(data) and len(third["observation"]) == 5 and list(third["protocol"]["in_a_timed_request"])[-1] == "text"
+    for number, file in ((1, older), (2, second), (3, third)):
+        assert file["schema"] == f"model-sample-performance/{number}" and perf.write_report(str(tmp_path / f"schema_{number}.json"), file) == ""
+        read = json.loads((tmp_path / f"schema_{number}.json").read_text(encoding="utf-8"))
+        assert read == file and read["observation"]["other_compute_processes"] is None, "what the screen of this version would take apart"
+        assert refused(read) == refusal.format(f"'model-sample-performance/{number}'")
+        assert refused(read).count("model-sample-performance/") == 2 and "\n" not in refused(read), "one sentence, both names"
+    assert "per_kernel" not in older and "gpu_busy" not in older["statistics"], "and what it would look for"
     # the file that took launch overhead from three medians: every section, every statistic and every field name this version reads is
     # there, and the numbers behind three of them are others -- it is refused by its name, not rendered under this version's
-    second = _schema_2(data)
-    assert (len(second), len(second["statistics"]), list(second)) == (18, 16, list(data)) and perf.write_report(str(tmp_path / "second.json"), second) == ""
-    was, now = second["statistics"]["launch_overhead"], data["statistics"]["launch_overhead"]
+    as_two = _schema_2(data)
+    assert (len(as_two), len(as_two["statistics"]), list(as_two)) == (18, 17, list(data)) and perf.write_report(str(tmp_path / "as_two.json"), as_two) == ""
+    was, now = as_two["statistics"]["launch_overhead"], data["statistics"]["launch_overhead"]
     assert set(now) - set(was) == {"label", "n", "median", "mean", "minimum", "maximum", "p90", "p99"} and not set(was) - set(now)
-    assert refused(json.loads((tmp_path / "second.json").read_text(encoding="utf-8"))) == refusal.format("'model-sample-performance/2'")
+    assert refused(json.loads((tmp_path / "as_two.json").read_text(encoding="utf-8"))) == refusal.format("'model-sample-performance/2'")
     form = _checkpoint_form()  # made-up parts: a median step of 400 ms with medians of 80 and 40 beside it, a mean step of 410 with means of 82 and 41
     was, now = _schema_2(form)["statistics"]["launch_overhead"], form["statistics"]["launch_overhead"]
     assert (was["remainder_ms"], was["value"]) == (280.0, 280.0) and (now["remainder_ms"], now["value"]) == (287.0, 287.0), "one field name, two numbers"
@@ -1551,8 +1598,9 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
     # form A: the step, its mean taken apart, the line that calls launch overhead an estimate, the traced steps and the note
     lines = perf.screen(_checkpoint_form())
     at = lines.index("step                  400.000  ms; mean 410.000 = GPU busy 82.000 + launch overhead 287.000 + host 41.000")
-    assert lines[at + 1 : at + 4] == [
+    assert lines[at + 1 : at + 5] == [
         "                      launch overhead: an estimate (GPU busy is the traced request's and an upper bound)",
+        "                      median of the per-step remainders: 285.000 ms (launch overhead is their mean)",
         "                      (GPU busy from 51 traced steps, positions 58 to 108; median 80.000 ms;",
         "                      tracing lengthens a step by 5.0 %)",
     ]
@@ -1574,12 +1622,11 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
         "                      tracing lengthens a step by 5.0 %)",
     ]
     assert not any(
-        line.startswith("note ") or "launch overhead 127" in line or "estimate" in line for line in bound
+        line.startswith("note ") or "launch overhead 127" in line or "127.000" in line or "estimate" in line for line in bound
     ), "the remainder is in the file, not on the screen"
-    assert (
-        bound[at + 5].startswith("with draft tokens ")
-        and _gpu_side(_checkpoint_form(), busy=240.0, term=False)["statistics"]["launch_overhead"]["remainder_ms"] == 127.0
-    )
+    assert not any("remainders" in line or "125.000" in line for line in bound), "nor its median: no figure of it under a sentence that says not resolved"
+    unresolved = _gpu_side(_checkpoint_form(), busy=240.0, term=False)["statistics"]["launch_overhead"]
+    assert bound[at + 5].startswith("with draft tokens ") and (unresolved["remainder_ms"], unresolved["median"]) == (127.0, 125.0), "both are in the file"
     unformed = perf.screen(_gpu_side(_checkpoint_form(), stretch=None))
     at = unformed.index(
         "                      (GPU busy from 51 traced steps, positions 58 to 108; median 80.000 ms;"
@@ -1691,6 +1738,7 @@ def test_the_remainder_is_formed_step_by_step_before_it_is_aggregated():
     assert (overhead["n"], overhead["value"]) == (1, pytest.approx(7.0)) and terms(stats) == pytest.approx((10.0, 2.0, 7.0, 1.0))
     assert lines[0] == "step                  10.000  ms; mean 10.000 = GPU busy 2.000 + launch overhead 7.000 + host 1.000"
     assert lines[2:] == [
+        "                      median of the per-step remainders: 7.000 ms (launch overhead is their mean)",
         "                      (GPU busy from the traced step, position 0; median 2.000 ms;",
         "                      tracing lengthens a step by 0.0 %)",
     ]
@@ -1726,6 +1774,97 @@ def test_the_remainder_is_formed_step_by_step_before_it_is_aggregated():
     _says("guide", "and their difference can be a time no step has.")
     _says("guide", "Where its terms are printed as a sum they are the means over the same steps, so that a reader can add them up,")
     _says("guide", "and it is called an estimate: the two sides are two requests.")
+
+
+def test_one_stalled_step_moves_the_mean_and_not_the_median():
+    """The launch overhead of a run is the MEAN of the per-step remainders, so that the terms of the ``step`` line add
+    up -- and a mean moves with one stalled step.  The line therefore prints their median beside it: under the line
+    that calls launch overhead an estimate, where it says that launch overhead is their mean, and nowhere else.  One
+    timed step of twenty that stalls makes the term large and leaves the median where it was, and both are printed.
+    One stalled step of the traced request takes the term away and leaves the median where it was -- in the file: the
+    line then says that launch overhead and host are not resolved, and no figure of the remainder stands under that
+    sentence, its median neither, which would read there as the resolved figure the sentence denies.  The figure is
+    the one the report file already holds (``launch_overhead.median``), in either form: the screen is rendered from
+    the file, and the file does not change.  Every number of this test is constructed, none is a run's."""
+    from model_samples import perf
+
+    def run(insides, busy):
+        steps = len(busy)
+        timed = [_stepped([1.0] * steps, of) for of in insides]  # per step 1 ms of the loop's host time, then the time from its launch to its read
+        stats = perf._statistics(timed, steps, 1, "", busy=busy, traced=_stepped([1.0] * steps, [1.0] * steps, "traced"), calls=10)
+        overhead = stats["launch_overhead"]
+        assert stats["step"]["mean"] == pytest.approx(stats["gpu_busy"]["mean"] + overhead["remainder_ms"] + stats["host"]["mean"]), "the terms add up"
+        return stats, overhead, perf._step_lines(stats, {"steps": steps, "first_position": 0, "last_position": steps - 1}, "")
+
+    def printed(lines):
+        (line,) = [line for line in lines if "per-step remainders" in line]
+        return float(re.fullmatch(r" {22}median of the per-step remainders: (-?\d+\.\d{3}) ms \(launch overhead is their mean\)", line).group(1))
+
+    def unprinted(lines):  # the form that says not resolved: its lines as they are without the line, and no figure of a remainder on any
+        return len(lines) == 5 and not any("remainders" in line or "median of" in line or "their mean" in line or "estimate" in line for line in lines)
+
+    # no step stalls: two timed requests of ten steps, each step 2 ms of GPU busy and 1 ms beside it and the host time
+    stats, overhead, lines = run([[3.0] * 10, [3.0] * 10], [2.0] * 10)
+    assert (overhead["n"], overhead["median"], overhead["remainder_ms"]) == (20, pytest.approx(1.0), pytest.approx(1.0)) and overhead["value"] is None
+    unresolved = [
+        "                      launch overhead and host together: not resolved by this method",
+        "                      (GPU busy from 10 traced steps, positions 0 to 9; median 2.000 ms;",
+    ]
+    assert lines[0] == "step                  4.000  ms (not traced), mean 4.000" and lines[2:4] == unresolved
+    assert unprinted(lines) and not any("1.000" in line for line in lines), "not resolved: the median of the remainders, 1 ms, is in the file and on no line"
+    # ONE timed step of the twenty stalls for 400 ms between its launch and its read
+    stats, overhead, lines = run([[3.0] * 10, [3.0] * 4 + [403.0] + [3.0] * 5], [2.0] * 10)
+    assert (overhead["n"], overhead["maximum"], overhead["p90"]) == (20, pytest.approx(401.0), pytest.approx(1.0)), "nineteen steps leave 1 ms, one 401"
+    assert overhead["value"] == overhead["remainder_ms"] == overhead["mean"] == pytest.approx(21.0), "(19 x 1 + 401) / 20: a term, larger than GPU busy"
+    assert overhead["median"] == pytest.approx(1.0) and stats["step"]["value"] == pytest.approx(4.0), "the medians do not move: of the remainders, of the step"
+    assert lines[:4] == [
+        "step                  4.000  ms; mean 24.000 = GPU busy 2.000 + launch overhead 21.000 + host 1.000",
+        "                      launch overhead: an estimate (GPU busy is the traced request's and an upper bound)",
+        "                      median of the per-step remainders: 1.000 ms (launch overhead is their mean)",
+        "                      (GPU busy from 10 traced steps, positions 0 to 9; median 2.000 ms;",
+    ], "the mean-based term, large, and under the line that calls it an estimate the median, small: both printed, each named"
+    assert printed(lines) == round(overhead["median"], 3) == 1.0 and "launch overhead 21.000" in lines[0], "the file's own figures"
+    # ONE step of the traced request stalls instead (400 ms more GPU busy at one position): no term, and the median as before
+    stats, overhead, lines = run([[3.0] * 10, [3.0] * 10], [2.0] * 9 + [402.0])
+    assert overhead["remainder_ms"] == pytest.approx(-39.0) and overhead["value"] is None, "(18 x 1 - 2 x 399) / 20, beside a mean GPU busy of 42"
+    assert lines[1] == "                      mean GPU busy 42.000 ms in a traced request (an upper bound: tracing lengthens kernels)"
+    assert lines[2:4] == unresolved and unprinted(lines), "the sentence, and under it the traced steps: no line between them"
+    assert (overhead["n"], overhead["median"], overhead["minimum"]) == (20, pytest.approx(1.0), pytest.approx(-399.0)), "the file holds the median as before"
+    assert not any("39" in line or "1.000" in line for line in lines), "the mean of the remainders and their median are in the file, not on the screen"
+    # a median below zero is printed as it is, beside the estimate; one that rounds to zero carries no sign
+    stats, overhead, lines = run([[2.0, 2.0, 108.0]], [8.0] * 3)  # the remainders: -6, -6 and 100 ms
+    assert overhead["value"] == pytest.approx(88 / 3) and overhead["median"] == pytest.approx(-6.0) and printed(lines) == -6.0
+    stats, overhead, lines = run([[2.0, 2.0, 102.0004]], [2.0004] * 3)  # the remainders: twice just below zero, and 100 ms
+    assert overhead["value"] is not None and -0.001 < overhead["median"] < 0
+    assert lines[2] == "                      median of the per-step remainders: 0.000 ms (launch overhead is their mean)"
+    # every remainder below zero: not resolved, and the median, -6 ms in the file, is on no line
+    stats, overhead, lines = run([[2.0] * 3], [8.0] * 3)
+    assert overhead["value"] is None and overhead["median"] == pytest.approx(-6.0) and unprinted(lines) and not any("6.000" in line for line in lines)
+    # GPU busy not measured: no remainder was formed, and no line gives a median of none
+    unseen = perf._statistics([_stepped([1.0] * 3, [3.0] * 3)], 0, 1, "", unmeasured="this PyTorch build records no kernel activity")
+    assert "median" not in unseen["launch_overhead"] and unseen["launch_overhead"]["n"] == 0
+    bare = perf._step_lines({**unseen}, {"steps": 0, "first_position": None, "last_position": None, "gpu_busy_reason": "not observed"}, "")
+    assert len(bare) == 1 and "remainders" not in bare[0] and "GPU busy not measured (not observed)" in bare[0]
+    # on the whole screen: the line stands between the estimate and the traced steps; where the term is not printed the screen has no such line
+    lines = perf.screen(_gpu_side(_checkpoint_form(), middle=3.5))
+    at = lines.index("                      launch overhead: an estimate (GPU busy is the traced request's and an upper bound)")
+    assert lines[at + 1] == "                      median of the per-step remainders: 3.500 ms (launch overhead is their mean)"
+    assert lines[at - 1].endswith("+ launch overhead 287.000 + host 41.000") and lines[at + 2].startswith(" " * 22 + "(GPU busy from 51 traced steps")
+    for middle in (-3.5, 3.5, 125.0):  # whatever the file's median is, below zero or above: it is not printed under that sentence
+        held = _gpu_side(_checkpoint_form(), busy=240.0, term=False, middle=middle)
+        bound = perf.screen(held)
+        at = bound.index("                      launch overhead and host together: not resolved by this method")
+        assert bound[at + 1] == "                      (GPU busy from 51 traced steps, positions 58 to 108; median 240.000 ms;"
+        assert not any("remainders" in line or f"{abs(middle):.3f}" in line for line in bound) and held["statistics"]["launch_overhead"]["median"] == middle
+    wide = _gpu_side(_data(), busy=123456.789, host=1234.567, mean=987654.321)  # a reduced model, six-digit values: no line wider than the screen
+    assert max(len(line) for line in perf.screen(wide)) <= perf.WIDTH and sum("per-step remainders" in line for line in perf.screen(wide)) == 1
+    wide = _gpu_side(_data(), busy=654321.789, term=False, host=1234.567, mean=987654.321)  # the same where the rest is not resolved: no such line
+    assert max(len(line) for line in perf.screen(wide)) <= perf.WIDTH and not any("remainders" in line for line in perf.screen(wide))
+    _says("area", "Under the line that calls launch overhead an estimate, and only there, a line gives the median of the per-step remainders:")
+    _says("area", "one stalled step moves their mean -- the launch overhead of the equation -- and not their median.")
+    _says("area", "Where the line says that launch overhead and host are not resolved it prints no figure of the remainder, its median neither:")
+    _says("area", "its median neither: the file holds both.")
+    _says("guide", "The median of the per-step values is printed beside it: one stalled step moves a mean and not a median.")
 
 
 def test_rows_by_wiring_position_not_by_name(monkeypatch):
@@ -1785,24 +1924,49 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
     ]
     assert perf._kernel_lines(quiet, "")[6] == f"  {'beside its kernel: both':<58}{0:>9}{'--':>11}{0.0:>9.3f}{'0.0 %':>9}", "a row of the plan, printed"
     # what serves a row is decided from the census entries of ALL its block calls: one library entry names the row; a block whose calls two
-    # entries serve is named by neither, and a kernel of cuDNN Frontend is no library's -- at another call of the block, or in the same call
+    # entries serve is named by neither, and a kernel of cuDNN Frontend is no library's -- at another call of the block, or in the same call --
+    # nor is an operator of PyTorch that a call launches beside the library's kernel
     library = (census.Kernel("cublaslt_fp8_gemm", "FlashInfer", "exact", launches=1),)
     second = ((census.Kernel("fi_mm_fp4", "FlashInfer", "exact", launches=1),), "another.library.call")
     own = (census.Kernel("fp8_projection", "cuDNN FE", "exact", launches=1),)
+    operator = (census.Kernel("embedding_gather", "PyTorch", "exact", launches=1),)
     cases = [[(library, "a.library.call")] * 2, [(library, "a.library.call"), second], [(library, "a.library.call"), (own, "an entry")]]
-    cases += [[(library + own, "a.library.call")] * 2]
+    cases += [[(library + own, "a.library.call")] * 2, [(library + operator, "a.library.call")] * 2]
     named = []
     for calls in cases:
         served = [census.Site("p", layer, kernels, entry=name) for layer, (kernels, name) in enumerate(calls)]
         row = perf.kernel_table(*_walked(served, [_records(served)]))["rows"][0]
         named.append((row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]))
-    assert named == [("a.library.call: p", "library", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 4, 4)]
+    assert named == [("a.library.call: p", "library", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 2, 2), ("p", "exact", 4, 4), ("p", "exact", 4, 4)]
+    assert set(perf.OWN_ORIGINS) == {"cuDNN FE", "PyTorch"} == {kernel.origin for kernel in own + operator}, "the two origins that are no library's"
+    # a name longer than its column -- a block's own, or a library's entry in front of its block -- is cut at the column: the columns behind it
+    # stay where they are and no line is wider than the screen; the file's row still names the block and its entry in full
+    long_block = "a_block_whose_name_alone_is_longer_than_the_column_of_the_names"
+    long_entry = "a.library.call.as.the.plan.names.it + another.call.of.the.library"
+    wide = [_site(long_block, 0, "gate_quant"), census.Site("p", 0, library, entry=long_entry)]
+    cut = perf.kernel_table(*_walked(wide, [_records(wide)]))
+    assert len(long_block) > perf.LABEL < len(f"{long_entry}: p") and perf.LABEL == 58
+    assert [(row["label"], row["relation"]) for row in cut["rows"][:2]] == [(long_block[:58], "exact"), (f"{long_entry}: p"[:58], "library")]
+    assert [(row["blocks"][0]["block"], row["blocks"][0]["entry"]) for row in cut["rows"][:2]] == [(long_block, f"entry of {long_block}"), ("p", long_entry)]
+    shown = perf._kernel_lines(cut, "")
+    assert shown[3] == f"  {long_block[:58]}{1:>9}{'4.30':>11}{0.004:>9.3f}{'33.3 %':>9}", "the columns behind a name that fills its column"
+    assert len({len(line) for line in shown[3:]}) == 1 and max(len(line) for line in shown) <= perf.WIDTH, "every row in its columns, no line too wide"
+    # the row of a wiring gap is cut at the same column, behind what the row is: one block of a long name, and two whose first name is long
+    gaps = [_site("first", 0, "gate_quant"), _site(long_block, 0, "pytorch"), _site("second", 0, "gate_quant")]
+    gaps += [_site(long_block, 1, "cublas"), _site("tail", 1, "pytorch")]
+    gap = perf.kernel_table(*_walked(gaps, [_records(gaps)]))
+    assert len(f"fallback: {long_block}") > perf.LABEL and [row["relation"] for row in gap["rows"]] == ["exact", "exact", "fallback", "fallback", "read"]
+    assert [row["label"] for row in gap["rows"][2:4]] == [f"fallback: {long_block}"[:58]] * 2, "the name alone, and `+ 1 more (one row)` behind it: cut alike"
+    assert [[block["block"] for block in row["blocks"]] for row in gap["rows"][2:4]] == [[long_block], [long_block, "tail"]], "the file names every block"
+    shown = perf._kernel_lines(gap, "")
+    assert shown[5].startswith(f"  {f'fallback: {long_block}'[:58]}{2:>9}{'--':>11}") and len({len(line) for line in shown[3:]}) == 1
+    assert max(len(line) for line in shown) <= perf.WIDTH, "every row in its columns, no line too wide"
     # the family's plan: 64 layers on the stack native -- the exact rows in the wiring order, each with its planned launches; the row of a block
     # a library serves carries the library's entry as the plan names it, and holds the launches of the library's kernel
     sites, claim = _planned(monkeypatch)
     traced, busy = _walked(sites, [_records(sites)], claim)
     rows = perf.kernel_table(traced, busy)["rows"]
-    exact = [(row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows[:9]]
+    exact = [(row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows[:10]]
     assert exact == [
         ("embedding", "exact", 1, 1),
         ("add_norm_quantize", "exact", 129, 129),
@@ -1811,21 +1975,22 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         ("flashinfer.gemm.bmm_fp8: projection.fp8.out", "library", 64, 64),
         ("mlp.gate_up", "exact", 64, 64),
         ("flashinfer.gemm.mm_fp4: mlp.down", "library", 64, 64),
+        ("attention.prepare", "exact", 16, 16),
         ("attention.gate_quantize", "exact", 16, 16),
         ("torch_ref.quantize + flashinfer.gemm.mm_fp4: output_head", "library", 1, 1),
     ]
-    assert not [row["label"] for row in rows[9:] if row["relation"] in ("exact", "library")]
+    assert not [row["label"] for row in rows[10:] if row["relation"] in ("exact", "library")]
     three = "the target's own compiled kernels + cuDNN Frontend entries with byte-equal results + declared stand-ins"
     numbers = claim.numbers()
-    assert sum(planned for *_, planned in exact) == traced.result.exact == numbers["target_code"] + numbers["target_port"] == 178 + 273 + 0, three
+    assert sum(planned for *_, planned in exact) == traced.result.exact == numbers["target_code"] + numbers["target_port"] == 178 + 289 + 0, three
     assert sum(planned for _, kind, _, planned in exact if kind == "library") == 64 + 64 + 1, "one launch of the library per call of its three blocks"
     assert rows[1]["blocks"] == [{"block": "add_norm_quantize", "calls_per_step": 129, "entry": "cudnn.AddNormQuantDecode", "identity": "target"}]
     assert rows[4]["blocks"] == [{"block": "projection.fp8.out", "calls_per_step": 64, "entry": "flashinfer.gemm.bmm_fp8", "identity": "target"}]
     # the file says which kernel the library launched for its row, by the name the profiler gave it, and how often in a step
     assert [(shape["symbol"], shape["launches"]) for shape in rows[4]["launch_shapes"]] == [(NVJET_FP8, 64)]
-    assert [(shape["symbol"], shape["launches"]) for shape in rows[6]["launch_shapes"]] == [(FI_MM_FP4, 64)] and rows[8]["launch_shapes"][0]["launches"] == 1
+    assert [(shape["symbol"], shape["launches"]) for shape in rows[6]["launch_shapes"]] == [(FI_MM_FP4, 64)] and rows[9]["launch_shapes"][0]["launches"] == 1
     printed = perf._kernel_lines(perf.kernel_table(traced, busy), "")
-    assert printed[9] == f"  {'flashinfer.gemm.mm_fp4: mlp.down':<58}{64:>9}{'4.30':>11}{0.275:>9.3f}{'9.7 %':>9}", "one kernel per launch: its time per launch"
+    assert printed[9] == f"  {'flashinfer.gemm.mm_fp4: mlp.down':<58}{64:>9}{'4.30':>11}{0.275:>9.3f}{'9.9 %':>9}", "one kernel per launch: its time per launch"
     # the stack fe-entries: the cuDNN Frontend rows of native and no library -- no row of that kind, and the exact rows it had before
     sites, claim = _planned(monkeypatch, "fe-entries")
     traced, busy = _walked(sites, [_records(sites)], claim)
@@ -1837,9 +2002,10 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         ("projection.fp8.in", 64, 64),
         ("linear_attention.step", 48, 48),
         ("mlp.gate_up", 64, 64),
+        ("attention.prepare", 16, 16),
         ("attention.gate_quantize", 16, 16),
     ]
-    assert traced.result.exact == 49 + 273 + 0, three
+    assert traced.result.exact == 49 + 289 + 0, three
     assert rows[-1]["label"] == "host read" and rows[-1]["launches_per_step"] == 1 and rows[-1]["blocks"] == []
     _defines("kernel_launches", "the kernel and copy records of a traced step that the kernel check attributes to the row's blocks; the median per step.")
     _corresponds("kernel_launches", "The kernel census of a traced serving step.")
@@ -1915,27 +2081,27 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
         ("beside its kernel: both", "beside"),
         ("host read", "read"),
     ]
-    # the family's plan: the attention preparation and the attention core of a layer have no exact kernel between them.  On the stack native
+    # the family's plan: the attention preparation is an exact row, and the attention core behind it a fallback row of its own.  On the stack native
     # three blocks are a library's: what their calls launch beside the library's kernel -- a further launch of the library's choice behind the
     # out-projection, the reference quantiser in front of the output head's multiply -- is the row of its place in the wiring, and says so
     sites, claim = _planned(monkeypatch)
     table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
     rows = table["rows"]
-    behind = [(row["label"], row["relation"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows[9:]]
+    behind = [(row["label"], row["relation"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows[10:]]
     assert behind == [
         ("beside its kernel: projection.fp8.out", "beside", [64]),
-        ("not yet: attention.prepare + attention.core (one row)", "fallback", [16, 16]),
+        ("not yet: attention.core", "fallback", [16]),
         ("beside its kernel: output_head", "beside", [1]),
         ("beside its kernel: output_head + token_choice (one row)", "beside", [1, 1]),
         ("host read", "read", []),
     ]
     assert not [label for label, *_ in behind if label.startswith("fallback: ")], "no block of this plan is without a stated identity"
-    assert rows[10]["blocks"][0]["identity"].startswith("not yet (") and rows[12]["blocks"] == [
+    assert rows[11]["blocks"][0]["identity"].startswith("not yet (") and rows[13]["blocks"] == [
         {"block": "output_head", "calls_per_step": 1, "entry": "torch_ref.quantize + flashinfer.gemm.mm_fp4", "identity": "target"},
         {"block": "token_choice", "calls_per_step": 1, "entry": "torch.argmax", "identity": "host path, not compared"},
     ]
     printed = perf._kernel_lines(table, "")
-    assert printed[14] == f"  {'beside its kernel: output_head':<58}{1:>9}{'--':>11}{0.004:>9.3f}{'0.2 %':>9}", "no time per launch: a chain"
+    assert printed[15] == f"  {'beside its kernel: output_head':<58}{1:>9}{'--':>11}{0.004:>9.3f}{'0.2 %':>9}", "no time per launch: a chain"
     assert sum(row["launches_per_step"] for row in rows) == len(_records(sites)), "the rows hold every record of the step, the library's among them"
     # the stack fe-entries: those three blocks are on their fallback rows there, and the census says `not yet` of them
     sites, claim = _planned(monkeypatch, "fe-entries")
@@ -1944,11 +2110,11 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     assert behind == [
         ("not yet: projection.fp8.out", [64]),
         ("not yet: mlp.down", [64]),
-        ("not yet: attention.prepare + attention.core (one row)", [16, 16]),
+        ("not yet: attention.core", [16]),
         ("not yet: output_head + token_choice (one row)", [1, 1]),
         ("host read", []),
     ]
-    assert rows[8]["blocks"][0]["identity"].startswith("not yet (") and rows[9]["blocks"][1] == {
+    assert rows[9]["blocks"][0]["identity"].startswith("not yet (") and rows[10]["blocks"][1] == {
         "block": "token_choice",
         "calls_per_step": 1,
         "entry": "torch.argmax",
@@ -2141,10 +2307,11 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     assert [(row["launches_per_step"], row["planned_launches_per_step"]) for row in exact] == [(1, 1), (1, 1)], "as the kernel check counted them"
     assert all(row["us_per_launch_added"] == pytest.approx(0.4375) and row["us_per_launch_recorded"] == 0.4375 for row in data["per_kernel"]["rows"])
     step, stats = lines.index(_line(lines, "step  ")), data["statistics"]
-    said = " ".join(line.strip() for line in lines[step : step + 5])
+    said = " ".join(line.strip() for line in lines[step : step + 6])
     assert " ms; mean " in said and " = GPU busy 0.017 + launch overhead " in said, "the mean of the step taken apart"
-    assert f" launch overhead: {perf.ESTIMATE} (GPU busy from 6 traced steps, positions 5 to 10; median 0.017 ms; tracing lengthens a step by " in said
     overhead, calls = stats["launch_overhead"], len(_tiny_model().wiring())
+    middle = f"median of the per-step remainders: {overhead['median']:.3f} ms (launch overhead is their mean)"
+    assert f" launch overhead: {perf.ESTIMATE} {middle} (GPU busy from 6 traced steps, positions 5 to 10; median 0.017 ms; tracing lengthens a step by " in said
     assert overhead["value"] == overhead["remainder_ms"] == overhead["mean"] > 0.017 and overhead["label"] == perf.ESTIMATE
     assert overhead["n"] == stats["step"]["n"] == stats["host"]["n"] == 2 * 6, "every timed step at a traced position: two requests of six"
     assert stats["step"]["mean"] == pytest.approx(
@@ -2401,10 +2568,9 @@ def test_perf_main_on_cpu(monkeypatch, capsys, tmp_path):
     assert lines[report + 1].startswith("record class          orientation, not a number of record: reduced model; ")
     assert "model       qwen_dense, reduced model, 2 layers | 1 sequence | greedy" in lines[report:]
     gpu = lines.index("GPU         stated device, compute capability 10.0, 148 SMs")
-    assert lines[gpu + 1 : gpu + 3] == [
-        "            other compute processes: not observed (this version)",
-        "            clocks observed: no (this version does not observe the GPU)",
-    ]
+    assert lines[gpu + 1] == "            other compute processes: not observed (nvidia-smi not found)"
+    load = r"host load \d+\.\d on \d+ cores?" if hasattr(os, "getloadavg") else "host load not observed"  # read also where the driver cannot be asked
+    assert re.fullmatch(r" {12}clocks observed: no \(nvidia-smi not found\) \| " + load, lines[gpu + 2]), lines[gpu + 2]
     assert "protocol    warm-up 2 steps | timed 6 steps x 2, end token ignored | launched from Python, not captured" in lines[report:]
     assert any(line.startswith("text out              sequence 0, 7 tokens (seeded weights: not language): ") for line in lines[report:])
     assert not any(
@@ -2726,16 +2892,17 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
     # what the mode never prints: not one line of a run of it, nor its file, holds these words, and what it does not observe it says so
     outcome, lines, _, _ = _mode(monkeypatch, tmp_path)
     printed = "\n".join(lines) + json.dumps(outcome.data)
-    for word in ("locked", "none seen", "speed-up", "baseline", "faster", "slower"):
+    for word in ("locked", "speed-up", "baseline", "faster", "slower"):
         assert word not in printed, word
-    assert "            other compute processes: not observed (this version)" in lines and outcome.data["observation"]["clocks"] is None
+    assert "none seen" not in "\n".join(lines), "a run that could not ask the driver says so"
+    assert "            other compute processes: not observed (no CUDA device)" in lines and outcome.data["observation"]["clocks"]["verdict"] == "no"
     _says("guide", "Another process, the clock and a limit reason are observed or printed as not observed;", "the report never prints the word 'locked'.")
     _says("guide", "`none seen` is printed only when the run's own process is in the driver's list;")
     _says("guide", "A report holds no speed-up, no baseline and no figure of a second GPU class.")
-    _says("area", "No version of the mode observes the GPU's other processes or its clock yet (`not observed`, never assumed)")
+    _says("area", "What a run could not observe of the GPU's other processes or of its clock is `not observed`, never assumed,")
     # the flag table of the family README: every flag of the mode, with the parser's default
     sample_flags = dict(re.findall(r"^\| `(--perf[a-z-]*)(?: [A-Z]+)?` \| ([^|]*) \|", family, flags=re.MULTILINE))
-    assert set(sample_flags) == {"--perf", "--perf-warmup", "--perf-steps", "--perf-requests", "--perf-report", "--perf-trace-records"}
+    assert set(sample_flags) == {"--perf", "--perf-warmup", "--perf-steps", "--perf-requests", "--perf-report", "--perf-trace-records", "--perf-clock-lock"}
     assert (
         sample_flags["--perf-warmup"].strip() == "`32`" and sample_flags["--perf-steps"].strip() == "`256`" and sample_flags["--perf-requests"].strip() == "`3`"
     )
@@ -2760,18 +2927,13 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
     section = area.split("## The performance mode\n", 1)[1].split("\n## ", 1)[0]
     example = section.split("```text\n", 1)[1].split("```", 1)[0].splitlines()
     # the stack the example names, native: its three numbers and its providers with the rows a library serves (the test of the kernels lines)
-    target = {"stated": True, "declared": True, "on_target": 451, "launches": 484, "code": 178, "port": 273, "stand_ins": 0}
-    target.update(by_provider={"cuDNN Frontend": 321, "FlashInfer": 129, "PyTorch": 1}, fallback_calls=32, kernels_per_step=2908, copies_per_step=200)
-    today = [
-        "fallback rows present",
-        "kernel identity not claimed on this GPU class",
-        "launched from Python",
-        "other processes not observed",
-        "clocks not observed",
-    ]
+    target = {"stated": True, "declared": True, "on_target": 467, "launches": 484, "code": 178, "port": 289, "stand_ins": 0}
+    target.update(by_provider={"cuDNN Frontend": 337, "FlashInfer": 129, "PyTorch": 1}, fallback_calls=16, kernels_per_step=2908, copies_per_step=200)
+    today = ["fallback rows present", "kernel identity not claimed on this GPU class", "launched from Python"]
     sites, claim = _planned(monkeypatch)  # the family's own plan, 64 layers: the rows of the example's table
     table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
     form = _checkpoint_form(kernels={**target, "absent": 1}, checks={"positions_text": "0-15, 63, 64, 312, 313"}, record={"reasons": today}, per_kernel=table)
+    form["observation"] = _alone()  # the example is a run that had its GPU to itself
     form["memory"].update(weights_gib=37.3, state_gib=0.5, peak_reserved_gib=40.0)
     shown = perf.screen({**form, "report_file": "report-<UTC time>.json"})
 
@@ -2791,3 +2953,1066 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
     ):
         assert said in _flat(section), said
     assert "| `--perf`" in family and "The performance mode" in family
+
+
+# ---------------------------------------------------------------------------------------------- the observation of the GPU
+@pytest.fixture(autouse=True)
+def driver_tool_not_found(monkeypatch):
+    """No test of this module asks the driver of the host it runs on: the driver's tool is not found, unless a test brings
+    its own stand-in for it (``_tool``)."""
+    found = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name, *more, **named: None if name == "nvidia-smi" else found(name, *more, **named))
+
+
+# a stand-in for the driver's tool: it answers the queries of the observation from the file scenario.json beside it, in
+# loop mode a line every period until it is ended, and writes how it was called into calls.log and, where it ends because
+# it was asked to, its process id into ends.log
+_STAND_IN = """#!@PYTHON@ -IS
+import json, os, signal, sys, time
+
+here = os.path.dirname(os.path.abspath(__file__))
+
+
+def scenario():
+    with open(os.path.join(here, "scenario.json")) as file:
+        return json.load(file)
+
+
+def stamp():
+    at = time.time()
+    return time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(at)) + ".%03d" % int(at % 1 * 1000)
+
+
+def asked(*_):
+    with open(os.path.join(here, "ends.log"), "a") as log:
+        log.write(str(os.getpid()) + "\\n")
+    sys.exit(0)
+
+
+now = scenario()
+signal.signal(signal.SIGTERM, signal.SIG_IGN if now.get("deaf") else asked)
+with open(os.path.join(here, "calls.log"), "a") as log:
+    log.write(json.dumps({"pid": os.getpid(), "argv": sys.argv[1:]}) + "\\n")
+if now.get("unbound"):
+    import ctypes
+
+    ctypes.CDLL(None).prctl(1, 0)
+time.sleep(now.get("hang", 0))
+if now.get("exit"):
+    sys.stderr.write(now.get("stderr", ""))
+    sys.exit(now["exit"])
+query = next(word for word in sys.argv[1:] if word.startswith("--query-"))
+loop = next((int(word.split("=")[1]) for word in sys.argv[1:] if word.startswith("--loop-ms=")), None)
+while True:
+    now = scenario()
+    if query.startswith("--query-gpu=driver_version"):
+        rows = [now["device"]]
+    elif query.startswith("--query-gpu="):
+        rows = [[stamp(), *now["clock"]]]
+    else:
+        rows = [([stamp()] if "timestamp" in query else []) + [str(value) for value in row] for row in now["processes"]]
+    for row in rows + now.get("junk", []):
+        print(", ".join(row), flush=True)
+    if loop is None:
+        break
+    time.sleep(loop / 1000)
+"""
+
+
+def _scenario(folder, **changes):
+    """What the stand-in answers from now on: the device's line of a reading (driver, SM clock in MHz, memory in use in
+    MiB, utilisation), the fields of a clock sample behind its stamp, the list of compute processes (id, MiB) -- by
+    default this process alone, at rest -- and ``exit`` / ``stderr`` / ``hang`` / ``junk`` for a tool that fails, ``deaf``
+    for one that does not end when it is asked to, ``unbound`` for one that has cut itself loose from the process that
+    started it (on Linux: it is not ended by the kernel with that process)."""
+    made = {"device": ["000.00", "2000", "450", "9"], "clock": ["2000", "300.00", "0x0000000000000000"], "processes": [[os.getpid(), 400]], **changes}
+    (folder / "scenario.next").write_text(json.dumps(made), encoding="utf-8")
+    os.replace(folder / "scenario.next", folder / "scenario.json")  # a loop that reads meanwhile reads the old file or the new one
+
+
+def _tool(monkeypatch, tmp_path, **scenario):
+    """The stand-in for the driver's tool in a folder of the test, found as ``nvidia-smi``, and a GPU id for it: the
+    folder.  It is a real program, so the readings and the sampler's child process run as they do on a GPU.  The host's
+    load and its cores are stated too -- 4.5 at the first reading behind this call and 5.5 at every later one, on 70
+    cores: what a line of the screen has room for does not depend on the host a test runs on."""
+    from model_samples import observe
+
+    folder = tmp_path / "driver tool"
+    folder.mkdir(parents=True)
+    tool = folder / "nvidia-smi"
+    tool.write_text(_STAND_IN.replace("@PYTHON@", sys.executable), encoding="utf-8")
+    tool.chmod(0o755)
+    _scenario(folder, **scenario)
+    found = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name, *more, **named: str(tool) if name == "nvidia-smi" else found(name, *more, **named))
+    monkeypatch.setattr(observe, "target_of", lambda device: "GPU-00000000-stand-in")
+    loads = iter([[4.5, 4.0, 3.5]])
+    monkeypatch.setattr(observe, "host_load", lambda: next(loads, [5.5, 5.0, 4.5]))
+    monkeypatch.setattr(observe, "host_cores", lambda: 70)
+    return folder
+
+
+def _calls(folder):
+    """Every start of the stand-in so far: its process id and its arguments."""
+    log = folder / "calls.log"
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+
+
+class _Untouched:
+    """In the place of what the timing process has no business with between the sampler's start and its stop -- the
+    keeper's process object, the folder of its files: whatever is asked of it goes into ``order``."""
+
+    def __init__(self, order, what):
+        self._order, self._what = order, what
+
+    def __getattr__(self, name):
+        self._order.append((self._what, name))
+        return lambda *more, **named: None
+
+
+def _asked(folder):
+    """The process ids of the stand-in's starts that ended because they were asked to: not those that were killed."""
+    log = folder / "ends.log"
+    return {int(line) for line in log.read_text(encoding="utf-8").split()} if log.exists() else set()
+
+
+def _dense(monkeypatch, order, clock=((2000.0, 300.0, 0),), processes=None):
+    """In the place of the sampler's child process: its samples are made behind the run, one every 0.1 ms from its start
+    to its stop -- ``clock``: the (MHz, W, event bits) of the clock samples, taken in turn; ``processes``: the (id, MiB) of
+    every line of the process list, default this process alone -- so that a request of a few milliseconds has samples.
+    ``order`` gets ``"start"`` and ``"stop"``, and every use of the keeper or of its files (``_Untouched``)."""
+    from model_samples import observe
+
+    listed = [(os.getpid(), 400.0)] if processes is None else processes
+
+    class Dense:
+        def __init__(self, tool, target, period=observe.PERIOD_MS):
+            self.period, self.child, self.folder = period, _Untouched(order, "the keeper"), _Untouched(order, "the files")
+            self.clocks, self.processes, self.unread, self.started, self.stopped = [], [], 0, (0.0, 0.0), (0.0, 0.0)
+
+        def start(self):
+            order.append("start")
+            self.started = (time.time(), observe.now())
+            return ""
+
+        def stop(self):
+            order.append("stop")
+            self.stopped = (time.time(), observe.now())
+            for index in range(int((self.stopped[0] - self.started[0]) * 1e4) + 1):
+                at = self.started[0] + index * 1e-4
+                self.clocks.append(observe.Clock(at, *clock[index % len(clock)]))
+                self.processes.extend(observe.Seen(at, pid, mib) for pid, mib in listed)
+
+    monkeypatch.setattr(observe, "Sampler", Dense)
+
+
+def _observed(monkeypatch, tmp_path, lock=None, dense=True, scenario=None, clock=((2000.0, 300.0, 0),), processes=None, **options):
+    """One run of the mode (``_mode``, which takes ``options``) whose observer believes its session is on a GPU and asks
+    the stand-in: ``(outcome, lines, order, the stand-in's folder)``.  ``order`` holds, as they happened, every stamp
+    the mode took (``"stamp"``), every reading (``("read", when)``) and the start and the stop of the sampler; with
+    ``dense`` false the sampler is the real one, on the stand-in's loops.  ``order`` also gets what a run may not do: a
+    stamp taken while the process runs a thread that it did not run before the run (``("threads", how many)``: told
+    by the thread itself, not by a count, which a thread that ends meanwhile would leave unchanged), and a call of the
+    observer while a stage is open (``("inside the stage", name)``), whose seconds it would be counted into."""
+    from model_samples import observe, perf, timing
+
+    folder, order, stamp = _tool(monkeypatch, tmp_path, **(scenario or {})), [], perf.now
+    if dense:
+        _dense(monkeypatch, order, clock, processes)
+    threads, opened, stage = set(threading.enumerate()), [], timing.Stages.stage
+
+    def stamped():
+        order.append("stamp")
+        if set(threading.enumerate()) - threads:
+            order.append(("threads", len(set(threading.enumerate()) - threads)))
+        return stamp()
+
+    @contextlib.contextmanager
+    def staged(self, name):
+        opened.append(name)
+        try:
+            with stage(self, name):
+                yield
+        finally:
+            opened.pop()
+
+    monkeypatch.setattr(perf, "now", stamped)
+    monkeypatch.setattr(timing.Stages, "stage", staged)
+
+    class OnAGpu(observe.Observer):
+        def __init__(self, device, lock=lock):
+            super().__init__(torch.device("cuda", 0), lock)
+
+        def read(self, when):
+            order.extend(("inside the stage", name) for name in opened)
+            order.append(("read", when))
+            super().read(when)
+
+        def start(self):
+            order.extend(("inside the stage", name) for name in opened)
+            super().start()
+
+        def stop(self):
+            order.extend(("inside the stage", name) for name in opened)
+            super().stop()
+
+    monkeypatch.setattr(observe, "Observer", OnAGpu)
+    outcome, lines, _, _ = _mode(monkeypatch, tmp_path, **options)
+    return outcome, lines, order, folder
+
+
+def _alone():
+    """The observation of a run that had its GPU to itself: one reading at rest, twelve steady clock samples and this
+    process alone in the list during its one timed request, on a host of 70 cores."""
+    from model_samples import observe
+
+    reading = observe.Reading("behind the last timed request", listed=True, own=400.0, used=410.0, load=[5.5, 5.0, 4.5])
+    samples = [observe.Clock(1.0 + index / 100, 2000.0, 250.0, 0) for index in range(12)]
+    return {**observe.summary([reading], samples, [observe.Seen(1.5, 4242, 400.0)], [("timed", 1.0, 2.0)], 4242), "host": {"load": 5.5, "cores": 70}}
+
+
+def test_samples_cut_by_request_bounds(monkeypatch, tmp_path):
+    """Statistic 18 on constructed samples: a sample belongs to the request whose bounds hold its stamp, both ends
+    included, and to no request between two; per request the clock's count, minimum, median, mean and maximum, the share
+    below a declared lock, the power median, the limit reasons, the idle samples and the process list; the screen's
+    clock over the samples of the timed requests, pooled.  The bounds of a request come to the samples' clock through
+    one pair of clock readings, and a second pair shows a wall clock that was set meanwhile."""
+    from model_samples import observe
+
+    own = 4242
+    requests = [("warm-up", 10.0, 12.0), ("timed", 20.0, 30.0), ("timed", 40.0, 50.0)]
+    clocks = [
+        observe.Clock(9.999, 700.0, 90.0, 1),  # in front of the warm-up request: no request's
+        observe.Clock(10.0, 1900.0, 200.0, 0),  # on a bound
+        observe.Clock(12.0, 1930.0, 210.0, 0),  # on a bound
+        observe.Clock(15.0, 500.0, 80.0, 1),  # between two requests
+        observe.Clock(20.0, 2000.0, 250.0, 0),
+        observe.Clock(22.5, 1880.0, 260.0, 0b100),  # the software power cap
+        observe.Clock(25.0, 2000.0, None, 0b1),  # no power in this line; the GPU idled
+        observe.Clock(30.0, 1820.0, 230.0, 0b1000000),  # the hardware thermal slow-down alone: the request's two limit reasons are two samples'
+        observe.Clock(30.001, 100.0, 1.0, 0),  # behind the request
+        observe.Clock(41.0, 2000.0, 255.0, 0),
+        observe.Clock(45.0, None, 251.0, None),  # neither a clock nor event bits in this line
+        observe.Clock(49.0, 1970.0, 249.0, 0),
+    ]
+    seen = [observe.Seen(21.0, own, 400.0), observe.Seen(21.0, 777, 900.0), observe.Seen(35.0, 888, 10.0), observe.Seen(44.0, own, 400.0)]
+    reading = observe.Reading("before the warm-up request", listed=True, own=400.0, used=410.0, load=[4.5, 4.0, 3.5])
+    made = observe.summary([reading], clocks, seen, requests, own, lock=1900)
+    warm, first, second = made["requests"]
+    assert [request["kind"] for request in made["requests"]] == ["warm-up", "timed", "timed"]
+    assert warm["clock"] == {
+        "samples": 2,
+        "minimum_mhz": 1900.0,
+        "median_mhz": 1915.0,
+        "mean_mhz": 1915.0,
+        "maximum_mhz": 1930.0,
+        "share_below_declared_lock": 0.0,
+    }
+    assert first["clock"] == {
+        "samples": 4,
+        "minimum_mhz": 1820.0,
+        "median_mhz": 1940.0,
+        "mean_mhz": 1925.0,
+        "maximum_mhz": 2000.0,
+        "share_below_declared_lock": 0.5,
+    }
+    assert (first["power_median_w"], first["limit_reasons"], first["idle_samples"]) == (250.0, ["hw_thermal_slowdown", "sw_power_cap"], 1)
+    assert [observe.limits_of(sample.events) for sample in clocks[4:8]] == [[], ["sw_power_cap"], [], ["hw_thermal_slowdown"]], "no sample holds both"
+    assert (first["process_samples"], first["this_process_listed"], first["other_compute_processes"]) == (2, True, 1)
+    assert second["clock"] == {
+        "samples": 2,
+        "minimum_mhz": 1970.0,
+        "median_mhz": 1985.0,
+        "mean_mhz": 1985.0,
+        "maximum_mhz": 2000.0,
+        "share_below_declared_lock": 0.0,
+    }
+    assert (second["clock_lines"], second["power_median_w"], second["limit_reasons"], second["idle_samples"]) == (3, 251.0, [], 0)
+    assert (second["process_samples"], second["this_process_listed"], second["other_compute_processes"]) == (1, True, 0)
+    # the screen's clock: the six samples of the two timed requests, pooled; the fewest samples of a timed request
+    assert (made["clocks"]["median_mhz"], made["clocks"]["minimum_mhz"], made["clocks"]["maximum_mhz"], made["clocks"]["samples"]) == (
+        1985.0,
+        1820.0,
+        2000.0,
+        2,
+    )
+    assert made["other_compute_processes"] == {"verdict": "seen", "seen": 2, "reason": None}, "777 inside a request and 888 between two"
+    assert made["host"]["load"] == 4.5 and made["clock_lock_declared_mhz"] == 1900 and made["sampler_period_ms"] == observe.PERIOD_MS == 50
+    _defines("gpu_and_host", "Per timed request: the SM clock samples (count, minimum, median, mean, maximum), the power median and the limit reasons")
+    _defines("gpu_and_host", "A sample belongs to a request when its time stamp lies between the request being handed to the text path and its last")
+    _defines("gpu_and_host", "The screen's clock is the median and the minimum over the samples of all timed requests.")
+    _says(
+        "area", "A sample belongs to a request when its time stamp lies between the request being handed to the text path and its last token's ids on the host."
+    )
+    _says("area", "`yes` with the median and the minimum of the SM clock over the samples of all timed requests,")
+    # a line of the tool: its stamp is local time, a field the driver does not give is none, another line is no sample
+    line = observe.clock_sample("2001/02/03 04:05:06.789, 2000, 111.11, 0x0000000000000102")
+    assert line == observe.Clock(time.mktime((2001, 2, 3, 4, 5, 6, 0, 0, -1)) + 0.789, 2000.0, 111.11, 0x102)
+    assert observe.clock_sample("2001/02/03 04:05:06.789, [N/A], [Not Supported], [Unknown Error]")[1:] == (None, None, None)
+    assert observe.clock_sample("not a line of the tool") is None and observe.clock_sample("2001-02-03, 2000, 111.11, 0x0") is None
+    assert observe.process_sample("2001/02/03 04:05:06.812, 7654321, 12345")[1:] == (7654321, 12345.0)
+    assert observe.process_sample("2001/02/03 04:05:06.812, a name, 12345") is None and observe.process_sample("") is None
+    assert observe.limits_of(0x1FF) == list(observe.EVENTS[1:]) and observe.limits_of(1) == [] and observe.limits_of(1 << 12) == ["bit 12"]
+    with monkeypatch.context() as patch:  # the stamp is the host's local time in whatever zone the host keeps: 04:05:06 in Tokyo is 19:05:06 UTC the day before
+        patch.setenv("TZ", "Asia/Tokyo")
+        time.tzset()
+        try:
+            elsewhere = observe.clock_sample("2001/02/03 04:05:06.789, 2000, 111.11, 0x0000000000000102")
+        finally:
+            patch.undo()
+            time.tzset()
+    assert elsewhere.at == pytest.approx(981140706.789, abs=1e-6)
+    # a field that is no size -- not a number, not finite, below zero -- is a field the driver does not give; a clock of zero is no clock
+    assert observe.clock_sample("2001/02/03 04:05:06.789, nan, inf, 0x0")[1:] == (None, None, 0)
+    assert observe.clock_sample("2001/02/03 04:05:06.789, -1, -0.5, 0x0")[1:] == (None, None, 0)
+    assert observe.clock_sample("2001/02/03 04:05:06.789, 0, 0.0, 0x0")[1:] == (None, 0.0, 0)
+    assert observe.clock_sample("2001/02/03 04:05:06.789, 1e400, -inf, 0x0")[1:] == (None, None, 0)
+    assert observe.process_sample("2001/02/03 04:05:06.812, 7654321, nan")[1:] == (7654321, None)
+    unsized = [observe.clock_sample(f"2001/02/03 04:05:06.{index:03d}, nan, 250.00, 0x0") for index in range(12)]
+    blind = observe.summary([reading], unsized, [], [("timed", unsized[0].at, unsized[-1].at)], own)
+    assert observe.clocks_text(blind) == "no (the driver reports no SM clock)" and observe.clock_reasons(blind) == ["clocks not observed"]
+    assert json.loads(json.dumps(blind, allow_nan=False)) == blind, "nothing that is not a number reaches the file"
+    # the stamps of a request are on the clock of the run, the tool's on the wall clock: one pair of readings at the start maps them
+    _tool(monkeypatch, tmp_path)
+    watch = observe.Observer(torch.device("cuda", 0), 1900)
+    assert watch.reason == "" and watch.pid == os.getpid()
+    watch.readings, watch.pid = [reading], own
+    watch.sampler = types.SimpleNamespace(
+        started=(1000.0, 5.0), stopped=(1100.0, 105.0), clocks=[observe.Clock(1020.0, 2000.0, 250.0, 0)], processes=[], unread=3, period=20
+    )
+    mapped = watch.section([("timed", 25.0, 35.0), ("timed", 45.0, 55.0)])  # on the wall clock: 1020 to 1030, 1040 to 1050
+    assert [request["clock"]["samples"] for request in mapped["requests"]] == [1, 0] and mapped["unread_lines"] == 3 and mapped["clock_offset_drift_ms"] == 0.0
+    assert mapped["sampler_period_ms"] == 20, "the period the loops were started with"
+    # a second pair at the stop: the two clocks may be a millisecond apart from the first pair, the resolution of the tool's stamp, and no more
+    assert observe.DRIFT_LIMIT_MS == 1.0
+    watch.sampler.stopped = (1100.0009, 105.0)
+    held = watch.section([("timed", 25.0, 35.0)])
+    assert held["requests"][0]["clock"]["samples"] == 1 and held["clocks"]["reason"] is None and held["clock_offset_drift_ms"] == pytest.approx(0.9)
+    watch.sampler.stopped = (1100.0011, 105.0)  # the wall clock was set by more than that meanwhile: the cut is not made
+    moved = watch.section([("timed", 25.0, 35.0)])
+    assert moved["clocks"]["reason"] == moved["other_compute_processes"]["reason"] == "the host's clock moved during the timed requests"
+    assert moved["requests"][0]["clock"]["samples"] == 0 and moved["clock_offset_drift_ms"] == pytest.approx(1.1)
+    watch.sampler.stopped = (1099.9989, 105.0)  # ... in either direction
+    back = watch.section([("timed", 25.0, 35.0)])
+    assert back["clocks"]["reason"] == "the host's clock moved during the timed requests" and back["clock_offset_drift_ms"] == pytest.approx(-1.1)
+    # a pair: the wall clock read between two readings of the stamps' clock, and of three such readings the closest -- here the second,
+    # a thousandth of a second wide beside two that were put off for seconds
+    ticks, walls = iter([0.0, 5.0, 10.0, 10.001, 20.0, 29.0]), iter([100.0, 110.0, 120.0])
+    with monkeypatch.context() as patch:
+        patch.setattr(observe, "now", lambda: next(ticks))
+        patch.setattr(observe, "time", types.SimpleNamespace(time=lambda: next(walls)))
+        pair = observe._pair()
+    assert pair == (110.0, pytest.approx(10.0005)) and next(ticks, None) is None and next(walls, None) is None
+
+
+def test_none_seen_needs_the_own_process():
+    """An empty list of compute processes is not ``none seen``: this process itself must be in every reading and in a
+    process sample of every timed request.  A list that hides processes therefore ends in ``not observed``."""
+    from model_samples import observe
+
+    def reading(**changes):
+        return observe.Reading("before the warm-up request", **{"listed": True, "own": 400.0, "used": 410.0, **changes})
+
+    def timed(**changes):
+        return {"kind": "timed", "process_samples": 20, "this_process_listed": True, **changes}
+
+    alone = observe.others([reading(), reading()], [timed(), timed()], 0)
+    assert alone == {"verdict": "none seen", "seen": 0, "reason": None}
+    assert observe.others_text({"other_compute_processes": alone}) == "none seen" and observe.others_reason({"other_compute_processes": alone}) == ""
+    hidden = {"verdict": "not observed", "seen": None, "reason": "this process is not in the driver's list"}
+    assert observe.others([reading(), reading(listed=False, own=None)], [timed()], 0) == hidden, "missing from one reading"
+    assert observe.others([reading(listed=False, own=None), reading(), reading()], [timed()], 0) == hidden, "from the first of three readings"
+    assert observe.others([reading(), reading(listed=False, own=None), reading()], [timed()], 0) == hidden, "from the one in the middle"
+    assert observe.others([reading()], [timed(), timed(this_process_listed=False)], 0) == hidden, "missing from the samples of one timed request"
+    assert observe.others([reading()], [timed(this_process_listed=False), timed()], 0) == hidden, "from those of the first timed request"
+    # the warm-up request and the traced request are not asked: the verdict is of the readings and of the timed requests
+    beside = [
+        {"kind": "warm-up", "process_samples": 0, "this_process_listed": False},
+        timed(),
+        {"kind": "traced", "process_samples": 4, "this_process_listed": False},
+    ]
+    assert observe.others([reading()], beside, 0) == alone
+    # a count of other processes is stated only of a list in which the run finds itself: another id, and this process missing from a
+    # reading or from the samples of a timed request -- one of the others may be this process under another id
+    assert observe.others([reading(), reading()], [timed()], 2) == {"verdict": "seen", "seen": 2, "reason": None}
+    assert observe.others([reading(listed=False, own=None), reading()], [timed()], 2) == hidden
+    assert observe.others([reading()], [timed(), timed(this_process_listed=False)], 1) == hidden
+    failed = observe.Reading("behind the last timed request", observe.TOOL_ERROR)
+    assert observe.others([reading(), failed], [timed(process_samples=0, this_process_listed=False)], 1)["verdict"] == "seen", "no list, nothing hidden"
+    assert observe.others([reading(listed=False, own=None), failed], [timed()], 1) == hidden, "the reason is the list without this process"
+    renamed = observe.summary([reading(listed=False, own=None, others={99001: 400.0})], [], [observe.Seen(1.5, 99001, 400.0)], [("timed", 1.0, 2.0)], 4242)
+    assert observe.others_text(renamed) == "not observed (this process is not in the driver's list)"
+    assert observe.others_reason(renamed) == "other processes not observed" and renamed["readings"][0]["other_compute_processes"] == 1
+    assert observe.others([], [timed()], 0) == hidden, "no reading at all"
+    assert observe.others_text({"other_compute_processes": hidden}) == "not observed (this process is not in the driver's list)"
+    assert observe.others_reason({"other_compute_processes": hidden}) == "other processes not observed"
+    unsampled = [timed(), timed(process_samples=0, this_process_listed=False)]
+    assert observe.others([reading()], unsampled, 0)["reason"] == observe.others([reading()], [], 0)["reason"] == "no process sample inside a timed request"
+    assert observe.others([reading(), observe.Reading("behind the last timed request", observe.TOOL_ERROR)], [timed()], 0)["reason"] == observe.TOOL_ERROR
+    assert observe.others([reading()], [timed()], 0, observe.NO_SAMPLER)["reason"] == "the sampler could not be started"
+    # the tool prints nothing for an empty list: a reading and a loop that saw no process at all
+    empty = observe.summary([reading(listed=False, own=None, used=0.0)], [], [], [("timed", 1.0, 2.0)], 4242)
+    assert empty["other_compute_processes"]["verdict"] == "not observed" and empty["readings"][0]["this_process_listed"] is False
+    _defines("gpu_and_host", "none seen is stated only when this process itself is in the driver's list and the device's memory in use agrees with")
+    _defines("gpu_and_host", "and is stated only when no reading and no timed request's samples showed a list without this process itself;")
+    _defines("gpu_and_host", "of such a list no count is stated: not observed, with the reason.")
+    _says("area", "`none seen` only when no other process was in the driver's list in a reading or in a sample, this process itself was in every reading")
+    _says("area", "this process itself was in every reading and in a sample of every timed request, and the device's memory in use agreed with")
+    _says("area", "A process list the run could not read, or in which it did not find itself, or beside a device memory in use that its own does not")
+    _says("area", "a list that hides processes is never read as an empty one.", "a list is never assumed to be empty.")
+    _says("area", "`<n> seen`, the distinct other processes over every reading and every sample -- the reading before the load and the time between")
+    _says(
+        "area", "and stated only when no reading and no timed request's samples showed a list without this process itself; or `not observed` with the reason --"
+    )
+    _says("guide", "A count of other processes is stated only of a list that shows the run's own entry too.")
+    _says("guide", "`none seen` is printed only when the run's own process is in the driver's list;")
+    _says("guide", "A list of processes counts as empty only beside the run's own entry and a device memory in use that the run's own explains.")
+
+
+def test_own_process_is_not_another(monkeypatch, tmp_path):
+    """This process's own entry of the driver's list is never counted as another process; every other id is, once, however
+    often and wherever it was seen -- in a reading, inside a request or between two.  Of another process the file keeps
+    its memory and nothing else."""
+    from model_samples import observe
+
+    own = 4242
+    before = observe.Reading("before the load", listed=True, own=300.0, used=1200.0, others={777: 900.0})
+    behind = observe.Reading("behind the last timed request", listed=True, own=400.0, used=410.0)
+    samples = [observe.Seen(1.5, own, 400.0), observe.Seen(1.5, 777, 900.0), observe.Seen(1.6, 888, 5.0), observe.Seen(5.0, 888, 5.0)]
+    made = observe.summary([before, behind], [], samples, [("timed", 1.0, 2.0)], own)
+    assert made["other_compute_processes"] == {"verdict": "seen", "seen": 2, "reason": None}
+    assert made["requests"][0]["other_compute_processes"] == 2 and made["requests"][0]["this_process_listed"]
+    assert observe.others_text(made) == "2 seen" and observe.others_reason(made) == "shared GPU"
+    _defines("gpu_and_host", "<n> seen is the number of distinct other compute processes over every reading and every sample, the reading before the")
+    _defines("gpu_and_host", "the reading before the load and the time between two requests included,")
+    assert made["readings"][0]["other_compute_processes"] == 1 and made["readings"][0]["other_memory_mib"] == [900.0]
+    assert "777" not in json.dumps(made) and "888" not in json.dumps(made), "no id of another process in the file"
+    early = observe.summary([before, behind], [], samples[:1], [("timed", 1.0, 2.0)], own)
+    assert early["other_compute_processes"] == {"verdict": "seen", "seen": 1, "reason": None}, "a process that was in the reading before the load alone"
+    late = observe.summary([behind, before], [], samples[:1], [("timed", 1.0, 2.0)], own)
+    assert late["other_compute_processes"] == {"verdict": "seen", "seen": 1, "reason": None}, "a process that was in the last reading alone"
+    only = observe.summary([behind], [], samples[:1], [("timed", 1.0, 2.0)], own)
+    assert only["other_compute_processes"]["verdict"] == "none seen" and only["requests"][0]["other_compute_processes"] == 0
+    # a reading through the tool: this process's line is its own, the other line is another process
+    folder = _tool(monkeypatch, tmp_path, processes=[[os.getpid(), 400], [777, 900]], device=["000.00", "2000", "1310", "55"])
+    read = observe.reading(str(folder / "nvidia-smi"), "GPU-00000000-stand-in", os.getpid(), "before the load")
+    assert (read.reason, read.listed, read.own, read.others, read.used, read.clock, read.utilization) == ("", True, 400.0, {777: 900.0}, 1310.0, 2000.0, 55.0)
+    assert read.driver == "000.00" and read.load == [4.5, 4.0, 3.5] and read.seconds > 0.0
+    data = read.data()
+    assert (data["this_process_mib"], data["other_compute_processes"], data["other_memory_mib"], data["memory_agrees"]) == (400.0, 1, [900.0], False)
+    assert [call["argv"] for call in _calls(folder)] == [
+        ["--id=GPU-00000000-stand-in", "--query-gpu=driver_version,clocks.sm,memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
+        ["--id=GPU-00000000-stand-in", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+    ], "a reading is two queries: no name of a process is asked for"
+    _says("area", "Another process on the GPU is the reason `shared GPU`.")
+    _says("guide", "no process name is asked for, and the report keeps no id of another process.")
+
+
+def test_memory_beyond_own_is_not_observed():
+    """A list in which this process stands alone counts only beside a device memory in use that this process's own
+    explains: more than the slack beyond it, in any reading, and the other processes are ``not observed``."""
+    from model_samples import observe
+
+    slack = observe.MEMORY_SLACK_MIB
+    assert slack == 64, "MiB: pinned; a proposal until an exclusive run has sized it"
+
+    def reading(used):
+        return observe.Reading("behind the last timed request", listed=True, own=1000.0, used=used)
+
+    timed = [{"kind": "timed", "process_samples": 3, "this_process_listed": True}]
+    assert reading(1000.0 + slack).agrees() and not reading(1001.0 + slack).agrees() and not reading(None).agrees()
+    assert observe.others([reading(1000.0 + slack)], timed, 0)["verdict"] == "none seen"
+    beyond = observe.others([reading(1010.0), reading(1001.0 + slack)], timed, 0)
+    assert beyond == {"verdict": "not observed", "seen": None, "reason": "device memory in use exceeds this process's own"}
+    assert observe.others([reading(1001.0 + slack), reading(1010.0), reading(1010.0)], timed, 0) == beyond, "in the first of three readings"
+    assert observe.others([reading(1010.0), reading(1001.0 + slack), reading(1010.0)], timed, 0) == beyond, "in the one in the middle"
+    assert observe.others_text({"other_compute_processes": beyond}) == "not observed (device memory in use exceeds this process's own)"
+    # a figure the driver does not give is not a figure beyond this process's own: the reason says which it was
+    unknown = {"verdict": "not observed", "seen": None, "reason": "the driver reports no memory figure"}
+    ownless = observe.Reading("before the warm-up request", listed=True, own=None, used=1010.0)
+    assert observe.others([reading(1010.0), reading(None)], timed, 0) == unknown, "the device's memory in use"
+    assert observe.others([ownless, reading(1010.0)], timed, 0) == unknown, "this process's own"
+    assert observe.others_text({"other_compute_processes": unknown}) == "not observed (the driver reports no memory figure)"
+    assert observe.others_reason({"other_compute_processes": unknown}) == "other processes not observed"
+    assert observe.others_reason({"other_compute_processes": beyond}) == "other processes not observed"
+    assert reading(1001.0 + slack).data()["memory_agrees"] is False and reading(1000.0).data()["device_memory_used_mib"] == 1000.0
+    assert _alone()["rules"] == {"least_clock_samples": 10, "clock_floor_percent": 97, "clock_ceiling_percent": 103, "memory_slack_mib": slack}
+    _says("area", "or beside a device memory in use that its own does not explain, is `other processes not observed`:")
+    _says("area", "the device's memory in use agreed with this process's own;")
+    _says("area", "the two verdicts of the `GPU` lines and the rules behind them), `kernels`,")
+
+
+def test_clock_value_forms(monkeypatch):
+    """Every form of the clock line: ``yes`` with the median and the minimum over the timed requests' samples, with a
+    declared lock, with the limit reasons by the driver's names; ``thin``; ``no`` with its reason.  The reasons each gives
+    the record class: a minimum below 97 % of the median, or of a declared lock; a maximum above 103 % of a declared
+    lock; a limit reason.  That the GPU idled is no limit.  Every timed request is judged, and the timed requests
+    alone.  No form holds the word 'locked'."""
+    from model_samples import observe
+
+    def watched(mhz, lock=None, events=0, more=(), failed=""):
+        """The observation of a timed request with these clock samples (``more``: those of a second timed request)."""
+        first = [observe.Clock(1.0 + index / 1000, value, 250.0, events) for index, value in enumerate(mhz)]
+        second = [observe.Clock(3.0 + index / 1000, value, 250.0, 0) for index, value in enumerate(more)]
+        return observe.summary([], first + second, [], [("timed", 1.0, 2.0), ("timed", 3.0, 4.0)] if more else [("timed", 1.0, 2.0)], 4242, lock, failed)
+
+    def said(made):
+        return observe.clocks_text(made), observe.clock_reasons(made)
+
+    steady = [2000.0] * 12
+    assert said(watched(steady)) == ("yes (SM 2000 MHz median, 2000 min; no limit reported)", [])
+    # no lock declared: the minimum against 97 % of the median (1940 MHz): a sample at it is not below it
+    assert said(watched(steady[:11] + [1940.0])) == ("yes (SM 2000 MHz median, 1940 min; no limit reported)", [])
+    assert said(watched(steady[:11] + [1939.0])) == ("yes (SM 2000 MHz median, 1939 min; no limit reported)", ["SM clock fell to 1939 MHz"])
+    # a declared lock: at the clock, above it, below it; the minimum and the maximum are held against it, not against the median
+    assert said(watched(steady, lock=2000)) == ("yes (SM 2000 MHz median, 2000 min; lock 2000 MHz declared; no limit reported)", [])
+    assert said(watched(steady, lock=2600)) == ("yes (SM 2000 MHz median, 2000 min; lock 2600 MHz declared; no limit reported)", ["below the declared lock"])
+    assert said(watched(steady, lock=1600)) == ("yes (SM 2000 MHz median, 2000 min; lock 1600 MHz declared; no limit reported)", ["above the declared lock"])
+    assert said(watched(steady[:11] + [1939.0], lock=2000))[1] == ["below the declared lock"]
+    assert said(watched([1450.0] * 6 + [1750.0] * 6, lock=1600))[1] == ["below the declared lock", "above the declared lock"]
+    assert said(watched([1553.0] * 6 + [1648.0] * 6, lock=1600))[1] == [], "inside 97 % and 103 % of the lock"
+    assert said(watched([1551.0] * 6 + [1600.0] * 6, lock=1600))[1] == ["below the declared lock"], "one MHz under 97 %"
+    assert said(watched([1600.0] * 6 + [1649.0] * 6, lock=1600))[1] == ["above the declared lock"], "one MHz over 103 %"
+    assert watched(steady[:9] + [1900.0] * 3, lock=2000)["requests"][0]["clock"]["share_below_declared_lock"] == 0.25
+    assert watched(steady)["requests"][0]["clock"]["share_below_declared_lock"] is None
+    # limit reasons, by the driver's own names; that the GPU idled is counted and is none
+    assert said(watched(steady, events=0b100)) == ("yes (SM 2000 MHz median, 2000 min; limit reported: sw_power_cap)", ["limit reported: sw_power_cap"])
+    several = said(watched(steady, lock=2000, events=0b1001101))
+    assert several[0] == "yes (SM 2000 MHz median, 2000 min; lock 2000 MHz declared; limit reported: hw_slowdown, hw_thermal_slowdown, sw_power_cap)"
+    assert several[1] == ["limit reported: hw_slowdown, hw_thermal_slowdown, sw_power_cap"]
+    idle = watched(steady, events=0b1)
+    assert said(idle) == ("yes (SM 2000 MHz median, 2000 min; no limit reported)", []) and idle["requests"][0]["idle_samples"] == 12
+    assert said(watched(steady, events=0b100, more=steady))[1] == ["limit reported: sw_power_cap"], "a limit in the first timed request, none in the last"
+    _says("area", "a lock that was declared, and the limit reasons the driver reported in a timed request, by its own names, or `no limit reported`;")
+    # thin: a timed request with fewer than ten clock samples; every reason that applies, in order
+    assert observe.LEAST_SAMPLES == 10 and said(watched(steady[:9])) == ("thin (9 samples in a timed request)", ["too few clock samples"])
+    assert said(watched(steady, more=steady[:3], lock=2000)) == ("thin (3 samples in a timed request; lock 2000 MHz declared)", ["too few clock samples"])
+    assert said(watched(steady[:1]))[0] == "thin (1 sample in a timed request)"
+    assert said(watched(steady[:3], more=steady)) == ("thin (3 samples in a timed request)", ["too few clock samples"]), "the first timed request, not the last"
+    # the timed requests alone: a warm-up request and a traced request that were thin, low and limited are in the file and are no reason
+    warm = [observe.Clock(0.1 + index / 1000, 1300.0, 250.0, 0b1000) for index in range(3)]
+    traced = [observe.Clock(5.0 + index / 1000, 1300.0, 250.0, 0b100) for index in range(3)]
+    timed = [observe.Clock(1.0 + index / 1000, 2000.0, 250.0, 0) for index in range(12)]
+    beside = observe.summary([], warm + timed + traced, [], [("warm-up", 0.0, 0.5), ("timed", 1.0, 2.0), ("traced", 5.0, 6.0)], 4242)
+    assert said(beside) == ("yes (SM 2000 MHz median, 2000 min; no limit reported)", [])
+    assert [(made["kind"], made["clock"]["samples"], made["clock"]["minimum_mhz"], made["limit_reasons"]) for made in beside["requests"]] == [
+        ("warm-up", 3, 1300.0, ["hw_slowdown"]),
+        ("timed", 12, 2000.0, []),
+        ("traced", 3, 1300.0, ["sw_power_cap"]),
+    ]
+    assert said(watched(steady[:5] + [1000.0], events=0b100))[1] == ["too few clock samples", "SM clock fell to 1000 MHz", "limit reported: sw_power_cap"]
+    # no: nothing to judge, and why
+    assert said(watched([])) == ("no (no clock sample inside a timed request)", ["clocks not observed"])
+    assert said(watched([None] * 12)) == ("no (the driver reports no SM clock)", ["clocks not observed"])
+    assert said(watched(steady, failed=observe.NO_SAMPLER)) == ("no (the sampler could not be started)", ["clocks not observed"])
+    assert said(watched([], lock=2000))[0] == "no (no clock sample inside a timed request; lock 2000 MHz declared)"
+    # the host's load beside the clocks, and the cores this process may use -- not those the host has
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2}, raising=False)
+        patch.setattr(os, "cpu_count", lambda: 64)
+        cores = observe.host_cores()
+    assert cores == 3
+    assert observe.host_text({"host": {"load": 7.345, "cores": 70}}) == "host load 7.3 on 70 cores"
+    assert (
+        observe.host_text({"host": {"load": 0.0, "cores": 1}}) == "host load 0.0 on 1 core"
+        and observe.host_text({"host": {"load": None, "cores": 8}}) == "host load not observed"
+    )
+    for made in (watched(steady, lock=2000), watched(steady[:3], lock=2000), watched([], lock=2000), watched(steady, lock=2600, events=0b10)):
+        assert "locked" not in observe.clocks_text(made) + " ".join(observe.clock_reasons(made)) + json.dumps(made)
+    _says("area", f"`thin` where a timed request has fewer than {observe.LEAST_SAMPLES} clock samples; `no` with the reason.")
+    _says("area", "`yes` says that the clock was sampled in every timed request, not that it held: a clock that fell, that left a declared lock or that the")
+    _says("area", "or that the driver limited is a reason of the `record class` line.", "The clocks give `clocks not observed`; `too few clock samples`;")
+    _says("area", f"`SM clock fell to <n> MHz`, a sample below {observe.FLOOR * 100:.0f} % of the median where no lock was declared;")
+    _says("area", f"a sample below {observe.FLOOR * 100:.0f} % or above {observe.CEILING * 100:.0f} % of a lock that was declared;")
+    assert round((1 - observe.FLOOR) * 100) == round((observe.CEILING - 1) * 100) == 3, "the family README: more than 3 % below or above it"
+    _says("area", "That the driver saw the GPU idle in a sample is counted in the file and is no limit.", "the report never prints the word 'locked'.")
+    _says("area", "`host load`: the host's load average over the last minute, read behind the last timed request, and the cores this process may use:")
+    _says("guide", "A lock is the operator's declaration: it is printed as declared, held against the observed clock in both directions, and never set.")
+
+
+def test_the_record_class_takes_what_was_observed(monkeypatch, tmp_path):
+    """Conditions C5 and C6: what the run observed of the other processes and of the clocks is a reason of line 2, in the
+    order of the conditions, or none.  Nothing observed makes a run that is launched from Python a controlled run."""
+    from model_samples import observe, perf
+
+    alone = _alone()
+    assert (observe.others_reason(alone), observe.clock_reasons(alone)) == ("", [])
+    assert perf.record_class(False, False, "", True, "", observe.others_reason(alone), observe.clock_reasons(alone)) == ("controlled", [])
+    assert perf.record_class(False, False, "", False, "", "", []) == ("orientation", ["launched from Python"]), "what every run of this tree is"
+    loaded = {**alone, "host": {"load": 999.0, "cores": 1}}  # the host's load is printed and is no condition
+    assert perf.record_class(False, False, "", True, "", observe.others_reason(loaded), observe.clock_reasons(loaded)) == ("controlled", [])
+    assert observe.host_text(loaded) == "host load 999.0 on 1 core"
+    _says("area", "and the cores this process may use: printed, not a condition |")
+    several = ["too few clock samples", "SM clock fell to 1000 MHz", "limit reported: sw_power_cap"]
+    assert perf.record_class(False, True, "", False, "", "shared GPU", several)[1] == ["fallback rows present", "launched from Python", "shared GPU", *several]
+    assert perf.record_class(False, False, "", True, "", "other processes not observed", ["clocks not observed"])[1] == [
+        "other processes not observed",
+        "clocks not observed",
+    ]
+    # a run that had its GPU to itself: the two reasons of a run that could not look are gone, the others stay
+    outcome, lines, _, _ = _observed(monkeypatch, tmp_path / "alone")
+    assert outcome.data["record"]["reasons"] == ["reduced model", "fallback rows present", "no target kernel set declared", "launched from Python"]
+    assert outcome.data["record"]["class"] == "orientation" and outcome.data["record"]["performance_claim_eligible"] is False
+    assert lines[lines.index("cuDNN Frontend model sample: decode performance report") + 1 :][:2] == [
+        "record class          orientation, not a number of record: reduced model; fallback rows present;",
+        "                      no target kernel set declared; launched from Python",
+    ]
+    assert "GPU         stated device, compute capability 10.0, 148 SMs | other compute processes: none seen" in lines
+    # another process in the list, in a reading and in the samples: seen, and the reason
+    other = [(os.getpid(), 400.0), (777, 900.0)]
+    shared, lines, _, _ = _observed(monkeypatch, tmp_path / "shared", scenario={"processes": [[os.getpid(), 400], [777, 900]]}, processes=other)
+    assert shared.data["record"]["reasons"][-2:] == ["launched from Python", "shared GPU"]
+    assert "GPU         stated device, compute capability 10.0, 148 SMs | other compute processes: 1 seen" in lines
+    # a clock that fell in a sample, and a limit the driver reported
+    dipped = ((2000.0, 300.0, 0),) * 9 + ((1600.0, 180.0, 0b100),)
+    capped, lines, _, _ = _observed(monkeypatch, tmp_path / "capped", clock=dipped)
+    assert capped.data["record"]["reasons"][-3:] == ["launched from Python", "SM clock fell to 1600 MHz", "limit reported: sw_power_cap"]
+    clocks = lines.index("            clocks observed: yes (SM 2000 MHz median, 1600 min; limit reported: sw_power_cap)")
+    assert lines[clocks + 1].startswith("            host load "), "the two parts do not fit one line: a line break in the place of the separator"
+    _says("area", "None of this makes a run a controlled run while its launch sequence is not captured.")
+    _says("area", "`below the declared lock` and `above the declared lock`,", "and `limit reported: <names>`, the driver's own names.")
+
+
+def test_the_observer_is_called_outside_every_request(monkeypatch, tmp_path):
+    """Where the timing process touches the observation: a reading and the start of the sampler behind the checks and in
+    front of the warm-up request's first stamp; a reading behind the last stamp of the last timed request; the stop
+    behind the last stamp of the traced request.  Between the first and the last stamp of the warm-up and of every timed
+    request, and inside the traced request, it makes no call of the observer, asks nothing of the keeper or of its
+    files and runs no thread; and no call of the observer falls into a stage, whose seconds the file holds.  The file's
+    ``observation`` holds every reading, every request the sampler ran beside, the two verdicts and the rules; the
+    screen is rendered from it."""
+    from model_samples import observe, perf
+
+    outcome, lines, order, folder = _observed(monkeypatch, tmp_path, steps=6, requests=2, warmup=2)
+    marks = [index for index, event in enumerate(order) if event != "stamp"]
+    # nothing else is in the order of the run: no use of the keeper or of its files, no stamp beside another thread, no call inside a stage
+    assert [order[index] for index in marks] == [("read", "before the warm-up request"), "start", ("read", "behind the last timed request"), "stop"]
+    checked, warm, timed, traced = 2 + 2 * 6, 2 + 2 * 2, 2 * (2 + 2 * 6), 2 + 2 * 6  # t_request and t_first, then two stamps a step
+    assert order[: marks[0]].count("stamp") == checked and marks[1] == marks[0] + 1, "behind the checked request; the sampler starts behind the reading"
+    assert order[marks[1] : marks[2]].count("stamp") == warm + timed, "the warm-up request and both timed requests: not one call among their stamps"
+    assert order[marks[2] : marks[3]].count("stamp") == traced and order[marks[3] :].count("stamp") == 0, "the traced request, then the stop"
+    # ... and the file says of the sampler what this order shows: nothing was asked of the keeper or of its files between the start and the stop
+    beside = outcome.data["protocol"]["in_a_timed_request"]
+    assert list(beside) == ["recorder", "call_log", "profiler", "text", "sampler"]
+    assert beside["sampler"] == observe.SAMPLER == "a child process that the timing process neither reads nor polls between its start and its stop"
+    _says("area", "`protocol` (the counts, the prompt's hash, where the profiler first started, what a timed request ran with and")
+    _says("area", "what the sampler is beside it: a child process that the timing process neither reads nor polls between its start and its stop,")
+    _says("guide", "The report file says what the sampler was to the timed requests of its run, or that none ran, with the reason (`protocol`).")
+    watched = outcome.data["observation"]
+    assert (watched["source"], watched["reason"], watched["sampler_period_ms"], watched["clock_lock_declared_mhz"]) == ("nvidia-smi", None, 50, None)
+    assert [made["when"] for made in watched["readings"]] == ["before the warm-up request", "behind the last timed request"]
+    for made in watched["readings"]:
+        assert (made["reason"], made["this_process_listed"], made["this_process_mib"], made["device_memory_used_mib"]) == (None, True, 400.0, 450.0)
+        assert (made["memory_agrees"], made["other_compute_processes"], made["sm_clock_mhz"], made["utilization_percent"]) == (True, 0, 2000.0, 9.0)
+    assert [made["kind"] for made in watched["requests"]] == ["warm-up", "timed", "timed", "traced"], "every request the sampler ran beside"
+    _says("area", "Beside the warm-up request, the timed requests and the traced request a child process samples the SM clock,")
+    _says("area", "| `GPU` | what the run observed of its GPU and of its host. `other compute processes`:")
+    assert all(made["clock"]["samples"] >= observe.LEAST_SAMPLES and made["this_process_listed"] for made in watched["requests"][1:3])
+    assert watched["other_compute_processes"] == {"verdict": "none seen", "seen": 0, "reason": None}
+    assert (watched["clocks"]["verdict"], watched["clocks"]["median_mhz"], watched["clocks"]["minimum_mhz"], watched["clocks"]["reasons"]) == (
+        "yes",
+        2000.0,
+        2000.0,
+        [],
+    )
+    # a request is cut from the request being handed to the text path to its last token: this sampler has a sample every 0.1 ms
+    behind = [made for made in outcome.data["raw"]["requests"] if made["kind"] != "checked"]
+    for made, request in zip(watched["requests"], behind):
+        assert abs(made["clock"]["samples"] - request["t_token_s"][-1] * 1e4) <= 2 and made["process_samples"] == made["clock_lines"], made["kind"]
+    assert set(watched["requests"][0]["clock"]) == {"samples", "minimum_mhz", "median_mhz", "mean_mhz", "maximum_mhz", "share_below_declared_lock"}
+    assert {"readings", "requests", "other_compute_processes", "clocks", "rules"} <= set(watched), "counts and extremes: no sample itself is in the file"
+    _says("area", "`observation` (every reading, the samples of every request behind the checked one as counts and extremes, the two verdicts of the `GPU`")
+    _says("area", "it reads the GPU's list of compute processes, its memory in use, its utilisation and its SM clock, and the host's load.")
+    gpu = lines.index("GPU         stated device, compute capability 10.0, 148 SMs | other compute processes: none seen")
+    assert lines[gpu + 1] == "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load 5.5 on 70 cores"
+    assert [made["host_load"] for made in watched["readings"]] == [[4.5, 4.0, 3.5], [5.5, 5.0, 4.5]]
+    assert watched["host"] == {"load": 5.5, "cores": 70}, "the load over the last minute, of the reading behind the last timed request"
+    environment = outcome.data["environment"]
+    assert environment["driver"] == {"value": "000.00", "reason": None}
+    assert list(environment["host"]["load"]) == ["before the warm-up request", "behind the last timed request"]
+    entry = outcome.data["statistics"]["gpu_and_host"]
+    assert (entry["definition"], entry["unit"], entry["value"]) == (perf.DEFINITIONS["gpu_and_host"][1], "MHz, W, MiB", None)
+    assert entry["reason"] == "see the section observation of this file" and entry["serving_counterpart"].startswith("The same observations as a serving")
+    # two readings of two queries each, and nothing else: the tool was asked, never told
+    assert len(_calls(folder)) == 4 and all(call["argv"][1].startswith("--query-") and len(call["argv"]) == 3 for call in _calls(folder))
+    text = (tmp_path / "report.json").read_text(encoding="utf-8")
+    assert perf.screen(json.loads(text)) == perf.screen(outcome.data) and str(folder) not in text + "\n".join(lines), "the file's data, and no path"
+    # perf.run without an observer of the caller's makes its own: no reading before the load, and the file says which there were
+    assert "before the load" not in environment["host"]["load"]
+    _says("area", "the process that times starts it in front of the warm-up request, makes no call that concerns it inside a request,")
+    _says(
+        "area",
+        "and reads its files behind the traced request.",
+        "The mode asks the driver through its `nvidia-smi` tool, in child processes, and adds no package.",
+    )
+    _says("area", "Where the run is at rest -- before the load, before the warm-up request and behind the last timed request -- it reads the GPU's list")
+    _says("guide", "The GPU is observed through the driver's `nvidia-smi` tool in child processes, with no package added, and never by")
+    _says("guide", "a call of the timing process inside a request: the sampler is started in front of the warm-up request and its files are read behind")
+    _says("guide", "its files are read behind the traced request, and its loops end with the pipe the run holds:")
+    _says("script", "The report's ``GPU`` lines say what the run observed through the driver's ``nvidia-smi`` tool, in child processes --")
+
+
+def _wait(condition, limit=30.0):
+    """Wait, bounded, for something a child process of the test does."""
+    end = time.monotonic() + limit
+    while not condition():
+        assert time.monotonic() < end, "a child process of the test did not get there in time"
+        time.sleep(0.01)
+
+
+def _running(pid):
+    """Whether a process is still at work: one that has ended and waits to be collected is not."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as file:
+            return file.read().rpartition(") ")[2][:1] != "Z"
+    except OSError:  # it went meanwhile -- or this host has no /proc, and then it is there
+        return not os.path.exists("/proc/self/stat")
+
+
+def test_the_sampler_is_a_child_process_whose_loops_end_with_its_pipe(monkeypatch, tmp_path):
+    """The sampler: one child, the keeper, and under it two loops of the tool that write a line every period into files
+    the timing process does not read before the stop.  The stop ends both loops and reads the files -- a line that is no
+    sample is counted -- and removes them.  A run that is gone without a stop, or a keeper that is ended from outside,
+    leaves no loop behind; nor does a tool that does not end when it is asked to, or -- on Linux -- a keeper that is
+    killed: no loop outlives its keeper."""
+    from model_samples import observe
+
+    folder = _tool(monkeypatch, tmp_path, junk=[["not a line of the tool"]])
+    tool = str(folder / "nvidia-smi")
+
+    def loops():
+        return [call for call in _calls(folder) if call["argv"][-1].startswith("--loop-ms=")]
+
+    def begun(sampler, count):
+        """The sampler started and both of its loops writing, the ``count``-th and the one before it: their process ids."""
+        said = sampler.start()
+        assert said == ""
+        _wait(lambda: len(loops()) == count)
+        files = [Path(sampler.folder.name) / name for name in ("clocks.csv", "processes.csv")]
+        _wait(lambda: all(file.exists() and file.stat().st_size for file in files))
+        return [call["pid"] for call in loops()][-2:]
+
+    sampler = observe.Sampler(tool, "GPU-00000000-stand-in", 5)
+    started = sampler.start()
+    assert started == "" and sampler.child.poll() is None and sampler.child.stdout is None and sampler.child.stderr is None
+    files = [Path(sampler.folder.name) / name for name in ("clocks.csv", "processes.csv")]
+    _wait(lambda: all(file.exists() and file.read_text(encoding="utf-8").count("\n") >= 8 for file in files))  # the test looks; the sampler does not
+    assert sampler.clocks == [] and sampler.processes == [] and len(loops()) == 2
+    queries = ["--query-compute-apps=timestamp,pid,used_memory", "--query-gpu=timestamp,clocks.sm,power.draw,clocks_event_reasons.active"]
+    expected = [["--id=GPU-00000000-stand-in", query, "--format=csv,noheader,nounits", "--loop-ms=5"] for query in queries]
+    assert sorted(call["argv"] for call in loops()) == expected, "the two loops start side by side: either may write its line first"
+    running = [call["pid"] for call in loops()]
+    assert all(_running(pid) for pid in running)
+    sampler.stop()
+    assert not any(_running(pid) for pid in running) and not files[0].parent.exists(), "both loops ended, the files read and removed"
+    assert _asked(folder) == set(running), "the keeper asked both loops to end and killed neither"
+    assert len(sampler.clocks) >= 4 and {sample[1:] for sample in sampler.clocks} == {(2000.0, 300.0, 0)}
+    assert len(sampler.processes) >= 4 and {sample[1:] for sample in sampler.processes} == {(os.getpid(), 400.0)}
+    assert sampler.unread >= 8 and sampler.started[0] - 0.002 <= sampler.clocks[0].at <= sampler.clocks[-1].at <= sampler.stopped[0] + 0.5
+    apart = (sampler.stopped[0] - sampler.stopped[1]) - (sampler.started[0] - sampler.started[1])
+    assert abs(apart) * 1e3 < observe.DRIFT_LIMIT_MS, "the wall clock against the stamps' clock at the start and at the stop: nobody set a clock meanwhile"
+    sampler.stop()  # a second stop finds nothing to do
+    # the run is gone without a stop: its end of the pipe closes, and the keeper ends the loops
+    gone = observe.Sampler(tool, "GPU-00000000-stand-in", 5)
+    left = begun(gone, 4)  # both loops writing: a loop that is asked to end before it has its handler ends by the default action
+    gone.child.stdin.close()
+    _wait(lambda: not any(_running(pid) for pid in left))
+    ended_with = gone.child.wait(timeout=30)
+    assert ended_with == 0 and set(left) <= _asked(folder), "the keeper ended in order, and so did its loops"
+    gone.folder.cleanup()
+    # the keeper is ended from outside: the loops end with it, and a stop behind it reads what there is
+    ended = observe.Sampler(tool, "GPU-00000000-stand-in", 5)
+    last = begun(ended, 6)
+    ended.child.terminate()
+    _wait(lambda: not any(_running(pid) for pid in last))
+    assert set(last) <= _asked(folder), "the keeper took the signal and ended its loops in order"
+    ended.stop()
+    assert ended.child is None and ended.unread >= 0
+    # a tool that does not end when it is asked to, and that nothing else ends: the keeper kills it within its limit, and the stop leaves no loop
+    assert 2 * observe.LOOP_LIMIT_S < observe.ASK_LIMIT_S, "the keeper is through with both loops before the stop gives up on it"
+    _scenario(folder, deaf=True, unbound=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(observe, "LOOP_LIMIT_S", 0.3)
+        deaf = observe.Sampler(tool, "GPU-00000000-stand-in", 5)
+        unasked = begun(deaf, 8)
+        deaf.stop()
+    assert not any(_running(pid) for pid in unasked) and not set(unasked) & _asked(folder), "killed by the keeper"
+    assert len(deaf.clocks) >= 1 and len(deaf.processes) >= 1
+    if sys.platform.startswith("linux"):  # a loop is bound to its keeper: none outlives a keeper that is killed, with a stop behind it or without
+        _scenario(folder)
+        killed = observe.Sampler(tool, "GPU-00000000-stand-in", 5)
+        orphans = begun(killed, 10)
+        os.kill(killed.child.pid, signal.SIGKILL)
+        _wait(lambda: not any(_running(pid) for pid in orphans), 10.0)
+        assert not set(orphans) & _asked(folder), "ended by the kernel with their keeper: a loop that takes no request to end goes too"
+        killed.stop()
+        assert killed.child is None and len(killed.clocks) >= 1
+        _scenario(folder, deaf=True)  # ... also where the stop itself gives up on a keeper that is still waiting for a loop, and kills it
+        with monkeypatch.context() as patch:
+            patch.setattr(observe, "ASK_LIMIT_S", 0.3)
+            patch.setattr(observe, "LOOP_LIMIT_S", 60.0)
+            given_up = observe.Sampler(tool, "GPU-00000000-stand-in", 5)
+            deserted = begun(given_up, 12)
+            given_up.stop()
+        _wait(lambda: not any(_running(pid) for pid in deserted), 10.0)
+    _scenario(folder)
+    for missing in (None, ""):  # no interpreter to run the keeper with (an embedded one names none): said, not raised
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "executable", missing)
+            refused = observe.Sampler(tool, "GPU-00000000-stand-in").start()
+        assert refused == "the sampler could not be started"
+    with monkeypatch.context() as patch:  # an interpreter that cannot be started: said, and the folder of the files is not left behind
+        patch.setattr(sys, "executable", str(tmp_path / "no interpreter"))
+        unstarted = observe.Sampler(tool, "GPU-00000000-stand-in")
+        refused = unstarted.start()
+    assert refused == "the sampler could not be started" and not Path(unstarted.folder.name).exists()
+
+    def no_folder(*_, **__):
+        raise FileNotFoundError(2, f"No usable temporary directory found in ['{tmp_path}']")
+
+    with monkeypatch.context() as patch:  # no folder for temporary files on this host: said, and nothing of the error's text
+        patch.setattr(observe.tempfile, "TemporaryDirectory", no_folder)
+        refused = observe.Sampler(tool, "GPU-00000000-stand-in").start()
+    assert refused == "the sampler could not be started"
+    _says("area", "a child process samples the SM clock, the power, the limit reasons the driver reports and the process list, twenty times a second,")
+    assert 1000 / observe.PERIOD_MS == 20
+    _says("guide", "and its loops end with the pipe the run holds: at the stop, or when the run is gone.")
+    # no package is added: the module imports the standard library, the helper layer's clock and, where it asks for the GPU's id, PyTorch
+    tree = ast.parse(Path(observe.__file__).read_text(encoding="utf-8"))
+    imports = [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
+    names = {(node.module or "") if isinstance(node, ast.ImportFrom) else node.names[0].name for node in imports}
+    standard = {"__future__", "math", "os", "shutil", "statistics", "subprocess", "sys", "tempfile", "time", "dataclasses", "typing"}
+    assert names == standard | {"timing", "torch"}, names
+
+
+def test_not_observed_names_no_path(monkeypatch, tmp_path):
+    """A tool that fails, hangs, answers something else or is not there: the reason is one of a closed list of phrases.
+    Neither the screen nor the file holds the tool's folder, its own words or an exception's text."""
+    from model_samples import observe
+
+    assert observe.Observer(torch.device("cpu")).reason == "no CUDA device", "a session that is not on a GPU"
+    assert observe.Observer(torch.device("cpu")).in_a_request() == "none (no CUDA device)"
+    with monkeypatch.context() as patch:  # the GPU is named to the tool by its UUID, with the prefix the tool takes
+        patch.setattr(torch.cuda, "get_device_properties", lambda device: types.SimpleNamespace(uuid="0f9a1c2e-5b7d-4e6f-8a90-123456789abc"))
+        named = observe.target_of(torch.device("cuda", 0))
+    assert named == "GPU-0f9a1c2e-5b7d-4e6f-8a90-123456789abc"
+    words = f"NVIDIA-SMI has failed because it could not open {tmp_path}/libnvidia-ml.so.1\n"
+    folder = _tool(monkeypatch, tmp_path, exit=6, stderr=words)
+    tool, pid = str(folder / "nvidia-smi"), os.getpid()
+    failed = observe.reading(tool, "GPU-00000000-stand-in", pid, "before the load")
+    assert failed.reason == "nvidia-smi ended with an error" and failed.data() == {
+        "when": "before the load",
+        "reason": "nvidia-smi ended with an error",
+        "host_load": failed.load,
+        "seconds": failed.seconds,
+    }
+    for scenario, reason in (
+        ({"device": ["000.00", "2000"]}, "nvidia-smi's answer could not be read"),
+        ({"processes": [["a name", 4]]}, "nvidia-smi's answer could not be read"),
+        ({"device": []}, "nvidia-smi's answer could not be read"),
+    ):
+        _scenario(folder, **scenario)
+        unread = observe.reading(tool, "GPU-00000000-stand-in", pid, "before the load")
+        assert unread.reason == reason, scenario
+    # fields the driver does not give, or gives as no size: the reading is made, and holds none of them
+    _scenario(folder, device=["[N/A]", "0", "inf", "nan"])
+    bare = observe.reading(tool, "GPU-00000000-stand-in", pid, "before the load")
+    assert (bare.reason, bare.driver, bare.clock, bare.used, bare.utilization, bare.listed, bare.own) == ("", None, None, None, None, True, 400.0)
+    asking = observe.Observer(torch.device("cuda", 0))
+    unasked = asking.driver()
+    asking.readings = [bare]
+    assert unasked == {"value": None, "reason": "not observed (no reading was made)"}
+    assert asking.driver() == {"value": None, "reason": "not observed (nvidia-smi's answer could not be read)"}
+    with monkeypatch.context() as patch:
+        patch.setattr(observe, "ASK_LIMIT_S", 0.5)
+        _scenario(folder, hang=60)
+        silent = observe.reading(tool, "GPU-00000000-stand-in", pid, "before the load")
+    absent_tool = observe.reading(str(folder / "not there"), "GPU-00000000-stand-in", pid, "before the load")
+    assert silent.reason == "nvidia-smi gave no answer" and absent_tool.reason == "nvidia-smi ended with an error"
+    # a run whose tool fails at every call, with the real sampler: both lines say why, by the list
+    outcome, lines, _, run = _observed(monkeypatch, tmp_path / "run", dense=False, scenario={"exit": 6, "stderr": words})
+    gpu = lines.index("GPU         stated device, compute capability 10.0, 148 SMs")
+    assert lines[gpu + 1] == "            other compute processes: not observed (nvidia-smi ended with an error)"
+    assert lines[gpu + 2].startswith("            clocks observed: no (no clock sample inside a timed request) | host load ")
+    assert outcome.passed and outcome.data["record"]["reasons"][-2:] == ["other processes not observed", "clocks not observed"]
+    watched = outcome.data["observation"]
+    assert outcome.data["environment"]["driver"] == {"value": None, "reason": "not observed (nvidia-smi ended with an error)"}
+    assert {made["reason"] for made in watched["readings"]} == {"nvidia-smi ended with an error"}
+    assert watched["sampler_period_ms"] == observe.PERIOD_MS == 50, "the period the run's loops were started with"
+    assert outcome.data["protocol"]["in_a_timed_request"]["sampler"] == observe.SAMPLER, "the keeper was started: its loops gave nothing"
+    asked = [call for call in _calls(run) if not call["argv"][-1].startswith("--loop-ms=")]
+    assert len(asked) == 2, "one call a reading: a tool that failed is not asked for its list too (the two loops of the sampler start beside the run)"
+    printed = "\n".join(lines) + json.dumps(outcome.data)
+    assert str(tmp_path) not in printed and "libnvidia" not in printed and "NVIDIA-SMI" not in printed and "Traceback" not in printed
+    assert watched["other_compute_processes"]["reason"] in observe.REASONS and watched["clocks"]["reason"] in observe.REASONS
+    # the tool is not there at all: nothing is started, and the report says so
+    with monkeypatch.context() as patch:
+        patch.setattr(shutil, "which", lambda name, *more, **named: None)
+        absent = observe.Observer(torch.device("cuda", 0), 2000)
+        absent.read("before the load")
+        absent.start()
+        absent.stop()
+        missing = absent.section([("timed", 0.0, 1.0)])
+    assert (absent.reason, absent.sampler, missing["source"], missing["reason"], missing["sampler_period_ms"]) == (
+        "nvidia-smi not found",
+        None,
+        "none",
+        "nvidia-smi not found",
+        None,
+    )
+    assert (
+        observe.others_text(missing) == "not observed (nvidia-smi not found)"
+        and observe.clocks_text(missing) == "no (nvidia-smi not found; lock 2000 MHz declared)"
+    )
+    assert (
+        absent.driver() == {"value": None, "reason": "not observed (nvidia-smi not found)"} and missing["readings"][0]["host_load"] == absent.readings[0].load
+    )
+    # what the file's protocol says where no sampler ran: none, with the reason -- the tool is not there, the session is not on a GPU, the
+    # sampler was not asked for yet, its child could not be started
+    assert absent.in_a_request() == "none (nvidia-smi not found)"
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "executable", "")
+        early = asking.in_a_request()
+        asking.start()
+    assert (early, asking.failed, asking.in_a_request()) == ("none (not started)", observe.NO_SAMPLER, "none (the sampler could not be started)")
+    _says("area", "its stop, or none, with the reason), `checks` (every")
+    with monkeypatch.context() as patch:  # a PyTorch that names no id for the GPU
+        patch.setattr(observe, "target_of", lambda device: device.uuid)
+        assert observe.Observer(torch.device("cuda", 0)).reason == "PyTorch names no id for this GPU"
+    assert len(set(observe.REASONS)) == len(observe.REASONS) == 15 and not any(os.sep in reason or "\\" in reason for reason in observe.REASONS)
+    _says("area", "A `not observed` names its reason, one of a closed list, and never a path;")
+    _says("guide", "A `not observed` carries a reason from a closed list, never the tool's path or its own words;")
+
+
+def test_clock_lock_is_a_declaration(monkeypatch, capsys, tmp_path):
+    """``--perf-clock-lock`` declares a clock that was fixed outside the sample: a flag of the mode, an integer from 1.  The
+    run prints it in its header, on the clock line and -- where a sample lies below or above it -- as a reason of line
+    2, and writes it into the file; it starts the driver's tool with queries and with nothing else, and the word
+    'locked' is in no line of such a run.  The reading before the load is made by ``main()``, before anything is loaded."""
+    folder = _tool(monkeypatch, tmp_path)
+    with monkeypatch.context() as patch:  # up to the load, which is an error here: what is refused, and what is read before it
+        sample = _sample_on_the_cpu(patch, [], loads=False)
+        for arguments, refusal in (
+            (["--perf-clock-lock", "2000"], "--perf-clock-lock: a flag of the performance mode; it needs --perf"),
+            (["--perf", "--perf-clock-lock", "0"], "--perf-clock-lock takes the declared SM clock in MHz, a positive integer"),
+        ):
+            with pytest.raises(SystemExit) as stop:
+                sample.main(arguments)
+            assert stop.value.code == 2 and capsys.readouterr().err.splitlines()[-1].split(": error: ", 1)[1] == refusal
+        assert sample._arguments(["--perf"]).perf_clock_lock is None and sample._arguments(["--perf", "--perf-clock-lock", "2000"]).perf_clock_lock == 2000
+        assert _calls(folder) == [], "a refusal asks nothing of the driver"
+        with pytest.raises(AssertionError, match="reached a load"):
+            sample.main(["--perf", "--perf-steps", "8"])
+        plain = capsys.readouterr().err.splitlines()
+        assert "[00] clock not locked: timings are for orientation only | reference precision fp64" in plain, "without the flag: the header as it was"
+        assert [call["argv"][1] for call in _calls(folder)] == [
+            "--query-gpu=driver_version,clocks.sm,memory.used,utilization.gpu",
+            "--query-compute-apps=pid,used_memory",
+        ], "the reading before the load: made before the load was reached, two queries and no loop"
+        with pytest.raises(AssertionError, match="reached a load"):
+            sample.main(["--perf", "--perf-steps", "8", "--perf-clock-lock", "2600"])
+        declared = capsys.readouterr().err.splitlines()
+        assert "[00] clock lock declared: 2600 MHz, set outside this sample, which sets no clock | reference precision fp64" in declared
+        assert not any("locked" in line for line in declared)
+    # a whole run with a lock declared above the clock it observes
+    _dense(monkeypatch, [])
+    loaded = _sample_on_the_cpu(monkeypatch, [])
+    monkeypatch.chdir(tmp_path)
+    code = loaded.main(["--perf", "--perf-steps", "6", "--perf-requests", "2", "--perf-warmup", "2", "--perf-clock-lock", "2600", "--perf-report", "lock.json"])
+    err = capsys.readouterr().err
+    lines = err.splitlines()
+    assert code == 0 and lines[-1] == "[00] PASS", err[-3000:]
+    clocks = lines.index("            clocks observed: yes (SM 2000 MHz median, 2000 min; lock 2600 MHz declared; no limit reported)")
+    assert lines[clocks + 1].startswith("            host load ") and lines[clocks - 1].endswith("| other compute processes: none seen")
+    report = lines.index("cuDNN Frontend model sample: decode performance report")
+    assert " ".join(line.strip() for line in lines[report + 1 : report + 4]).split(" scope ")[0].endswith("launched from Python; below the declared lock")
+    text = (tmp_path / "lock.json").read_text(encoding="utf-8")
+    data = json.loads(text)
+    assert data["observation"]["clock_lock_declared_mhz"] == 2600 and data["record"]["reasons"][-1] == "below the declared lock"
+    assert [made["when"] for made in data["observation"]["readings"]] == ["before the load", "before the warm-up request", "behind the last timed request"]
+    assert list(data["environment"]["host"]["load"]) == ["before the load", "before the warm-up request", "behind the last timed request"]
+    assert all(made["clock"]["share_below_declared_lock"] == 1.0 for made in data["observation"]["requests"])
+    assert "locked" not in err and "locked" not in text, "neither the run nor its file"
+    for call in _calls(folder):  # the tool is asked and never told: a GPU, a query, the format and, for the sampler, a period
+        assert call["argv"][0] == "--id=GPU-00000000-stand-in" and call["argv"][1].startswith("--query-") and call["argv"][2] == "--format=csv,noheader,nounits"
+        assert all(word.startswith("--loop-ms=") for word in call["argv"][3:])
+    _says("family", "| `--perf-clock-lock MHZ` | none | the SM clock in MHz that an operator fixed outside the sample: a declaration.")
+    _says("family", "The report prints it beside the clock it observed and names it as a reason where a sample lies more than 3 % below or above it;")
+    _says("family", "the sample never sets a clock |")
+    _says("area", "`--perf-clock-lock MHZ` declares a clock that an operator fixed outside the sample: the declaration is written into the report and held")
+    _says("area", "against the clock the run observed, and nothing is set.")
+    _says("area", "*Clock*: a sample never sets the GPU's clock; the performance mode observes it, and an operator may declare a lock applied outside.")
+    _says("area", "# An operator who fixed the GPU's clock outside the sample declares it; the sample sets nothing:")
+    _says("area", "--model /data/Qwen3.8-27B-NVFP4 --stack native --perf --perf-clock-lock <MHz>")
+    _says("script", "``--perf-clock-lock MHZ`` declares a clock that an operator fixed outside this sample, which sets none: the report")
+    _says("script", "holds the declaration against the clock it observed.")
+    _says("script", "the other compute processes on the GPU, its SM clock, the limit reasons -- or that it could not, with the reason.")
+    _says("script", "with --perf: the SM clock in MHz that an operator fixed outside this sample: a declaration, written into the report and held")
+    _says("script", "a declaration, written into the report and held against the clock the run observes. The sample never sets a clock")
+
+
+def test_every_form_of_the_gpu_lines_within_110():
+    """No line of the screen is wider than 110 characters in any form of the two ``GPU`` lines: every reason of a ``not
+    observed``, a lock, every limit the driver names, a long device name, a large host."""
+    from model_samples import observe, perf
+
+    def screen(gpu="stated device", **changes):
+        form = _checkpoint_form(environment={"gpu": {"name": gpu, "compute_capability": "10.0", "sm_count": 148}})
+        form["observation"] = {**_alone(), **changes}
+        lines = perf.screen(form)
+        assert max(len(line) for line in lines) <= perf.WIDTH == 110, max(lines, key=len)
+        start = next(index for index, line in enumerate(lines) if line.startswith("GPU         "))
+        return lines[start : next(index for index, line in enumerate(lines) if line.startswith("kernels     "))]
+
+    alone = _alone()
+    assert screen() == [
+        "GPU         stated device, compute capability 10.0, 148 SMs | other compute processes: none seen",
+        "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load 5.5 on 70 cores",
+    ]
+    assert len(screen()[1]) == 110, "one line at the screen's width"
+    _says("area", "(a checkpoint on the stack `native`, on a GPU the run had to itself;")
+    assert (
+        screen(host={"load": None, "cores": 4})[1]
+        == "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load not observed"
+    )
+    seen = {"verdict": "seen", "seen": 12, "reason": None}
+    assert screen(other_compute_processes=seen)[0].endswith("148 SMs | other compute processes: 12 seen")
+    for reason in observe.REASONS:  # every reason, in both lines, with a lock declared
+        hidden = {"verdict": "not observed", "seen": None, "reason": reason}
+        lines = screen(other_compute_processes=hidden, clocks={**alone["clocks"], "verdict": "no", "reason": reason}, clock_lock_declared_mhz=2000)
+        assert f"other compute processes: not observed ({reason})" in " ".join(line.strip() for line in lines[:2])
+        assert f"clocks observed: no ({reason}; lock 2000 MHz declared)" in " ".join(line.strip() for line in lines)
+    every = [*observe.EVENTS[1:], "bit 12"]
+    limited = screen(clocks={**alone["clocks"], "limit_reasons": every}, clock_lock_declared_mhz=2000, host={"load": 123.4, "cores": 256})
+    assert " ".join(line.strip() for line in limited[1:]) == (
+        "clocks observed: yes (SM 2000 MHz median, 2000 min; lock 2000 MHz declared; limit reported: " + ", ".join(every) + ") host load 123.4 on 256 cores"
+    ), "a part that does not fit its line is wrapped by its words; the host's load stands on a line of its own"
+    long_name = screen("a device with a name of " + "many " * 12 + "words")
+    assert long_name[-2:] == [
+        "            other compute processes: none seen",
+        "            " + f"clocks observed: {observe.clocks_text(alone)} | {observe.host_text(alone)}",
+    ]
+    thin = screen(clocks={**alone["clocks"], "verdict": "thin", "samples": 3})
+    assert thin[1].startswith("            clocks observed: thin (3 samples in a timed request) | host load ")
+
+
+def test_an_ordinary_run_asks_no_driver(monkeypatch, capsys, tmp_path):
+    """An ordinary run does not import the module that observes the GPU, starts the driver's tool not once, and prints the
+    header it printed."""
+    folder = _tool(monkeypatch, tmp_path)
+    sample = _sample_on_the_cpu(monkeypatch, [])
+    package = importlib.import_module("model_samples")
+    for name in ("perf", "observe"):  # other tests of this module imported them: neither is there before the run
+        monkeypatch.delitem(sys.modules, f"model_samples.{name}", raising=False)
+        monkeypatch.delattr(package, name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    code = sample.main(["--sequences", "1", "--force-tokens", "4"])
+    lines = capsys.readouterr().err.splitlines()
+    assert code == 0 and lines[-1] == "[00] PASS" and _calls(folder) == []
+    assert "model_samples.observe" not in sys.modules and "model_samples.perf" not in sys.modules and not hasattr(package, "observe")
+    assert "[00] clock not locked: timings are for orientation only | reference precision fp64" in lines
+    assert not any("other compute processes" in line or "clocks observed" in line or "host load" in line for line in lines)

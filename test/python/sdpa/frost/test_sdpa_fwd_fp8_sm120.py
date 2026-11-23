@@ -1283,6 +1283,7 @@ def _run_thd_fp8(
     attn_scale=None,
     interleaved=False,
     o_token_pad=0,
+    virtual_stats=False,
 ):
     """Run a ragged FP8 graph on the SM120 engine vs per-sequence references.
 
@@ -1375,7 +1376,7 @@ def _run_thd_fp8(
         scale_s=ssn,
         scale_o=son,
         attn_scale=scale,
-        generate_stats=check_stats,
+        generate_stats=check_stats or virtual_stats,
         use_padding_mask=True,
         seq_len_q=sq_h,
         seq_len_kv=skv_h,
@@ -1524,6 +1525,14 @@ def _run_thd_fp8(
 def test_fp8_sm120_thd():
     """THD self-attention: packed ragged batch vs per-sequence references."""
     _run_thd_fp8(seq_q_lens=[200, 150], seq_kv_lens=[200, 150], is_causal=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=42)
+def test_fp8_sm120_thd_virtual_stats():
+    """FlashInfer requests Stats on FP8 ViT prefill but exposes only O when return_lse=False."""
+    lens = [256] + [0] * 7
+    _run_thd_fp8(seq_q_lens=lens, seq_kv_lens=lens, h_q=16, h_kv=16, D=80, is_causal=False, o_dtype=torch.bfloat16, attn_scale=72**-0.5, virtual_stats=True)
 
 
 @pytest.mark.L0

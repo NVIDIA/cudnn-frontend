@@ -210,6 +210,7 @@ FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("add_norm_quant", re.compile(r"^cudnn_kernel_frost_add_rms_norm_quant_")),
     ("fp8_projection", re.compile(r"^cudnn_kernel_frost_fp8_projection_decode_")),
     ("swiglu_fp4", re.compile(r"^cudnn_kernel_frost_swiglu_fp4_decode_")),
+    ("attention_prepare", re.compile(r"^cudnn_kernel_frost_attention_prepare_")),
     ("cudnn_fe", re.compile(r"^cudnn_kernel_frost_")),  # a kernel of cuDNN Frontend that no entry above names: never a family member
     # FlashInfer's multiplies on the stored formats.  The 4-bit multiply launches one of two kernel classes of one module, and
     # the class is in the name (a census entry names it: ``class``).  The 8-bit multiply is served by the kernel the library
@@ -784,11 +785,29 @@ def _class_text(key: str) -> str:
     return f"cc {cc[2:]} / {sms[2:]} SMs"
 
 
-def _other_widths(recorded: Mapping[str, int], geometry) -> str:
+def _plain(value):
+    """A value of a form or of a geometry as it is compared and printed: a JSON file holds a list where a provider table and a
+    geometry hold a tuple (the sections of a rotary width), and the two are one value."""
+    return tuple(_plain(item) for item in value) if isinstance(value, (list, tuple)) else value
+
+
+def _width(value) -> bool:
+    """Whether ``value`` is a layer width as a census section names one: a whole number, or a list of whole numbers (a width
+    that has parts: the sections of a rotary width)."""
+
+    def whole(n):
+        return isinstance(n, int) and not isinstance(n, bool)
+
+    return whole(value) or (isinstance(value, (list, tuple)) and bool(value) and all(whole(n) for n in value))
+
+
+def _other_widths(recorded: Mapping[str, object], geometry) -> str:
     """The fields of a model's geometry that are not the recorded ones, as a run names them: ``hidden 4096 (recorded 5120)``;
     empty where every recorded field is the model's."""
     return ", ".join(
-        f"{name} {getattr(geometry, name, 'none')} (recorded {value})" for name, value in recorded.items() if getattr(geometry, name, None) != value
+        f"{name} {_plain(getattr(geometry, name, 'none'))} (recorded {_plain(value)})"
+        for name, value in recorded.items()
+        if _plain(getattr(geometry, name, None)) != _plain(value)
     )
 
 
@@ -969,7 +988,7 @@ class Target:
     * ``layers``: which entry list of a section a layer kind of the model reads;
     * ``configurations``: per configuration and per ``ccMAJOR.MINOR/smCOUNT`` a section: ``claimed``, its ``basis``
       (``recorded`` or ``planned``), what was recorded, ``geometry`` -- the layer widths of the model it holds for, under
-      the names of the family's geometry -- ``tokens`` -- the tokens per sequence of the step it holds for, where that
+      the names of the family's geometry (a whole number each, or a list of them for a width that has parts) -- ``tokens`` -- the tokens per sequence of the step it holds for, where that
       is more than one -- and per row count the entries of a step as ``[block, kernel id, facts]``,
       before the layers, per layer kind, after the layers, after the step.  The facts of an entry (:data:`ENTRY_FACTS`):
       ``launch`` = ``[grid, block, shared memory]``, ``at`` = further fields of the geometry that this one launch
@@ -1021,8 +1040,8 @@ class Target:
                 if section["claimed"] and section["basis"] != "recorded":
                     wrong(f"{where}: claimed on the basis {section['basis']}; only a recorded section can be claimed")
                 geometry = section.get("geometry")
-                if not isinstance(geometry, dict) or not all(isinstance(v, int) and not isinstance(v, bool) for v in geometry.values()):
-                    wrong(f"{where}: a section holds geometry, the layer widths of the model it was taken on (name: whole number)")
+                if not isinstance(geometry, dict) or not all(_width(v) for v in geometry.values()):
+                    wrong(f"{where}: a section holds geometry, the layer widths of the model it was taken on (name: whole number, or a list of them)")
                 if section["claimed"] and not geometry:
                     wrong(f"{where}: claimed without the layer widths it holds for")
                 tokens = section.get("tokens", 1)
@@ -1183,9 +1202,10 @@ class Target:
         if len(exact) != 1 or exact[0].id != kernel_id:
             return Identity(OTHER, kernel_id, kind, f"the row launches {', '.join(kernel.id for kernel in exact)}, the target {kernel_id}")
         # the target's form at this call: the form its kernel has everywhere and, behind it, what the census names for this call
-        want = tuple({**meta.get("form", {}), **facts.get("form", {})}.items())
+        # (a field of several values is a list in the file and a tuple in a provider table: one value)
+        want = tuple((name, _plain(value)) for name, value in {**meta.get("form", {}), **facts.get("form", {})}.items())
         try:
-            have = tuple(row.site_form(site))
+            have = tuple((name, _plain(value)) for name, value in row.site_form(site))
         except ValueError as error:  # the wiring calls the block at a site its row has no form for
             return Identity(OTHER, kernel_id, kind, str(error))
         if dict(have) != dict(want):
