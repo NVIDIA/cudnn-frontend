@@ -838,7 +838,7 @@ def test_other_lengths_take_the_uncut_table(monkeypatch, frost, lengths):
     """A batch with a measured cell's total but sequences of other chunk counts -- two lengths, an empty first sequence,
     an empty last one -- builds the level plan (the shapes cannot tell) and its prologue writes the uncut table: the
     chains as items, no order entry, no level word, and the uncut plan's bytes.  The levelled table would cut every chain
-    where sequence 0's chunk count says."""
+    where the chunk count the token rows give says."""
     backend, built, regions = frost
     even, cell = cell_case()
     case, _ = cell_case(seq_lens=lengths([int(n) for n in (even.cu[1:] - even.cu[:-1]).tolist()]))
