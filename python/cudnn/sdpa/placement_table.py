@@ -893,12 +893,51 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm80_thd_d256_v2_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 835bbdb9b; the training harness's THD forward, recorded facts:
     # d256 GQA causal, squares and bottom-right chunks over S_q 17-8192, groups 2-8, b 8-96; 200 train cells). Ragged lengths lead from
     # S_q 2^7.5 on the tile and from 2^9.09 tiles off it (changed train 0.537 / 0.531); holdout at fresh heads, scored once, 0.516 /
-    # 0.566 (worst 0.705). Equal lengths (`thd`) have no entry: their off-tile holdout side reached 1.101.
+    # 0.566 (worst 0.705). Equal lengths (`thd`) are sm80_train_fwd_gaps_pcie_20261123's (below).
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", False): Entry(
         "ge", 7.5, "sm80_thd_d256_v2_20261117", "q"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", True): Entry(
         "ge", 9.085, "sm80_thd_d256_v2_20261117", "tiles"
+    ),
+    # study sm80_train_fwd_gaps_pcie_20261123 (A100 80GB PCIe; the training harness's forward, recorded facts): equal-length THD d256
+    # and ragged THD MHA lead from a floor, and dense d512 sliding-window prefill leads (GQA off the tile from a cost floor). Equal-length
+    # THD d128 and ragged d128 GQA keep the hand rule; ragged d256 GQA keeps the entries above.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "thd_ragged", "causal_br", False, "mha", False): Entry(
+        "ge", 28.5, "sm80_train_fwd_gaps_pcie_20261123", "cost", ("ge", 8.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "thd_ragged", "causal_br", False, "mha", True): Entry(
+        "ge", 7.5, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 7.006, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", False): Entry(
+        "ge", 6.292, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 7.5, "kv")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", True): Entry(
+        "ge", 29.0, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "mha", False): Entry(
+        "ge", 27.5, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "mha", True): Entry(
+        "ge", 28.003, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "mha", False): Entry(
+        "ge", 5.5, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 6.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "mha", True): Entry(
+        "ge", 5.5, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 6.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", False): Entry(
+        "always", None, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", True): Entry(
+        "ge", 24.0, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "mha", False): Entry(
+        "always", None, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "mha", True): Entry(
+        "always", None, "sm80_train_fwd_gaps_pcie_20261123"
     ),
     # study sm80_dense_prefill_20261031 (cuDNN 9.29.0.18; A100 80GB PCIe; dense bf16 context d64 / d128 / d192x128 / d256, causal,
     # mask-free and d64 sink / window + sink, s_q 8-8192 over S_kv on and off the tile; 2,448 train cells incl. two consumed
