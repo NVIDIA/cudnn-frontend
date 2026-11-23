@@ -124,6 +124,76 @@ the default tuning's output bytes over repeated calls. These checks do not
 cover replay under concurrent work, batch invariance, warm stress or goldens,
 and no golden files are recorded.
 
+### SM90 dedicated D128 additive-bias forward (issue #378) (2026-11-23)
+
+`sdpa/frost/test_sdpa_bias_sm90_determinism.py` adds 4 L0 forward-only cases for
+the additive bias on the dedicated SM90 D128 template (engine 20541,
+`sm90/d128_f16_multi_q/kernel.py`): FP16 and BF16 Q/K/V with a bias in the Q/K/V
+dtype, unmasked and top-left causal, on the record the standalone
+`SdpaFwdDslSm90` builds at the 128 x 128 tile (persistent: 3 x 64 heads x 2 Q
+tiles = 384 items over at most 132 CTAs). Each case asserts the loaded kernel and
+the prepared spec's bias leg before it compares a byte. The 12 cases of the D512
+body above now pin its 64 x 64 tile (the adapter takes the D128 template for an
+exact (128, 128) bias in the Q/K/V dtype otherwise); their kernels are unchanged
+and their committed goldens matched the new record byte for byte.
+
+- Shape, checks and inputs: as the D512-body cases (B 3, 64/16 heads, S_q 129,
+  S_kv 257, a 272-column bias buffer, an empty row 0). On the 128-row tile the
+  second Q tile holds one live row and the last KV tile one key, so the second
+  compute warpgroup's bias boxes of that Q tile lie wholly past S_q.
+- Warm stress (`sdpa/frost/test_sdpa_bias_sm90_stress.py`, 3 L0 cases added): WG0
+  refills each compute warpgroup's bias slot by TMA once per KV tile, after that
+  warpgroup's `tile_dsl.consume` release of its reads. B 3, 64/16 heads, S_q 257,
+  S_kv 513, D128: the shipped persistent record (132 thread blocks, 1.00 per SM,
+  19 refills per launch; FP16 and BF16) and the one-tile-per-CTA record (576
+  thread blocks, 4.36 per SM, 4 refills per launch; BF16), the latter at a
+  geometry the stress control qualifies.
+
+Runtime: NVIDIA H200 (132 SMs), driver 570.86.15 with the CUDA 13 forward
+compatibility libraries, PyTorch 2.15.0+cu132, CUDA 13.2, cuDNN 92801, CuTe DSL
+4.8.1 (compiles with CUDA 13.4). The goldens are in `a6e0199439a0a182/` (4 new
+files, `sdpa_sm90_d128_bias_fwd_*`).
+
+```
+cd test/python
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+D=sdpa/frost/test_sdpa_bias_sm90_determinism.py
+CUDNN_DETERMINISM_RECORD=<new directory> python -m pytest -m L0 -q -rs $D   # 16 passed
+CUDNN_DETERMINISM_GOLDENS=<new directory> python -m pytest -m L0 -q -rs $D  # 16 passed, 0 skipped
+python -m pytest -m L0 -q -rs sdpa/frost/test_sdpa_bias_sm90_stress.py     # 5 passed
+python -m pytest -q sdpa/frost/test_sdpa_bias_sm90.py                       # 99 passed, 1 skipped
+```
+
+The skip is `test_sm90_d128_bias_records[dense-persistent-walk]`: the paired walk
+orders causal records only. Warm stress, persistent D128 cases: 0 wrong of 3000
+warm launches and 0 wrong of 3000 poisoned launches each (per-launch rate below
+0.0998 % at 95 %); at one thread block per SM the helper notes that a zero bounds
+little, which the one-tile case covers: 0 wrong of 3000 warm and 0 wrong of 3000
+poisoned launches at 4.36 thread blocks per SM. The D512-body cases are
+unchanged (0 wrong of 3000 and 3000 each). The control's unsafe twin failed 200
+of 200 launches on the same GPU. The stress helper's cold reference is two
+launches behind a cache flush; the FP64 check before it is the independent
+reference. With the 4 new files committed, the default comparison gives 16
+passed, 0 skipped.
+
+The bias-free specializations are unchanged: the normalized PTX of 12
+bias-free D128 specializations (v1 and overlap one-tile kernels, persistent dense
+and causal stride, paired walk, claim counter; LPT, LPT_L2 top-left causal,
+negative and zero scale, base-2 Stats without Stats storage) is identical between
+the base (`7e71bee9`) and this branch, so their existing goldens still apply.
+The 13 SM90 forward files of the D512-body section above, at `-m "L0 or L1"`,
+gave 1235 passed, 14 skipped, 0 failed. The new cases among them include the
+D128 SASS probes of four bias records (no spills, under the 240-register budget,
+and the Rule 11 rendering pin: every bias-slot EMPTY arrive is computed from the
+thread's 32 loaded words through the kernel's last parameter). Every skip is a
+D512-body determinism cell without a golden for this runtime
+(`sdpa-sm90-dense-*` split and pack cells and `sdpa-sm90-paged-*`), none of them
+a bias path.
+
+Not covered here: an FP32 bias is declined by this template (the D512 body
+serves it). Bottom-right causal with a bias is refused by the graph validator.
+There is no bias backward or dBias.
+
 ### SM90 D512-body additive-bias forward (issue #378) (2026-11-22)
 
 `sdpa/frost/test_sdpa_bias_sm90_determinism.py` adds 12 L0 forward-only cases
