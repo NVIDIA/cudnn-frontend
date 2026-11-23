@@ -460,7 +460,8 @@ conflict-rank layouts (below) and unlike its shard and relay layouts and the
 SM90 deterministic path. The plan option `deterministic_dkv_mode` (below)
 picks the layout of H128 two-CTA plans: under `'records'` (the default) the
 plan chooses between the two layouts from the shapes, `'shards'` keeps the
-private-plane layout for every shape, and `'chain'` is rejected. The
+private-plane layout for every shape, `'ordered'` selects the batch-invariant
+ordered layout (H128 D512 only, below), and `'chain'` is rejected. The
 private-plane layouts hold 128 FP32 dKV planes for D512 and 96 for D576; H96
 D576 two-CTA plans always use their 96-plane layout. `'shards'` restores the
 private-plane layout but, for D512, not the bits of releases without
@@ -581,16 +582,37 @@ follows, and of the H128 two-CTA plans as described above:
 - `'shards'` — the shard layout or the cluster relay described below, chosen
   from the query and KV extents alone, with the kernels, workspace and
   bitwise results of releases without this option.
+- `'ordered'` — batch-invariant results, run by the H128 D512 two-CTA backend
+  only (SM100/SM103, BF16, contiguous inputs, top-k 128/512/1024/1152/2048).
+  The plan keeps the conflict-rank layout with one dense plane and consecutive
+  waves: rank 0 of a wave adds to plane 0, every higher rank of a shared row
+  takes an overflow record, and the wave's tail (in the next main kernel for
+  top-k 128, in the next setup launch above) adds the records to the
+  plane-0 value one at a time in rank order (no segmented sums). A row whose
+  previous wave left a tail sends all of this wave's ranks to records, so a
+  wave's drains never add to a plane-0 row a running tail owns. Each dKV row is
+  therefore the FP32 left fold of its terms in ascending (query, slot) order,
+  whatever the KV extent, the wave size or a query's position in the batch, and
+  `d_sink` is the left fold of the per-query terms `p_sink * (O . dO)` in query
+  order. A sequence's dQ, dKV and `d_sink` keep their bytes when its neighbors,
+  their order or its duplicates change, provided no neighbor selects its KV rows
+  and the neighbors contribute zero `d_sink` terms (zero upstream gradients).
+  The workspace holds one dense plane plus the overflow records of one wave
+  (two waves for top-k 128) at every KV extent. Every other plan rejects the
+  mode.
 
 Further properties of the option:
 
 - **Validation** — values other than the default require `deterministic=True`
   and unknown values are rejected. `'chain'` cannot be combined with
   `deterministic_relay_cluster_size` and is rejected on SM90 and on the
-  two-CTA backends. On the H128 two-CTA backends `'records'` chooses between
-  conflict-rank and private-plane storage from the shapes and `'shards'`
-  selects the private-plane layout; H96 D576 two-CTA plans keep their 96-plane
-  layout under both. Under `'records'` and `'shards'`, an explicit relay size
+  two-CTA backends. `'ordered'` is rejected on SM90, on compute capability
+  10.7 and by every backend except the H128 D512 two-CTA backend (including
+  FP16 and H64 plans, which run the generic M64 kernel). On the H128 two-CTA
+  backends `'records'` chooses between conflict-rank and private-plane storage
+  from the shapes and `'shards'` selects the private-plane layout; H96 D576
+  two-CTA plans keep their 96-plane layout under both. Under `'records'` and
+  `'shards'`, an explicit relay size
   selects that cluster relay. The option is part of the compiled plan and of
   the wrapper's plan cache key.
 - **Devices** — conflict-rank storage (the `'records'` and `'chain'` layouts
@@ -626,10 +648,12 @@ Further properties of the option:
   H64 + H32 composition of H96 D576 is a separate kernel). dQ does not depend on the
   dKV layout either, except for chain plans, which gather a query's rows in
   sorted order, and records plans with split pairs, which add two dQ partials.
-  dKV is not batch invariant once a batch spans several waves, with any layout:
-  the layout, the waves and the plane or shard count follow the batch's query
-  and KV extents. `d_sink` is: a uniform shift of the queries only rotates the
-  lanes of that warp (see [Determinism Support](/operations/determinism)).
+  dKV is not batch invariant once a batch spans several waves, with any layout
+  except `'ordered'`: the layout, the waves and the plane or shard count follow
+  the batch's query and KV extents. The generic M64 kernel's `d_sink` is: a
+  uniform shift of the queries only rotates the lanes of that warp. `'ordered'`
+  H128 D512 plans keep dQ, dKV and `d_sink` batch invariant (see
+  [Determinism Support](/operations/determinism)).
 - **Compilation** — the wave size and the split and interleave choices are
   compile-time constants of a records plan. For given heads, head dimension,
   dtype, top-k width and KV extent, the wave order gives records plans two

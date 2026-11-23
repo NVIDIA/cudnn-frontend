@@ -23,6 +23,19 @@ Rows selected more than once by one query use per-slot overflow records (every
 slot of the wave that selects such a row). The tail adds them in ascending
 (query, slot) order.
 
+Ordered plans (``rank_ordered``, ``deterministic_dkv_mode='ordered'``) keep one
+dense plane and contiguous waves, and add every tail record onto the plane-0
+value one at a time (no segmented long-chain sums). They fuse their tails for
+``K <= RANK_ORDERED_FUSED_MAX_TOPK``: a row whose previous wave left a tail
+shifts this wave's ranks off plane 0, which with one plane sends all of them to
+overflow records for the next tail. Rank 0 of a wave adds to plane 0 only when
+no tail of the previous wave touches the row, so each dKV row is the FP32 left
+fold of its terms in ascending (query, slot) order, whatever the KV extent, the
+wave size, the tail placement or the position of the queries in the batch.
+dSink is the left fold of its per-query terms in query order. A sequence's dKV rows and its dSink
+terms therefore keep their bytes when its neighbors change, provided the
+neighbors select none of its KV rows and contribute zero dSink terms.
+
 Plans. Wave ``w``'s setup clears wave ``w - 1``'s row state, assigns wave
 ``w``'s destination codes and records wave ``w + 1``'s ordinal bits (the slot
 phases, ``_rank_setup_slots``), and adds wave ``w - 1``'s overflow and
@@ -131,6 +144,10 @@ RANK_LIST_PARITIES = 4
 # setup warp's slot passes (16+ per wave) slow the main kernel more than a per-wave setup launch costs.
 RANK_FUSED_MAX_TOPK = 512
 RANK_FUSED_MIN_PLANES = 3
+# Ordered plans fuse their tails only for this top-k width. Their single plane sends every shared rank to
+# records, and a tail row's next-wave ranks too, so wider waves put most of their slots through the tail,
+# which the per-wave setup launch spreads over the whole GPU while fused tails run on the reducer warps.
+RANK_ORDERED_FUSED_MAX_TOPK = 128
 # Plans without per-query lengths interleave their waves (wave ``w`` holds queries ``w + j * waves``) once
 # this many dense planes absorb the rows that queries ``waves`` apart still share.
 RANK_INTERLEAVE_MIN_PLANES = 3
@@ -210,13 +227,18 @@ def _rank_budget_words(total_s_kv: int, record: int) -> int:
     return min((RANK_DENSE_BUDGET_BYTES - RANK_LSE_RESERVE_BYTES) // 4, RANK_PRIVATE_PLANES * plane_words)
 
 
-def rank_merged_fused(total_s_kv: int, max_topk: int, record: int, wave: int) -> bool:
+def rank_merged_fused(total_s_kv: int, max_topk: int, record: int, wave: int, ordered: bool = False) -> bool:
     """Fuse each wave's tail into the next main kernel for ``K <= RANK_FUSED_MAX_TOPK`` when the doubled
     overflow area still leaves ``RANK_FUSED_MIN_PLANES`` dense planes.
 
     Fused waves shift a tail row's ranks off plane 0, so too few planes would push
     shared rows into overflow wave after wave; wide top-k keeps the per-wave setup.
+    Ordered plans keep one dense plane by design (every shared rank already
+    overflows) and fuse for ``K <= RANK_ORDERED_FUSED_MAX_TOPK`` at every KV extent;
+    fused and per-wave-setup ordered plans write the same bits.
     """
+    if ordered:
+        return max_topk <= RANK_ORDERED_FUSED_MAX_TOPK
     if max_topk > RANK_FUSED_MAX_TOPK:
         return False
     plane_words = rank_pitch(total_s_kv) * record
@@ -224,10 +246,13 @@ def rank_merged_fused(total_s_kv: int, max_topk: int, record: int, wave: int) ->
     return planes >= RANK_FUSED_MIN_PLANES
 
 
-def rank_merged_planes(total_s_kv: int, max_topk: int, record: int, wave: int, fused: bool) -> int:
+def rank_merged_planes(total_s_kv: int, max_topk: int, record: int, wave: int, fused: bool, ordered: bool = False) -> int:
     """Return the D512 dense plane count, within ``[1, wave]``.
 
-    Plans take the planes that fit the workspace budget. When fewer than
+    Ordered plans keep one dense plane for every extent: rank 0 of a wave adds
+    to plane 0 and every higher rank takes an overflow record, so no row's
+    summation order depends on a plane count. Other plans take the planes that
+    fit the workspace budget. When fewer than
     ``RANK_FLOOR_PLANES`` fit, they take at least the expected per-row conflict
     density of a wave (``ceil(W * K / pitch)`` planes, plus one spare once rows
     are expected to be shared) as long as the private-plane layout still bounds
@@ -236,6 +261,8 @@ def rank_merged_planes(total_s_kv: int, max_topk: int, record: int, wave: int, f
     the floor only ever applies to per-wave-setup plans.
     Must match ``RankShardReduction.rank_geometry`` exactly (integer arithmetic only).
     """
+    if ordered:
+        return 1
     pitch = rank_pitch(total_s_kv)
     plane_words = pitch * record
     fixed = rank_merged_fixed_words(total_s_kv, max_topk, record, wave, fused)
@@ -260,42 +287,45 @@ def rank_merged_few_planes(total_s_kv: int, max_topk: int, record: int, wave: in
     return rank_merged_planes(total_s_kv, max_topk, record, wave, False) <= RANK_FEW_PLANES
 
 
-def rank_merged_codes_fit(total_s_kv: int, max_topk: int, record: int, wave: int) -> bool:
+def rank_merged_codes_fit(total_s_kv: int, max_topk: int, record: int, wave: int, ordered: bool = False) -> bool:
     """Return whether every record of the D512 conflict-rank layout fits the destination-code fields.
 
     A code's value field (``RANK_CODE_VALUE``) holds record indices below ``P * pitch`` plus the
     overflow-record parities' ``S`` records, and the plane-use entries keep plane counts in 16-bit
     fields. Only KV extents far beyond any allocatable private-plane layout fail this.
     """
-    fused = rank_merged_fused(total_s_kv, max_topk, record, wave)
-    planes = rank_merged_planes(total_s_kv, max_topk, record, wave, fused)
+    fused = rank_merged_fused(total_s_kv, max_topk, record, wave, ordered)
+    planes = rank_merged_planes(total_s_kv, max_topk, record, wave, fused, ordered)
     slots = wave * max_topk
     return planes * rank_pitch(total_s_kv) + (2 if fused else 1) * slots <= RANK_CODE_VALUE and planes < 1 << 16
 
 
-def rank_merged_workspace_words(total_s_kv: int, max_topk: int, record: int, wave: int) -> int:
+def rank_merged_workspace_words(total_s_kv: int, max_topk: int, record: int, wave: int, ordered: bool = False) -> int:
     """Return the 32-bit word count of the D512 pipelined conflict-rank workspace."""
-    assert rank_merged_codes_fit(total_s_kv, max_topk, record, wave)
-    fused = rank_merged_fused(total_s_kv, max_topk, record, wave)
-    planes = rank_merged_planes(total_s_kv, max_topk, record, wave, fused)
+    assert rank_merged_codes_fit(total_s_kv, max_topk, record, wave, ordered)
+    fused = rank_merged_fused(total_s_kv, max_topk, record, wave, ordered)
+    planes = rank_merged_planes(total_s_kv, max_topk, record, wave, fused, ordered)
     return planes * rank_pitch(total_s_kv) * record + rank_merged_fixed_words(total_s_kv, max_topk, record, wave, fused)
 
 
-def rank_merged_workspace_rows(total_s_kv: int, max_topk: int, record: int, wave: int) -> int:
+def rank_merged_workspace_rows(total_s_kv: int, max_topk: int, record: int, wave: int, ordered: bool = False) -> int:
     """Return the D512 pipelined workspace size in whole records."""
-    return -(-rank_merged_workspace_words(total_s_kv, max_topk, record, wave) // record)
+    return -(-rank_merged_workspace_words(total_s_kv, max_topk, record, wave, ordered) // record)
 
 
-def rank_merged_selected(total_s_kv: int, max_topk: int, record: int, wave: int, private_bytes: int) -> bool:
+def rank_merged_selected(total_s_kv: int, max_topk: int, record: int, wave: int, private_bytes: int, ordered: bool = False) -> bool:
     """Prefer D512 conflict-rank storage whenever it fits the private-plane layout (``private_bytes``).
 
     The wave's ordinal bits must fit the row state (``RANK_MAX_WAVE``) and its records the codes
-    (``rank_merged_codes_fit``).
+    (``rank_merged_codes_fit``). Ordered plans have no private-plane alternative, so they need only those
+    two conditions.
     """
     if wave < 2 or wave > RANK_MAX_WAVE:
         return False
-    if not rank_merged_codes_fit(total_s_kv, max_topk, record, wave):
+    if not rank_merged_codes_fit(total_s_kv, max_topk, record, wave, ordered):
         return False
+    if ordered:
+        return True
     return rank_merged_workspace_rows(total_s_kv, max_topk, record, wave) * record * 4 <= private_bytes
 
 
@@ -564,6 +594,10 @@ class RankShardReduction:
     rank_record = 512
     # Fused plans run wave ``w``'s tail inside main kernel ``w + 1`` (see ``rank_record_buffers``).
     rank_fused = False
+    # Ordered plans (``deterministic_dkv_mode='ordered'``) make each dKV row the FP32 left fold of its
+    # terms in ascending (query, slot) order and dSink the left fold of its per-query terms in query
+    # order: one dense plane, every tail added onto plane 0 term by term, no segmented long-chain sums.
+    rank_ordered = False
 
     def rank_record_buffers(self) -> int:
         """Overflow-record parities: fused plans read wave ``w - 1``'s records while wave ``w`` writes."""
@@ -584,24 +618,27 @@ class RankShardReduction:
         Mirrors ``rank_merged_planes`` in 64-bit arithmetic (a negative budget clamps to one plane).
         """
         pitch = Int64(cute.round_up(seqlen_kv, 8))
-        plane_words = pitch * Int64(self.rank_record)
-        slots = Int64(self.max_query_pairs_per_wave * self.max_topk)
-        fixed = (
-            Int64(self.rank_record_buffers()) * slots * Int64(self.rank_record)
-            + Int64(RANK_STATE_BUFFERS * RANK_STATE_WORDS + RANK_USE_WORDS + 2) * pitch
-            + Int64(RANK_LIST_PARITIES * (1 + 4 + 1) + 2) * slots
-            + Int64(RANK_MERGED_COUNTER_WORDS)
-        )
-        budget = min(Int64((RANK_DENSE_BUDGET_BYTES - RANK_LSE_RESERVE_BYTES) // 4), Int64(RANK_PRIVATE_PLANES) * plane_words)
-        planes = (budget - fixed) // plane_words
-        if cutlass.const_expr(not self.rank_fused):
-            # Fused plans are selected with at least RANK_FUSED_MIN_PLANES >= RANK_FLOOR_PLANES planes.
-            if planes < Int64(RANK_FLOOR_PLANES):
-                demand = (slots + pitch - Int64(1)) // pitch + min(slots // pitch, Int64(1))
-                demand = min(demand, (Int64(RANK_PRIVATE_PLANES) * plane_words - fixed) // plane_words)
-                planes = max(planes, demand)
-        planes = min(planes, Int64(self.max_query_pairs_per_wave))
-        planes = max(planes, Int64(1))
+        if cutlass.const_expr(self.rank_ordered):
+            planes = Int64(1)
+        else:
+            plane_words = pitch * Int64(self.rank_record)
+            slots = Int64(self.max_query_pairs_per_wave * self.max_topk)
+            fixed = (
+                Int64(self.rank_record_buffers()) * slots * Int64(self.rank_record)
+                + Int64(RANK_STATE_BUFFERS * RANK_STATE_WORDS + RANK_USE_WORDS + 2) * pitch
+                + Int64(RANK_LIST_PARITIES * (1 + 4 + 1) + 2) * slots
+                + Int64(RANK_MERGED_COUNTER_WORDS)
+            )
+            budget = min(Int64((RANK_DENSE_BUDGET_BYTES - RANK_LSE_RESERVE_BYTES) // 4), Int64(RANK_PRIVATE_PLANES) * plane_words)
+            planes = (budget - fixed) // plane_words
+            if cutlass.const_expr(not self.rank_fused):
+                # Fused plans are selected with at least RANK_FUSED_MIN_PLANES >= RANK_FLOOR_PLANES planes.
+                if planes < Int64(RANK_FLOOR_PLANES):
+                    demand = (slots + pitch - Int64(1)) // pitch + min(slots // pitch, Int64(1))
+                    demand = min(demand, (Int64(RANK_PRIVATE_PLANES) * plane_words - fixed) // plane_words)
+                    planes = max(planes, demand)
+            planes = min(planes, Int64(self.max_query_pairs_per_wave))
+            planes = max(planes, Int64(1))
         return pitch, Int32(planes)
 
     @cute.jit
@@ -674,18 +711,27 @@ class RankShardReduction:
 
         Each lane owns one FP32x4 column; ``RANK_TAIL_BATCH`` records are loaded
         per step (the last step predicated) so many independent loads stay in
-        flight, and the additions keep ascending record order.
+        flight, and the additions keep ascending record order. Ordered plans add
+        each record onto the plane-0 value (``((p + r0) + r1) + ...``); the other
+        plans add the records' sum to it (``p + ((r0 + r1) + ...)``).
         """
         record = Int64(self.rank_record)
         column = Int64((lane + Int32(32) * part) * Int32(4))
-        early_target = not self.rank_fused
+        # Setup-launch tails: the plane-0 value does not depend on the records, so load it first and
+        # overlap both latencies. Fused tails run on the main kernel's reducers and keep the late load,
+        # except ordered ones, which start their fold from it (no drain of the running wave touches a tail
+        # row's plane 0: that wave's ranks of the row are shifted off plane 0, into overflow records).
+        early_target = not self.rank_fused or self.rank_ordered
         if cutlass.const_expr(early_target):
-            # Setup-launch tails: the plane-0 value does not depend on the records, so load it first and
-            # overlap both latencies. Fused tails run on the main kernel's reducers and keep the late load.
             target = floats + destination * record + column
             p0, p1, p2, p3 = _rank_load_f32x4(target)
         acc = cute.make_rmem_tensor((4,), Float32)
         acc.fill(0.0)
+        if cutlass.const_expr(self.rank_ordered):
+            acc[0] = p0
+            acc[1] = p1
+            acc[2] = p2
+            acc[3] = p3
         loaded = cute.make_rmem_tensor((RANK_TAIL_BATCH, 4), Float32)
         item = Int32(0)
         while item < count:
@@ -704,7 +750,10 @@ class RankShardReduction:
         if cutlass.const_expr(not early_target):
             target = floats + destination * record + column
             p0, p1, p2, p3 = _rank_load_f32x4(target)
-        rank_store_f32x4(target, p0 + acc[0], p1 + acc[1], p2 + acc[2], p3 + acc[3])
+        if cutlass.const_expr(self.rank_ordered):
+            rank_store_f32x4(target, acc[0], acc[1], acc[2], acc[3])
+        else:
+            rank_store_f32x4(target, p0 + acc[0], p1 + acc[1], p2 + acc[2], p3 + acc[3])
 
     @cute.jit
     def _rank_sum_records_column(self, floats: cute.Pointer, first: Int64, count: Int32, column: Int32):
@@ -855,11 +904,22 @@ class RankShardReduction:
         wave_stride: Int32,
         lane: Int32,
     ):
-        """Add a duplicated row's per-slot records to plane 0 in ascending (query, slot) order."""
+        """Add a duplicated row's per-slot records to plane 0 in ascending (query, slot) order.
+
+        Ordered plans add each record onto the plane-0 value; the other plans add the records' sum to it.
+        """
         record = Int64(self.rank_record)
         chunks = self.rank_record // 128
         acc = cute.make_rmem_tensor((4 * chunks,), Float32)
         acc.fill(0.0)
+        if cutlass.const_expr(self.rank_ordered):
+            for plane_chunk in cutlass.range_constexpr(chunks):
+                plane_column = Int64((lane + Int32(32 * plane_chunk)) * Int32(4))
+                plane_0, plane_1, plane_2, plane_3 = _rank_load_f32x4(floats + Int64(row) * record + plane_column)
+                acc[4 * plane_chunk] = plane_0
+                acc[4 * plane_chunk + 1] = plane_1
+                acc[4 * plane_chunk + 2] = plane_2
+                acc[4 * plane_chunk + 3] = plane_3
         for ordinal in cutlass.range(wave_size, unroll=1):
             query = wave_begin + ordinal * wave_stride
             topk = _rank_topk(mTopkIdxs, mTopkLength, query)
@@ -887,8 +947,11 @@ class RankShardReduction:
         for chunk in cutlass.range_constexpr(chunks):
             column = Int64((lane + Int32(32 * chunk)) * Int32(4))
             target = floats + Int64(row) * record + column
-            p0, p1, p2, p3 = _rank_load_f32x4(target)
-            rank_store_f32x4(target, p0 + acc[4 * chunk], p1 + acc[4 * chunk + 1], p2 + acc[4 * chunk + 2], p3 + acc[4 * chunk + 3])
+            if cutlass.const_expr(self.rank_ordered):
+                rank_store_f32x4(target, acc[4 * chunk], acc[4 * chunk + 1], acc[4 * chunk + 2], acc[4 * chunk + 3])
+            else:
+                p0, p1, p2, p3 = _rank_load_f32x4(target)
+                rank_store_f32x4(target, p0 + acc[4 * chunk], p1 + acc[4 * chunk + 1], p2 + acc[4 * chunk + 2], p3 + acc[4 * chunk + 3])
 
     @cute.kernel
     def rank_init(self, mRows: cute.Tensor, seqlen_kv: Int32):
@@ -1090,8 +1153,9 @@ class RankShardReduction:
                     if count > planes and conflict == planes:
                         need_records = count - planes
                         need_row = Int32(1)
-                        if cutlass.const_expr(not self.rank_fused):
-                            # Long chains go to the end of the row list for the whole-CTA tail.
+                        # Long chains go to the end of the row list for the whole-CTA tail. Ordered plans keep
+                        # every chain in the per-warp tail: segment sums would group a chain by wave positions.
+                        if cutlass.const_expr(not self.rank_fused and not self.rank_ordered):
                             if need_records > Int32(RANK_TAIL_LONG):
                                 need_row = Int32(0)
                                 need_long = Int32(1)
@@ -1399,6 +1463,8 @@ class RankShardReduction:
 
         Every main kernel has completed, so each thread reduces one (query chunk,
         head) into consumed O*dO storage exactly as the standalone partial kernel.
+        Ordered plans instead store every (query, head) term in place for the
+        fold's query-order sum (``_dSink_query_term``).
         """
         cute.arch.griddepcontrol_launch_dependents()
         cute.arch.griddepcontrol_wait()
@@ -1422,12 +1488,21 @@ class RankShardReduction:
             Int32(0),
         )
         heads = problem_shape[3][0]
-        items = cute.ceil_div(problem_shape[0], chunk_size) * heads
-        item = thread
-        while item < items:
-            q_block_idx = item // heads
-            self._sum_dSink_partial_head_unrolled(sum_odo, scaled_lse, attn_sink, problem_shape, q_block_idx, item - q_block_idx * heads, chunk_size)
-            item += nthreads
+        if cutlass.const_expr(self.rank_ordered):
+            # Head-major items: consecutive threads touch consecutive queries of one head.
+            items = problem_shape[0] * heads
+            item = thread
+            while item < items:
+                head = item // problem_shape[0]
+                self._dSink_query_term(sum_odo, scaled_lse, attn_sink, item - head * problem_shape[0], head)
+                item += nthreads
+        else:
+            items = cute.ceil_div(problem_shape[0], chunk_size) * heads
+            item = thread
+            while item < items:
+                q_block_idx = item // heads
+                self._sum_dSink_partial_head_unrolled(sum_odo, scaled_lse, attn_sink, problem_shape, q_block_idx, item - q_block_idx * heads, chunk_size)
+                item += nthreads
 
     @cute.kernel
     def fold_rank_convert_dkv(
@@ -1495,7 +1570,10 @@ class RankShardReduction:
         if tidy == Int32(0):
             head = seq_block
             while head < problem_shape[3][0]:
-                self._finalize_dSink_head_warp(sum_odo, d_sink, problem_shape, head, tidx, chunk_size)
+                if cutlass.const_expr(self.rank_ordered):
+                    self._finalize_dSink_head_ordered(sum_odo, d_sink, problem_shape, head, tidx)
+                else:
+                    self._finalize_dSink_head_warp(sum_odo, d_sink, problem_shape, head, tidx, chunk_size)
                 head += fold_grid
 
     @cute.jit
@@ -1526,6 +1604,44 @@ class RankShardReduction:
             total = total + cute.arch.shuffle_sync(total, lane ^ Int32(16 >> shift))
         if lane == Int32(0):
             d_sink[head, (0, 0)] = total
+
+    @cute.jit
+    def _finalize_dSink_head_ordered(self, sum_odo: cute.Tensor, d_sink: cute.Tensor, problem_shape, head: Int32, lane: Int32):
+        """Add one head's per-query dSink terms in query order with one warp.
+
+        Lanes load 32 consecutive terms per step (the next step's terms are in flight while this step adds),
+        and every lane adds the step's terms in lane order, so the total is the FP32 left fold
+        ``((0 + t_0) + t_1) + ...`` over the queries. Lane 0 stores it.
+        """
+        count = problem_shape[0]
+        total = Float32(0.0)
+        current = Float32(0.0)
+        if lane < count:
+            current = sum_odo[head, (lane, 0)]
+        base = Int32(0)
+        while base < count:
+            upcoming = Float32(0.0)
+            if base + Int32(32) + lane < count:
+                upcoming = sum_odo[head, (base + Int32(32) + lane, 0)]
+            for source in cutlass.range_constexpr(32):
+                term = cute.arch.shuffle_sync(current, source)
+                if base + Int32(source) < count:
+                    total = total + term
+            current = upcoming
+            base += Int32(32)
+        if lane == Int32(0):
+            d_sink[head, (0, 0)] = total
+
+    @cute.jit
+    def _dSink_query_term(self, sum_odo: cute.Tensor, scaled_lse: cute.Tensor, attn_sink: cute.Tensor, query: Int32, head: Int32):
+        """Replace one consumed O*dO entry with its dSink term ``p_sink * (O . dO)`` (the partials' ``p``)."""
+        sink_log2 = Float32(attn_sink[head, (0, 0)]) * Float32(math.log2(math.e))
+        p = cute.math.exp2(sink_log2 + Float32(scaled_lse[head, (query, 0)]))
+        if sink_log2 == Float32(float("inf")):
+            p = Float32(1.0)
+        elif sink_log2 == Float32(float("-inf")):
+            p = Float32(0.0)
+        sum_odo[head, (query, 0)] = p * Float32(sum_odo[head, (query, 0)])
 
     @cute.jit
     def _sum_dSink_partial_head_unrolled(

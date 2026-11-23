@@ -424,9 +424,9 @@ def parse_args():
     )
     p.add_argument(
         "--deterministic-dkv-mode",
-        choices=("records", "chain", "shards"),
+        choices=("records", "chain", "shards", "ordered"),
         default="records",
-        help="deterministic_dkv_mode of the deterministic SM100 generic M64 and H128 two-CTA plans (default: records)",
+        help="deterministic_dkv_mode of the deterministic SM100 generic M64 and H128 two-CTA plans; ordered: H128 D512 only (default: records)",
     )
     p.add_argument(
         "--sorted-topk",

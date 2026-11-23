@@ -5445,3 +5445,20 @@ class FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFused(FlashA
     """Conflict-rank storage whose wave tails run inside the next main kernel (no per-wave setup launch)."""
 
     rank_fused = True
+
+
+class FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFusedOrdered(FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFused):
+    """Batch-invariant conflict-rank plan whose wave tails run inside the next main kernel (``deterministic_dkv_mode=
+    'ordered'``, top-k up to ``RANK_ORDERED_FUSED_MAX_TOPK``; see ``RankShardReduction.rank_ordered``)."""
+
+    rank_ordered = True
+
+
+class FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardOrdered(FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFewPlanes):
+    """Batch-invariant conflict-rank plan with a setup launch per wave (``deterministic_dkv_mode='ordered'``, top-k
+    above ``RANK_ORDERED_FUSED_MAX_TOPK``; see ``RankShardReduction.rank_ordered``).
+
+    One dense plane: every rank above 0 of a shared row overflows, so the few-plane drain applies.
+    """
+
+    rank_ordered = True

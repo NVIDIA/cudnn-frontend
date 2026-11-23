@@ -107,6 +107,7 @@ arbitrary user callbacks.
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
+| `DSA.sparse_attention_backward_wrapper` (`deterministic_dkv_mode='ordered'`, H128 D512 two-CTA) | bprop | BF16 | Unsupported | SM100: Supported; SM103: Unverified | Unsupported |
 | `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 or FP32 weights | Unverified | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | NVFP4 packed E2M1 Q/K; E4M3 scales; BF16 weights | Unsupported | Supported | Supported |
@@ -647,7 +648,19 @@ for replay, batch-invariance, and stress-test results.
   positions, and H128 D576 plans with top-k 1024 or wider sort each query's
   rows by ranges of the batch's KV extent, which also changes dQ. SM107 plans
   keep the shard and relay layouts: `'records'` runs as `'shards'` and
-  `'chain'` is rejected.
+  `'chain'` and `'ordered'` are rejected.
+- Batch-invariant DSA sparse attention backward: set `deterministic=True` and
+  `deterministic_dkv_mode='ordered'` (H128 D512 two-CTA plans: SM100/SM103,
+  BF16, contiguous inputs, top-k 128/512/1024/1152/2048; every other plan
+  rejects the mode). Each dKV row is the FP32 left fold of its terms in
+  ascending (query, slot) order and dSink the left fold of its per-query terms
+  in query order, so a sequence's dQ, dKV and dSink keep their bytes when it
+  moves, packs or duplicates in a batch, across wave splits and KV extents,
+  provided no other sequence selects its KV rows and the other sequences'
+  upstream gradients are zero (dSink is a sum over every sequence). Duplicate,
+  out-of-range and `-1` indices and `topk_length` are inside the contract.
+  The ordered mode rounds dKV and dSink differently from `'records'`; forward
+  results and dQ are identical. SM103 execution is unverified.
 - QSA backward (`qsa_backward`, `qsa_indexed_backward`): set
   `deterministic=True`. `dq`, `dk` and `dv` then repeat for fixed inputs and a
   fixed packed layout: every FP32 accumulation adds in an order the layout
