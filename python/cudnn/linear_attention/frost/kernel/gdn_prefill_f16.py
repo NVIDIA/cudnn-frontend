@@ -346,7 +346,8 @@ def level_sets(cfg, early_handover: bool) -> bool:
         return False
     if not (early_handover and cfg.store_final_state):
         raise ValueError(
-            "a level plan holds a tile's second item for a level word: compute group 1 must set it behind an fp32 final-state store of the early hand-over"
+            f"early_handover={bool(early_handover)}, store_final_state={bool(cfg.store_final_state)}: a level plan holds a tile's second item for a level "
+            "word, which compute group 1 sets behind an fp32 final-state store of the early hand-over"
         )
     return True
 

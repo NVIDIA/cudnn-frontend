@@ -54,8 +54,13 @@ def measured_shapes():
     return [(tiles, chunks, sms, group, group) for sms, _, _, group, tiles, chunks in gdn_prefill_f16.LEVEL_MEASURED_CELLS]
 
 
-def taken_shapes():
-    return measured_shapes() + [shape for shape in SWEEP if split_k.level_plan_shape(*shape)]
+def swept_shapes():
+    """The shapes of the sweep the rule takes."""
+    return [shape for shape in SWEEP if split_k.level_plan_shape(*shape)]
+
+
+# What a table case runs over: every measured cell, or the sweep around them.
+TABLE_SHAPES = [pytest.param(measured_shapes, marks=pytest.mark.L0, id="measured_cells"), pytest.param(swept_shapes, marks=pytest.mark.L1, id="sweep")]
 
 
 def line_layout(n_tiles, chunks, num_sms, group):
@@ -146,23 +151,23 @@ def cell_facts(**overrides):
 # ---------------------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.L0
-def test_levelled_table_is_the_line_of_groups_cut_at_even_borders():
-    """Both tables -- the work items and the order entries -- of every measured cell and of every shape of a sweep the
-    rule takes are the groups laid end to end and cut at the share borders, a border moved up where it would leave a
+@pytest.mark.parametrize("shapes", TABLE_SHAPES)
+def test_levelled_table_is_the_line_of_groups_cut_at_even_borders(shapes):
+    """Both tables -- the work items and the order entries -- of every measured cell, and of every shape of a sweep the
+    rule takes, are the groups laid end to end and cut at the share borders, a border moved up where it would leave a
     first part of an odd number of chunks."""
-    shapes = taken_shapes()
-    assert len(shapes) > len(measured_shapes()) + 100
+    shapes = shapes()
+    assert shapes
     for n_tiles, chunks, num_sms, _, group in shapes:
         assert split_k.level_table(n_tiles, chunks, num_sms, group) == line_layout(n_tiles, chunks, num_sms, group), (n_tiles, chunks, num_sms, group)
 
 
-@pytest.mark.L0
-def test_levelled_table_keeps_the_order():
+@pytest.mark.parametrize("shapes", TABLE_SHAPES)
+def test_levelled_table_keeps_the_order(shapes):
     """One setting row above one waiting row per level word, the word inside the level words, every setting row with a
-    chunk to store a state behind, the siblings of a group in adjacent rows: for every measured cell and every shape of
-    the sweep the rule takes, by this module's own check and by the kernel's gate."""
-    for n_tiles, chunks, num_sms, _, group in taken_shapes():
+    chunk to store a state behind, the siblings of a group in adjacent rows: for every measured cell, and for every
+    shape of the sweep the rule takes, by this module's own check and by the kernel's gate."""
+    for n_tiles, chunks, num_sms, _, group in shapes():
         parts, order = split_k.level_table(n_tiles, chunks, num_sms, group)
         assert order_problems(parts, order, n_tiles, chunks, num_sms, group) == [], (n_tiles, chunks, num_sms, group)
         assert split_k.level_table_gate(parts, order, n_tiles, chunks, num_sms)
@@ -214,7 +219,7 @@ SHAPE_REFUSALS = {
     "heads_not_a_multiple_of_the_group": ((768, 16, 152, 48, 3), (768, 16, 152, 48, 5)),
     "tiles_not_whole_sequences": ((768, 16, 152, 48, 3), (771, 16, 152, 48, 3)),
     "a_share_not_longer_than_a_chain": ((192, 16, 152, 48, 3), (153, 16, 152, 3, 3)),
-    "one_chunk_chains": ((240, 2, 152, 48, 3), (240, 1, 152, 48, 3)),
+    "one_chunk_chains": ((768, 2, 152, 48, 3), (768, 1, 152, 48, 3)),
     "no_partial_round": ((303, 16, 152, 3, 3), (300, 16, 152, 3, 3)),
     "fewer_blocks_than_a_group": ((9, 16, 6, 3, 3), (9, 16, 2, 3, 3)),
     "more_blocks_than_prologue_threads": ((4095, 16, split_k.ORDER_THREADS, 1, 1), (4095, 16, split_k.ORDER_THREADS + 1, 1, 1)),
@@ -231,15 +236,40 @@ def test_shape_rule_refuses(refusal):
     assert not split_k.level_plan_shape(*refused)
 
 
+@pytest.mark.L0
+def test_shape_rule_asks_the_table_gate(monkeypatch):
+    """The rule takes a shape only with a table that keeps the order: a measured cell whose table lost one setting row
+    -- its waiting row would wait for ever -- is refused."""
+    shape = measured_shapes()[0]
+    assert split_k.level_plan_shape(*shape)
+    level_table = split_k.level_table
+
+    def without_one_setting_row(*args):
+        parts, order = level_table(*args)
+        word = next(entry for entry in order if entry > 0)
+        return parts, [0 if entry == word else entry for entry in order]
+
+    monkeypatch.setattr(split_k, "level_table", without_one_setting_row)
+    assert not split_k.level_plan_shape(*shape)
+
+
 # ---------------------------------------------------------------------------------------------------------------------------
 # the admission, on the host
 # ---------------------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.L0
-def test_admission_takes_every_measured_cell_and_no_other_shape(level_form):
-    """Every measured cell is a shape the table can be laid out for and is admitted; a sweep of sequence counts, lengths and
-    SM counts around the cells admits exactly the cells."""
+# The batches the admission is asked for around the cells: (SM counts beside the cells' own, sequence counts, chunk counts).
+ADMISSION_BATCHES = [
+    pytest.param(((148,), (3, 4, 5, 15, 16), (15, 16, 17)), marks=pytest.mark.L0, id="neighbours"),
+    pytest.param(((144, 148, 150, 160, 170), range(1, 33), (1, 2, 4, 8, 15, 16, 17, 32, 64)), marks=pytest.mark.L1, id="sweep"),
+]
+
+
+@pytest.mark.parametrize("batches", ADMISSION_BATCHES)
+def test_admission_takes_every_measured_cell_and_no_other_shape(level_form, batches):
+    """Every measured cell is a shape the table can be laid out for and is admitted; of the sequence counts, lengths and
+    SM counts around the cells exactly the cells are admitted."""
+    other_sms, seq_counts, chunk_counts = batches
     cells = set(gdn_prefill_f16.LEVEL_MEASURED_CELLS)
     for sms, d_k, d_v, group, tiles, chunks in cells:
         assert split_k.level_plan_shape(tiles, chunks, sms, group, group)
@@ -249,9 +279,9 @@ def test_admission_takes_every_measured_cell_and_no_other_shape(level_form):
             assert gdn_engine.level_plan_refusal(gdn_prefill_f16, facts) is None
     base = cell_facts()
     group = base.heads_out // base.heads_key
-    for sms in sorted({cell[0] for cell in cells} | {144, 148, 150, 160, 170}):
-        for num_seqs in range(1, 33):
-            for chunks in (1, 2, 4, 8, 15, 16, 17, 32, 64):
+    for sms in sorted({cell[0] for cell in cells} | set(other_sms)):
+        for num_seqs in seq_counts:
+            for chunks in chunk_counts:
                 facts = base._replace(num_sm=sms, num_seqs=num_seqs, rows=num_seqs * chunks * B_T)
                 cell = (sms, base.dim_k, base.dim_v, group, num_seqs * base.heads_out, chunks)
                 assert (gdn_engine.level_plan_refusal(gdn_prefill_f16, facts) is None) == (cell in cells), cell
@@ -320,7 +350,7 @@ def test_level_form_is_the_build_configs_seed_copy(monkeypatch, level_form):
 @pytest.mark.L0
 def test_test_knobs_are_inert_without_the_test_switch(monkeypatch, level_form):
     """A build without ``LEVEL_TEST`` orders its cut tiles and takes neither a delay, a count nor an unmeasured shape,
-    whatever the test knobs say; with the switch they act."""
+    whatever the test knobs say; with the switch they act, and a forced admission still asks the shape rule."""
     import cutlass
 
     def build(level_plan=True):
@@ -343,6 +373,7 @@ def test_test_knobs_are_inert_without_the_test_switch(monkeypatch, level_form):
     monkeypatch.setattr(gdn_prefill_f16, "LEVEL_UNORDERED", True)
     monkeypatch.setattr(gdn_prefill_f16, "LEVEL_STRESS", (1, 2, 3, 4))
     monkeypatch.setattr(gdn_prefill_f16, "LEVEL_FORCE", True)
+    monkeypatch.setattr(gdn_prefill_f16, "LEVEL_RELOAD_COUNT", True)
     assert gdn_prefill_f16.level_build_key(True, 3) == served_key
     assert build() == served
     assert gdn_engine.level_plan_refusal(gdn_prefill_f16, unmeasured) == "cell"
@@ -351,10 +382,11 @@ def test_test_knobs_are_inert_without_the_test_switch(monkeypatch, level_form):
     assert (tested.level_wait, tested.level_stress) == (0, (1, 2, 3, 4))
     assert gdn_prefill_f16.level_build_key(True, 3) != served_key
     assert gdn_engine.level_plan_refusal(gdn_prefill_f16, unmeasured) is None
+    # the forced admission lifts the measured cells alone: a batch the table cannot be laid out for is still refused
+    assert gdn_engine.level_plan_refusal(gdn_prefill_f16, cell_facts(num_seqs=1, rows=16 * B_T)) == "shape"
     assert build(level_plan=False).level_wait == 0
     monkeypatch.setattr(gdn_prefill_f16, "LEVEL_UNORDERED", False)
     monkeypatch.setattr(gdn_prefill_f16, "LEVEL_STRESS", ())
-    monkeypatch.setattr(gdn_prefill_f16, "LEVEL_RELOAD_COUNT", True)
     assert build().level_reload_count and build().level_wait == 1
 
 
@@ -369,7 +401,7 @@ def test_a_build_that_holds_a_row_sets_its_word(level_form):
 
     level = build(store_final_state=True, level_plan=True, level_group=3)
     assert gdn_prefill_f16.level_orders(level) and gdn_prefill_f16.level_sets(level, True)
-    with pytest.raises(ValueError, match="level word"):
+    with pytest.raises(ValueError, match="early_handover"):
         gdn_prefill_f16.level_sets(level, False)
     uncut = build(store_final_state=True)
     assert not gdn_prefill_f16.level_orders(uncut) and not gdn_prefill_f16.level_sets(uncut, False)
@@ -484,17 +516,25 @@ def hand_out_ends(order, n_blocks, resident, rng, late_ticket=True):
         running = [b for b in running if not (load[b][1] == group[b][1] == others[b][1] == "done")]
 
 
-@pytest.mark.L0
-def test_no_hand_out_of_a_levelled_table_waits_for_ever():
+# The hand-outs a case runs: (the measured cells it takes, seeds per hand-out).
+HAND_OUTS = [
+    pytest.param((lambda: [min(measured_shapes(), key=lambda shape: shape[0] * shape[1])], 1), marks=pytest.mark.L0, id="smallest_cell"),
+    pytest.param((measured_shapes, 3), marks=pytest.mark.L1, id="every_cell"),
+]
+
+
+@pytest.mark.parametrize("hand_outs", HAND_OUTS)
+def test_no_hand_out_of_a_levelled_table_waits_for_ever(hand_outs):
     """Every hand-out of a measured cell's rows ends, with every block running and with one, two or half of them: a
     setting row stands above its waiting row and an item that hands its state over takes its next ticket behind its
     set.  The same hand-outs with that ticket taken in front of the store do stop: a block's load warp holds the very
     publication its compute group waits for in front of the set."""
+    cells, seeds = hand_outs
     stopped_without_the_late_ticket = 0
-    for n_tiles, chunks, num_sms, _, group in measured_shapes() + [(9, 16, 6, 3, 3), (3, 16, 2, 1, 1), (192, 16, 152, 48, 1)]:
+    for n_tiles, chunks, num_sms, _, group in cells() + [(9, 16, 6, 3, 3), (3, 16, 2, 1, 1), (192, 16, 152, 48, 1)]:
         _, order = split_k.level_table(n_tiles, chunks, num_sms, group)
         for resident in sorted({1, 2, max(1, num_sms // 2), num_sms}):
-            for seed in range(3):
+            for seed in range(seeds):
                 assert hand_out_ends(order, num_sms, resident, random.Random(seed)), (n_tiles, chunks, num_sms, group, resident, seed)
                 stopped_without_the_late_ticket += not hand_out_ends(order, num_sms, resident, random.Random(seed), late_ticket=False)
     assert stopped_without_the_late_ticket > 0
@@ -632,6 +672,28 @@ def test_levelled_plan_is_taken_on_a_measured_grid_only(monkeypatch, frost):
     assert (device_table(regions, case)[0] > case.N * case.HO) == measured
     assert_bitwise("o[device grid]", o_on, o_off)
     assert_bitwise("pool[device grid]", pool_on, pool_off)
+
+
+# what the op is asked for beside the state pool, each a fact the admission refuses a level plan for
+REFUSED_PLANS = {"batch_invariant": dict(batch_invariant=True), "checkpoints": dict(checkpoint_every_n_tokens=4 * B_T)}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("plan", list(REFUSED_PLANS))
+def test_a_plan_the_admission_refuses_builds_no_level_plan(monkeypatch, frost, plan):
+    """A measured cell planned for its SM count, asked for with one thing the admission refuses -- a schedule that may
+    not depend on the batch, a checkpoint cadence: the engine tells the admission so, no level build is made and the
+    prologue writes the uncut table."""
+    backend, built, regions = frost
+    case, sms = cell_case()
+    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: sms)
+    pool, indices, _ = state_pool(case, random_state(case))
+    set_level(monkeypatch, True)
+    run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=True, **REFUSED_PLANS[plan])
+    torch.cuda.synchronize()
+    assert built and not any(cfg.level_plan for cfg in built)
+    count, _, order, _ = device_table(regions, case)
+    assert count == case.N * case.HO and order is None
 
 
 def unequal(lens):
