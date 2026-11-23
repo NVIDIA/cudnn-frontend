@@ -777,7 +777,6 @@ class MoEPersistentTileScheduler:
             cluster_idx = cute.arch.shuffle_sync(claim[0], offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
         else:
             broadcast_tensor = cute.make_tensor(ds.broadcast_ptr, cute.make_layout((1,)))
-            cluster_idx = Int32(0)
 
             # --- Producer: leader acquires and broadcasts ---
             if ds.is_leader_cta:
