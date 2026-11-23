@@ -151,7 +151,7 @@ def test_the_drafters_plan_its_table_and_its_keys():
     new = ("torch.argmax+lookup", "torch_ref.pre_fc_norm_quantize", "torch_ref.gate_row_quantize", "torch_ref.silu_mul", "torch_ref.quantize")
     classes = (torch_ref.ListedTokenChoice, torch_ref.PreFcNormQuantize, torch_ref.GateRowQuantize, torch_ref.SiluMul, torch_ref.Quantize)
     assert all(key in providers.KEYS for key in new) and [providers.factories()[key] for key in new] == list(classes)
-    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 25 and set(providers.KEYS) == set(providers.factories())
+    assert len(providers.KEYS) == len(set(providers.KEYS)) == len(providers.factories()) == 26 and set(providers.KEYS) == set(providers.factories())
     used_by_the_model = {row.key for rows in configs.PROVIDERS.values() for row in rows}
     assert used_by_the_model.isdisjoint(new) and set(providers.KEYS) == used_by_the_model | set(new), "no key that no table names"
     assert all(providers.ENTRY_NAMES[key] == key for key in new[1:]) and providers.ENTRY_NAMES[new[0]] == "torch.argmax + the token id of the chosen row"
@@ -1210,7 +1210,7 @@ def test_one_session_with_two_plans_keeps_the_forms_both_read_and_counts_one_sta
     table = session.plan_table()
     assert (session.plan.tokens, session.prefill_plan.tokens) == (6, 1) and session.plan.first_used and session.prefill_plan.first_used
     numbers = session.claim().numbers()  # what the session says about the target kernel set is its verify plan's
-    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 130, 321)
+    assert (numbers["launches"], numbers["target_code"], numbers["target_port"]) == (484, 130, 337)
     # in the stack native the library multiplies the out-projection on its stored codes at both call sites of both plans
     stored = alone = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp.down", "output_head")
     assert session.stored_weights() == stored and session.uncopied_weights() == alone
@@ -1446,8 +1446,8 @@ def test_the_speculative_scripts_help_states_the_memory_the_tree_computes(monkey
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The paged attention cache of a state (``state.PagedKvCache``, ``state.PageTable``): a pool of pages of 64 positions per
-# sequence, with the position and slot tables a kernel that writes a paged pool is handed.  No provider row asks for it
-# yet; a session builds it where a block of its plans does (``Block.cache_page``), and the reference chains reach either
+# sequence, with the position and slot tables a kernel that writes a paged pool is handed.  The row of the attention
+# preparation's entry asks for it; a session builds it where a block of its plans does (``Block.cache_page``), and the reference chains reach either
 # layout through ``write`` / ``keys`` / ``values``.  Every index of the pool below is arithmetic written in the test.
 
 PAGE = 64
@@ -1861,21 +1861,38 @@ def test_a_paged_cache_takes_the_tables_of_its_own_pool_and_no_others():
         cache.rows(8, 16)  # the rows 8 to 15 of a step would be sequences 2 and 3
 
 
-def test_no_provider_asks_for_a_paged_cache_yet_and_every_plan_builds_the_plain_one():
-    """The paged layout comes in front of the row that needs it: no adapter of the closed list names a page today, so no
-    plan of any family, stack, GPU class or step shape builds a pool, and the area README says so.  The first adapter
-    that names a page fails this case: its row changes what the runs of its stacks hold, and the README's sentence.
-    Two more sentences of that README are held here to what they are about: the page of the target kernel set, which
-    is the family's constant and the page of every case of this group; and where the GPU cell of the paged cache runs."""
+def test_one_provider_asks_for_a_paged_cache_and_every_other_plan_builds_the_plain_one():
+    """One adapter of the closed list names a page: the one of the attention preparation's entry, whose kernel writes a pool
+    of pages.  So a plan builds a pool where that row serves -- the two target stacks on compute capability 10.x -- and
+    no plan of another stack, GPU class or row count does; the area README says so.  The next adapter that names a page
+    fails this case: its row changes what the runs of its stacks hold, and the README's sentence.  Two more sentences of
+    that README are held here to what they are about: the page of the target kernel set, which is the family's constant
+    and the page of every case of this group; and where the GPU cell of the paged cache runs."""
     from model_samples import Session, TextIO, providers
-    from model_samples.qwen_dense import configs
+    from model_samples.qwen_dense import QwenDense, configs
 
-    assert providers.BlockBase.cache_page is None and all(getattr(factory, "cache_page", None) is None for factory in providers.factories().values())
+    asking = {key: factory.cache_page for key, factory in providers.factories().items() if getattr(factory, "cache_page", None) is not None}
+    assert providers.BlockBase.cache_page is None and asking == {"fe.attention_prepare_decode": PAGE}, "the one adapter whose kernel writes a paged pool"
     model = _tiny_model()
     for more in ({}, {"tokens": 4}, {"draft_tokens": 3}):
         assert Session(model, TextIO.synthetic(model.geometry.vocab), sequences=2, stack="reference", device="cpu", capacity=16, **more).cache_page() is None
+    for stack, cc, sequences, page in (
+        ("fe-entries", (10, 0), 1, PAGE),
+        ("fe-entries", (10, 7), 4, PAGE),
+        ("fe-entries", (10, 3), 1024, PAGE),
+        ("fe-entries", (10, 0), 1025, None),  # past the rows of the entry: the chain, on the cache it had
+        ("fe-entries", (12, 0), 1, None),
+        ("fe-cublas", (10, 0), 1, None),
+        ("reference", (10, 0), 1, None),
+    ):
+        planned = _plan(cc, sequences, stack, layers=2)
+        assert {getattr(block, "cache_page", None) for block in planned.values()} - {None} == ({page} if page else set()), (stack, cc, sequences)
+    assert QwenDense.attention_page == configs.ATTENTION_PAGE == dict(configs.PREPARE_FORM)["PAGE_SIZE"], "the page of the row is the family's constant"
     readme = " ".join((MODELS / "README.md").read_text(encoding="utf-8").split())
-    assert "a session builds the pool where a block of its plans asks for one, and no provider row does yet, so every run builds the first layout" in readme
+    assert (
+        "a session builds the pool where a block of its plans asks for one: the row of the attention preparation's entry does, so a run of the stacks "
+        "`native` and `fe-entries` holds the pool on compute capability 10.x, up to 1,024 rows, and every other run the first layout"
+    ) in readme
     assert PAGE == configs.ATTENTION_PAGE and f"(a fixed number of positions each, {PAGE} in the target kernel set; a run of pages per sequence)" in readme
     # the cell is gated: the classes the family serves and compute capability 8.0 (the GPU module holds the condition on stated capabilities)
     assert (
@@ -1974,7 +1991,7 @@ def _judged_run(defect=None):
     from model_samples.state import PagedKvCache
 
     model = _paged_model()
-    (row,) = model.provider_table["attention.prepare"]
+    *_, row = model.provider_table["attention.prepare"]  # the reference chain's row: the last one of the block
     model.provider_table = dict(model.provider_table, **{"attention.prepare": [dataclasses.replace(row, band="bitwise")]})
     text = model_samples.TextIO.synthetic(model.geometry.vocab)
     session = model_samples.Session(model, text, sequences=3, stack="reference", device="cpu", capacity=80)

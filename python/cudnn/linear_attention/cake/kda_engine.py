@@ -33,7 +33,6 @@ from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost import buffers
-from cudnn.frost.device import build_device
 from ..frost.engine import FrostLaPlan
 from ..graph_analyzer import analyze
 from . import compiler
@@ -140,10 +139,7 @@ class KdaCakeEngine(BaseEngine):
             _decline("'state_checkpoints' must be bf16")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            return FrostLaPlan(build_kda_cake(graph))
+        return FrostLaPlan(build_kda_cake(graph))
 
 
 __all__ = ["KdaCakeEngine"]

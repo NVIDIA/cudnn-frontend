@@ -1975,7 +1975,7 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         "A second run printed the same bytes.",
         "(reported; no line of it is a gate of this sample)",
         # a dated run names the rows it ran on: the stack has had three library rows since, and its runs need the library's package
-        "The model decoded three prompts greedily on the cuDNN Frontend rows of the stack `native` (the rows `fe-entries` selects today), "
+        "The model decoded three prompts greedily on the cuDNN Frontend rows of the stack `native` (the rows `fe-entries` selects today without the attention preparation's row), "
         "70 new tokens each: the default prompt and two arithmetic word problems whose text is not part of this repository, 58, 117 and 78 prompt tokens.",
         "the 342 ids of six dump files, then the lowest ids; the default prompt is one of the three prompts behind those dumps, the other two are not.",
         "The first proposal equals the model's next token at 167 of 207 positions (46, 56 and 65 of 69 by prompt), "

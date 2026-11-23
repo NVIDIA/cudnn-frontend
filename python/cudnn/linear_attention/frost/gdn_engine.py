@@ -14,10 +14,10 @@ from typing import NamedTuple, Tuple
 
 import cudnn
 from cudnn import cpp_launcher
-from cudnn.engines.base import BaseEngine, CompiledPlan
+from cudnn.engines.base import BaseEngine, CompiledPlan, require_stream
 
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.device import build_device, compute_capability, current_device, multiprocessor_count
+from cudnn.frost.device import compute_capability, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze, qk_l2norm_eps
 from .common.context import backward_context, forward_apply_context, forward_context
@@ -193,10 +193,7 @@ class GdnFrostEngine(BaseEngine):
         gdn_support_gates("GdnFrostEngine", facts)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            return FrostLaPlan(build_gdn(graph))
+        return FrostLaPlan(build_gdn(graph))
 
 
 class CompiledGdn:
@@ -683,7 +680,7 @@ class CompiledGdn:
                 self.chain_launch,
                 *self.chain_scalars,
                 *self.chain_buffers(merged),
-                self.stream_type(int(stream or 0)),
+                self.stream_type(require_stream(stream, type(self).__name__)),
                 None,
                 *self.chain_lead(merged),
                 self.qk_l2norm_eps,
@@ -701,7 +698,7 @@ class CompiledGdn:
         state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
         a_log = views[self.index_a_log] if self.index_a_log is not None else None
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
-        stream = stream if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_context else {}
         fold = self.index_preceding_state_update is not None
@@ -1433,7 +1430,7 @@ class CompiledGdnBwd:
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         d_a_log = views[self.index_d_a_log] if self.index_d_a_log is not None else None
         d_dt_bias = views[self.index_d_dt_bias] if self.index_d_dt_bias is not None else None
-        stream = stream if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_context else {}
@@ -1804,10 +1801,7 @@ class GdnSummaryFrostEngine(BaseEngine):
         summary_support_gates("GdnSummaryFrostEngine", facts, graph)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            return FrostLaPlan(build_gdn_summary(graph))
+        return FrostLaPlan(build_gdn_summary(graph))
 
 
 class CompiledGdnSummary:
@@ -2057,7 +2051,7 @@ class CompiledGdnSummary:
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         final_state = views[self.index_final_state]
         transition = views[self.index_transition] if self.index_transition is not None else None
-        stream = stream if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_k_normalized else {}
@@ -2453,7 +2447,7 @@ class CompiledGdnSummaryBwd:
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         dstate0 = views[self.index_d_initial_state]
         transition = views[self.index_transition] if self.index_transition is not None else None
-        stream = stream if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_context else {}
