@@ -681,7 +681,9 @@ def gdn_fwd_overwrite_state(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GDN forward whose final state overwrites ``initial_state``, the rows ``state_indices`` names when that int32 or int64 ``[N]``
     table addresses a state pool.  The engine runs the chain or the uncut schedule and
-    never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last.  Inference
+    never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last (a prefill
+    kernel built with its levelled plan may run a tile as two work items, the second handed out behind the first one's
+    store of that state: see ``gated_delta_net``).  Inference
     only: a mutating op registers no autograd formula.  Returns ``(o, state_checkpoints)``."""
     o, _, state_checkpoints, _, _ = run_gdn_fwd(
         q=q,
@@ -1526,8 +1528,20 @@ def gated_delta_net(
             into the ``initial_state`` buffer, which is required and
             returned as the final state; the engine runs the chain or the
             uncut schedule and never the split-K cut, so the aliasing is
-            race-free.  Inference only: the in-place op has no autograd
-            formula.
+            race-free.  A prefill kernel built with its levelled plan may
+            run a (sequence, head) tile as two work items on two thread
+            blocks: the second starts from the state the first stored in
+            this buffer and is handed out only behind that store, so the
+            output and the final state stay the uncut schedule's.  A batch
+            whose sequences differ in their chunk count, whose
+            ``cu_seqlens`` stop short of the token rows by a chunk or more,
+            or whose ``state_indices`` name one row twice, keeps the uncut
+            schedule.  Where the engine would otherwise run a batch's last
+            partial wave as a chain of pieces, whose output and final state
+            differ from the uncut schedule's inside the op's tolerance, a
+            levelled plan runs the whole batch and returns the uncut
+            schedule's.
+            Inference only: the in-place op has no autograd formula.
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` inside the kernel.
         allow_neg_eigval: scale the fused beta sigmoid by 2, so the delta-rule
             operator ``I - beta k k^T`` can reach negative eigenvalues
