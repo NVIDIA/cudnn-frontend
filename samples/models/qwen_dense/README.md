@@ -602,7 +602,8 @@ meet at the end of a step too, on each 10.x class: the final norm releases at it
 operand behind it starts on that release, loads its one scale -- a constant the adapter formed on the host -- and
 waits for the norm before it reads the rows; it releases the launch after it directly behind its own wait. In
 `fe-entries` the head behind it is a fallback row and starts when the kernel has completed; in `native` it is the
-library's multiply, which starts on that release and waits before it loads the codes and the block scales. Each
+library's multiply, which on compute capability 10.0 starts on that release and waits before it loads the codes and
+the block scales. Each
 row of `configs.py` says what the launch before it must not write and what the launch after it must wait for. With `--provider
 linear_attention.step=fe.gdn_decode_fused` the stack runs the fused step in its `fe-cublas` form instead (no wait, no
 release); the table then prints `not the target (...)` for the block and the census line says why the run is not the

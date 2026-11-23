@@ -186,11 +186,12 @@ def _library_row(block: str, form, band: str = "bf16_rounding", last=None) -> Pr
     it), so behind a launch that releases early -- the fused step or the gate in front of the out-projection, the gate / up
     kernel in front of the down multiply -- the kernel starts early and must wait before it reads that launch's codes.  The
     kernels of the validated version wait in front of their first load.  The 4-bit multiply reads its one scalar in front of
-    that wait (both kernel classes of the validated version): the fp32 product of the two global scales, which the adapter
-    forms on the host once per pair of values -- a constant no launch writes.  A launch behind one that carries the attribute must
-    wait before it reads the product (the norm: its row).  In front of the head stands the quantise of its operand, a block
-    of its own: where its entry serves, a launch that releases early, and the head's kernel waits before it reads the codes
-    and the block scales; on its reference chain PyTorch's launches, none of which releases early.
+    that wait (both kernel classes of the validated version on compute capability 10.0): the fp32 product of the two global
+    scales, which the adapter forms on the host once per pair of values -- a constant no launch writes.  A launch behind one
+    that carries the attribute must wait before it reads the product (the norm: its row).  In front of the head stands the
+    quantise of its operand, a block of its own: where its entry serves, a launch that releases early, and the head's kernel
+    waits before it reads the codes and the block scales; on its reference chain PyTorch's launches, none of which releases
+    early.
     ``band``: the row's band against the reference; ``last``: the last row count the row claims (left out: any)."""
     key, serves, widths = LIBRARY_ROWS[block]
     # no test of this repository's own lanes runs a row that needs the library's package: printed as unverified in CI
