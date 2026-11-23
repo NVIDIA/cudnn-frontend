@@ -158,5 +158,6 @@ include = ["**/*"]
 
 "cudnn._cake._vendor" = ["**/*.json", "**/*.cu", "**/*.cuh", "**/*.h", "**/*.hpp", "**/*.cpp", "**/*.md", "**/LICENSE*"]
 "cudnn._cake" = ["UPSTREAM.md", "jax_ffi.cc"]
+"cudnn.moe_ep._cutemok" = ["UPSTREAM.md"]
 
 "cudnn.causal_conv1d_cake" = ["*.cu"]

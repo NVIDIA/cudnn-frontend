@@ -36,6 +36,8 @@ its rows in tiles of gate rows and up rows and its block scales in the 128 x 4 l
 (:class:`InterleavedBlockScaledTensor`): the same bytes in another order, built once per weight at load by the
 provider that multiplies on it.  A load then holds that ONE tensor, never the checkpoint's order beside it, and
 :func:`dequantize` gives its bf16 copy back in the checkpoint's row order, which is what every reader of a copy reads.
+A library multiply on the stored 4-bit format reads the rows in the checkpoint's order and the block scales in the
+128 x 4 layout (:class:`TiledBlockScaledWeight`): built at load in the same way, and kept as that weight's one stored form.
 
 The quantisers follow the public arithmetic of the two formats (round to nearest even, saturating); they are not promised to
 make the midpoint choices of another quantiser.
@@ -224,6 +226,25 @@ def untile_scales(tiled: torch.Tensor, rows: int, blocks: int) -> torch.Tensor:
 
 
 @dataclass
+class TiledBlockScaledWeight(TiledBlockScaledTensor):
+    """A 4-bit weight in the layout a library multiply on the stored format reads: the packed E2M1 codes ``[out, in / 2]`` in
+    the checkpoint's row order and the E4M3 block scales of those rows as code bytes in the 128 x 4 layout
+    (:func:`tile_scales`).  The same bytes as the stored weight, the scale bytes in another order: a provider that
+    multiplies on this layout builds it once per weight at load, and a load that keeps it keeps no other form of the stored
+    weight.  A reader of a bf16 copy gets one from it (:func:`dequantize`), bit for bit the copy of the stored weight."""
+
+    def row_major(self) -> BlockScaledTensor:
+        """The weight with its block scales row by row: whole bands of whole tiles are a permutation of dimensions (every
+        weight of the published widths), anything else one gather."""
+        rows, blocks = self.codes.shape[0], self.codes.shape[-1] * 2 // BLOCK
+        return BlockScaledTensor(self.codes, untile_scales(self.tiled_scales, rows, blocks), self.scale)
+
+    def tensors(self):
+        """What the block multiplies on, as it holds it: the bytes a checksum of this weight reads."""
+        return (self.codes, self.tiled_scales)
+
+
+@dataclass
 class InterleavedBlockScaledTensor:
     """The merged gate / up weight of an MLP in the layout a fused gate / up kernel multiplies on: packed E2M1 codes
     ``[2 x intermediate, in / 2]`` whose rows come in tiles of ``tile`` gate rows followed by the ``tile`` up rows of the
@@ -284,9 +305,9 @@ class Dequantized:
     """A weight as a multiply is handed it, in the forms the plans of a run read: ``data`` is the bf16 copy of its code
     values (exact), ``scale`` the scale a multiply applies to its result (a float or one scale per row), ``stored`` the
     stored tensor the copy is made from (a :class:`ScaledTensor`, a :class:`BlockScaledTensor`, or that weight in the
-    layout its provider multiplies on: an :class:`InterleavedBlockScaledTensor`).  A family's loader
-    decides from the plans which of the two a weight has: ``stored`` is ``None`` where no block multiplies on the stored
-    format, ``data`` is ``None`` where no block reads a copy.  It has one of them at least.  ``checksum`` is taken by the
+    layout its provider multiplies on: an :class:`InterleavedBlockScaledTensor`, a :class:`TiledBlockScaledWeight`).  A
+    family's loader decides from the plans which of the two a weight has: ``stored`` is ``None`` where no block multiplies
+    on the stored format, ``data`` is ``None`` where no block reads a copy.  It has one of them at least.  ``checksum`` is taken by the
     loader of a weight it keeps on its stored format alone (:func:`stored_checksum`): what its stored bytes were at the
     load, for the checks of the run to hold them to (``intact``)."""
 

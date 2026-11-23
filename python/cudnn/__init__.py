@@ -245,6 +245,22 @@ def load_cudnn():
     _pybind_module._set_dlhandle_cudnn(handle)
 
 
+def _cudnn_wheel_lib_on_sys_path():
+    """The nvidia-cudnn-cuXX (or nvidia-cudnn-jit) wheel's libcudnn.so.x in any
+    sys.path entry, for wheels installed outside purelib: ``pip install --user``,
+    ``pip install --target`` plus PYTHONPATH, or the base environment of a
+    ``--system-site-packages`` venv."""
+    for sub in ("nvidia/cudnn/lib", "nvidia/cudnn_jit/lib"):
+        for base in sys.path:
+            # The import system only looks at str entries, so skip the rest too.
+            if not base or not isinstance(base, str):
+                continue
+            lib_path = glob.glob(os.path.join(base, sub, "libcudnn.so.*[0-9]"))
+            if lib_path:
+                return lib_path
+    return []
+
+
 def _dlopen_cudnn():
     # Honor the dynamic linker search path before packaged cuDNN so local backend
     # builds can override the wheel dependency during development.
@@ -265,6 +281,9 @@ def _dlopen_cudnn():
 
     if not lib_path:
         lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"))
+
+    if not lib_path:
+        lib_path = _cudnn_wheel_lib_on_sys_path()
 
     if lib_path:
         assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
@@ -405,6 +424,7 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "AddNormQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "SwigluFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "AttentionPrepareDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "RowQuantizeFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -441,6 +461,10 @@ _LAZY_OPTIONAL_IMPORTS = {
     # and the keys and values written into paged pools, in one launch, SM100-class parts): a direct-call entry like the steps above (also
     # `cudnn.attention_prepare.frost.AttentionPrepareDecode`, with its `AttentionPrepareGeometry`)
     "AttentionPrepareDecode": (".attention_prepare.frost.prepare_decode", "AttentionPrepareDecode"),
+    # the FP4 row quantization decode step (the block-scaled FP4 quantization of bf16 rows under a global scale -- E2M1 codes, one E4M3
+    # block scale per sixteen elements in the 128 x 4 scale layout -- in one launch, SM100-class parts): a direct-call entry like the
+    # steps above (also `cudnn.row_quantize.frost.RowQuantizeFp4Decode`)
+    "RowQuantizeFp4Decode": (".row_quantize.frost.row_quantize_fp4_decode", "RowQuantizeFp4Decode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),

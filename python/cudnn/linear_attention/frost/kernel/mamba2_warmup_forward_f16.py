@@ -29,6 +29,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
 from cudnn.frost.compiled_cache import compile_cached
 
@@ -780,7 +781,8 @@ def run_warmup_forward(
     ragged_buffers=(),
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,
@@ -1282,7 +1284,8 @@ def run_recompute(
     tail_buffers=(),
 ) -> None:
     """Replay the recompute: one crossing into the DSL for the table, prologue and kernel launches."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,

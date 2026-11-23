@@ -127,7 +127,8 @@ def _installed_distributions():
 def _fe_backend_search():
     """Replicate the search order of cudnn/__init__.py:_dlopen_cudnn()
     read-only: LD_LIBRARY_PATH first, then site-packages nvidia/cudnn[_jit],
-    then the dynamic-linker soname fallback. Shows which libcudnn the
+    then the same directories under each sys.path entry, then the
+    dynamic-linker soname fallback. Shows which libcudnn the
     frontend picks *before* any torch import gets a say."""
     if sys.platform.startswith("win"):
         return "<not traced on Windows>"
@@ -144,6 +145,11 @@ def _fe_backend_search():
         hits = glob.glob(os.path.join(sysconfig.get_path("purelib"), sub, "libcudnn.so.*[0-9]"))
         if hits:
             return f"{os.path.realpath(hits[0])} (via site-packages {sub})"
+    for sub in ("nvidia/cudnn/lib", "nvidia/cudnn_jit/lib"):
+        for base in sys.path:
+            hits = glob.glob(os.path.join(base, sub, "libcudnn.so.*[0-9]")) if base and isinstance(base, str) else []
+            if hits:
+                return f"{os.path.realpath(hits[0])} (via sys.path entry {base}, {sub})"
     return "dynamic-linker soname fallback (ldconfig / RPATH)"
 
 

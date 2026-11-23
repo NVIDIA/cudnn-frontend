@@ -3883,7 +3883,8 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         num_acc_stage = 1 if (mma_tiler_mnk[1] == 256 or (enable_breuse and mma_tiler_mnk[1] == 192)) else 2
 
         # Default C/D stages
-        num_c_stage = 4 if a_dtype.width == 8 else (4 if store_d_directly else 2)
+        # 4 C stages for FP4 too: the epilogue stores overlap the next subtile instead of waiting for a free stage
+        num_c_stage = 4
         num_d_stage = 2 if a_dtype.width == 8 else (0 if store_d_directly else 2)
 
         # Default Tile info stages

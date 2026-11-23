@@ -243,15 +243,18 @@ def test_graph_declines_cleanly_until_a_row_serves_it():
 # =========================================================================== registration / capabilities (host)
 
 
-def test_engine_is_registered_and_opt_in():
+def test_engine_is_registered_and_offered_by_default():
     from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
     from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.bwd.heuristics import TRAIL_ONLY_ROWS
 
     _spec()
     fam = next(f for f in MANIFEST if f.name == _FAMILY_NAME)
     assert _ENGINE in fam.slots, f"{_ENGINE} has no manifest slot (never reuse a retired slot; plan s7 says slot {_SLOT})"
     slot = fam.slots[_ENGINE]
-    assert slot.slot == _SLOT and slot.opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # Default since 2026-11-16, behind the backend (cudnn.sdpa.bwd.heuristics.TRAIL_ONLY_ROWS).
+    assert slot.slot == _SLOT and not slot.opt_in
+    assert _ENGINE in TRAIL_ONLY_ROWS
     assert FROST_SDPA_BWD_ID_BASE + slot.slot == _ENGINE_ID
 
 

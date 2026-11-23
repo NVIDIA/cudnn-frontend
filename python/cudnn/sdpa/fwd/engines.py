@@ -262,7 +262,8 @@ class SdpaFwdKnobs:
     the backend's own encoding of its 2-CTA SDPA variant); ``sched_policy``,
     ``pack_gqa`` and ``split_kv`` are frontend-only types (the backend's
     split-KV counterpart, ``STREAM_K``, is an on/off mode, not a chunk count,
-    hence the distinct ``SPLIT_KV``).
+    hence the distinct ``SPLIT_KV``); ``cluster_reduce`` is the frontend-only
+    ``CLUSTER_K_REDUCE``, read here against ``SPLIT_KV``.
 
     Knobs are performance-only: every value computes the same function, so an
     autotuner may pick any of them. The softmax accumulator precision (the
@@ -284,6 +285,13 @@ class SdpaFwdKnobs:
     warp_spec_cfg: Optional[int] = None
     # Explicit MMA operand orientation; unset preserves the existing lowering.
     swap_ab: Optional[int] = None
+    # Reduce the split_kv partials inside the launch: the chunks of one unit run as one thread-block cluster and fold their
+    # partials there, in the separate reduction pass's own order, instead of a second launch. None and False are the
+    # two-launch form. Meaningful with split_kv > 1 only; a row that cannot run it for the plan declines the request.
+    cluster_reduce: Optional[bool] = None
+
+    # The 0/1 knobs: a public record carries them as ints, the native field is a bool.
+    _BOOL_KNOBS = ("pack_gqa", "cluster_reduce")
 
     # field name -> cudnn.knob_type member name (resolved lazily: the compiled
     # module is not importable at class-definition time in every build).
@@ -296,6 +304,7 @@ class SdpaFwdKnobs:
         ("split_kv", "SPLIT_KV"),
         ("warp_spec_cfg", "WARP_SPEC_CFG"),
         ("swap_ab", "SWAP_AB"),
+        ("cluster_reduce", "CLUSTER_K_REDUCE"),
     )
 
     def to_public(self) -> dict:
@@ -320,16 +329,16 @@ class SdpaFwdKnobs:
             if field is None:
                 raise ValueError(f"knob {knob.name} is not a tuning axis of the SDPA-forward engines")
             if isinstance(value, bool):
-                if field != "pack_gqa":
+                if field not in cls._BOOL_KNOBS:
                     raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
                 value = int(value)
             if not isinstance(value, int):
                 # A persisted record carries ints; "0" or 1.0 would round-trip to
                 # a different native knob than the one recorded.
                 raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
-            if field == "pack_gqa" and value not in (0, 1):
-                raise ValueError(f"knob PACK_GQA must be 0 or 1, got {value}")
-            kwargs[field] = bool(value) if field == "pack_gqa" else value
+            if field in cls._BOOL_KNOBS and value not in (0, 1):
+                raise ValueError(f"knob {knob.name} must be 0 or 1, got {value}")
+            kwargs[field] = bool(value) if field in cls._BOOL_KNOBS else value
         return cls(**kwargs)
 
 
@@ -755,6 +764,10 @@ class Capabilities:
     delegated_envelope: bool = False
     # cc codes outside [sm_lo, sm_hi] the row also serves (Thor on the SM100-line rows, cc 8.6 / 8.9 on the SM80 rows).
     sm_extra: frozenset[int] = frozenset()
+    # CLUSTER_K_REDUCE domain (SdpaFwdKnobs.cluster_reduce): True = the row's split kernel can reduce its partials inside
+    # the launch. WHICH plans it does so for is the implementation's own check in mismatch(). APPENDED after sm_extra
+    # (append-only contract above).
+    cluster_reduces: frozenset[bool] = frozenset({False})
 
 
 # The block sizes the own-block-excluded causal bound is wired for: the MXFP8 V
@@ -1914,6 +1927,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return "this engine serves sdpa() forward graphs only"
     if knobs is not None and not isinstance(knobs, SdpaFwdKnobs):
         return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
+    if knobs is not None and knobs.cluster_reduce and True not in capabilities.cluster_reduces:
+        return "CLUSTER_K_REDUCE=1 (the split-KV partials reduced inside the launch) is a form of the SM100 D256 swap-AB split decode tile; this engine has no such form"
     delegated = (facts.d_qk, facts.d_v)
     if capabilities.delegated_envelope and (facts.device_cc, delegated) not in capabilities.delegated_exact:
         delegated = _selected_d_shape(capabilities, facts, knobs) or delegated
@@ -2608,7 +2623,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     ):
         return "SM120 D576 envelope requires the matching native cuDNN Frontend extension"
     if _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE and not getattr(
-        cudnn._pybind_module._SdpaDenseBinder, "supports_native_d576", False
+        cudnn._pybind_module._SdpaDenseBinder, "supports_fp8_d576" if facts.is_fp8 else "supports_native_d576", False
     ):
         return "native D576x512 requires the matching cuDNN Frontend native extension"
     if (
@@ -3424,6 +3439,9 @@ def _sm100_d256_specs():
         sched_policies=frozenset({SCHED_NATURAL}),
         pack_gqa_partial_d_shapes=None,
         pack_gqa_requires_divisible=False,
+        # The split decode tile's in-launch reduction; the plans it serves are the swap-AB contract's own
+        # (d256_f16_swap_ab.contract.cluster_reduce_decline, read by mismatch()).
+        cluster_reduces=frozenset({False, True}),
     )
     return (
         EngineSpec(_D256_LOOKAHEAD, lookahead, lower_lookahead),
@@ -3919,13 +3937,15 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     """
 
     rubin_row = arch == "sm107"
+    native_shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    blackwell_shapes = native_shapes | {SM100_NATIVE_D576_SHAPE}
     return EngineSpec(
         name=f"sdpa_fwd_prefill_{arch}_fp8",
         capabilities=Capabilities(
             delegated_exact=(
                 frozenset(((10, 7), shape) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
                 if rubin_row
-                else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
+                else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in blackwell_shapes)
             ),
             delegated_envelope=True,
             layouts=frozenset({"bshd", "dense_flex"}),
@@ -3937,7 +3957,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             phase="prefill",
             # Both architectures carry native D64 through their d128 FP8 body.
             # The record selects 64-wide K/O geometry, including packed/split plans.
-            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            d_shapes=native_shapes if rubin_row else blackwell_shapes,
             d_pad_multiple=16,
             # The d512 flavor serves the (256, 512] band on BOTH head dims —
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
@@ -3952,7 +3972,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # keep rank-5. Native SM107 uses rank-4 for both exact and partial heads.
             # Both architecture rows mirror api_dsl._SM100_FP8_ENVELOPE_FLOORS
             # so graph admission and prepared lowering agree.
-            d_envelope_floors=(((512, 512), 256),),
+            d_envelope_floors=(((512, 512), 256),) if rubin_row else (((512, 512), 256), (SM100_NATIVE_D576_SHAPE, 512)),
             # Both lines serve THD at every native flavor.  The Rubin arm keeps a
             # NAMED constant (shared with the standalone adapter's gate, rule 8b')
             # rather than collapsing to `d_shapes`, so a future partial arch line
@@ -3980,13 +4000,15 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
-            # Native per-tensor FP8 page pools on SM100/103: D64, D128,
-            # D256 and D512 use independent K/V block tables and pool strides. Dense Q,
+            # SM100/103 page loaders use independent K/V block tables and pool
+            # strides, including the shared D576/V512 MLA record. Dense Q,
             # scalar-scaled O, padding/causal/windows, sink and legal KV splits
             # compose with the loader. Native Rubin serves dense-Q D512 pools
             # through its role-split pipeline. THD D512 and block-scaled O decline.
             paged_kv=True,
-            paged_d_shapes=frozenset({(512, 512)}) if rubin_row else frozenset({(64, 64), (128, 128), (256, 256), (512, 512)}),
+            paged_d_shapes=(
+                frozenset({(512, 512)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE})
+            ),
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
@@ -4106,7 +4128,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             split_kv_supported=True,
-            split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})),
+            split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else blackwell_shapes),
             pack_gqas=frozenset({False, True}),
             # Native SM107 per-tensor FP8 flavors pack whole GQA groups,
             # including the D512 role-split pipeline.
@@ -4228,8 +4250,8 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
         d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=shape,
-        paged_kv=False,
-        paged_d_shapes=frozenset(),
+        paged_kv=True,
+        paged_d_shapes=shape,
         split_d_shapes=shape,
         pack_gqa_d_shapes=shape,
         out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
@@ -4339,7 +4361,7 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
     """One per-tensor FP8 body; shared graph binding and launch construction."""
     from .kernels.sm100.d512_fp8_role_split.host import lower
 
-    shape = frozenset({(512, 512)})
+    shape = frozenset({(512, 512), SM100_NATIVE_D576_SHAPE})
     capabilities = replace(
         _sm100_fp8_spec().capabilities,
         implementation=_D512_FP8_ROLE_SPLIT,
@@ -4347,8 +4369,8 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
         delegated_envelope=False,
         d_shapes=shape,
         d_pad_multiple=16,
-        d_envelope_floors=(((512, 512), 256),),
-        thd_d_shapes=shape,
+        d_envelope_floors=(((512, 512), 256), (SM100_NATIVE_D576_SHAPE, 512)),
+        thd_d_shapes=frozenset({(512, 512)}),
         paged_d_shapes=shape,
         split_d_shapes=shape,
         pack_gqa_d_shapes=shape,
@@ -5156,6 +5178,8 @@ def lower_dsl_prefill(
             else ({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {})
         ),
         **({"swap_ab": knobs.swap_ab} if knobs is not None and knobs.swap_ab is not None else {}),
+        # CLUSTER_K_REDUCE: forwarded only when SET (mismatch admitted it on this row), so only an adapter that declares it sees it.
+        **({"cluster_reduce": True} if knobs is not None and knobs.cluster_reduce else {}),
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
         # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
         # attn_scale_prefolded_d_shapes claim gated it; every forward adapter declares the kwarg).
@@ -5408,7 +5432,11 @@ def lower_dsl_prefill(
             scheduler=getattr(cfg, "SCHEDULER_POLICY", SCHED_NATURAL),
             pack_group=getattr(cfg, "PACK_G", cfg.QH_PER_KH if cfg.PACK_GQA else 1),
             split_kv=cfg.SPLIT_KV,
+            # whether the split's partials are reduced inside the launch (one launch) or by the separate pass
+            cluster_reduce=bool(getattr(api, "_cluster_combine", False)),
         )
+        # A kernel whose in-launch reduction is the plan's CLUSTER_K_REDUCE knob must have compiled the selected form.
+        reduce_by_knob = bool(getattr(kernel_module, "CLUSTER_COMBINE_BY_KNOB", False))
         if (
             kernel_template != selected_kernel.template
             or implementation_config["query_tile"] != selected_kernel.query_tile
@@ -5418,6 +5446,7 @@ def lower_dsl_prefill(
             or implementation_config["scheduler"] != knobs.sched_policy
             or params.split_kv != knobs.split_kv
             or bool(params.pack_gqa) != bool(knobs.pack_gqa)
+            or (reduce_by_knob and implementation_config["cluster_reduce"] != bool(knobs.cluster_reduce))
         ):
             raise RuntimeError(f"{spec.name}: compiled implementation disagrees with the selected configuration: {implementation_config}")
 

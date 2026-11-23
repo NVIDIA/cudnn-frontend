@@ -2533,6 +2533,8 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 
 FROST_MXFP8_ENGINE = "sdpa_fwd_prefill_sm100_mxfp8"
 FROST_MXFP8_ENGINE_KEY = f"frost:{FROST_MXFP8_ENGINE}"
+# Default-offered (behind the backend) since 2026-11-16; the backend declines paged MXFP8, so the default walk reaches it (#2630).
+FROST_MXFP8_D256_OWNER = "sdpa_fwd_sm100_d256_mxfp8_single_q"
 
 
 def _exec_sdpa_mxfp8_expect_frost(cfg, request, cudnn_handle, strict=True, engine=FROST_MXFP8_ENGINE):
@@ -2578,7 +2580,7 @@ def _run_mxfp8_paged(test, test_no, request, cudnn_handle):
 def test_sdpa_mxfp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_handle):
     """Decode / MTP-shaped (s_q <= 8) MXFP8 paged graphs at page sizes 128 / 256, d256, over the
     default plan walk, each asserting the FROST MXFP8 row served it."""
-    _require_frost_sm100(FROST_MXFP8_ENGINE)
+    _require_frost_sm100(FROST_MXFP8_D256_OWNER)
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -2626,7 +2628,7 @@ MXFP8_PAGED_PINNED_CASES = [
 @pytest.mark.L0
 def test_sdpa_mxfp8_fwd_paged_pinned_frost_L0(env_info, case_id, batches, h_q, h_kv, s_q, s_kv, block_size, diag_align, right_bound, seq_len_kv, request, cudnn_handle):
     """Qwen3.5-shaped MXFP8 paged decode / MTP and a chunked-prefill step, pinned."""
-    _require_frost_sm100(FROST_MXFP8_ENGINE)
+    _require_frost_sm100(FROST_MXFP8_D256_OWNER)
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = ExecConfig(
         data_type=torch.float8_e4m3fn,

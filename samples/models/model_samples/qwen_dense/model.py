@@ -113,9 +113,16 @@ def _names(among: Sequence[str], block: str, kind: Optional[str] = None) -> bool
     return block in among or (site is not None and scoped(block, site) in among)
 
 
+#: the sections of the rotary width of an attention layer: how many of its rotary index pairs follow each of the three position
+#: rows a position has in this architecture -- of the published model.  A text position is one number, so the three rows are
+#: equal and no byte depends on the sections; the form a kernel that takes three position rows is called in does
+ROTARY_SECTION = (11, 11, 10)
+
+
 @dataclass(frozen=True)
 class Geometry:
-    """Layer widths of the published dense 27B-class model; ``layer_kinds`` in order."""
+    """Layer widths of the published dense 27B-class model; ``layer_kinds`` in order.  ``rotary_section``: the sections of the
+    rotary width (:data:`ROTARY_SECTION`), which a checkpoint's configuration may name."""
 
     layer_kinds: Tuple[str, ...] = PATTERN * 16
     hidden: int = 5120
@@ -131,6 +138,7 @@ class Geometry:
     rotary_dim: int = 64
     rope_theta: float = 1.0e7
     norm_eps: float = 1.0e-6
+    rotary_section: Tuple[int, int, int] = ROTARY_SECTION
 
     @property
     def qkv_channels(self) -> int:
@@ -204,6 +212,7 @@ class QwenDense:
     logits_band_units = configs.LOGITS_BAND_UNITS
     table_source = "model_samples/qwen_dense/configs.py"
     target_stacks = configs.TARGET_STACKS  # the stacks a run of which is held against the census of the target kernel set
+    attention_page = configs.ATTENTION_PAGE  # positions per page of the target's attention cache: where a timed run is judged
     _target = None  # that census, read once per process
 
     @classmethod
@@ -258,6 +267,9 @@ class QwenDense:
                 raise ValueError(f"{checkpoint.label}: config.json has {key} = {value!r} where {'a whole number' if kind is int else 'a number'} is expected")
             return kind(value)
 
+        section = rope.get("mrope_section", list(ROTARY_SECTION))  # where the configuration names none: the published model's
+        if not isinstance(section, list) or len(section) != 3 or not all(isinstance(part, int) and not isinstance(part, bool) for part in section):
+            raise ValueError(f"{checkpoint.label}: config.json has mrope_section = {section!r} where three whole numbers are expected")
         try:
             kinds = config["layer_types"]
             if not isinstance(kinds, list) or not all(isinstance(name, str) for name in kinds):
@@ -279,6 +291,7 @@ class QwenDense:
                 rotary_dim=int(head_dim * number("partial_rotary_factor", float, rope, default=config.get("partial_rotary_factor", 1.0))),
                 rope_theta=number("rope_theta", float, rope, default=config.get("rope_theta", 10000.0)),
                 norm_eps=number("rms_norm_eps", float),
+                rotary_section=tuple(section),
             )
         except KeyError as error:
             raise NotImplementedError(f"{checkpoint.label}: config.json has no {error.args[0]!r}; not a checkpoint this sample reads") from None
@@ -475,18 +488,30 @@ class QwenDense:
         whose weights the load keeps on their stored format alone."""
         return sum(2 * s.numel for s in self.tensor_specs() if s.fmt != "scalar") - 2 * self._elements(uncopied)
 
-    def state_bytes(self, sequences: int, capacity: int, tokens: int = 1) -> int:
+    def state_bytes(self, sequences: int, capacity: int, tokens: int = 1, page: Optional[int] = None, pages: Optional[int] = None) -> int:
         """Bytes of the decode state of ``sequences`` sequences: the slot pools of the linear-attention layers (one null slot
         each) and the key/value caches of the attention layers.  At ``tokens`` tokens per sequence a pool holds a
-        recurrent state per (sequence, token) and ``tokens + 2`` history columns per sequence."""
+        recurrent state per (sequence, token) and ``tokens + 2`` history columns per sequence.
+
+        ``page``: the attention caches are pools of pages of that many positions (``state.PagedKvCache``): per layer the
+        ``pages`` pages of every sequence (left out: as many as hold the capacity) -- the capacity rounded up to whole
+        pages -- and, once for the state, its tables (``state.PageTable``): two bytes per position and rotary element of
+        the cos / sin table, and 32 bytes per row for every position a step of ``tokens`` tokens can start at (three
+        position rows and one slot row of 64-bit integers), and again at one token per sequence for a state of several."""
         g = self.geometry
+        attention = sum(kind != "linear_attention" for kind in g.layer_kinds)
         state = 0
         for kind in g.layer_kinds:
             if kind == "linear_attention":
                 state += (sequences * tokens + 1) * g.la_value_heads * g.la_head_dim**2 * 4
                 state += (sequences + 1) * (g.la_conv_width - 2 + tokens) * g.qkv_channels * 2
-            else:
+            elif page is None:
                 state += 2 * sequences * g.attn_kv_heads * capacity * g.attn_head_dim * 2
+            else:
+                state += sequences * (-(-capacity // page) if pages is None else pages) * g.attn_kv_heads * page * 2 * g.attn_head_dim * 2
+        if page is not None and attention:
+            state += capacity * g.rotary_dim * 2
+            state += sum(max(capacity - each + 1, 0) * sequences * each * 32 for each in sorted({tokens, 1}))
         return state
 
     def stored_bytes(self, stored: Sequence[str] = ()) -> int:
@@ -506,11 +531,21 @@ class QwenDense:
         weight has its copy."""
         return max((2 * out * inner for block in uncopied for out, inner in self.weight_shapes(block)[1]), default=0)
 
-    def memory_bytes(self, sequences: int, capacity: int, stored: Sequence[str] = (), uncopied: Sequence[str] = (), tokens: int = 1) -> int:
+    def memory_bytes(
+        self,
+        sequences: int,
+        capacity: int,
+        stored: Sequence[str] = (),
+        uncopied: Sequence[str] = (),
+        tokens: int = 1,
+        page: Optional[int] = None,
+        pages: Optional[int] = None,
+    ) -> int:
         """What a run needs on the GPU besides a kernel's own reservation: the weights held -- the bf16 copies (not those
         of the blocks ``uncopied``) and the stored tensors of the blocks ``stored`` (``stored_bytes``) -- the state (at
-        ``tokens`` tokens per sequence: ``state_bytes``), working memory, and the one copy the checks make on demand at
-        a time (``check_bytes``).
+        ``tokens`` tokens per sequence, and with attention caches in pages of ``page`` positions where a block of the
+        run asks for them: ``state_bytes``), working memory, and the one copy the checks make on demand at a time
+        (``check_bytes``).
 
         Working memory is load-time temporaries, activations, the reference's fp64 temporaries during the checks and the
         allocator's slack: 2 GiB, or an eighth of the weights held where that is more, and a quarter of the stored
@@ -534,21 +569,24 @@ class QwenDense:
         kept = self.stored_bytes(stored)
         held = self.copy_bytes(uncopied) + kept
         working = max(2 * GIB, held // 8) + kept // 4
-        return held + self.state_bytes(sequences, capacity, tokens) + working + self.check_bytes(uncopied)
+        return held + self.state_bytes(sequences, capacity, tokens, page, pages) + working + self.check_bytes(uncopied)
 
-    def bytes_per_step(self, sequences: int, positions: int, stored: Sequence[str] = ()) -> Dict[str, int]:
-        """What one decode step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a
-        measurement.
+    def bytes_per_step(self, sequences: int, positions: int, stored: Sequence[str] = (), tokens: int = 1) -> Dict[str, int]:
+        """What one step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a
+        measurement.  ``tokens``: the tokens per sequence the step feeds -- 1, the decode step; more, the verify step,
+        which reads every weight once and that many embedding rows, reads one recurrent state per sequence and writes
+        one per token, reads the three history columns and writes ``tokens + 2``, and reads the caches up to its last
+        position, ``positions + tokens - 1``.
 
         * ``weights``: every weight the step reads in full, in its stored format (8-bit: 1 byte per element; 4-bit: 0.5 byte
-          per element plus one block-scale byte per 16; bf16: 2), and one row of the embedding table per sequence;
+          per element plus one block-scale byte per 16; bf16: 2), and one row of the embedding table per row of the step;
         * ``copies``: the same weights as a stack of this family reads them: a bf16 copy at 2 bytes per element -- but the
           weights of the blocks ``stored`` (the blocks of the stack's plan whose provider multiplies on the stored format:
           ``STORED_WEIGHTS``) on that format, as the loader kept them;
         * ``stored``: the part of ``copies`` that is read on a stored format (``stored_bytes``); 0 for a stack whose every
           multiply reads a copy;
         * ``state``: the recurrent state and the conv history of every linear-attention layer, read and written, and the
-          cached keys and values of every attention layer up to ``positions`` positions, read."""
+          cached keys and values of every attention layer over ``positions + tokens - 1`` positions, read."""
         g = self.geometry
         on_disk = copies = 0
         for spec in self.tensor_specs():
@@ -556,24 +594,28 @@ class QwenDense:
                 continue
             on_disk += spec.stored_bytes
             copies += 2 * spec.numel
-        embedding = 2 * sequences * g.hidden
-        state = 0
+        embedding = 2 * sequences * tokens * g.hidden
+        taps, state = g.la_conv_width - 1, 0
         for kind in g.layer_kinds:
-            if kind == "linear_attention":
-                state += 2 * sequences * (g.la_value_heads * g.la_head_dim**2 * 4 + (g.la_conv_width - 1) * g.qkv_channels * 2)
+            if kind == "linear_attention":  # one state read and one per token written; the taps read, and tokens + taps - 1 columns written
+                state += sequences * ((1 + tokens) * g.la_value_heads * g.la_head_dim**2 * 4 + (2 * taps + tokens - 1) * g.qkv_channels * 2)
             else:
-                state += 2 * sequences * g.attn_kv_heads * positions * g.attn_head_dim * 2
+                state += 2 * sequences * g.attn_kv_heads * (positions + tokens - 1) * g.attn_head_dim * 2
         # a block that multiplies on the stored format reads its weight there (1 byte per element of an 8-bit weight, 0.5625 of
         # a 4-bit one), and the 2 bytes per element of a copy of it are not read by a step
         kept = self.stored_bytes(stored)
         return {"weights": on_disk + embedding, "copies": copies - 2 * self._elements(stored) + kept + embedding, "stored": kept, "state": state}
 
     def state_shapes(self) -> Dict[str, tuple]:
+        """What a decode state is built from (``state.DecodeState``): the shapes of a recurrent state, of a conv history and
+        of a cached key or value row, and the rotary facts of an attention layer -- the rotary width and theta, from
+        which a paged cache builds its cos / sin table."""
         g = self.geometry
         return {
             "state": (g.la_value_heads, g.la_head_dim, g.la_head_dim),
             "conv": (g.la_conv_width - 1, g.qkv_channels),
             "kv": (g.attn_kv_heads, g.attn_head_dim),
+            "rotary": (g.rotary_dim, g.rope_theta),
         }
 
     # ------------------------------------------------------------------ load
@@ -650,7 +692,15 @@ class QwenDense:
                     copied = dequantize(whole)
             if block in layouts:  # the provider multiplies on a layout of its own: the one stored form this load keeps
                 with stages.stage("lay out"):
-                    whole = layouts[block](whole)
+                    merged, whole = whole, layouts[block](whole)
+                    # a layout that states its way back to the checkpoint's order (``row_major``) is held to the bytes it was
+                    # made from, here: the reference's copy of such a weight is made through that way back, so no later
+                    # check of the run could tell a wrong layout from a right one
+                    if hasattr(whole, "row_major") and stored_checksum(whole.row_major()) != stored_checksum(merged):
+                        raise ValueError(
+                            f"the layout of the stored weight of {block}{'' if layer is None else f' (layer {layer})'} does not hold the bytes of the "
+                            f"checkpoint's tensor: {type(whole).__name__}, read back in the checkpoint's order, is another weight than the one it was made from"
+                        )
             if copied is None:  # every plan of the run multiplies this weight on its stored format: no copy is made
                 with stages.stage("checksum"):  # of the bytes the block multiplies on and the checks' reference is made from
                     bare = Dequantized(None, whole.scale, whole, stored_checksum(whole))
@@ -744,7 +794,10 @@ class QwenDense:
         several is the decode step of a prompt in front of the verify steps: ``rows`` = sequences, the blocks are handed
         the plain slot ids and the token-0 views of the state (``state.prompt_layers()``: a ``ValueError`` once the state
         stands behind a verify step), and the position moves on by one.  Any other count than the state's is a
-        ``ValueError``: a state serves its own step and the decode step of its prompt."""
+        ``ValueError``: a state serves its own step and the decode step of its prompt.
+
+        The step leaves on the state what a drafter reads of it: ``state.hidden``, the final-norm rows ``[rows, hidden]``
+        bf16 -- the tensor the last norm's call returned, by reference -- and ``state.greedy``, the ids it chose."""
         tokens = state.tokens if tokens is None else tokens
         if tokens == state.tokens:
             layers = state.layers
@@ -769,9 +822,11 @@ class QwenDense:
             branch = call("projection.fp8.out", i, mixed, layer.out_proj, OUT_PROJECTION_SITES[layer.kind])
             q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant, "mlp")
             branch = call("mlp.down", i, call("mlp.gate_up", i, q, layer.gate_up, layer.down_quant), layer.down)
-        q, _, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
+        q, normed, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
         logits = call("output_head", -1, q, weights.head)
         next_ids = call("token_choice", -1, logits)
+        # what a drafter reads of this step, by reference: the final-norm rows and, for each of them, the token that follows it
+        state.hidden, state.greedy = normed, next_ids
         if tokens == 1:
             state.position = position + 1
         else:

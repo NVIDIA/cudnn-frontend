@@ -1878,7 +1878,8 @@ def run_uncut_summary_backward(
     tail_buffers=(),
 ) -> None:
     """Replay the uncut backward summary: one crossing into the DSL."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         float(scale),
         q,
         k,

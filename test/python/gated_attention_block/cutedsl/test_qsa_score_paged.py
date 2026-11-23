@@ -1140,13 +1140,24 @@ def test_e4m3_arm_smem_is_half_the_bf16_arms(units, want16, want8):
 
 
 def _skip_past_the_sm120_selector_cap(n_blocks_max):
-    """The selector runs the deterministic FP32 IndexerTopK, which on SM120 serves at most
-    _SM120_DETERMINISTIC_MAX_NUM_COLS columns and declines wider rows in check_support(); skip those cells there."""
+    """Respect the deterministic FP32 IndexerTopK column limit on SM12.x."""
     from cudnn.deepseek_sparse_attention.indexer_top_k import api as topk_api
 
     cap = topk_api._SM120_DETERMINISTIC_MAX_NUM_COLS[torch.float32]
-    if _cc() == (12, 0) and n_blocks_max > cap:
-        pytest.skip(f"deterministic IndexerTopK on SM120 serves at most {cap} columns; this cell selects over {n_blocks_max}")
+    capability = _cc()
+    if capability in ((12, 0), (12, 1)) and n_blocks_max > cap:
+        pytest.skip(f"deterministic IndexerTopK on SM12.x serves at most {cap} columns; this cell selects over {n_blocks_max}")
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0), (12, 0), (12, 1)])
+@pytest.mark.parametrize("n_blocks_max", [16384, 32768])
+def test_paged_selector_column_limit_gate(monkeypatch, capability, n_blocks_max):
+    monkeypatch.setattr(sys.modules[__name__], "_cc", lambda: capability)
+    if capability in ((12, 0), (12, 1)) and n_blocks_max > 16384:
+        with pytest.raises(pytest.skip.Exception, match="at most 16384 columns"):
+            _skip_past_the_sm120_selector_cap(n_blocks_max)
+    else:
+        _skip_past_the_sm120_selector_cap(n_blocks_max)
 
 
 @needs_selector

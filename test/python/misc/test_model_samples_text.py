@@ -1118,11 +1118,12 @@ def test_a_standard_stream_that_was_closed_before_the_process_started_ends_in_no
     assert (done[2].returncode, done[2].stdout, done[2].stderr) == (0, "stderr=None: the text\n", ""), "no line of the run in the text"
 
 
-def _sample_script(monkeypatch):
-    """The sample script as a module, for its own functions; what loading it changes in the process leaves with the test."""
+def _sample_script(monkeypatch, script="00_decode.py"):
+    """A sample script of the family as a module, for its own functions; what loading it changes in the process leaves with
+    the test."""
     monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models and its own folder on the path
     monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # and sets a default for the profiler's log level
-    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_serving_options", FAMILY / "00_decode.py")
+    spec = importlib.util.spec_from_file_location(f"model_sample_qwen_dense_{script[:2]}_serving_options", FAMILY / script)
     sample = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sample)
     return sample
@@ -1233,12 +1234,13 @@ def _save_safetensors(path: Path, tensors: dict) -> None:
     path.write_bytes(struct.pack("<Q", len(text)) + text + b"".join(blobs))
 
 
-def _checkpoint_directory(directory: Path, generation=None) -> Path:
+def _checkpoint_directory(directory: Path, generation=None, drafter=False) -> Path:
     """A whole checkpoint directory of the tiny geometry, generated here: seeded weights in the layout a quantised
     checkpoint stores (the language model under one prefix, the output head under none; 8-bit codes with their scale,
     packed 4-bit codes with block scales and a global scale), ``config.json``, and its text files -- a tokenizer of
     ``WORDS`` words ``w0 w1 ...`` with the end token after them, a chat template that writes the messages' contents, and
-    ``generation_config.json`` with the checkpoint's own sampling settings (``generation``)."""
+    ``generation_config.json`` with the checkpoint's own sampling settings (``generation``).  ``drafter``: the checkpoint
+    carries a drafter -- its own tensors in bf16 under ``mtp.`` and the two entries of ``config.json`` that describe it."""
     pytest.importorskip("safetensors")
     pytest.importorskip("jinja2")
     tokenizers = pytest.importorskip("tokenizers")
@@ -1259,6 +1261,12 @@ def _checkpoint_directory(directory: Path, generation=None) -> Path:
             tensors[key + "_scale_2"] = torch.tensor(stored.scale, dtype=torch.float32)
         else:
             tensors[key] = stored
+    if drafter:
+        from model_samples.qwen_dense import QwenDenseDrafter
+
+        own = QwenDenseDrafter.seeded(model, seed=5)
+        drawn = Checkpoint.synthetic(own, seed=5)
+        tensors.update({"mtp." + spec.name[len("drafter.") :]: drawn.load(spec.name, "cpu") for spec in own.tensor_specs() if spec.name.startswith("drafter.")})
     directory.mkdir(parents=True, exist_ok=True)
     _save_safetensors(directory / "model.safetensors", tensors)
     config = {
@@ -1279,6 +1287,7 @@ def _checkpoint_directory(directory: Path, generation=None) -> Path:
         "rms_norm_eps": geometry.norm_eps,
         "attn_output_gate": True,
         "hidden_act": "silu",
+        **({"mtp_num_hidden_layers": 1, "mtp_use_dedicated_embeddings": False} if drafter else {}),
     }
     (directory / "config.json").write_text(json.dumps({"model_type": "qwen3_5", "text_config": config}))
     tokenizer = tokenizers.Tokenizer(models.WordLevel({f"w{index}": index for index in range(WORDS)}, unk_token="w0"))
@@ -1292,8 +1301,8 @@ def _checkpoint_directory(directory: Path, generation=None) -> Path:
     return directory
 
 
-def _sample_on_the_cpu(monkeypatch, loads=True):
-    """The sample script as a module whose runs stay on the CPU: stated device facts (compute capability 10.0), every
+def _sample_on_the_cpu(monkeypatch, loads=True, script="00_decode.py"):
+    """A sample script as a module whose runs stay on the CPU: stated device facts (compute capability 10.0), every
     session on the CPU, and the environment check answered.  With ``loads`` false a load is an ``AssertionError``: what
     such a test looks at comes before it."""
     pytest.importorskip("cudnn")
@@ -1318,7 +1327,7 @@ def _sample_on_the_cpu(monkeypatch, loads=True):
     if not loads:
         monkeypatch.setattr(real_session, "load", no_load)
     monkeypatch.setattr(model_samples, "Session", session)
-    return _sample_script(monkeypatch)
+    return _sample_script(monkeypatch, script)
 
 
 def _lines(text, start):
@@ -1759,3 +1768,874 @@ def test_the_family_readme_says_of_a_request_what_the_data_and_the_run_say():
     ):
         commands = [line for line in document.splitlines() if line.startswith("python samples/models/qwen_dense/00_decode.py")]
         assert commands and not any("--max-new-tokens" in line for line in commands), "the commands of the documents use the flag's first spelling"
+
+
+# --------------------------------------------------------------------------- the speculative script: its configuration, its flags, its last line
+
+SPECULATIVE = {"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": True}
+#: every key of a speculative configuration the sample holds, with one value it is refused at; a refused key is refused at any
+SPECULATIVE_KEYS = {
+    "method": "eagle3",
+    "num_speculative_tokens": 0,
+    "use_local_argmax_reduction": False,
+    "rejection_sample_method": "synthetic",
+    "draft_sample_method": "probabilistic",
+    "enable_adaptive_verification": True,
+    "disable_padded_drafter_batch": True,
+    "parallel_drafting": True,
+    "use_heterogeneous_vocab": True,
+    "model": "/data/somebody/another-drafter",
+    "quantization": "fp8",
+    "revision": "a-branch-of-somebody",
+    "code_revision": "a-branch-of-somebody",
+    "draft_load_config": {"download_dir": "/data/somebody"},
+    "draft_lm_head_quantization": "nvfp4",
+    "max_model_len": 4096,
+    "synthetic_acceptance_rates": [0.9, 0.8, 0.7, 0.6, 0.5],
+    "synthetic_acceptance_length": 4.5,
+    "num_speculative_tokens_per_batch_size": [[1, 8, 5]],
+    "enforce_eager": True,
+    "tensor_parallel_size": 2,
+    "draft_tensor_parallel_size": 1,
+    "moe_backend": "auto",
+    "attention_backend": "auto",
+    "kv_cache_dtype": "auto",
+    "index_share_for_mtp_iteration": True,
+    "disable_eagle_block_drop": False,
+    "disable_lookahead_block_hashes": False,
+    "prompt_lookup_max": 4,
+    "prompt_lookup_min": 2,
+    "suffix_decoding_max_tree_depth": 24,
+    "suffix_decoding_max_cached_requests": 10000,
+    "suffix_decoding_max_spec_factor": 1.0,
+    "suffix_decoding_min_token_prob": 0.1,
+    "dspark_draft_topk": 4,
+    "xpress_topc": 2,
+    "fly_window_size": 4,
+    "fly_entropy_threshold": 0.3,
+    "fly_entropy_top_k": 3,
+}
+SHOWN = "--speculative-config"
+
+
+def _configured(**keys):
+    """The line and the count of the default object with ``keys`` set (``None``: as JSON ``null``)."""
+    import serving_options
+
+    return serving_options.parse_speculative_config(json.dumps({**SPECULATIVE, **keys}), SHOWN)
+
+
+def test_the_speculative_configuration_is_one_json_object_answered_key_by_key():
+    """Every key of the object lands in exactly one table -- read, neutral, refused -- and a key no table holds is refused
+    by its name: a key of this object selects what is launched, so none is printed and ignored.  The line a run prints
+    holds the names of the keys and the values the tables know; a boolean is compared with a boolean only."""
+    import serving_options
+
+    read, neutral, refused = serving_options.SPECULATIVE_READ, serving_options.SPECULATIVE_NEUTRAL, serving_options.SPECULATIVE_REFUSED
+    assert len(read) + len(neutral) + len(refused) == len({*read, *neutral, *refused}) == 39, "no key is in two tables"
+    assert set(SPECULATIVE_KEYS) == {*read, *neutral, *refused}, "a key added to a table comes with a value this module refuses it at"
+    assert (list(read), list(neutral)[:2]) == (list(SPECULATIVE), ["rejection_sample_method", "draft_sample_method"])
+    for reason in (*(why for _, why in read.values()), *(why for _, why in neutral.values()), *refused.values()):
+        assert reason and reason[0].islower() and not reason.endswith("."), reason
+    drafted, line = serving_options.parse_speculative_config(serving_options.SPECULATIVE_DEFAULT, f"{SHOWN} (the default)")
+    said = f'{SHOWN} (the default): the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, '
+    assert (drafted, line) == (5, said + "use_local_argmax_reduction true.") and json.loads(serving_options.SPECULATIVE_DEFAULT) == SPECULATIVE
+    # the count is any whole number from 1: which counts a stack serves is its rows' answer, at the plan
+    assert [_configured(num_speculative_tokens=count)[0] for count in (1, 3, 7, 12)] == [1, 3, 7, 12]
+    full = _configured(draft_sample_method="greedy", rejection_sample_method="standard", parallel_drafting=False, use_heterogeneous_vocab=None, model=None)
+    assert full[1].endswith(
+        'use_local_argmax_reduction true. At the value that changes nothing: draft_sample_method "greedy", rejection_sample_method "standard", '
+        "parallel_drafting false."
+    ), "null is the key left out, for a neutral key and for a refused one"
+    # true is not 1, and a count is a whole number: nothing is converted
+    for name, value in (
+        ("num_speculative_tokens", True),
+        ("num_speculative_tokens", 5.0),
+        ("num_speculative_tokens", "5"),
+        ("num_speculative_tokens", -1),
+        ("use_local_argmax_reduction", 1),
+        ("use_local_argmax_reduction", "true"),
+        ("method", "MTP"),
+        ("method", ["mtp"]),
+    ):
+        with pytest.raises(ValueError, match=re.escape(f'{SHOWN}: "{name}": {json.dumps(value)} is not served: ')):
+            _configured(**{name: value})
+    for name, value in (("enable_adaptive_verification", 0), ("parallel_drafting", "false"), ("draft_sample_method", "Greedy")):
+        with pytest.raises(ValueError, match=re.escape(f'{SHOWN}: "{name}": {json.dumps(value)} would change what is launched and is not served: ')):
+            _configured(**{name: value})
+    # a key no table holds: refused by its name, as a JSON string -- a name is whatever the object's author wrote
+    unknown = (("frobnicate", '"frobnicate"', 1), ("num_speculative_token", '"num_speculative_token"', None), ("a\n[02] PASS", '"a\\n[02] PASS"', 1))
+    for name, shown, value in unknown:  # ... whatever it holds: null is a key left out for a key a table holds, not for a mistyped name
+        with pytest.raises(ValueError) as refusal:
+            _configured(**{name: value})
+        assert str(refusal.value) == (
+            f"{SHOWN}: {shown} is not a key this sample holds: a key of a speculative configuration selects what is launched, so none is ignored. "
+            "Leave the key out"
+        )
+    # a reason is true of its key: "another speculative method" is said of no option of the method mtp or of a way to keep tokens
+    other = {name for name, reason in refused.items() if reason.startswith("it is an option of another speculative method")}
+    kept = {"synthetic_acceptance_rates", "synthetic_acceptance_length", "fly_window_size", "fly_entropy_threshold", "fly_entropy_top_k"}
+    assert len(other) == 10 and not other & {"index_share_for_mtp_iteration", *kept} and len({refused[name] for name in kept}) == 1
+    assert refused["index_share_for_mtp_iteration"].startswith("it overrides a field of the drafter's own configuration: ")
+    # text that is not a JSON object
+    for text, sentence in (
+        ("{'method': 'mtp'}", f"{SHOWN}: not JSON ("),
+        ("", f"{SHOWN}: not JSON ("),
+        ("[1, 2]", f"{SHOWN}: [1, 2] is not a JSON object; a speculative configuration is one, with its keys"),
+        ('"mtp"', f'{SHOWN}: "mtp" is not a JSON object; a speculative configuration is one, with its keys'),
+        ("5", f"{SHOWN}: 5 is not a JSON object; a speculative configuration is one, with its keys"),
+        ("null", f"{SHOWN}: null is not a JSON object; a speculative configuration is one, with its keys"),
+    ):
+        with pytest.raises(ValueError) as refusal:
+            serving_options.parse_speculative_config(text, SHOWN)
+        assert str(refusal.value).startswith(sentence) if sentence.endswith("(") else str(refusal.value) == sentence, text
+    # the rule the guide states for such an object, beside the rule for a request body
+    guide = " ".join((MODELS / "AGENTS.md").read_text().split())
+    assert (
+        "A configuration object of a serving engine that selects what is launched is answered key by key in the same module; "
+        "a key it does not hold is an `ERROR` that names it."
+    ) in guide
+
+
+@pytest.mark.parametrize("name", sorted(SPECULATIVE_KEYS))
+def test_a_key_of_the_speculative_configuration_is_answered_by_the_table(name):
+    """One case per key: a key that is read is held to what is accepted and must be named; a neutral key is accepted at its
+    value and at ``null`` and refused by name at another; a key the table refuses is refused at any value, with its
+    reason, and what it holds is not printed back."""
+    import serving_options
+
+    wrong = SPECULATIVE_KEYS[name]
+    if name in serving_options.SPECULATIVE_READ:
+        values, reason = serving_options.SPECULATIVE_READ[name]
+        accepted = ", ".join(json.dumps(value) for value in values) or "a whole number from 1"
+        with pytest.raises(ValueError) as refusal:
+            _configured(**{name: wrong})
+        assert str(refusal.value) == f'{SHOWN}: "{name}": {json.dumps(wrong)} is not served: {reason}. Accepted: {accepted}'
+        without = {key: value for key, value in SPECULATIVE.items() if key != name}
+        for text in (json.dumps(without), json.dumps({**without, name: None})):  # left out, or null: the same
+            with pytest.raises(ValueError) as refusal:
+                serving_options.parse_speculative_config(text, SHOWN)
+            assert str(refusal.value) == f'{SHOWN}: "{name}" is not named: {reason}. Accepted: {accepted}'
+        assert f"{name} {json.dumps(SPECULATIVE[name])}" in _configured()[1]
+    elif name in serving_options.SPECULATIVE_NEUTRAL:
+        values, reason = serving_options.SPECULATIVE_NEUTRAL[name]
+        for value in values:
+            drafted, line = _configured(**{name: value})
+            assert drafted == 5 and line.endswith(f" At the value that changes nothing: {name} {json.dumps(value)}.")
+        assert _configured(**{name: None}) == _configured(), "null is the key left out"
+        accepted = ", ".join([json.dumps(value) for value in values] + ["null"])
+        with pytest.raises(ValueError) as refusal:
+            _configured(**{name: wrong})
+        assert str(refusal.value) == (
+            f'{SHOWN}: "{name}": {json.dumps(wrong)} would change what is launched and is not served: {reason}. Accepted: {accepted}, or the key left out'
+        )
+    else:
+        reason = serving_options.SPECULATIVE_REFUSED[name]
+        with pytest.raises(ValueError) as refusal:
+            _configured(**{name: wrong})
+        assert str(refusal.value) == f'{SHOWN}: "{name}" is not served: {reason}. Leave the key out'
+        assert "somebody" not in str(refusal.value), "what somebody wrote into the key is not printed back"
+        assert _configured(**{name: None}) == _configured(), "null is the key left out"
+
+
+def test_the_line_before_the_load_of_a_speculative_run_states_a_rule_and_counts():
+    """What a speculative run says before anything is loaded: per prompt the decode steps and the drafter's passes before
+    the first token, then what every step is -- counts, never a time."""
+    import serving_options
+
+    one = serving_options.speculative_line([("the default prompt", 58)], 5)
+    assert one == (
+        "prompt of 58 tokens = 58 decode steps and 57 passes of the drafter before the first token; then every step is 5 draft passes and one "
+        "verify step of 6 tokens, and keeps 1 to 6 of them"
+    )
+    two = serving_options.speculative_line([("--prompt 1", 1234), ("--messages chat.json", 1)], 1)
+    assert two == (
+        "prompt of 1,234 tokens (--prompt 1) = 1,234 decode steps and 1,233 passes of the drafter before the first token; "
+        "prompt of 1 tokens (--messages chat.json) = 1 decode steps and 0 passes of the drafter before the first token; "
+        "then every step is 1 draft pass and one verify step of 2 tokens, and keeps 1 to 2 of them"
+    )
+    assert not re.search(r"\d ?(?:ms|s)\b", one + two), "no time: the report measures it"
+
+
+def test_the_speculative_scripts_flags_say_what_they_apply_to(tmp_path, monkeypatch, capsys):
+    """The flags of ``02_speculative_decode.py``: its defaults, what each applies to and every refusal by its sentence -- a
+    draft vocabulary without a checkpoint, a block of the drafter in ``--provider``, ``--dump-census``, each the usage
+    error; ``--sequences`` other than 1, one ``ERROR`` line in the session's own sentence, before the plan.  And the two
+    flags ``00_decode.py`` declares to refuse them by the name of this script."""
+    import serving_options
+    from model_samples import loop
+
+    sample = _sample_on_the_cpu(monkeypatch, loads=False, script="02_speculative_decode.py")
+    assert sample.serving_options is serving_options and sample.TAG == "[02]" and sample.STACKS == loop.STACKS
+    seeded = sample._arguments([])
+    assert (seeded.model, seeded.sequences, seeded.layers, seeded.force_tokens, seeded.stack) == (None, 1, 2, 32, "fe-cublas")
+    assert (seeded.speculative_config, seeded.draft_vocab, seeded.max_new_tokens, seeded.max_model_len) == (None, None, 256, 2051)
+    config = '{"method": "mtp", "num_speculative_tokens": 3, "use_local_argmax_reduction": true}'
+    real = sample._arguments(["--model", "d", "--draft-vocab", "ids.json", "--speculative-config", config, "--max-tokens", "8", "--stack", "native"])
+    assert (real.draft_vocab, real.speculative_config, real.max_new_tokens, real.force_tokens, real.stack) == ("ids.json", config, 8, None, "native")
+    for wrong, sentence in (
+        (["--draft-vocab", "ids.json"], "--draft-vocab needs --model: the seeded run draws its draft vocabulary from the seed"),
+        (
+            ["--provider", "draft.head=torch_ref.linear"],
+            "--provider selects a row of a block of the model; a block of the drafter has one row, a reference chain, in every stack",
+        ),
+        (
+            ["--dump-census", "census.json"],
+            "--dump-census: the launch records of a draft pass have no kernel census to be held against yet; 00_decode.py writes those of a decode step",
+        ),
+        (["--check-kernels", "--stack", "reference"], "--check-kernels is for a provider stack; --stack reference checks no kernel"),
+        (["--sequences", "1,4"], "argument --sequences: invalid int value: '1,4'"),
+        (["--model", "d", "--messages", "-", "--messages", "-"], "--messages - reads one request from standard input; it was given 2 times"),
+        (["--max-tokens", "8"], "--max-tokens is for --model; the seeded run produces --force-tokens N (default 32)"),
+        (["--model", "d", "--force-tokens", "40", "--max-tokens", "8"], "--force-tokens N produces exactly N tokens; --max-tokens does not apply beside it"),
+        (["--model", "d", "--layers", "4"], "--layers is for the reduced model"),
+        (["--prompt", "hi"], "--prompt and --messages need --model"),
+        (["--no-stream"], "--text-out and --no-stream need --model"),
+        (["--temperature", "0.5"], "--temperature 0.5: token choice is greedy"),
+        (["--layers", "0"], "--layers, --max-tokens, --max-model-len and --force-tokens take positive integers"),
+    ):
+        with pytest.raises(SystemExit) as stop:
+            sample._arguments(wrong)
+        assert stop.value.code == 2 and sentence in capsys.readouterr().err, wrong
+    with pytest.raises(SystemExit) as stop:
+        sample._arguments(["--help"])
+    shown = " ".join(capsys.readouterr().out.split())  # argparse wraps its lines by the terminal's width
+    assert stop.value.code == 0
+    for part in (
+        "--speculative-config JSON",
+        f"(default {serving_options.SPECULATIVE_DEFAULT})",
+        "--draft-vocab FILE",
+        "with --model, required: a JSON list of the token ids the drafter proposes from",
+        "--sequences 1",
+        "accepted at 1 only: this script serves one request",
+        "The drafter's blocks are reference chains in every stack",
+        "The generated text goes to standard output; every other line of a run goes to standard error.",
+        "samples/models/qwen_dense/README.md",
+    ):
+        assert part in shown, part
+    # what a user can get wrong beyond a flag's usage: one ERROR line each, before the plan, exit code 1
+    for wrong, line in (
+        (["--sequences", "2"], f"[02] ERROR --sequences 2: {loop.ONE_SEQUENCE}"),
+        (["--sequences", "0"], f"[02] ERROR --sequences 0: {loop.ONE_SEQUENCE}"),
+        (
+            ["--force-tokens", "16"],
+            "[02] ERROR --force-tokens 16: the seeded run schedules its steps to keep 0 to 5 drafted tokens in turn and needs 17 new tokens "
+            "to keep every count once",
+        ),
+        (
+            ["--speculative-config", '{"method": "mtp", "num_speculative_tokens": 5}'],
+            '[02] ERROR --speculative-config: "use_local_argmax_reduction" is not named: the draft token is the largest of the listed rows of the '
+            "head; without it an engine launches another set. Accepted: true",
+        ),
+        (["--dump-tokens", str(tmp_path / "nowhere" / "ids.json")], "[02] ERROR --dump-tokens ids.json: cannot be written there"),
+        (["--model", "d", "--text-out", str(tmp_path / "nowhere" / "answer.txt")], "[02] ERROR --text-out answer.txt: cannot be written there"),
+    ):
+        capsys.readouterr()
+        code = sample.main(wrong)
+        assert (code, capsys.readouterr().err.splitlines()) == (1, [line]), wrong
+    # a standard stream that was closed before the process started: no text without a place for it is said before the plan,
+    # and a line of the run goes nowhere -- never to standard output; a file in an ERROR line is named by its own name
+    with monkeypatch.context() as patched:
+        patched.setattr(sys, "stdout", None)
+        code = sample.main(["--model", "d"])
+    with monkeypatch.context() as patched:
+        patched.setattr(sys, "stderr", None)
+        sample._say("a line of the run")
+    closed = "[02] ERROR standard output is closed and the generated text has nowhere to go; redirect it, or name a file with --text-out\n"
+    assert (code, *capsys.readouterr()) == (1, "", closed)
+    assert sample._reason(OSError(errno.ENOENT, "No such file or directory", "/data/somebody/request.json")) == "request.json: No such file or directory"
+    assert loop.ONE_SEQUENCE == "a session with a drafter serves one sequence: one request, as the drafter rows are for"
+    # 00_decode.py declares the two flags to refuse them: the usage error, exit code 2, with the name of this script
+    plain = _sample_script(monkeypatch)
+    for wrong, sentence in (
+        (
+            ["--speculative-config", config],
+            "00_decode.py: error: --speculative-config: speculative decoding is the script 02_speculative_decode.py of this folder, "
+            "which takes the same JSON",
+        ),
+        (
+            ["--model", "d", "--draft-vocab", "ids.json"],
+            "00_decode.py: error: --draft-vocab: speculative decoding is the script 02_speculative_decode.py of this folder, which takes the same list",
+        ),
+    ):
+        monkeypatch.setattr(sys, "argv", ["00_decode.py"])  # the program's name in a usage error is the script's own
+        with pytest.raises(SystemExit) as stop:
+            plain._arguments(wrong)
+        assert stop.value.code == 2 and sentence in " ".join(capsys.readouterr().err.split()), wrong
+    assert (FAMILY / plain.SPECULATIVE).is_file(), "the script the sentence names is a script of this folder"
+
+
+COMPARED = ("tokens", "kept state", "position", "prompt", "recorded", "bytes", "rejected rows", "drafter cache", "draft proposals")
+
+
+def _compared(lines, name):
+    """The line ``name`` of the comparison of a speculative run with decode steps (the first of that name in a run)."""
+    return next(line for line in lines if line.startswith(f"  {name} ".ljust(20)) or line.startswith(f"  {name}  "))
+
+
+def test_the_speculative_sample_runs_to_its_last_line_on_the_cpu(tmp_path, monkeypatch, capsys):
+    """``main()`` of ``02_speculative_decode.py`` on the CPU, on the reference stack, on a checkpoint directory with a
+    drafter that is generated here: a request body from a file and from standard input.  Standard output holds the
+    generated text and nothing else; standard error every line of the run, in its order, to the verdict -- what a prompt
+    and a step are before the load, the measured acceptance before the comparison, the drafter's lines among the checks.
+    The tokens of the run are those of the README's library loop on the same checkpoint and list."""
+    import serving_options
+    from model_samples import Checkpoint, Session, TextIO, sampling
+    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+
+    directory = _checkpoint_directory(tmp_path / "tiny-checkpoint", drafter=True)
+    (tmp_path / "draft_vocab.json").write_text(json.dumps(list(range(0, WORDS + 1, 2))))
+    sample = _sample_on_the_cpu(monkeypatch, script="02_speculative_decode.py")
+    body = dict(CLIENT_BODY, messages=[{"role": "user", "content": "w3 w1 w4 w1 w5"}], max_completion_tokens=20)
+    (tmp_path / "body.json").write_text(json.dumps(body))
+    config = '{"method": "mtp", "num_speculative_tokens": 3, "use_local_argmax_reduction": true, "draft_sample_method": "greedy"}'
+    arguments = ["--model", str(directory), "--stack", "reference", "--draft-vocab", str(tmp_path / "draft_vocab.json")]
+    arguments += ["--speculative-config", config, "--dump-tokens", str(tmp_path / "ids.json")]
+    windows, compared = [], sampling.accepted
+    monkeypatch.setattr(sampling, "accepted", lambda window, greedy: compared(window, greedy) if windows.append(list(window)) is None else None)
+    capsys.readouterr()
+    code = sample.main([*arguments, "--messages", str(tmp_path / "body.json")])
+    out, err = capsys.readouterr()
+    lines = err.splitlines()
+    assert code == 0 and lines[-1] == "[02] RAN reference stack (no provider checked)", err[-3000:]
+    assert str(tmp_path) not in out + err
+    drafts = [token for window in windows for token in window[1:]]
+    assert len(drafts) == 3 * len(windows) > 0 and all(token % 2 == 0 for token in drafts), "the drafter proposes from the list --draft-vocab names"
+    dumped = json.loads((tmp_path / "ids.json").read_text())
+    (run,) = dumped["runs"]
+    assert (dumped["sample"], dumped["stack"], dumped["draft_tokens"]) == ("qwen_dense/02_speculative_decode", "reference", 3)
+    assert run["prompt_ids"] == [[3, 1, 4, 1, 5]] and 1 <= len(run["ids"][0]) <= 20, "the body's max_completion_tokens bounds the loop"
+    ids, kept = run["ids"][0], run["kept"]
+    assert all(0 <= count <= 3 for count in kept) and len(ids) <= 1 + sum(count + 1 for count in kept), "every step keeps 1 to 4 tokens"
+    assert len(ids) > 1 + sum(count + 1 for count in kept[:-1]), "only the last step's tokens can lie behind the end token or the limit"
+    words = " ".join(f"w{token}" for token in ids if token != WORDS)
+    assert out == words + "\n" and out.strip(), "standard output: the text and one line break"
+    # the tokens are those of the library loop of the family README on this checkpoint and this list
+    checkpoint = Checkpoint.describe(str(directory))
+    model = QwenDense.describe(checkpoint)
+    drafter = QwenDenseDrafter.describe(checkpoint, model, draft_vocab=str(tmp_path / "draft_vocab.json"))
+    text = TextIO.from_checkpoint(str(directory))
+    session = Session(model, text, stack="reference", device="cpu", capacity=5 + 20 + 2, draft_tokens=3, drafter=drafter, checkpoint=checkpoint)
+    session.load()
+    new, counts = session.read(session.prefill([text.encode("w3 w1 w4 w1 w5 ")])), []
+    while len(new) < len(ids):
+        ((window, greedy),) = session.read(session.speculate())
+        counts.append(sampling.accepted(window, greedy))
+        session.accept(counts[-1])
+        new += greedy[: counts[-1] + 1]
+    assert new[: len(ids)] == ids and counts == kept, "the script's loop is the library's: the same tokens, the same counts"
+    checkpoint.close()
+    # before the load: the configuration key by key, the list, the rule and the counts of a prompt and a step
+    said = (
+        '[02] --speculative-config: the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 3, '
+        'use_local_argmax_reduction true. At the value that changes nothing: draft_sample_method "greedy".'
+    )
+    listed = "[02] draft vocabulary draft_vocab.json: 136 ids of the model's 272, in ascending order (136 entries listed, none dropped)"
+    before = "[02] " + serving_options.speculative_line([("--messages body.json", 5)], 3)
+    load = next(index for index, line in enumerate(lines) if line.startswith("[02] stage "))
+    table = next(index for index, line in enumerate(lines) if line.startswith("served by (decided before the load"))
+    assert lines.index(said) < lines.index(listed) < lines.index(before) < table < load
+    assert lines[0].endswith(" | the drafter runs on reference blocks") and "1 sequence, 3 drafted tokens a step | stack reference" in lines[1]
+    assert any(line.startswith("[02] --messages body.json: a chat request body. Read: messages (1), max_completion_tokens 20.") for line in lines)
+    assert any(
+        line.startswith("[02] greedy decoding: the token of the largest logit at every step; the checkpoint's own generation settings") for line in lines
+    )
+    decoding = _lines(err, "[02] decoding: ")
+    assert decoding == [
+        "[02] decoding: 5 prompt tokens through the decode step, each but the first behind one pass of the drafter, then up to 20 new tokens in "
+        "steps of 3 draft passes and one verify step, and a traced pass; the text of sequence 0 goes to stdout as it is generated, the report follows"
+    ]
+    # the report stands in front of the comparison, with the measured acceptance: no schedule on a checkpoint
+    report = lines.index(next(line for line in lines if line.startswith("acceptance            kept tokens per step ")))
+    against = lines.index(next(line for line in lines if line.startswith("speculative against decode (1 sequence x 4 tokens per sequence, ")))
+    steps = len(kept)
+    mean = f"kept tokens per step {1 + sum(kept) / steps:.2f} of 4 (1 + accepted drafted tokens / steps), {steps} steps; kept "
+    assert lines[report].startswith("acceptance            " + mean) and lines[report + 1].startswith("                      accepted per draft: 1: ")
+    assert report < against and "scheduled, not measured" not in err
+    assert "rate                  not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)" in lines
+    assert any(line.startswith("bytes per step        model ") and " + drafter 3 x " in line for line in lines[:against])
+    text_out = _lines(err, "text out ")
+    ended = "ended at the end token" if ids[-1] == WORDS else f"stopped after {len(ids)} tokens"
+    assert text_out == [f"text out              {len(ids)} tokens in {steps} steps, {ended}: written to stdout as it was generated"]
+    assert lines.index(text_out[0]) < against
+    # the comparison: a checkpoint declares no band, so its token line is reported; every other line holds, on this stack the bytes too
+    assert _compared(lines, "tokens").endswith("    REPORTED") and " kept tokens equal to those of the decode steps of the same tokens (" in _compared(
+        lines, "tokens"
+    )
+    for name in COMPARED[2:]:
+        assert _compared(lines, name).endswith("    PASS"), _compared(lines, name)
+    assert _compared(lines, "kept state").endswith(("    PASS", "    REPORTED"))
+    assert not any(line.startswith(("  acceptance ", "  ids ")) for line in lines), "nothing was scheduled, and no plain run made a stream"
+    assert "  replay            ids, logits and the drafter's proposals byte-identical on a second run from a fresh state    PASS" in lines
+    checks = next(line for line in lines if line.startswith("[02] checks on "))
+    assert checks.startswith(
+        "[02] checks on the first 16 steps: the run against decode steps of the same tokens (tokens, kept state, position, prompt, recorded, bytes, "
+        "rejected rows, the drafter's cache and proposals); then on the first 16 prompt steps and the first 8 steps against the fp64-accumulated reference"
+    )
+    # ... on the steps the header names: the comparison on what the run recorded (16 steps), the block check on the first 8 of them
+    assert steps > 16, "the seeded drafter of this checkpoint is seldom accepted: twenty tokens are more steps than a run records"
+    assert lines[against].startswith("speculative against decode (1 sequence x 4 tokens per sequence, 16 engine steps behind a prompt of 5 tokens; ")
+    assert any(
+        line.startswith("checks (1 sequence x 4 tokens per sequence, the first 8 verify steps; ") and line.endswith("; behind a prompt of 5 decode steps)")
+        for line in lines
+    )
+    assert f"where the session's own run ended is not held (it ran {steps} verify steps and recorded 16)" in _compared(lines, "position")
+    scale = next(line for line in lines if line.startswith("  tokens ") and "greedy tokens equal to the reference stack's; " in line)
+    assert "for scale, the reference stack with ieee-fp32 accumulation is " in scale, "a checkpoint run prints a second reference"
+    assert lines[-3].startswith("[02] checkpoint weights, greedy decoding; ids hash ")
+    assert lines[-2] == "[02] the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"
+    assert "[02] token ids and kept counts of 1 prompt(s) written to ids.json" in lines
+
+    # the same body on standard input: the same tokens, the same text
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(body)))
+    code = sample.main([*arguments, "--messages", "-"])
+    again_out, again_err = capsys.readouterr()
+    assert code == 0 and again_out == out and json.loads((tmp_path / "ids.json").read_text())["runs"][0] == run
+    assert again_err.splitlines()[0] == "[02] --messages -: reading the request from standard input"
+    # two prompts in one run, the default configuration, not streamed, into a file: a session keeps nothing between two prompts
+    target = tmp_path / "answers.txt"
+    two = ["--model", str(directory), "--stack", "reference", "--draft-vocab", str(tmp_path / "draft_vocab.json"), "--dump-tokens", str(tmp_path / "ids.json")]
+    code = sample.main([*two, "--prompt", "w3 w1 w4 w1 w5", "--prompt", "w9 w9", "--max-tokens", "9", "--text-out", str(target), "--no-stream"])
+    both_out, both_err = capsys.readouterr()
+    runs = json.loads((tmp_path / "ids.json").read_text())["runs"]
+    assert code == 0 and both_out == "" and [(each["prompt"], len(each["prompt_ids"][0])) for each in runs] == [(0, 5), (1, 2)]
+    texts = [" ".join(f"w{token}" for token in each["ids"][0] if token != WORDS) + "\n" for each in runs]
+    assert target.read_text(encoding="utf-8") == texts[0] + texts[1] and all(len(each["ids"][0]) <= 9 for each in runs)
+    assert "[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method" in both_err
+    assert (
+        "[02] prompt of 5 tokens (--prompt 1) = 5 decode steps and 4 passes of the drafter before the first token; prompt of 2 tokens (--prompt 2) = "
+        "2 decode steps and 1 passes of the drafter before the first token; then every step is 5 draft passes and one verify step of 6 tokens, "
+        "and keeps 1 to 6 of them"
+    ) in both_err.splitlines()
+    assert both_err.count("\nspeculative against decode (") == 2 and both_err.splitlines()[-1] == "[02] RAN reference stack (no provider checked)"
+    # a request whose first new token ends it: no step ran, nothing is compared, and the line says so
+    code = sample.main([*two, "--prompt", "w3 w1 w4 w1 w5", "--max-tokens", "1"])
+    short_out, short_err = capsys.readouterr()
+    assert code == 0 and short_out.count("\n") == 1 and "text out              1 tokens in 0 steps, " in short_err
+    nothing = "speculative against decode: no step ran behind the prompt (its first new token ended the request): nothing to compare    REPORTED"
+    assert nothing in short_err.splitlines() and "acceptance            no step ran" in short_err.splitlines()
+    # a text that ends at an end token behind its steps is compared as any other: the eleventh new token of this run made the end token
+    assert ids[10] not in ids[:10], "the token that ends the text is not produced before"
+    ending = _checkpoint_directory(tmp_path / "ending", generation={"eos_token_id": ids[10], "do_sample": True}, drafter=True)
+    code = sample.main(["--model", str(ending), *two[2:], "--prompt", "w3 w1 w4 w1 w5", "--max-tokens", "20"])
+    ended = capsys.readouterr().err.splitlines()
+    assert code == 0 and "text out              11 tokens in 10 steps, ended at the end token: written to stdout as it was generated" in ended
+    assert any(line.startswith("speculative against decode (1 sequence x 6 tokens per sequence, 10 engine steps behind ") for line in ended)
+    assert _compared(ended, "position").endswith("the session's own run ended there    PASS") and nothing not in ended
+
+    # what a user of the script can get wrong about the drafter: one line each, before the plan
+    code = sample.main(["--model", str(directory), "--stack", "reference"])
+    last = capsys.readouterr().err.splitlines()[-1]
+    assert code == 1 and last.startswith("[02] ERROR a checkpoint's drafter needs a draft vocabulary: a JSON list of the token ids its head is cut to.")
+    assert last.endswith('samples/models/qwen_dense/README.md, "The checkpoint\'s drafter"')
+    (tmp_path / "not_a_list.json").write_text('{"ids": [1, 2]}')
+    code = sample.main(["--model", str(directory), "--draft-vocab", str(tmp_path / "not_a_list.json")])
+    last = capsys.readouterr().err.splitlines()[-1]
+    assert code == 1 and last == "[02] ERROR draft vocabulary not_a_list.json: holds an object where a JSON list of token ids is expected"
+    plain = _checkpoint_directory(tmp_path / "no-drafter")
+    code = sample.main(["--model", str(plain), "--draft-vocab", str(tmp_path / "draft_vocab.json")])
+    last = capsys.readouterr().err.splitlines()[-1]
+    assert code == 0 and last.startswith("[02] SKIP checkpoint no-drafter (local) holds no drafter"), last
+    # ... and about the text side: a prompt that renders to no token; a tokenizer of more ids than the model's table has rows
+    code = sample.main([*two, "--prompt", ""])
+    last = capsys.readouterr().err.splitlines()[-1]
+    assert code == 1 and last == "[02] ERROR --prompt 1: the checkpoint's chat template and tokenizer turn it into no token; there is nothing to decode from"
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizers.Tokenizer(tokenizers.models.WordLevel({f"w{index}": index for index in range(300)}, unk_token="w0")).save(str(plain / "tokenizer.json"))
+    code = sample.main(["--model", str(plain), "--draft-vocab", str(tmp_path / "draft_vocab.json")])
+    last = capsys.readouterr().err.splitlines()[-1]
+    mismatch = "the tokenizer has 300 ids, the model's embedding table 272 rows: not the tokenizer of this checkpoint"
+    assert code == 1 and last == f"[02] ERROR --model no-drafter: {mismatch}"
+    # a body's tools and its template options reach the checkpoint's template: both scripts decode the prompt the body asks for
+    template = "{% if tools %}w7 {% endif %}{% if flag %}w8 {% endif %}{% for message in messages %}{{ message.content + ' ' }}{% endfor %}"
+    (directory / "chat_template.jinja").write_text(template)
+    (tmp_path / "tools.json").write_text(json.dumps(dict(body, tools=[WEATHER], chat_template_kwargs={"flag": True}, max_completion_tokens=1)))
+    for script, more in ((sample, two[2:]), (_sample_on_the_cpu(monkeypatch), [*two[2:4], *two[6:]])):
+        code = script.main(["--model", str(directory), *more, "--messages", str(tmp_path / "tools.json")])
+        assert code == 0 and "Read: messages (1), tools (1), chat_template_kwargs (flag), max_completion_tokens 1." in capsys.readouterr().err
+        assert json.loads((tmp_path / "ids.json").read_text())["runs"][0]["prompt_ids"] == [[7, 8, 3, 1, 4, 1, 5]]
+
+    # the reader of the text went away: the run ends in one ERROR line that keeps its verdict
+    class Gone:
+        def write(self, text):
+            raise OSError(errno.EPIPE, PIPE)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", Gone())
+    code = sample.main([*arguments, "--messages", str(tmp_path / "body.json")])
+    monkeypatch.undo()
+    last = capsys.readouterr().err.splitlines()[-1]
+    assert (
+        code == 1
+        and last == f"[02] ERROR the generated text could not be written to stdout: {PIPE} (the run itself: RAN reference stack (no provider checked))"
+    )
+
+
+def _keeps_one_more(real):
+    """A loop that keeps a drafted token the comparison rejected: the count one above the compared one."""
+
+    def accepted(window, greedy):
+        return min(real(window, greedy) + 1, len(window) - 1)
+
+    return accepted
+
+
+def _emits_the_drafted_token(real):
+    """A loop that emits the first rejected drafted token where the verify step chose another: the count is the compared
+    one, and the token the caller reads at the last kept row is the draft behind it."""
+
+    def accepted(window, greedy):
+        kept = real(window, greedy)
+        if kept + 1 < len(window):
+            greedy[kept] = window[kept + 1]
+        return kept
+
+    return accepted
+
+
+def _keeps_one_fewer(real):
+    """A loop that keeps one drafted token fewer than the comparison accepted: every token it emits is the model's, and no
+    step keeps what it was scheduled to keep."""
+
+    def accepted(window, greedy):
+        return max(real(window, greedy) - 1, 0)
+
+    return accepted
+
+
+WRONG_LOOPS = [
+    (None, ()),
+    (_emits_the_drafted_token, ("ids",)),
+    (_keeps_one_more, ("tokens", "drafter cache", "draft proposals", "acceptance", "ids")),
+    (_keeps_one_fewer, ("acceptance",)),
+]
+
+
+@pytest.mark.parametrize("wrong, failing", WRONG_LOOPS)
+def test_a_wrong_loop_of_the_speculative_script_fails_its_line(monkeypatch, capsys, wrong, failing):
+    """The seeded default run of ``02_speculative_decode.py`` through ``main()``, on the CPU, the tiny geometry and the
+    reference stack -- and the same run with ONE thing wrong in its loop.  A drafted token emitted where the verify
+    step chose another reaches no line of the comparison (the next window is the session's): the script's own ``ids``
+    fails.  A count kept beyond the compared one fails the token line's greedy rule, the schedule and the drafter's two
+    lines (the first pass of the next step takes the greedy token of a kept row for the token that follows it); one
+    kept below it fails the schedule alone.  A failed line ends the run in ``[02] FAIL``, exit code 1, on this stack too."""
+    from model_samples import sampling
+    from model_samples.qwen_dense import QwenDense
+
+    sample = _sample_on_the_cpu(monkeypatch, script="02_speculative_decode.py")
+    monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=2, vocab=15520: _tiny_model()))
+    if wrong is not None:
+        monkeypatch.setattr(sampling, "accepted", wrong(sampling.accepted))
+    capsys.readouterr()
+    code = sample.main(["--stack", "reference", "--force-tokens", "24"])
+    out, err = capsys.readouterr()
+    lines = err.splitlines()
+    assert out == "", "a seeded run writes nothing to standard output"
+    assert (code, lines[-1]) == ((1, "[02] FAIL") if failing else (0, "[02] RAN reference stack (no provider checked)")), err[-3000:]
+    failed = [name for name in (*COMPARED, "acceptance", "ids") if _compared(lines, name).endswith("    FAIL")]
+    assert tuple(sorted(failed)) == tuple(sorted(failing)), failed
+    assert "acceptance            scheduled, not measured (reduction): " in err, "the script hands force=: nothing was measured"
+    report, against = lines.index(next(line for line in lines if line.startswith("bytes per step "))), lines.index(
+        next(line for line in lines if line.startswith("speculative against decode ("))
+    )
+    assert report < against, "the report is printed before the comparison: its bytes of a step follow where the session stands"
+    if not failing:
+        assert _compared(lines, "acceptance").endswith("every count from 0 to 5 was kept at least once    PASS")
+        ids = _compared(lines, "ids")
+        assert re.fullmatch(
+            r"  ids               the 24 new tokens of the speculative run against the plain run's of this process: ids hash ([0-9a-f]{12}), plain \1    PASS",
+            ids,
+        ), ids
+        assert f"[02] seeded weights: the output is not language; ids hash {ids.split('ids hash ')[1].split(',')[0]}" in lines
+        assert "  bytes             the logits of " in err and _compared(lines, "bytes").endswith("    PASS"), "gated on the reference stack"
+
+
+def _speculative_section() -> str:
+    """The family README's section on the speculative script, as it is written there."""
+    return (FAMILY / "README.md").read_text().split("\n## Speculative decoding\n", 1)[1].split("\n## ", 1)[0]
+
+
+def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_run_say(monkeypatch, capsys):
+    """The section "Speculative decoding": the table of the speculative configuration is the data, row for row; its
+    commands are parsed as written; the lines it quotes are the lines a run prints; its flags are the script's; its
+    counts are the schedule's arithmetic and the script's constants; the two kinds of step differ in the blocks it
+    names, per stack.  The area README, the list of samples and the documentation page name the script."""
+    import shlex
+
+    import serving_options
+    from model_samples import blocks, loop, tie_out
+    from model_samples.qwen_dense import QwenDense
+
+    sample = _sample_script(monkeypatch, "02_speculative_decode.py")
+    section = _speculative_section()
+    text = " ".join(section.split())
+    # the table: one row per key that is read, one per neutral key, one per reason of the refused keys -- in the data's order
+    table = section.split("| key | answer | accepted | another value is refused because |\n|---|---|---|---|\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    rows = []
+    for name, (values, reason) in serving_options.SPECULATIVE_READ.items():
+        accepted = ", ".join(f"`{json.dumps(value)}`" for value in values) or "a whole number from 1"
+        rows.append(f"| `{name}` | read; must be named | {accepted} | {reason} |")
+    for name, (values, reason) in serving_options.SPECULATIVE_NEUTRAL.items():
+        accepted = ", ".join([f"`{json.dumps(value)}`" for value in values] + ["`null`"])
+        rows.append(f"| `{name}` | accepted at the value that changes nothing | {accepted} | {reason} |")
+    reasons = {}
+    for name, reason in serving_options.SPECULATIVE_REFUSED.items():
+        reasons.setdefault(reason, []).append(f"`{name}`")
+    rows += [f"| {', '.join(names)} | refused at any value | `null` | {reason} |" for reason, names in reasons.items()]
+    assert table == rows, "the three tables of serving_options.py, in their order, with their values and reasons"
+    assert "The key names and the values of this table were read in the public release 0.33.0 of a serving engine (2026-10-31)." in text
+    assert "**The speculative configuration of a serving engine.**" in section and "A key no row holds is an `ERROR` that names it." in text
+    # the commands, as they are written: each is parsed by the script, and the object of the third is the default one
+    block = section.split("```bash\n", 1)[1].split("```", 1)[0].replace("\\\n", " ")
+    commands = [shlex.split(line, comments=True) for line in block.splitlines() if line.startswith("python samples/models/qwen_dense/02_speculative_decode.py")]
+    assert len(commands) == 3 and all(command[:2] == ["python", "samples/models/qwen_dense/02_speculative_decode.py"] for command in commands)
+    default, native, real = (sample._arguments([word for word in command[2:] if word not in (">", "answer.txt")]) for command in commands)
+    assert (default.model, default.stack, native.stack, default.speculative_config) == (None, "fe-cublas", "native", None)
+    assert (real.model, real.stack, real.draft_vocab, real.messages, real.max_new_tokens) == (
+        "/data/Qwen3.8-27B-NVFP4",
+        "native",
+        "draft_vocab.json",
+        ["request.json"],
+        256,
+    )
+    assert json.loads(real.speculative_config) == json.loads(serving_options.SPECULATIVE_DEFAULT) and commands[2][-2:] == [">", "answer.txt"]
+    # the lines the section quotes are the lines a run prints
+    assert f"[02] {serving_options.speculative_line([('the default prompt', 58)], 5)}\n" in section
+    quoted = dict(json.loads(serving_options.SPECULATIVE_DEFAULT), draft_sample_method="greedy")
+    assert f"[02] {serving_options.parse_speculative_config(json.dumps(quoted), '--speculative-config')[1]}\n" in section
+    with pytest.raises(ValueError) as refusal:
+        serving_options.parse_speculative_config('{"method": "mtp", "num_speculative_tokens": 5}', "--speculative-config")
+    assert f"[02] ERROR {refusal.value}\n" in section
+    assert f'"{loop.ONE_SEQUENCE}"' in text and f'"{tie_out.DRAFTER_KERNELS}"' in text
+    assert '"the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"' in text
+    source = (FAMILY / "02_speculative_decode.py").read_text()
+    assert "the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)" in source
+    scheduled = "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 positions"
+    assert f'"{scheduled} in turn and by another token behind them"' in text
+    # the flags of the section's table are flags the script declares, with the defaults it has
+    flags = section.split("| flag | default | meaning |\n|---|---|---|\n", 1)[1].split("\n\n", 1)[0]
+    with pytest.raises(SystemExit):
+        sample._arguments(["--help"])
+    shown = capsys.readouterr().out
+    named = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*[a-z]", flags))
+    assert len(named) >= 18 and [flag for flag in sorted(named) if f"{flag} " not in shown and f"{flag}\n" not in shown] == []
+    assert f"| `--speculative-config JSON` | `{serving_options.SPECULATIVE_DEFAULT}` | " in flags and "| `--sequences 1` | `1` | " in flags
+    assert "| `--dump-census FILE` | -- | not in this script: a usage error." in flags
+
+    # the counts: what a schedule keeps at the default length, what it needs, and which steps a checkpoint run checks
+    def scheduled(new, drafted):  # the counts the steps of a scheduled run of `new` tokens keep: 0, 1, .., drafted in turn
+        kept, done = [], 1
+        while done < new:
+            kept.append(len(kept) % (drafted + 1))
+            done += kept[-1] + 1
+        return kept
+
+    def least(drafted):  # the fewest new tokens of a run that keeps every count once
+        return next(new for new in range(1, 99) if set(scheduled(new, drafted)) == set(range(drafted + 1)))
+
+    assert scheduled(32, 5) == [0, 1, 2, 3, 4, 5, 0, 1, 2, 3] and (least(5), least(8)) == (17, 38)
+    assert "With the default 32 new tokens that is 10 steps that keep 0, 1, 2, 3, 4, 5, 0, 1, 2, 3 drafted tokens." in text
+    assert "(17 at five drafted tokens) is an `ERROR` before the plan; left to its default, the count follows the schedule." in text
+    assert "then 32 new tokens in 10 steps scheduled to keep 0, 1, 2, 3, 4, 5, 0, 1, 2 and 3 drafted tokens" in text and len(scheduled(32, 3)) == 13
+    assert 'three drafted tokens (`"num_speculative_tokens": 3`) passed in 13 steps' in text
+    # the three checkpoint runs it reports -- native on the cuDNN Frontend rows, fe-cublas, native with its library rows: each one's counts
+    # are the counts of one loop (every step in full; the first token is the prompt's)
+    runs = ((204, 63, (14, 11, 11, 9, 10, 8), (49, 38, 27, 18, 8)), (249, 74, (13, 14, 14, 10, 11, 12), (61, 47, 33, 23, 12)))
+    for new, steps, kept, chain in (*runs, (231, 71, (9, 16, 20, 9, 7, 10), (62, 46, 26, 17, 10))):
+        accepted = sum(index * count for index, count in enumerate(kept))
+        assert sum(kept) == steps and [sum(kept[index:]) for index in range(1, 6)] == list(chain) and new <= 1 + steps + accepted
+        assert f"{new} new tokens in {steps} steps: {1 + accepted / steps:.2f} kept tokens a step (1 + {accepted} " in text
+        assert ", ".join(map(str, kept[:-1])) + f" and {kept[-1]} steps kept one to six tokens" in text and f" {chain[0]} of {steps}" in text
+    assert (sample.TRACED_STEPS, sample.CHECKED_PROMPT_STEPS, sample.CHECKED_STEPS) == (16, 16, 8)
+    assert (
+        "The comparison covers the first 16 steps behind the prompt, the block check the first 16 prompt steps and the first 8 steps, the traced pass 16 steps."
+        in text
+    )
+    paragraph = (  # about the two texts, word for word; and the blocks it names: where the two kinds of step are served by other kernels
+        "Every token of a speculative run after the first is a greedy token of a verify step; the first is the greedy token of the prompt's last "
+        "decode step. The drafter decides how many tokens a step keeps, never which. In the stacks `native` and `fe-entries` on compute capability "
+        "10.0 a verify step and a decode step launch different kernels for two blocks (the sections `plain` and `verify` of the kernel census: the "
+        "linear-attention step, and the out-projection of the linear-attention layers up to 16 rows of a step); in `fe-cublas` for one, the "
+        "linear-attention step. The speculative run is compared with decode steps of the same tokens at the steps the family's declared band "
+        "decides. On a checkpoint, which declares no band, the comparison is reported: there a verify step and a decode step of the same tokens do "
+        "not choose the same greedy token everywhere (this page has the run), so the text of a speculative run and the text of the plain script "
+        "part early; each is the greedy text of its own kind of step."
+    )
+    assert paragraph in text
+    model = QwenDense.reduced()
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 80 * GIB)
+
+    def served(stack, sequences, tokens):
+        plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, tokens, stack, model=model)
+        keys = {}
+        for _, name, _, row, _ in plan.parts():
+            keys.setdefault(name, set()).add(row.key)
+        return keys
+
+    def differing(stack, sequences, tokens):
+        decode, verify = served(stack, sequences, 1), served(stack, sequences, tokens)
+        return {name for name in decode if decode[name] != verify[name]}
+
+    assert differing("native", 1, 6) == differing("fe-entries", 1, 6) == {"linear_attention.step", "projection.fp8.out"}
+    assert differing("fe-cublas", 1, 6) == {"linear_attention.step"}
+    assert differing("native", 2, 8) == {"linear_attention.step", "projection.fp8.out"} and differing("native", 3, 6) == {
+        "linear_attention.step"
+    }, "16 rows, 18 rows"
+    assert set(json.loads((MODELS / "model_samples" / "qwen_dense" / "kernel_census.json").read_text())["configurations"]) >= {"plain", "verify"}
+    # what a run reports, and what is not here
+    for sentence in (
+        "The acceptance length is a figure of this run's prompts and of this draft-vocabulary list; it is not comparable with a figure made with another list.",
+        'The rate line reads "not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)"',
+        "`kept tokens per step X.XX of 6 (1 + accepted drafted tokens / steps), n steps; kept 1: .., .. 6: ..` and `accepted per draft: 1: x of n, 2: y of x, ..`",
+        "Every step counts in full, the last one included, whose tokens behind an end token are not written.",
+        "The report is printed before the checks.",
+        "ends in `[02] RAN reference stack (no provider checked)`, or in `[02] FAIL`",
+        "A prompt of N tokens is N decode steps and N - 1 passes of the drafter before the first token; then every step is five draft passes and one "
+        "verify step of six tokens, and keeps one to six of them.",
+        "**What is not here.** The drafter on target kernels: every block of it but its embedding lookup is a reference chain,",
+        "More than one request: `--sequences` is accepted at 1. A rate. A count or a position per sequence. A captured step. `--dump-census`.",
+        "Any GPU class but compute capability 10.0: the script has run there only, and a class it has not run on is uncovered, not passing.",
+    ):
+        assert sentence in text, sentence
+    assert "tokens per second" not in text and not re.search(r"\d(?:\.\d+)? (?:ms|tokens/s)\b", text), "the section states no speed"
+    # what ran, as the runs printed it: a figure of a run is changed with the run, here and there
+    for sentence in (
+        "on the 64-layer model 467 of the 484 launches of a verify step are target kernels (130 the target's own compiled kernels + 337 cuDNN Frontend "
+        "entries with byte-equal results), on the two-layer model of the default run 18 of 20 (6 the target's own compiled kernels + 12 cuDNN Frontend "
+        "entries with byte-equal results); on `fe-entries`, without the library rows, 386 of the 484 (49 the target's own compiled kernels + 337 cuDNN "
+        "Frontend entries with byte-equal results) and 14 of 20 (2 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results)",
+        "Nor with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (this section's last runs have three).",
+        # a dated run names its rows, and the run of native with the rows a library serves stands beside it with its versions
+        "correctness only; `native` on the cuDNN Frontend rows -- the rows it selected when these runs were made and `fe-entries` selects today without the attention preparation's row).",
+        "With its library rows (2026-11-20; `native` in PyTorch 2.14.0 with FlashInfer 0.7.2.post1; the same GPU class; the attention preparation on its reference chain) the default run on `native` "
+        "ended in `[02] PASS` with the same 32 new tokens: ids hash `11bfb9f9bcf5`, the plain run's of its process.",
+        "Every gated line of the table above passed, `acceptance` with 10 of 10 steps on their scheduled count, "
+        "and the kernel check passed over 10 traced steps, "
+        "with 17 of 20 launches of the verify step target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal "
+        "results; the attention layer's out-projection among them held by membership, on the library's own CUTLASS multiply). Three drafted tokens",
+        'Three drafted tokens passed in 13 steps, with "kernel identity: not stated for this run".',
+        "The memory sentence of the default run asked for about 5.7 GiB. Without FlashInfer installed the same command ended in `[02] SKIP "
+        "flashinfer.gemm.bmm_fp8 needs flashinfer-python 0.7.2.post1, which is not installed: ...` before anything was loaded, exit code 0.",
+        # the records of two row sets, and where the last runs with a checkpoint are
+        "**The last runs of this recipe with a checkpoint** are those with the attention preparation on its entry, on `native` and on `fe-entries` (2026-11-20;",
+        'compute capability 10.0, 148 SMs): the section "The attention preparation: pages, slots and positions" has their figures.',
+        "**The run with a checkpoint on the cuDNN Frontend rows, before the attention preparation's row** (2026-11-19;",
+        "correctness only; `native` selected those rows then, as `fe-entries` does today without the attention preparation's row; the third command of this section as it is written,",
+        "**The run with a checkpoint on `native` with its library rows, before the attention preparation's row** (2026-11-20; PyTorch 2.14.0, FlashInfer 0.7.2.post1; the same checkpoint, "
+        "command, prompt, list and GPU class; the attention preparation on its reference chain), made twice with the same figures. Both runs ended in `[02] PASS` at the end token.",
+        "accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, "
+        'the fifth in 10 of 17 -- the counts of the library loop on `native` in the section "The verify step".',
+        "`tokens` was reported -- 39 of 45 kept tokens were the decode steps' on the same tokens, the first that differs kept token 17.",
+        "The kernel check passed over 16 traced steps, with "
+        "451 of 484 launches of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal "
+        "results): 435 of them in the launch shape the census records (114 the target's own compiled kernels + 321 cuDNN Frontend entries with "
+        "byte-equal results), the 16 out-projections of the attention layers by membership, on the library's own CUTLASS multiply; nothing is stated "
+        "about the kernels of the passes. The memory sentence asked for about 32.2 GiB.",
+        '| for `--stack native` on compute capability 10.x | also FlashInfer at a validated version (the section "The rows a library serves"): the '
+        "verify step and the decode steps call its multiplies on the stored weights. Without it the run ends in `[02] SKIP` before anything is loaded, "
+        "exit code 0; `--stack fe-entries` runs the cuDNN Frontend rows without the package |",
+        "so the tokens a checkpoint run writes are held by no line of that run: the loop that writes them is the one the default run proves.",
+        "the stack `reference` serves any count (the seeded run as far as the new tokens its schedule needs fit the context length).",
+        "a prompt of 26 tokens, then 32 new tokens in 10 steps scheduled to keep 0, 1, 2, 3, 4, 5, 0, 1, 2 and 3 drafted tokens -- ended in `[02] PASS` on "
+        "`fe-cublas`, `native` and `fe-entries` and in `[02] RAN reference stack (no provider checked)` on `reference`.",
+        "In each of the four the 32 new tokens were the plain run's of the same process (ids hash `11bfb9f9bcf5`, which is also what `00_decode.py "
+        "--sequences 1 --force-tokens 32 --stack native` printed), nothing was written to standard output, and every gated line of the table above "
+        "passed, `acceptance` with 10 of 10 steps on their scheduled count. `bytes` passed on `reference` and was reported on the other three.",
+        "On `native` and `fe-entries` the kernel check passed over 10 traced steps, with 13 of 20 launches of the verify step target kernels "
+        "(2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results).",
+        "eight ended in `[02] SKIP cudnn.GdnVerifyFused serves 8 tokens per sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per "
+        "sequence` before anything was loaded. The four-layer model (`--layers 4`, on the default stack) passed.",
+        "asked for about 6.3 GiB on `fe-cublas` and `reference` and about 6.1 GiB on `native` and `fe-entries`; PyTorch reserved between 3.8 and 4.6 GiB "
+        "in the four runs, and the device grew by about 0.2 GiB more in each.",
+        "A drafted token written out where the verify step chose another failed `ids` alone; one drafted token kept beyond the compared count failed "
+        "`tokens`, `drafter cache`, `draft proposals`, `acceptance` and `ids`; one kept below it failed `acceptance` alone.",
+        "58 tokens through the prompt, five drafted tokens, the draft vocabulary of this README's recipe with 65,536 ids). Both runs ended in `[02] PASS`, "
+        "and both stopped at the end token.",
+        "the last step kept six tokens and the end token was its fourth, so the last two of them were not written",
+        "the second in 38 of those 49, the third in 27 of 38, the fourth in 18 of 27, the fifth in 8 of 18",
+        "on `native` 38 of 46 kept tokens were the decode steps' on the same tokens, the first that differs kept token 13; on `fe-cublas` 43 of 49, the "
+        "first kept token 30.",
+        "On `native` the kernel check passed over 16 traced steps, with 370 of 484 launches of the verify step target kernels "
+        "(49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results) and nothing stated",
+        "asked for about 43.3 GiB on `native`, where PyTorch reserved 39.8 GiB and the device grew by 40.0 GiB, and for about 61.0 GiB on `fe-cublas`, "
+        "where PyTorch reserved 58.5 GiB and the device grew by 58.7 GiB; the GPU was otherwise empty at the start of each.",
+    ):
+        assert sentence in text, sentence
+    # the other documents name the script, and their commands run its first form
+    family = (FAMILY / "README.md").read_text()
+    assert "| `02_speculative_decode.py` | speculative decoding with the checkpoint's drafter, one request in one process: " in family
+    assert (
+        "| a speculative configuration: the JSON object that asks an engine to draft tokens | `02_speculative_decode.py --speculative-config JSON` | " in family
+    )
+    area = " ".join((MODELS / "README.md").read_text().split())
+    assert "The second sample, `02_speculative_decode.py`, runs that step for one request:" in area and "no script drafts yet" not in area + family
+    assert "No block of the drafter is on a kernel yet, and the sample prints no rate." in area
+    for document in ((MODELS / "README.md").read_text(), (REPO / "samples" / "README.md").read_text(), (REPO / "docs" / "model-samples.mdx").read_text()):
+        assert "python samples/models/qwen_dense/02_speculative_decode.py" in document and "`02_speculative_decode.py`" in document
+    guide = " ".join((MODELS / "AGENTS.md").read_text().split())
+    for lesson in (
+        '- A configuration that selects what is launched has no class "printed and ignored".',
+        "- A script that compares where another checks nothing needs the verdict's order.",
+        "- What the library's comparison cannot see, the script holds itself.",
+        "- A default follows what it is the default of. A scheduled run needs enough new tokens to keep every count once: 17 at five drafted tokens, 38 at eight.",
+        "- A flag that is declared in order to be refused is still a string of the script.",
+        "- A refusal belongs where the object is built.",
+        "- A stand-in that rounds otherwise is not given the product's band.",
+    ):
+        assert lesson in guide, lesson
+
+
+def test_the_speculative_loop_writes_the_tokens_a_step_kept_and_ends_inside_a_step_at_an_end_token(tmp_path, monkeypatch, capsys):
+    """The loop function of ``02_speculative_decode.py`` on a CPU session with a checkpoint's text side and scheduled
+    drafts (its steps keep 0, 1, 2 drafted tokens): the tokens a step kept reach the sink between that step's host read
+    and the next launch; an end token inside a step ends the text there, and the step still counts in full."""
+    import serving_options
+    from model_samples import Session, StopRule, TextIO, sampling, tie_out
+    from model_samples.qwen_dense import QwenDenseDrafter
+
+    sample = _sample_script(monkeypatch, "02_speculative_decode.py")
+    model = _tiny_model()
+    text = TextIO.from_checkpoint(str(_checkpoint_directory(tmp_path / "tiny-checkpoint")))  # a checkpoint's tokenizer: its text is language
+    common = dict(sequences=1, stack="reference", device="cpu", capacity=5 + 12 + 4)
+    plain = Session(model, text, **common)
+    session = Session(model, text, share=plain, draft_tokens=5, drafter=QwenDenseDrafter.seeded(model), **common)
+    plain.plan_table([session])
+    plain.load()
+    session.load()
+    prompt = text.encode("w3 w1 w4 w1 w5")
+    ids = plain.prefill([prompt])
+    stream = plain.read(ids)
+    for _ in range(12 + 5 - 2):
+        ids = plain.step(ids)
+        stream += plain.read(ids)
+    forced = torch.tensor([[tie_out.forced_drafts(stream[done:], length, 5, WORDS + 1) for length in range(6)] for done in range(1, 12)], dtype=torch.int32)
+    # the schedule: the first token from the prompt, then steps that emit new tokens 2 | 3, 4 | 5, 6, 7: token 6 stands inside the third step
+    end = stream[5]
+    assert end not in stream[:5], "the token that ends the text is not produced before"
+    events = []
+    real_step, real_say = session.speculate, sample._say
+    monkeypatch.setattr(session, "speculate", lambda force=None: real_step(force) if events.append(("step",)) is None else None)
+    monkeypatch.setattr(sample, "_say", lambda *lines, flush=False: real_say(*lines, flush=flush) if events.append(("line",)) is None else None)
+    capsys.readouterr()
+    sink = serving_options.TextSink(stream=_Recorder(events))
+    produced, kept, scheduled = sample._speculate(session, text, StopRule([end], max_new_tokens=12), prompt, sampling, forced, sink)
+    assert produced == stream[:6] and kept == scheduled == [0, 1, 2], "three steps, each counted in full; the seventh token was kept and is not written"
+    kinds = [event[0] for event in events if event[0] != "flush"]
+    order = "line text step text step text text step text text"
+    assert " ".join(kinds[:10]) == order, "a step's tokens behind its host read, in front of the next launch"
+    assert kinds[10] == "text" and set(kinds[11:]) == {"line"}, "the line break, then the report"
+    written = [event[1] for event in events if event[0] == "text"]
+    assert "".join(written) == text.decode(stream[:6]) + "\n" and written[-1] == "\n"
+    err = capsys.readouterr().err
+    assert _lines(err, "text out ") == ["text out              6 tokens in 3 steps, ended at the end token: written to stdout as it was generated"]
+    assert "acceptance            scheduled, not measured (reduction): 3 steps; kept 1: 1, 2: 1, 3: 1, 4: 0, 5: 0, 6: 0" in err
+    assert session.record.count == 3 and session.record.forced == 3 and session.state.position == 5 + 1 + 2 + 3, "the state stands behind the whole third step"
+    # the limit of new tokens ends a text inside a step as well: five tokens are the first, one, two and one of the third step's three
+    session.reset(fresh=True)
+    session.new_report()
+    limited = sample._speculate(session, text, StopRule([WORDS], max_new_tokens=5), prompt, sampling, forced, serving_options.TextSink(stream=_Recorder()))
+    assert limited[0] == stream[:5] and limited[1] == [0, 1, 2]
+    said = _lines(capsys.readouterr().err, "text out ")
+    assert said == ["text out              5 tokens in 3 steps, stopped after 5 tokens: written to stdout as it was generated"]

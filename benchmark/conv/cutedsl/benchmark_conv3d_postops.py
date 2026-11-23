@@ -4,14 +4,17 @@
 """Benchmark SM100 Conv3D post-operations against ``torch.compile``.
 
 The shape is ``N,T,H,W,Ci,Co`` for the valid convolution output. Inputs add
-two elements to T, H, and W. Seeded synthetic BF16 tensors are used; no model
+two elements to T, H, and W. Seeded synthetic BF16 or FP32 tensors are used; no model
 checkpoint is required. Compilation, weight packing, correctness checks, and
-CUDA Graph capture are outside the timed region.
+CUDA Graph capture are outside the timed region. Each implementation warms
+for 100 ms before seven consecutive graph-replay timing samples.
 For conv3d_rmsnorm_silu_pad, both paths write current frames and zero padding
 but exclude caller-owned history copies. The e2e benchmark includes those copies.
 
---production filters the WAN shapes to relevant operation variants, retaining
-conv3d_rmsnorm_silu as a generic comparison. Residual/history options are not swept.
+--production covers representative Wan 2.1/2.2 encoder operations at 480x832
+video resolution: steady-state chunks plus selected single-frame padded fusions.
+Raw convolution and contiguous fused output provide component comparisons.
+Residual/history options are not swept.
 Standalone preparation has no output-channel dimension (Co is shown as '-').
 
 Examples:
@@ -27,6 +30,7 @@ from __future__ import annotations
 import argparse
 import math
 import statistics
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -42,18 +46,31 @@ from cudnn import (
 )
 
 VARIANTS = ("conv3d_raw", "conv3d_rmsnorm_silu", "conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad", "rmsnorm_silu_pad")
-PRODUCTION_CASES = (
-    ("32,1,320,240,160,160", ("conv3d_rmsnorm_silu", "conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad", "rmsnorm_silu_pad")),
-    ("32,4,320,240,160,160", ("conv3d_rmsnorm_silu", "conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad", "rmsnorm_silu_pad")),
-    ("32,1,160,120,160,320", ("conv3d_rmsnorm_silu", "conv3d_rmsnorm_silu_pad", "rmsnorm_silu_pad")),
-    ("32,4,160,120,160,320", ("conv3d_rmsnorm_silu", "conv3d_rmsnorm_silu_pad", "rmsnorm_silu_pad")),
-    ("32,1,160,120,320,320", ("conv3d_rmsnorm_silu", "conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad")),
-    ("32,4,160,120,320,320", ("conv3d_rmsnorm_silu", "conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad")),
-    ("32,1,80,60,320,640", ("conv3d_raw", "rmsnorm_silu_pad")),
-    ("32,2,80,60,320,640", ("conv3d_raw", "rmsnorm_silu_pad")),
-    ("32,1,80,60,640,640", ("conv3d_raw", "conv3d_bias_residual_pad", "rmsnorm_silu_pad")),
-    ("32,2,80,60,640,640", ("conv3d_raw", "conv3d_bias_residual_pad", "rmsnorm_silu_pad")),
+# Wan 2.1: batch 1, unpatched input. C384 includes only standalone preparation,
+# matching the e2e BF16 path. Use --shape for its custom TF32 convolution.
+WAN21_PRODUCTION_CASES = (
+    ("1,4,480,832,96,96", VARIANTS),
+    ("1,4,240,416,96,192", ("conv3d_raw", "conv3d_rmsnorm_silu_pad", "rmsnorm_silu_pad")),
+    ("1,4,240,416,192,192", ("conv3d_raw", "conv3d_rmsnorm_silu", "conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad")),
+    ("1,2,120,208,192,384", ("rmsnorm_silu_pad",)),
+    ("1,2,120,208,384,384", ("rmsnorm_silu_pad",)),
+    ("1,1,60,104,384,384", ("rmsnorm_silu_pad",)),
+    # Single-frame sensitivity of normalization/cache and spatial-padding fusion.
+    ("1,1,480,832,96,96", ("conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad")),
+    ("1,1,240,416,192,192", ("conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad")),
 )
+# Wan 2.2: batch 32, matching the e2e demo after 2x2 input patchification.
+WAN22_PRODUCTION_CASES = (
+    ("32,4,240,416,160,160", VARIANTS),
+    ("32,4,120,208,160,320", ("conv3d_raw", "conv3d_rmsnorm_silu_pad", "rmsnorm_silu_pad")),
+    ("32,4,120,208,320,320", ("conv3d_raw", "conv3d_rmsnorm_silu", "conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad")),
+    ("32,2,60,104,320,640", ("conv3d_raw", "rmsnorm_silu_pad")),
+    ("32,2,60,104,640,640", ("conv3d_raw", "conv3d_bias_residual_pad", "rmsnorm_silu_pad")),
+    ("32,1,30,52,640,640", ("conv3d_raw", "rmsnorm_silu_pad")),
+    ("32,1,240,416,160,160", ("conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad")),
+    ("32,1,120,208,320,320", ("conv3d_rmsnorm_silu_pad", "conv3d_bias_residual_pad")),
+)
+PRODUCTION_CASES = WAN21_PRODUCTION_CASES + WAN22_PRODUCTION_CASES
 COMPILE_OPTIONS = {"emulate_precision_casts": True, "triton.cudagraphs": False}
 
 
@@ -128,17 +145,17 @@ def _norm_silu(
     residual: torch.Tensor | None,
     residual_bias: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Apply bias, optional residual, RMSNorm, and SiLU with explicit BF16 rounding."""
-    value = (conv.float() + bias.float()).to(torch.bfloat16)
+    """Apply bias, optional residual, RMSNorm, and SiLU with explicit storage-dtype rounding."""
+    value = (conv.float() + bias.float()).to(conv.dtype)
     if residual is not None:
         skip = residual
         if residual_bias is not None:
-            skip = (skip.float() + residual_bias.float()).to(torch.bfloat16)
-        value = (value.float() + skip.float()).to(torch.bfloat16)
-    normalized = F.normalize(value.float(), dim=-1).to(torch.bfloat16)
-    scaled = (normalized.float() * math.sqrt(value.shape[-1])).to(torch.bfloat16)
-    affine = (scaled.float() * gamma.float()).to(torch.bfloat16)
-    activated = F.silu(affine.float()).to(torch.bfloat16)
+            skip = (skip.float() + residual_bias.float()).to(conv.dtype)
+        value = (value.float() + skip.float()).to(conv.dtype)
+    normalized = F.normalize(value.float(), dim=-1).to(conv.dtype)
+    scaled = (normalized.float() * math.sqrt(value.shape[-1])).to(conv.dtype)
+    affine = (scaled.float() * gamma.float()).to(conv.dtype)
+    activated = F.silu(affine.float()).to(conv.dtype)
     return activated, value if residual is not None else None
 
 
@@ -219,11 +236,11 @@ def _compiled_reference(
         def reference(input, weight, bias, gamma, previous, residual, residual_bias):
             """Add convolution bias and residual, then pad the bottom and right edges."""
             del gamma, previous
-            conv = (_conv(input, weight).float() + bias.float()).to(torch.bfloat16)
+            conv = (_conv(input, weight).float() + bias.float()).to(input.dtype)
             skip = residual
             if residual_bias is not None:
-                skip = (skip.float() + residual_bias.float()).to(torch.bfloat16)
-            summed = (conv.float() + skip.float()).to(torch.bfloat16)
+                skip = (skip.float() + residual_bias.float()).to(input.dtype)
+            summed = (conv.float() + skip.float()).to(input.dtype)
             return (F.pad(summed, (0, 0, 0, 1, 0, 1)),)
 
     return torch.compile(
@@ -246,7 +263,7 @@ def _capture(fn: Callable) -> tuple[torch.cuda.CUDAGraph, object]:
 
 
 def _time_pair(reference: Callable, custom: Callable, repeats: int) -> tuple[float, float]:
-    """Measure median graph-replay latency with alternating reference/custom order."""
+    """Measure consecutive graph replays after warming each implementation."""
     graphs = []
     captured_outputs = []
     for fn in (reference, custom):
@@ -258,11 +275,17 @@ def _time_pair(reference: Callable, custom: Callable, repeats: int) -> tuple[flo
     samples = [[], []]
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    for sample in range(7):
-        for index in (0, 1) if sample % 2 == 0 else (1, 0):
+    for index, graph in enumerate(graphs):
+        # Settle this implementation's power/clock state before sampling.
+        warmup_end = time.perf_counter() + 0.1
+        while time.perf_counter() < warmup_end:
+            for _ in range(repeats):
+                graph.replay()
+            torch.cuda.synchronize()
+        for _ in range(7):
             start.record()
             for _ in range(repeats):
-                graphs[index].replay()
+                graph.replay()
             end.record()
             end.synchronize()
             samples[index].append(start.elapsed_time(end) / repeats)
@@ -276,7 +299,12 @@ def _assert_outputs_close(actual, expected) -> None:
         if actual_tensor is None or expected_tensor is None:
             assert actual_tensor is expected_tensor
             continue
-        torch.testing.assert_close(actual_tensor, expected_tensor, atol=0.02, rtol=0.02)
+        if actual_tensor.dtype == torch.float32:
+            error = (actual_tensor - expected_tensor).float()
+            nrmse = error.square().mean().sqrt() / expected_tensor.float().square().mean().sqrt().clamp_min(1e-12)
+            assert torch.isfinite(error).all() and nrmse <= 1e-3, f"FP32/TF32 NRMSE={nrmse.item():.6g} > 1e-3"
+        else:
+            torch.testing.assert_close(actual_tensor, expected_tensor, atol=0.02, rtol=0.02)
 
 
 @torch.inference_mode()
@@ -287,6 +315,8 @@ def run_case(
     history: int,
     use_residual: bool,
     repeats: int,
+    dtype: torch.dtype = torch.bfloat16,
+    allow_tf32: bool = False,
 ) -> Result | None:
     """Validate and time one variant, or warn and skip a rejected configuration."""
     if variant == "conv3d_bias_residual_pad":
@@ -301,7 +331,7 @@ def run_case(
             input_shape,
             generator=generator,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=dtype,
         )
         * 0.1
     )
@@ -312,21 +342,22 @@ def run_case(
                 (shape.co, shape.ci, 3, 3, 3),
                 generator=generator,
                 device="cuda",
-                dtype=torch.bfloat16,
+                dtype=dtype,
             )
             * (shape.ci * 27) ** -0.5
         )
-        packed_weight = pack_conv3d_weight_sm100(weight)
+        weight = weight.contiguous(memory_format=torch.channels_last_3d)
+        packed_weight = pack_conv3d_weight_sm100(weight, allow_tf32=allow_tf32)
     post_channels = shape.ci if variant == "rmsnorm_silu_pad" else shape.co
     post_shape = (shape.n, shape.t, shape.h, shape.w, post_channels)
-    bias = torch.randn(post_channels, generator=generator, device="cuda", dtype=torch.bfloat16) * 0.1 if variant != "conv3d_raw" else None
-    gamma = torch.randn(post_channels, generator=generator, device="cuda", dtype=torch.bfloat16) if has_norm else None
+    bias = torch.randn(post_channels, generator=generator, device="cuda", dtype=dtype) * 0.1 if variant != "conv3d_raw" else None
+    gamma = torch.randn(post_channels, generator=generator, device="cuda", dtype=dtype) if has_norm else None
     previous = (
         torch.randn(
             (shape.n, history, shape.h, shape.w, post_channels),
             generator=generator,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=dtype,
         )
         if variant == "rmsnorm_silu_pad" and history
         else None
@@ -336,7 +367,7 @@ def run_case(
             post_shape,
             generator=generator,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=dtype,
         )
         if use_residual
         else None
@@ -347,22 +378,24 @@ def run_case(
         padded = torch.empty(
             (shape.n, shape.t + 2, shape.h + 2, shape.w + 2, post_channels),
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=dtype,
         )
         cache = torch.empty(
             (shape.n, min(2, shape.t + history), shape.h, shape.w, post_channels),
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=dtype,
         )
 
+    workspace = torch.empty_like(input) if dtype == torch.float32 and variant != "rmsnorm_silu_pad" else None
+    conv_options = {"allow_tf32": allow_tf32, "sample_workspace": workspace}
     # Reference closures share code objects; isolate each case's shape specialization.
     torch.compiler.reset()
     if variant == "conv3d_raw":
-        output = torch.empty(shape.output_shape, device="cuda", dtype=torch.bfloat16)
-        plan = Conv3dRawSm100(input, packed_weight, output)
-        custom_call = lambda: (plan.execute(input, packed_weight, output),)
+        output = torch.empty(shape.output_shape, device="cuda", dtype=dtype)
+        plan = Conv3dRawSm100(input, packed_weight, output, **conv_options)
+        custom_call = lambda: (plan.execute(input, packed_weight, output, workspace=workspace),)
     elif variant == "conv3d_rmsnorm_silu":
-        output = torch.empty(shape.output_shape, device="cuda", dtype=torch.bfloat16)
+        output = torch.empty(shape.output_shape, device="cuda", dtype=dtype)
         plan = Conv3dRmsNormSiluSm100(
             input,
             packed_weight,
@@ -372,6 +405,7 @@ def run_case(
             residual,
             residual_bias,
             residual_output,
+            **conv_options,
         )
         custom_call = lambda: plan.execute(
             input,
@@ -382,6 +416,7 @@ def run_case(
             residual,
             residual_bias,
             residual_output,
+            workspace=workspace,
         )
     elif variant == "conv3d_rmsnorm_silu_pad":
         plan = Conv3dRmsNormSiluPadSm100(
@@ -395,6 +430,7 @@ def run_case(
             residual,
             residual_bias,
             residual_output,
+            **conv_options,
         )
         custom_call = lambda: plan.execute(
             input,
@@ -406,6 +442,7 @@ def run_case(
             residual,
             residual_bias,
             residual_output,
+            workspace=workspace,
         )
     elif variant == "rmsnorm_silu_pad":
         plan = RmsNormSiluPadSm100(
@@ -434,10 +471,10 @@ def run_case(
         padded = torch.empty(
             (shape.n, shape.t, shape.h + 1, shape.w + 1, shape.co),
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=dtype,
         )
-        plan = Conv3dBiasResidualPadSm100(input, packed_weight, bias, residual, padded, residual_bias)
-        custom_call = lambda: (plan.execute(input, packed_weight, bias, residual, padded, residual_bias),)
+        plan = Conv3dBiasResidualPadSm100(input, packed_weight, bias, residual, padded, residual_bias, **conv_options)
+        custom_call = lambda: (plan.execute(input, packed_weight, bias, residual, padded, residual_bias, workspace=workspace),)
 
     try:
         plan.check_support()
@@ -499,6 +536,9 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--production", action="store_true", help="run compact Wan 2.1/2.2 encoder cases at 480x832 video resolution")
+    parser.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument("--allow-tf32", action="store_true", help="allow TF32 convolution for both implementations; custom timing includes input rounding")
     parser.add_argument(
         "--shape",
         action="append",
@@ -506,7 +546,6 @@ def main() -> None:
         default=argparse.SUPPRESS,
         help=("output shape N,T,H,W,Ci,Co; may be repeated (default: 1,2,4,5,320,320)"),
     )
-    parser.add_argument("--production", action="store_true", help="run relevant WAN shape/variant pairs, including generic Conv3D + norm/SiLU")
     parser.add_argument(
         "--variant",
         choices=("all", *VARIANTS),
@@ -533,6 +572,11 @@ def main() -> None:
         help="CUDA Graph replays per timing sample",
     )
     args = parser.parse_args()
+    if args.dtype == "fp32" and not args.allow_tf32 and args.variant != "rmsnorm_silu_pad":
+        parser.error("strict FP32 convolution is external to these kernels; select --allow-tf32 or --variant rmsnorm_silu_pad")
+    torch.backends.cudnn.allow_tf32 = args.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     shapes_arg = getattr(args, "shape", None)
     if args.replays < 1:
         parser.error("--replays must be positive")
@@ -544,13 +588,14 @@ def main() -> None:
     else:
         cases = [(shape, variant) for shape in shapes_arg or [Shape.parse("1,2,4,5,320,320")] for variant in variants]
     print(
-        f"device={torch.cuda.get_device_name()} torch={torch.__version__} " f"compile_options={COMPILE_OPTIONS} synthetic_weights=true",
+        f"device={torch.cuda.get_device_name()} torch={torch.__version__} "
+        f"dtype={args.dtype} allow_tf32={args.allow_tf32} compile_options={COMPILE_OPTIONS} synthetic_weights=true",
         flush=True,
     )
     results = []
     for shape, variant in cases:
         print(f"running {variant} shape={shape}", flush=True)
-        result = run_case(shape, variant, history=args.history, use_residual=args.residual, repeats=args.replays)
+        result = run_case(shape, variant, history=args.history, use_residual=args.residual, repeats=args.replays, dtype=dtype, allow_tf32=args.allow_tf32)
         if result is not None:
             results.append(result)
     _print_results(results)

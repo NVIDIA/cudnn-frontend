@@ -14,8 +14,9 @@
 //   --compare-lib <other.so>: run the prefill cases through both libraries and require bit-identical outputs (the
 //             in-tree runtime shim vs the CuTeDSL runtime build: aot/sm120/build.py --runtime cute-dsl)
 //
-// Exits 0 with "SKIPPED" when there is no compute capability 12.0 device or the library cannot be loaded.
+// Exits 0 with "SKIPPED" when there is no compute capability 12.0 or 12.1 device or the library cannot be loaded.
 
+#include "sm120_family.h"
 #include "cudnn_frontend/experimental/sm120_aot_attention.h"
 
 #include "decode_problem.h"
@@ -1013,10 +1014,10 @@ main(int argc, char** argv) {
     for (dev = 0; dev < n; ++dev) {
         cudaDeviceProp p;
         CK(cudaGetDeviceProperties(&p, dev));
-        if (p.major == 12 && p.minor == 0) break;
+        if (cudnn_frontend::aot_sm120::supports_device(10 * p.major + p.minor)) break;
     }
     if (dev == n) {
-        std::printf("SKIPPED: no compute capability 12.0 device\n");
+        std::printf("SKIPPED: no compute capability 12.0 or 12.1 device\n");
         return 0;
     }
     CK(cudaSetDevice(dev));

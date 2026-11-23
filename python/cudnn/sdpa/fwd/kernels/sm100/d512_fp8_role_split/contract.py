@@ -17,7 +17,7 @@ LEGACY_ROW = "sdpa_fwd_prefill_sm100_fp8"
 def in_domain(facts):
     return (
         facts.device_cc in ((10, 0), (10, 3))
-        and padded_shape(facts) == (512, 512)
+        and (padded_shape(facts) == (512, 512) or (facts.d_qk, facts.d_v) == (576, 512))
         and not (facts.invalid or facts.is_backward)
         and facts.is_fp8
         and not facts.is_mxfp8
@@ -50,7 +50,7 @@ class Geometry:
         )
 
     def configure_params(self, params):
-        return replace(params, mma_2x2=False, d_flavor=512)
+        return replace(params, mma_2x2=False, d_flavor=576 if params.d_flavor == 576 else 512)
 
 
 def mismatch(facts, knobs):

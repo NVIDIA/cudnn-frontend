@@ -25,6 +25,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, AddressSpace
+from ..glu_layout import interleaved_glu_view, validate_glu_layout
 from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
@@ -121,6 +122,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         act_func: str = "swiglu",
         enable_bias: bool = False,
         generate_c: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -132,6 +134,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         if act_func not in ["swiglu", "geglu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
 
+        self.glu_layout = validate_glu_layout(glu_layout)
         self.expert_cnt = expert_cnt
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -315,6 +318,11 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             self.num_c_stage,
         )
 
+        if self.glu_layout == "gate_then_up":
+            c_atom_kind = sm100_utils.get_smem_layout_atom_epi(self.c_layout, self.c_dtype, (self.epi_tile_c[0], 32))
+            c_atom = sm100_utils.make_smem_layout_atom(c_atom_kind, self.c_dtype)
+            self.c_smem_layout_staged = cute.tile_to_shape(c_atom, (*self.epi_tile_c, self.num_c_stage), order=(0, 1, 2))
+
         self.d_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.d_dtype,
             self.d_layout,
@@ -450,6 +458,8 @@ class MoEGroupedGemmGluBiasBf16Kernel:
                 b_ptr,
                 cute.make_layout((n, k, c1), stride=(stride_n, stride_k, c0)),
             )
+            if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                b_tensor_i = interleaved_glu_view(b_tensor_i, 0)
             tma_atom_b, _ = cute.nvgpu.make_tiled_tma_atom_B(
                 b_tma_op_arg,
                 b_tensor_i,
@@ -541,6 +551,12 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             b_ptr_typed = cute.make_ptr(self.b_dtype, b.toint(), AddressSpace.gmem, assumed_align=16)
             b = cute.make_tensor(b_ptr_typed, b_template_layout)
 
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            b = interleaved_glu_view(b, 0)
+            c = interleaved_glu_view(c, 1)
+            if cutlass.const_expr(self.enable_bias):
+                bias = interleaved_glu_view(bias, 0)
+
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
@@ -622,7 +638,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         # ---- Grid computation via MoE scheduler ----
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
             b_n, b_k, b_l = cute.shape(b)
-            sched_expert_shape = (self.expert_cnt, b_n, b_k)
+            sched_expert_shape = (self.expert_cnt, cute.size(b_n), cute.size(b_k))
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
 
@@ -1444,7 +1460,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
                 tBs_sBias = thr_bias_g2s.partition_D(sBias)
 
                 # Predicate tensor for bias cp.async
-                bias_n_total = mBias_nl.shape[0]
+                bias_n_total = cute.size(mBias_nl.shape[0])
                 tBpBias = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Boolean)
 
                 # Get first tile info from pipeline

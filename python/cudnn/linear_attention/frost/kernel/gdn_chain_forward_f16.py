@@ -155,6 +155,7 @@ def chain_forward_host(
     l2norm_k: Optional[cute.Tensor] = None,
     l2norm_inv_q: Optional[cute.Tensor] = None,
     l2norm_inv_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
 ) -> None:
     if cutlass.const_expr(fold_update is not None):
         launch_state_chain(
@@ -204,6 +205,7 @@ def chain_forward_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     cu_full = None
     if cutlass.const_expr(tail):
@@ -480,11 +482,12 @@ def build_chain_forward(
     tail_enable=None,
     lead_buffers=(None,) * 8,
     l2norm_skip_k=False,
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags, checkpoint and final-state presence, seed dtype,
     chain rows, device) the chain forward launch over the buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are
-    launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every kernel compiles as it
-    does there."""
+    launch arguments, and so is ``l2norm_eps`` (the q/k normalize's additive epsilon, absent from the key).  The placeholders
+    repeat the marks of the standalone modules' builds so every kernel compiles as it does there."""
     _HQ, DK = q.shape[1], q.shape[2]
     DV = v.shape[-1]
     HO = gate.shape[1]
@@ -671,6 +674,7 @@ def build_chain_forward(
             from_dlpack(l2norm_k, assumed_align=16).mark_layout_dynamic(leading_dim=len(l2norm_k.shape) - 1) if l2norm_k is not None else None,
             from_dlpack(l2norm_inv_q, assumed_align=16).mark_layout_dynamic(leading_dim=1) if l2norm_inv_q is not None else None,
             from_dlpack(l2norm_inv_k, assumed_align=16).mark_layout_dynamic(leading_dim=1) if l2norm_inv_k is not None else None,
+            float(l2norm_eps),
             cache_key=repr((__name__, key)),
             symbol="frost_la_gdn_chain_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
@@ -725,6 +729,7 @@ def run_chain_forward(
     first_head_lo=0,
     tail_enable=None,
     lead_buffers=(None,) * 8,
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ) -> None:
     """Replay the chain forward: one crossing into the DSL for the five launches.  The plan validated the contract at build,
     so nothing here raises."""
@@ -742,6 +747,7 @@ def run_chain_forward(
         cuda.CUstream(int(stream)),
         tail_enable,
         *lead_buffers,
+        float(l2norm_eps),
     )
 
 
@@ -833,6 +839,7 @@ def chain_summary_host(
     l2norm_k_slots: cutlass.Constexpr[int] = 1,
     l2norm_k_expand_num: cutlass.Constexpr[int] = 1,
     l2norm_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
 ) -> None:
     """The chain of the summary node: the chain forward without its main pass."""
     if cutlass.const_expr(l2norm_k is not None):
@@ -857,6 +864,7 @@ def chain_summary_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     cu_full = None
     if cutlass.const_expr(tail):
@@ -1027,9 +1035,10 @@ def build_chain_summary(
     tail=False,
     tail_enable=None,
     l2norm_k=None,
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ):
-    """Compile (cached per static config) the summary chain launch over the buffers of one plan; ``pieces``, ``heads_out``
-    and ``num_seqs`` are launch arguments."""
+    """Compile (cached per static config) the summary chain launch over the buffers of one plan; ``pieces``, ``heads_out``,
+    ``num_seqs`` and ``l2norm_eps`` (the k normalize's additive epsilon) are launch arguments."""
     DK = k.shape[-1]
     DV = v.shape[-1]
     HO = gate.shape[1]
@@ -1175,6 +1184,7 @@ def build_chain_summary(
             l2norm_k_slots,
             l2norm_k_expand_num,
             from_dlpack(l2norm_k, assumed_align=16).mark_layout_dynamic(leading_dim=len(l2norm_k.shape) - 1) if l2norm_k is not None else None,
+            float(l2norm_eps),
             cache_key=repr((__name__, key)),
             symbol="frost_la_gdn_chain_summary_f16",
             options="--enable-tvm-ffi --opt-level 2",
@@ -1219,10 +1229,12 @@ def run_chain_summary(
     first_head_lo=0,
     tail_enable=None,
     l2norm_k=None,
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ) -> None:
     """Replay the summary chain: one crossing into the DSL for its launches."""
     buffers = locals()
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),
@@ -1232,4 +1244,5 @@ def run_chain_summary(
         cuda.CUstream(int(stream)),
         tail_enable,
         l2norm_k,
+        float(l2norm_eps),
     )

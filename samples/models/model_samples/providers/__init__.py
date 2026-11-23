@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Providers of model blocks: adapters to cuDNN Frontend entries (``fe``), to library kernels (``library``) and the plain-PyTorch
-reference of every block (``torch_ref``).
+"""Providers of model blocks: adapters to cuDNN Frontend entries (``fe``), to library kernels (``library``; FlashInfer's
+multiplies on the stored formats: ``flashinfer_calls``) and the plain-PyTorch reference of every block (``torch_ref``).
 
-``KEYS`` is the closed list of provider keys a provider table may name; it changes only together with a kernel, or with the
-reference chain of a block that a kernel is to serve.  The operand containers below are what the blocks of a family pass to
-each other.  Nothing here imports a provider module, PyTorch or cuDNN Frontend until :func:`factories` is called.
+``KEYS`` is the closed list of provider keys a provider table may name; it changes only together with a kernel, with the
+reference chain of a block that a kernel is to serve, or with a declared library entry.  The operand containers below are
+what the blocks of a family pass to each other.  Nothing here imports a provider module, PyTorch or cuDNN Frontend until
+:func:`factories` is called, and no provider module imports a third-party package: an adapter to one imports it inside the
+functions that run on a device.
 
 Every adapter declares its census entries (``kernels``, :class:`model_samples.census.Kernel`): the kernels one call launches.
 An adapter to an entry that states its launch also answers ``launch_facts(rows)`` and says what served its last call
@@ -19,7 +21,10 @@ copy of that weight only where another block of the run's plans reads one.  An a
 layout of its own also says how the layout is made (``stored_layout(merged)``, its entry's own load-time helper): the
 loader then keeps the weight in that layout and in no other stored form.  An adapter to an entry of a step that feeds
 several tokens per sequence takes the step's slot table where the decode step's adapter takes slot ids
-(``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).
+(``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).  An adapter whose
+entry reads or writes the attention cache as a pool of pages says so (``cache_page``): the session then builds its state
+in that layout, and the adapter takes the pool's two halves and the rows of the state's tables from the cache it is handed
+(``state.PagedKvCache.at``), never from the position.
 """
 
 from __future__ import annotations
@@ -33,10 +38,14 @@ from ..census import Kernel
 ENTRY_NAMES: Dict[str, str] = {
     "fe.gdn_decode_fused": "cudnn.GdnDecodeFused",
     "fe.gdn_verify_fused": "cudnn.GdnVerifyFused",
+    "fe.attention_prepare_decode": "cudnn.AttentionPrepareDecode",
     "fe.attention_gate_quant_decode": "cudnn.AttentionGateQuantDecode",
     "fe.add_norm_quant_decode": "cudnn.AddNormQuantDecode",
     "fe.fp8_projection_decode": "cudnn.Fp8ProjectionDecode",
     "fe.swiglu_fp4_decode": "cudnn.SwigluFp4Decode",
+    "flashinfer.mm_fp4": "flashinfer.gemm.mm_fp4",
+    "torch_ref.quantize+flashinfer.mm_fp4": "torch_ref.quantize + flashinfer.gemm.mm_fp4",
+    "flashinfer.bmm_fp8": "flashinfer.gemm.bmm_fp8",
     "cublas.bf16_dequantized": "torch.matmul over a bf16 copy",
     "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": "torch.matmul over a bf16 copy + torch_ref.silu_mul_quantize",
     "torch.index_select": "torch.index_select",
@@ -147,6 +156,14 @@ class BlockBase:
     #: statement, as a run prints it beside the batch-invariance line and wherever it compares such a block across row
     #: counts.  Empty: the entry states no such difference
     batch_note = ""
+    #: for a block whose kernel reads or writes the attention cache as a pool of pages: the positions of a page.  A session
+    #: collects it over its plans and builds its state in that layout (``state.PagedKvCache``); two blocks of one session
+    #: that name two pages are a wrong table.  ``None``: the block reaches the cache through its accessors alone, in
+    #: either layout -- every reference chain
+    cache_page = None
+    #: for a block whose first use does more than build an entry's kernel -- a library that builds kernels of its own with
+    #: the installed compiler: the sentence a sample prints before the plan makes that first use.  Empty: nothing to announce
+    first_use_note = ""
 
     def __init__(self, row, model, facts, options):
         self.row, self.model, self.facts, self.options = row, model, facts, options
@@ -196,15 +213,19 @@ class BlockBase:
 def factories() -> Dict[str, Callable]:
     """Provider key -> ``factory(row, model, facts, options) -> Block``.  Imports the provider modules (and with them PyTorch);
     cuDNN Frontend is imported only when a cuDNN Frontend block is asked whether it serves or is compiled."""
-    from . import fe, library, torch_ref
+    from . import fe, flashinfer_calls, library, torch_ref
 
     return {
         "fe.gdn_decode_fused": fe.GdnDecodeFusedBlock,
         "fe.gdn_verify_fused": fe.GdnVerifyFusedBlock,
+        "fe.attention_prepare_decode": fe.AttentionPrepareDecodeBlock,
         "fe.attention_gate_quant_decode": fe.AttentionGateQuantDecodeBlock,
         "fe.add_norm_quant_decode": fe.AddNormQuantDecodeBlock,
         "fe.fp8_projection_decode": fe.Fp8ProjectionDecodeBlock,
         "fe.swiglu_fp4_decode": fe.SwigluFp4DecodeBlock,
+        "flashinfer.mm_fp4": flashinfer_calls.MmFp4Block,
+        "torch_ref.quantize+flashinfer.mm_fp4": flashinfer_calls.QuantizeMmFp4Block,
+        "flashinfer.bmm_fp8": flashinfer_calls.BmmFp8Block,
         "cublas.bf16_dequantized": library.CublasLinear,
         "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": library.CublasGateUp,
         "torch.index_select": torch_ref.Embedding,

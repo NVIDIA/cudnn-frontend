@@ -27,7 +27,8 @@ reference that is named here, or a bound that is the instruction's own specifica
 
 The row helpers of the module have their cells at the end: on the host the load's required ``dtype``; on the device the per-row
 FP8 scale against two IEEE divisions on the host, the E4M3 store's bytes in element order against the host cast, the 16-bit
-load / store round trip on all 65,536 patterns.
+load / store round trip on all 65,536 patterns, and the 4-bit store's sixteen codes in NIBBLE order against a host rule written
+from the E2M1 grid.
 """
 
 import importlib
@@ -352,6 +353,7 @@ def expected_pins(arch: str) -> dict:
             "store_e4m3": {"mul.f32": 8, "cvt.rn.satfinite.e4m3x2.f32": 4, "st.global.v2": 1},
             "load8_bf16": {"ld.global.v4": 1},
             "roundtrip": {"ld.global.v4": 1, "cvt.rn.bf16x2.f32": 4, "st.global.v4": 1},
+            "store16_e2m1": {"mul.f32": 16, "cvt.rn.satfinite.e2m1x2.f32": 8, "st.global.v2": 1},
         }
     )
     want.update(
@@ -941,3 +943,64 @@ def test_row_load8_and_store8_bf16_round_trip():
     widened = probe.run_load8(half.to(dev)).cpu()
     bad = (_bits(widened) != _bits(half.float())) & not_nan
     assert not bool(bad.any()), f"{int(bad.sum())} fp16 patterns are not widened exactly"
+
+
+E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)  # the magnitudes of the codes 0 .. 7; bit 3 of a code is the sign
+
+
+def e2m1_code(values: torch.Tensor) -> torch.Tensor:
+    """The 4-bit E2M1 code of every fp32 value, from the grid's definition: nearest, a tie to the EVEN code, saturation at 6,
+    the sign kept (a negative value that rounds to zero is the code 8)."""
+    mag = values.abs().double()
+    mids = torch.tensor([(a + b) / 2 for a, b in zip(E2M1_GRID[:-1], E2M1_GRID[1:])], dtype=torch.float64)
+    below = torch.bucketize(mag, mids, right=False)  # a tie counts as below its midpoint
+    above = torch.bucketize(mag, mids, right=True)  # a tie counts as above it
+    code = torch.where(below % 2 == 0, below, above)
+    return code.to(torch.uint8) | (torch.signbit(values).to(torch.uint8) << 3)
+
+
+def e2m1_blocks(gen):
+    """``(x [n, 16], encode [n])`` for the 4-bit store cell: two blocks whose sixteen codes are all DISTINCT (every code 0 .. 15
+    once, in two orders); every grid value and every rounding tie of both signs with ``encode = 1``; elements beyond +-6 and
+    both infinities; zeros of both signs; and random blocks with random power-of-two and other multipliers."""
+    grid = torch.tensor(E2M1_GRID)
+    distinct = torch.stack([torch.cat([grid, -grid]), torch.cat([-grid, grid]).flip(0)])
+    mids = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    ties = torch.cat([mids, -mids, torch.tensor([0.0, -0.0])]).reshape(1, 16)
+    beyond = torch.tensor([[6.5, -6.5, 100.0, -100.0, 3.0e38, -3.0e38, float("inf"), -float("inf"), 5.999, -5.999, 0.2499, -0.2499, 0.0, -0.0, 6.0, -6.0]])
+    fixed = torch.cat([distinct, ties, beyond])
+    drawn = (torch.randn(4096, 16, generator=gen) * 3.0).to(torch.float32)
+    x = torch.cat([fixed, drawn]).contiguous()
+    multipliers = torch.cat([torch.exp2(torch.randint(-3, 4, (2048,), generator=gen).float()), torch.empty(2048).uniform_(0.1, 4.0, generator=gen)])
+    encode = torch.cat([torch.ones(fixed.shape[0]), multipliers]).to(torch.float32).contiguous()
+    return x, encode
+
+
+@requires_blackwell
+def test_row_store16_e2m1_nibble_order():
+    """``row_store16_e2m1``: the sixteen codes of every block, in NIBBLE order (``values[j]`` -> the low nibble of byte ``j // 2``
+    for an even ``j``, the high nibble for an odd one), equal the host rule on the fp32 product ``values[j] * encode`` -- blocks
+    of sixteen distinct codes (a permuted store or swapped nibbles fail), every grid value, every tie (to the even code), the
+    saturated codes of elements beyond +-6 and of both infinities, the signed zeros, random blocks with random multipliers.  The
+    sentinel bytes in front of the first block and behind the last are untouched."""
+    probe = _probe()
+    gen = torch.Generator(device="cpu").manual_seed(41)
+    x, encode = e2m1_blocks(gen)
+    want = e2m1_code(x * encode[:, None])
+    assert sorted(want[0].tolist()) == list(range(16)) and sorted(want[1].tolist()) == list(range(16)) and want[0].tolist() != want[1].tolist()
+    assert want[2].tolist() == [0, 2, 2, 4, 4, 6, 6, 8, 10, 10, 12, 12, 14, 14, 0, 8]  # every tie goes to the even code; the zeros keep their sign
+    assert want[3, :8].tolist() == [7, 15, 7, 15, 7, 15, 7, 15]  # saturation at +-6, the infinities included
+    codes = probe.run_store_e2m1(x.to(_device()), encode.to(_device())).cpu()
+    stored = codes[probe.PAD : -probe.PAD].view(-1, 8)
+    got = torch.stack([stored & 0xF, stored >> 4], dim=-1).flatten(-2)
+    bad = got != want
+    assert not bool(bad.any()), f"{int(bad.any(dim=1).sum())} blocks differ from the host rule (first block {int(bad.any(dim=1).nonzero()[0])})"
+    assert bool((codes[: probe.PAD] == 0xA5).all()) and bool((codes[-probe.PAD :] == 0xA5).all()), "a byte outside the blocks was written"
+
+
+def test_row_store16_e2m1_needs_sixteen_values():
+    """A value list of another length is a ``ValueError`` raised before any operation is emitted."""
+    rowwise = _rowwise()
+    for bad in ([0.0] * 8, [0.0] * 15, (), None, 1.0):
+        with pytest.raises(ValueError, match="row_store16_e2m1"):
+            rowwise.row_store16_e2m1(0, bad, 1.0)

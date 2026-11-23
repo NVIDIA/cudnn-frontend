@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
+from cudnn.frost.device import current_device
 
 if TYPE_CHECKING:
     from cudnn.norm.fprop.engines import EngineSpec
@@ -28,6 +29,7 @@ class _FrostNormPlan(CompiledPlan):
     def __init__(self, name: str, run):
         self._name = name
         self._run = run
+        self._device = current_device()  # built inside the graph's device scope: the plan's GPU
         # The lowering sizes its scratch at build time; 0 means the kernels this
         # graph routes to carve nothing, which is most of them.
         self._ws_bytes = int(getattr(run, "workspace_bytes", 0) or 0)
@@ -42,7 +44,7 @@ class _FrostNormPlan(CompiledPlan):
         # stream, so the handle's stream has to be made current for the whole
         # call -- see on_stream().
         ws = Workspace(getattr(ctx, "workspace", None)) if self._ws_bytes else None
-        with on_stream(getattr(ctx, "stream", None)):
+        with on_stream(getattr(ctx, "stream", None), self._device):
             self._run(variant_pack, ws)
 
 
