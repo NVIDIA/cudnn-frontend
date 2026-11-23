@@ -2244,6 +2244,7 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
 
     device = _training_device()
     _skip_forward_tuning_declined_on_device(device, forward_tuning)
+    _skip_dgrad_profile_declined_on_device(device, dgrad_optimization)
     args = make_forward_inputs(device)
     args = (*args[:4], args[4].float().contiguous())
     grad_output = _grad_output(device, args[0].shape[0], seed=20260911)
@@ -2421,6 +2422,17 @@ def _skip_forward_tuning_declined_on_device(device: torch.device, tuning: dict, 
         architecture.validate_forward_tuning("training_forward_tuning", MoeEpTuningConfig(**tuning), combine_format)
     except NotImplementedError as error:
         pytest.skip(str(error))
+
+
+def _skip_dgrad_profile_declined_on_device(device: torch.device, dgrad_optimization: str) -> None:
+    """Skip ds3_ep4_pattern off the DS3 EP4 workload on Blackwell SM100, which declines it there (see prepare_backward_kernel)."""
+
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import BLACKWELL_SM100, architecture_for
+
+    if dgrad_optimization == "ds3_ep4_pattern" and architecture_for(torch.cuda.get_device_capability(device)) is BLACKWELL_SM100:
+        pytest.skip(
+            "ds3_ep4_pattern is qualified on Blackwell SM100 only for the DS3 EP4 workload; test_ds3_ep4_profiles_match_baseline_and_reference covers it"
+        )
 
 
 _TRAINING_FORWARD_TUNING_CASES = {

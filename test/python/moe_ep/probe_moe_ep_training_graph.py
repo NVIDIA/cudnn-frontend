@@ -281,10 +281,15 @@ def _prepare_case(
     if forward.config.cluster_shape_mnk != expected_cluster:
         raise RuntimeError("training graph probe prepared the wrong forward cluster: " f"{forward.config.cluster_shape_mnk} != {expected_cluster}")
     expected_schedule = "phase_interleave" if forward_tuning.scheduling == "phase_interleave" else "grouped"
-    if (forward.kernel.schedule_mode, forward.config.fc2_use_bulk) != (expected_schedule, forward_tuning.fc2_bulk_store != "off"):
-        raise RuntimeError(
-            "training graph probe prepared the wrong forward schedule: " f"{forward.kernel.schedule_mode!r}, fc2_use_bulk={forward.config.fc2_use_bulk}"
-        )
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+    # Only a forward kernel with schedule options has schedule_mode; the Blackwell SM100 kernel always runs the grouped schedule.
+    if architecture_for(torch.cuda.get_device_capability(device)).supports_forward_schedule_options:
+        forward_schedule = forward.kernel.schedule_mode
+    else:
+        forward_schedule = "grouped"
+    if (forward_schedule, forward.config.fc2_use_bulk) != (expected_schedule, forward_tuning.fc2_bulk_store != "off"):
+        raise RuntimeError("training graph probe prepared the wrong forward schedule: " f"{forward_schedule!r}, fc2_use_bulk={forward.config.fc2_use_bulk}")
     _runtime_debug("probe.prepare_training.end")
     _runtime_debug("probe.pack_weights.begin")
     forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
