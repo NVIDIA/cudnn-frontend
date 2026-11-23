@@ -681,7 +681,9 @@ def gdn_fwd_overwrite_state(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GDN forward whose final state overwrites ``initial_state``, the rows ``state_indices`` names when that int32 or int64 ``[N]``
     table addresses a state pool.  The engine runs the chain or the uncut schedule and
-    never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last.  Inference
+    never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last (a prefill
+    kernel built with its levelled plan may run a tile as two work items, the second handed out behind the first one's
+    store of that state: see ``gated_delta_net``).  Inference
     only: a mutating op registers no autograd formula.  Returns ``(o, state_checkpoints)``."""
     o, _, state_checkpoints, _, _ = run_gdn_fwd(
         q=q,
