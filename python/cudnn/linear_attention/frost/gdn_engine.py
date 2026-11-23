@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import math
 from operator import itemgetter
-from typing import NamedTuple
+from typing import NamedTuple, Tuple
 
 import cudnn
 from cudnn import cpp_launcher
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.device import build_device, current_device, multiprocessor_count
+from cudnn.frost.device import build_device, compute_capability, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze, qk_l2norm_eps
 from .common.context import backward_context, forward_apply_context, forward_context
@@ -117,6 +117,7 @@ class LevelFacts(NamedTuple):
     rows: int  # token rows of the batch
     b_t: int
     num_sm: int
+    compute_capability: Tuple[int, int]  # of the part the plan is built for
     expand_num: int = 1
     gdn: bool = True
     scheme: str = "uncut"  # "uncut", or the scheme the plan chose in its place: chain, dv_split, warmup
@@ -132,11 +133,13 @@ def level_plan_refusal(kernel_module, facts: LevelFacts):
     """Why a forward plan keeps the uncut table, or ``None`` where it takes the levelled one.  The levelled table cuts a
     (sequence, head) tile at a share border and runs it as two items that hand the fp32 state over through its stored
     row, so it needs: the kernel's level build at this geometry; a GDN plan that is the uncut one with nothing in front
-    of or behind the prefill (no chain group, value-width split, cut table, tail or ragged pieces); a schedule that may
+    of or behind the prefill (no chain group, value-width split, cut table or ragged pieces); a schedule that may
     depend on the batch; one fp32 state table as seed and final state, with no folded seed; no checkpoint (a checkpoint
     row belongs to one item); no sub-token expansion; a total that divides into sequences of one length (the prologue
     checks the lengths themselves); value heads in whole groups per key head; a shape the table can be laid out for; and
-    a cell that was measured (``LEVEL_MEASURED_CELLS``)."""
+    a cell that was measured (``LEVEL_MEASURED_CELLS``).  A tail -- the plan's last partial wave as a launch of its own
+    -- keeps a batch no line names on the uncut table; at a measured cell the levelled table runs the whole batch in
+    the tail's place."""
     from .common.host import get_dtype
     from .common.split_k import level_plan_shape
 
@@ -146,7 +149,7 @@ def level_plan_refusal(kernel_module, facts: LevelFacts):
         return "scheme"
     if facts.batch_invariant:
         return "batch_invariant"
-    if facts.tail or facts.ragged_pieces:
+    if facts.ragged_pieces:
         return "tail"
     if not facts.state_in_place or facts.folded_seed:
         return "state"
@@ -161,9 +164,14 @@ def level_plan_refusal(kernel_module, facts: LevelFacts):
     group = facts.heads_out // facts.heads_key
     n_tiles = facts.num_seqs * facts.heads_out
     chunks = -(-(facts.rows // facts.num_seqs) // facts.b_t)
+    cell = kernel_module.LevelCell(
+        tuple(facts.compute_capability), facts.num_sm, facts.io_name, facts.dim_k, facts.dim_v, facts.heads_key, facts.heads_out, facts.num_seqs, chunks
+    )
+    if facts.tail and not kernel_module.level_plan_listed(cell):
+        return "tail"
     if not level_plan_shape(n_tiles, chunks, facts.num_sm, facts.heads_out, group):
         return "shape"
-    if not kernel_module.level_plan_cell(facts.dim_k, facts.dim_v, group, n_tiles, chunks, facts.num_sm):
+    if not kernel_module.level_plan_cell(cell):
         return "cell"
     return None
 
@@ -312,8 +320,8 @@ class CompiledGdn:
             )
             if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
                 self.tail = None
-        # The levelled table (level_plan_refusal); everything else keeps the uncut plan.  The tail goes first: a cell was
-        # measured against the uncut plan, not against a tail.
+        # The levelled table (level_plan_refusal); everything else keeps the plan above.  A measured cell's levelled table
+        # runs the whole batch: it ranks above the tail, which is dropped there.
         self.level_group = HO // HK if HK and HO % HK == 0 else 1
         self.level_refusal = level_plan_refusal(
             kernel_module,
@@ -327,6 +335,7 @@ class CompiledGdn:
                 rows=self.q_rows,
                 b_t=self.b_t,
                 num_sm=self.num_sm,
+                compute_capability=compute_capability(self.device),
                 expand_num=self.expand_num,
                 gdn=node.node_type.name == "GDN",
                 scheme="chain" if self.chain else "dv_split" if self.dv_split else "warmup" if self.split else "uncut",
@@ -344,6 +353,8 @@ class CompiledGdn:
             ),
         )
         self.level_plan = self.level_refusal is None
+        if self.level_plan:
+            self.tail = None
         self.uncut_launch = None
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=self.q_rows, batch_invariant=self.batch_invariant) if self.chain else B

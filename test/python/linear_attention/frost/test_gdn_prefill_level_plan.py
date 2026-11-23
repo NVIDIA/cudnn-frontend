@@ -17,6 +17,7 @@ import torch
 from cudnn import cpp_launcher
 from cudnn.linear_attention.frost import gdn_engine
 from cudnn.linear_attention.frost.common import split_k
+from cudnn.linear_attention.frost.common import tail as tail_rule
 from cudnn.linear_attention.ops import gdn as gdn_ops
 from linear_attention.test_la import (
     FWD_TOL,
@@ -51,8 +52,9 @@ SWEEP = [
 
 
 def measured_shapes():
-    """``(tiles, chunks, SMs, heads per sequence, group)`` of every measured cell, heads as few as the group allows."""
-    return [(tiles, chunks, sms, group, group) for sms, _, _, group, tiles, chunks in gdn_prefill_f16.LEVEL_MEASURED_CELLS]
+    """``(tiles, chunks, SMs, heads per sequence, group)`` of every measured cell."""
+    cells = gdn_prefill_f16.LEVEL_MEASURED_CELLS
+    return [(cell.sequences * cell.heads_out, cell.chunks, cell.sms, cell.heads_out, cell.heads_out // cell.heads_key) for cell in cells]
 
 
 def swept_shapes():
@@ -135,16 +137,53 @@ def level_form(monkeypatch):
         monkeypatch.setattr(gdn_prefill_f16, switch, True)
 
 
-def cell_facts(**overrides):
-    """The engine's facts of the first measured cell, at as few sequences as its tiles allow."""
-    sms, d_k, d_v, group, tiles, chunks = gdn_prefill_f16.LEVEL_MEASURED_CELLS[0]
-    heads_key = 16
-    heads_out = heads_key * group
-    num_seqs = tiles // heads_out
+def facts_of(cell, **overrides):
+    """The engine's facts of a batch that is the line ``cell``."""
     facts = gdn_engine.LevelFacts(
-        io_name="bfloat16", dim_k=d_k, dim_v=d_v, heads_out=heads_out, heads_key=heads_key, num_seqs=num_seqs, rows=num_seqs * chunks * B_T, b_t=B_T, num_sm=sms
+        io_name=cell.io,
+        dim_k=cell.d_k,
+        dim_v=cell.d_v,
+        heads_out=cell.heads_out,
+        heads_key=cell.heads_key,
+        num_seqs=cell.sequences,
+        rows=cell.sequences * cell.chunks * B_T,
+        b_t=B_T,
+        num_sm=cell.sms,
+        compute_capability=cell.compute_capability,
     )
     return facts._replace(**overrides)
+
+
+def cell_facts(**overrides):
+    """The engine's facts of the first measured cell."""
+    return facts_of(gdn_prefill_f16.LEVEL_MEASURED_CELLS[0], **overrides)
+
+
+def line_of(facts):
+    """The line the admission looks up for the engine's facts."""
+    chunks = -(-(facts.rows // facts.num_seqs) // B_T)
+    return gdn_prefill_f16.LevelCell(
+        tuple(facts.compute_capability), facts.num_sm, facts.io_name, facts.dim_k, facts.dim_v, facts.heads_key, facts.heads_out, facts.num_seqs, chunks
+    )
+
+
+def engine_tail(cell, chunks=None):
+    """The tail the engine's own rule gives the cell's sequences and heads (``chunks``: at another length), or None."""
+    tokens = cell.sequences * (cell.chunks if chunks is None else chunks) * B_T
+    return tail_rule.choose_tail(
+        num_seqs=cell.sequences, heads_out=cell.heads_out, num_sm=cell.sms, total_tokens=tokens, b_t=B_T, cadence_tokens=0, expand_num=1, dim_v=cell.d_v
+    )
+
+
+def tail_cells():
+    """``(cell, chunk counts beside it)`` of every measured cell the engine's own plan has a tail at: the counts one
+    chunk longer or shorter that keep a tail and that no line names."""
+    cells = gdn_prefill_f16.LEVEL_MEASURED_CELLS
+
+    def beside(cell):
+        return [chunks for chunks in (cell.chunks + 1, cell.chunks - 1) if engine_tail(cell, chunks) and cell._replace(chunks=chunks) not in cells]
+
+    return [(cell, beside(cell)) for cell in cells if engine_tail(cell)]
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -272,24 +311,22 @@ def test_admission_takes_every_measured_cell_and_no_other_shape(level_form, batc
     SM counts around the cells exactly the cells are admitted."""
     other_sms, seq_counts, chunk_counts = batches
     cells = set(gdn_prefill_f16.LEVEL_MEASURED_CELLS)
-    for sms, d_k, d_v, group, tiles, chunks in cells:
-        assert split_k.level_plan_shape(tiles, chunks, sms, group, group)
-        heads_out = 16 * group
-        if tiles % heads_out == 0:
-            facts = cell_facts(dim_k=d_k, dim_v=d_v, num_sm=sms, heads_out=heads_out, num_seqs=tiles // heads_out, rows=tiles // heads_out * chunks * B_T)
-            assert gdn_engine.level_plan_refusal(gdn_prefill_f16, facts) is None
+    for shape, cell in zip(measured_shapes(), gdn_prefill_f16.LEVEL_MEASURED_CELLS):
+        assert split_k.level_plan_shape(*shape)
+        assert gdn_engine.level_plan_refusal(gdn_prefill_f16, facts_of(cell)) is None
     base = cell_facts()
-    group = base.heads_out // base.heads_key
-    for sms in sorted({cell[0] for cell in cells} | set(other_sms)):
+    for sms in sorted({cell.sms for cell in cells} | set(other_sms)):
         for num_seqs in seq_counts:
             for chunks in chunk_counts:
                 facts = base._replace(num_sm=sms, num_seqs=num_seqs, rows=num_seqs * chunks * B_T)
-                cell = (sms, base.dim_k, base.dim_v, group, num_seqs * base.heads_out, chunks)
-                assert (gdn_engine.level_plan_refusal(gdn_prefill_f16, facts) is None) == (cell in cells), cell
+                assert (gdn_engine.level_plan_refusal(gdn_prefill_f16, facts) is None) == (line_of(facts) in cells), line_of(facts)
 
 
 ADMISSION_REFUSALS = {
     "another_sm_count": (dict(num_sm=148), "cell"),
+    "another_part_of_the_same_sm_count": (dict(compute_capability=(10, 3)), "cell"),
+    "another_operand_type": (dict(io_name="float16"), "cell"),
+    "the_same_tiles_as_other_sequences_and_heads": (dict(heads_out=96, heads_key=32, num_seqs=8, rows=8 * 16 * B_T), "cell"),
     "an_unmeasured_batch": (dict(num_seqs=15, rows=15 * 16 * B_T), "cell"),
     "another_key_width": (dict(dim_k=64), "cell"),
     "one_value_head_per_key_head": (dict(heads_key=48), "cell"),
@@ -299,7 +336,6 @@ ADMISSION_REFUSALS = {
     "batch_invariant": (dict(batch_invariant=True), "batch_invariant"),
     "checkpoints": (dict(checkpoints=True), "checkpoints"),
     "sub_token_expansion": (dict(expand_num=2), "expand_num"),
-    "a_tail": (dict(tail=True), "tail"),
     "ragged_pieces": (dict(ragged_pieces=True), "tail"),
     "a_chain_plan": (dict(scheme="chain"), "scheme"),
     "a_value_width_split": (dict(scheme="dv_split"), "scheme"),
@@ -317,6 +353,20 @@ def test_admission_refuses(level_form, refusal):
     change, reason = ADMISSION_REFUSALS[refusal]
     assert gdn_engine.level_plan_refusal(gdn_prefill_f16, cell_facts()) is None
     assert gdn_engine.level_plan_refusal(gdn_prefill_f16, cell_facts(**change)) == reason
+
+
+@pytest.mark.L0
+def test_a_measured_cell_ranks_above_the_tail(level_form):
+    """Where the engine's own plan runs a batch's last partial wave as a tail, a measured cell takes the levelled table
+    in the tail's place.  The same sequences one chunk longer or shorter, a batch no line names, keep the tail, and
+    ragged pieces refuse a cell as they refuse any batch."""
+    cells = tail_cells()
+    assert cells and all(beside for _, beside in cells)
+    for cell, beside in cells:
+        assert gdn_engine.level_plan_refusal(gdn_prefill_f16, facts_of(cell, tail=True)) is None
+        assert gdn_engine.level_plan_refusal(gdn_prefill_f16, facts_of(cell, tail=True, ragged_pieces=True)) == "tail"
+        for chunks in beside:
+            assert gdn_engine.level_plan_refusal(gdn_prefill_f16, facts_of(cell, tail=True, rows=cell.sequences * chunks * B_T)) == "tail"
 
 
 @pytest.mark.L0
@@ -595,19 +645,23 @@ def set_level(monkeypatch, on):
     clear_caches()
 
 
-def smallest_cell():
-    """The measured cell with the fewest chunks: ``(SMs, key width, value width, group, tiles, chunks)``."""
-    return min(gdn_prefill_f16.LEVEL_MEASURED_CELLS, key=lambda cell: cell[4] * cell[5])
+def smallest_cell(cells=None):
+    """The measured cell with the fewest chunks to run (of ``cells``)."""
+    return min(cells or gdn_prefill_f16.LEVEL_MEASURED_CELLS, key=lambda cell: cell.sequences * cell.chunks)
 
 
-def cell_case(seq_lens=None):
-    """A batch of the smallest measured cell (``seq_lens``: other lengths of the same total) and the SM count to plan for."""
-    sms, d_k, d_v, group, tiles, chunks = smallest_cell()
-    heads_key = 16
-    num_seqs = tiles // (heads_key * group)
-    seq_lens = [chunks * B_T] * num_seqs if seq_lens is None else seq_lens
-    assert sum(seq_lens) == num_seqs * chunks * B_T
-    return make_case("gdn", torch.bfloat16, seq_lens=seq_lens, H=heads_key, HV=heads_key * group, K=d_k, V=d_v, lo=0.9), sms
+def cell_case(cell=None, seq_lens=None):
+    """``(case, cell)``: a batch of a measured cell, the smallest unless one is named (``seq_lens``: other lengths of
+    its sequences)."""
+    cell = cell or smallest_cell()
+    seq_lens = [cell.chunks * B_T] * cell.sequences if seq_lens is None else seq_lens
+    return make_case("gdn", getattr(torch, cell.io), seq_lens=seq_lens, H=cell.heads_key, HV=cell.heads_out, K=cell.d_k, V=cell.d_v, lo=0.9), cell
+
+
+def plan_for(monkeypatch, cell):
+    """The engine plans for the cell's part, whatever part the device is."""
+    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: cell.sms)
+    monkeypatch.setattr(gdn_engine, "compute_capability", lambda device: cell.compute_capability)
 
 
 def pooled_forward(backend, case, packed, indices=None, cu=None):
@@ -644,9 +698,9 @@ def test_levelled_plan_keeps_the_uncut_plans_bytes(monkeypatch, frost):
     has them -- every level word a row sets reads the lanes of compute group 1 behind the launch and no other word is
     touched, and output and pool are bitwise the uncut plan's and agree with the fp64 reference."""
     backend, built, regions = frost
-    case, sms = cell_case()
+    case, cell = cell_case()
     group = case.HO // case.HK
-    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: sms)
+    plan_for(monkeypatch, cell)
     packed = random_state(case)
     set_level(monkeypatch, False)
     o_off, pool_off, indices = pooled_forward(backend, case, packed)
@@ -657,10 +711,10 @@ def test_levelled_plan_keeps_the_uncut_plans_bytes(monkeypatch, frost):
     o_on, pool_on, _ = pooled_forward(backend, case, packed)
     assert any(cfg.level_plan and cfg.level_wait == 1 and cfg.level_group == group for cfg in built)
     count, parts, order, words = device_table(regions, case)
-    host_parts, host_order = split_k.level_table(case.N * case.HO, smallest_cell()[5], sms, group)
+    host_parts, host_order = split_k.level_table(case.N * case.HO, cell.chunks, cell.sms, group)
     assert (count, parts, order) == (len(host_parts), host_parts, host_order)
     lanes = gdn_prefill_f16.level_set_lanes(next(cfg for cfg in built if cfg.level_plan))
-    assert words == [lanes if word in {entry for entry in host_order if entry > 0} else 0 for word in range(sms)]
+    assert words == [lanes if word in {entry for entry in host_order if entry > 0} else 0 for word in range(cell.sms)]
     assert_bitwise("o[level plan]", o_on, o_off)
     assert_bitwise("pool[level plan]", pool_on, pool_off)
     o_ref, fs_ref = reference(case, initial_state=packed)
@@ -670,12 +724,13 @@ def test_levelled_plan_keeps_the_uncut_plans_bytes(monkeypatch, frost):
 
 @pytest.mark.L0
 def test_levelled_plan_is_taken_on_a_measured_grid_only(monkeypatch, frost):
-    """The same batch planned for the device's own SM count: the plan is levelled exactly where that count is a measured
-    cell's, and output and pool are the uncut plan's either way."""
+    """The same batch planned for the device itself: the plan is levelled exactly where the device is a measured cell's
+    part -- its compute capability and its SM count -- and output and pool are the uncut plan's either way."""
     backend, built, regions = frost
-    case, _ = cell_case()
-    sms = gdn_engine.multiprocessor_count(torch.cuda.current_device())
-    measured = (sms,) + smallest_cell()[1:] in gdn_prefill_f16.LEVEL_MEASURED_CELLS
+    case, cell = cell_case()
+    device = torch.cuda.current_device()
+    part = cell._replace(compute_capability=tuple(gdn_engine.compute_capability(device)), sms=gdn_engine.multiprocessor_count(device))
+    measured = part in gdn_prefill_f16.LEVEL_MEASURED_CELLS
     packed = random_state(case)
     set_level(monkeypatch, False)
     o_off, pool_off, _ = pooled_forward(backend, case, packed)
@@ -698,8 +753,8 @@ def test_a_plan_the_admission_refuses_builds_no_level_plan(monkeypatch, frost, p
     not depend on the batch, a checkpoint cadence: the engine tells the admission so, no level build is made and the
     prologue writes the uncut table."""
     backend, built, regions = frost
-    case, sms = cell_case()
-    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: sms)
+    case, cell = cell_case()
+    plan_for(monkeypatch, cell)
     pool, indices, _ = state_pool(case, random_state(case))
     set_level(monkeypatch, True)
     run_fwd(backend, case, initial_state=pool, state_indices=indices, output_final_state=True, **REFUSED_PLANS[plan])
@@ -707,6 +762,62 @@ def test_a_plan_the_admission_refuses_builds_no_level_plan(monkeypatch, frost, p
     assert built and not any(cfg.level_plan for cfg in built)
     count, _, order, _ = device_table(regions, case)
     assert count == case.N * case.HO and order is None
+
+
+@pytest.mark.L0
+def test_levelled_plan_takes_the_tails_place_at_a_measured_cell(monkeypatch, frost):
+    """A measured cell whose tiles leave a partial last wave, planned for its part.  With the switches as they are
+    committed, and with the seed-copy form alone, the engine runs that wave as a tail: the main launch's table stops at
+    the full waves.  With the level switch on the whole batch runs levelled -- both tables as the host form has them
+    -- and output and pool are bitwise those of the plan without a tail."""
+    backend, built, regions = frost
+    cell = smallest_cell([cell for cell, _ in tail_cells()])
+    case, _ = cell_case(cell)
+    plan_for(monkeypatch, cell)
+    n_tiles = case.N * case.HO
+    full_waves = n_tiles // cell.sms * cell.sms
+    packed = random_state(case)
+    pooled_forward(backend, case, packed)
+    assert device_table(regions, case)[0] == full_waves
+    waves = tail_rule.TAIL_MAX_WAVES
+    monkeypatch.setattr(tail_rule, "TAIL_MAX_WAVES", 0)
+    set_level(monkeypatch, False)
+    o_uncut, pool_uncut, _ = pooled_forward(backend, case, packed)
+    assert device_table(regions, case)[0] == n_tiles
+    monkeypatch.setattr(tail_rule, "TAIL_MAX_WAVES", waves)
+    set_level(monkeypatch, False)
+    pooled_forward(backend, case, packed)
+    assert device_table(regions, case)[0] == full_waves
+    assert not any(cfg.level_plan for cfg in built)
+    set_level(monkeypatch, True)
+    o_on, pool_on, _ = pooled_forward(backend, case, packed)
+    assert any(cfg.level_plan for cfg in built)
+    count, parts, order, _ = device_table(regions, case)
+    host_parts, host_order = split_k.level_table(n_tiles, cell.chunks, cell.sms, case.HO // case.HK)
+    assert (count, parts, order) == (len(host_parts), host_parts, host_order)
+    assert_bitwise("o[level plan in the tail's place]", o_on, o_uncut)
+    assert_bitwise("pool[level plan in the tail's place]", pool_on, pool_uncut)
+
+
+@pytest.mark.L0
+def test_a_batch_beside_a_measured_cell_keeps_its_tail(monkeypatch, frost):
+    """The sequences of a measured cell with a tail, one chunk longer or shorter -- a batch no line names: the level
+    switch changes nothing.  The engine builds no level plan, runs the tail and returns the same bytes."""
+    backend, built, regions = frost
+    cell, beside = min(tail_cells(), key=lambda entry: entry[0].sequences * entry[0].chunks)
+    case, _ = cell_case(cell, seq_lens=[beside[0] * B_T] * cell.sequences)
+    plan_for(monkeypatch, cell)
+    full_waves = case.N * case.HO // cell.sms * cell.sms
+    packed = random_state(case)
+    set_level(monkeypatch, False)
+    o_off, pool_off, _ = pooled_forward(backend, case, packed)
+    assert device_table(regions, case)[0] == full_waves
+    set_level(monkeypatch, True)
+    o_on, pool_on, _ = pooled_forward(backend, case, packed)
+    assert not any(cfg.level_plan for cfg in built)
+    assert device_table(regions, case)[0] == full_waves
+    assert_bitwise("o[beside a cell]", o_on, o_off)
+    assert_bitwise("pool[beside a cell]", pool_on, pool_off)
 
 
 def unequal(lens):
@@ -729,9 +840,10 @@ def test_other_lengths_take_the_uncut_table(monkeypatch, frost, lengths):
     chains as items, no order entry, no level word, and the uncut plan's bytes.  The levelled table would cut every chain
     where sequence 0's chunk count says."""
     backend, built, regions = frost
-    even, sms = cell_case()
-    case, _ = cell_case(lengths([int(n) for n in (even.cu[1:] - even.cu[:-1]).tolist()]))
-    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: sms)
+    even, cell = cell_case()
+    case, _ = cell_case(seq_lens=lengths([int(n) for n in (even.cu[1:] - even.cu[:-1]).tolist()]))
+    assert int(case.cu[-1]) == int(even.cu[-1])
+    plan_for(monkeypatch, cell)
     packed = random_state(case)
     set_level(monkeypatch, False)
     o_off, pool_off, _ = pooled_forward(backend, case, packed)
@@ -752,8 +864,8 @@ def test_lengths_short_of_the_token_rows_take_the_uncut_table(monkeypatch, frost
     sequences have another chunk count -- a shape no measured cell names -- and the prologue writes the uncut table.
     The output rows the lengths name and the pool are the uncut plan's."""
     backend, built, regions = frost
-    case, sms = cell_case()
-    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: sms)
+    case, cell = cell_case()
+    plan_for(monkeypatch, cell)
     packed = random_state(case)
     cu = (case.cu // 2).contiguous()
     rows = int(cu[-1])
@@ -776,8 +888,8 @@ def test_a_pool_row_named_twice_takes_the_uncut_table(monkeypatch, frost):
     sequence's state.  The prologue writes the uncut table for such a batch, with no order entry of the levelled call in
     front of it left among its rows, and the levelled one again for the same batch with every row named once."""
     backend, built, regions = frost
-    case, sms = cell_case()
-    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: sms)
+    case, cell = cell_case()
+    plan_for(monkeypatch, cell)
     packed = random_state(case)
     set_level(monkeypatch, True)
     _, _, indices = pooled_forward(backend, case, packed)
@@ -788,7 +900,7 @@ def test_a_pool_row_named_twice_takes_the_uncut_table(monkeypatch, frost):
     twice[-1] = twice[0]
     pooled_forward(backend, case, packed, twice)
     count, parts, order, words = device_table(regions, case)
-    assert count == case.N * case.HO and sorted(parts) == [(tile, 0, smallest_cell()[5]) for tile in range(count)]
+    assert count == case.N * case.HO and sorted(parts) == [(tile, 0, cell.chunks) for tile in range(count)]
     assert not any(order) and not any(words)
     pooled_forward(backend, case, packed, indices)
     assert device_table(regions, case) == levelled
@@ -800,8 +912,8 @@ def test_two_state_buffers_run_the_uncut_build(monkeypatch, frost):
     which its first item did not write.  The engine runs the uncut build then, and the level build when one buffer is
     bound for both; either gives the uncut plan's bytes."""
     backend, built, regions = frost
-    case, sms = cell_case()
-    monkeypatch.setattr(gdn_engine, "multiprocessor_count", lambda device: sms)
+    case, cell = cell_case()
+    plan_for(monkeypatch, cell)
     packed = random_state(case)
     scale = case.K**-0.5
 

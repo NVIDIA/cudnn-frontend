@@ -228,14 +228,39 @@ STATE_SEED_KEY_NONE = -1  # an empty slot of the final-state keys
 #   as TILE_HANDOVER_EARLY has it: a held publication may be the one that item's CTA takes next, and its set must not
 #   wait for it.
 LEVEL_PLAN = False
-# The shapes a level plan is taken at, one line per cell that was measured not slower than the uncut plan of the same
-# build: (SMs of the grid, key width, value width, value heads per key head, tiles, chunks per tile).  What a cut tile
-# costs beside its chunks does not follow from the shape, so a shape without a line keeps the uncut plan.
+
+
+class LevelCell(NamedTuple):
+    """A batch as a line of ``LEVEL_MEASURED_CELLS`` names it: the part, the kernel's geometry and the batch."""
+
+    compute_capability: Tuple[int, int]
+    sms: int
+    io: str  # the operands' type, by name
+    d_k: int
+    d_v: int
+    heads_key: int
+    heads_out: int
+    sequences: int
+    chunks: int  # per sequence
+
+
+# The batches a level plan is taken at, one line per cell that was measured faster on the 152-SM part of compute
+# capability 10.0 than the plan the engine has there without it: the uncut plan or, where the cell's tiles leave a
+# partial last wave the engine runs as a tail, that tail.  A line names what the measurement fixed: the part, the
+# operands' type, the key and value widths, the key and output heads, the sequences and the chunks per sequence.  It
+# does not name the op's pointwise options (the q / k normalisation, the gate's domain, the beta sigmoid) nor whether
+# the state lives in a pool: they change a chunk's pointwise work, not which thread block runs which chunk.  What a
+# cut tile costs beside its chunks does not follow from the shape, so a batch without a line keeps the engine's own
+# plan.
 LEVEL_MEASURED_CELLS = (
-    (152, 128, 128, 3, 768, 16),
-    (152, 128, 128, 3, 192, 16),
-    (152, 128, 128, 3, 192, 64),
-    (152, 128, 128, 3, 528, 16),
+    LevelCell((10, 0), 152, "bfloat16", 128, 128, 16, 48, 16, 16),
+    LevelCell((10, 0), 152, "bfloat16", 128, 128, 16, 48, 4, 16),
+    LevelCell((10, 0), 152, "bfloat16", 128, 128, 16, 48, 7, 16),
+    LevelCell((10, 0), 152, "bfloat16", 128, 128, 16, 48, 10, 16),
+    LevelCell((10, 0), 152, "bfloat16", 128, 128, 16, 48, 13, 16),
+    LevelCell((10, 0), 152, "bfloat16", 128, 128, 16, 48, 4, 64),
+    LevelCell((10, 0), 152, "bfloat16", 128, 128, 16, 48, 4, 32),
+    LevelCell((10, 0), 152, "bfloat16", 128, 128, 16, 48, 11, 16),
 )
 # Test only, off: the switch of the four knobs below.  A build with it off takes none of them -- the level plan orders
 # its cut tiles, has no delay and no count, and is taken only at a measured cell.
@@ -302,10 +327,15 @@ def level_plan_form(io_dtype: Type[cutlass.Numeric], d_k: int, d_v: int) -> bool
     return bool(build_cfg(io_dtype, cutlass.Float32, max_active_clusters=1, use_initial_state=True, store_final_state=True, d_k=d_k, d_v=d_v).state_seed_copy)
 
 
-def level_plan_cell(d_k: int, d_v: int, group: int, n_tiles: int, chunks: int, num_sms: int) -> bool:
-    """Whether ``n_tiles`` tiles of ``chunks`` chunks each, ``group`` value heads per key head, on ``num_sms`` CTAs are a
-    line of ``LEVEL_MEASURED_CELLS`` (a test build with ``LEVEL_FORCE``: any shape)."""
-    return (int(num_sms), int(d_k), int(d_v), int(group), int(n_tiles), int(chunks)) in LEVEL_MEASURED_CELLS or level_test().force
+def level_plan_listed(cell: LevelCell) -> bool:
+    """Whether the batch is a line of ``LEVEL_MEASURED_CELLS``."""
+    return cell in LEVEL_MEASURED_CELLS
+
+
+def level_plan_cell(cell: LevelCell) -> bool:
+    """Whether a level plan is taken at the batch: a line of ``LEVEL_MEASURED_CELLS`` (a test build with ``LEVEL_FORCE``:
+    any batch)."""
+    return level_plan_listed(cell) or level_test().force
 
 
 def level_wait(level_plan: bool) -> int:
