@@ -558,7 +558,10 @@ block of a step on its target kernel, a census recorded on that compute capabili
 of the record. Until then the line reads `NOT CLAIMED` with every reason that applies: a row selected with `--provider`
 (`not the target set: <block> selected by --provider`), fallback rows present, a launch shape recorded with a width
 or at a maximum length the run does not share, a kernel of the target the plan has no block for, no recorded section for this compute capability and SM count (the line names both) or for this row count,
-versions other than the recorded ones. The census file has one section today: compute capability 10.0 with 148 SMs, at
+versions other than the recorded ones. On the recorded class `native` launches every kernel of the plain step and of the
+verify step today, and its line still reads `NOT CLAIMED (the census does not claim this class yet)`: the quantise in
+front of the output head is a port whose launch grid is its own, the census records no launch shape for it, and so
+there is none to compare its launch with yet. The census file has one section today: compute capability 10.0 with 148 SMs, at
 1 row, for the layer widths of the published 27B-class model, recorded on 2026-11-12. On another GPU class, another SM
 count, another sequence count or a checkpoint of the family with other layer widths a run says `kernel identity: not
 stated for this run` and names what differs: the kernels of the target are recorded per class, row count and model, and
