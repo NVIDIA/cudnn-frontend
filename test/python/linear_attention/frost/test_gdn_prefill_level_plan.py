@@ -39,6 +39,7 @@ gdn_warmup_forward_f16 = pytest.importorskip("cudnn.linear_attention.frost.kerne
 
 SEED_COPY_FORM = ("STATE_IO_COALESCED", "TILE_HANDOVER_EARLY", "STATE_SEED_COPY")
 B_T = gdn_prefill_f16.CFG.B_T
+UNWRITTEN = -(1 << 30)  # what a device case leaves in the prologue's tables in front of a call: no row, order entry or count reads so
 # Shapes beside the measured cells: (tiles, chunks, SMs, heads per sequence, group).
 SWEEP = [
     (n_seqs * heads, chunks, sms, heads, group)
@@ -549,7 +550,9 @@ def test_no_hand_out_of_a_levelled_table_waits_for_ever(hand_outs):
 def frost(monkeypatch):
     """``(backend, built, regions)``: the FROST backend, the prefill configs the test's calls build and, per call, what
     the prologue left in the regions the forward host was handed (the item count, the work items, the order entries, the
-    scheduler words).  The host cache starts empty and every call runs the op, not a recording of an earlier one."""
+    scheduler words).  The count, the work items and the order entries read ``UNWRITTEN`` in front of every call, so a
+    region shows what that call's prologue wrote.  The host cache starts empty and every call runs the op, not a
+    recording of an earlier one."""
     reason = frost_la_unavailable()
     if reason:
         pytest.skip(reason)
@@ -563,6 +566,10 @@ def frost(monkeypatch):
         return cfg
 
     def run_warmup_forward(compiled, facts, **buffers):
+        for name in ("work_count", "work_items", "level_order"):
+            if buffers.get(name) is not None:
+                torch.from_dlpack(buffers[name]).fill_(UNWRITTEN)
+        torch.cuda.synchronize()
         real_run(compiled, facts, **buffers)
         torch.cuda.synchronize()
 
@@ -616,9 +623,15 @@ def pooled_forward(backend, case, packed, indices=None, cu=None):
 
 
 def device_table(regions, case):
-    """The last call's ``(item count, parts, order entries, level words)`` as the prologue wrote them."""
+    """The last call's ``(item count, parts, order entries, level words)`` as the prologue wrote them: every row and
+    order entry below the count, and nothing at or above it."""
     last = regions[-1]
     count = int(last["work_count"][0])
+    assert 0 <= count <= last["work_items"].shape[0]
+    for name in ("work_items", "level_order"):
+        if last[name] is not None:
+            assert not bool((last[name][:count] == UNWRITTEN).any()), f"{name}: a row below the item count {count} was not written"
+            assert bool((last[name][count:] == UNWRITTEN).all()), f"{name}: a row at or above the item count {count} was written"
     rows = last["work_items"][:count].tolist()
     parts = [(row[0] * case.HO + row[1], row[2], row[3]) for row in rows]
     order = None if last["level_order"] is None else last["level_order"][:count].tolist()
