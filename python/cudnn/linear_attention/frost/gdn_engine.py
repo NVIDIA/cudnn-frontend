@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import math
 from operator import itemgetter
+from typing import NamedTuple
 
 import cudnn
 from cudnn import cpp_launcher
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
+from cudnn.frost.buffers import data_ptr
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze, qk_l2norm_eps
@@ -103,6 +105,69 @@ def gdn_support_gates(engine: str, facts) -> None:
         )
 
 
+class LevelFacts(NamedTuple):
+    """What decides whether a forward plan takes the prefill kernel's levelled table (``level_plan_refusal``)."""
+
+    io_name: str
+    dim_k: int
+    dim_v: int
+    heads_out: int
+    heads_key: int
+    num_seqs: int
+    rows: int  # token rows of the batch
+    b_t: int
+    num_sm: int
+    expand_num: int = 1
+    gdn: bool = True
+    scheme: str = "uncut"  # "uncut", or the scheme the plan chose in its place: chain, dv_split, warmup
+    batch_invariant: bool = False
+    tail: bool = False
+    ragged_pieces: bool = False
+    state_in_place: bool = True  # one fp32 state table is the seed and receives the final state
+    folded_seed: bool = False  # preceding summaries or a composed initial state
+    checkpoints: bool = False
+
+
+def level_plan_refusal(kernel_module, facts: LevelFacts):
+    """Why a forward plan keeps the uncut table, or ``None`` where it takes the levelled one.  The levelled table cuts a
+    (sequence, head) tile at a share border and runs it as two items that hand the fp32 state over through its stored
+    row, so it needs: the kernel's level build at this geometry; a GDN plan that is the uncut one with nothing in front
+    of or behind the prefill (no chain group, value-width split, cut table, tail or ragged pieces); a schedule that may
+    depend on the batch; one fp32 state table as seed and final state, with no folded seed; no checkpoint (a checkpoint
+    row belongs to one item); no sub-token expansion; a total that divides into sequences of one length (the prologue
+    checks the lengths themselves); value heads in whole groups per key head; a shape the table can be laid out for; and
+    a cell that was measured (``LEVEL_MEASURED_CELLS``)."""
+    from .common.host import get_dtype
+    from .common.split_k import level_plan_shape
+
+    if not kernel_module.level_plan_form(get_dtype(facts.io_name), facts.dim_k, facts.dim_v):
+        return "level_plan_form"
+    if not facts.gdn or facts.scheme != "uncut":
+        return "scheme"
+    if facts.batch_invariant:
+        return "batch_invariant"
+    if facts.tail or facts.ragged_pieces:
+        return "tail"
+    if not facts.state_in_place or facts.folded_seed:
+        return "state"
+    if facts.checkpoints:
+        return "checkpoints"
+    if facts.expand_num != 1:
+        return "expand_num"
+    if facts.num_seqs < 1 or facts.rows % facts.num_seqs != 0:
+        return "lengths"
+    if facts.heads_key < 1 or facts.heads_out % facts.heads_key != 0:
+        return "heads"
+    group = facts.heads_out // facts.heads_key
+    n_tiles = facts.num_seqs * facts.heads_out
+    chunks = -(-(facts.rows // facts.num_seqs) // facts.b_t)
+    if not level_plan_shape(n_tiles, chunks, facts.num_sm, facts.heads_out, group):
+        return "shape"
+    if not kernel_module.level_plan_cell(facts.dim_k, facts.dim_v, group, n_tiles, chunks, facts.num_sm):
+        return "cell"
+    return None
+
+
 class GdnFrostEngine(BaseEngine):
     """FROST chunked-kernel backend for single-node GDN graphs (THD layout); the default GDN engine on SM100 / SM103 / SM107,
     declining elsewhere so ranking falls back to ``GdnCuTileEngine``."""
@@ -147,7 +212,7 @@ class CompiledGdn:
 
         from .kernel.gdn_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.gdn_warmup_forward_f16 import TAIL_BUFFERS, build_warmup_forward, run_warmup_forward
-        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, level_plan_shape, level_scheduler_words, max_work_items, split_scratch_rows
+        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, level_scheduler_words, max_work_items, split_scratch_rows
         from .common.tail import GATE_WORDS, choose_tail
 
         self.node = node
@@ -247,29 +312,39 @@ class CompiledGdn:
             )
             if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
                 self.tail = None
-        # The levelled table (the kernel's build switch, on its seed-copy form only: level_plan_form): an uncut GDN plan
-        # without a tail or a chain group, whose fp32 state buffer is both the seed and the final state (a cut tile hands
-        # its state over through its row), no checkpoints, every sequence of one length (the shapes can only show a total
-        # that divides), a shape the rule takes.  Everything else keeps the uncut plan.
-        self.level_plan = bool(
-            kernel_module.level_plan_form(K, V)
-            and node.node_type.name == "GDN"
-            and not (self.chain or self.dv_split or self.split or self.batch_invariant)
-            and self.tail is None
-            and not self.ragged_pieces
-            and self.overwrite_initial_state
-            and self.has_final_state
-            and "initial_state" in node.inputs
-            and node.inputs["initial_state"].get_data_type().name == "FLOAT"
-            and "preceding_state_update" not in node.inputs
-            and "composed_initial_state" not in node.inputs
-            and not self.checkpoint
-            and not self.has_state_checkpoints
-            and self.expand_num == 1
-            and B > 0
-            and self.q_rows % B == 0
-            and level_plan_shape(B * HO, -(-(self.q_rows // B) // self.b_t), self.num_sm)
+        # The levelled table (level_plan_refusal); everything else keeps the uncut plan.  The tail goes first: a cell was
+        # measured against the uncut plan, not against a tail.
+        self.level_group = HO // HK if HK and HO % HK == 0 else 1
+        self.level_refusal = level_plan_refusal(
+            kernel_module,
+            LevelFacts(
+                io_name=self.io_name,
+                dim_k=K,
+                dim_v=V,
+                heads_out=HO,
+                heads_key=HK,
+                num_seqs=B,
+                rows=self.q_rows,
+                b_t=self.b_t,
+                num_sm=self.num_sm,
+                expand_num=self.expand_num,
+                gdn=node.node_type.name == "GDN",
+                scheme="chain" if self.chain else "dv_split" if self.dv_split else "warmup" if self.split else "uncut",
+                batch_invariant=self.batch_invariant,
+                tail=self.tail is not None,
+                ragged_pieces=bool(self.ragged_pieces),
+                state_in_place=bool(
+                    self.overwrite_initial_state
+                    and self.has_final_state
+                    and "initial_state" in node.inputs
+                    and node.inputs["initial_state"].get_data_type().name == "FLOAT"
+                ),
+                folded_seed="preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs,
+                checkpoints=bool(self.checkpoint or self.has_state_checkpoints),
+            ),
         )
+        self.level_plan = self.level_refusal is None
+        self.uncut_launch = None
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=self.q_rows, batch_invariant=self.batch_invariant) if self.chain else B
         self.tinv_pass = self.chain
@@ -676,11 +751,15 @@ class CompiledGdn:
             ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
             ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
             ragged_buffers=self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
-            level_order=region.get("level_order"),
         )
-        if self.warmup_launch is None:
+        # A cut tile's second item starts from the row its first item stored: the plan is levelled only while ONE buffer
+        # is bound as the seed and as the final state.  Two buffers run the uncut build over the same regions.
+        level_plan = self.level_plan and data_ptr(state0) == data_ptr(final_state)
+        buffers["level_order"] = region.get("level_order") if level_plan else None
+        launch = self.warmup_launch if level_plan == self.level_plan else self.uncut_launch
+        if launch is None:
             tail = self.tail
-            self.warmup_launch = self.build_warmup_forward(
+            launch = self.build_warmup_forward(
                 **buffers,
                 ragged_pieces=self.ragged_pieces,
                 ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
@@ -708,9 +787,14 @@ class CompiledGdn:
                 scale=self.scale,
                 device=self.device,
                 stream=stream,
-                level_plan=self.level_plan,
+                level_plan=level_plan,
+                level_group=self.level_group,
             )
-        self.run_warmup_forward(*self.warmup_launch, **buffers, checkpoint_every_n_tokens=self.checkpoint, scale=self.scale, stream=stream)
+            if level_plan == self.level_plan:
+                self.warmup_launch = launch
+            else:
+                self.uncut_launch = launch
+        self.run_warmup_forward(*launch, **buffers, checkpoint_every_n_tokens=self.checkpoint, scale=self.scale, stream=stream)
 
     def run_chain(
         self, q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream, lead_buffers

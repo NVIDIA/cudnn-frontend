@@ -330,6 +330,8 @@ def warmup_forward_host(
         gate_tail=tail_prefill_cfg is not None,
         level_blocks=prefill_cfg.max_active_clusters if cutlass.const_expr(prefill_cfg.level_plan) else 0,
         level_order=level_order,
+        level_group=prefill_cfg.level_group,
+        level_pool_rows=seed_indices if cutlass.const_expr(prefill_cfg.level_plan) else None,
     )
     gdn_prefill_f16.host(
         prefill_cfg,
@@ -599,14 +601,17 @@ def build_warmup_forward(
     ragged_buffers=(),
     l2norm_eps=l2norm.L2_NORM_EPS,
     level_plan=False,
+    level_group=1,
     level_order=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags, the split-K geometry, the d_v split, state and checkpoint
     presence, device, ``level_plan``) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat the marks
     of the standalone split-table and prefill builds so every kernel compiles as it does there.  ``l2norm_eps`` (the q/k
     normalize's additive epsilon) is a launch argument, absent from the key.  ``level_plan``: the uncut prologue writes the
-    levelled work-item table for ``num_sm`` CTAs and its order entries into ``level_order``, and the prefill runs it
-    (``gdn_prefill_f16.LEVEL_PLAN``); ``scheduler`` then carries a level word per CTA behind the ticket words."""
+    levelled work-item table for ``num_sm`` CTAs, in groups of ``level_group`` tiles, and its order entries into
+    ``level_order`` -- or the uncut table where the batch's lengths or pool rows cannot take the levelled one -- and the
+    prefill runs it (``gdn_prefill_f16.LEVEL_PLAN``); ``scheduler`` then carries a level word per CTA behind the ticket
+    words."""
     DK = q.shape[2]
     DV = v.shape[-1]
     if level_plan and (item_limit_word is not None or tail_enable is not None):
@@ -695,7 +700,7 @@ def build_warmup_forward(
         bool(gdn_prefill_f16.STATE_IO_COALESCED),
         bool(gdn_prefill_f16.TILE_HANDOVER_EARLY),
         bool(gdn_prefill_f16.STATE_SEED_COPY),
-        gdn_prefill_f16.level_build_key(bool(level_plan)),
+        gdn_prefill_f16.level_build_key(bool(level_plan), level_group),
     )
     if key not in warmup_forward_cache:
         prefill_cfg = gdn_prefill_f16.build_cfg(
@@ -722,6 +727,7 @@ def build_warmup_forward(
             v_slots=v_slots,
             beta_slots=beta_slots,
             level_plan=bool(level_plan),
+            level_group=level_group,
         )
 
         gate_table_placeholder = None

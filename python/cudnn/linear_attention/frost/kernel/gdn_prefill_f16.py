@@ -114,6 +114,7 @@ from ..common.thd import (
     TENSOR_MAP_QWORDS,
 )
 from ..common.split_k import (
+    LEVEL_VOTE_WORDS,
     LEVEL_WORD_BASE,
     ORDER_CAPACITY,
     ORDER_ELEMENTS,
@@ -208,38 +209,72 @@ STATE_SEED_CALL_BYTES = 32  # bytes per row of one tcgen05.cp.128x256b
 STATE_SEED_DESC_STEP_BYTES = 16  # one step of a tcgen05 shared-memory descriptor
 STATE_SEED_KEY_HEAD = 1 << 20
 STATE_SEED_KEY_NONE = -1  # an empty slot of the final-state keys
-# Build switch, off: the levelled plan of an in-place batch of equal lengths whose (sequence, head) tiles exceed one wave
-# and leave a partial last one (the engine admits it, common/split_k.py: level_plan_shape).  The prologue lays the tiles end
-# to end over the CTAs in balanced shares (level_order_body, level_closing_body); a tile across a share border runs as two
-# items, the second started from the state the first stored; every item, a CTA's first one included, is handed out by the
-# ticket.  Built on the seed-copy form only (STATE_IO_COALESCED, TILE_HANDOVER_EARLY and STATE_SEED_COPY on): every item is
-# then a seeded one, so the second item of a cut tile gets the first one's state through the load warp's seed fills.
+# Build switch, off: the levelled plan of an in-place batch of sequences of one chunk count whose (sequence, head) tiles
+# exceed one wave and leave a partial last one.  The prologue lays the tiles end to end, in groups of the value heads of
+# one key head, over the CTAs in balanced shares (common/split_k.py: level_order_body, level_closing_body); a tile across a
+# share border runs as two items, the second started from the state the first stored; every item, a CTA's first one
+# included, is handed out by the ticket.  Built on the seed-copy form only (STATE_IO_COALESCED, TILE_HANDOVER_EARLY and
+# STATE_SEED_COPY on): every item is then a seeded one, so the second item of a cut tile gets the first one's state
+# through the load warp's seed fills.
+# - What orders the second item behind the first one's state store: the first item's CTA adds to the border's level word
+#   from every lane of compute group 1 behind their stores of the state (a release at GPU scope, behind a proxy fence:
+#   the second item's seed is read through the async proxy); the second item's publication is held until the word reads
+#   the number of those lanes.
+# - The load warp holds the ticket it fetched back: every lane polls, as one warp (a loop in the elected lane's branch
+#   would leave the warp's later elects lowered per lane), and takes one acquire load.  The zero of that load goes into
+#   the row the warp itself goes on with -- its seed fills are addressed from that row -- and into the word it
+#   publishes, so the CTA loads nothing of the item in front of the acquire.  The zero is the acquired count minus the
+#   adding lanes: the load warp never reads the kernel's release-zero argument.
+# - An item that hands its state over takes its next ticket BEHIND its set and not in front of its final-state store
+#   as TILE_HANDOVER_EARLY has it: a held publication may be the one that item's CTA takes next, and its set must not
+#   wait for it.
 LEVEL_PLAN = False
-# What orders the second item of a cut tile behind the first one's state store in a level plan.
-#   1  The first item's CTA adds to the border's level word from every lane of compute group 1 behind their stores of the
-#      state (a release at GPU scope, behind a proxy fence: the second item's seed is read through the async proxy); the
-#      second item's publication is held until the word reads the lane count.  The default.
-#      The load warp holds the ticket it fetched back: every lane polls, as one warp (a loop in the elected lane's branch
-#      would leave the warp's later elects lowered per lane), and takes one acquire load.  The zero of that load goes into
-#      the row the warp itself goes on with -- its seed fills are addressed from that row -- and into the word it
-#      publishes, so the CTA loads nothing of the item in front of the acquire.  The zero is the acquired count minus the
-#      adding lanes: the load warp never reads the kernel's release-zero argument.
-#      An item that hands its state over takes its next ticket BEHIND its set and not in front of its final-state store
-#      as TILE_HANDOVER_EARLY has it: a held publication may be the one that item's CTA takes next, and its set must not
-#      wait for it.
-#   0  Nothing sets and nothing waits -- the order is left to timing: the positive control of the order's stress and the
-#      base for measuring what 1 costs, never a served build.
-LEVEL_WAIT = 1
-LEVEL_WAITS = (0, 1)
-# Test-only delays of a level plan, off: (row, cta, n_ctas, units).  The item of work-item row ``row`` sleeps about ``units``
-# microseconds in front of its final-state store, and the load warps of CTAs ``cta`` .. ``cta + n_ctas - 1`` sleep as long
-# in front of their first ticket; a negative ``row`` or ``cta`` leaves that delay out.  For the stress of the order between
-# the two items of a cut tile; () emits nothing.
+# The shapes a level plan is taken at, one line per cell that was measured not slower than the uncut plan of the same
+# build: (SMs of the grid, key width, value width, value heads per key head, tiles, chunks per tile).  What a cut tile
+# costs beside its chunks does not follow from the shape, so a shape without a line keeps the uncut plan.
+LEVEL_MEASURED_CELLS = (
+    (152, 128, 128, 3, 768, 16),
+    (152, 128, 128, 3, 192, 16),
+    (152, 128, 128, 3, 192, 64),
+    (152, 128, 128, 3, 528, 16),
+)
+# Test only, off: the switch of the four knobs below.  A build with it off takes none of them -- the level plan orders
+# its cut tiles, has no delay and no count, and is taken only at a measured cell.
+LEVEL_TEST = False
+# Nothing sets and nothing waits -- the order of a cut tile's two items is left to timing: the positive control of the
+# order's stress.  It returns other bytes.
+LEVEL_UNORDERED = False
+# Delays, (row, cta, n_ctas, units): the item of work-item row ``row`` sleeps about ``units`` microseconds in front of its
+# final-state store, and the load warps of CTAs ``cta`` .. ``cta + n_ctas - 1`` sleep as long in front of their first
+# ticket; a negative ``row`` or ``cta`` leaves that delay out.  () emits nothing.
 LEVEL_STRESS = ()
-# Test only, off (LEVEL_WAIT 1 builds): every thread of compute group 1 that loads a seed again at the start of an item that
-# continues a cut tile adds 1 to the level word of border 0, which no row sets or is held for.  A probe reads the word back
-# to see that the reload ran on such an item; False emits nothing.
+# Every thread of compute group 1 that loads a seed again at the start of an item that continues a cut tile adds 1 to
+# level word 0, which no row sets or is held for: a probe reads the word back to see that the reload ran on such an item.
 LEVEL_RELOAD_COUNT = False
+# The level plan at every shape the levelled table can be laid out for (common/split_k.py: level_plan_shape), measured
+# or not.
+LEVEL_FORCE = False
+
+
+class LevelTest(NamedTuple):
+    """The test knobs a level build is made with."""
+
+    unordered: bool = False
+    stress: Tuple[int, ...] = ()
+    reload_count: bool = False
+    force: bool = False
+
+
+def level_test() -> LevelTest:
+    """The module's test knobs as a build reads them: every one off unless ``LEVEL_TEST`` is on.  Raises on a
+    ``LEVEL_STRESS`` that is neither () nor four ints."""
+    if not LEVEL_TEST:
+        return LevelTest()
+    stress = tuple(int(value) for value in LEVEL_STRESS)
+    if stress and (len(stress) != 4 or stress[2] < 1 or stress[3] < 1):
+        raise ValueError(f"LEVEL_STRESS is () or (row, cta, n_ctas >= 1, units >= 1), got {LEVEL_STRESS!r}")
+    unordered = bool(LEVEL_UNORDERED)
+    return LevelTest(unordered, stress, bool(LEVEL_RELOAD_COUNT) and not unordered, bool(LEVEL_FORCE))
 
 
 def seed_copy_fills(d_k: int, d_v: int, kq_stage_bytes: int, state_bytes: int, kq_stages: int):
@@ -258,40 +293,36 @@ def seed_copy_fills(d_k: int, d_v: int, kq_stage_bytes: int, state_bytes: int, k
     return seed_box_cols, seed_subtiles_per_fill, seed_subtiles // seed_subtiles_per_fill
 
 
-def level_plan_form(d_k: int, d_v: int, io_bytes: int = 2) -> bool:
-    """Whether a level plan can be built at this geometry: ``LEVEL_PLAN`` with the three switches of the seed-copy form on,
-    and a geometry ``build_cfg`` takes the seed copy at for an fp32 state table that is stored back, without checkpoints, a
-    composed seed or sub-token expansion (the caller's own conditions for a level plan).  Every other combination is
-    refused here -- the plan then stays the uncut one -- and ``build_cfg`` raises for a level build without the seed copy."""
-    if not (LEVEL_PLAN and STATE_IO_COALESCED and TILE_HANDOVER_EARLY and STATE_SEED_COPY):
+def level_plan_form(io_dtype: Type[cutlass.Numeric], d_k: int, d_v: int) -> bool:
+    """Whether a level plan can be built at this geometry: ``LEVEL_PLAN`` on and a build that takes the seed copy for what
+    a level plan is -- an fp32 state table that is stored back, no checkpoints, no composed seed, no sub-token expansion,
+    one tile per head (the caller's own conditions).  ``build_cfg`` is asked, so its conditions are the only ones; every
+    other combination is refused here and the plan stays the uncut one."""
+    if not LEVEL_PLAN:
         return False
-    if d_v != 128 or d_k % 32 != 0:
-        return False
-    return seed_copy_fills(d_k, d_v, 2 * CFG.B_T * d_k * io_bytes, 4, CFG.SMEM_KQ_STAGES) is not None
+    return bool(build_cfg(io_dtype, cutlass.Float32, max_active_clusters=1, use_initial_state=True, store_final_state=True, d_k=d_k, d_v=d_v).state_seed_copy)
+
+
+def level_plan_cell(d_k: int, d_v: int, group: int, n_tiles: int, chunks: int, num_sms: int) -> bool:
+    """Whether ``n_tiles`` tiles of ``chunks`` chunks each, ``group`` value heads per key head, on ``num_sms`` CTAs are a
+    line of ``LEVEL_MEASURED_CELLS`` (a test build with ``LEVEL_FORCE``: any shape)."""
+    return (int(num_sms), int(d_k), int(d_v), int(group), int(n_tiles), int(chunks)) in LEVEL_MEASURED_CELLS or level_test().force
 
 
 def level_wait(level_plan: bool) -> int:
-    """The ``LEVEL_WAIT`` a level plan is built with (0 without the level plan); raises on a value outside ``LEVEL_WAITS``."""
-    if not level_plan:
-        return 0
-    if LEVEL_WAIT not in LEVEL_WAITS or isinstance(LEVEL_WAIT, bool):
-        raise ValueError(f"LEVEL_WAIT must be one of {LEVEL_WAITS}, got {LEVEL_WAIT!r}")
-    return int(LEVEL_WAIT)
+    """1 where the build orders the two items of a cut tile -- every level plan but a test build's ``LEVEL_UNORDERED`` --
+    else 0."""
+    return 1 if level_plan and not level_test().unordered else 0
 
 
 def level_stress(level_plan: bool) -> tuple:
-    """The delays of ``LEVEL_STRESS`` a level plan is built with: ``()`` or four ints; raises on another shape."""
-    if not level_plan or not LEVEL_STRESS:
-        return ()
-    stress = tuple(int(value) for value in LEVEL_STRESS)
-    if len(stress) != 4 or stress[2] < 1 or stress[3] < 1:
-        raise ValueError(f"LEVEL_STRESS is () or (row, cta, n_ctas >= 1, units >= 1), got {LEVEL_STRESS!r}")
-    return stress
+    """The delays a level plan is built with: () outside a test build with ``LEVEL_STRESS``."""
+    return level_test().stress if level_plan else ()
 
 
-def level_build_key(level_plan: bool):
-    """What a compile is keyed by for the level plan: False, or the flag with the module's build knobs ``build_cfg`` reads."""
-    return (True, level_wait(True), level_stress(True), bool(LEVEL_RELOAD_COUNT)) if level_plan else False
+def level_build_key(level_plan: bool, level_group: int = 1):
+    """What a compile is keyed by for the level plan: False, or the flag with the group and the test knobs ``build_cfg`` reads."""
+    return (True, int(level_group), level_wait(True), level_stress(True), level_test().reload_count) if level_plan else False
 
 
 def level_set_lanes(cfg) -> int:
@@ -301,8 +332,23 @@ def level_set_lanes(cfg) -> int:
 
 
 def level_orders(cfg) -> bool:
-    """Whether the build sets and waits for level words (a level plan with ``LEVEL_WAIT`` 1)."""
+    """Whether the build orders the two items of a cut tile: its load warp holds a row for a level word and its compute
+    group 1 sets that word (``level_sets``)."""
     return bool(cfg.level_plan and cfg.level_wait != 0)
+
+
+def level_sets(cfg, early_handover: bool) -> bool:
+    """Whether compute group 1 compiles the set of a level word, for its caller's trace: true exactly in a build whose
+    load warp holds a row for one (``level_orders``).  The set stands behind the final-state store of the early
+    hand-over; a build that holds without compiling that store would leave every held row waiting for ever, so it does
+    not build."""
+    if not level_orders(cfg):
+        return False
+    if not (early_handover and cfg.store_final_state):
+        raise ValueError(
+            "a level plan holds a tile's second item for a level word: compute group 1 must set it behind an fp32 final-state store of the early hand-over"
+        )
+    return True
 
 
 class GdnPrefillBars(NamedTuple):
@@ -490,7 +536,7 @@ def level_hold(cfg, row, mLevelOrder, mScheduler):
     flow with one ``row``.
 
     The zero is the acquired count minus ``level_set_lanes`` and not the count masked by the release-zero: the load warp
-    must not read that argument (``LEVEL_WAIT``).  The warp leaves the poll only when every lane has read that count,
+    must not read that argument (``LEVEL_PLAN``).  The warp leaves the poll only when every lane has read that count,
     exactly one row of the table adds to a word and adds exactly that many, the word is cleared in front of the launch
     and nothing else stores it, so the acquire load behind the poll returns exactly that count in every lane."""
     hold = cutlass.Int32(0)
@@ -504,13 +550,13 @@ def level_hold(cfg, row, mLevelOrder, mScheduler):
 @cute.jit
 def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one, total_tiles=None, mLevelOrder=None):
     """TMA-LDG-warp side: pull the next tile off the global ticket, publish it.  Level plan: the slot holds the ticket
-    itself (every row of the levelled table comes by the ticket).  ``LEVEL_WAIT`` 1: the warp holds a row that continues
-    a cut tile back (``level_hold``) between its own read of the ticket and the arrive that releases the consumers; the
-    wait's zero goes into the row the warp returns AND into the slot, which the elected lane writes once more in front of
-    that arrive -- one published row, formed from the acquire load, for the load warp and for the consumers.  The arrive
-    is delayed, never skipped; a ticket at or past ``total_tiles`` names no row and reads no order entry.  ``LEVEL_WAIT``
-    0: the elected lane arrives right behind its store of the slot and the warp reads the slot behind that arrive -- no
-    load of the slot is live across the arrive that hands it to the consumers."""
+    itself (every row of the levelled table comes by the ticket), and the warp holds a row that continues a cut tile
+    back (``level_hold``) between its own read of the ticket and the arrive that releases the consumers; the wait's zero
+    goes into the row the warp returns AND into the slot, which the elected lane writes once more in front of that
+    arrive -- one published row, formed from the acquire load, for the load warp and for the consumers.  The arrive is
+    delayed, never skipped; a ticket at or past ``total_tiles`` names no row and reads no order entry.  A test build
+    without the order (``LEVEL_UNORDERED``): the elected lane arrives right behind its store of the slot and the warp
+    reads the slot behind that arrive -- no load of the slot is live across the arrive that hands it to the consumers."""
     bars.mb_scheduler_done[scheduler_state.idx].wait(scheduler_state.phase)
     if elect_one:
         fetched = cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu"))
@@ -2320,7 +2366,7 @@ def compute1_warp_group(
     """Compute warp-group 1 role (warps 4-7): persistent scheduler loop
     running the per-chunk state-update and output epilogues.  In a level plan that orders its cut tiles the group adds
     to the level word of an item that hands its state over, behind the final-state store, and takes that item's next
-    ticket behind the add (``LEVEL_WAIT``)."""
+    ticket behind the add (``LEVEL_PLAN``)."""
     nvvm.setmaxregister(cfg.num_regs_compute_group_1, nvvm.SetMaxRegisterAction.INCREASE)
 
     v_index = PipelineState.start(phase=0)
@@ -2414,6 +2460,8 @@ def compute1_warp_group(
         free_in_store = mState_out.element_type == cutlass.Float32
     if cutlass.const_expr(cfg.state_seed_copy):
         seed_ready_index = PipelineState.start(phase=0)
+    # A build whose load warp holds a row for a level word sets that word here: one check for both sides.
+    sets_level_words = level_sets(cfg, early_handover)
     if cutlass.const_expr(cfg.seed_alias_guard):
         # The warp's keys of the final states it stored last (STATE_SEED_KEY_NONE = none).  Every lane of the warp stores
         # the same words and reads back words it stored itself; no other role touches them.  The address is warp-uniform,
@@ -2883,7 +2931,7 @@ def compute1_warp_group(
                         nvvm.fence_proxy("async.shared", space="cta")
                         bars.mb_o_tmastg_ready[o_idx].arrive()
 
-        if cutlass.const_expr(early_handover and level_orders(cfg)):
+        if cutlass.const_expr(sets_level_words):
             # ---- a level plan that orders its cut tiles.  An item that hands its state over (the first part of a cut
             # tile) takes no ticket here: its set stands behind the final-state store below, and the next publication may
             # be the one that set releases.  Every other item goes one item ahead as below. ----
@@ -3069,7 +3117,7 @@ def compute1_warp_group(
                         # The fp32 state region's next writer is the next item's seed, issued by these same threads; the
                         # final-state loads are complete before anything overwrites their columns.
                         nvvm.tcgen05_wait("load")
-                    if cutlass.const_expr(early_handover and level_orders(cfg)):
+                    if cutlass.const_expr(sets_level_words):
                         # The stored state is the seed of the tile's second part, which another CTA may run: every lane
                         # releases it behind its last store.
                         if hands_over:
@@ -3120,7 +3168,7 @@ def compute1_warp_group(
                                 if state_row_valid:
                                     gState_out[state_gmem_row + v_offset, i * ldtm_width + k] = cutlass.Float32(0.0).to(mState_out.element_type)
 
-        if cutlass.const_expr(early_handover and level_orders(cfg)):
+        if cutlass.const_expr(sets_level_words):
             # ---- the ticket of an item that handed its state over: behind its set ----
             if hands_over:
                 next_tile, scheduler_state, ahead, ahead_seed_row, next_final_dst = cg1_next_item(
@@ -3261,15 +3309,20 @@ def frost_gdn_prefill_prologue(
     gate_tail: cutlass.Constexpr[bool] = True,
     level_blocks: cutlass.Constexpr[int] = 0,
     mLevelOrder: Optional[cute.Tensor] = None,
+    level_group: cutlass.Constexpr[int] = 1,
+    mPoolRows: Optional[cute.Tensor] = None,
 ) -> None:
     """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the
     scheduler rings via :func:`order_body` (with ``level_blocks`` > 0 it writes the
-    levelled table for that many main-kernel CTAs and its order entries via
-    :func:`level_order_body` instead, and zeroes the level words with the ticket),
-    block 1 builds the per-batch TMA-descriptor arrays via
-    :func:`build_descs_body`, one warp per array.  With ``level_blocks`` > 0 the
-    launch has a third CTA: block 2 writes the closing parts of the levelled table
-    and the item count via :func:`level_closing_body`."""
+    levelled table for that many main-kernel CTAs, in groups of ``level_group``
+    tiles, and its order entries via :func:`level_order_body` instead -- or the
+    uncut table where the batch cannot take the levelled one -- and zeroes the
+    level words with the ticket), block 1 builds the per-batch TMA-descriptor
+    arrays via :func:`build_descs_body`, one warp per array.  With
+    ``level_blocks`` > 0 the launch has a third CTA: block 2 writes the closing
+    parts of the levelled table and the item count via
+    :func:`level_closing_body`.  ``mPoolRows``: the state pool's row per
+    sequence, where the state lives in a pool."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
@@ -3277,10 +3330,9 @@ def frost_gdn_prefill_prologue(
     widx = tidx // cutlass.Int32(32)
     bidx = cutlass.Int32(cute.arch.block_idx()[0])
     if bidx == cutlass.Int32(0):
-        # the sort's shared memory: the levelled writer sorts nothing and declares none
-        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16) if cutlass.const_expr(level_blocks == 0) else None
-        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16) if cutlass.const_expr(level_blocks == 0) else None
-        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8) if cutlass.const_expr(level_blocks == 0) else None
+        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
         n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= v.shape[2] else v.shape[2])
         if cutlass.const_expr(tiles_per_head > 1):
             n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
@@ -3291,18 +3343,28 @@ def frost_gdn_prefill_prologue(
         if cutlass.const_expr(mTailEnable is not None):
             n_items = n_items if cutlass.Int32(mTailEnable[0]) != cutlass.Int32(0) else cutlass.Int32(0)
         if cutlass.const_expr(level_blocks > 0):
+            sVote = cutlass.Array(cutlass.Int32, LEVEL_VOTE_WORDS, space=cutlass.AddressSpace.smem, alignment=16)
             level_order_body(
                 b_t,
                 ORDER_THREADS,
+                ORDER_ELEMENTS,
                 level_blocks,
+                level_group,
                 tidx,
                 n_heads_out,
                 n_items,
+                n_batch,
                 cu_seqlens,
+                mCount,
                 mWorkItems,
                 mScheduler,
+                sKey,
+                sIdx,
+                sSpread,
+                sVote,
                 expand_num=expand_num,
                 mLevelOrder=mLevelOrder,
+                mPoolRows=mPoolRows,
             )
         else:
             order_body(
@@ -3330,11 +3392,27 @@ def frost_gdn_prefill_prologue(
             # and the item count, off the SM that writes the rest of the table.
             if bidx != cutlass.Int32(1):
                 sRank = cutlass.Array(cutlass.Int32, level_blocks, space=cutlass.AddressSpace.smem, alignment=16)
+                sVote = cutlass.Array(cutlass.Int32, LEVEL_VOTE_WORDS, space=cutlass.AddressSpace.smem, alignment=16)
                 n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= v.shape[2] else v.shape[2])
                 if cutlass.const_expr(tiles_per_head > 1):
                     n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
                 level_closing_body(
-                    b_t, level_blocks, tidx, n_heads_out, n_items, cu_seqlens, mCount, mWorkItems, sRank, expand_num=expand_num, mLevelOrder=mLevelOrder
+                    b_t,
+                    ORDER_THREADS,
+                    level_blocks,
+                    level_group,
+                    tidx,
+                    n_heads_out,
+                    n_items,
+                    n_batch,
+                    cu_seqlens,
+                    mCount,
+                    mWorkItems,
+                    sRank,
+                    sVote,
+                    expand_num=expand_num,
+                    mLevelOrder=mLevelOrder,
+                    mPoolRows=mPoolRows,
                 )
                 widx = cutlass.Int32(ORDER_THREADS)  # past every descriptor array's warp: the guards below pass this CTA by
         build_descs_body(
@@ -3397,10 +3475,13 @@ def prologue(
     gate_tail: cutlass.Constexpr[bool] = True,
     level_blocks: cutlass.Constexpr[int] = 0,
     level_order: Optional[cute.Tensor] = None,
+    level_group: cutlass.Constexpr[int] = 1,
+    level_pool_rows: Optional[cute.Tensor] = None,
 ):
     """One-launch prologue: LPT-order the work items (``level_blocks`` > 0: the
-    levelled table for that many main-kernel CTAs, its order entries into
-    ``level_order``) and build the per-(b,h)
+    levelled table for that many main-kernel CTAs in groups of ``level_group``
+    tiles, its order entries into ``level_order``; ``level_pool_rows`` the state
+    pool's row per sequence) and build the per-(b,h)
     TMA-descriptor arrays (Q, K, V, O, checkpoints) into
     ``tensormap_workspace``."""
     k = expanded_view(k, k_slots, expand_num)
@@ -3521,6 +3602,8 @@ def prologue(
         gate_tail,
         level_blocks,
         level_order,
+        level_group,
+        level_pool_rows,
     ).launch(grid=(3 if cutlass.const_expr(level_blocks > 0) else 2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -4167,6 +4250,7 @@ class GdnPrefillCfg:
     seed_subtiles_per_fill: int = 0
     seed_fills: int = 0
     level_plan: bool = False
+    level_group: int = 1
     level_wait: int = 0
     level_stress: Tuple[int, ...] = ()
     level_reload_count: bool = False
@@ -4263,14 +4347,15 @@ def build_cfg(
     state_table: Optional[bool] = None,
     has_composed: bool = False,
     level_plan: bool = False,
+    level_group: int = 1,
 ) -> GdnPrefillCfg:
     """Build the per-compile ``GdnPrefillCfg`` (io_dtype in {Float16, BFloat16}; acc is
     always Float32).  ``tinv_source`` "compute" builds the chunk factor in compute
     group 0; "gmem" bulk-loads the tiles of ``gdn_tinv_f16.py``.  ``tiles_per_head`` > 1 runs every gate head as
     ``tiles_per_head`` tiles of ``d_v`` value columns each (the d_v split).  ``level_plan``: the work-item table is the
-    levelled one, so every item, a CTA's first included, comes by the ticket and starts from the stored state; such a
-    build takes the module's ``LEVEL_WAIT`` (what orders the two items of a cut tile) and its test-only knobs
-    (``LEVEL_STRESS``, ``LEVEL_RELOAD_COUNT``) and raises where it does not take the seed copy (``level_plan_form``)."""
+    levelled one in groups of ``level_group`` tiles, so every item, a CTA's first included, comes by the ticket and starts
+    from the stored state; such a build orders the two items of a cut tile, takes the module's test knobs only under
+    ``LEVEL_TEST`` and raises where it does not take the seed copy (``level_plan_form``)."""
     if tinv_source not in TINV_SOURCES:
         raise ValueError(f"tinv_source must be one of {TINV_SOURCES}, got {tinv_source!r}")
     cfg = GdnPrefillCfg(
@@ -4282,9 +4367,10 @@ def build_cfg(
         state_table=use_initial_state if state_table is None else bool(state_table),
         has_composed=bool(has_composed),
         level_plan=bool(level_plan),
+        level_group=int(level_group) if level_plan else 1,
         level_wait=level_wait(bool(level_plan)),
         level_stress=level_stress(bool(level_plan)),
-        level_reload_count=bool(level_plan and LEVEL_RELOAD_COUNT and level_wait(True) == 1),
+        level_reload_count=bool(level_plan and level_test().reload_count),
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         log_gate=log_gate,
