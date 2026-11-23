@@ -25,6 +25,10 @@ validation. Atomic dprob is numerically checked but is not claimed deterministic
 
 ### BF16 grouped GEMM sReLU forward
 
+Split validation (2026-11-23): pre-commit and `git diff --check` pass. Fern
+reports zero errors and one authentication-related redirect-check warning. GPU
+execution of the split revision remains pending; the six goldens are unchanged.
+
 `gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py` checks BF16 C/D replay,
 batch invariance and independent references for plain and clamped sReLU, with
 both `act_input="acc"` and `"saved"`. Six existing goldens under
