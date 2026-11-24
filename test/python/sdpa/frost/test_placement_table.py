@@ -65,7 +65,8 @@ def test_entries_are_well_formed_and_name_known_rows():
         )
         assert mask != "window_narrow" or (row, phase) == ("sdpa_bwd_sm80", "prefill_det"), key  # a row-local key
         assert group != "gqa_body" or (row, layout, phase in ("mtp", "prefill")) == ("sdpa_fwd_prefill_sm120", "paged", True), key
-        assert group != "gqa_partial" or (row, phase) in (("sdpa_fwd_prefill_sm107", "verify"), ("sdpa_fwd_prefill_sm90", "q1")), key
+        sm100_window_q1 = (row, phase, layout, mask) == ("sdpa_fwd_prefill_sm100", "q1", "paged", "window")
+        assert group != "gqa_partial" or (row, phase) in (("sdpa_fwd_prefill_sm107", "verify"), ("sdpa_fwd_prefill_sm90", "q1")) or sm100_window_q1, key
         assert group != "gqa_long_cache" or (row, heads, layout, mask, kv_off_tile) == ("sdpa_fwd_prefill_sm100", (192, 128), "dense", "window", False), key
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
@@ -1599,6 +1600,43 @@ def test_sm100_dense_d192x128_window_long_cache_follows_its_study(device_cc):
     for b, h_q, h_kv, s_q in ((1, 16, 1, 256), (1, 16, 2, 512), (2, 64, 8, 256)):
         leads = [pt.lookup(row, f(b, h_q, h_kv, s_q, kv)) for kv in (1 << 16, 1 << 17, 1 << 18)]
         assert leads == sorted(leads), (b, h_q, h_kv, s_q)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_sm100_window_decode_follows_its_study(device_cc):
+    """Study sm100_window_decode_v2_20261121: windowed paged single-row decode at d128 / d64. A GQA group the row packs only in part
+    keys `gqa_partial`, apart from whole packs; FROST leads whole packs between a grid floor and a ceiling, and the partial-pack
+    rows of the nightly keep the backend. Unpacked groups, unwindowed decode, MTP and other head dims keep their keys and entries."""
+    row = "sdpa_fwd_prefill_sm100"
+    study = "sm100_window_decode_v2_20261121"
+
+    def f(b, h_q, h_kv, s_kv=131072, d=128, **over):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=1, s_kv=s_kv, d_qk=d, d_v=d, causal=True, bottom_right=True, window_left=511)
+        base.update(device_cc=device_cc, has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for d, h_q, h_kv, group in ((128, 16, 2, "gqa"), (128, 80, 8, "gqa_partial"), (128, 24, 2, "gqa_partial"), (64, 16, 2, "gqa")):
+        for s_kv in (131072, 131073):
+            key = pt.class_key(row, f(128, h_q, h_kv, s_kv, d))
+            assert key == (row, device_cc, "bf16", (d, d), "q1", "paged", "window", False, group, s_kv % 128 != 0), key
+            assert pt.matched_entry(row, f(128, h_q, h_kv, s_kv, d)).study == study
+    # unpacked groups keep no entry; unwindowed decode, MTP and d256 do not key the partial pack
+    for d, h_q, h_kv in ((128, 72, 8), (64, 80, 8)):
+        assert pt.class_key(row, f(128, h_q, h_kv, d=d))[8] == "gqa_unpacked" and pt.matched_entry(row, f(128, h_q, h_kv, d=d)) is None
+    assert pt.class_key(row, f(128, 80, 8, window_left=None, causal=False, bottom_right=False))[8] == "gqa"
+    assert pt.class_key(row, f(128, 80, 8, s_q=4))[8] != "gqa_partial"
+    assert pt.class_key(row, f(128, 80, 8, d=256))[8] != "gqa_partial"
+    # whole packs: both verdicts, the lead between a floor and a ceiling of the grid
+    for d in (128, 64):
+        assert pt.lookup(row, f(1, 16, 2, d=d)) is False
+        assert pt.lookup(row, f(64, 16, 2, s_kv=8192, d=d)) is True
+    assert pt.lookup(row, f(128, 16, 2)) is True
+    assert pt.lookup(row, f(128, 128, 16)) is False
+    # the nightly's partial packs (ripple_swa) keep the backend at b 128
+    for h_q, h_kv in ((80, 8), (10, 1)):
+        assert pt.lookup(row, f(128, h_q, h_kv, window_left=1023)) is False
 
 
 @pytest.mark.L0
