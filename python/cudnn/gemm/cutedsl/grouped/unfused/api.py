@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public API for the unfused BF16 grouped GEMM: GroupedGemmSm100 (SM100+) and its SM90 (Hopper) twin GroupedGemmSm90."""
+"""Public API for the unfused BF16 grouped GEMM: GroupedGemmSm100 (SM100+) and its SM90 (Hopper) counterpart GroupedGemmSm90."""
 
 from __future__ import annotations
 

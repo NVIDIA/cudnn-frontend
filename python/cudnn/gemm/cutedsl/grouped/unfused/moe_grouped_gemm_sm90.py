@@ -55,7 +55,7 @@ def _widen_for_cluster(tma_tensor, mode, tile, cluster_count):
 
 
 KERNEL_SCHEDULES = ("cooperative", "pingpong")
-# The one pingpong configuration (the H100 sweep's only competitive one); every other tile or cluster is cooperative.
+# The one pingpong configuration (the only competitive one in an H100 tile sweep); every other tile or cluster is cooperative.
 PINGPONG_TILE = (128, 192)
 PINGPONG_CLUSTER = (2, 1)
 
@@ -101,7 +101,7 @@ def apply_schedule_override(rule_picks_pingpong: bool) -> bool:
 
 def use_pingpong(n: int, k: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]]) -> bool:
     """fwd / dgrad / GLU with or without C (n: the accumulator N, a GLU's 2I): the override, else pingpong for K <= 3072
-    and N >= 2048 (s6 H100 sweep; the K bound from the s13 H100 K x N sweep) on the 128x192 / (2, 1) configuration only."""
+    and N >= 2048 (from H100 sweeps over N and K) on the 128x192 / (2, 1) configuration only."""
     rule = k <= 3072 and n >= 2048 and pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None
     return apply_schedule_override(rule)
 
@@ -710,7 +710,7 @@ class MoEGroupedGemmBf16KernelSm90:
         sched_params: MoESchedulerParams,
         rz_arg: cutlass.Int32,
     ):
-        # The release-zero (python/cudnn/AGENTS.md Rule 11): the host passes 0; its only use is this call.
+        # The release-zero argument of tile_dsl.consume: the host passes 0; its only use is this call.
         rz = release_zero(rz_arg)
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)

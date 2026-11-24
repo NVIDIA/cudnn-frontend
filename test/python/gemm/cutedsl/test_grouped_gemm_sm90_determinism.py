@@ -111,7 +111,7 @@ def test_sm90_warm_stress(direction):
 
 # The tile-info slots (2 stages) turn over once per tile. K = 64 makes each tile one k-block, so 64 experts x 256 rows at
 # N = 3072 give 1536 (cooperative 128x256) or 2048 (pingpong 128x192) tiles, about 12 or 16 per CTA on H100, and the
-# scheduler warp waits on an empty slot at nearly every release (python/cudnn/AGENTS.md Rule 11).
+# scheduler warp waits on an empty slot at nearly every release, so a refill that overtook a pending load would show.
 TILE_INFO_STRESS = {
     "cooperative": dict(mma_tiler_mn=(128, 256), cluster_shape_mn=(2, 1)),
     "pingpong": dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1)),
