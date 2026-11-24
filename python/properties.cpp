@@ -783,7 +783,7 @@ init_properties(py::module_& m) {
         .value("WINOGRAD_TILE_13x13", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_13x13)
         .value("STRICT_NAN_PROP", cudnn_frontend::NumericalNote_t::STRICT_NAN_PROP)
         .value("FULL_PRECISION_MATH", cudnn_frontend::NumericalNote_t::FULL_PRECISION_MATH)
-        .value("RL", cudnn_frontend::NumericalNote_t::RL);
+        .value("BATCH_INVARIANT", cudnn_frontend::NumericalNote_t::BATCH_INVARIANT);
 
     bind_enum<cudnn_frontend::CudaGraphRetention_t>(m, "cuda_graph_retention", R"pbdoc(
         How CUDA graphs recorded from a graph keep its execution plans' resources alive.

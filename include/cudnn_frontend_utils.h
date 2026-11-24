@@ -755,7 +755,7 @@ enum class NumericalNote_t {
     WINOGRAD_TILE_13x13,
     STRICT_NAN_PROP,
     FULL_PRECISION_MATH,
-    RL = FRONTEND_NUMERICAL_NOTE_BASE,
+    BATCH_INVARIANT = FRONTEND_NUMERICAL_NOTE_BASE,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
@@ -772,7 +772,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
                                  {NumericalNote_t::WINOGRAD_TILE_13x13, "WINOGRAD_TILE_13x13"},
                                  {NumericalNote_t::STRICT_NAN_PROP, "STRICT_NAN_PROP"},
                                  {NumericalNote_t::FULL_PRECISION_MATH, "FULL_PRECISION_MATH"},
-                                 {NumericalNote_t::RL, "RL"},
+                                 {NumericalNote_t::BATCH_INVARIANT, "BATCH_INVARIANT"},
                              })
 
 enum class DataType_t {
@@ -1545,7 +1545,7 @@ convert_to_cudnn_type(cudnn_frontend::NumericalNote_t const mode, cudnnBackendNu
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
-        case NumericalNote_t::RL:
+        case NumericalNote_t::BATCH_INVARIANT:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 
 #ifndef NO_DEFAULT_IN_SWITCH

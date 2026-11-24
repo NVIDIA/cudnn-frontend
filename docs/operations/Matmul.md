@@ -38,10 +38,10 @@ set_compute_data_type(DataType_t value)
     - name
     - compute_data_type
 
-### Batch-invariant BF16 forward for reinforcement learning
+### Batch-invariant BF16 forward
 
-The Python graph API offers the `rl_gemm` engine on SM100, SM103 and SM107.
-Request it with the `RL` numerical note on both the rollout and training forward graphs.
+The Python graph API offers the `batch_invariant_gemm` engine on SM100, SM103 and SM107.
+Request it with the `BATCH_INVARIANT` numerical note on both the rollout and training forward graphs.
 
 ```python
 g = cudnn.pygraph(
@@ -53,7 +53,7 @@ a = g.tensor(dim=[1, m, k], stride=[m * k, k, 1], data_type=cudnn.data_type.BFLO
 b = g.tensor(dim=[1, k, n], stride=[n * k, 1, k], data_type=cudnn.data_type.BFLOAT16)
 y = g.matmul(A=a, B=b)
 y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
-g.select_numeric_notes([cudnn.numerical_note.RL])
+g.select_numeric_notes([cudnn.numerical_note.BATCH_INVARIANT])
 g.build()
 ```
 
@@ -73,12 +73,12 @@ for concurrent launches. Requesting the note on an unsupported graph raises
 `cudnnGraphNotSupportedError`. For a linear layer `Y = X @ W.T + bias`, training
 can use native cuDNN matmul plans to compute `dX = dY @ W` and `dW = dY.T @ X`,
 and an FP32 sum over the rows of `dY` for the bias gradient. The backward graphs
-use the saved input and weight and do not require the RL note.
+use the saved input and weight and do not require the `BATCH_INVARIANT` note.
 See the [determinism support matrix](https://docs.nvidia.com/cudnn/operations/determinism).
 
-### Scaled FP8 and FP4 forward for reinforcement learning
+### Batch-invariant FP8 and FP4 forward
 
-Select `cudnn.numerical_note.RL` on the training graph and pass
+Select `cudnn.numerical_note.BATCH_INVARIANT` on the training graph and pass
 `batch_invariant=True` to the corresponding FlashInfer rollout operation.
 Use FP32 compute and intermediate tensors, then set the final output to
 `BFLOAT16` or `HALF`. The input dtype, scale format and graph operations
@@ -109,7 +109,7 @@ w = g.block_scale_dequantize(input=b, descale=sb, block_size=[32, 1])
 p = g.matmul(A=x, B=w)
 y = g.mul(a=p, b=alpha)  # Omit the multiply when alpha is absent.
 y.set_output(True).set_data_type(cudnn.data_type.HALF)
-g.select_numeric_notes([cudnn.numerical_note.RL])
+g.select_numeric_notes([cudnn.numerical_note.BATCH_INVARIANT])
 g.build()
 ```
 
@@ -126,4 +126,7 @@ The bitwise forward contract applies on the same GPU architecture and software
 stack with fixed weights, scales, output dtype and logical input rows. Training
 can compute gradients for the effective floating-point operands using native
 cuDNN matmuls. A scalar output multiplier also multiplies the upstream gradient.
-See the [RL tests](../../test/python/rl/README.md) for executable graphs.
+See the [batch-invariant tests](../../test/python/gemm/batch_invariant/README.md) for executable graphs.
+The [forward benchmark](../../benchmark/gemm/benchmark_batch_invariant.py) measures the selected
+engine and the native cuDNN plan for the same graph. Pass `--flashinfer-legacy` to include
+the original FlashInfer kernels.

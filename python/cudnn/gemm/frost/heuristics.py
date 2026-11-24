@@ -29,8 +29,8 @@ class GemmFacts:
 def analyze_facts(graph) -> Optional[GemmFacts]:
     """The manifest's ``analyzer`` hook: facts for a GEMM graph, or None when
     the FROST analyzer cannot express it (the backend then serves it alone)."""
-    if graph._requires_rl:
-        # The RL engine matches the declared graph directly. Its eligibility
+    if graph._requires_batch_invariant:
+        # The batch-invariant engine matches the declared graph directly. Its eligibility
         # is independent of the fusion chains supported by the FROST compiler.
         return GemmFacts(chain=None, dynamic_shapes=False)
     from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed
@@ -49,7 +49,7 @@ def analyze_facts(graph) -> Optional[GemmFacts]:
 def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[PlanConfig]:
     """Ordered, supported plans carrying exact public-replay knobs."""
     if facts.chain is None:
-        return [PlanConfig(offered["rl_gemm"])] if "rl_gemm" in offered else []
+        return [PlanConfig(offered["batch_invariant_gemm"])] if "batch_invariant_gemm" in offered else []
     engine_id = offered.get(ENGINE)
     if engine_id is None:
         return []

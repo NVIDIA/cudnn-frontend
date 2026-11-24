@@ -294,7 +294,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "frost_gemm",
         "cudnn.gemm.frost.engine",
         "FrostGemmEngines",
-        slots={"frost_gemm": EngineSlot(0, opt_in=True), "rl_gemm": EngineSlot(1, opt_in=True, required_numeric_note="RL")},
+        slots={"frost_gemm": EngineSlot(0, opt_in=True), "batch_invariant_gemm": EngineSlot(1, opt_in=True, required_numeric_note="BATCH_INVARIANT")},
         # Facts + heuristics: the plan the engine would build, listed WITH its
         # tile config spelled as public knobs, so a recorded (engine_id, knobs)
         # pins the exact kernel (cudnn.gemm.frost.heuristics). One candidate for

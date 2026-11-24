@@ -371,11 +371,18 @@ SOFTWARE.
 12. FlashInfer (flashinfer-ai/flashinfer)
     https://github.com/flashinfer-ai/flashinfer
 
-The RL GEMMs in python/cudnn/gemm/rl/ adapt the BF16, FP8, groupwise FP8,
-MXFP8, NVFP4, MXFP4 and mixed MXFP8 x MXFP4 kernels, their weight-shape
-chunk rules, block-scale layouts and ordered FP32 epilogues from FlashInfer's
-flashinfer/gemm/batch_invariant at commit e2d163fb3d46dfe251feba5b6652a08871f4a0b8
-(Apache-2.0). These kernels use a frontend-owned compiler and launch interface.
+The batch-invariant GEMMs in python/cudnn/gemm/batch_invariant/ adapt
+Apache-2.0 sources from FlashInfer at commit e2d163fb3d46dfe251feba5b6652a08871f4a0b8.
+The BF16, FP8, groupwise FP8, MXFP8, NVFP4, MXFP4 and mixed MXFP8 x MXFP4
+kernels, K-chunk selection, block-scale layouts and ordered FP32 epilogues
+come from flashinfer/gemm/batch_invariant/. The CuteF32 arithmetic in
+_quantized/arithmetic.py also adapts flashinfer/batch_invariant/fp_interface/cute.py.
+The cuDNN Frontend port binds graph tensors and workspace through its own
+compiler and launch interface.
+
+The BF16 input generator in test/python/gemm/batch_invariant/test_flashinfer_integration.py
+adapts adv_bf16 from tests/gemm/test_batch_invariant_mm_bf16.py at the same
+revision. The fixture selects the device to which the generated inputs are copied.
 
 The FP8 split-K projection kernel for decode rows in
 python/cudnn/gemm/frost/projection_decode/kernel/fp8_projection_decode_e4m3.py
