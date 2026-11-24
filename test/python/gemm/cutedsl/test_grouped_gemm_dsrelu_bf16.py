@@ -280,12 +280,12 @@ def test_dsrelu_bf16_nan_propagates(clamp_scale, tanh_mode, deterministic):
 @pytest.mark.L0
 def test_dsrelu_bf16_default_determinism_follows_torch(monkeypatch):
     """Changing the global setting selects the matching plan; explicit False still opts out."""
-    import cudnn.gemm.cutedsl.grouped.dsrelu.api as module
+    from cudnn.gemm.cutedsl.grouped.dsrelu import api as dsrelu_module
 
     problem = make_problem([256, 0, 256], 320, 128, discrete=True, seed=47, exact=True)
     z_save = exact_z(problem["rows"], problem["n"], seed=48)
     prob = exact_prob(problem["rows"], seed=49)
-    compiles = count_wrapper_compiles(monkeypatch, module, "GroupedGemmDsreluSm100", "_cache_of_GroupedGemmDsreluSm100Objects")
+    compiles = count_wrapper_compiles(monkeypatch, dsrelu_module, "GroupedGemmDsreluSm100", "_cache_of_GroupedGemmDsreluSm100Objects")
     previous = torch.are_deterministic_algorithms_enabled()
     previous_warn = torch.is_deterministic_algorithms_warn_only_enabled()
     try:
@@ -1315,7 +1315,7 @@ def test_dsrelu_bf16_deterministic_dprob_side_stream_unordered_init():
     d_srelu and dprob must equal bit for bit the same call on torch's stream."""
     from cuda.bindings import driver as cuda
 
-    from cudnn.gemm.cutedsl.grouped.dsrelu.api import _dprob_n_slots
+    from cudnn.gemm.cutedsl.grouped.dsrelu import api as dsrelu_module
 
     n = 512
     problem = make_problem([256, 0, 512], n, 128, discrete=True, b_major="n", seed=301)
@@ -1324,7 +1324,7 @@ def test_dsrelu_bf16_deterministic_dprob_side_stream_unordered_init():
     prob = make_prob(rows, seed=303)
     expected = run_dsrelu(problem, z_save, prob, clamp_scale=CLAMP_SCALE, deterministic=True)
     torch.cuda.synchronize()
-    slots = _dprob_n_slots(n, (256, 256), (2, 1), True)
+    slots = dsrelu_module._dprob_n_slots(n, (256, 256), (2, 1), True)
     assert slots > 1, "the slot buffer needs more than one N tile to be exercised"
     side = torch.cuda.Stream()
     for shape in ((rows, slots, 1), (rows, 1, 1)):
