@@ -266,6 +266,29 @@ op.execute(
 
 ## Scheduling, cache, and errors
 
+### Atomic-counter tile claim
+
+By default the SM100 wgrad kernels (BF16, and block-scaled on SM100 and SM107)
+launch a grid of every output tile and rebalance uneven expert token counts with
+cluster launch control (CLC). `atomic_counter_claim=True` (a keyword of
+`grouped_gemm_wgrad_wrapper_sm100` and the last argument of
+`GroupedGemmWgradSm100`) launches persistent clusters instead, which claim output
+tiles from a 4-byte int32 counter in the kernel workspace; a helper kernel resets
+it on the launch stream before every launch. Each output tile is still computed
+by one CTA (pair) over its expert's whole token range, so the result is the same
+bytes as the CLC path. The default, `False`, generates the same code as before.
+
+- The counter follows the TMA descriptors in the workspace.
+  `get_grouped_gemm_wgrad_workspace_size_sm100(..., atomic_counter_claim=True)`
+  includes its 4 bytes; size a block-scaled `descriptor_workspace` with it.
+- The wrapper allocates that workspace per call on the launch stream (BF16
+  always, block-scaled with this option), so same-signature wrapper calls may
+  overlap on different streams. A class-API object without a
+  `descriptor_workspace` uses its own workspace; its calls must not overlap.
+- Dense and discrete output, both input orders, and `accumulate_on_output` are
+  supported. The JAX MXFP8 path does not take the option: the wrapper raises
+  `ValueError` there.
+
 The BF16 kernel uses dynamic persistent scheduling. The token dimension is
 compiled dynamically, and the wrapper cache abstracts the token-sized axes of A
 and B while retaining static dimensions, layouts, dtypes, output descriptors,

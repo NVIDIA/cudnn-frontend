@@ -55,8 +55,9 @@ def get_grouped_gemm_wgrad_workspace_size_sm100(
     *,
     output_mode: str = "dense",
     input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+    atomic_counter_claim: bool = False,
 ) -> int:
-    """Return required runtime TMA-descriptor workspace bytes."""
+    """Return required runtime workspace bytes: the TMA descriptors, plus the tile counter with ``atomic_counter_claim``."""
     if num_experts <= 0:
         raise ValueError(f"num_experts must be positive, got {num_experts}")
     try:
@@ -72,7 +73,8 @@ def get_grouped_gemm_wgrad_workspace_size_sm100(
             normalized_input_order,
             weight_mode,
             num_experts,
-        ),
+        )
+        + (4 if atomic_counter_claim else 0),
         1,
     )
 
@@ -140,6 +142,7 @@ class GroupedGemmWgradSm100(APIBase):
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+        atomic_counter_claim: bool = False,
     ) -> None:
         super().__init__()
         self._pending_init_kwargs = dict(locals())
@@ -322,6 +325,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
     *,
     descriptor_workspace: Optional[torch.Tensor] = None,
+    atomic_counter_claim: bool = False,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
     if sfa_tensor is not None and detect_framework(a_tensor) == "jax":
@@ -335,6 +339,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             ("sf_fp8_dtype_override", sf_fp8_dtype_override is not None),
             ("current_stream", current_stream is not None),
             ("descriptor_workspace", descriptor_workspace is not None),
+            ("atomic_counter_claim", atomic_counter_claim is not False),
         ):
             if rejected:
                 raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
@@ -376,6 +381,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+        atomic_counter_claim,
     )
     memo = _wgrad_wrapper_memo.get(memo_key)
     if memo is not None:
@@ -464,6 +470,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        atomic_counter_claim,
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
@@ -495,6 +502,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             sf_fp8_dtype_override=sf_fp8_dtype_override,
             accumulate_on_output=accumulate_on_output,
             input_order=input_order,
+            atomic_counter_claim=atomic_counter_claim,
         )
         if output_mode == "dense":
             common["sample_wgrad"] = wgrad_tensor

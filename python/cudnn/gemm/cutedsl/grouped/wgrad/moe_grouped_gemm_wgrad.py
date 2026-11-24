@@ -11,13 +11,14 @@ where C is the weight gradient.  K (tokens) varies per expert;
 M (hidden) and N (intermediate) are fixed across all experts.
 
 Supports:
-    - CLC-based dynamic persistent tile scheduling
+    - CLC-based dynamic persistent tile scheduling, or (atomic_counter_claim)
+      persistent clusters claiming tiles from a gmem atomic counter
     - Dense (contiguous 3-D C) / Discrete (per-expert pointer array C) output
     - accumulate_on_output (TMA reduce for atomic accumulation)
     - k_tile_cnt == 0 handling (zero output for empty experts)
 
 This module contains only the kernel class.
-Scheduler: moe_persistent_scheduler.py (CLC mode, scenario="2Dx2D")
+Scheduler: moe_persistent_scheduler.py (scenario="2Dx2D": CLC, or the atomic counter)
 Extension: moe_sched_extension.py (WgradDense / WgradDiscrete)
 """
 
@@ -33,6 +34,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.typing import AddressSpace
 from cutlass.utils.gemm.sm100 import (
     transform_partitioned_tensor_layout,
     epilogue_tmem_copy_and_partition,
@@ -71,6 +73,10 @@ class MoEGroupedGemmWgradBF16Kernel:
         K-contiguous blocks concatenated in memory). Only the unit-stride axis
         of host-side ``mat_a/mat_b`` is meaningful in ``TensorRagged`` mode;
         the non-unit stride values are ignored.
+    :param atomic_counter_claim: Launch persistent clusters that claim output
+        tiles from a 4-byte int32 counter in the workspace, which the helper
+        kernel resets before every launch, instead of a grid of every tile
+        rebalanced by cluster launch control (CLC, the default).
     """
 
     FIX_PAD_SIZE = 256
@@ -164,6 +170,7 @@ class MoEGroupedGemmWgradBF16Kernel:
         expert_cnt: int = 1,
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
+        atomic_counter_claim: bool = False,
     ):
         self.expert_cnt = expert_cnt
         self.acc_dtype = acc_dtype
@@ -173,6 +180,7 @@ class MoEGroupedGemmWgradBF16Kernel:
         self.accumulate_on_output = accumulate_on_output
         self.weight_mode = weight_mode
         self.input_order = input_order
+        self.atomic_counter_claim = atomic_counter_claim
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -201,8 +209,17 @@ class MoEGroupedGemmWgradBF16Kernel:
     # Workspace
     # ------------------------------------------------------------------
 
-    def get_workspace_bytes(self) -> int:
+    def get_desc_workspace_bytes(self) -> int:
         return WgradTensormapConstructor.get_workspace_size(self.input_order, self.weight_mode, self.expert_cnt)
+
+    def get_workspace_bytes(self) -> int:
+        # atomic_counter_claim: the scheduler's int32 tile counter follows the TMA descriptors.
+        return self.get_desc_workspace_bytes() + (4 if self.atomic_counter_claim else 0)
+
+    @cute.jit
+    def _get_sched_counter_ptr(self, workspace_ptr):
+        counter_addr = workspace_ptr.toint() + self.get_desc_workspace_bytes()
+        return cute.make_ptr(cutlass.Int32, counter_addr, AddressSpace.gmem, assumed_align=4)
 
     # ------------------------------------------------------------------
     # _setup_attributes
@@ -417,13 +434,15 @@ class MoEGroupedGemmWgradBF16Kernel:
             expert_shape=(expert_cnt, intermediate_dim, hidden_dim),
             cta_tile_shape_mnk=self.cta_tile_shape_mnk,
             cluster_shape_mn=self.cluster_shape_mn,
+            atomic_counter_claim=self.atomic_counter_claim,
         )
         grid = MoESchedulerParams.get_grid_shape(sched_params, max_active_clusters)
 
         # =================================================================
         # Step 6: Launch helper kernel when descriptors are needed
         # =================================================================
-        # Builds A/B (TensorRagged only) + C (Discrete weight_mode only).
+        # Builds A/B (TensorRagged only) + C (Discrete weight_mode only), and
+        # resets the atomic_counter_claim tile counter (block 0).
         # The WgradTensormapConstructor
         # is created inside the kernel body from the raw params — it has too
         # many Constexpr fields for MLIR serialization as a kernel argument.
@@ -444,7 +463,8 @@ class MoEGroupedGemmWgradBF16Kernel:
             a_op_helper = None
             b_op_helper = None
 
-        if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged or self.weight_mode == MoEWeightMode.DISCRETE):
+        needs_descriptors = self.input_order == WGradInputOrder.TensorRagged or self.weight_mode == MoEWeightMode.DISCRETE
+        if cutlass.const_expr(needs_descriptors or self.atomic_counter_claim):
             self.helper_kernel(
                 offs,
                 workspace.iterator,
@@ -462,7 +482,7 @@ class MoEGroupedGemmWgradBF16Kernel:
                 a_smem_layout_helper,
                 b_smem_layout_helper,
             ).launch(
-                grid=(expert_cnt, 1, 1),
+                grid=(expert_cnt if cutlass.const_expr(needs_descriptors) else 1, 1, 1),
                 block=(1, 1, 1),
                 stream=stream,
                 min_blocks_per_mp=1,
@@ -557,41 +577,48 @@ class MoEGroupedGemmWgradBF16Kernel:
         a_smem_layout=None,
         b_smem_layout=None,
     ):
-        """Build per-expert TMA descriptors.
+        """Build per-expert TMA descriptors and reset the tile counter.
 
         Builds:
           - A, B when ``input_order == WGradInputOrder.TensorRagged``
           - C    when ``weight_mode == MoEWeightMode.DISCRETE``
 
-        Launched with grid=(expert_cnt, 1, 1). Each block handles one expert.
+        Launched with grid=(expert_cnt, 1, 1) when it builds descriptors, else
+        grid=(1, 1, 1). Each block handles one expert. With
+        ``atomic_counter_claim``, block 0 also resets the scheduler's tile counter.
         """
         from ..moe_utils import WgradTensormapConstructor
 
-        ctor = WgradTensormapConstructor(
-            weight_mode=self.weight_mode,
-            tiled_mma=tiled_mma,
-            mma_tiler=self.mma_tiler,
-            cluster_layout_vmnk_shape=cluster_layout_vmnk_shape,
-            offs=offs,
-            workspace_ptr=workspace_ptr,
-            c_tma_op=c_tma_op,
-            epi_smem_layout=epi_smem_layout,
-            epi_tile=epi_tile,
-            c_ptrs=c_ptrs,
-            c_single_expert=c_single_expert,
-            expert_cnt=self.expert_cnt,
-            input_order=self.input_order,
-            a_tma_op=a_tma_op,
-            b_tma_op=b_tma_op,
-            a_smem_layout=a_smem_layout,
-            b_smem_layout=b_smem_layout,
-            a_major_mode=self.a_major_mode,
-            b_major_mode=self.b_major_mode,
-            a_tensor=a_tensor,
-            b_tensor=b_tensor,
-        )
-        expert_idx = cute.arch.block_idx()[0]
-        ctor.construct_and_write(expert_idx)
+        if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged or self.weight_mode == MoEWeightMode.DISCRETE):
+            ctor = WgradTensormapConstructor(
+                weight_mode=self.weight_mode,
+                tiled_mma=tiled_mma,
+                mma_tiler=self.mma_tiler,
+                cluster_layout_vmnk_shape=cluster_layout_vmnk_shape,
+                offs=offs,
+                workspace_ptr=workspace_ptr,
+                c_tma_op=c_tma_op,
+                epi_smem_layout=epi_smem_layout,
+                epi_tile=epi_tile,
+                c_ptrs=c_ptrs,
+                c_single_expert=c_single_expert,
+                expert_cnt=self.expert_cnt,
+                input_order=self.input_order,
+                a_tma_op=a_tma_op,
+                b_tma_op=b_tma_op,
+                a_smem_layout=a_smem_layout,
+                b_smem_layout=b_smem_layout,
+                a_major_mode=self.a_major_mode,
+                b_major_mode=self.b_major_mode,
+                a_tensor=a_tensor,
+                b_tensor=b_tensor,
+            )
+            expert_idx = cute.arch.block_idx()[0]
+            ctor.construct_and_write(expert_idx)
+        if cutlass.const_expr(self.atomic_counter_claim):
+            if cute.arch.block_idx()[0] == cutlass.Int32(0):
+                counter = cute.make_tensor(self._get_sched_counter_ptr(workspace_ptr), cute.make_layout(1))
+                counter[0] = cutlass.Int32(0)
 
     helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -621,7 +648,7 @@ class MoEGroupedGemmWgradBF16Kernel:
         c_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
     ):
-        """GPU device kernel for MoE BF16 wgrad with CLC scheduling."""
+        """GPU device kernel for MoE BF16 wgrad with CLC or atomic-counter scheduling."""
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -705,13 +732,13 @@ class MoEGroupedGemmWgradBF16Kernel:
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
-        # Scheduler (CLC-based for 2Dx2D)
+        # Scheduler (2Dx2D: CLC, or the workspace's atomic counter with atomic_counter_claim)
         scheduler = MoEPersistentTileScheduler.create(
             sched_params,
             offs,
             cute.arch.block_idx(),
             cute.arch.grid_dim(),
-            counter_ptr=None,
+            counter_ptr=self._get_sched_counter_ptr(workspace_ptr) if cutlass.const_expr(self.atomic_counter_claim) else None,
             sched_storage=sched_storage,
         )
         scheduler.internal_init()
@@ -768,18 +795,22 @@ class MoEGroupedGemmWgradBF16Kernel:
 
             work_tile_info = scheduler.initial_work_tile_info()
 
-            sched_pipeline.producer_acquire(sched_producer_state)
-            rmem = work_tile_info.to_rmem_tensor()
-            cute.copy(
-                sched_copy_atom,
-                rmem,
-                sched_buf_tensor[(None, sched_producer_state.index)],
-            )
-            cute.arch.fence_proxy("async.shared", space="cta")
-            sched_pipeline.producer_commit(sched_producer_state)
-            sched_producer_state.advance()
+            # atomic_counter_claim: a cluster whose first claim is already past the last tile (more clusters than
+            # tiles) publishes only the sentinel. Consumers stop at the first invalid entry they read, so an invalid
+            # first entry would leave the sentinel's stage unreleased and producer_tail waiting forever. A CLC grid's
+            # first tile is always valid.
+            if cutlass.const_expr(not self.atomic_counter_claim):
+                sched_pipeline.producer_acquire(sched_producer_state)
+                cute.copy(
+                    sched_copy_atom,
+                    work_tile_info.to_rmem_tensor(),
+                    sched_buf_tensor[(None, sched_producer_state.index)],
+                )
+                cute.arch.fence_proxy("async.shared", space="cta")
+                sched_pipeline.producer_commit(sched_producer_state)
+                sched_producer_state.advance()
 
-            work_tile_info = scheduler.advance_to_next_work()
+                work_tile_info = scheduler.advance_to_next_work()
             while work_tile_info.is_valid_tile:
                 sched_pipeline.producer_acquire(sched_producer_state)
                 rmem = work_tile_info.to_rmem_tensor()
