@@ -28,7 +28,8 @@ in that layout, and the adapter takes the pool's two halves and the rows of the 
 (``state.PagedKvCache.at``), never from the position.  An adapter whose kernel READS such a pool through a page table
 says so as well (``attended_tables``): the session then builds its state with the page table and the lengths of the
 run's maximum length -- the constant every block is handed in its options (``max_model_len``) -- and the adapter takes
-its rows of both from the cache (``state.PagedKvCache.attended``).
+its rows of both from the cache (``state.PagedKvCache.attended``).  An adapter whose call a recorded launch sequence
+can hold says so (``captures``): a plan every block of which says it can have its step recorded once and replayed.
 """
 
 from __future__ import annotations
@@ -172,6 +173,13 @@ class BlockBase:
     #: (``options["max_model_len"]``), and the block takes its rows of them from the cache it is handed
     #: (``state.PagedKvCache.attended``).  Such a block names the page too (``cache_page``): the tables are a pool's
     attended_tables = False
+    #: whether a recorded launch sequence can hold a call of the block (a step recorded once and replayed for every token:
+    #: ``Plan.recordable``).  It can where a call is launches alone, on operands at addresses that do not move from step
+    #: to step: an adapter to an entry or to a library call, the lookup, the token choice.  It cannot where a call forms
+    #: a table or a scalar on the host and copies it to the device, or shapes its launches by the position -- every
+    #: reference chain and every multiply over a copy: such a call is refused inside a recording, or replays the one
+    #: position it was recorded at.  Data of the adapter, never a test at run time
+    captures = False
     #: for a block whose first use does more than build an entry's kernel -- a library that builds kernels of its own with
     #: the installed compiler: the sentence a sample prints before the plan makes that first use.  Empty: nothing to announce
     first_use_note = ""

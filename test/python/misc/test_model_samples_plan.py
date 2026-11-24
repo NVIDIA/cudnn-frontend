@@ -2413,6 +2413,60 @@ def test_the_cursor_holds_the_rows_of_one_position_at_fixed_addresses():
         DecodeState(("linear_attention",), 2, 70, KV_SHAPES, "cpu", page=PAGE).step_cursor()
 
 
+def test_a_plan_says_whether_its_step_can_be_recorded():
+    """``Plan.recordable()``: whether a step of the plan can be recorded once as a launch sequence and replayed, from the
+    adapters' own data (``Block.captures``) and before anything is built.  The adapters that say yes are the closed
+    list's adapters to an entry and to a library call, the lookup and the token choice; every reference chain and
+    every multiply over a copy says no.  On compute capability 10.0 the stack ``native`` has no block that says no, at
+    two layers and at the published depth; every other stack names its first block that cannot, with the reason of
+    its row; and ``native`` itself names one where a block of it falls to a fallback row (a row count past its rows,
+    a class its library rows do not serve).  A block whose calls several rows serve answers part by part."""
+    from model_samples import blocks, providers
+    from model_samples.qwen_dense import QwenDense
+
+    yes = {key for key, factory in providers.factories().items() if getattr(factory, "captures", False)}
+    assert yes == {key for key in providers.KEYS if key.startswith(("fe.", "flashinfer."))} | {"torch.index_select", "torch.argmax"}
+    assert providers.BlockBase.captures is False and blocks.BySite.captures is False, "an adapter that does not say so cannot be recorded"
+    cannot = "which a recorded launch sequence cannot hold"
+    for layers in (2, 64):
+        native = _plan(stack="native", layers=layers)
+        assert native.recordable() == "", layers
+        assert all(block.captures for _, _, _, _, block in native.parts())
+    expected = {
+        "fe-entries": f"projection.fp8.out is on a fallback row of this stack (bf16 copy of 8-bit weights), {cannot}",
+        "fe-cublas": f"add_norm_quantize is on a fallback row of this stack (reference chain), {cannot}",
+        "reference": f"add_norm_quantize is on a fallback row of this stack (reference chain), {cannot}",
+    }
+    for stack, sentence in expected.items():
+        plan = _plan(stack=stack)
+        assert plan.recordable() == sentence, stack
+        # the sentence names the FIRST part of the table that says no, and that part's own row
+        label, _, _, row, block = next(part for part in plan.parts() if not part[4].captures)
+        assert sentence.startswith(f"{label} is on a fallback row of this stack ({row.fallback})") and row.fallback and row.key not in yes
+        assert [part[0] for part in plan.parts() if part[4].captures] and not block.captures
+    # ``native`` where a block of it is on a fallback row: one sequence past the rows its kernels serve, and another class
+    for where in ({"sequences": 1025}, {"cc": (12, 0)}):
+        plan = _plan(stack="native", **where)
+        fallbacks = [label for label, _, _, row, _ in plan.parts() if row.fallback]
+        assert fallbacks and plan.recordable().startswith(f"{fallbacks[0]} is on a fallback row of this stack (") and plan.recordable().endswith(cannot), where
+    # a block whose calls several rows serve: the sentence names the part, ``<block> at <call site>``
+    model = QwenDense.reduced(2)
+    verify = blocks.plan(model.provider_table, model.regimes, _facts(), 1, 6, "fe-entries", None, model=model)
+    split = [(label, block) for label, name, site, _, block in verify.parts() if site]
+    assert split and any(not block.captures for _, block in split) and any(block.captures for _, block in split)
+    first = next(label for label, _, _, _, block in verify.parts() if not block.captures)
+    assert verify.recordable().startswith(f"{first} is on a fallback row of this stack (")
+    # a part without a fallback reason is named by what serves it
+    plan = _plan(stack="native")
+    block = plan["token_choice"]
+    block.captures = False
+    try:
+        assert plan.recordable() == f"token_choice is served by {block.entry}, {cannot}"
+    finally:
+        del block.captures
+    assert plan.recordable() == ""
+
+
 def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_reads_them(monkeypatch):
     """One adapter of the closed list reads the page table and the lengths (``Block.attended_tables``): the library's paged
     decode attention.  A state of a run without such a block holds neither: its tables, its bytes and the memory

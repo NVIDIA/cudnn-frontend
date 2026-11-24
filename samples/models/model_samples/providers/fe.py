@@ -300,6 +300,7 @@ class EntryBlock(BlockBase):
 
     provider = "cuDNN FE"
     compiles = True
+    captures = True  # one launch per call on the operands it is handed: a recorded launch sequence holds it
     name = ""  # the entry, as ``cudnn`` exports it
     what = ""  # what the entry is, for the sentence of an older package
     first_version = FIRST_VERSION  # the first cuDNN Frontend version that carries the entry, for that sentence

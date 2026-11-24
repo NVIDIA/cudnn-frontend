@@ -406,6 +406,7 @@ class LibraryBlock(BlockBase):
 
     provider = "FlashInfer"
     stored_weights = True  # the weight is multiplied on its stored codes: the loader keeps them for this block
+    captures = True  # a library call is launches on the operands it is handed; what it reads of the host it reads once, at its first call
     module = "gemm"  # of the library: where the call of this adapter lives
     fields: tuple = ()
     #: the device types on which the plan makes the first use (a host test names its own device to run it on a stand-in library)

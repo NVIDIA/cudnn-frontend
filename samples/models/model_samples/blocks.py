@@ -160,6 +160,7 @@ class Block(Protocol):
     kernels: Tuple[Kernel, ...]  # the block's census entries: the kernels a call launches, or the families of a fallback row
     per_row: Tuple[int, ...]  # the operands that have one leading row per sequence
     state_args: Tuple[int, ...]  # the operands the call updates in place
+    captures: bool  # whether a recorded launch sequence can hold a call of the block (``Plan.recordable``)
 
     def check_support(self, sequences: int, tokens: int) -> None:
         """Raise the provider's typed decline when it does not serve this run; return otherwise.  Allocates nothing on the
@@ -221,6 +222,7 @@ class BySite:
     stored_layout = None
     cache_page = None  # asked of the parts too: the session collects the page of the attention cache over every part of its plans
     attended_tables = False  # ... and whether a part reads the page table and the lengths of that cache
+    captures = False  # asked of the parts too: whether a recorded launch sequence can hold a call is each part's answer
     batch_note = ""
 
     def __init__(self, name: str, parts: Sequence[tuple]):
@@ -340,6 +342,18 @@ class Plan(dict):
             else:
                 found += [(scoped(name, site), name, site, row, part) for site, row, part in split]
         return found
+
+    def recordable(self) -> str:
+        """Whether a step of this plan can be recorded once as a launch sequence and replayed for every token: ``""`` where
+        every part of it says it can (``Block.captures``), else why not, in one sentence that names the first part, in
+        table order, that cannot -- with the reason of its row where the row is a fallback.  Decided from the adapters'
+        data alone: before anything is built, loaded or launched."""
+        for label, _, _, row, block in self.parts():
+            if not getattr(block, "captures", False):
+                if row.fallback:
+                    return f"{label} is on a fallback row of this stack ({row.fallback}), which a recorded launch sequence cannot hold"
+                return f"{label} is served by {block.entry}, which a recorded launch sequence cannot hold"
+        return ""
 
     def announcements(self) -> list:
         """What the first use of this plan will do beyond building an entry's kernel, one sentence per kind

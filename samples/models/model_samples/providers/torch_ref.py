@@ -547,6 +547,7 @@ class Embedding(_Reference):
     """One gather per call: an exact kernel, known by its name.  Its launch shape is PyTorch's and is declared nowhere."""
 
     kernels = (Kernel("embedding_gather", "PyTorch", "exact", launches=1),)
+    captures = True  # one gather on the ids it is handed
 
     def __call__(self, ids, table):
         return table.index_select(0, ids)
@@ -556,6 +557,7 @@ class TokenChoice(_Reference):
     """The sample's host path: what it launches is listed by the kernel check and compared with nothing."""
 
     kernels = (Kernel("pytorch", "PyTorch", "host"),)
+    captures = True  # the reduction and the cast, on the device: greedy choice holds no state on the host
 
     def __call__(self, logits):
         return greedy(logits)
