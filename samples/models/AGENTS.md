@@ -250,6 +250,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
       launch the recorded steps again from Python and hold ids AND logits byte for byte (a wrong length moved the
       logits of a step and no token); the step's own tail is read behind the request; the replayed steps of the
       traced pass are held to the traced steps launched from Python, launch by launch.
+    - In the performance mode the requests of a run that records its step are replays; its traced request stays
+      launched from Python (the kernel check and the per-kernel table need the call log) and a second traced request
+      replays the first steps, whose GPU busy the `step` line prints. No launch overhead is formed for a replayed step.
     - A recorded step that does not compute what the steps launched from Python compute is a failed check, never a
       fall-back. A count of what a recorded sequence holds is printed as observed only where the installation
       states the sequence, and is then held against the plan; a report sets no GPU-busy figure against a period and

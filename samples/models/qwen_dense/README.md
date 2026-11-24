@@ -88,8 +88,10 @@ requests run `--perf-steps` forced steps behind the first new token, the traced 
 warm-up request `--perf-warmup`, which may be the larger count. A prompt whose tokens, its first new token and the
 forced steps of that longest request do not fit `--max-model-len` is an `ERROR` before the load, like every request
 beyond the context: it says which request is the longest and names every count to take lower (`--perf-steps`,
-`--perf-warmup`). No count is changed to make a run fit. Every run of the mode is `orientation` today
-and says why on the second line of its report: its blocks are launched from Python, a block on a fallback row is a
+`--perf-warmup`). No count is changed to make a run fit. On the stack `native` the requests of the mode are
+replays of the recorded step, as a default run's are. A run of the mode that is `orientation`
+says why on the second line of its report: its blocks are launched from Python (`--no-capture`, a
+functional-validation stack), a block on a fallback row is a
 reason of its own, and whatever the run saw of the GPU's other processes and of its clock that a controlled run may
 not have is a reason too.
 

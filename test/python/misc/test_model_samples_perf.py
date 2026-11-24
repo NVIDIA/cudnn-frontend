@@ -314,10 +314,60 @@ def test_record_class_reasons_in_the_order_of_the_conditions():
     _says("area", "A run is a controlled run only when it observed every condition itself: a checkpoint, no block on a fallback row,")
     _says("area", "Otherwise it is `orientation` and the line lists every reason, in that order, and the rate line reads `decode rate (orientation)`.")
     _says("area", "*Record class*: what a run may call its numbers, on the second line of its report: `orientation` with every reason, or a controlled run.")
-    _says("family", "Every run of the mode is `orientation` today and says why on the second line of its report")
-    _says("family", "its blocks are launched from Python, a block on a fallback row is a reason of its own, and whatever the run saw of the")
+    _says("family", "A run of the mode that is `orientation` says why on the second line of its report")
+    _says("family", "a functional-validation stack), a block on a fallback row is a reason of its own, and whatever the run saw of the")
     _says("family", "whatever the run saw of the GPU's other processes and of its clock that a controlled run may not have is a reason too.")
-    _says("area", "and no stack of this area is captured: every run today is `orientation`.")
+    _says("area", "and the launch sequence is captured where the run replays its recorded step -- the stack `native`, by default:")
+    _says("area", "is `orientation` with the reason `launched from Python`.")
+
+
+def test_the_report_of_a_run_whose_steps_are_replays():
+    """The screen of a run whose steps were replays of the recorded step, from the data its file holds: ``protocol`` reads
+    ``launch sequence captured``; the record class carries no ``launched from Python`` -- with every other condition
+    met the run is a controlled run --; the ``checks`` lines say that the replayed steps are the same steps launched
+    from Python, with their count; the ``step`` line is one replay with the launches of the recorded sequence -- or
+    the recorded step, where the installation states none -- and GPU busy of the replayed traced steps, or why it was
+    not measured; no launch overhead is printed, no note about it and no stretch of tracing.  The per-kernel table and
+    its note stay.  A run launched from Python prints what it printed."""
+    from model_samples import perf
+
+    replayed = {"steps": 16, "first_position": 58, "last_position": 73, "launches": 491, "gpu_busy_ms": 4.25, "reason": None, "per_step": {}}
+    data = _checkpoint_form(
+        record={"class": "controlled", "reasons": []},
+        protocol={**_data()["protocol"], "launch_path": "captured", "launch_path_reason": None},
+        checks={**_data()["checks"], "recorded_step": "PASS", "recomputed_steps": 314},
+    )
+    data["traced"]["replayed"] = replayed
+    data["protocol"]["prompt"]["tokens"] = 58
+    data["statistics"]["launch_overhead"].update(value=None, reason="not formed: a replayed step has no launch path from Python between its blocks")
+    data["statistics"]["gpu_busy_replayed"].update(value=4.25, reason=None)
+    lines = perf.screen(data)
+    assert all(len(line) <= perf.WIDTH for line in lines), [line for line in lines if len(line) > perf.WIDTH]
+    assert lines[1] == "record class          controlled run in one process; a number of record is the median of 3 such runs"
+    assert _line(lines, "protocol").endswith("| launch sequence captured") and not any("not captured" in line for line in lines[:12])
+    held = _flat(" ".join(lines[lines.index(_line(lines, "checks")) : lines.index("")]))
+    assert "the replayed steps are the same steps launched from Python, ids and logits, all 314, and leave the same state: PASS" in held
+    assert "timed requests give the checked request's tokens and state: " in held and "kernels, traced steps: " in held
+    step = lines.index(_line(lines, "step   "))
+    assert lines[step] == "step                  400.000  ms: one replay of 491 launches and one host read"
+    busy = _flat(" ".join(lines[step + 1 : step + 3]))
+    assert busy == "GPU busy 4.250 ms in 16 traced replayed steps, positions 58 to 73 (an upper bound: tracing lengthens kernels)"
+    assert lines[step + 3].startswith("with draft tokens"), "nothing of a launch overhead, of a remainder or of a stretch under it"
+    assert not any("launch overhead" in line or "not resolved" in line or line.startswith("note") for line in lines)
+    assert any(line.strip() == perf.FROM_PYTHON for line in lines), "the per-kernel table is of the traced request, launched from Python, and says so"
+    assert _line(lines, "decode rate").startswith("decode rate           2.5  tokens/s per sequence"), "a controlled run: no label on the rate"
+    data["traced"]["replayed"] = {**replayed, "launches": None, "gpu_busy_ms": None, "reason": "the profiler recorded no kernel activity on this GPU"}
+    lines = perf.screen(data)
+    step = lines.index(_line(lines, "step   "))
+    assert lines[step].endswith("ms: one replay of the recorded step and one host read")
+    assert _flat(" ".join(lines[step + 1 : step + 3])) == "GPU busy of a replayed step not measured (the profiler recorded no kernel activity on this GPU)"
+    # the checks line of a replayed run whose recomputation does not hold; and a run launched from Python, as it printed
+    data["checks"]["recorded_step"] = "FAIL (first at step 61)"
+    assert "all 314, and leave the same state: FAIL (first at step 61)" in _flat(" ".join(perf.screen(data)))
+    python = perf.screen(_checkpoint_form())
+    assert _line(python, "protocol").endswith("| launched from Python, not captured") and not any("the replayed steps are" in line for line in python)
+    assert any("launch overhead" in line for line in python) and perf.SCHEMA == "model-sample-performance/6"
+    assert perf.REPLAYED_TRACED == 16 and "gpu_busy_replayed" in perf.DEFINITIONS
 
 
 # ---------------------------------------------------------------------------------------------- a session on the CPU, stand-in providers
@@ -1020,7 +1070,7 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     assert data == json.loads(json.dumps(outcome.data)) and outcome.unwritten == ""
     sections = "schema kind written_utc report_file record model environment observation kernels protocol checks statistics raw traced per_kernel memory"
     sections += " startup text_path"
-    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/5" and data["kind"] == "run"
+    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/6" and data["kind"] == "run"
     assert "fingerprints" not in data and "report_text" not in data, "of later versions"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", data["written_utc"]) and data["report_file"] == "report.json"
     assert str(tmp_path) not in text and os.sep + "home" + os.sep not in text and str(MODELS) not in text, "a file is named by its own name"
@@ -1079,6 +1129,20 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     _says("guide", "One definition per statistic, written in the report file, with a host test of its arithmetic on constructed time stamps.")
     _says("area", "**The statistics**, each with one definition, which the report file carries beside the number:")
     _says("area", "in GiB (2^30 bytes), where an ordinary run's `bytes per step` line is in GB")
+
+
+def _schema_5(data):
+    """The report file of the same run as the mode wrote it before its steps could be replays of a recorded step, schema
+    ``model-sample-performance/5``: 17 statistics -- none of the GPU busy of replayed steps --, a ``traced`` section
+    without its replayed steps, a ``protocol`` whose launch path has no reason and no recorded step beside it, and
+    ``checks`` without the statement about the replayed steps."""
+    import copy
+
+    older = copy.deepcopy(data)
+    older["schema"] = "model-sample-performance/5"
+    del older["statistics"]["gpu_busy_replayed"], older["traced"]["replayed"], older["protocol"]["launch_path_reason"], older["protocol"]["recorded_step"]
+    del older["checks"]["recorded_step"], older["checks"]["recomputed_steps"]
+    return older
 
 
 def _schema_3(data):
@@ -1153,23 +1217,28 @@ def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_pa
 
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)
     data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
-    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/5"
+    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/6"
     _says("area", f"The file's first field names its schema, `{perf.SCHEMA}`.")
     assert perf.screen(data) == perf.screen(outcome.data) and perf.screen(data)[0] in lines, "a file of this schema is rendered: the screen of its run"
     _says("area", "The screen is rendered from the data of a file of this schema (`screen` in `model_samples/perf.py`);")
-    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/5'"
+    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/6'"
 
     def refused(file):
         with pytest.raises(ValueError) as said:  # a KeyError is not one: it would pass through and fail the test
             perf.screen(file)
         return str(said.value)
 
-    # the files of the three versions before, each written and read back as a file: 18 sections and 16 statistics twice, and 17 and 10,
-    # where this version has 18 and 17
-    third = _schema_3(data)
+    # the files of the versions before, each written and read back as a file: 18 sections and 16 statistics twice, and 17 and 10,
+    # where the version before this one had 18 and 17 and this one has 18 and 18
+    fifth = _schema_5(data)
+    third = _schema_3(fifth)
     second = _schema_2(third)
     older = _schema_1(second)
-    assert [(len(file), len(file["statistics"])) for file in (older, second, third, data)] == [(17, 10), (18, 16), (18, 16), (18, 17)]
+    counts = [(len(file), len(file["statistics"])) for file in (older, second, third, fifth, data)]
+    assert counts == [(17, 10), (18, 16), (18, 16), (18, 17), (18, 18)]
+    assert perf.write_report(str(tmp_path / "schema_5.json"), fifth) == ""
+    assert refused(json.loads((tmp_path / "schema_5.json").read_text(encoding="utf-8"))) == refusal.format("'model-sample-performance/5'")
+    assert "gpu_busy_replayed" not in fifth["statistics"] and list(fifth) == list(data)
     assert list(older["traced"])[-2:] == ["gpu_busy_ms", "gpu_busy_reason"] and len(older["traced"]) == 7
     assert list(third) == list(second) == list(data) and len(third["observation"]) == 5 and list(third["protocol"]["in_a_timed_request"])[-1] == "text"
     for number, file in ((1, older), (2, second), (3, third)):
@@ -1181,7 +1250,7 @@ def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_pa
     assert "per_kernel" not in older and "gpu_busy" not in older["statistics"], "and what it would look for"
     # the file that took launch overhead from three medians: every section, every statistic and every field name this version reads is
     # there, and the numbers behind three of them are others -- it is refused by its name, not rendered under this version's
-    as_two = _schema_2(data)
+    as_two = _schema_2(_schema_5(data))
     assert (len(as_two), len(as_two["statistics"]), list(as_two)) == (18, 17, list(data)) and perf.write_report(str(tmp_path / "as_two.json"), as_two) == ""
     was, now = as_two["statistics"]["launch_overhead"], data["statistics"]["launch_overhead"]
     assert set(now) - set(was) == {"label", "n", "median", "mean", "minimum", "maximum", "p90", "p99"} and not set(was) - set(now)
@@ -2292,7 +2361,13 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     )
     assert data["statistics"]["gpu_busy"]["n"] == data["traced"]["steps"] == len(data["traced"]["per_step"]["gpu_busy_ms"]) == 6, "every traced step"
     _says("area", "It is taken apart with the launch records of the traced request: GPU busy = the union of the intervals")
-    assert list(data["traced"])[-5:] == ["gpu_busy_ms", "gpu_busy_reason", "per_step", "tracing_stretch_percent", "time_resolution_us"]
+    assert list(data["traced"])[-6:] == ["gpu_busy_ms", "gpu_busy_reason", "per_step", "tracing_stretch_percent", "time_resolution_us", "replayed"]
+    # a run launched from Python: nothing of a replayed step, and the file says why its steps are launched from Python
+    assert data["traced"]["replayed"] is None and data["checks"]["recorded_step"] is None and data["checks"]["recomputed_steps"] is None
+    assert data["protocol"]["launch_path"] == "python" and data["protocol"]["recorded_step"] is None
+    assert data["protocol"]["launch_path_reason"] == "recording the step was not asked for (Session(capture=True))"
+    again = data["statistics"]["gpu_busy_replayed"]
+    assert (again["value"], again["n"], again["reason"]) == (None, 0, "not formed: the steps of this run are launched from Python")
     assert list(data["traced"]["per_step"]) == ["gpu_busy_ms", "idle_ms", "kernels", "copies"] and data["traced"]["per_step"]["copies"] == [1] * 6
     _says("area", "GPU busy, idle time, kernels and copies of every traced step; the resolution of the profiler's time stamps as found),")
     assert list(data["per_kernel"]) == ["launch_path", "launch_path_note", "us_per_launch_printed", "reason", "rows"]
@@ -2599,7 +2674,8 @@ def test_perf_main_on_cpu(monkeypatch, capsys, tmp_path):
     # the GPU cells of the area run this form on the two stacks the repository's tests run, each in a fresh interpreter
     cells = (MODELS.parents[1] / "test" / "python" / "linear_attention" / "frost" / "test_model_sample_qwen_dense.py").read_text(encoding="utf-8")
     cell = cells.split("def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(", 1)
-    assert cell[0].endswith('@pytest.mark.L0\n@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries"])\n') and "_fresh_interpreter(arguments)" in cell[1]
+    stacks = '@pytest.mark.L0\n@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries", "native"])\n'  # and on the sample's own, where its library is
+    assert cell[0].endswith(stacks) and "_fresh_interpreter(arguments)" in cell[1]
     _says(
         "area", "the performance mode of the seeded model (`--perf`) on both stacks, in a fresh interpreter: `[NN] PASS`, the report in its reduced-model form"
     )

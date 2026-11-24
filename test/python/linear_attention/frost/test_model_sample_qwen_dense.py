@@ -429,7 +429,7 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries"])
+@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries", "native"])
 def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stack, tmp_path):
     """``--perf`` on the reduced seeded model, on the two stacks the tests of this repository run, in a fresh interpreter
     (the kernel check reads kernel names from the profiler: the module docstring): the checked request and its reference
@@ -448,8 +448,11 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
 
     if not torch.cuda.is_available():  # decided here, before a child is started
         pytest.skip("needs a CUDA GPU")
+    if stack == "native":  # the sample's own stack: its requests are replays of the recorded step, where its library is installed
+        _needs_the_library()
     report = tmp_path / "report.json"
-    arguments = ["--stack", stack, "--perf", "--perf-steps", "16", "--perf-requests", "2", "--perf-warmup", "4", "--perf-report", str(report)]
+    named = [] if stack == "native" else ["--stack", stack]  # the sample's stack is the default; a validation stack is named
+    arguments = [*named, "--perf", "--perf-steps", "16", "--perf-requests", "2", "--perf-warmup", "4", "--perf-report", str(report)]
     start = time.perf_counter()
     code, out, written = _fresh_interpreter(arguments)
     tagged = [line for line in out.splitlines() if line.startswith("[00] ")]
@@ -472,23 +475,31 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     said = " ".join(line.strip() for line in screen)
     assert "timed requests give the checked request's tokens and state: PASS" in said
     assert ("kernels, traced steps: NOT OBSERVED (" if unobserved else "kernels, traced steps: PASS") in said
-    assert "protocol    warm-up 4 steps | timed 16 steps x 2, end token ignored | launched from Python, not captured" in screen
+    replayed = stack == "native" and tuple(torch.cuda.get_device_capability()) == (10, 0)  # every row a kernel: the step is recorded and replayed
+    path = "launch sequence captured" if replayed else "launched from Python, not captured"
+    assert f"protocol    warm-up 4 steps | timed 16 steps x 2, end token ignored | {path}" in screen
+    if replayed:
+        assert "the replayed steps are the same steps launched from Python, ids and logits, all " in said and "and leave the same state: PASS" in said
+        assert any(line.startswith("[00] step recorded: ") for line in tagged) and not any("launch overhead" in line for line in screen)
+        assert any("one replay of " in line and line.strip().endswith("and one host read") for line in screen)
     assert any(line.startswith("[00] performance mode: at most ") for line in tagged), "what the mode will run, before the load"
 
     def refuse(constant):
         raise AssertionError(f"the report file holds {constant}")
 
     data = json.loads(report.read_text(encoding="utf-8"), parse_constant=refuse)
-    assert data["schema"] == "model-sample-performance/5" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
+    assert data["schema"] == "model-sample-performance/6" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
     assert data["protocol"]["stack"] == stack and str(tmp_path) not in report.read_text(encoding="utf-8"), "no path in the file"
     requests = data["raw"]["requests"]
-    assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced"]
+    assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced", *(["traced replay"] if replayed else [])]
     assert requests[2]["ids_sha256"] == requests[3]["ids_sha256"] == requests[0]["ids_sha256"], "every timed request: the checked request's ids"
     assert requests[2]["end_state_sha256"] == requests[3]["end_state_sha256"] == requests[0]["end_state_sha256"], "and its end state, byte for byte"
     assert data["protocol"]["profiler_first_started"] == (None if unobserved else "behind the last timed request, in the traced request")
     # the record class: every reason, in the order of the conditions; both stacks have a block on a fallback row
     observed = ["kernels not observed"] if unobserved else []
-    fixed = ["reduced model", "fallback rows present", "launched from Python", *observed]
+    fixed = ["reduced model", *([] if replayed else ["fallback rows present", "launched from Python"]), *observed]
+    assert data["protocol"]["launch_path"] == ("captured" if replayed else "python") and bool(data["protocol"]["launch_path_reason"]) == (not replayed)
+    assert (data["traced"]["replayed"] is not None) == replayed and (data["checks"]["recorded_step"] == "PASS") == replayed
     # what the run observed of its GPU: the reasons behind the fixed ones are those of its two verdicts, which the screen prints
     watched = data["observation"]
     seen, clocks = watched["other_compute_processes"], watched["clocks"]
@@ -499,7 +510,7 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     assert "locked" not in " ".join(screen), "the report never prints the word"
     if watched["source"] == "nvidia-smi":  # the driver's tool was found: a reading before the load, before the warm-up request and behind the timed requests
         assert [made["when"] for made in watched["readings"]] == ["before the load", "before the warm-up request", "behind the last timed request"]
-        assert [made["kind"] for made in watched["requests"]] == ["warm-up", "timed", "timed", "traced"]
+        assert [made["kind"] for made in watched["requests"]] == ["warm-up", "timed", "timed", "traced", *(["traced replay"] if replayed else [])]
         child = "a child process that the timing process neither reads nor polls between its start and its stop"
         assert data["protocol"]["in_a_timed_request"]["sampler"] in (child, "none (the sampler could not be started)")
     else:
@@ -524,17 +535,30 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
         # the step taken apart: a remainder per timed step at a traced position; its mean and the means of the same steps add up
         step, host, overhead = (data["statistics"][key] for key in ("step", "host", "launch_overhead"))
         assert overhead["n"] == step["n"] == host["n"] == 2 * data["traced"]["steps"], "every timed step at a traced position"
-        assert overhead["remainder_ms"] == overhead["mean"] and overhead["label"].startswith("an estimate") and overhead["value"] in (None, overhead["mean"])
         of_gpu = data["statistics"]["gpu_busy"]["mean"]
         assert abs(of_gpu - sum(busy) / len(busy)) <= 1e-9 * of_gpu, "the mean of GPU busy of the traced steps"
-        assert abs(step["mean"] - (of_gpu + overhead["remainder_ms"] + host["mean"])) <= 1e-9 * step["mean"], "the terms of the step add up"
+        if replayed:  # a replayed step has no launch path from Python to estimate: GPU busy of the replayed traced steps stands in the step line
+            again, of_replays = data["traced"]["replayed"], data["statistics"]["gpu_busy_replayed"]
+            assert overhead["value"] is None and overhead["reason"].startswith("not formed: a replayed step has no launch path from Python")
+            assert 1 <= again["steps"] <= 16 and len(again["per_step"]["gpu_busy_ms"]) == again["steps"] and min(again["per_step"]["gpu_busy_ms"]) > 0
+            assert of_replays["value"] == again["gpu_busy_ms"] > 0 and of_replays["n"] == again["steps"] and requests[5]["ids_sha256"] is not None
+            assert data["protocol"]["recorded_step"]["block_launches_planned"] == kernels["exact_launches_per_step"]
+        else:
+            assert (
+                overhead["remainder_ms"] == overhead["mean"] and overhead["label"].startswith("an estimate") and overhead["value"] in (None, overhead["mean"])
+            )
+            assert abs(step["mean"] - (of_gpu + overhead["remainder_ms"] + host["mean"])) <= 1e-9 * step["mean"], "the terms of the step add up"
         assert 0 < data["traced"]["time_resolution_us"] <= 1 and data["per_kernel"]["us_per_launch_printed"] == (data["traced"]["time_resolution_us"] < 1)
     # the launches of a step as the plan states them: on exact rows, by provider, and the block calls on fallback rows -- an exact
     # row launches once per call, so the two add up to the 20 block calls of a step of the two-layer model that are no host path
-    assert kernels["exact_launches_per_step"] == sum(kernels["by_provider"].values()) and kernels["fallback_rows"]
+    # (the sample's own stack on compute capability 10.0 has no block on a fallback row: every call is a launch on an exact row)
+    assert kernels["exact_launches_per_step"] == sum(kernels["by_provider"].values()) and bool(kernels["fallback_rows"]) == (not replayed)
     assert kernels["exact_launches_per_step"] + kernels["fallback_calls"] == 20
     if stack == "fe-cublas":
         assert kernels["by_provider"] == {"PyTorch": 1, "cuDNN Frontend": 1}
+    elif stack == "native":
+        if replayed:
+            assert kernels["by_provider"] == {"cuDNN Frontend": 13, "FlashInfer": 6, "PyTorch": 1} and kernels["fallback_calls"] == 0
     elif tuple(torch.cuda.get_device_capability()) == (10, 0):
         assert kernels["by_provider"] == {"cuDNN Frontend": 13, "PyTorch": 1}
     else:  # a row of an entry claims its GPU classes: off compute capability 10.0 fewer of the 13 are exact rows
@@ -543,7 +567,7 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     assert screen[at] == f"kernels     {kernels['exact_launches_per_step']} launches per step on exact rows: " + ", ".join(
         f"{provider} {count}" for provider, count in kernels["by_provider"].items()
     )
-    assert screen[at + 1].startswith(f"            {kernels['fallback_calls']} block calls on fallback rows; ")
+    assert screen[at + 1].startswith(f"            {kernels['fallback_calls'] or 'no'} block calls on fallback rows; ")
     assert (
         "scope       the decode loop of one process: no request queue, no scheduler, no network" in screen[2:5]
     ), "behind the record class, however many lines that takes"

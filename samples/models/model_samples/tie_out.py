@@ -928,6 +928,11 @@ class Checks:
     unobserved: str = ""  # why the kernels were not observed
     on_demand: Optional[OnDemand] = None  # what the reference's copies of the weights the run keeps no copy of cost
     positions: Tuple[int, ...] = ()  # of a run with judged positions: the steps at which its blocks were held against the reference
+    #: of a run whose steps were replays: the verdict of its ``recorded step`` lines as one word (``PASS``, or ``FAIL`` with
+    #: what failed), how many steps were launched again from Python, and what ``digest`` gave of the state behind them
+    recorded: str = ""
+    recomputed: int = 0
+    end_state: Optional[str] = None
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -1094,6 +1099,7 @@ def run_checks(
     max_prompt_steps: Optional[int] = None,
     positions: Optional[Sequence[int]] = None,
     reach: Optional[int] = None,
+    digest=None,
 ) -> Checks:
     """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded: its recorded steps, or the first
     ``max_steps`` of them (a long run of a deep model is checked on its first steps).  Leaves the session reset.
@@ -1128,6 +1134,10 @@ def run_checks(
     the ids buffer held the last chosen ids and the position rows stood where the request left the state.  A recorded
     step that does not compute what the same steps compute from Python fails the run.  The recomputation, the block
     check, the reference passes and the traced steps the kernel check judges are all launched from Python.
+
+    ``digest`` (a function of a decode state) is called on the state the recomputation from Python leaves, where it
+    recomputed every step the run recorded: ``Checks.end_state`` then holds what it returned, for a caller that holds
+    the end state of a replayed request against it.
 
     ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
     reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
@@ -1230,6 +1240,7 @@ def run_checks(
     first_wrong = None
     if replays and not replay_ok:
         first_wrong = next(t for t in range(last) if not (bytes_equal(session.record.logits[t], logits[t]) and bytes_equal(session.record.outputs[t], ids[t])))
+    end_state = digest(session.state) if digest is not None and last == main.count else None  # behind every recorded step, launched from Python
     logits, ids = logits[:steps], ids[:steps]  # the reference stack's own pass stays on the first ``steps``
     if proposals is not None:  # ... and what the drafter proposed in front of every step
         replay_ok = replay_ok and bytes_equal(session.record.proposals[:steps], proposals)
@@ -1335,7 +1346,10 @@ def run_checks(
             )
     session.reset(fresh=True)
     ok = replay_ok and tail_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
-    return Checks(lines, ok, judged, status, unobserved, cost, tuple(sorted(judged_at or ())))
+    recorded = ""
+    if replays:
+        recorded = "PASS" if replay_ok and tail_ok else (f"FAIL (first at step {first_wrong})" if not replay_ok else "FAIL (the step's own tail)")
+    return Checks(lines, ok, judged, status, unobserved, cost, tuple(sorted(judged_at or ())), recorded, last if replays else 0, end_state)
 
 
 @dataclass

@@ -86,7 +86,9 @@ kernels of an entry by name, order, count, grid, block and shared memory.  Where
 ``[00] RAN <stack> stack (kernels not observed: <reason>)``, never in ``PASS``.  ``--dump-census FILE`` writes those launch
 records as JSON.
 
-``--perf`` is the performance mode: the decode performance report of this GPU from one process.  One checked request
+``--perf`` is the performance mode: the decode performance report of this GPU from one process, on the steps a run
+runs: replays of the recorded step on the stack ``native``, steps launched from Python with ``--no-capture`` and on a
+functional-validation stack.  One checked request
 with the reference checks on it, also at four positions of the timed steps; a warm-up request (``--perf-warmup`` forced
 steps, default 32); ``--perf-requests`` timed requests (default 3), each the prompt, its first new token and
 ``--perf-steps`` forced decode steps (default 256, the end token ignored) with nothing but the step inside; only then
@@ -490,8 +492,6 @@ def _launch_line(session, args) -> str:
         )
     if args.no_capture:
         return "launched from Python: --no-capture"
-    if args.perf:
-        return "launched from Python: the performance mode times steps launched from Python"
     return f"launched from Python: {session.python_reason}"
 
 
@@ -709,8 +709,8 @@ def main(argv=None) -> int:
         _say(f"{TAG} ERROR {error}")
         return 1
     # the sample's stack records its step once and replays it, where the plan says it can be (the session decides and says why
-    # not); the performance mode times steps launched from Python
-    replayed = args.stack == SAMPLE_STACK and not (args.no_capture or args.perf)
+    # not), in an ordinary run and in the performance mode alike
+    replayed = args.stack == SAMPLE_STACK and not args.no_capture
     runs = []  # (session, prompt sets) per sequence count; the later sessions run on the first one's weights
     for index, sequences in enumerate(args.sequences):
         if real:
@@ -779,7 +779,7 @@ def main(argv=None) -> int:
 
     if args.perf:  # before the load: what the mode will run, a rule and counts
         protocol = perf.Protocol(args.perf_warmup, args.perf_steps, args.perf_requests, args.perf_trace_records)
-        _say(f"{TAG} {protocol.line(int(runs[0][1][0][0][0].numel()))}")
+        _say(f"{TAG} {protocol.line(int(runs[0][1][0][0][0].numel()), replayed and not runs[0][0].recordable())}")
         observer = perf.observe.Observer(device, args.perf_clock_lock)  # the GPU and the host before the load: the driver is asked, nothing is set
         observer.read("before the load")
 

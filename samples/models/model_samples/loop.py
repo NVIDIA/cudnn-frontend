@@ -1423,6 +1423,26 @@ class Session:
             self._call_log = None
         self.traced = census.Traced.of(sites, call_log, launches, steps, self._report.trace_missing, self.sequences)
 
+    def trace_replays(self, step, steps: int) -> tuple:
+        """The replayed steps of a request that is running, under the profiler: ``step(i)`` for ``i`` in ``range(steps)``, the
+        caller's own loop body -- one ``Session.step``, which is one replay, and its host read.  For a caller that has
+        traced the same steps launched from Python (``trace_request``): the launch records of the replays are kept
+        beside those (``Traced.replayed``), so the kernel check holds the recorded step to the step launched from
+        Python, launch by launch.  Returns ``(timing.Trace, "")`` of the replayed steps, or ``(None, reason)`` where
+        their records cannot be had.  ``ValueError`` on a session whose present state has no recorded step, or that
+        has traced no request."""
+        self._decode_only("Session.trace_replays")
+        if self.recorded is None or self.recorded.state is not self.state or self.python_reason:
+            raise ValueError("Session.trace_replays traces replays of the recorded step: this session's present state has none")
+        if self.traced is None:
+            raise ValueError("Session.trace_replays follows a traced request of steps launched from Python (Session.trace_request), which it is held against")
+        launches: list = []
+        trace, missing = trace_steps(step, steps, self.device, records=launches)
+        cut, _ = census.split_steps(launches)
+        self.traced.replayed = cut if launches and len(cut) == steps else []
+        self.traced.own_tail = (1, self.recorded.cursor.launches())
+        return trace, missing
+
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""
         calls = self._report.calls_per_step
