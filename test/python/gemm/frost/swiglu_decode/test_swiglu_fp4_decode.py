@@ -37,9 +37,11 @@ torch = pytest.importorskip("torch")
 cudnn = pytest.importorskip("cudnn")
 
 import swiglu_fp4_decode_utils as U  # noqa: E402  (the operand builders, the reference and the device gate)
+from init_order_schedules import on_device, park, pooled, settled_records, spans_of, stand_ins, warm_fills  # noqa: E402, F401  (settled_records is a fixture)
 from launch_records import assert_facts_equal_the_launch  # noqa: E402
 from warm_stress import StressCase, assert_warm_stress, build_launchers, stress_validation  # noqa: E402
 
+from cudnn.frost import init_order  # noqa: E402
 from cudnn.frost.launch_facts import LaunchShape  # noqa: E402
 from cudnn.gemm.frost.swiglu_decode import swiglu_fp4_decode as entry  # noqa: E402
 from cudnn.gemm.frost.swiglu_decode.kernel import swiglu_fp4_decode_config as kcfg  # noqa: E402
@@ -315,6 +317,67 @@ def _modelled_cuda_entry(monkeypatch, readings=(233472, 232448, 148), cc=(10, 0)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: cc)
     monkeypatch.setattr(entry, "device_readings", lambda device: readings)
     return entry.SwigluFp4Decode("cuda:0", **kw)
+
+
+def _launch_intercepted(monkeypatch):
+    """``(stand-ins, entry, operands, the device's records)``: an entry for a modelled part whose launch at three rows is
+    intercepted, with host operands that report the entry's device (no device)."""
+    s = stand_ins(monkeypatch)
+    k = _modelled_cuda_entry(monkeypatch, geometry=G_SMALL)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
+    host = _host_ops()
+    ops = dict(zip(host, on_device(k.device, *host.values())))
+    k.compiled[k.cfg_for(3)] = lambda *args: s.calls.append(("launch", int(args[-1])))
+    k._kernel_module = types.SimpleNamespace(launch_args=lambda *args: args)
+    return s, k, ops, init_order.pending_of(k.device)
+
+
+def test_a_call_orders_its_launch_behind_a_pending_record_over_an_output_it_writes(monkeypatch):
+    """The entry owns no device memory, but ``out`` and ``out_scale`` can be buffers ANOTHER entry of the device allocated: it
+    walks the device's records (``init_order.pending_of``).  The wiring, on stand-ins with the launch intercepted (no device):
+    IN FRONT of the launch and on the LAUNCH stream, a call is ordered behind a pending record over the bytes of ``out`` or of
+    ``out_scale`` and behind none over an operand it only reads; without a record nothing but the launch happens."""
+    s, k, ops, records = _launch_intercepted(monkeypatch)
+
+    def ordering_of_a_call(over=None):
+        records.clear()
+        event = s.Event(False)
+        if over is not None:
+            records[0] = (event, 7, over if isinstance(over, tuple) else spans_of((over,)))
+        s.calls.clear()
+        k(*(ops[name] for name in ARG_ORDER))
+        return [c for c in s.calls if c[0] in ("wait_event", "launch")], [("wait_event", 100, event), ("launch", 100)]
+
+    for name in ("out", "out_scale"):
+        got, ordered = ordering_of_a_call(ops[name])
+        assert got == ordered, f"a record over the {name} the launch writes"
+        first, last = spans_of((ops[name],))[0]
+        for edge in ((first, first + 1), (last - 1, last)):  # a record over the first byte alone, and over the last
+            got, ordered = ordering_of_a_call((edge,))
+            assert got == ordered, f"a record over one end byte of {name}: {edge}"
+    for name in sorted(set(ARG_ORDER) - {"out", "out_scale"}):
+        assert ordering_of_a_call(ops[name])[0] == [("launch", 100)], f"{name} is only read"
+    assert ordering_of_a_call()[0] == [("launch", 100)] and s.calls == [("launch", 100)], "without a record: the launch alone"
+
+
+def test_a_device_without_a_record_costs_a_call_one_truth_test(monkeypatch):
+    """The steady state, on stand-ins with the launch intercepted (no device): while the entry's device holds no record a
+    call reads the truth of the device's records and nothing else of the ordering.  The ordering step and the range
+    arithmetic raise here if they are entered, whatever the records of ANOTHER device hold."""
+    s, k, ops, records = _launch_intercepted(monkeypatch)
+    init_order.pending_of(torch.device("cuda", 6))[0] = (s.Event(False), 7, ((0, 1 << 62),))  # another device's, over every address
+    assert not records and k.device != torch.device("cuda", 6)
+
+    def entered(what):
+        def raises(*args, **kwargs):
+            raise AssertionError(f"{what} was entered without a record of the device")
+
+        return raises
+
+    for name in ("order_behind", "record", "span"):
+        monkeypatch.setattr(init_order, name, entered(f"init_order.{name}"))
+    k(*(ops[name] for name in ARG_ORDER))
+    assert s.calls == [("launch", 100)], "without a record of the device: the launch alone"
 
 
 def test_an_unserved_cuda_part_declines_at_construction_by_name(monkeypatch):
@@ -953,6 +1016,35 @@ def _assert_reference(out, out_scale, weight, act, ops, geometry, tiles=None, la
     assert chk["scale_outside"] == 0, f"{label}: {chk['scale_outside']} of {chk['blocks']} block scales outside the admissible interval ({chk})"
     assert chk["code_ratio"] <= 1.0, f"{label}: a code is {chk['code_ratio']:.4f} of its bound away from the reference ({chk})"
     return chk
+
+
+@pytest.mark.usefixtures("settled_records")
+def test_warm_launch_into_another_entrys_pending_scales_waits_for_their_zero_fill():
+    """The records are the DEVICE's, not an entry's.  The zero-filled block scales of a ``cudnn.AddNormQuantDecode`` entry are
+    taken with ``outputs`` on a side stream that is parked behind a delay kernel and passed as the ``out_scale`` of a WARM
+    launch on the original stream: the launch is ordered behind that zero-fill although the host does not wait.  Unordered,
+    the zero-fill erases the block scales the kernel wrote."""
+    from cudnn.norm.frost.add_norm_quant_decode import AddNormQuantDecode
+
+    dev = U.device_or_skip()
+    rows = 7
+    k = _entry(dev, G_SMALL)
+    ops, _ = _ops(dev, G_SMALL, rows, seed=41)
+    want_out, want_scale = U.run(k, ops)  # the warm-up: the bytes of ready caller-owned outputs
+    torch.cuda.synchronize()
+    other = AddNormQuantDecode(dev, G_SMALL.HIDDEN, 1e-6, add=False, bf16=False, quant="nvfp4")
+    warm_fills(dev, U.E4M3, torch.uint8)
+    taken = {}
+    blocks = lambda: [torch.empty(n, dtype=torch.uint8, device=dev) for n in (rows * G_SMALL.HIDDEN // 2, 128 * G_SMALL.HIDDEN // 16)]  # noqa: E731
+    pending = park(pooled(dev, blocks), lambda: taken.update(other.outputs(rows)))
+    out, out_scale = U.run(k, ops, torch.empty_like(want_out), taken["scales"])
+    assert not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    got, want = U.live_scales(out_scale, rows, G_SMALL), U.live_scales(want_scale, rows, G_SMALL)
+    differing = int((got != want).sum())
+    assert (
+        torch.equal(out, want_out) and differing == 0
+    ), f"the live block scales, written into another entry's pending scales: {differing} of {want.numel()} bytes differ"
 
 
 @pytest.mark.parametrize("kind", ("random", "structured"))
