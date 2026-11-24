@@ -173,6 +173,11 @@ TINV_SOURCES = ("compute", "gmem")
 # 8 g + j // 4 (8 rows x 64 B per instruction) and a per-warp shared-memory scratch transposes between that order and the
 # row-per-lane order of tcgen05.ld / tcgen05.st.  The words and their bytes do not change.  build_cfg admits it for fp32
 # states at d_v 128 with the chunk factor built in the kernel; the scratch takes the A ring's third stage.
+# - The scratch hands words from lane to lane: what a lane loads from it, a different lane of its warp stored.  Lanes
+#   of a warp are not ordered against each other, so the warp synchronises (bar.warp.sync) behind the stores of an
+#   exchange, in front of its loads, and again behind the loads, in front of the next stores (scratch_put,
+#   scratch_take).  A state of d_k columns is d_k / 16 exchanges in either direction, two synchronisations each: 16 per
+#   warp at d_k 128, per work item that moves the state, none per chunk.
 STATE_IO_COALESCED = False
 STATE_XFER_ROWS = 32  # rows of one warp's scratch region = the lanes of a warp
 STATE_XFER_ROW_WORDS = 16  # fp32 words per scratch row (64 B: half of a 32-column tcgen05.ld / tcgen05.st round)
@@ -2342,23 +2347,118 @@ def coalesced_state_loads(gState, gmem_row, row_step, gmem_col, v_offset, num_ro
 
 
 @cute.jit
+def state_scratch_maps(lane_idx):
+    """``(co_off, row_off)``: where lane ``lane_idx`` of a warp finds its 16-byte pieces in the warp's state scratch, in
+    fp32 words from the scratch's base.  The scratch is ``STATE_XFER_ROWS`` rows of 64 B under the 64-byte XOR swizzle;
+    no descriptor reads it, the swizzle spreads the banks for both access orders.  ``co_off[g]`` is its piece of global
+    instruction ``g`` in the coalesced order (piece ``lane % 4`` of scratch row ``8 g + lane // 4``), ``row_off[piece]``
+    is piece ``piece`` of its own tensor-memory row (scratch row ``lane``).  The two maps name the same pieces through
+    different lanes: lane ``l`` finds at ``row_off[p]`` what lane ``4 (l % 8) + p`` put at ``co_off[l // 8]``, and at
+    ``co_off[g]`` what lane ``8 g + l // 4`` put at ``row_off[l % 4]``."""
+    rows_per_store = STATE_XFER_ROWS // 4
+    pieces_per_row = STATE_XFER_ROW_WORDS // 4
+    lane_col = (lane_idx % pieces_per_row) * 4
+    co_off = []
+    for g in cutlass.range_constexpr(pieces_per_row):
+        co_row = cutlass.Int32(g * rows_per_store) + lane_idx // pieces_per_row
+        co_off.append(co_row * STATE_XFER_ROW_WORDS + swizzle_xor_64b(co_row, lane_col, elem_bytes=4))
+    row_off = []
+    for piece in cutlass.range_constexpr(pieces_per_row):
+        row_off.append(lane_idx * STATE_XFER_ROW_WORDS + swizzle_xor_64b(lane_idx, cutlass.Int32(piece * 4), elem_bytes=4))
+    return co_off, row_off
+
+
+@cute.jit
+def scratch_put(xfer_base, offsets, pieces):
+    """The first half of an exchange through a warp's state scratch: every lane stores its 16-byte ``pieces`` at its
+    ``offsets``, then the warp synchronises.  Lanes of a warp are not ordered against each other; behind the
+    synchronisation every lane's stores are in the scratch for whichever lane loads them (``scratch_take``).  The caller
+    is a whole warp in converged control flow."""
+    for n in cutlass.range_constexpr(len(offsets)):
+        (xfer_base + offsets[n]).store(pieces[n], alignment=16)
+    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+@cute.jit
+def scratch_take(xfer_base, offsets):
+    """The second half of an exchange: every lane loads the 16-byte pieces at its ``offsets`` -- words other lanes of
+    the warp stored (``scratch_put``) -- then the warp synchronises, so that no lane stores to the scratch again while
+    another still loads from it.  Returns the pieces.  The caller is a whole warp in converged control flow."""
+    pieces = [(xfer_base + offsets[n]).load(count=4, alignment=16) for n in range(len(offsets))]
+    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+    return pieces
+
+
+@cute.jit
 def coalesced_state_to_tmem(pieces, xfer_base, xfer_co_off, xfer_row_off, tmem_state_addr, num_rounds: int, round_words: int):
-    """Through the warp's scratch into the row-per-lane order, then one tcgen05.st per round of ``round_words`` columns."""
+    """Through the warp's scratch into the row-per-lane order, then one tcgen05.st per round of ``round_words`` columns.
+    Per half round every lane puts the pieces of its global loads and takes its own row's (``scratch_put``,
+    ``scratch_take``: the warp synchronises behind either)."""
     pieces_per_row = STATE_XFER_ROW_WORDS // 4
     for i in cutlass.range_constexpr(num_rounds):
         words = []
         for half in cutlass.range_constexpr(round_words // STATE_XFER_ROW_WORDS):
-            for g in cutlass.range_constexpr(pieces_per_row):
-                (xfer_base + xfer_co_off[g]).store(pieces[i][half][g], alignment=16)
+            scratch_put(xfer_base, xfer_co_off, pieces[i][half])
+            row_pieces = scratch_take(xfer_base, xfer_row_off)
             for piece in cutlass.range_constexpr(pieces_per_row):
-                row_piece = (xfer_base + xfer_row_off[piece]).load(count=4, alignment=16)
                 for t in cutlass.range_constexpr(4):
-                    words.append(row_piece[t])
+                    words.append(row_pieces[piece][t])
         nvvm.tcgen05_st(
             "32x32b",
             nvvm.make_tmem_ptr(tmem_state_addr + i * round_words, cutlass.Float32),
             cutlass.Vector.from_elements(tuple(words), cutlass.Float32),
         )
+
+
+@cute.jit
+def coalesced_state_from_tmem(tmem_state_addr, xfer_base, xfer_co_off, xfer_row_off, gmem_rows, gmem_col, num_rounds: int, round_words: int, free_bars=None):
+    """One tcgen05.ld per round of ``round_words`` columns, then through the warp's scratch into the coalesced order and
+    out: per half round every lane puts its row's pieces and takes the piece of each of its global stores
+    (``scratch_put``, ``scratch_take``: the warp synchronises behind either), 8 rows x 64 B per store instruction to
+    ``gmem_rows[g]`` at word ``gmem_col`` of the half round.  ``free_bars``, where the seed copy takes the fp32 state
+    region over inside this store: every lane arrives ``mb_state_free`` behind the last round's tcgen05.ld (complete:
+    tcgen05.wait::ld) and the stores of its first words."""
+    pieces_per_row = STATE_XFER_ROW_WORDS // 4
+    for i in cutlass.range_constexpr(num_rounds):
+        state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_state_addr + i * round_words, cutlass.Float32), num=32)
+        for half in cutlass.range_constexpr(round_words // STATE_XFER_ROW_WORDS):
+            scratch_put(
+                xfer_base,
+                xfer_row_off,
+                [
+                    cutlass.Vector.from_elements(tuple(state_vec[half * STATE_XFER_ROW_WORDS + piece * 4 + t] for t in range(4)), cutlass.Float32)
+                    for piece in range(pieces_per_row)
+                ],
+            )
+            if cutlass.const_expr(free_bars is not None and i == num_rounds - 1 and half == 0):
+                # The item's last tcgen05.ld of the fp32 state region is complete and its first words are stored: the
+                # region is the next seed's.
+                nvvm.tcgen05_wait("load")
+                free_bars.mb_state_free[0].arrive()
+            store_pieces = scratch_take(xfer_base, xfer_co_off)
+            for g in cutlass.range_constexpr(pieces_per_row):
+                (gmem_rows[g] + (i * round_words + half * STATE_XFER_ROW_WORDS) + gmem_col).store(store_pieces[g], alignment=16)
+
+
+@cute.jit
+def final_key_put(final_keys, slot, key):
+    """Every lane of a compute-group-1 warp stores ``key`` into word ``slot`` of the warp's final-state keys, then the
+    warp synchronises.  The lanes store one value, but each loads the words as shared memory holds them
+    (``final_key_held``): the synchronisation puts every lane's store in front of every lane's later load."""
+    (final_keys + slot).store(key)
+    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+@cute.jit
+def final_key_held(final_keys, guard_items: int, key):
+    """Whether one of the warp's ``guard_items`` final-state keys is ``key``, one value across the warp: every lane
+    loads the words, then the warp synchronises, so that no lane stores the next key (``final_key_put``) while another
+    still loads."""
+    held = cutlass.Boolean(False)
+    for entry in cutlass.range_constexpr(guard_items):
+        held = held or ((final_keys + entry).load() == key)
+    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+    return held
 
 
 @cute.jit
@@ -2442,21 +2542,14 @@ def compute1_warp_group(
     sO_base = sO[0].base
     num_vals = 32
     if cutlass.const_expr(cfg.state_io_coalesced):
-        # The warp's scratch region: STATE_XFER_ROWS rows of 64 B under the 64-byte XOR swizzle.  No descriptor reads it; the
-        # swizzle spreads the banks for both access orders (a row per lane, and 8 rows x 4 pieces per instruction).
+        # The warp's scratch region and this thread's two address maps into it (state_scratch_maps: a row per lane, and
+        # 8 rows x 4 pieces per instruction).
         xfer_rows = STATE_XFER_ROWS // 4
         xfer_pieces = STATE_XFER_ROW_WORDS // 4
-        xfer_halves = ldtm_width // STATE_XFER_ROW_WORDS
         xfer_base = sStateXfer_raw.data_ptr() + (cg1_tidx // cfg.threads_per_warp) * (STATE_XFER_ROWS * STATE_XFER_ROW_WORDS)
         xfer_gmem_row = (cg1_tidx // cfg.threads_per_warp) * cfg.threads_per_warp + lane_idx // xfer_pieces
         xfer_gmem_col = (lane_idx % xfer_pieces) * 4
-        xfer_co_off = []
-        for g in cutlass.range_constexpr(xfer_pieces):
-            co_row = cutlass.Int32(g * xfer_rows) + lane_idx // xfer_pieces
-            xfer_co_off.append(co_row * STATE_XFER_ROW_WORDS + swizzle_xor_64b(co_row, xfer_gmem_col, elem_bytes=4))
-        xfer_row_off = []
-        for piece in cutlass.range_constexpr(xfer_pieces):
-            xfer_row_off.append(lane_idx * STATE_XFER_ROW_WORDS + swizzle_xor_64b(lane_idx, cutlass.Int32(piece * 4), elem_bytes=4))
+        xfer_co_off, xfer_row_off = state_scratch_maps(lane_idx)
 
     nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
@@ -2494,12 +2587,13 @@ def compute1_warp_group(
     sets_level_words = level_sets(cfg, early_handover)
     if cutlass.const_expr(cfg.seed_alias_guard):
         # The warp's keys of the final states it stored last (STATE_SEED_KEY_NONE = none).  Every lane of the warp stores
-        # the same words and reads back words it stored itself; no other role touches them.  The address is warp-uniform,
-        # so the compare that selects the reload is too.
+        # the same words and loads them; no other role touches them.  The address is warp-uniform, so the compare that
+        # selects the reload is too.  The words are shared by the warp's lanes: the warp synchronises behind every store
+        # of a key and behind the loads of a compare (final_key_put, final_key_held).
         guard_items = cfg.scheduler_stages + 1
         final_keys = sFinalKeys.data_ptr() + (warp_idx - cfg.compute_group_1_warp_ids[0]) * guard_items
         for entry in cutlass.range_constexpr(guard_items):
-            (final_keys + entry).store(cutlass.Int32(STATE_SEED_KEY_NONE))
+            final_key_put(final_keys, entry, cutlass.Int32(STATE_SEED_KEY_NONE))
         final_key_slot = cutlass.Int32(0)
     scheduler_state = PipelineState.start(phase=0)
     tile_idx, scheduler_state = scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz)
@@ -2557,10 +2651,7 @@ def compute1_warp_group(
                         if cutlass.const_expr(cfg.seed_alias_guard):
                             # The copied seed was read in front of the final-state stores of the thread block's last work
                             # items: when its block is one of theirs, load it again here, behind them, over the copy.
-                            seed_key = head_o * cutlass.Int32(STATE_SEED_KEY_HEAD) + seed_row
-                            seed_stale = cutlass.Boolean(False)
-                            for entry in cutlass.range_constexpr(guard_items):
-                                seed_stale = seed_stale or ((final_keys + entry).load() == seed_key)
+                            seed_stale = final_key_held(final_keys, guard_items, head_o * cutlass.Int32(STATE_SEED_KEY_HEAD) + seed_row)
                             if seed_stale:
                                 if cutlass.const_expr(cfg.level_reload_count):
                                     if level_order_entry(tile_idx, mLevelOrder) < cutlass.Int32(0):
@@ -3101,7 +3192,7 @@ def compute1_warp_group(
                             final_row = cutlass.Int32(mFinalIndices[final_dst])
                     gState_out = mState_out[None, None, head_o, final_row]
                     if cutlass.const_expr(cfg.seed_alias_guard):
-                        (final_keys + final_key_slot).store(head_o * cutlass.Int32(STATE_SEED_KEY_HEAD) + final_row)
+                        final_key_put(final_keys, final_key_slot, head_o * cutlass.Int32(STATE_SEED_KEY_HEAD) + final_row)
                         final_key_slot = cutlass.Int32(0) if final_key_slot == cutlass.Int32(guard_items - 1) else final_key_slot + 1
                     state_vw = 16 // (mState_out.element_type.width // 8)
                     state_dst = (gState_out.iterator + gState_out.layout((state_gmem_row + v_offset, 0))).raw_ptr()
@@ -3113,25 +3204,17 @@ def compute1_warp_group(
                         final_rows = [
                             (gState_out.iterator + gState_out.layout((xfer_gmem_row + g * xfer_rows + v_offset, 0))).raw_ptr() for g in range(xfer_pieces)
                         ]
-                        for i in cutlass.range_constexpr(num_ldtms):
-                            state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32), num=32)
-                            for half in cutlass.range_constexpr(xfer_halves):
-                                for piece in cutlass.range_constexpr(xfer_pieces):
-                                    (xfer_base + xfer_row_off[piece]).store(
-                                        cutlass.Vector.from_elements(
-                                            tuple(state_vec[half * STATE_XFER_ROW_WORDS + piece * 4 + t] for t in range(4)), cutlass.Float32
-                                        ),
-                                        alignment=16,
-                                    )
-                                if cutlass.const_expr(free_in_store and i == num_ldtms - 1 and half == 0):
-                                    # The item's last tcgen05.ld of the fp32 state region is complete and its first words
-                                    # are stored: the region is the next seed's.
-                                    nvvm.tcgen05_wait("load")
-                                    bars.mb_state_free[0].arrive()
-                                for g in cutlass.range_constexpr(xfer_pieces):
-                                    (final_rows[g] + (i * ldtm_width + half * STATE_XFER_ROW_WORDS) + xfer_gmem_col).store(
-                                        (xfer_base + xfer_co_off[g]).load(count=4, alignment=16), alignment=16
-                                    )
+                        coalesced_state_from_tmem(
+                            row_lo_addr + tmem_state_col,
+                            xfer_base,
+                            xfer_co_off,
+                            xfer_row_off,
+                            final_rows,
+                            xfer_gmem_col,
+                            num_ldtms,
+                            ldtm_width,
+                            bars if cutlass.const_expr(free_in_store) else None,
+                        )
                     else:
                         for i in cutlass.range_constexpr(num_ldtms):
                             state_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32), num=32)
@@ -3171,7 +3254,7 @@ def compute1_warp_group(
                         final_row = cutlass.Int32(mFinalIndices[final_dst])
                     gState_out = mState_out[None, None, head_o, final_row]
                     if cutlass.const_expr(cfg.seed_alias_guard):
-                        (final_keys + final_key_slot).store(head_o * cutlass.Int32(STATE_SEED_KEY_HEAD) + final_row)
+                        final_key_put(final_keys, final_key_slot, head_o * cutlass.Int32(STATE_SEED_KEY_HEAD) + final_row)
                         final_key_slot = cutlass.Int32(0) if final_key_slot == cutlass.Int32(guard_items - 1) else final_key_slot + 1
                     if cutlass.const_expr(cfg.use_initial_state):
                         if cutlass.const_expr(cfg.state_table):
