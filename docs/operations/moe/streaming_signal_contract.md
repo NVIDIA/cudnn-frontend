@@ -18,10 +18,11 @@ Kernels:
   (`quant/grouped_gemm_quant.py`, FC2 forward) in the output direction (section 4b).
 - dGLU backward on SM100, input direction (section 4a): `MoEGroupedGemmDgluDbiasBf16Kernel` (BF16) and
   `BlockScaledMoEGroupedGemmDgluDbiasKernel` (MXFP8).
+- Rubin (SM107), input direction only (section 4a): the block-scaled GLU twin `BlockScaledMoEGroupedGemmGluKernel` and
+  dGLU twin `BlockScaledMoEGroupedGemmDgluKernel`. The Rubin quant kernel does not take `N_CHUNK` yet.
 
-The Rubin (SM107) twins of the block-scaled and dGLU kernels take the same options in a later change. Both directions need
-`use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is the same as without this
-feature.
+Both directions need `use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is the
+same as without this feature.
 
 ## 1. Input direction: producer → GEMM
 
@@ -176,13 +177,15 @@ routing.
 ## 4. Block-scaled and dGLU kernels
 
 On SM100 the block-scaled GLU kernel (FC1 forward) and the BF16 and MXFP8 dGLU kernels (backward) take the input
-direction (4a), and the block-scaled quant kernel (FC2 forward) the output direction (4b). The Rubin (SM107) twins are not
-wired yet.
+direction (4a), and the block-scaled quant kernel (FC2 forward) the output direction (4b). On Rubin (SM107) the
+block-scaled GLU and dGLU twins take the input direction with stock SF atoms; the Rubin quant kernel is not wired for the
+output direction yet.
 
 ### 4a. Input direction: GLU and dGLU kernels
 
-The MXFP8 / NVFP4 block-scaled GLU kernel `BlockScaledMoEGroupedGemmGluBiasKernel` (`glu/`, FC1 forward, SM100) takes
-the BF16 GLU kernel's input-direction options: `streaming_signal_capacity`, `device_layout`, `use_pdl` and
+The MXFP8 / NVFP4 block-scaled GLU kernel `BlockScaledMoEGroupedGemmGluBiasKernel` (`glu/`, FC1 forward, SM100) and its
+Rubin twin `BlockScaledMoEGroupedGemmGluKernel` (`glu/moe_blockscaled_grouped_gemm_glu_rubin.py`, SM107) take the BF16
+GLU kernel's input-direction options: `streaming_signal_capacity`, `device_layout`, `use_pdl` and
 `launch_pdl_dependents_at_all_streaming_signal_slots_ready`. Sections 1 and 2 hold unchanged, and `signal[t]` also covers
 M tile t's scale factors:
 
@@ -192,12 +195,12 @@ M tile t's scale factors:
 | M tile t | A rows `[256 t, 256 (t + 1))` and SFA atom rows 2t and 2t + 1: the contiguous bytes `[t * 256 * Kc, (t + 1) * 256 * Kc)`, `Kc = round_up(ceil(K / sf_vec_size), 4)`. |
 | producer | Writes both, padding rows and padding scale columns included, before the release store of `signal[t]` (section 1, memory ordering). |
 | GEMM | The per-tile `fence.proxy.async.global` after the acquire orders the SFA TMA loads as well as A's. |
-| other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA. |
+| other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA; on Rubin no B-reuse. |
 
 #### Compact SFA (`compact_sfa_sf_warp=True`)
 
 An EP dispatch delivers each token's scales as a compact row, not as SF atoms. With `compact_sfa_sf_warp=True` the SM100
-GLU kernel takes `sfa` as those rows and builds the atoms itself:
+GLU kernel (not the Rubin twin, which takes stock SF atoms only) takes `sfa` as those rows and builds the atoms itself:
 
 | Item | Contract |
 |---|---|
@@ -229,23 +232,23 @@ either). Moving the arrive before the stores is caught (the producer and release
 #### Backward dGLU
 
 The dGLU kernels `MoEGroupedGemmDgluDbiasBf16Kernel` (BF16) and `BlockScaledMoEGroupedGemmDgluDbiasKernel` (MXFP8), both
-in `dglu/` on SM100, compute FC1's backward activation: dY x W2 with the dGLU epilogue over the saved pre-activation C.
+in `dglu/` on SM100, and the MXFP8 Rubin twin `BlockScaledMoEGroupedGemmDgluKernel` (SM107, stock SF atoms) compute FC1's backward activation: dY x W2 with the dGLU epilogue over the saved pre-activation C.
 They read the dispatched output gradient dY as A, so the backward dispatch is the producer and `signal[t]` covers dY's
 rows of M tile t (and, for MXFP8, their scales) exactly as A's for the forward GLU. C, prob, alpha, beta and B are
 ordinary inputs that must be complete before the GEMM starts.
 
 | Item | Contract |
 |---|---|
-| options | `streaming_signal_capacity`, `use_pdl` and `launch_pdl_dependents_at_entry`; MXFP8 also `compact_sfa_sf_warp` (as above). No `device_layout` and no all-slots-ready trigger: the expert layout is known before the backward dispatch. |
+| options | `streaming_signal_capacity`, `use_pdl` and `launch_pdl_dependents_at_entry`; MXFP8 on SM100 also `compact_sfa_sf_warp` (as above). No `device_layout` and no all-slots-ready trigger: the expert layout is known before the backward dispatch. |
 | M tile t | dY rows `[256 t, 256 (t + 1))`; MXFP8: their SF atoms or compact scale rows, as for the GLU. |
-| outputs | D, the row and column SFD and dprob are written per tile as without a producer. With `deterministic=True` dprob has one slot per N tile, so it is bitwise independent of the release order. |
-| other | Dense weights, `padded_offsets` in global memory, cluster (2, 1) with the 2-CTA MMA. |
+| outputs | D, the row and column SFD and dprob are written per tile as without a producer. With `deterministic=True` (SM100) dprob has one slot per N tile, so it is bitwise independent of the release order. The Rubin kernel adds dprob partials with fp32 atomics in tile arrival order: its dprob is not deterministic (not even across replays without a producer); D is. |
+| other | Dense weights, `padded_offsets` in global memory, cluster (2, 1) with the 2-CTA MMA; on Rubin no B-reuse. |
 
 ### 4b. Output direction: quant kernel (FC2 forward)
 
 The SM100 block-scaled quant kernel `BlockScaledMoEGroupedGemmQuantKernel` takes the output direction with the same
 options as the BF16 plain kernel: `streaming_output_notify`, `use_pdl` and `launch_pdl_dependents_at_entry`. Section 3
-holds unchanged, with these limits:
+holds unchanged, with these limits. The Rubin (SM107) quant kernel does not take these options yet.
 
 | Item | Contract |
 |---|---|
@@ -320,9 +323,10 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 - N must be known at build time (dense B).
 - `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
   exists on the GLU kernels only and requires `streaming_signal_capacity`.
-- Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3); on SM100 the input direction on the
-  block-scaled GLU forward kernel and the BF16 and MXFP8 dGLU kernels (section 4a), and `N_CHUNK` on the block-scaled
-  quant forward kernel with BF16 D (section 4b). The Rubin (SM107) kernels and other recipes are not wired up yet.
+- Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3); the input direction on the
+  block-scaled GLU forward kernel and the BF16 and MXFP8 dGLU kernels, SM100 and the Rubin twins (section 4a); and
+  `N_CHUNK` on the SM100 block-scaled quant forward kernel with BF16 D (section 4b; not the Rubin quant kernel yet).
+  Other recipes are not wired up yet.
 
 ## Acknowledgements
 

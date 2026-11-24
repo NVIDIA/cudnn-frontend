@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared by the streaming signal tests of the SM100 block-scaled grouped GEMM kernels, on top of #2810's BF16 helper:
-problems, kernels, one compile cache per process, the N_CHUNK consumer and the fake input producer.
+"""Shared by the streaming signal tests of the SM100 block-scaled grouped GEMM kernels and their SM107 (Rubin) twins, on
+top of #2810's BF16 helper: problems, kernels, one compile cache per process, the N_CHUNK consumer and the fake input
+producer.
 
 Kernel kinds (K = 512, cluster (2, 1) with the 2-CTA 256 x 256 tile unless ``one_cta``, dense weights):
 
@@ -10,6 +11,9 @@ Kernel kinds (K = 512, cluster (2, 1) with the 2-CTA 256 x 256 tile unless ``one
 - "glu": the MXFP8 SwiGLU kernel (FC1), N = gate and up -> BF16 C [rows, N] and D [rows, N / 2]; the input signal.
 - "dglu_bf16", "dglu": the BF16 and MXFP8 dSwiGLU kernels, dY [rows, K] x W2 [E, N, K] with the saved C [rows, 2N] ->
   BF16 D [rows, 2N] and dprob (``deterministic=True``: one FP32 slot per 256-wide N tile); the input signal.
+
+On SM107 "glu" and "dglu" build the Rubin twins (stock SF atoms only).  The Rubin dGLU has no ``deterministic``: it adds
+the FP32 dprob partials with atomics in tile arrival order, so its dprob (``dprob_atomic``) is compared with a tolerance.
 
 MXFP8 operands are E4M3 codes with E8M0 exponents, kept row-major (``a_exp``, ``b_exp``) and as the swizzled SF atoms
 the kernels read (``sfa``, ``sfb``); with ``compact_sfa_sf_warp`` the kernel reads ``a_exp`` and builds the atoms.
@@ -41,23 +45,27 @@ def is_rubin():
     return tuple(torch.cuda.get_device_capability()) == (10, 7)
 
 
-def require_kernel(kind):
-    """Skip what this GPU's kernel of ``kind`` does not take."""
+def require_kernel(kind, compact):
+    """Skip what this GPU's kernel of ``kind`` does not take: on SM107, N_CHUNK and the compact SF warp."""
     if not is_rubin():
         return
     if kind == "quant":
         pytest.skip("N_CHUNK on the SM107 (Rubin) quant kernel is not wired yet")
-    if kind != "dglu_bf16":
-        pytest.skip("the SM100 kernel (the Rubin twin does not take a streaming input producer)")
+    if compact:
+        pytest.skip("compact_sfa_sf_warp: the SM100 kernels only (the Rubin twins take SF atoms)")
 
 
-def kernel_class(kind):
+def kernel_class(kind, rubin):
     if kind == "quant":
         from cudnn.gemm.cutedsl.grouped.quant.grouped_gemm_quant import BlockScaledMoEGroupedGemmQuantKernel as cls
+    elif kind == "glu" and rubin:
+        from cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_rubin import BlockScaledMoEGroupedGemmGluKernel as cls
     elif kind == "glu":
         from cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel as cls
     elif kind == "dglu_bf16":
         from cudnn.gemm.cutedsl.grouped.dglu.moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel as cls
+    elif rubin:
+        from cudnn.gemm.cutedsl.grouped.dglu.moe_blockscaled_grouped_gemm_dglu_rubin import BlockScaledMoEGroupedGemmDgluKernel as cls
     else:
         from cudnn.gemm.cutedsl.grouped.dglu.moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel as cls
     return cls
@@ -68,7 +76,8 @@ def make_kernel(kind, experts, one_cta=False, **options):
     import cutlass
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
 
-    require_kernel(kind)
+    require_kernel(kind, bool(options.get("compact_sfa_sf_warp")))
+    rubin = kind in ("glu", "dglu") and is_rubin()
     common = dict(
         acc_dtype=cutlass.Float32,
         use_2cta_instrs=not one_cta,
@@ -86,15 +95,18 @@ def make_kernel(kind, experts, one_cta=False, **options):
         common["enable_bias"] = False
     if kind == "glu":
         common["act_func"] = "swiglu"
+        if rubin:
+            options["generate_c"] = True
     if kind.startswith("dglu"):
         common["act_func"] = "dswiglu"
-        options.setdefault("deterministic", True)
-    # compact_sfa_sf_warp is passed only when on: the BF16 kernel has no such argument.
+        if not rubin:
+            options.setdefault("deterministic", True)
+    # compact_sfa_sf_warp is passed only when on: the BF16 and Rubin kernels have no such argument.
     if not options.get("compact_sfa_sf_warp"):
         options.pop("compact_sfa_sf_warp", None)
     common.update({name: options.pop(name) for name in list(options) if name in common})
-    kernel = kernel_class(kind)(**common, **options)
-    kernel.test_kind, kernel.test_cluster_size = kind, 1 if one_cta else 2
+    kernel = kernel_class(kind, rubin)(**common, **options)
+    kernel.test_kind, kernel.test_rubin, kernel.test_cluster_size = kind, rubin, 1 if one_cta else 2
     kernel.test_compact = bool(options.get("compact_sfa_sf_warp"))
     kernel.test_signal = bool(options.get("streaming_signal_capacity"))
     kernel.test_device_layout = bool(options.get("device_layout"))
@@ -213,15 +225,28 @@ OUTPUTS = {"quant": ("d",), "glu": ("c", "d"), "dglu_bf16": ("d", "dprob"), "dgl
 
 
 def outputs(kernel, problem, buffers):
-    """The output buffers by name, over the experts' rows."""
-    rows = valid_rows(problem)
-    return {name: value[:rows] for name, value in zip(OUTPUTS[kernel.test_kind], buffers)}
+    """The output buffers by name, over the experts' rows (the Rubin dGLU's dprob as ``dprob_atomic``)."""
+    rows, names = valid_rows(problem), OUTPUTS[kernel.test_kind]
+    if kernel.test_rubin and kernel.test_kind == "dglu":
+        names = ("d", "dprob_atomic")
+    return {name: value[:rows] for name, value in zip(names, buffers)}
+
+
+def exact(out):
+    """The outputs a kernel promises bit for bit: all but an atomic sum."""
+    return {name: value for name, value in out.items() if not name.endswith("_atomic")}
 
 
 def assert_same_bytes(got, want, label=""):
-    """Raw-byte equal outputs."""
-    for name in want:
+    """Raw-byte equal outputs; an atomic sum within FP32 reassociation of ``want``."""
+    for name in exact(want):
         assert torch.equal(got[name].view(torch.int16), want[name].view(torch.int16)), f"{label}: {name} differs from the stock scheduler"
+    for name in set(want) - set(exact(want)):
+        # The rounding is relative to the partials, not to the sum: a token whose large partials cancel can differ by a
+        # few ulp of the largest partial (Rubin: 0.016-0.047 at |dprob| up to 2.7e5).  So the absolute tolerance scales
+        # with the output, 8 FP32 eps of max |want|, plus a small relative one.
+        atol = 8 * torch.finfo(torch.float32).eps * max(want[name].abs().max().item(), 1.0)
+        torch.testing.assert_close(got[name], want[name], rtol=1e-5, atol=atol, msg=lambda m: f"{label}: {name}: {m}")
 
 
 #: Index of the amax tensor among the quant kernel's arguments.
@@ -258,7 +283,8 @@ def kernel_args(kernel, problem, *buffers):
         return head + [tensor(buffers[0]), d, d, sfa, None, None, None, None, offsets, alpha, prob, None]
     # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, padded_offsets, alpha, beta, prob, dprob, dbias)
     tail = [tensor(problem["c"]), d, d, sfa, None, None, None, None, offsets, alpha, tensor(problem["beta"]), prob, tensor(buffers[1].unsqueeze(-1))]
-    return head + tail + [None]
+    # The Rubin dGLU also takes linear_offset before dbias.
+    return head + tail + ([cutlass.Float32(0.0), None] if kernel.test_rubin else [None])
 
 
 def b_major_arg(kernel):

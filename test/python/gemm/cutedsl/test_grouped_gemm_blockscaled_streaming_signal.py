@@ -3,7 +3,8 @@
 
 """Streaming signal options of the SM100 block-scaled grouped GEMM kernels: N_CHUNK output notify on the MXFP8 quant
 kernel (FC2); the input signal on the MXFP8 SwiGLU kernel (FC1), with stock SF atoms or ``compact_sfa_sf_warp``, and on
-the BF16 and MXFP8 dSwiGLU kernels.
+the BF16 and MXFP8 dSwiGLU kernels.  On SM107 the GLU and MXFP8 dGLU cases run the Rubin twins (stock SF atoms; the
+compact and N_CHUNK cases skip there), whose dGLU dprob is an FP32 atomic sum compared within 8 FP32 eps of max |dprob|.
 
 The options reorder tiles, wait and count; they never change the tile math, so every output must be raw-byte equal to
 the stock dynamic scheduler's.  Input direction: the producer writes A (dY) and its scales, then releases ``signal[t] =

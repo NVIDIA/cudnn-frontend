@@ -3,7 +3,10 @@
 
 """Bitwise determinism of the streaming signal options on the SM100 block-scaled grouped GEMM kernels: N_CHUNK output
 notify on the MXFP8 quant kernel (FC2), and the input signal on the MXFP8 SwiGLU kernel (FC1; stock SF atoms or
-``compact_sfa_sf_warp``) and on the BF16 and MXFP8 dSwiGLU kernels (``deterministic=True``).
+``compact_sfa_sf_warp``) and on the BF16 and MXFP8 dSwiGLU kernels (``deterministic=True``).  On SM107 the GLU and MXFP8
+dGLU cases run the Rubin twins (stock SF atoms).  The Rubin dGLU adds its FP32 dprob partials with atomics in tile
+arrival order, so its dprob is not deterministic, not even across replays of the stock scheduler: there D is compared
+bit for bit and dprob is left out (not deterministic on the Rubin MXFP8 dGLU).
 
 The options change which cluster runs a tile and when, never the tile math, so the outputs (FC2: BF16 D; FC1: BF16 C
 and D; dGLU: BF16 D and the FP32 dprob slots) must be raw-byte equal across replays, extra clusters that stop early or
@@ -23,7 +26,7 @@ REPLAYS = 3
 
 
 def run(launcher, problem):
-    return launcher(problem)[0]
+    return bs.exact(launcher(problem)[0])
 
 
 def case_ids(cases):
@@ -92,9 +95,9 @@ def test_signal_producer_release_order_invariance(kind, variant):
     with ``device_layout`` also the expert layout; a producer stream writes each M tile and releases it, in order, in
     reverse and in a seeded random order, over 64 experts.  Every order gives the stock scheduler's bytes."""
     _, expected, results = bs.producer_case(kind, variant, "many_experts_64")
-    expected = snapshot(expected)
+    expected = snapshot(bs.exact(expected))
     for order, got in results.items():
-        assert_bitwise(snapshot(got), expected, f"{order} release vs stock")
+        assert_bitwise(snapshot(bs.exact(got)), expected, f"{order} release vs stock")
 
 
 # ---- Batch invariance and claim-slot warm stress, every kernel ----
@@ -115,7 +118,7 @@ def test_target_expert_batch_invariance(kind, variant):
         kernel = bs.notify_kernel(bs.SLOTS, 768, 512, one_cta)
     else:
         kernel = bs.make_kernel(kind, bs.SLOTS, **bs.variant_options(kind, alone, variant))
-    stock = bs.Launcher(bs.stock_kernel(kind, bs.SLOTS, one_cta), alone)(alone)[0]
+    stock = run(bs.Launcher(bs.stock_kernel(kind, bs.SLOTS, one_cta), alone), alone)
     expected = snapshot({name: value[alone_rows[0]] for name, value in stock.items()})
     launcher = bs.Launcher(kernel, alone)
     for name, (problem, target_rows) in problems.items():
@@ -156,10 +159,10 @@ def test_claim_slot_release_warm_stress(kind, variant):
         StressCase(
             f"{bs.KIND_IDS[kind]} {variant}, 5000-row expert, {clusters} clusters",
             launch=launch,
-            outputs=bs.outputs(kernel, problem, buffers),
+            outputs=bs.exact(bs.outputs(kernel, problem, buffers)),
             thread_blocks=2 * clusters,
             refills_per_launch=(problem["rows"] // bs.ROWS_ALIGNMENT) * (problem["n"] // 256) // clusters,
-            reference=stock,
+            reference=bs.exact(stock),
             reset=(lambda: ready(buffers[-1])) if kernel.test_signal else None,
         ),
         warm=500,
