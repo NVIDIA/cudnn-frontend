@@ -21,6 +21,7 @@ from .common import (
     check_composed_state,
     check_composed_summaries,
     check_context,
+    eager_backward,
     eager_dispatch,
     execute_graph,
     make_execution_resources,
@@ -1579,8 +1580,9 @@ class EagerGdp(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
-        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range
-        return gdp_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else run_gdp_bwd)
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range, and a
+        # trace or mode that started after the forward has to see the op
+        return gdp_backward(ctx, *grads, bwd=run_gdp_bwd if eager_backward(grads) else None)
 
 
 # ---------------------------------------------------------------------------

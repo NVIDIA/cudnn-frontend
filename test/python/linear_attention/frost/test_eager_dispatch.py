@@ -205,6 +205,31 @@ def test_op_and_eager_paths_share_recordings(family, monkeypatch):
     assert [type(p).__name__ for p in run_bwd.recordings.values()] == ["_Recording"]
 
 
+def assert_traced_backward_keeps_the_custom_op(o, leaves, d_o, want, bwd_name):
+    """An FX trace of a backward, started after its eager forward, holds the backward's custom op and replays its gradients."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    used = [leaf for leaf, g in zip(leaves, want, strict=True) if g is not None]
+    traced = make_fx(lambda dy: torch.autograd.grad(o, used, dy, retain_graph=True))(d_o)
+    assert f"cudnn.{bwd_name}.default" in {str(node.target) for node in traced.graph.nodes}
+    assert_same(traced(d_o), [g for g in want if g is not None])
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_a_backward_traced_after_an_eager_forward_records_the_custom_op(family):
+    """The forward's check cannot see a trace that starts later: the backward body would leave it with the allocations and
+    no kernels, so the backward checks again."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family Frost linear attention")
+    public, op_name, eager_name, channel_gate = FAMILIES[family]
+    leaves, cu, _, (do, _) = inputs(4, False, channel_gate)
+    xs = [leaves[k].detach().requires_grad_(True) for k in ("q", "k", "v", "g", "beta")]
+    o = public(*xs, cu, use_qk_l2norm_in_kernel=True)[0]
+    assert type(o.grad_fn).__name__ == f"{eager_name}Backward"
+    want = torch.autograd.grad(o, xs, do, retain_graph=True)
+    assert_traced_backward_keeps_the_custom_op(o, xs, do, want, op_name[: -len("_fwd")] + "_bwd")
+
+
 # family: (its forward custom op's name, its eager Function), for the families driven through the suite's cases
 OTHERS = {
     "gdn2": ("gated_delta_net_v2_fwd", "EagerGdn2"),
@@ -221,14 +246,20 @@ def suite_step(family):
     n = len(la.LEAF_NAMES[family])
     d_o = (torch.randn(la.op(family)(*args, plan_name=f"{family}_frost")[0].shape, device="cuda") * 0.1).to(torch.bfloat16)
 
-    def step(requires_grad, create_graph=False):
+    def step(requires_grad, create_graph=False, retain_graph=False):
         leaves = [a.detach().requires_grad_(requires_grad) for a in args[:n]]
         res = la.op(family)(*leaves, *args[n:], plan_name=f"{family}_frost")
         meta = [(t.requires_grad, type(t.grad_fn).__name__ if t.grad_fn is not None else None) for t in res]
         if not requires_grad:
             return res, meta, (), leaves
-        return res, meta, torch.autograd.grad(res[0], leaves, d_o, allow_unused=True, create_graph=create_graph), leaves
+        return (
+            res,
+            meta,
+            torch.autograd.grad(res[0], leaves, d_o, allow_unused=True, create_graph=create_graph, retain_graph=retain_graph or create_graph),
+            leaves,
+        )
 
+    step.d_o = d_o
     return step
 
 
@@ -268,6 +299,15 @@ def test_double_backward_raises_like_custom_op_on_the_suite_cases(family):
         assert all(g.requires_grad for g in gs if g is not None), custom_op
         with pytest.raises(RuntimeError, match="no autograd formula was registered"):
             torch.autograd.grad(sum(g.float().sum() for g in gs if g is not None), [leaves[0]])
+
+
+@pytest.mark.parametrize("family", OTHERS)
+def test_a_backward_traced_after_an_eager_forward_records_the_custom_op_on_the_suite_cases(family):
+    op_name, eager_name = OTHERS[family]
+    step = suite_step(family)
+    res, meta, want, leaves = step(True, retain_graph=True)
+    assert f"{eager_name}Backward" in {m[1] for m in meta}
+    assert_traced_backward_keeps_the_custom_op(res[0], leaves, step.d_o, want, op_name[: -len("_fwd")] + "_bwd")
 
 
 @pytest.mark.parametrize("family", OTHERS)

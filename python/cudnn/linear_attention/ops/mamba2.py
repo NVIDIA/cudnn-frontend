@@ -38,6 +38,7 @@ from cudnn.cpp_launcher import cpp_launched
 from .common import (
     check_composed_state,
     check_composed_summaries,
+    eager_backward,
     eager_dispatch,
     execute_graph,
     make_execution_resources,
@@ -1226,8 +1227,9 @@ class EagerMamba2(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
-        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range
-        return mamba2_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else run_mamba2_bwd)
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range, and a
+        # trace or mode that started after the forward has to see the op
+        return mamba2_backward(ctx, *grads, bwd=run_mamba2_bwd if eager_backward(grads) else None)
 
 
 # ---------------------------------------------------------------------------
