@@ -1003,6 +1003,72 @@ def test_two_condition_entry_leads_only_where_both_hold():
 
 
 @pytest.mark.L0
+def test_sm80_dense_split_class_reads_the_planner_and_follows_its_study():
+    """A100 dense d128 GQA causal prefill that k_prefetch splits SM80_DENSE_SPLIT_KEY_MIN or more ways keys `gqa_split`, read from the
+    planner itself; study sm80_dense_d128_split_key_v2_20261122 owns that class, and v4 keeps every graph split fewer ways."""
+    from cudnn.sdpa.fwd import heuristics
+
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=1, h_q=32, h_kv=4, s_q=512, s_kv=131072, d_qk=128, d_v=128, causal=True, bottom_right=True)
+        base.update(device_cc=(8, 0), has_paged_kv=False, device_sm_count=108)
+        base.update(over)
+        return _facts(**base)
+
+    shapes = [dict(), dict(b=2, h_kv=8), dict(b=4, h_kv=8, s_q=1024), dict(b=8, h_kv=8, s_q=2048, s_kv=2048, bottom_right=False), dict(s_q=64, s_kv=4096)]
+    for over in shapes:
+        x = f(**over)
+        split = heuristics.sm80_dense_split_choice(x) >= pt.SM80_DENSE_SPLIT_KEY_MIN
+        assert pt.class_key(row, x)[8] == ("gqa_split" if split else "gqa"), over
+    assert {pt.class_key(row, f(**over))[8] for over in shapes} == {"gqa", "gqa_split"}
+
+    for kv in (131072, 131073):
+        assert pt.matched_entry(row, f(s_kv=kv)).study == "sm80_dense_d128_split_key_v2_20261122"
+    assert pt.lookup(row, f()) is True and pt.lookup(row, f(s_kv=131073)) is True  # llama3.1-tp2, b 1, a 128k cache
+    assert pt.lookup(row, f(b=2, h_kv=8)) is False  # split, past the launch-tile ceiling
+    assert pt.matched_entry(row, f(b=4, h_kv=8, s_q=1024)).study == "sm80_dense_d128_gqa_v4_split_20261117"  # a 2-way split
+    assert pt.class_key(row, f(device_sm_count=None))[8] == "gqa"  # the planner splits nothing without the SM count
+    assert pt.class_key(row, f(s_q=8))[4:9:4] == ("verify", "gqa")  # spec-decode verify keeps its own classes
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("cc, sm", [((10, 0), 152), ((10, 7), 224)], ids=["b200", "rubin"])
+def test_sm100_dense_split_class_reads_the_planner_and_follows_its_study(cc, sm):
+    """B200 and Rubin dense d128 GQA causal prefill that the row's planner splits over KV keys `gqa_split`, read from the planner
+    itself; study dense_d128_split_key_bw_20261123 owns that class. Graphs the row does not split keep their classes, as does Rubin
+    below S_q 256 or in a group it does not pack whole, and cc 10.3 keeps one class."""
+    from cudnn.sdpa.fwd import heuristics
+
+    row = "sdpa_fwd_prefill_sm100" if cc == (10, 0) else "sdpa_fwd_prefill_sm107"
+
+    def f(**over):
+        base = dict(b=1, h_q=64, h_kv=8, s_q=2048, s_kv=65536, d_qk=128, d_v=128, causal=True, bottom_right=True)
+        base.update(device_cc=cc, has_paged_kv=False, device_sm_count=sm)
+        base.update(over)
+        return _facts(**base)
+
+    shapes = [dict(), dict(s_kv=131072), dict(s_kv=8192), dict(b=8, s_q=8192, s_kv=131072), dict(h_q=56)]
+    for over in shapes:
+        x = f(**over)
+        split = heuristics.sm100_dense_split_choice(row, x) >= 2
+        assert pt.class_key(row, x)[8] == ("gqa_split" if split else "gqa"), over
+    assert {pt.class_key(row, f(**over))[8] for over in shapes} == {"gqa", "gqa_split"}
+
+    # llama3.1 64/8 b 1 2k chunks over a 64k / 128k cache: the run-584 rows the default ran on the backend at 1.13-1.23
+    for kv in (65536, 131072):
+        assert pt.matched_entry(row, f(s_kv=kv)).study == "dense_d128_split_key_bw_20261123"
+        assert pt.lookup(row, f(s_kv=kv)) is True
+    assert pt.class_key(row, f(h_q=8, h_kv=8))[8] == "mha"
+    assert pt.class_key(row, f(device_cc=(10, 3)))[8] == "gqa"
+    if cc == (10, 7):
+        unpacked = f(h_q=40, s_q=512, s_kv=131072)  # group 5: the row splits it but packs one head per row group
+        assert heuristics.sm100_dense_split_choice(row, unpacked) >= 2 and pt.class_key(row, unpacked)[8] == "gqa"
+        short = f(s_q=128)
+        assert heuristics.sm100_dense_split_choice(row, short) >= 2 and pt.class_key(row, short)[8] == "gqa"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_sm80_dense_chunk_follows_its_study(s_kv):
     """Study sm80_dense_chunk_20261117 (A100): dense d256 GQA causal prefill leads past a cost floor, so qwen3.5's b 1 long-KV chunks

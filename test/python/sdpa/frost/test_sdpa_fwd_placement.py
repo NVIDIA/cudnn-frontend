@@ -166,9 +166,10 @@ def test_a_trail_only_row_leads_where_a_generated_entry_says_so(monkeypatch, ent
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_sm80_d128_gqa_long_kv_chunks_lead(s_kv):
-    """Study sm80_dense_d128_gqa_v4_split_20261117 (A100): bf16 dense d128 GQA causal prefill leads with few query rows / tiles over a
-    long cache (llama3.1-tp8 b 1 long-KV chunks ran the backend at 3.7-3.8x); many rows, f16 or another part trail, and on the KV
-    tile so does a short cache."""
+    """Studies sm80_dense_d128_gqa_v4_split_20261117 and sm80_dense_d128_split_key_v2_20261122 (A100): bf16 dense d128 GQA causal
+    prefill leads with few query rows / tiles over a long cache; many rows, f16 or another part trail. A short cache that k_prefetch
+    still splits 4 ways is the split class's and leads too."""
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     row, impl = (next(s for s in ENGINE_SPECS if s.name == n) for n in ("sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch"))
@@ -179,7 +180,9 @@ def test_sm80_d128_gqa_long_kv_chunks_lead(s_kv):
     assert placement.place(row, f()) == placement.LEAD
     assert placement.place(impl, f()) == placement.LEAD
     assert placement.place(row, f(b=8, h_q=64, h_kv=8, s_q=2048)) == placement.TRAIL  # many query rows
-    assert placement.place(row, f(s_kv=1024 + s_kv % 2)) == (placement.TRAIL if s_kv % 2 == 0 else placement.LEAD)  # a short cache
+    short = f(s_kv=1024 + s_kv % 2)
+    assert placement_table.matched_entry("sdpa_fwd_prefill_sm80", short).study == "sm80_dense_d128_split_key_v2_20261122"
+    assert placement.place(row, short) == placement.LEAD
     assert placement.place(row, f(dtype=cudnn.data_type.HALF)) == placement.TRAIL
     assert placement.place(row, f(device_cc=(8, 6))) == placement.TRAIL
 
@@ -1185,7 +1188,9 @@ def test_sm107_dense_d192x128_long_cache_chunks_lead_past_the_tile_cap(s_kv, hea
 def test_sm107_dense_d128_whole_pack_chunks_lead_to_512_tiles(s_kv):
     """Study sm107_dense_d128_longkv_v2_20261118: Rubin bf16 dense d128 GQA causal chunks whose group the row packs whole lead up to 512
     launch tiles from an 8k cache (llama3.1 chunks at b 1 over 8k-128k ran the backend at 1.12-1.52x); groups the row runs unpacked keep
-    the 256-tile cap (they lost up to 2.0x past it)."""
+    the 256-tile cap (they lost up to 2.0x past it). Past the cap, a chunk the row splits over KV is the split class's
+    (dense_d128_split_key_bw_20261123), which leads."""
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
@@ -1195,7 +1200,10 @@ def test_sm107_dense_d128_whole_pack_chunks_lead_to_512_tiles(s_kv):
     assert (placement.SM107_D128_WHOLE_PACK_MAX_Q_TILES, placement.SM107_D128_WHOLE_PACK_MIN_KV) == (512, 8192)
     assert place() == placement.LEAD  # 512 tiles, group 8 packs whole
     assert place(h_q=32, h_kv=4, s_q=2048) == placement.LEAD  # llama3.1-tp2
-    assert place(s_q=2048) == placement.TRAIL  # 1024 tiles
+    assert place(s_q=4096) == placement.TRAIL  # 2048 tiles, unsplit
+    split = _facts(**{**base, "s_q": 2048})  # 1024 tiles, a 2-way KV split: llama3.1 b 1 over a 128k cache
+    assert placement_table.class_key("sdpa_fwd_prefill_sm107", split)[8] == "gqa_split"
+    assert placement.place(spec, split) == placement.LEAD
     assert place(h_q=48) == placement.TRAIL  # group 6 runs unpacked: 384 tiles past the 256-tile cap
     assert place(s_kv=4096 + s_kv % 2, s_q=1024) == placement.TRAIL  # below the cache floor
     assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL

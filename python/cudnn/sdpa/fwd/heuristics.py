@@ -3098,6 +3098,28 @@ SM100_PAGED_PACKED_SPLIT_D64_Q128_KV_TILES = 128
 SM100_PAGED_PACKED_SPLIT_WAVE_MAX = 4
 
 
+def sm80_dense_split_choice(facts) -> int:
+    """The KV split the SM80 k_prefetch engine leads with on ``facts`` (its first knob set; 1 = unsplit): the decision
+    placement keys the A100 dense chunk regime on, read from the planner rather than re-derived."""
+    from .kernels.sm80.f16_k_prefetch.contract import NAME
+
+    spec = next((s for s in ENGINE_SPECS if s.name == NAME), None)
+    if spec is None:
+        return 1
+    sets = _knob_sets(spec, facts)
+    return (sets[0].split_kv or 1) if sets else 1
+
+
+def sm100_dense_split_choice(row: str, facts) -> int:
+    """The KV split the SM100 / SM107 bf16 forward ``row`` leads with on ``facts`` (its first knob set; 1 = unsplit), read from
+    the planner as :func:`sm80_dense_split_choice` is. The SM107 row plans through its legacy policy spec."""
+    spec = sm100_legacy_policy_spec(row) if row == "sdpa_fwd_prefill_sm107" else next((s for s in ENGINE_SPECS if s.name == row), None)
+    if spec is None:
+        return 1
+    sets = _knob_sets(spec, facts)
+    return (sets[0].split_kv or 1) if sets else 1
+
+
 def sm100_paged_packed_split_choice(caps: Capabilities, facts) -> int:
     """SM100/103 paged bf16 D64 / D256 GQA prefix: the packed split count (:func:`_sm100_paged_packed_wave_split`, else the packed
     :func:`sm100_paged_tail_split_choice`), 1 when neither splits."""

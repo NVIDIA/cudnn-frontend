@@ -277,6 +277,39 @@ def _packed_split(row: str, facts) -> bool:
     return heuristics.sm100_paged_packed_split_choice(caps, facts) > 1
 
 
+SM80_DENSE_SPLIT_KEY_MIN = 4  # a 2-way split runs like the unsplit tile; from 4 ways it is the split regime
+
+
+def _sm80_dense_split(row: str, facts) -> bool:
+    """A100 dense d128 GQA causal prefill that the k_prefetch engine splits at least SM80_DENSE_SPLIT_KEY_MIN ways over KV: split
+    partials plus a combine, a different regime from the unsplit tile beside it, so it keys apart. Read from the engine's own
+    planned split, as ``_packed_split`` is."""
+    if row != "sdpa_fwd_prefill_sm80" or facts.has_paged_kv or facts.thd or facts.h_q == facts.h_kv or (facts.d_qk, facts.d_v) != (128, 128):
+        return False
+    from cudnn.sdpa.fwd import heuristics
+
+    return heuristics.sm80_dense_split_choice(facts) >= SM80_DENSE_SPLIT_KEY_MIN
+
+
+SM107_DENSE_SPLIT_KEY_MIN_S_Q = 256  # placement.SM107_D128_CHUNKED_MIN_S_Q: shorter Rubin d128 chunks lost to the backend (1.37x)
+
+
+def _sm100_dense_split(row: str, facts) -> bool:
+    """B200 (cc 10.0) and Rubin dense d128 GQA prefill that the row's planner splits over KV: the same split regime as
+    ``_sm80_dense_split``, from a 2-way split. Rubin keys only the groups its row packs whole, from S_q
+    SM107_DENSE_SPLIT_KEY_MIN_S_Q; its split unpacked groups ran 0.63-1.48 of the backend. cc 10.3 keeps one class, which its
+    generated entry already leads."""
+    if row not in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm107") or facts.device_cc not in ((10, 0), (10, 7)):
+        return False
+    if facts.has_paged_kv or facts.thd or facts.h_q == facts.h_kv or (facts.d_qk, facts.d_v) != (128, 128):
+        return False
+    if row == "sdpa_fwd_prefill_sm107" and (facts.s_q < SM107_DENSE_SPLIT_KEY_MIN_S_Q or _row_pack_group(row, facts) != facts.h_q // facts.h_kv):
+        return False
+    from cudnn.sdpa.fwd import heuristics
+
+    return heuristics.sm100_dense_split_choice(row, facts) >= 2
+
+
 _VERIFY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90"})
 _VERIFY_MAX_S_Q = 16  # placement.DECODE_SHAPED_MAX_S_Q: the spec-decode verify depth
 
@@ -343,7 +376,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
     elif _sm90_partial_pack(row, facts) or _sm100_window_decode_partial_pack(row, facts):
         group = "gqa_partial"
     else:
-        group = "gqa_split" if _packed_split(row, facts) else "gqa"
+        dense_split = phase == "prefill" and mask == "causal_br" and (_sm80_dense_split(row, facts) or _sm100_dense_split(row, facts))
+        group = "gqa_split" if _packed_split(row, facts) or dense_split else "gqa"
     if group == "gqa" and _sm120_paged_body(row, facts):
         group = "gqa_body"
     if group == "gqa" and _sm100_short_window_d192(row, facts):
@@ -1317,6 +1351,29 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "le", 13.497, "sm80_dense_d128_gqa_v4_split_20261117", "rows"
+    ),
+    # study sm80_dense_d128_split_key_v2_20261122: A100 dense d128 GQA causal prefill that k_prefetch splits >= 4 ways over KV keys
+    # `gqa_split` (`_sm80_dense_split`); FROST leads it below a launch-tile ceiling. Graphs split fewer ways keep v4's entries above.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", False): Entry(
+        "le", 7.292, "sm80_dense_d128_split_key_v2_20261122", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", True): Entry(
+        "le", 7.377, "sm80_dense_d128_split_key_v2_20261122", "tiles"
+    ),
+    # study dense_d128_split_key_bw_20261123: the same split class on B200 and Rubin (`_sm100_dense_split`). B200 is fit on
+    # sm100_d128_dense_prefill_cc100_20261121's cells (cuDNN 9.24.0.43), Rubin on the sm107_dense_d128_longkv cells; FROST leads below a
+    # cost / tile ceiling on B200 and across Rubin's whole-pack split class. Graphs the row does not split keep the hand rules.
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", False): Entry(
+        "le", 39.452, "dense_d128_split_key_bw_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", True): Entry(
+        "le", 7.065, "dense_d128_split_key_bw_20261123", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", False): Entry(
+        "always", None, "dense_d128_split_key_bw_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa_split", True): Entry(
+        "always", None, "dense_d128_split_key_bw_20261123"
     ),
     # study sm80_d576_paged_v3_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE b085f3499; paged THD-Q D576 x 512 MQA causal prefill over the
     # whole range, stratified by launch tiles and cache; 120 train cells). On the tile it replaces sm80_d576_prefill_20261117's floor of
