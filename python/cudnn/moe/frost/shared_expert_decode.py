@@ -26,7 +26,18 @@ launch 1; ``w_down`` loads before the wait), ``pdl_release`` = ``griddepcontrol.
 is off (a knob measured before it defaults on).  Workspace: the inter-launch scratch ``act`` [32, I] bf16 and ``gate_part`` [32, GATE_SLOTS]
 fp32 is entry-owned, allocated once per config at the first compile (outside any capture), never on the execute path (Rule 1); the launch
 reads no device memory to the host (Rule 3).  Two entries, or one entry on two streams concurrently, must not share a scratch: build one
-entry per concurrent stream.  Eager-path host cost: the forms of the band are resolved once at construction (``forms``: one validated ``Cfg`` per m-tile count;
+entry per concurrent stream.  THE SCRATCH OF A FORM AND THE ENTRY-OWNED OUTPUT BUFFER ARE STREAM WORK of torch's current stream of the
+entry's device at the moment they are allocated (the zero-fill of the scratch; a fill torch adds to the output buffer under deterministic
+algorithms; whatever that stream still owes a block the allocator recycles), and every call of the pair that writes their bytes -- the
+scratch, the output buffer by default or its rows passed back as ``out``, by this entry or by another entry that orders its launches the
+same way -- is ordered behind it on whatever stream it runs (``cudnn.frost.init_order``; ONE ordering in front of the pair: both launches
+run on the call's stream, the second behind the first).  The launch stream waits for the event recorded behind the allocation -- no host
+wait, never a synchronization of a stream or of the device; a captured call that finds that work still pending waits for that ONE event
+on the host before its launches
+(set-up, never part of a replay); nothing is recorded for an allocation made inside a capture (allocate before it); once a call has seen
+the work complete nothing is kept of it, and while it is pending on the device every call reads the device's records.  The caller's: ``x``
+and the weights, which the launches only read, and its own reads and writes of the returned ``out`` outside a call.
+Eager-path host cost: the forms of the band are resolved once at construction (``forms``: one validated ``Cfg`` per m-tile count;
 ``cfg_for`` is a dictionary read, never a validation per call), the compile key is computed once per call, and the DSL views of the entry-owned scratch
 are built once per form (static pointers); the per-layer operands (``x``, the three weights, ``out``) are wrapped per call -- they change
 with every layer -- and the binding checks run on every call (Rule 1 keeps the validation, not the recomputation).
@@ -35,6 +46,7 @@ with every layer -- and the binding checks run on every call (Rule 1 keeps the v
 from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
+from cudnn.frost import init_order  # imports no framework at module level
 from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state
 
 from .kernel.shared_expert_decode_config import (
@@ -253,6 +265,8 @@ class SharedExpertDecode:
         self.compiled: Dict[tuple, Any] = {}
         self.scratch: Dict[Cfg, Dict[str, Any]] = {}
         self.out_buffer = None
+        #: the device's records of entry-owned allocations whose initialization may be pending (shared by every entry of the device)
+        self._pending = init_order.pending_of(self.device)
 
     def _default_cfg(self) -> Cfg:
         """The geometry's default form on this part's readings; a part that cannot hold it in one wave is declined by type (a part fact)."""
@@ -315,26 +329,44 @@ class SharedExpertDecode:
     def scratch_for(self, cfg: Cfg) -> Dict[str, Any]:
         """The inter-launch scratch of a config (``act`` [32, I] bf16, ``gate_part`` [32, GATE_SLOTS] fp32), allocated once per config at
         its first compile (outside any capture); rows past the call's ``T`` are never written.  ``views`` holds their DSL views (built at
-        the first ``_args``; the tensors never move, so the views are static)."""
+        the first ``_args``; the tensors never move, so the views are static).  Returns a copy of the entry's table (the same tensors),
+        without waiting for the zero-fill (the module docstring says what is ordered behind it)."""
+        return dict(self._scratch(cfg))
+
+    def _scratch(self, cfg: Cfg) -> Dict[str, Any]:
+        """The entry's own table of a config's scratch, allocated on first use.  The zero-fill is recorded
+        (:mod:`cudnn.frost.init_order`) behind the second fill and BEFORE the scratch is in the table."""
         if cfg not in self.scratch:
             import torch
 
-            self.scratch[cfg] = dict(
+            scratch = dict(
                 act=torch.zeros(SCRATCH_ROWS, cfg.I, dtype=torch.bfloat16, device=self.device),
                 gate_part=torch.zeros(SCRATCH_ROWS, cfg.GATE_SLOTS, dtype=torch.float32, device=self.device),
             )
+            init_order.record(self._pending, scratch.values())
+            self.scratch[cfg] = scratch
         return self.scratch[cfg]
 
     def _default_out(self):
-        """The entry-owned output buffer [32, H] (sliced to the call's T) when the caller hands none."""
+        """The entry-owned output buffer [32, H] (sliced to the call's T) when the caller hands none.  Its allocation's stream work is
+        recorded (:mod:`cudnn.frost.init_order`) BEFORE the buffer is where a launch finds it."""
         if self.out_buffer is None:
             import torch
 
-            self.out_buffer = torch.empty(SCRATCH_ROWS, self.geometry.HIDDEN, dtype=torch.bfloat16, device=self.device)
+            buffer = torch.empty(SCRATCH_ROWS, self.geometry.HIDDEN, dtype=torch.bfloat16, device=self.device)
+            init_order.record(self._pending, (buffer,))
+            self.out_buffer = buffer
         return self.out_buffer
 
+    def _launch_writes(self, cfg: Cfg, tokens: int, out) -> Tuple[Tuple[int, int], ...]:
+        """The byte ranges the pair of a call of ``tokens`` tokens WRITES: the scratch of the form (launch 1) and the live rows of
+        ``out`` (launch 2) -- what the call is ordered by (:func:`cudnn.frost.init_order.order_behind`)."""
+        s = self.scratch[cfg]
+        live = (tokens - 1) * out.stride(0) + self.geometry.HIDDEN
+        return (init_order.span(s["act"]), init_order.span(s["gate_part"]), init_order.span(out, live))
+
     def _args(self, cfg, x, w_gate_up, w_down, w_gate, out):
-        s = self.scratch_for(cfg)
+        s = self._scratch(cfg)
         views = s.get("views")
         if views is None:
             views = s["views"] = (_flat(s["act"]), _flat(s["gate_part"]))
@@ -364,7 +396,9 @@ class SharedExpertDecode:
 
     def __call__(self, x, w_gate_up, w_down, w_gate, out=None):
         """Launch the pair on torch's current stream; returns ``out`` [T, H] bf16 (the caller's, or the entry's own buffer sliced to T).
-        Compiles on first use for a new (form, strides).  Every launch re-runs the binding checks before the compiled pair is looked up."""
+        Compiles on first use for a new (form, strides).  Every launch re-runs the binding checks before the compiled pair is looked up.
+        The pair is ordered behind the pending initialization of every entry-owned allocation of the device it writes (the module
+        docstring)."""
         import cuda.bindings.driver as cuda
         import torch
 
@@ -375,5 +409,8 @@ class SharedExpertDecode:
         if key not in self.compiled:
             self.compile(x, w_gate_up, w_down, w_gate, out if given else None)
         args = self._args(key[0], x, w_gate_up, w_down, w_gate, out)
-        self.compiled[key](*args, T, cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
+        stream = torch.cuda.current_stream(self.device)
+        if self._pending:  # empty in the steady state: a warm call does nothing here
+            init_order.order_behind(self._pending, stream, self._launch_writes(key[0], T, out))
+        self.compiled[key](*args, T, cuda.CUstream(stream.cuda_stream))
         return out if given else out[:T]

@@ -201,11 +201,15 @@ class CompiledGdn:
     (one item per sequence and head), ``warmup`` (decay-warmup split-K), ``dv_split`` (two uncut items per sequence and head,
     each owning half of d_v) or ``chain`` (per-piece H and M from the fused summary, an fp32 state chain seeding every piece,
     the prefill over the pieces as independent sequences).  The chunk factor T comes from the T pass in chain
-    plans."""
+    plans.  A GDN plan that overwrites its initial state, without a context port and without ``batch_invariant``, carries the
+    length-rule chain group only where ``chain_group_pays``, and keeps a chain, whole-batch or tail, only where ``chain_pays``
+    against the scheme it would run instead; a whole-batch chain whose scheme below would carry the chain group stays."""
 
     def __init__(self, node, kernel_module):
         from .common.piece_chain import (
             DV_SPLIT_TILES,
+            chain_group_pays,
+            chain_pays,
             chain_rows_per_cta,
             choose_pieces,
             is_dv_split,
@@ -283,27 +287,37 @@ class CompiledGdn:
             batch_invariant=self.batch_invariant,
             expand_num=self.expand_num,
         )
-        self.chain = self.pieces > 0
-        self.dv_split = (
-            not self.chain
-            and not self.batch_invariant
-            and is_dv_split(
-                num_seqs=B,
-                heads_out=HO,
-                dim_v=V,
-                num_sm=self.num_sm,
-                total_tokens=self.q_rows,
-                b_t=self.b_t,
-                expand_num=self.expand_num,
-                unit_chunks=self.unit_chunks,
-            )
+        dv_split = not self.batch_invariant and is_dv_split(
+            num_seqs=B,
+            heads_out=HO,
+            dim_v=V,
+            num_sm=self.num_sm,
+            total_tokens=self.q_rows,
+            b_t=self.b_t,
+            expand_num=self.expand_num,
+            unit_chunks=self.unit_chunks,
+            uncut=self.overwrite_initial_state,
         )
+        # A context port fixes the pieces by the shared rule (common/context.py) and batch_invariant by the length rule.  A plan
+        # that does not overwrite its initial state runs the split-K table below the chain, whose pace follows the gates, and
+        # keeps the shared rule too.  Every other GDN forward chains only where the chain beats the plan it would run instead.
+        by_shape = self.batch_invariant or self.has_context or node.params.get("output_context", False)
+        chain_by_cost = self.expand_num == 1 and self.overwrite_initial_state and not by_shape
+        chain_group = 0
+        if not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
+            chain_group = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
+            group = dict(pieces=chain_group, num_seqs=B, heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
+            if chain_group and chain_by_cost and not chain_group_pays(**group):
+                chain_group = 0
+        # chain_pays reads the chain against a plan without the chain group, so a chain whose plan below would carry one stays.
+        if self.pieces and chain_by_cost and not chain_group and not chain_pays(pieces=self.pieces, num_seqs=B, total_tokens=self.q_rows, split=dv_split):
+            self.pieces = 0
+        self.chain = self.pieces > 0
+        self.dv_split = not self.chain and dv_split
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.tail = None
-        self.ragged_pieces = 0
-        if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
-            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
+        self.ragged_pieces = 0 if self.chain else chain_group
         if not self.chain and not self.dv_split and not self.batch_invariant:
             self.tail = choose_tail(
                 num_seqs=B,
@@ -316,6 +330,9 @@ class CompiledGdn:
                 dim_v=V,
             )
             if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
+                self.tail = None
+            chain_tail = self.tail is not None and not self.tail.dv_split
+            if chain_tail and chain_by_cost and not chain_pays(pieces=self.tail.pieces, num_seqs=B, total_tokens=self.q_rows, tail=True):
                 self.tail = None
         # The levelled table (level_plan_refusal); everything else keeps the plan above.  A measured cell's levelled table
         # runs the whole batch: it ranks above the tail, which is dropped there.
@@ -1881,6 +1898,7 @@ class CompiledGdnSummary:
                 b_t=self.b_t,
                 expand_num=self.num_householder,
                 unit_chunks=self.unit_chunks,
+                uncut=self.overwrite_initial_state,
             )
         )
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state

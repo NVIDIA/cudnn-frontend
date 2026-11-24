@@ -284,6 +284,14 @@ _SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
 # holdout cells, no changed cell past 1.04 / 1.01 of today's choice. The 64-row tile keeps the shared model.
 _SM80_SPLIT_KV_CTA_COST = 3.0
 _SM80_SPLIT_KV_COMBINE_COST = 0.02
+# SM90 (H200, 132 SMs) half decode without a window (_sm90_decode_split): the shared model with these constants in place of SM100's.
+# With no per-wave combine term, the floor prices every partial. Fitted on a forced split ladder (study sm90_decode_split_cal_20261123,
+# two timing passes): regret 1.080 -> 1.052 on 157 train cells and 1.099 -> 1.073 on 64 holdout cells, no changed cell past 1.027 /
+# 0.946 of today's choice. Windowed graphs keep the shared constants (sm90_window_split_model_20261123 found none that fit).
+_SM90_SPLIT_KV_CTA_COST = 16.0
+_SM90_SPLIT_KV_COMBINE_COST = 0.0
+_SM90_SPLIT_KV_COMBINE_FLOOR = 0.2
+_SM90_DECODE_SPLIT_D_SHAPES = frozenset({(128, 128), (192, 128), (192, 192), (256, 256)})
 # SM80 half d256 PAGED decode on the short-d256 tile (64-row Q tile, 32-key KV tiles): the wave model mis-splits it in both
 # directions, so it takes a direct rule (_sm80_paged_d256_split_choice): the largest power-of-two split that keeps >= 8 KV tiles
 # per split and <= 16 waves of CTAs. Study sm80_d256_decode_split_cal_20261118: regret vs the best forced split 1.388 -> 1.038 on
@@ -2740,6 +2748,35 @@ def _sm107_window_split(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: 
     return min(split, SM107_WINDOW_SPLIT_CAP_FACTOR * cap)
 
 
+def _sm90_decode_split(caps: Capabilities, facts) -> bool:
+    """SM90 half causal decode without a window or sink, S_q <= 16, not THD, on the head dims its study timed: the domain of the SM90
+    split constants (_SM90_SPLIT_KV_CTA_COST). A single-row graph counts as causal (its mask is a no-op, and the facts drop it).
+    Windowed graphs keep the shared constants."""
+    return (
+        caps.sm_lo == 90
+        and caps.sm_hi == 90
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and facts.window_left is None
+        and (facts.causal or facts.s_q == 1)
+        and not facts.has_sink
+        and not facts.thd
+        and facts.s_q <= 16
+        and (facts.d_qk, facts.d_v) in _SM90_DECODE_SPLIT_D_SHAPES
+    )
+
+
+def _split_model_overrides(caps: Capabilities, facts, tile_m: Optional[int]) -> dict:
+    """The constants choose_split_kv takes in place of the shared (SM100-fitted) ones, for the machines fitted on their own."""
+    if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8):
+        return dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
+    if _sm80_chunk_split(caps, facts, tile_m):
+        return dict(cta_cost=_SM80_SPLIT_KV_CTA_COST, combine_cost=_SM80_SPLIT_KV_COMBINE_COST)
+    if _sm90_decode_split(caps, facts):
+        return dict(cta_cost=_SM90_SPLIT_KV_CTA_COST, combine_cost=_SM90_SPLIT_KV_COMBINE_COST, combine_floor=_SM90_SPLIT_KV_COMBINE_FLOOR)
+    return {}
+
+
 def _sm80_chunk_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
     """The SM80 domain whose split model reads the adapter's own grid and SM80 constants (_SM80_SPLIT_KV_CTA_COST)."""
     return (
@@ -2981,11 +3018,7 @@ def _split_points(
             combine_rows=facts.s_q * facts.h_q * facts.b,
             ctas_per_tile=split_launch.ctas_per_tile,
             unsplit_launch=unsplit_launch,
-            **(
-                dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
-                if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
-                else (dict(cta_cost=_SM80_SPLIT_KV_CTA_COST, combine_cost=_SM80_SPLIT_KV_COMBINE_COST) if _sm80_chunk_split(caps, facts, tile_m) else {})
-            ),
+            **_split_model_overrides(caps, facts, tile_m),
             serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ,
             serial_combine_cost=_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED if (facts.is_fp8 or facts.is_mxfp8) else _SPLIT_KV_SERIAL_COMBINE_COST,
         )

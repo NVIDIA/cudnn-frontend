@@ -17,6 +17,7 @@ The operand builders, the reference and the device gate live in ``fp8_projection
 invariance per row count, the pick's byte neutrality and the goldens live in ``test_fp8_projection_decode_determinism.py``."""
 
 import ast
+import contextlib
 import importlib
 import inspect
 import json
@@ -55,8 +56,19 @@ from fp8_projection_decode_utils import (  # noqa: E402  (the operand builders, 
     raw,
 )
 
+from cudnn.frost import init_order  # noqa: E402
 from cudnn.gemm.frost.projection_decode import fp8_projection_decode as entry  # noqa: E402
 from cudnn.gemm.frost.projection_decode.kernel import fp8_projection_decode_config as kcfg  # noqa: E402
+from init_order_schedules import (  # noqa: E402, F401  (settled_records is a fixture)
+    deterministic_fill,
+    on_device,
+    park,
+    pooled,
+    settled_records,
+    spans_of,
+    stand_ins,
+    warm_fills,
+)
 from launch_records import assert_facts_equal_the_launch  # noqa: E402
 
 # ``no_workspace_shim``: this directory's conftest wraps the GEMM engine's MoE plans for every test unless a test opts out, which would
@@ -593,6 +605,66 @@ def _modelled_cuda_entry(monkeypatch, readings, cc=(10, 3), **kw):
     return entry.Fp8ProjectionDecode("cuda:0", **kw)
 
 
+def _launch_intercepted(monkeypatch):
+    """``(stand-ins, entry, operands, the device's records)``: an entry for a modelled part whose launch at three rows is
+    intercepted, with host operands that report the entry's device (no device)."""
+    s = stand_ins(monkeypatch)
+    k = _modelled_cuda_entry(monkeypatch, (233472, 232448, 152), geometry=G_OUT)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
+    host = _host_ops()
+    ops = dict(zip(host, on_device(k.device, *host.values())))
+    k.compiled[k.cfg_for(3)] = lambda *args: s.calls.append(("launch", int(args[-1])))
+    k._kernel_module = types.SimpleNamespace(launch_args=lambda *args: args)
+    return s, k, ops, init_order.pending_of(k.device)
+
+
+def test_a_call_orders_its_launch_behind_a_pending_record_over_the_out_it_writes(monkeypatch):
+    """The entry allocates nothing, but its ``out`` can be a buffer ANOTHER entry of the device allocated: it walks the
+    device's records (``init_order.pending_of``).  The wiring, on stand-ins with the launch intercepted (no device): IN FRONT
+    of the launch and on the LAUNCH stream, a call is ordered behind a pending record over the bytes of the ``out`` it writes
+    and behind none over an operand it only reads; without a record nothing but the launch happens."""
+    s, k, ops, records = _launch_intercepted(monkeypatch)
+
+    def ordering_of_a_call(over=None):
+        records.clear()
+        event = s.Event(False)
+        if over is not None:
+            records[0] = (event, 7, over if isinstance(over, tuple) else spans_of((over,)))
+        s.calls.clear()
+        k(ops["weight"], ops["activation"], ops["scale"], ops["out"])
+        return [c for c in s.calls if c[0] in ("wait_event", "launch")], [("wait_event", 100, event), ("launch", 100)]
+
+    got, ordered = ordering_of_a_call(ops["out"])
+    assert got == ordered, "a record over the out the launch writes"
+    first, last = spans_of((ops["out"],))[0]
+    for edge in ((first, first + 1), (last - 1, last)):  # a record over the first byte alone, and over the last
+        got, ordered = ordering_of_a_call((edge,))
+        assert got == ordered, f"a record over one end byte of out: {edge}"
+    for name in ("weight", "activation", "scale"):
+        assert ordering_of_a_call(ops[name])[0] == [("launch", 100)], f"{name} is only read"
+    assert ordering_of_a_call()[0] == [("launch", 100)] and s.calls == [("launch", 100)], "without a record: the launch alone"
+
+
+def test_a_device_without_a_record_costs_a_call_one_truth_test(monkeypatch):
+    """The steady state, on stand-ins with the launch intercepted (no device): while the entry's device holds no record a
+    call reads the truth of the device's records and nothing else of the ordering.  The ordering step and the range
+    arithmetic raise here if they are entered, whatever the records of ANOTHER device hold."""
+    s, k, ops, records = _launch_intercepted(monkeypatch)
+    init_order.pending_of(torch.device("cuda", 6))[0] = (s.Event(False), 7, ((0, 1 << 62),))  # another device's, over every address
+    assert not records and k.device != torch.device("cuda", 6)
+
+    def entered(what):
+        def raises(*args, **kwargs):
+            raise AssertionError(f"{what} was entered without a record of the device")
+
+        return raises
+
+    for name in ("order_behind", "record", "span"):
+        monkeypatch.setattr(init_order, name, entered(f"init_order.{name}"))
+    k(ops["weight"], ops["activation"], ops["scale"], ops["out"])
+    assert s.calls == [("launch", 100)], "without a record of the device: the launch alone"
+
+
 def test_an_unserved_cuda_part_declines_at_construction_by_name(monkeypatch):
     for cc in ((12, 0), (9, 0), (8, 0)):
         with pytest.raises(NotImplementedError, match=rf"10\.x.*{cc[0]}\.{cc[1]}"):
@@ -1082,6 +1154,34 @@ def _run(k, ops, rows, out=None):
     got = k(ops["weight"], ops["activation"][:rows], ops["scale"], out)
     assert got is out
     return out
+
+
+@pytest.mark.usefixtures("settled_records")
+def test_warm_launch_into_another_entrys_pending_output_waits_for_its_initialization():
+    """The records are the DEVICE's, not an entry's.  The bf16 output of a ``cudnn.AddNormQuantDecode`` entry is taken with
+    ``outputs`` on a side stream that is parked behind a delay kernel, under deterministic algorithms (torch fills it there),
+    and passed as the ``out`` of a WARM projection launch on the original stream: the launch is ordered behind that fill
+    although the host does not wait.  Unordered, the fill lands on the projection's bytes."""
+    from cudnn.norm.frost.add_norm_quant_decode import AddNormQuantDecode
+
+    dev = device_or_skip()
+    rows, numerics = 7, kcfg.Numerics(G_5K, 4)
+    k, ops = _entry(dev, numerics), _ops(dev, G_5K)
+    want = _run(k, ops, rows).clone()  # the warm-up: the bytes of a ready caller-owned out
+    torch.cuda.synchronize()
+    other = AddNormQuantDecode(dev, G_5K.OUT_FEATURES, 1e-6, add=False, bf16=True, quant=None)
+    warm_fills(dev, torch.bfloat16)
+    taken = {}
+
+    def allocate():
+        with deterministic_fill():
+            taken.update(other.outputs(rows))
+
+    pending = park(pooled(dev, lambda: torch.empty(rows, G_5K.OUT_FEATURES, dtype=torch.bfloat16, device=dev)), allocate)
+    out = _run(k, ops, rows, taken["out"])
+    assert not pending.query(), "the call did not overlap the pending work (or it waited on the host)"
+    torch.cuda.synchronize()
+    assert_same_bytes(out, want, "a warm projection into the pending output of another entry")
 
 
 def test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current():
