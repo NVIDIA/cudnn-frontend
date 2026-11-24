@@ -19,13 +19,13 @@ output tile:
     N = cta_tile_n (32..256)     C-in  channels of dW, read from X    (operand B)
     K = a_layout.reduction       output pixels, folded over n, z, p, q
 
-The reduction is the large axis here, so it is neither split nor atomically
-accumulated: exactly one CTA owns each dW element and each element is produced by
-one ordered chain of MMA issues, so a relaunch over the same shape reproduces the
-same bytes. The batch axis is part of that reduction and carries no separate
-partial-sum contract. Work items are (k tile, c tile, filter position t*r*s)
-dealt by the static persistent scheduler, so the compiled artifact does not
-depend on the shape it runs on.
+The reduction is the large axis here, so it is neither split across CTAs nor
+atomically accumulated: exactly one CTA owns each dW element and each element is
+produced by two ordered chains of MMA issues folded once, so a relaunch over the
+same shape reproduces the same bytes. The batch axis is part of that reduction
+and carries no separate partial-sum contract. Work items are (k tile, c tile,
+filter position t*r*s) dealt by the static persistent scheduler, so the compiled
+artifact does not depend on the shape it runs on.
 
 MN-major TMA boxes keep channels contiguous and pixels in the reduction axis.
 OperandLayout derives TMA boxes, SMEM capacity, descriptors and MMA offsets
@@ -36,12 +36,16 @@ its release dependency; output slots drain bulk reads before reuse.
 Warp roles (block = 6 warps, 192 threads):
 
     warps 0-3   epilogue: TMEM -> registers -> SMEM -> TMA store of dW
-    warp 4      MMA: issues the tcgen05.mma chain and both accumulator commits
+    warp 4      MMA: issues the two tcgen05.mma chains and their commits
     warp 5      producer: TMA loads of the dY and X TMA boxes (im2col for X)
 
-Two pipelines overlap consecutive work items: the 3-stage A/B SMEM ring
-(full/empty) and the 2-stage TMEM accumulator (acc_full/acc_empty), so the MMA
-of tile i+1 runs while the epilogue of tile i drains.
+The reduction is accumulated as two independent chains, one per TMEM slot, and
+the two partial sums are folded in IEEE FP32 by the epilogue. The tensor-core
+FP32 accumulator truncates on every MMA issue, so a single chain multiplies its
+per-issue error by the number of issues (a coherent error growing as L^1.5);
+halving the chain length keeps that error under an atol-bound tolerance for
+long reductions. Both slots belong to the same work item, so the 3-stage A/B
+SMEM ring is the only pipeline that overlaps consecutive work items.
 
 Coverage: test/python/conv/frost/test_frost_conv_wgrad.py (numerics against an
 independent FP64 contraction, every dtype/tile/CTA-group combination, geometry,
@@ -85,6 +89,8 @@ _TMEM_COLS = 512
 
 # Pipeline stage counts, warp roles, and synchronization constants
 _NUM_AB_STAGES = 3
+# TMEM slots: also the number of accumulation chains folded per dW element
+# (512 TMEM columns / cta_tile_n). Both slots belong to the same work item.
 _NUM_ACC_STAGES = 2
 _NUM_C_STAGES = 2
 _WARP_SIZE = 32
@@ -254,7 +260,7 @@ def _kernel(
     cta_tile_m = config.cta_tile_m  # K-out channel rows of one MMA tile
     cta_tile_n = config.cta_tile_n  # C-in channel columns of one MMA tile
     reduction_per_stage = a_layout.reduction  # reduction pixels per stage
-    num_epi_subtiles = cta_tile_n // (epi_datapath.warp_n_count * epi_datapath.subtile_n)  # N subtiles one epilogue warp drains per accumulator
+    num_epi_subtiles = cta_tile_n // (epi_datapath.warp_n_count * epi_datapath.subtile_n)  # N subtiles one epilogue warp drains per accumulation slot
     c_stage_elements = epi_datapath.c_tile_rows * epi_datapath.subtile_n  # elements in one staging fragment
 
     # ---- Shared memory inventory (one flat allocation; the launch passes
@@ -265,8 +271,9 @@ def _kernel(
     #                         only the MMA leader waits on it.
     #   ab_empty_mbar[s]      init 1: tcgen05.commit once the MMAs that read stage s
     #                         have completed; each CTA's own producer waits on it.
-    #   acc_full_mbar[a]      init 1: accumulator slot a holds a complete reduction;
-    #                         committed with multicast so both CTAs' epilogues see it.
+    #   acc_full_mbar[a]      init 1: accumulator slot a holds one chain's share of
+    #                         this work item's reduction; committed with multicast so
+    #                         both CTAs' epilogues see it.
     #   acc_empty_mbar[a]     init 128*num_epi_subtiles*cta_group: one arrive per epilogue
     #                         lane per fragment, from BOTH CTAs, all on the leader's copy.
     #   tmem_ptr_slot[1]      the Int32 TMEM token written by tcgen05.alloc.
@@ -413,25 +420,33 @@ def _kernel(
             n_dim=cta_tile_n,
         )
         if is_leader_cta:
-            ab_stage_idx, ab_full_phase, acc_stage_idx, acc_empty_phase = 0, 0, 0, 1
+            ab_stage_idx, ab_full_phase, acc_empty_phase = 0, 0, 1
+            # One chain per accumulator slot. Consecutive MMA issues feed
+            # alternate chains, so the first stage seeds every chain and the two
+            # partial sums cover disjoint halves of the reduction.
+            acc_tmem_ptrs = [
+                cutlass.Array(tmem_base_ptr.data_ptr() + chain_idx * cta_tile_n, dtype=cutlass.Int32, addrspace=cutlass.AddressSpace.tmem)
+                for chain_idx in range(_NUM_ACC_STAGES)
+            ]
             while work_tile.is_valid_tile:
-                # Acquire an accumulator slot; the initial phase makes this first
+                # Acquire every chain's slot; the initial phase makes this first
                 # wait pass without blocking (nothing has been consumed yet).
-                while not prims.mbarrier_try_wait_parity(acc_empty_mbar.subview(acc_stage_idx), acc_empty_phase, time_limit=_MBAR_WAIT_TIMEOUT):
-                    pass
-                acc_tmem_ptr = cutlass.Array(tmem_base_ptr.data_ptr() + acc_stage_idx * cta_tile_n, dtype=cutlass.Int32, addrspace=cutlass.AddressSpace.tmem)
+                for chain_idx in cutlass.range_constexpr(_NUM_ACC_STAGES):
+                    while not prims.mbarrier_try_wait_parity(acc_empty_mbar.subview(chain_idx), acc_empty_phase, time_limit=_MBAR_WAIT_TIMEOUT):
+                        pass
                 for reduction_step in cutlass.range(reduction_tiles, unroll=1):
                     while not prims.mbarrier_try_wait_parity(ab_full_mbar.subview(ab_stage_idx), ab_full_phase, time_limit=_MBAR_WAIT_TIMEOUT):
                         pass
                     # A stage holds cta_tile_k_bytes of reduction but one MMA
                     # consumes 32 bytes, so it is issued in that many steps, each
-                    # advancing its descriptors by instruction_bytes.
+                    # advancing its descriptors by instruction_bytes. Issue i of
+                    # the reduction feeds chain i % _NUM_ACC_STAGES.
                     for mma_k_idx in cutlass.range_constexpr(config.cta_tile_k_bytes // _MMA_INST_K_BYTES):
                         if prims.elect_sync():
                             prims.tcgen05_mma(
                                 _mma_kind_for_dtype(ab_dtype),
                                 cta_group,
-                                acc_tmem_ptr,
+                                acc_tmem_ptrs[mma_k_idx % _NUM_ACC_STAGES],
                                 desc_a
                                 + ab_stage_idx * (a_layout.stage_bytes // _SMEM_DESC_UNIT_BYTES)
                                 + mma_k_idx * (a_layout.instruction_bytes // _SMEM_DESC_UNIT_BYTES),
@@ -439,9 +454,10 @@ def _kernel(
                                 + ab_stage_idx * (b_layout.stage_bytes // _SMEM_DESC_UNIT_BYTES)
                                 + mma_k_idx * (b_layout.instruction_bytes // _SMEM_DESC_UNIT_BYTES),
                                 mma_instr_desc,
-                                # enable_input_d: accumulate every issue except
-                                # the very first, which initializes the slot.
-                                (reduction_step > 0) | (mma_k_idx > 0),
+                                # enable_input_d: accumulate every issue except the
+                                # first issue of each chain, which seeds it. The
+                                # first stage therefore seeds one chain per issue.
+                                (reduction_step > 0) | (mma_k_idx >= _NUM_ACC_STAGES),
                             )
                     if prims.elect_sync():
                         # Release the stage once the tracked MMAs have completed
@@ -452,14 +468,14 @@ def _kernel(
                     if ab_stage_idx == _NUM_AB_STAGES:
                         ab_stage_idx = 0
                         ab_full_phase ^= 1
-                if prims.elect_sync():
-                    # The reduction is complete for this slot: hand it to both
-                    # CTAs' epilogues.
-                    prims.tcgen05_commit(acc_full_mbar.subview(acc_stage_idx), group=cta_group, multicast_mask=commit_multicast_mask)
-                acc_stage_idx += 1
-                if acc_stage_idx == _NUM_ACC_STAGES:
-                    acc_stage_idx = 0
-                    acc_empty_phase ^= 1
+                for chain_idx in cutlass.range_constexpr(_NUM_ACC_STAGES):
+                    if prims.elect_sync():
+                        # This chain's share of the reduction is complete: hand it
+                        # to both CTAs' epilogues. The number of commits matches
+                        # the slots the epilogue waits on, so both parities advance
+                        # once per work item.
+                        prims.tcgen05_commit(acc_full_mbar.subview(chain_idx), group=cta_group, multicast_mask=commit_multicast_mask)
+                acc_empty_phase ^= 1
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
@@ -488,7 +504,7 @@ def _kernel(
             prims.tcgen05_alloc(tmem_ptr_slot, _TMEM_COLS, group=cta_group)
         prims.barrier_cta_sync(_TMEM_ALLOC_BAR_ID, thread_count=_TMEM_ALLOC_SYNC_THREADS)
         tmem_raw_addr = tmem_ptr_slot.load()
-        acc_stage_idx, acc_full_phase, c_stage_idx = 0, 0, 0
+        acc_full_phase, c_stage_idx = 0, 0
         r_divisor, s_divisor = rs_divisors
         while work_tile.is_valid_tile:
             # Filter position of this work item; the dW store coordinates are
@@ -496,28 +512,36 @@ def _kernel(
             k_tile_idx, c_tile_idx, filter_idx = work_tile.tile_idx
             tr_idx, s_idx = divmod(filter_idx, s_divisor)
             t_idx, r_idx = divmod(tr_idx, r_divisor)
-            # Wait for the MMA's accumulator commit for this slot: the reduction
-            # is complete and every fragment below may be read.
-            while not prims.mbarrier_try_wait_parity(acc_full_mbar.subview(acc_stage_idx), acc_full_phase, time_limit=_MBAR_WAIT_TIMEOUT):
-                pass
+            # Wait for every chain's commit: the reduction is complete and every
+            # fragment below may be read.
+            for chain_idx in cutlass.range_constexpr(_NUM_ACC_STAGES):
+                while not prims.mbarrier_try_wait_parity(acc_full_mbar.subview(chain_idx), acc_full_phase, time_limit=_MBAR_WAIT_TIMEOUT):
+                    pass
             # Drain the accumulator one N subtile at a time so the staging stays
             # small and the bulk store of one subtile overlaps the next read.
             for subtile_idx in cutlass.range(num_epi_subtiles, unroll=1):
-                # TMEM view of this warp's 32-lane sub-partition at the slot's
-                # column base plus this subtile's N band.
-                subtile_tmem_ptr = prims.make_tmem_ptr_from_warp_row_col(
-                    tmem_raw_addr,
-                    warp_m_idx,
-                    (tmem_raw_addr & 0xFFFF) + acc_stage_idx * cta_tile_n + subtile_idx * epi_datapath.subtile_n,
-                    cutlass.Float32,
-                )
-                # 16x32bx2 (fp8) is the only shape that takes a column offset.
-                acc_regs = prims.tcgen05_ld(
-                    epi_datapath.ldtm_shape,
-                    subtile_tmem_ptr,
-                    num=epi_datapath.ldtm_repx,
-                    offset=epi_datapath.ldtm_offset if cutlass.const_expr(epi_datapath.use_fp8_simt) else None,
-                )
+                # Every chain holds a partial reduction of the same output tile;
+                # fold them here in IEEE FP32 before the elementwise epilogue.
+                chain_regs = []
+                acc_regs = None
+                for chain_idx in cutlass.range_constexpr(_NUM_ACC_STAGES):
+                    # TMEM view of this warp's 32-lane sub-partition at the chain's
+                    # column base plus this subtile's N band.
+                    subtile_tmem_ptr = prims.make_tmem_ptr_from_warp_row_col(
+                        tmem_raw_addr,
+                        warp_m_idx,
+                        (tmem_raw_addr & 0xFFFF) + chain_idx * cta_tile_n + subtile_idx * epi_datapath.subtile_n,
+                        cutlass.Float32,
+                    )
+                    # 16x32bx2 (fp8) is the only shape that takes a column offset.
+                    regs = prims.tcgen05_ld(
+                        epi_datapath.ldtm_shape,
+                        subtile_tmem_ptr,
+                        num=epi_datapath.ldtm_repx,
+                        offset=epi_datapath.ldtm_offset if cutlass.const_expr(epi_datapath.use_fp8_simt) else None,
+                    )
+                    chain_regs.append(regs)
+                    acc_regs = regs if acc_regs is None else acc_regs + regs
                 # Elementwise epilogue on the FP32 accumulator before the cast.
                 epi_regs = epilogue_op(acc_regs)
                 # This fragment's staging slot: two of them, swapped per subtile.
@@ -571,20 +595,18 @@ def _kernel(
                     prims.cp_async_bulk_commit_group()
                     prims.cp_async_bulk_wait_group(_NUM_C_STAGES - 1, read=True)
                 prims.barrier_cta_sync(_EPI_SYNC_BAR_ID, thread_count=_EPI_THREADS)
-                # Release the accumulator slot only after every register this
-                # warp loaded from it has been read (Rule 11). The arrive
-                # address depends on those registers, so the ordering survives
+                # Release a chain's slot only after every register this warp
+                # loaded from it has been read (Rule 11). The arrive address
+                # depends on those registers, so the ordering survives
                 # optimization. In a 2-CTA group both CTAs' epilogues credit
                 # rank 0's barrier -- the MMA leader is its only waiter.
-                if cutlass.const_expr(config.use_2cta_instrs):
-                    consume_then_arrive_on_peer(acc_empty_mbar.subview(acc_stage_idx), cutlass.Int32(0), acc_regs, release_zero_mask)
-                else:
-                    consume_then_arrive(acc_empty_mbar.subview(acc_stage_idx), acc_regs, release_zero_mask)
+                for chain_idx in cutlass.range_constexpr(_NUM_ACC_STAGES):
+                    if cutlass.const_expr(config.use_2cta_instrs):
+                        consume_then_arrive_on_peer(acc_empty_mbar.subview(chain_idx), cutlass.Int32(0), chain_regs[chain_idx], release_zero_mask)
+                    else:
+                        consume_then_arrive(acc_empty_mbar.subview(chain_idx), chain_regs[chain_idx], release_zero_mask)
                 c_stage_idx ^= 1  # swap staging fragments for the next subtile
-            acc_stage_idx += 1
-            if acc_stage_idx == _NUM_ACC_STAGES:
-                acc_stage_idx = 0
-                acc_full_phase ^= 1
+            acc_full_phase ^= 1
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
         if warp_m_idx == 0:

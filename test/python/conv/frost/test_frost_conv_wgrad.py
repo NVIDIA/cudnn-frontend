@@ -356,7 +356,8 @@ def test_frost_wgrad_release_rendering(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     renders = list(Path(tmp_path).glob("*.ptx"))
     assert len(renders) == 1
-    assert_release_dependence(renders[0].read_text(), sites=1, words=32)
+    # Two accumulation slots, so one release site per slot, each folding its own fragment.
+    assert_release_dependence(renders[0].read_text(), sites=2, words=32)
 
 
 def test_frost_wgrad_slot_and_ranking(monkeypatch):

@@ -1313,7 +1313,9 @@ This does not establish determinism for frontend kernel plans.
 ## FROST convolution weight gradients
 
 `frost_conv_wgrad` always completes each output tile's reduction within one MMA
-CTA group, without split-K or atomic output accumulation. Each spatial axis must
+CTA group, without split-K or atomic output accumulation: the reduction is
+accumulated as two fixed chains in that CTA group's tensor memory and folded
+once in FP32, so replay is byte-identical. Each spatial axis must
 satisfy `(filter_extent - 1) * dilation <= 31`. Replay status refers
 to fixed inputs, shapes, geometry, epilogue, and public knobs. dW sums over batch;
 reordering or splitting batch changes addition order and is not guaranteed to
