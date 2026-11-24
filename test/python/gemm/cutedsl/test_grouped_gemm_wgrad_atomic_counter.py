@@ -435,7 +435,19 @@ def test_more_clusters_than_tiles(request, precision, config):
 
     test_timeout = float(os.environ.get("CUDNN_TEST_TIMEOUT", "1500"))
     timeout = min(600.0, 0.6 * test_timeout) if test_timeout > 0 else 900.0
-    cmd = [sys.executable, "-u", "-m", "pytest", f"{Path(__file__).resolve()}::{request.node.name}", *(["-n0"] if importlib.util.find_spec("xdist") else []), "-o", "addopts=", "-p", "no:cacheprovider", "-q"]
+    cmd = [
+        sys.executable,
+        "-u",
+        "-m",
+        "pytest",
+        f"{Path(__file__).resolve()}::{request.node.name}",
+        *(["-n0"] if importlib.util.find_spec("xdist") else []),
+        "-o",
+        "addopts=",
+        "-p",
+        "no:cacheprovider",
+        "-q",
+    ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=dict(os.environ, **{_CHILD_ENV: "1"}), start_new_session=True)
     try:
         out, _ = proc.communicate(timeout=timeout)
