@@ -893,12 +893,51 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm80_thd_d256_v2_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 835bbdb9b; the training harness's THD forward, recorded facts:
     # d256 GQA causal, squares and bottom-right chunks over S_q 17-8192, groups 2-8, b 8-96; 200 train cells). Ragged lengths lead from
     # S_q 2^7.5 on the tile and from 2^9.09 tiles off it (changed train 0.537 / 0.531); holdout at fresh heads, scored once, 0.516 /
-    # 0.566 (worst 0.705). Equal lengths (`thd`) have no entry: their off-tile holdout side reached 1.101.
+    # 0.566 (worst 0.705). Equal lengths (`thd`) are sm80_train_fwd_gaps_pcie_20261123's (below).
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", False): Entry(
         "ge", 7.5, "sm80_thd_d256_v2_20261117", "q"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", True): Entry(
         "ge", 9.085, "sm80_thd_d256_v2_20261117", "tiles"
+    ),
+    # study sm80_train_fwd_gaps_pcie_20261123 (A100 80GB PCIe; the training harness's forward, recorded facts): equal-length THD d256
+    # and ragged THD MHA lead from a floor, and dense d512 sliding-window prefill leads (GQA off the tile from a cost floor). Equal-length
+    # THD d128 and ragged d128 GQA keep the hand rule; ragged d256 GQA keeps the entries above.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "thd_ragged", "causal_br", False, "mha", False): Entry(
+        "ge", 28.5, "sm80_train_fwd_gaps_pcie_20261123", "cost", ("ge", 8.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "thd_ragged", "causal_br", False, "mha", True): Entry(
+        "ge", 7.5, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 7.006, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", False): Entry(
+        "ge", 6.292, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 7.5, "kv")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", True): Entry(
+        "ge", 29.0, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "mha", False): Entry(
+        "ge", 27.5, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "mha", True): Entry(
+        "ge", 28.003, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "mha", False): Entry(
+        "ge", 5.5, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 6.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "mha", True): Entry(
+        "ge", 5.5, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 6.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", False): Entry(
+        "always", None, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", True): Entry(
+        "ge", 24.0, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "mha", False): Entry(
+        "always", None, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "mha", True): Entry(
+        "always", None, "sm80_train_fwd_gaps_pcie_20261123"
     ),
     # study sm80_dense_prefill_20261031 (cuDNN 9.29.0.18; A100 80GB PCIe; dense bf16 context d64 / d128 / d192x128 / d256, causal,
     # mask-free and d64 sink / window + sink, s_q 8-8192 over S_kv on and off the tile; 2,448 train cells incl. two consumed
@@ -1227,8 +1266,10 @@ TABLE: Dict[Tuple, Entry] = {
     # refit on every earlier cell of them pooled (sm80_prefill_gaps_20261117, its edge supplement, sm80_paged_d256_d192_v2_20261117; 744
     # cells, default = the backend) with a query-token condition that keeps few-query long-cache chunks on the backend. Fresh holdout at
     # new head pairs incl. that edge, scored once: d192 x 128 0.680 / 0.678 (worst 0.917), d256 0.587 / 0.592 (worst 1.055).
+    # study sm80_paged_d192x128_pcie_20261121: v3's on-tile d192 x 128 floor, same form, re-fit on the nightly's board. The off-tile entry
+    # below stays v3's.
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 35.366, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+        "ge", 29.226, "sm80_paged_d192x128_pcie_20261121", "cost", ("ge", 6.5, "q")
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 6.792, "sm80_paged_d256_d192_v3_20261117", "tiles", ("ge", 7.506, "q")
@@ -1242,6 +1283,14 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 36.454, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+    ),
+    # study sm80_paged_d256_swa_v4_pcie_20261121: windowed d256 prefill. `cost` ignores the window, so the floors also need a wide grid:
+    # with few parallel tiles FROST's time stays flat as heads drop while the backend's falls. Off the tile the grid alone decides.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "ge", 27.792, "sm80_paged_d256_swa_v4_pcie_20261121", "cost", ("ge", 7.453, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", True): Entry(
+        "ge", 8.085, "sm80_paged_d256_swa_v4_pcie_20261121", "tiles"
     ),
     # study sm80_gen_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE c9d0bcb7d; the generation path's padded-Q paged GQA decode
     # shapes with no entry: d64 MTP / verify, d64 windowed, d128 windowed and d192 x 192 causal / windowed MTP / verify; b 1-128, KV 1k-128k
@@ -1344,6 +1393,24 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", False): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "dense", "none", False, "gqa", True): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
+    # study sm80_d512_decode_v3_pcie_20261121: d512 decode over one or more KV heads, K / V shared or distinct. The floors are on `cost`,
+    # which grows with h_kv, so a cache with more KV heads reaches them at fewer keys.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm80_d512_decode_v3_pcie_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm80_d512_decode_v3_pcie_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 22.792, "sm80_d512_decode_v3_pcie_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 22.86, "sm80_d512_decode_v3_pcie_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "dense", "none", False, "gqa", False): Entry("ge", 25.002, "sm80_d512_decode_v3_pcie_20261121"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "dense", "none", False, "gqa", True): Entry("ge", 25.296, "sm80_d512_decode_v3_pcie_20261121"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.002, "sm80_d512_decode_v3_pcie_20261121"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 26.305, "sm80_d512_decode_v3_pcie_20261121"),
     # study sm90_decode_gaps_20261117 (H100 80GB HBM3, cuDNN 9.24.0.43, FE dbae6eec5; SM90 decode classes no study answered, found by
     # re-timing the h200 nightly on the branch: paged d512 verify (gemma4 global) and paged d256 sliding-window decode / MTP / verify
     # (gemma4 SWA, window 1024); 763 train cells fitted under the criterion, a 48-cell holdout scored once). FROST runs 0.05 of the

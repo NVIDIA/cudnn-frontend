@@ -1306,8 +1306,9 @@ block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
     allocation's, with that stream held behind pending work
     (`test/python/init_order_schedules.py`). On the helper today:
     `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`,
-    `SharedExpertDecode`, `RowQuantizeFp4Decode` (they allocate: record and
-    order), `Fp8ProjectionDecode`, `SwigluFp4Decode` (they own nothing: order).
+    `RowArgmaxDecode`; `SharedExpertDecode`, `RowQuantizeFp4Decode` (they
+    allocate: record and order); `Fp8ProjectionDecode`, `SwigluFp4Decode` (they
+    own nothing: order).
     Not yet, to follow in a separate change: `GdnDecodeFused`, `GdnVerifyFused`
     (they allocate: record and order). Until then the caller orders (allocates
     on the stream its calls run on, or orders that stream behind the allocating

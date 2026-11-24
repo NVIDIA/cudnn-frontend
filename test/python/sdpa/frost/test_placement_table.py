@@ -668,9 +668,66 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
     assert pt.lookup(row, f(**small, h_q=8, h_kv=2)) is False
     assert pt.matched_entry(row, f(d_qk=128, d_v=128)) is None
     for over in (dict(d_qk=256, d_v=256, h_q=32, h_kv=2), dict(d_qk=192, d_v=128, h_q=64, h_kv=4)):
-        on_tile_d256 = over["d_qk"] == 256 and s_kv % 128 == 0
-        expected = "sm80_paged_d256_v7_pcie_20261118" if on_tile_d256 else "sm80_paged_d256_d192_v3_20261117"
+        on_tile_owner = {256: "sm80_paged_d256_v7_pcie_20261118", 192: "sm80_paged_d192x128_pcie_20261121"}[over["d_qk"]]
+        expected = on_tile_owner if s_kv % 128 == 0 else "sm80_paged_d256_d192_v3_20261117"
         assert pt.matched_entry(row, f(**over)).study == expected, over
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm80_paged_d256_window_prefill_follows_its_study(s_kv):
+    """sm80_paged_d256_swa_v4_pcie_20261121: SM80 paged THD-Q d256 windowed prefill is owned by its study on both tile sides, FROST's
+    lead never shrinks as the grid widens, and the narrowest grid keeps the backend while the widest leads."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_paged_d256_swa_v4_pcie_20261121"
+
+    def f(b, h_q, h_kv, s_q):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=b * s_q, window_left=1023)
+        return _facts(**base)
+
+    for shape in [(b, h_q, h_kv, s_q) for b in (1, 4) for h_q, h_kv in ((8, 4), (16, 8), (32, 16)) for s_q in (512, 2048, 8192)]:
+        assert pt.matched_entry(row, f(*shape)).study == study, shape
+    for s_q in (512, 2048, 8192):
+        leads = [pt.lookup(row, f(b, 2 * h_kv, h_kv, s_q)) for b, h_kv in ((1, 1), (1, 4), (1, 16), (4, 16), (16, 16))]
+        assert leads == sorted(leads), (s_q, leads)
+    assert pt.lookup(row, f(1, 2, 1, 512)) is False
+    assert pt.lookup(row, f(16, 32, 16, 8192)) is True
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("off_tile", [False, True], ids=["on_tile", "off_tile"])
+def test_sm80_training_thd_and_d512_window_prefill_follow_their_study(off_tile):
+    """sm80_train_fwd_gaps_pcie_20261123 (A100 80GB PCIe): the training harness's equal-length THD d256, ragged THD MHA and dense d512
+    sliding-window prefill are owned by the study on both tile sides, and FROST's lead never shrinks as the grid widens. Equal-length THD
+    d128 and ragged THD d128 GQA keep no entry; ragged THD d256 GQA keeps its earlier study."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_train_fwd_gaps_pcie_20261123"
+
+    def thd(b, h_q, h_kv, s, d=256, ragged=False):
+        s += off_tile
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s, s_kv=s, d_qk=d, d_v=d, causal=True, device_cc=(8, 0), has_paged_kv=False, thd=True)
+        return _facts(**base, max_total_seq_len_q=b * s // 2 if ragged else b * s)
+
+    def window(b, h_q, h_kv, s, left=128):
+        s += off_tile
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s, s_kv=s, d_qk=512, d_v=512, causal=True, device_cc=(8, 0), has_paged_kv=False)
+        return _facts(**base, window_left=left - 1)
+
+    for facts in (thd(64, 32, 8, 1024), thd(16, 16, 16, 2048), thd(16, 16, 16, 2048, ragged=True), thd(16, 16, 16, 2048, d=128, ragged=True)):
+        assert pt.matched_entry(row, facts).study == study, facts
+    for facts in (window(2, 128, 1, 8192), window(2, 64, 1, 2048), window(4, 16, 16, 4096, left=1024)):
+        assert pt.matched_entry(row, facts).study == study, facts
+        assert pt.lookup(row, facts) is True, facts
+    for make in (lambda b, s: thd(b, 4 * b, b, s), lambda b, s: thd(b, 2 * b, 2 * b, s), lambda b, s: window(b, 8 * b, b, s)):
+        for s in (128, 1024, 8192):
+            leads = [pt.lookup(row, make(b, s)) for b in (1, 2, 4, 8, 16)]
+            assert leads == sorted(leads), (s, leads)
+    assert pt.lookup(row, thd(1, 4, 1, 128)) is False
+    assert pt.lookup(row, thd(64, 32, 8, 1024)) is True
+    assert pt.matched_entry(row, thd(16, 16, 4, 2048, d=128)) is None
+    assert pt.matched_entry(row, thd(16, 16, 4, 2048, d=128, ragged=True)) is None
+    assert pt.matched_entry(row, thd(16, 16, 4, 2048, ragged=True)).study == "sm80_thd_d256_v2_20261117"
 
 
 @pytest.mark.L0
@@ -759,8 +816,8 @@ def test_sm80_paged_d256_d192_prefill_follow_v3(d, s_kv):
         base.update(over)
         return _facts(**base)
 
-    on_tile_d256 = d == (256, 256) and s_kv % 128 == 0
-    assert pt.matched_entry(row, f()).study == ("sm80_paged_d256_v7_pcie_20261118" if on_tile_d256 else "sm80_paged_d256_d192_v3_20261117")
+    on_tile_owner = {(256, 256): "sm80_paged_d256_v7_pcie_20261118", (192, 128): "sm80_paged_d192x128_pcie_20261121"}[d]
+    assert pt.matched_entry(row, f()).study == (on_tile_owner if s_kv % 128 == 0 else "sm80_paged_d256_d192_v3_20261117")
     assert pt.lookup(row, f()) is True
     edge = f(b=32, h_q=64, h_kv=8, s_q=32, max_total_seq_len_q=32 * 32)
     assert pt.lookup(row, edge) is False
@@ -785,6 +842,54 @@ def test_sm80_paged_d256_on_tile_floor_follows_v7():
     off = f(h_q=10, s_kv=131073)
     assert pt.matched_entry(row, off).study == "sm80_paged_d256_d192_v3_20261117"
     assert pt.lookup(row, off) is False
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("off_tile", [0, 1], ids=["on_tile", "off_tile"])
+def test_sm80_d512_decode_follows_its_study(off_tile):
+    """A100 d512 decode (dense and paged, single-row and MTP, 1-8 KV heads) belongs to study sm80_d512_decode_v3_pcie_20261121 on and
+    off the KV tile. Within each class the lead is monotone in the entry's feature, and `cost` grows with h_kv."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_d512_decode_v3_pcie_20261121"
+
+    def f(b, h_q, h_kv, s_q, s_kv, paged):
+        causal = s_q > 1
+        return _facts(
+            b=b,
+            h_q=h_q,
+            h_kv=h_kv,
+            s_q=s_q,
+            s_kv=s_kv + off_tile,
+            d_qk=512,
+            d_v=512,
+            causal=causal,
+            bottom_right=causal,
+            has_paged_kv=paged,
+            page_size=64 if paged else 0,
+            padded=paged,
+            device_cc=(8, 0),
+        )
+
+    classes = {}
+    grid = [
+        (b, h_q, h_kv, s_q, s_kv, paged)
+        for paged in (False, True)
+        for s_q in (1, 2, 4)
+        for h_q, h_kv in ((16, 1), (128, 1), (16, 2), (32, 4), (32, 8))
+        for b in (1, 4, 64)
+        for s_kv in (128, 1024, 8192, 131072)
+    ]
+    for b, h_q, h_kv, s_q, s_kv, paged in grid:
+        facts = f(b, h_q, h_kv, s_q, s_kv, paged)
+        key = pt.class_key(row, facts)
+        entry = pt.matched_entry(row, facts)
+        assert key[-1] == bool(off_tile) and entry.study == study, (b, h_q, h_kv, s_q, s_kv, paged)
+        classes.setdefault(key, []).append((pt.FEATURES[entry.feature](facts), pt.lookup(row, facts)))
+    assert len(classes) == 4  # dense / paged x single-row / MTP
+    for key, points in classes.items():
+        leads = [lead for _, lead in sorted(points)]
+        assert leads == sorted(leads), key  # the backend below the floor, FROST from it
+    assert pt.FEATURES["cost"](f(1, 32, 8, 2, 4096, True)) > pt.FEATURES["cost"](f(1, 32, 1, 2, 4096, True))
 
 
 @pytest.mark.L0
@@ -1057,8 +1162,8 @@ def test_sm80_deterministic_backward_follows_its_study(s):
 @pytest.mark.parametrize("s", [8192, 8100], ids=["on_tile", "off_tile"])
 def test_sm80_thd_d256_prefill_follows_its_v2_study(s):
     """Study sm80_thd_d256_v2_20261117 (A100) replaced sm80_thd_prefill_20261117, whose `always` entries lost below S_q 500: ragged
-    d256 THD causal prefill leads past a floor (S_q 2^7.5 on the tile, 2^9.09 tiles off it); equal lengths keep the trail-only row
-    (their off-tile holdout side reached 1.101)."""
+    d256 THD causal prefill leads past a floor (S_q 2^7.5 on the tile, 2^9.09 tiles off it). Equal lengths are keyed apart and belong to
+    sm80_train_fwd_gaps_pcie_20261123, which leads this wide grid."""
     from cudnn.sdpa.fwd import placement
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
@@ -1072,10 +1177,11 @@ def test_sm80_thd_d256_prefill_follows_its_v2_study(s):
 
     assert pt.matched_entry(row, thd(0.75)).study == "sm80_thd_d256_v2_20261117"
     assert pt.lookup(row, thd(0.75)) is True
-    assert pt.lookup(row, thd(1.0)) is None  # equal lengths: no entry
+    assert pt.matched_entry(row, thd(1.0)).study == "sm80_train_fwd_gaps_pcie_20261123"
+    assert pt.lookup(row, thd(1.0)) is True
     d256 = [spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_sm80_d256_kv_prefetch"]
     assert d256 and placement.place(d256[0], thd(0.75)) == placement.LEAD
-    assert placement.place(d256[0], thd(1.0)) == placement.TRAIL
+    assert placement.place(d256[0], thd(1.0)) == placement.LEAD
 
 
 @pytest.mark.L0

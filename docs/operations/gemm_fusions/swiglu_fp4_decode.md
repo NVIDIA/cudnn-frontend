@@ -99,7 +99,7 @@ the operand values on one runtime, and of nothing else:
   of bytes its propagated error admits, and every code is within half a code step of its own block scale plus that error
   (the test utilities derive both bounds). Operands whose every intermediate is exact -- integer sums, bf16 ties of both
   roundings in both directions, a gate of zero, power-of-two scales -- give a host-built expectation byte for byte.
-- This rounding chain is the entry's own. `cudnn.ops.nvfp4_block_scale_quantize` applies its encode scale to the elements
+- This rounding chain is the entry's own. `cudnn.ops.nvfp4_block_scale_quantize_forward` applies its encode scale to the elements
   before the block maximum, and it and the grouped GLU + Hadamard + quant fusion clamp the reciprocal of a zero block
   scale to the largest fp32 where this entry writes zero codes: the bytes of those APIs are not this entry's.
 - Not a contract: equal bytes across GPU architectures or CuTe DSL compilers (the exponential, the division and the

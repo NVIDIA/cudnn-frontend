@@ -21,7 +21,7 @@ DSL >= 4.8.0.
 
 It is a decode-step entry. Two neighbours of this library do related work and are not the same operation:
 
-- [`cudnn.ops.nvfp4_block_scale_quantize`](/operations/BlockScaling/nvfp4_block_scale_conversion) converts whole 128-row bands
+- [`cudnn.ops.nvfp4_block_scale_quantize_forward`](/operations/BlockScaling/nvfp4_block_scale_conversion) converts whole 128-row bands
   (`M` a multiple of 128) with a caller workspace and another rounding rule: it multiplies every element by the encode scale
   first and takes the block maximum of the products. Its bytes are not this entry's. Use it to convert a stored tensor; use
   this entry for the rows of a decode step, 1 .. 1024 of them, inside a chain of dependent launches.
