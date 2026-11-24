@@ -30,6 +30,7 @@ from ..backend_utils import (
     backend_cache_key,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
+    execute_with_wrapper_workspace,
 )
 from ..moe_utils import MoEWeightMode, WGradInputOrder, WgradSfTensormapConstructor
 
@@ -239,6 +240,7 @@ class GroupedGemmWgradSm100(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         descriptor_workspace: Optional[torch.Tensor] = None,
+        _workspace=None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -261,6 +263,8 @@ class GroupedGemmWgradSm100(APIBase):
         )
         if descriptor_workspace is not None:
             execute_kwargs["descriptor_workspace"] = descriptor_workspace
+        if _workspace is not None:
+            execute_kwargs["_workspace"] = _workspace
         self._implementation.execute(**execute_kwargs)
 
 
@@ -378,7 +382,9 @@ def grouped_gemm_wgrad_wrapper_sm100(
         op, framework, wgrad_shape, memo_wgrad_dtype = memo
         if wgrad_tensor is None and wgrad_ptrs is None:
             wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, memo_wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
-        op.execute(
+        execute_with_wrapper_workspace(
+            op,
+            framework,
             a_tensor=a_tensor,
             b_tensor=b_tensor,
             sfa_tensor=sfa_tensor,
@@ -505,7 +511,9 @@ def grouped_gemm_wgrad_wrapper_sm100(
         op.compile()
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
     _wgrad_wrapper_memo[memo_key] = (op, framework, wgrad_shape, wgrad_dtype)
-    op.execute(
+    execute_with_wrapper_workspace(
+        op,
+        framework,
         a_tensor=a_tensor,
         b_tensor=b_tensor,
         sfa_tensor=sfa_tensor,

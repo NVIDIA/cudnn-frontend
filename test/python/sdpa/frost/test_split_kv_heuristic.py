@@ -1497,12 +1497,16 @@ def test_sm80_d128_chunks_split_on_the_adapter_grid(b, h_q, h_kv, s_q, s_kv, spl
         ("paged", 4, 32, 2, 64, 32768, 2, None),
         # A window caps the keys each row reads; the rule would count the whole cache (gemma4: 1.35-1.94x slower), so it is outside.
         ("paged", 1, 16, 8, 1, 131072, 8, 1024),
-        # Dense d256 keeps the shared model's choice.
-        ("dense", 8, 40, 4, 1, 32768, 2, None),
+        # Dense single-row decode takes the same rule.
+        ("dense", 8, 40, 4, 1, 32768, 32, None),
+        ("dense", 1, 10, 1, 1, 16384, 64, None),
+        ("dense", 128, 10, 1, 1, 1025, 4, None),
+        # Dense S_q 2-16 keeps the shared model's choice.
+        ("dense", 8, 40, 4, 4, 32768, 2, None),
     ],
 )
-def test_sm80_paged_d256_decode_split_rule(layout, b, h_q, h_kv, s_q, s_kv, split, window):
-    """SM80 paged d256 decode on the short tile takes a direct split rule; the wave model mis-split it both ways."""
+def test_sm80_d256_decode_split_rule(layout, b, h_q, h_kv, s_q, s_kv, split, window):
+    """SM80 d256 decode on the short tile (paged S_q <= 16, dense S_q 1) takes a direct split rule; the wave model mis-split it both ways."""
     import cudnn
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS

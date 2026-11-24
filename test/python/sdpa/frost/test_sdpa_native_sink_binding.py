@@ -99,10 +99,11 @@ def test_thd_sink_native_graph_rebind_and_replay(d, monkeypatch):
     from frost_test_utils import _dsl_installed
     from test_sdpa_prepared_thd import _thd_graph, _buffers, _pack
 
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7), (12, 0)) or not _dsl_installed():
+    cc = torch.cuda.get_device_capability()
+    if cc not in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)) or not _dsl_installed():
         pytest.skip("requires a supported Blackwell/Rubin half THD template")
     b, sq, sk, h, hk = 2, 4, 128, 8, 2
-    arch = {(10, 7): "sm107", (12, 0): "sm120"}.get(torch.cuda.get_device_capability(), "sm100")
+    arch = "sm107" if cc == (10, 7) else "sm120" if cc[0] == 12 else "sm100"
     graph, desc = _thd_graph(b, sq, sk, h, hk, d, causal=False, has_sink=True, arch=arch)
     launch = graph._compiled_plans[graph._plan_index]._prepared
     assert isinstance(launch, prep.PreparedThdLaunch) and launch.spec.native is not None
