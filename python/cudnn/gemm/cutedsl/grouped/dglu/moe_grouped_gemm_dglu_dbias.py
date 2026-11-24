@@ -55,6 +55,8 @@ from ..moe_kernel_helpers import (
     can_implement_bf16_grouped_gemm,
     compute_grid,
 )
+from ..moe_streaming_input_block_tile_scheduler import MoEInputBlockSignalSchedulerParams, StreamingInputSignalMixin
+from cudnn.frost.tile_dsl.consume import release_zero
 
 
 def atomic_add_bf16x2(ptr, val_fp32_lo, val_fp32_hi, *, loc=None, ip=None):
@@ -72,12 +74,15 @@ def atomic_add_bf16x2(ptr, val_fp32_lo, val_fp32_hi, *, loc=None, ip=None):
     )
 
 
-class MoEGroupedGemmDgluDbiasBf16Kernel:
+class MoEGroupedGemmDgluDbiasBf16Kernel(StreamingInputSignalMixin):
     """Plain BF16 grouped GEMM kernel with MoE scheduling and dGLU backward fusion.
 
     The kernel is organized as persistent scheduler, A/B TMA load, MMA, C-load,
     and epilogue warps. The epilogue computes dSwiGLU or dGeGLU gradients,
     reduces dprob, optionally reduces dbias, and writes D.
+
+    :param streaming_signal_capacity, use_pdl, launch_pdl_dependents_at_entry: a streaming input producer of A (the
+        dispatched output gradient); see docs/operations/moe/streaming_signal_contract.md (section 4a).
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -140,6 +145,9 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         round_dgrad_to_input_dtype: bool = False,
         glu_layout: str = "interleaved_32",
         deterministic: bool = False,
+        streaming_signal_capacity: Optional[int] = None,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         # Validate FIX_PAD_SIZE compatibility with tile size
         mma_tile_m = mma_tiler_mn[0]
@@ -153,6 +161,15 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
         if act_func not in ["dswiglu", "dgeglu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
+        self.init_streaming_input_signal(
+            streaming_signal_capacity,
+            use_dynamic_sched=use_dynamic_sched,
+            use_2cta_instrs=use_2cta_instrs,
+            cluster_shape_mn=cluster_shape_mn,
+            unmet_requirement=None if weight_mode == MoEWeightMode.DENSE else "dense weights",
+            use_pdl=use_pdl,
+            launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
+        )
 
         self.glu_layout = validate_glu_layout(glu_layout)
         self.expert_cnt = expert_cnt
@@ -350,7 +367,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         """Return descriptor workspace plus optional dynamic scheduler state."""
         desc_workspace_bytes = self.get_desc_workspace_bytes()
         dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
-        return desc_workspace_bytes + dynamic_sched_bytes
+        return desc_workspace_bytes + dynamic_sched_bytes + self.streaming_input_workspace_bytes()
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):
@@ -420,7 +437,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             workspace = TensormapWorkspace(workspace_ptr, ["b"])
             store_tma_desc(tma_atom_b, workspace.get_ptr("b", expert_idx))
 
-        if cutlass.const_expr(self.use_dynamic_sched):
+        # The signal scheduler's counter is reset by the caller together with signal[].
+        if cutlass.const_expr(self.use_dynamic_sched and not self.use_streaming_signal_sched):
             if expert_idx == cutlass.Int32(0):
                 sched_counter = cute.make_tensor(
                     self._get_sched_counter_ptr(workspace_ptr),
@@ -586,12 +604,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         # dGLU output has shape (m, 2*N_half, 1), but scheduling is over (m, N_half)
         # expert_shape = (expert_cnt, N_half, K)
         n_half = n_d // 2
-        sched_params = MoESchedulerParams(
-            scenario="2Dx3D",
-            expert_shape=(self.expert_cnt, n_half, cute.size(a.shape, mode=[1])),
-            cta_tile_shape_mnk=self.cta_tile_shape_mnk_d,
-            cluster_shape_mn=self.cluster_shape_mn,
-            use_dynamic_sched=self.use_dynamic_sched,
+        sched_params = self.make_streaming_input_sched_params(
+            (self.expert_cnt, n_half, cute.size(a.shape, mode=[1])), self.cta_tile_shape_mnk_d, self.cluster_shape_mn, self.use_dynamic_sched
         )
         self.sched_params, grid = compute_grid(sched_params, max_active_clusters, self.use_2cta_instrs)
 
@@ -649,7 +663,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
 
         # Initialize per-expert B TMA descriptors in workspace
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or self.use_dynamic_sched)
+        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and not self.use_streaming_signal_sched))
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (
@@ -697,6 +711,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             self.epi_tile,
             self.sched_params,
             activation,
+            Int32(0) if self.use_streaming_signal_sched else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -705,6 +720,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -1218,15 +1234,20 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         d_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
-        sched_params: MoESchedulerParams,
+        sched_params: Union[MoESchedulerParams, MoEInputBlockSignalSchedulerParams],
         mActivation: Optional[cute.Tensor] = None,
+        release_zero_arg: Optional[Int32] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
+
+        ``release_zero_arg``: with the signal scheduler, the release-zero (python/cudnn/AGENTS.md Rule 11): the host passes
+        the literal 0 and its only use is ``release_zero()``; None otherwise.
         """
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = tidx // 32
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        self.streaming_input_entry()
 
         total_tokens = padded_offsets[self.expert_cnt - 1]
 
@@ -1319,14 +1340,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             consumer_group=tile_info_pipeline_consumer_group,
         )
 
-        scheduler = MoEPersistentTileScheduler.create(
-            sched_params,
-            padded_offsets,
-            cute.arch.block_idx(),
-            cute.arch.grid_dim(),
-            counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
-            sched_storage=sched_storage,
-        )
+        zero = release_zero(release_zero_arg) if cutlass.const_expr(release_zero_arg is not None) else None
+        scheduler = self.create_streaming_input_scheduler(sched_params, padded_offsets, self._get_sched_counter_ptr(workspace_ptr), sched_storage, zero)
         scheduler.internal_init()
 
         # dBias SMEM setup
@@ -1504,6 +1519,9 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                 mma_tile_coord_n = work_tile_info.tile_n_idx
                 tAgA_slice = tAgA[(None, mma_tile_coord_m, None, 0)]
                 tBgB_slice = tBgB[(None, mma_tile_coord_n, None, 0)]
+
+                # The producer wrote A through the generic proxy: order it before this tile's TMA loads.
+                self.streaming_input_tile_fence()
 
                 # Peek (try_wait) AB buffer empty
                 peek_ab_empty_status = cutlass.Boolean(1)
@@ -2132,6 +2150,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             # Wait C buffer tail complete
             #
             c_pipeline.producer_tail(c_pipeline_producer_state)
+
+        self.streaming_input_exit(scheduler)
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 

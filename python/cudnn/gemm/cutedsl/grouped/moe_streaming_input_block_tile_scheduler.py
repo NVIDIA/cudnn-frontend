@@ -45,7 +45,7 @@ Opening a batch: one warp, serialized across claims, scans the experts 32 at a t
 Assumes A rows <= (2^31 - 1) * cluster tile M.
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import (
@@ -60,6 +60,7 @@ from cutlass._mlir import ir
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineUserType, make_pipeline_state
 from .moe_kernel_helpers import (
+    check_dynamic_sched_cluster_shape,
     streaming_scheduler_state_offset,
     streaming_signal_ptr,
     mbarrier_arrive_expect_tx_on_peer_relaxed_cluster,
@@ -70,6 +71,8 @@ from .moe_utils import ceil_div
 from cudnn.frost.tile_dsl.consume import ReleaseZero, consume_then_arrive_on_peer
 from .moe_persistent_scheduler import (
     atomic_add_i32,
+    MoEPersistentTileScheduler,
+    MoESchedulerParams,
     MoEWorkTileInfo,
     _DynamicSchedState,
 )
@@ -608,3 +611,128 @@ class MoEStreamingInputBlockSignalTileScheduler:
         """K tiles per work tile: ``ceil(hidden / cta_tile_k)``, folded when ``hidden`` is static.
         The Int32 keeps the work tile's field type the same on both arms of the caller's branch."""
         return Int32(ceil_div(self.params.hidden, const_expr(self.params.cta_tile_shape_mnk[2])))
+
+
+class StreamingInputSignalMixin:
+    """The streaming input signal wiring of a MoE grouped GEMM kernel whose A (and SFA) a producer fills while it runs: the
+    options, the workspace, the scheduler, the trigger warp, entry and exit.  Contract and options:
+    docs/operations/moe/streaming_signal_contract.md.
+
+    The kernel calls ``init_streaming_input_signal`` in ``__init__``; with ``streaming_signal_capacity`` None every method
+    below gives the stock dynamic scheduler's code."""
+
+    def init_streaming_input_signal(
+        self,
+        streaming_signal_capacity: Optional[int],
+        *,
+        use_dynamic_sched: bool,
+        use_2cta_instrs: bool,
+        cluster_shape_mn: Tuple[int, int],
+        unmet_requirement: Optional[str] = None,
+        device_layout: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
+    ) -> None:
+        """Check and keep the options.  ``unmet_requirement``: what this kernel configuration lacks for a producer (for
+        example "dense weights"), or None."""
+        self.streaming_signal_capacity = streaming_signal_capacity
+        self.use_streaming_signal_sched = streaming_signal_capacity is not None
+        if self.use_streaming_signal_sched and not use_dynamic_sched:
+            raise ValueError("streaming_signal_capacity requires use_dynamic_sched=True")
+        if self.use_streaming_signal_sched and unmet_requirement is not None:
+            raise ValueError(f"streaming_signal_capacity requires {unmet_requirement}")
+        if device_layout and not self.use_streaming_signal_sched:
+            raise ValueError("device_layout requires streaming_signal_capacity")
+        if launch_pdl_dependents_at_all_streaming_signal_slots_ready and not self.use_streaming_signal_sched:
+            raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
+        if self.use_streaming_signal_sched:
+            check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
+        self.device_layout = device_layout
+        self.use_pdl = use_pdl
+        self.launch_pdl_dependents_at_all_streaming_signal_slots_ready = launch_pdl_dependents_at_all_streaming_signal_slots_ready
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
+        self.trigger_warp_id = None
+
+    def streaming_input_trigger_warps(self, first_free_warp_id: int) -> List[int]:
+        """``launch_pdl_dependents_at_all_streaming_signal_slots_ready``: one more warp, which only waits for every
+        ``signal[]`` entry and then triggers; its id in a list (else empty), for the kernel's warp list."""
+        if not self.launch_pdl_dependents_at_all_streaming_signal_slots_ready:
+            return []
+        self.trigger_warp_id = first_free_warp_id
+        return [first_free_warp_id]
+
+    def streaming_input_workspace_bytes(self) -> int:
+        """Workspace bytes after the claim counter: ``signal[]`` and the scheduler state (0 without a producer)."""
+        if not self.use_streaming_signal_sched:
+            return 0
+        return streaming_signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt)
+
+    def check_streaming_input_scheduler_counter(self, scheduler_counter) -> None:
+        """In ``__call__``: ``signal[]`` and the scheduler state follow the kernel's own claim counter in the workspace."""
+        if self.use_streaming_signal_sched and scheduler_counter is not None:
+            raise ValueError("streaming_signal_capacity owns the claim counter: pass no scheduler_counter")
+
+    def make_streaming_input_sched_params(self, expert_shape, cta_tile_shape_mnk, cluster_shape_mn, use_dynamic_sched: bool):
+        """The scheduler parameters: the signal scheduler's, or the stock 2Dx3D ones."""
+        if self.use_streaming_signal_sched:
+            return MoEInputBlockSignalSchedulerParams(expert_shape=expert_shape, cta_tile_shape_mnk=cta_tile_shape_mnk, cluster_shape_mn=cluster_shape_mn)
+        return MoESchedulerParams(
+            scenario="2Dx3D",
+            expert_shape=expert_shape,
+            cta_tile_shape_mnk=cta_tile_shape_mnk,
+            cluster_shape_mn=cluster_shape_mn,
+            use_dynamic_sched=use_dynamic_sched,
+        )
+
+    def create_streaming_input_scheduler(self, sched_params, padded_offsets, counter_ptr, sched_storage, zero):
+        """In the kernel: the signal scheduler, or the stock persistent one.  ``zero``: ``release_zero(<the kernel's
+        release-zero argument>)``, which the host passes with the signal scheduler (python/cudnn/AGENTS.md Rule 11)."""
+        if self.use_streaming_signal_sched:
+            return MoEStreamingInputBlockSignalTileScheduler.create(
+                sched_params,
+                padded_offsets,
+                counter_ptr=counter_ptr,
+                sched_storage=sched_storage,
+                streaming_signal_capacity=self.streaming_signal_capacity,
+                release_zero=zero,
+                device_layout=self.device_layout,
+            )
+        return MoEPersistentTileScheduler.create(
+            sched_params,
+            padded_offsets,
+            cute.arch.block_idx(),
+            cute.arch.grid_dim(),
+            counter_ptr=counter_ptr,
+            sched_storage=sched_storage,
+        )
+
+    @cute.jit
+    def streaming_input_entry(self) -> None:
+        """At kernel entry: ``launch_pdl_dependents_at_entry`` lets this kernel's own dependent launch."""
+        if const_expr(self.launch_pdl_dependents_at_entry):
+            cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def streaming_input_trigger_warp(self, warp_idx, scheduler) -> None:
+        """The trigger warp's whole job: wait until every ``signal[]`` entry is ready, then launch the dependent."""
+        if const_expr(self.launch_pdl_dependents_at_all_streaming_signal_slots_ready):
+            if warp_idx == self.trigger_warp_id:
+                scheduler.wait_all_streaming_signal_slots_ready()
+                cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def streaming_input_tile_fence(self) -> None:
+        """In the TMA warp, per tile: the producer wrote A (and SFA) through the generic proxy, so order its stores (acquired
+        by the claim) before this tile's TMA loads."""
+        if const_expr(self.use_streaming_signal_sched):
+            cute.arch.fence_proxy("async.global")
+
+    @cute.jit
+    def streaming_input_exit(self, scheduler) -> None:
+        """Every thread, last: the signal scheduler's last cluster handoff writes into a peer's shared memory, so the
+        cluster waits for it; with ``use_pdl`` the grid this launch overlapped must end before this one does."""
+        if const_expr(self.use_streaming_signal_sched):
+            scheduler.internal_finalize()
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()

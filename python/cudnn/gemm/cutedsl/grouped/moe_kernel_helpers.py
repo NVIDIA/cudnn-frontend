@@ -1397,6 +1397,39 @@ def mbarrier_try_wait_parity_acquire_cluster(mbar_ptr, phase: Int32, *, loc=None
     )
 
 
+@dsl_user_op
+def mbarrier_try_wait_parity_relaxed_cluster(mbar_ptr, phase: Int32, *, loc=None, ip=None) -> Boolean:
+    """``mbarrier.try_wait.parity.relaxed.cluster``: a strong read of a peer's arrive with no acquire, so no L1
+    invalidation per poll.  Follow the successful poll with an acquire fence (an acquire pattern)."""
+    return Boolean(
+        nvvm.mbarrier_wait_parity(
+            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+            Int32(phase).ir_value(loc=loc, ip=ip),
+            nvvm.MBarrierWaitKind.TRY,
+            scope=nvvm.MemScopeKind.CLUSTER,
+            order=nvvm.MemOrderKind.RELAXED,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fence_release_sync_restrict_shared_cta_cluster(*, loc=None, ip=None) -> None:
+    """``fence.release.sync_restrict::shared::cta.cluster``: a cluster-scope release of this thread's (and, through a
+    barrier, its warp's) earlier operations on ``.shared::cta`` objects only, for a relaxed ``.cluster`` mbarrier arrive
+    after it.  ``MEMBAR.ALL.CTA`` on SM100 / SM107, not the ``MEMBAR.ALL.GPU`` of ``fence.release.cluster``."""
+    nvvm.fence_sync_restrict(nvvm.MemOrderKind.RELEASE, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def fence_acquire_sync_restrict_shared_cluster_cluster(*, loc=None, ip=None) -> None:
+    """``fence.acquire.sync_restrict::shared::cluster.cluster``: after a relaxed ``.cluster`` mbarrier wait, a cluster-scope
+    acquire that orders this thread's later operations on ``.shared::cluster`` objects only.  No SASS on SM100 / SM107
+    (no ``CCTL.IVALL``: shared memory is not cached in L1)."""
+    nvvm.fence_sync_restrict(nvvm.MemOrderKind.ACQUIRE, loc=loc, ip=ip)
+
+
 # ---- The signal workspace byte map: the producer's and this consumer's contract ----
 
 
