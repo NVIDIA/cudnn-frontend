@@ -3401,9 +3401,10 @@ class ScoreGradSm100:
 
     WARP_SIZE = 32
 
-    def __init__(self, topk: int, zero_dk_f32: bool = False):
+    def __init__(self, topk: int, zero_dk_f32: bool = False, clip_log: bool = True):
         self.topk = topk
         self.zero_dk_f32 = zero_dk_f32
+        self.clip_log = clip_log
         # For short TopK, each thread owns one aligned float4.  TopK=128 maps
         # one row to a warp and packs 16 rows per CTA; TopK=256 packs four
         # two-warp rows; TopK=384/512 pack two three-/four-warp rows.  These
@@ -3490,14 +3491,20 @@ class ScoreGradSm100:
                 index_ptr = mIndexScore[seq_idx, None, batch_idx].iterator + lane_idx * 4
                 target0, target1, target2, target3 = _load_global_f32x4(attn_ptr)
                 predict0, predict1, predict2, predict3 = _load_global_f32x4(index_ptr)
-                target0 = cute.arch.fmax(target0, Float32(CLIP_PROB_MIN))
-                target1 = cute.arch.fmax(target1, Float32(CLIP_PROB_MIN))
-                target2 = cute.arch.fmax(target2, Float32(CLIP_PROB_MIN))
-                target3 = cute.arch.fmax(target3, Float32(CLIP_PROB_MIN))
-                mask0 = Float32(1.0) if predict0 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
-                mask1 = Float32(1.0) if predict1 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
-                mask2 = Float32(1.0) if predict2 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
-                mask3 = Float32(1.0) if predict3 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                # Stable KL must retain -target even when student probability underflows.
+                mask0 = Float32(1.0)
+                mask1 = Float32(1.0)
+                mask2 = Float32(1.0)
+                mask3 = Float32(1.0)
+                if const_expr(self.clip_log):
+                    target0 = cute.arch.fmax(target0, Float32(CLIP_PROB_MIN))
+                    target1 = cute.arch.fmax(target1, Float32(CLIP_PROB_MIN))
+                    target2 = cute.arch.fmax(target2, Float32(CLIP_PROB_MIN))
+                    target3 = cute.arch.fmax(target3, Float32(CLIP_PROB_MIN))
+                    mask0 = Float32(1.0) if predict0 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    mask1 = Float32(1.0) if predict1 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    mask2 = Float32(1.0) if predict2 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    mask3 = Float32(1.0) if predict3 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                 g0 = -target0 * mask0 * grad_scale_f32
                 g1 = -target1 * mask1 * grad_scale_f32
                 g2 = -target2 * mask2 * grad_scale_f32
@@ -3534,14 +3541,20 @@ class ScoreGradSm100:
                 index_ptr = mIndexScore[seq_idx, None, batch_idx].iterator + vector_in_row * 4
                 target0, target1, target2, target3 = _load_global_f32x4(attn_ptr)
                 predict0, predict1, predict2, predict3 = _load_global_f32x4(index_ptr)
-                target0 = cute.arch.fmax(target0, Float32(CLIP_PROB_MIN))
-                target1 = cute.arch.fmax(target1, Float32(CLIP_PROB_MIN))
-                target2 = cute.arch.fmax(target2, Float32(CLIP_PROB_MIN))
-                target3 = cute.arch.fmax(target3, Float32(CLIP_PROB_MIN))
-                mask0 = Float32(1.0) if predict0 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
-                mask1 = Float32(1.0) if predict1 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
-                mask2 = Float32(1.0) if predict2 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
-                mask3 = Float32(1.0) if predict3 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                # Stable KL must retain -target even when student probability underflows.
+                mask0 = Float32(1.0)
+                mask1 = Float32(1.0)
+                mask2 = Float32(1.0)
+                mask3 = Float32(1.0)
+                if const_expr(self.clip_log):
+                    target0 = cute.arch.fmax(target0, Float32(CLIP_PROB_MIN))
+                    target1 = cute.arch.fmax(target1, Float32(CLIP_PROB_MIN))
+                    target2 = cute.arch.fmax(target2, Float32(CLIP_PROB_MIN))
+                    target3 = cute.arch.fmax(target3, Float32(CLIP_PROB_MIN))
+                    mask0 = Float32(1.0) if predict0 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    mask1 = Float32(1.0) if predict1 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    mask2 = Float32(1.0) if predict2 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                    mask3 = Float32(1.0) if predict3 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                 g0 = -target0 * mask0 * grad_scale_f32
                 g1 = -target1 * mask1 * grad_scale_f32
                 g2 = -target2 * mask2 * grad_scale_f32
@@ -3589,8 +3602,11 @@ class ScoreGradSm100:
             for pos in cutlass.range(tidx, self.topk, self.threads_per_cta):
                 target = Float32(mAttnScore[seq_idx, pos, batch_idx])
                 predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
-                log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                target_eff = target
+                log_clip_mask = Float32(1.0)
+                if const_expr(self.clip_log):
+                    target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
+                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                 local_sum += -target_eff * log_clip_mask * grad_scale_f32
 
             warp_idx = tidx // self.WARP_SIZE
@@ -3605,8 +3621,11 @@ class ScoreGradSm100:
             for pos in cutlass.range(tidx, self.topk, self.threads_per_cta):
                 target = Float32(mAttnScore[seq_idx, pos, batch_idx])
                 predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
-                log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                target_eff = target
+                log_clip_mask = Float32(1.0)
+                if const_expr(self.clip_log):
+                    target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
+                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                 g_i = -target_eff * log_clip_mask * grad_scale_f32
                 mAttnScore[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
 

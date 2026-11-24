@@ -584,6 +584,11 @@ def indexer_backward_jax(
     grad_loss: Any,
     *,
     sm_scale: float = 1.0,
+    clip_log: bool = True,
+    cu_seqlens_q: Any = None,
+    cu_seqlens_k: Any = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
 ) -> tuple[Any, Any, Any]:
     """Sparse (top-k) indexer backward for the DSv4 KL indexer loss using CuTeDSL.
 
@@ -597,17 +602,57 @@ def indexer_backward_jax(
 
     The per-token KL gradient is scaled by ``grad_loss / (B * S_q)``. ``d_k`` is returned in FP32 (the kernel
     reduce-adds into it, zero-initialized here); ``d_q`` and ``d_weights`` are BF16. Requires H=64, D=128 and
-    ``topk == 512``.
+    ``topk == 512``. ``clip_log=False`` preserves stable-log-softmax gradients, including non-unit teacher
+    mass and student probabilities below ``exp(-100)``; the default retains clipped-log behavior.
+
+    Packed THD accepts ``q (T_q, 64, 128)``, ``k (T_k, 1, 128)``, ``weights (T_q, 64)`` and selected-slot
+    arrays ``(T_q, 512)``. Pass matching int32 ``cu_seqlens_q`` / ``cu_seqlens_k`` and positive static int
+    ``max_seqlen_q`` / ``max_seqlen_k``, as in :func:`indexer_forward_jax`. Prefixes must start at zero,
+    be nondecreasing, end within the token capacities, and have per-segment lengths within the maxima.
+    These device-value preconditions are caller-owned, without a host read or synchronization.
+    Selected IDs are segment-local compressed-key positions; negative or out-of-segment IDs are ignored.
+    They must be unique within each row. Causal/selection masking is caller-owned; no ratio mask is added.
+    Masked slots and Q/K capacity past the terminal prefixes contribute zero gradients, including empty
+    segments and all-invalid rows. Teacher/student values in those slots may be arbitrary and are ignored.
+    Active Q/K/weights must be finite. Teacher mass is preserved, without renormalization.
+
+    THD returns ``(d_q (T_q, 64, 128), d_weights (T_q, 64), d_k (T_k, 128))`` in BF16/BF16/FP32 order.
+    Its score gradient is ``(predict * sum(target) - target) * grad_loss / T_q`` with ``clip_log=False``;
+    ``T_q`` is physical query capacity, not the valid prefix total or sum of sequence maxima. Multiply
+    ``grad_loss`` by ``T_q`` for a summed loss before applying a caller's valid-token normalization.
+    ``sm_scale`` is applied exactly once to every returned gradient. One packed native backward pipeline
+    is used, with sparse device metadata preparation and no per-sequence dispatch or dense padding.
     """
     check_sm100()
-    if q.ndim != 4 or k.ndim != 4 or weights.ndim != 3:
-        raise ValueError("q/k/weights must use BSHD/BSHD/BSH layouts")
-    batch, seqlen_q, heads, head_dim = q.shape
-    if k.shape[0] != batch or k.shape[2:] != (1, head_dim):
-        raise ValueError(f"k must have shape ({batch}, S_k, 1, {head_dim}), got {k.shape}")
-    seqlen_k = k.shape[1]
-    if weights.shape != (batch, seqlen_q, heads):
-        raise ValueError(f"weights must have shape {(batch, seqlen_q, heads)}, got {weights.shape}")
+    if q.ndim not in (3, 4):
+        raise ValueError("q must use the BSHD or THD layout")
+    is_varlen = q.ndim == 3
+    heads, head_dim = q.shape[-2:]
+    if is_varlen:
+        if k.ndim != 3 or k.shape[1:] != (1, head_dim) or weights.shape != q.shape[:2]:
+            raise ValueError(f"THD k/weights must have shapes (T_k, 1, {head_dim}) / {q.shape[:2]}, got {k.shape} / {weights.shape}")
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            raise ValueError("THD requires cu_seqlens_q and cu_seqlens_k")
+        if cu_seqlens_q.ndim != 1 or cu_seqlens_q.size < 2 or cu_seqlens_k.shape != cu_seqlens_q.shape:
+            raise ValueError("cu_seqlens_q and cu_seqlens_k must be matching 1-D arrays of at least two prefixes")
+        if cu_seqlens_q.dtype != jnp.int32 or cu_seqlens_k.dtype != jnp.int32:
+            raise TypeError("cu_seqlens_q and cu_seqlens_k must be int32")
+        if any(not isinstance(n, int) or isinstance(n, bool) or n <= 0 for n in (max_seqlen_q, max_seqlen_k)):
+            raise ValueError("THD requires positive static int max_seqlen_q and max_seqlen_k")
+        if q.shape[0] == 0 or k.shape[0] == 0:
+            raise ValueError("THD requires nonempty q and k capacity")
+        batch, seqlen_q, seqlen_k = 1, q.shape[0], k.shape[0]
+        score_shape = (seqlen_q, topk_indices.shape[-1])
+    else:
+        if any(x is not None for x in (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)):
+            raise ValueError("cu_seqlens_* and max_seqlen_* are only accepted for THD inputs")
+        batch, seqlen_q = q.shape[:2]
+        if k.ndim != 4 or k.shape[0] != batch or k.shape[2:] != (1, head_dim):
+            raise ValueError(f"k must have shape ({batch}, S_k, 1, {head_dim}), got {k.shape}")
+        seqlen_k = k.shape[1]
+        if weights.shape != (batch, seqlen_q, heads):
+            raise ValueError(f"weights must have shape {(batch, seqlen_q, heads)}, got {weights.shape}")
+        score_shape = (batch, seqlen_q, topk_indices.shape[-1])
     if q.dtype != jnp.bfloat16 or k.dtype != jnp.bfloat16 or weights.dtype != jnp.bfloat16:
         raise TypeError("q, k, and weights must be bfloat16")
     if head_dim != 128 or heads != 64:
@@ -618,7 +663,6 @@ def indexer_backward_jax(
         # stall (deadlock) on a 152-SM GB300 for some row counts (e.g. B=4, S=1024) while completing with a
         # smaller persistent grid, so shorter rows are not exposed until that is understood.
         raise ValueError(f"the JAX sparse indexer backward supports topk=512 only, got {topk}")
-    score_shape = (batch, seqlen_q, topk)
     if attn_score.shape != score_shape or index_score.shape != score_shape or topk_indices.shape != score_shape:
         raise ValueError(f"attn_score/index_score/topk_indices must have shape {score_shape}")
     if attn_score.dtype != jnp.float32 or index_score.dtype != jnp.float32:
@@ -628,12 +672,29 @@ def indexer_backward_jax(
     if grad_loss.size != 1 or grad_loss.dtype != jnp.float32:
         raise ValueError("grad_loss must be a single float32 element")
 
+    q_shape, weights_shape = q.shape, weights.shape
+    if is_varlen:
+        # The native GEMM already accepts packed B=1 views and flat K IDs. Translate only sparse slots;
+        # side="right" skips empty segments at repeated prefixes without reading prefix values on the host.
+        rows = jnp.arange(seqlen_q, dtype=jnp.int32)
+        segment = jnp.minimum(jnp.searchsorted(cu_seqlens_q, rows, side="right") - 1, cu_seqlens_q.size - 2)
+        k_start, k_end = cu_seqlens_k[segment], cu_seqlens_k[segment + 1]
+        valid = (rows[:, None] < cu_seqlens_q[-1]) & (topk_indices >= 0) & (topk_indices < (k_end - k_start)[:, None])
+        topk_indices = jnp.where(valid, topk_indices + k_start[:, None], -1)[None]
+        attn_score = jnp.where(valid, attn_score, 0.0)[None]
+        index_score = jnp.where(valid, index_score, 0.0)[None]
+        # GEMM visits capacity rows even with no selected keys. Zero Q/W before its arithmetic so poisoned
+        # unused capacity cannot turn a zero signal into NaN gradients through 0*NaN.
+        active = jnp.any(valid, axis=-1)
+        q = jnp.where(active[:, None, None], q, jnp.zeros((), q.dtype))[None]
+        weights = jnp.where(active[:, None], weights, jnp.zeros((), weights.dtype))[None]
+
     sm_count = jax.devices()[0].core_count
-    key = (head_dim, heads, topk, batch * seqlen_q, sm_count)
+    key = (head_dim, heads, topk, batch * seqlen_q, sm_count, clip_log)
     kernels = _sparse_indexer_bwd_kernels.get(key)
     if kernels is None:
         kernels = (
-            ScoreGradSm100(topk=topk, zero_dk_f32=False),
+            ScoreGradSm100(topk=topk, zero_dk_f32=False, clip_log=clip_log),
             IndexerBackwardSm100(
                 head_dim=head_dim,
                 heads=heads,
@@ -654,7 +715,7 @@ def indexer_backward_jax(
             jax.ShapeDtypeStruct(q.shape, jnp.bfloat16),
             jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),
             jax.ShapeDtypeStruct((batch, seqlen_k, head_dim), jnp.float32),
-            jax.ShapeDtypeStruct(score_shape, jnp.float32),
+            jax.ShapeDtypeStruct((batch, seqlen_q, topk), jnp.float32),
         ),
         initialized_outputs={2: zeros_init},
         # attn_score is overwritten in place with the score gradient; alias it to a (discarded) output so XLA
@@ -665,7 +726,8 @@ def indexer_backward_jax(
         grad_scale=1.0 / (batch * seqlen_q),
         sm_scale=float(sm_scale),
     )(q, weights, k.reshape(batch, seqlen_k, head_dim), attn_score, index_score, topk_indices, grad_loss.reshape(1))
-    return d_q, d_weights, d_k
+    d_k_shape = (seqlen_k, head_dim) if is_varlen else (batch, seqlen_k, head_dim)
+    return d_q.reshape(q_shape), d_weights.reshape(weights_shape), d_k.reshape(d_k_shape)
 
 
 __all__ = [

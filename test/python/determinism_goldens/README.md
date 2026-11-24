@@ -4,6 +4,29 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### JAX sparse indexer backward: BSHD and packed THD (2026-11-23)
+
+On B200 (SM100), cuDNN 92700, CuTe DSL 4.8.0 and JAX 0.12 development
+builds, the focused DSA/compressor files passed 17 cases before the THD
+extension. The final backward selection passed 11 cases without skips,
+including six packed THD cases with clipped/unclipped gradients, unequal
+and empty segments, poisoned capacity and independent JAX KL gradients.
+Validation used source baseline `3b7cd6ca` plus this change.
+
+From `test/python`:
+
+```bash
+python -m pytest deepseek_sparse_attention/jax/test_dsa_jax.py compressed_sparse_attention/jax/test_csa_compressor_jax.py -v
+python -m pytest deepseek_sparse_attention/jax/test_dsa_jax.py -k indexer_backward_jax -v
+```
+
+The THD cases verify raw-byte replay of dQ/dWeights with fresh input buffers
+and numerical replay of atomic FP32 dK. The underflow case checks unchanged
+default clipping and small-case raw-byte replay of all three gradients.
+Input preservation is bytewise, including deliberately poisoned BF16 NaNs.
+These cases do not establish general atomic-dK bitwise replay, batch
+invariance or other GPU targets; those remain unverified. No goldens changed.
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution

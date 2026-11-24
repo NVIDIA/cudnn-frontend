@@ -50,7 +50,8 @@ def _check_against_reference(reference, inputs, *, ratio, coff, out_tol, grad_to
     """
     kv, score, ape, cu, cu_comp = inputs
     got = jax.jit(lambda x, s, a: dsa.compressor_forward_jax(x, s, a, cu, cu_comp, total_comp=kv.shape[0] // ratio, ratio=ratio, coff=coff))(kv, score, ape)
-    grads = dsa.compressor_backward_jax(kv, score, ape, cu, cu_comp, jnp.ones_like(got), ratio=ratio, coff=coff)
+    # Outer JIT exercises initialized-output aliasing across the full backward call.
+    grads = jax.jit(lambda x, s, a, dy: dsa.compressor_backward_jax(x, s, a, cu, cu_comp, dy, ratio=ratio, coff=coff))(kv, score, ape, jnp.ones_like(got))
     ref_grads = jax.grad(lambda x, s, a: reference(x, s, a).astype(jnp.float32).sum(), argnums=(0, 1, 2))(kv, score, ape)
 
     pairs = [(got, reference(kv, score, ape), out_tol)]
