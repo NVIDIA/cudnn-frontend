@@ -1115,8 +1115,8 @@ def _normalize_dglu_call(
     if call.activation_tensor is not None:
         if detect_framework(call.a_tensor) != "torch":
             raise ValueError("activation output currently requires torch tensors")
-        if call.act_func != "dgeglu" or _convert_to_cutlass_data_type(call.c_tensor.dtype) != cutlass.BFloat16 or call.d_dtype != cutlass.BFloat16:
-            raise ValueError("activation output requires BF16 C/D and dgeglu")
+        if _convert_to_cutlass_data_type(call.c_tensor.dtype) != cutlass.BFloat16 or call.d_dtype != cutlass.BFloat16:
+            raise ValueError("activation output requires BF16 C/D")
 
     if call.use_single_group_runtime_offsets:
         raise ValueError("use_single_group_runtime_offsets is supported only by the block-scaled kernel")

@@ -110,7 +110,7 @@ def test_bf16_deterministic_dprob(act_func, linear_offset, discrete, use_dynamic
     det = assert_replays(lambda: outputs(run(p, act_func, deterministic=True, **launch), valid_m))
 
     plans = [o._implementation for o in dglu_api._cache_of_GroupedGemmDgluSm100Objects.values() if getattr(o._implementation, "_deterministic", False)]
-    assert any(plan._dprob_slots == N // 256 for plan in plans), "the deterministic slot path did not compile"
+    assert any(getattr(plan, "_dprob_slots", None) == N // 256 for plan in plans), "the deterministic slot path did not compile"
     assert torch.count_nonzero(det["dprob"][:valid_m]).item() > 0
     # D has one writer per element; the flag must leave it byte-identical.
     assert_bitwise({"d_row": det["d_row"]}, {"d_row": atomic["d_row"]}, "deterministic vs atomic")
