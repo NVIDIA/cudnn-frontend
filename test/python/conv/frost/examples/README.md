@@ -73,3 +73,23 @@ by dense FROST. Both must decline C96 before importing its kernel template;
 than substituting a version string. A skipped C96 execution test on these
 wheels is not evidence that C96 compiled or ran with CUDA 12. The cuDNN provider
 can still use the same tiled caller.
+
+# Convolution weight gradient
+
+[`04_conv_wgrad.py`](04_conv_wgrad.py) calls the FROST weight-gradient kernel
+(`python/cudnn/conv/frost/templates/sm100_conv_wgrad.py`) directly instead of
+going through `cudnn.pygraph`: it compiles one artifact per (operand dtype, dW
+dtype, tile config, epilogue), launches it with the operands channel-innermost
+plus the pre-padding/post-padding/stride/dilation triplets, and checks dW
+elementwise against `torch.nn.grad.conv3d_weight` evaluated in FP64.
+
+```bash
+python test/python/conv/frost/examples/04_conv_wgrad.py
+```
+
+It runs BF16 and FP32 operands, each with and without a fused ReLU epilogue.
+Because it uses the kernel rather than the graph, it needs no
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES`; it does need SM100/SM103 and the dense
+FROST CuTe DSL gate, both checked before the kernel module is imported. The
+first run JIT-compiles four artifacts, so expect a few minutes; later runs load
+them from the compiled cache.
