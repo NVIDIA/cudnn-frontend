@@ -475,8 +475,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.generate_activation = activation is not None
         if cutlass.const_expr(self.generate_activation):
-            if cutlass.const_expr(self.act_func != "dgeglu" or self.c_dtype != cutlass.BFloat16 or self.d_dtype != cutlass.BFloat16):
-                raise ValueError("activation output requires BF16 C/D and dgeglu")
+            if cutlass.const_expr(self.c_dtype != cutlass.BFloat16 or self.d_dtype != cutlass.BFloat16):
+                raise ValueError("activation output requires BF16 C/D")
             if cutlass.const_expr(activation.element_type != cutlass.BFloat16):
                 raise ValueError("activation output must be BF16")
         self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
@@ -814,6 +814,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         beta_val: Float32,
         square_alpha: Float32,
         dprob_swiglu: Optional[cute.Tensor] = None,
+        activation_vec: Optional[cute.Tensor] = None,
     ):
         LOG2_E = cutlass.Float32(1.4426950408889634)
         if cutlass.const_expr(self.vectorized_f32):
@@ -876,6 +877,10 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     rnd="rn",
                     ftz=False,
                 )
+                if cutlass.const_expr(activation_vec is not None):
+                    # The forward GLU order: (silu(gate) * up) * prob.
+                    primal = cute.arch.mul_packed_f32x2(swish, ab2_vec_acc_type, rnd="rn", ftz=False)
+                    activation_vec[i], activation_vec[i + 1] = cute.arch.mul_packed_f32x2(primal, (mProb, mProb), rnd="rn", ftz=False)
                 # calculate dprob
                 if cutlass.const_expr(self.generate_dprob):
                     (
@@ -957,7 +962,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             d2_vec = d2_vec.load()
             if cutlass.const_expr(self.generate_dprob):
                 dprob_swiglu = dprob_swiglu.load()
-            return d1_vec, d2_vec, dprob_swiglu
+            primal = activation_vec.load() if cutlass.const_expr(activation_vec is not None) else None
+            return d1_vec, d2_vec, dprob_swiglu, primal
         else:
             acc_vec = acc_vec.load()
             ab1_vec_load = ab1_vec_load.load()
@@ -985,7 +991,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             # calculate dswiglu
             d1_vec = acc_vec * mProb * ab2_vec_load * sig * (1 + ab1_vec_load * (1 - sig))
             d2_vec = acc_vec * mProb * swish
-            return d1_vec, d2_vec, dprob_swiglu
+            primal = ab2_vec_load * swish * mProb if cutlass.const_expr(activation_vec is not None) else None
+            return d1_vec, d2_vec, dprob_swiglu, primal
 
     @cute.jit
     def dgeglu(
@@ -1866,10 +1873,12 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     # Apply alpha, act, and prob
                     #
                     square_alpha = alpha_val * alpha_val
+                    activation_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32) if cutlass.const_expr(self.generate_activation) else None
                     if cutlass.const_expr(self.act_func == "dswiglu"):
-                        d1_vec, d2_vec, dprob_swiglu = self.dswiglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu)
+                        d1_vec, d2_vec, dprob_swiglu, primal = self.dswiglu(
+                            acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu, activation_vec
+                        )
                     elif cutlass.const_expr(self.act_func == "dgeglu"):
-                        activation_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32) if cutlass.const_expr(self.generate_activation) else None
                         d1_vec, d2_vec, dprob_swiglu, primal = self.dgeglu(
                             acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, linear_offset, dprob_swiglu, activation_vec
                         )

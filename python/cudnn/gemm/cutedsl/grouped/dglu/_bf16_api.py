@@ -339,8 +339,8 @@ class GroupedGemmDgluBf16API(APIBase):
             self._expect_device(self.dbias_desc, device, "sample_dbias")
 
         if self.activation_desc is not None:
-            if self.act_func != "dgeglu" or self.c_desc.dtype != cutlass.BFloat16 or self.d_row_desc.dtype != cutlass.BFloat16:
-                raise ValueError("activation output requires BF16 C/D and dgeglu")
+            if self.c_desc.dtype != cutlass.BFloat16 or self.d_row_desc.dtype != cutlass.BFloat16:
+                raise ValueError("activation output requires BF16 C/D")
             self._expect_shape(self.activation_desc, (tensor_m, n, 1), "sample_activation")
             self._expect_stride(self.activation_desc, (n, 1, tensor_m * n), "sample_activation")
             self._check_dtype(self.activation_desc, cutlass.BFloat16, "sample_activation")
