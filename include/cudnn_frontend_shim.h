@@ -1069,6 +1069,10 @@ get_compiled_version(void) {
 // Version-neutral ABI definitions for direct-call GNN APIs. The Python extension
 // dynamically resolves these APIs, so its exported bindings must not depend on
 // the cuDNN headers that happened to be installed when the extension was built.
+// Keep shim parameter types identical to the backend C ABI: NV_FE_CALL_TO_BACKEND
+// casts symbols using decltype(shim). In particular, backend int flags must not
+// be declared bool here; even an int argument expression is narrowed back to bool,
+// which can leave the upper bytes of an ARM64 stack argument uninitialized.
 enum class gnn_activation_op_t : std::int32_t {
     LINEAR     = 0,
     RELU       = 1,
@@ -1570,7 +1574,7 @@ gnn_mha_simple_forward(cudaStream_t stream,
                        void *output,
                        void *sm_scores,
                        int node_feat_dim,
-                       bool norm_by_dim,
+                       int norm_by_dim,
                        const gnn_mha_params_t *params,
                        cudnnDataType_t data_type) {
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -1649,7 +1653,7 @@ gnn_mha_simple_backward(cudaStream_t stream,
                         void *grad_score_bias,
                         void *grad_score_weight,
                         int node_feat_dim,
-                        bool norm_by_dim,
+                        int norm_by_dim,
                         const gnn_mha_params_t *params,
                         cudnnDataType_t data_type,
                         cudnnDataType_t grad_type) {
