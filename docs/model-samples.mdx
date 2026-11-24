@@ -44,11 +44,11 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 On standard error, in this order (standard output carries the generated text of a checkpoint run and nothing else):
 
 - **Header**: the model or the checkpoint (directory name, shards, size, a manifest hash), the GPU, the stack, the versions, and whether `cudnn` is an editable checkout or a wheel.
-- **Served by**: per block, the calls per step, the provider (cuDNN Frontend, cuBLAS or PyTorch), the entry and the rows it serves, then the memory the run needs against what is free. It is decided and printed before anything is loaded.
-- **Stages**: seconds to read, merge and dequantise the weights, to compile, and to warm up.
+- **Served by**: per block, the calls per step, the provider (cuDNN Frontend, FlashInfer or PyTorch; cuBLAS on a functional-validation stack), the entry and the rows it serves, then the memory the run needs against what is free. It is decided and printed before anything is loaded.
+- **Stages**: seconds to read, merge and lay out the weights, to compile, to warm up and to record the step; then one line that says the step is recorded, with what the recorded sequence holds, or that it is launched from Python, and why.
 - **Text path**: render, tokenize, ids to the GPU, text out per token.
-- **Steps**: period, time in the step, turnaround; from one traced pass of 32 steps under the profiler: GPU busy, idle inside the step, host-exposed time, kernel launches per step; the bytes a step moves against the bytes the model needs in its stored formats.
-- **Text out** and the **checks**: replay, every provider block against the reference, the greedy tokens (judged against a declared band on the seeded model, reported on a checkpoint), each sequence alone against the same sequence in a batch.
+- **Steps**: period, time in the step, turnaround, and that a step is one replay and one host read; from one traced pass under the profiler: GPU busy and the kernel launches per step of the first 32 steps launched from Python, and of 2 of them replayed (a run that is launched from Python prints the idle time inside the step and the host-exposed time in their place); the bytes a step moves against the bytes the model needs in its stored formats.
+- **Text out** and the **checks**: the replayed steps launched again from Python, ids and logits byte for byte, and the step's own tail; every provider block against the reference; the greedy tokens (judged against a declared band on the seeded model, reported on a checkpoint); each sequence alone against the same sequence in a batch; the kernels of the traced steps against the plan.
 
 The other stacks of the sample are for functional validation and are taken by an explicit `--stack` alone: `fe-entries` runs the cuDNN Frontend entries without the library, `fe-cublas` holds every quantised weight as a bf16 copy and multiplies on cuBLAS, `reference` is every block in PyTorch; each is launched from Python and says so in one line of its run. Timings printed by a sample are for orientation only; performance numbers are published through the formal mode of the `benchmark/` folder.
 

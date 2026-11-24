@@ -4022,7 +4022,7 @@ def test_every_form_of_the_gpu_lines_within_110():
         "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load 5.5 on 70 cores",
     ]
     assert len(screen()[1]) == 110, "one line at the screen's width"
-    _says("area", "(a checkpoint on the stack `native`, on a GPU the run had to itself;")
+    _says("area", "a checkpoint on the stack `native` with `--no-capture`, on a GPU the run had to itself;")
     assert (
         screen(host={"load": None, "cores": 4})[1]
         == "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load not observed"

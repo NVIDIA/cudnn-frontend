@@ -908,10 +908,10 @@ accumulation precision has. The stack has not run on another GPU class.
 
 | you need | |
 |---|---|
-| GPU | compute capability 10.x or 12.x **and**, for the 27B checkpoint on the stack `fe-cublas`, about 57 GiB of free memory (about 60 GiB on compute capability 12.x, where the first launch of the fused step takes about 3 GiB more): in practice a data-center Blackwell GPU. A 32 GB card prints the memory sentence and exits 0. The checkpoint has run on compute capability 10.0 and 10.3 |
+| GPU | compute capability 10.x or 12.x **and**, for the 27B checkpoint, about 28 GiB of free memory on the sample's stack `native` on compute capability 10.0 (about 32 GiB on the other 10.x classes, by arithmetic); on the functional-validation stack `fe-cublas`, about 57 GiB (about 60 GiB on compute capability 12.x, where the first launch of the fused step takes about 3 GiB more): in practice a data-center Blackwell GPU. A 32 GB card prints the memory sentence and exits 0. The checkpoint has run on compute capability 10.0 on the stack `native`, and on 10.0 and 10.3 on the stack `fe-cublas` |
 | disk | 22 GB for the checkpoint |
-| packages | `pip install -r samples/models/requirements.txt` |
-| time | about two and a half minutes for the default prompt with 256 new tokens (the seconds are below) |
+| packages | `pip install -r samples/models/requirements.txt`; on compute capability 10.x also the two packages of the sample's stack ("The rows a library serves") |
+| time | on the stack `fe-cublas`, launched from Python: about two and a half minutes for the default prompt with 256 new tokens (the seconds are below) |
 
 The sample was last run with:
 
@@ -941,11 +941,12 @@ with exit code 0 before a tensor is read. As part of the plan every cuDNN Fronte
 for the run's sequence counts on scratch operands: an entry asks what it needs of the installed toolchain where it
 builds, so a CuTe DSL that cannot build for the GPU is a `SKIP` in the entry's own words here, not an error after the
 weights are read. Then the weights are read, merged (query, key and value; `qkv` and `z`; the
-beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, each entry's kernel is launched once, and each prompt
+beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies where the stack holds one (the stack `native` keeps a weight
+its kernels multiply on its stored format), each entry's kernel is launched once, the step is recorded where the run records it, and each prompt
 is fed through the decode step and decoded greedily to an end token or to its limit of new tokens. The text of sequence 0
 goes to standard output as it is generated; reasoning the model writes before its answer is part of that text.
 
-How long it takes, as orientation values of one run (compute capability 10.3, the default prompt, 256 new tokens, the
+How long it takes on the stack `fe-cublas`, launched from Python, as orientation values of one run (compute capability 10.3, the default prompt, 256 new tokens, the
 checkpoint in the page cache): about two and a half minutes. About 6 s until the first step (import, read, merge,
 dequantise, compile, warm-up); 14 s for the 58 prompt tokens; 54 s for 225 new tokens, a quarter of a second per token on
 this stack; 12 s for the traced pass; and about a minute for the checks. The text of sequence 0 is written while the
@@ -2323,12 +2324,12 @@ and the trace the check reads grows accordingly): a class or a model it has not 
 validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention/gdn_decode_flashinfer_backend.md`).
 `nvidia-smi --query-gpu=name,compute_cap --format=csv` prints the compute capability of a GPU.
 
-| compute capability | the default run of this sample |
+| compute capability | what has run on it: the seeded run on the stack `fe-cublas`, the default run until the stack `native` became it, unless a stack is named |
 |---|---|
-| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above. With `--check-kernels`: `[00] PASS` at 1 and 4 sequences, the only class the kernel check has run on. The stacks `native` and `fe-entries`: `[00] PASS` at 1 and 4 sequences and with the checkpoint, batch invariance of the fused step, of the gate entry, of the norm entry, of the projection entry and of the fused gate / up entry gated and equal; the only class these stacks have run on |
-| 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; a checkpoint run before the one of the section above |
-| 10.7 (a VR200-class part) | `[00] PASS`; batch invariance of the fused step is printed on this class (`REPORTED`), not gated: every block was equal in the runs so far |
-| 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The checkpoint does not fit a 32 GB card: on one, the sample printed the memory sentence (about 59.7 GiB needed) and exited 0 |
+| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above. With `--check-kernels`: `[00] PASS` at 1 and 4 sequences, the only class the kernel check has run on. The stacks `native` and `fe-entries`: `[00] PASS` at 1 and 4 sequences and with the checkpoint, batch invariance of the fused step, of the gate entry, of the norm entry, of the projection entry and of the fused gate / up entry gated and equal; the only class these stacks have run on. The default run -- the stack `native`, its step recorded and replayed -- `[00] PASS` at 1 and 4 sequences and with the checkpoint (2026-11-24): the only class a recorded step has run on |
+| 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; a checkpoint run before the one of the section above. The default run, on the stack `native`, has not run on this class |
+| 10.7 (a VR200-class part) | `[00] PASS`; batch invariance of the fused step is printed on this class (`REPORTED`), not gated: every block was equal in the runs so far. The default run, on the stack `native`, has not run on this class |
+| 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The checkpoint does not fit a 32 GB card: on one, the sample printed the memory sentence (about 59.7 GiB needed) and exited 0. The default run, on the stack `native`, has not run on this class |
 | any other | `[00] SKIP`, by design. `--stack reference` runs the reduced model there on PyTorch alone, with the whole report, and ends in `[00] RAN reference stack (no provider checked)`: nothing is verified (seen on compute capability 8.0) |
 
 A class the current checks have not run on is uncovered, not passing. That holds for the stacks `native` and
@@ -2348,7 +2349,7 @@ planned: what a plan prints on a GPU for which the installed CuTe DSL cannot bui
 held by a host test over a stand-in entry and was seen on a real GPU only with the entry's own toolchain question made to
 decline, not on such an installation.
 
-Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak,
+Memory of the seeded run on the stack `fe-cublas` (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak,
 reserved 3.5 GiB and grew the device by 3.7 GiB on a compute capability 10.0 GPU. The sample asks for about 3.9 GiB
 free there: 3.7 GiB for the weights, the state and the working memory, and 0.2 GiB for what its checks hold for the
 three sequences beyond the first of the larger count (below). On compute capability 12.x
