@@ -54,6 +54,14 @@ geometry. Every launch re-runs the binding checks (type, dtype, device, shape, c
 kernel is looked up; the host path makes views only -- no conversion, no copy, no device allocation, no device read.
 `out` must not overlap `weight`, `activation` or `scale` (not checked).
 
+`out` can be a buffer another direct-call entry of the device allocated for itself and recorded with
+`cudnn.frost.init_order` (for example an output of `cudnn.AddNormQuantDecode`; rule 16 of `python/cudnn/frost/README.md`
+lists the entries that record and those that do not yet), whose initialization is still queued on the stream that
+allocated it. The entry allocates nothing, but its launch is ordered behind every such pending initialization of the bytes
+it writes, on whatever stream it runs: the launch stream waits for an event recorded behind the allocation, without a host
+wait and without synchronizing a stream or the device; under a stream capture the call waits for that one event on the
+host before its captured launch. The operands the launch only reads stay the caller's to order.
+
 **The row count is a compile key.** The kernel is specialised on `rows` (its output bounds and its token tile are
 trace-time constants), so an entry holds one rendering per row count: at most 32, each a fraction of a second to compile.
 This is a stated, bounded exception to the rule that a runtime extent is not a compile key; `GdnDecodeFused` keys on its

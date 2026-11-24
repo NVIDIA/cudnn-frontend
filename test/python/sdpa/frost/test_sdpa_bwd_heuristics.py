@@ -5,6 +5,8 @@
 row lists exactly one entry, and the entry spells the tiles the lowering would
 pick when handed no knobs -- so a recorded (engine_id, knobs) pins the kernel."""
 
+import itertools
+
 import pytest
 
 import cudnn
@@ -278,6 +280,56 @@ def test_sm100_d128_leads_the_backend_only_on_unwindowed_d128_thd(monkeypatch):
     assert order(thd=True, device_cc=(10, 7), window_left=1024) == ["backend", "frost"]
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert order() == ["frost"]
+
+
+def test_sm100_d128_deterministic_entries_key_apart(monkeypatch):
+    """Study sm100_det_bwd_20261122 owns deterministic dense d64 / d128 bf16 classes of ``sdpa_bwd_sm100_d128`` on cc 10.0 and cc 10.3.
+    The row is in ``DETERMINISTIC_KEYED_ROWS``: a deterministic graph keys ``prefill_det``, so only these entries answer it, and through
+    ``propose`` the kernel pair goes ahead of the backend exactly where its entry leads; every entry leads some graph of its class. The
+    same graph without determinism keeps the hand rule (dense trails), as do the classes the study did not ship."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.bwd import heuristics
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    row, study = "sdpa_bwd_sm100_d128", "sm100_det_bwd_20261122"
+    eid = _OFFERED["sdpa_bwd_sm100_d128_pair"]
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
+    assert row in pt.DETERMINISTIC_KEYED_ROWS
+
+    def facts(**over):
+        return _facts(**{"dtype": cudnn.data_type.BFLOAT16, "deterministic": True, **over})
+
+    def first(f):
+        return "backend" if is_backend_block(heuristics.propose("A", f, _OFFERED)[0]) else "frost"
+
+    entries = {k: e for k, e in pt.TABLE.items() if e.study == study}
+    assert len(entries) == 42
+    led = set()
+    for key, entry in entries.items():
+        _, cc, _, (d, _), phase, layout, mask, _, group, off = key
+        assert phase == "prefill_det" and layout == "dense" and mask in ("causal_br", "none", "window")
+        heads = ((32, 32), (128, 128)) if group == "mha" else ((64, 8), (48, 3), (32, 2))
+        for b, s, (h_q, h_kv) in itertools.product((1, 2, 8), (128, 1024, 8192), heads):
+            shape = dict(device_cc=cc, d_qk=d, d_v=d, b=b, h_q=h_q, h_kv=h_kv, s_q=s + off, s_kv=s + off, causal=mask != "none")
+            f = facts(**shape, window_left=127 if mask == "window" else None)
+            assert pt.class_key(row, f) == key and pt.matched_entry(row, f) is entry
+            lead = pt.lookup(row, f)
+            assert first(f) == ("frost" if lead else "backend"), (key, b, s, h_q, h_kv)
+            assert first(facts(**shape, deterministic=False, window_left=f.window_left)) == "backend"
+            if lead:
+                led.add(key)
+    assert led == set(entries)
+    # the GB nightlies' deterministic rows: wan 2.2 / ltx 2 (d128 MHA mask-free) and gpt-oss (d64 MHA, 128-key window) lead; llama's
+    # d128 GQA 64/8 causal keeps the backend; classes without an entry (d64 causal GQA, cc 10.0 d128 mask-free GQA) and f16 trail
+    for cc in ((10, 0), (10, 3)):
+        assert first(facts(device_cc=cc, b=1, h_q=40, h_kv=40, s_q=7800, s_kv=7800, causal=False)) == "frost"
+        assert first(facts(device_cc=cc, d_qk=64, d_v=64, b=2, h_q=128, h_kv=128, s_q=4096, s_kv=4096, window_left=127)) == "frost"
+        assert first(facts(device_cc=cc, b=2, h_q=64, h_kv=8, s_q=4096, s_kv=4096)) == "backend"
+        assert pt.matched_entry(row, facts(device_cc=cc, d_qk=64, d_v=64, b=2, h_q=64, h_kv=8, s_q=4096, s_kv=4096)) is None
+        assert first(facts(device_cc=cc, b=1, h_q=40, h_kv=40, s_q=7800, s_kv=7800, causal=False, dtype=cudnn.data_type.HALF)) == "backend"
+    assert pt.matched_entry(row, facts(device_cc=(10, 0), b=2, h_q=64, h_kv=8, s_q=4096, s_kv=4096, causal=False)) is None
 
 
 def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):

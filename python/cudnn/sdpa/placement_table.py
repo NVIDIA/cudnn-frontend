@@ -43,13 +43,15 @@ def _dtype_name(dtype) -> Optional[str]:
     return None
 
 
-DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120", "sdpa_bwd_sm80", "sdpa_bwd_sm100_d256"})
+DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120", "sdpa_bwd_sm80", "sdpa_bwd_sm100_d128", "sdpa_bwd_sm100_d256"})
 SM80_DET_NARROW_WINDOW_MAX_LEFT = 383  # window_left at or below keys `window_narrow` on sdpa_bwd_sm80 prefill_det (256 measured, 512 not)
 SM120_PAGED_BODY_MAX_S_Q = 16  # sdpa_fwd_prefill_sm120 paged d128 up to this s_q, off the decode tile, keys `gqa_body`
 SM100_WINDOW_PREFILL_MIN_S_Q = 256  # the smallest S_q the SM100 windowed packing studies timed (sm100_d192x128_swa_sink_pack_20261118)
-"""Rows whose deterministic graphs are classes of their own (phase ``<phase>_det``), so those graphs neither share the default classes'
-entries nor count as unmeasured. SM120's deterministic body is a different kernel (the two-kernel dS / dQ split). The SM100 d256 body is
-deterministic by construction, but its classes are decided against the backend's deterministic engine, which a study times separately."""
+SM100_WINDOW_LONG_CACHE_MIN_S_KV = 1 << 16  # dense d192 x 128 windowed packed prefill from this KV length keys `gqa_long_cache`
+"""Rows whose deterministic graphs are classes of their own (phase ``<phase>_det``): the row's deterministic body is a different kernel
+(SM120: the two-kernel dS / dQ split; SM100 d64 / d128: the dense dK / dV + dQ kernel pair), so those graphs neither share the default
+classes' entries nor count as unmeasured. The SM100 d256 body is deterministic by construction, but its classes are decided against
+the backend's deterministic engine, which a study times separately."""
 
 
 def _unmeasured(facts, row: Optional[str] = None) -> bool:
@@ -184,6 +186,15 @@ def _sm100_unpacked_window_prefill(row: str, facts) -> bool:
     return pack is not None and pack < facts.h_q // facts.h_kv
 
 
+def _sm100_long_cache_window_d192(row: str, facts) -> bool:
+    """SM100 / SM103 dense d192 x 128 windowed prefill on the KV tile over a long cache. The backend's windowed time grows with the
+    KV length and FROST's does not, so the grid size at which FROST leads falls as the cache grows; one threshold cannot place both
+    cache ranges. Off the tile the class leads at every length and keeps its key."""
+    if not _sm100_window_prefill_measured(row, facts) or (facts.d_qk, facts.d_v) != (192, 128):
+        return False
+    return facts.s_kv >= SM100_WINDOW_LONG_CACHE_MIN_S_KV and facts.s_kv % 128 == 0
+
+
 def _sm100_short_window_d192(row: str, facts) -> bool:
     """SM100 / SM103 d192 x 128 GQA graphs below the S_q their studies timed (256): dense with a window
     (sm100_d192x128_swa_sink_pack_20261118) and paged without one (sm100_d192x128_paged_v2_20261118). Their own class with no
@@ -196,11 +207,13 @@ def _sm100_short_window_d192(row: str, facts) -> bool:
 
 
 def _sm90_partial_pack(row: str, facts) -> bool:
-    """SM90 d256 single-row decode whose GQA group the row packs only in part (the packed group must divide the tile): each
-    packed CTA still re-reads K/V G / pack times. On H100 it ran 1.35-1.40x the backend where full packs ran 0.87-0.95 at b >= 8
-    (sm90_dense_d256_q1_h100_20261118), so it keys apart; paged likewise (qwen36_27b 24/4 on the h200 nightly: 2.3-2.4x,
-    sm90_paged_decode_gaps_20261118). Scoped to the measured classes."""
-    if row != "sdpa_fwd_prefill_sm90" or (facts.d_qk, facts.d_v) != (256, 256) or facts.s_q != 1 or facts.thd:
+    """SM90 single-row decode whose GQA group the row packs only in part (the packed group must divide the tile). Each packed CTA
+    still re-reads K/V G / pack times, a different cost regime from a whole pack, so it keys apart. Scoped to the classes whose
+    studies timed the two regimes apart: d256, and paged windowed d192 x 192."""
+    if row != "sdpa_fwd_prefill_sm90" or facts.s_q != 1 or facts.thd:
+        return False
+    d192_window = (facts.d_qk, facts.d_v) == (192, 192) and facts.has_paged_kv and facts.window_left is not None
+    if (facts.d_qk, facts.d_v) != (256, 256) and not d192_window:
         return False
     pack = _decode_pack_group(row, facts)
     return pack is not None and 1 < pack < facts.h_q // facts.h_kv
@@ -325,6 +338,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         group = "gqa_body"
     if group == "gqa" and _sm100_short_window_d192(row, facts):
         group = "gqa_short"
+    if group == "gqa" and _sm100_long_cache_window_d192(row, facts):
+        group = "gqa_long_cache"
     if group == "gqa" and phase == "verify" and _sm107_verify_partial_pack(row, facts):
         group = "gqa_partial"
     # Off the 128-key tile dense KV cannot split and paged KV measures differently near the boundary: its own class, which
@@ -894,12 +909,51 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm80_thd_d256_v2_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE 835bbdb9b; the training harness's THD forward, recorded facts:
     # d256 GQA causal, squares and bottom-right chunks over S_q 17-8192, groups 2-8, b 8-96; 200 train cells). Ragged lengths lead from
     # S_q 2^7.5 on the tile and from 2^9.09 tiles off it (changed train 0.537 / 0.531); holdout at fresh heads, scored once, 0.516 /
-    # 0.566 (worst 0.705). Equal lengths (`thd`) have no entry: their off-tile holdout side reached 1.101.
+    # 0.566 (worst 0.705). Equal lengths (`thd`) are sm80_train_fwd_gaps_pcie_20261123's (below).
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", False): Entry(
         "ge", 7.5, "sm80_thd_d256_v2_20261117", "q"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", True): Entry(
         "ge", 9.085, "sm80_thd_d256_v2_20261117", "tiles"
+    ),
+    # study sm80_train_fwd_gaps_pcie_20261123 (A100 80GB PCIe; the training harness's forward, recorded facts): equal-length THD d256
+    # and ragged THD MHA lead from a floor, and dense d512 sliding-window prefill leads (GQA off the tile from a cost floor). Equal-length
+    # THD d128 and ragged d128 GQA keep the hand rule; ragged d256 GQA keeps the entries above.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "thd_ragged", "causal_br", False, "mha", False): Entry(
+        "ge", 28.5, "sm80_train_fwd_gaps_pcie_20261123", "cost", ("ge", 8.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "thd_ragged", "causal_br", False, "mha", True): Entry(
+        "ge", 7.5, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 7.006, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", False): Entry(
+        "ge", 6.292, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 7.5, "kv")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", True): Entry(
+        "ge", 29.0, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "mha", False): Entry(
+        "ge", 27.5, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "mha", True): Entry(
+        "ge", 28.003, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "mha", False): Entry(
+        "ge", 5.5, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 6.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "mha", True): Entry(
+        "ge", 5.5, "sm80_train_fwd_gaps_pcie_20261123", "tiles", ("ge", 6.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", False): Entry(
+        "always", None, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "gqa", True): Entry(
+        "ge", 24.0, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "mha", False): Entry(
+        "always", None, "sm80_train_fwd_gaps_pcie_20261123"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (512, 512), "prefill", "dense", "window", False, "mha", True): Entry(
+        "always", None, "sm80_train_fwd_gaps_pcie_20261123"
     ),
     # study sm80_dense_prefill_20261031 (cuDNN 9.29.0.18; A100 80GB PCIe; dense bf16 context d64 / d128 / d192x128 / d256, causal,
     # mask-free and d64 sink / window + sink, s_q 8-8192 over S_kv on and off the tile; 2,448 train cells incl. two consumed
@@ -1228,8 +1282,10 @@ TABLE: Dict[Tuple, Entry] = {
     # refit on every earlier cell of them pooled (sm80_prefill_gaps_20261117, its edge supplement, sm80_paged_d256_d192_v2_20261117; 744
     # cells, default = the backend) with a query-token condition that keeps few-query long-cache chunks on the backend. Fresh holdout at
     # new head pairs incl. that edge, scored once: d192 x 128 0.680 / 0.678 (worst 0.917), d256 0.587 / 0.592 (worst 1.055).
+    # study sm80_paged_d192x128_pcie_20261121: v3's on-tile d192 x 128 floor, same form, re-fit on the nightly's board. The off-tile entry
+    # below stays v3's.
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 35.366, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+        "ge", 29.226, "sm80_paged_d192x128_pcie_20261121", "cost", ("ge", 6.5, "q")
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 6.792, "sm80_paged_d256_d192_v3_20261117", "tiles", ("ge", 7.506, "q")
@@ -1243,6 +1299,14 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 36.454, "sm80_paged_d256_d192_v3_20261117", "cost", ("ge", 6.5, "q")
+    ),
+    # study sm80_paged_d256_swa_v4_pcie_20261121: windowed d256 prefill. `cost` ignores the window, so the floors also need a wide grid:
+    # with few parallel tiles FROST's time stays flat as heads drop while the backend's falls. Off the tile the grid alone decides.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", False): Entry(
+        "ge", 27.792, "sm80_paged_d256_swa_v4_pcie_20261121", "cost", ("ge", 7.453, "tiles")
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", True): Entry(
+        "ge", 8.085, "sm80_paged_d256_swa_v4_pcie_20261121", "tiles"
     ),
     # study sm80_gen_gaps_20261117 (A100-SXM4 80GB, cuDNN 9.24.0.43, FE c9d0bcb7d; the generation path's padded-Q paged GQA decode
     # shapes with no entry: d64 MTP / verify, d64 windowed, d128 windowed and d192 x 192 causal / windowed MTP / verify; b 1-128, KV 1k-128k
@@ -1836,9 +1900,6 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", False): Entry(
         "ge", 9.246, "sm90_paged_decode_gaps_20261118", "rows"
     ),
-    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", True): Entry(
-        "ge", 9.246, "sm90_paged_decode_gaps_20261118", "rows"
-    ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm90_paged_decode_gaps_20261118"
     ),
@@ -1869,6 +1930,50 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa_partial", True): Entry(
         "never", None, "sm90_paged_decode_gaps_20261118"
     ),
+    # study sm90_paged_window_mtp_gaps_20261121: paged d128 MTP whose group the decode tile does not divide (gqa_unpacked), windowed d128
+    # single-row decode, windowed d128 verify off the KV tile (its on-tile twin keeps the entry above), windowed d64 MTP and verify.
+    # Windowed d64 single-row decode has no entry and keeps the rules.
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_unpacked", False): Entry(
+        "le", 4.0, "sm90_paged_window_mtp_gaps_20261121", "tiles", ("ge", 9.0, "kv")
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa_unpacked", True): Entry(
+        "le", 4.0, "sm90_paged_window_mtp_gaps_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 6.161, "sm90_paged_window_mtp_gaps_20261121", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 6.161, "sm90_paged_window_mtp_gaps_20261121", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", True): Entry(
+        "ge", 1.5, "sm90_paged_window_mtp_gaps_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp", "paged", "window", False, "gqa_unpacked", False): Entry(
+        "always", None, "sm90_paged_window_mtp_gaps_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp", "paged", "window", False, "gqa_unpacked", True): Entry(
+        "always", None, "sm90_paged_window_mtp_gaps_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "verify", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm90_paged_window_mtp_gaps_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "verify", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm90_paged_window_mtp_gaps_20261121"
+    ),
+    # study sm90_paged_window_q1_v2_20261121: windowed paged d192 x 192 single-row decode, keyed by the row's pack group
+    # (`_sm90_partial_pack`): a whole pack keys gqa, a partial pack gqa_partial.
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa", False): Entry(
+        "always", None, "sm90_paged_window_q1_v2_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa", True): Entry(
+        "always", None, "sm90_paged_window_q1_v2_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa_partial", False): Entry(
+        "le", 5.5, "sm90_paged_window_q1_v2_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa_partial", True): Entry(
+        "le", 4.5, "sm90_paged_window_q1_v2_20261121", "tiles"
+    ),
     # study sm90_d64_sink_mtp_20261118 (H100 700 W, cuDNN 9.24.0.43 and 9.30.0.8; 813 + 318 off-tile train cells, 60 holdout cells at
     # fresh head pairs scored once): gpt-oss paged d64 MTP with a sink, which the row runs unpacked. Full cache leads up to 2^4.5 parallel
     # tiles (holdout 0.771 / 0.775 on / off the tile); with a window always (0.768 / 0.664)
@@ -1884,27 +1989,32 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa_unpacked", True): Entry(
         "always", None, "sm90_d64_sink_mtp_20261118"
     ),
-    # study sm100_d192x128_paged_v2_20261118 (B200 1000 W train on cuDNN 9.24.0.43 and 9.30.0.8, the earlier study's cells included;
-    # holdout at fresh head pairs scored once, B200 0.364 / 0.371 and B300 0.297 / 0.313 on / off the tile): mimo full paged d192 x 128
-    # context leads from S_q ~887 at enough work on the tile and from S_q ~362 off it. Graphs below S_q 256 key `gqa_short`
+    # study sm100_d192x128_paged_924_20261123 (B200 1000 W / B300 1100 W, cuDNN 9.24.0.43 only; sm100_d192x128_paged_v2_20261118's 9.24
+    # cells plus a lower-edge supplement as train, holdout at fresh head pairs scored once): mimo full paged d192 x 128 context leads
+    # from S_q 256, on and off the tile; on 9.24 the backend runs eng8 on this class. Graphs below S_q 256 key `gqa_short`
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 34.407, "sm100_d192x128_paged_v2_20261118", "cost", ("ge", 9.792, "q")
+        "always", None, "sm100_d192x128_paged_924_20261123"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
-        "ge", 8.5, "sm100_d192x128_paged_v2_20261118", "q"
+        "always", None, "sm100_d192x128_paged_924_20261123"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
-        "ge", 34.407, "sm100_d192x128_paged_v2_20261118", "cost", ("ge", 9.792, "q")
+        "always", None, "sm100_d192x128_paged_924_20261123"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
-        "ge", 8.5, "sm100_d192x128_paged_v2_20261118", "q"
+        "always", None, "sm100_d192x128_paged_924_20261123"
     ),
     # study sm100_d192x128_swa_sink_pack_20261118 (B200 1000 W train on cuDNN 9.24.0.43 and 9.30.0.8, B200 + B300 holdout at fresh head
     # pairs scored once; run-559 gates GB200 11 rows at 0.690, GB300 11 at 0.591): mimo swa dense d192 x 128 with a window and a sink,
     # keyed by whether the row packs the GQA group whole (`_sm100_unpacked_window_prefill`). On the tile both lead past a tiles floor
-    # (the b 1 2048-square 16-head rows stay below it); off the tile both lead
+    # (the b 1 2048-square 16-head rows stay below it); off the tile both lead.
+    # study sm100_d192x128_swa_sink_v2_20261121 re-fit the packed side on the tile, keyed apart from 2^16 keys
+    # (`_sm100_long_cache_window_d192`): over a long cache FROST leads from a smaller grid, which one tiles floor cannot place
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", False): Entry(
-        "ge", 9.5, "sm100_d192x128_swa_sink_pack_20261118", "tiles"
+        "ge", 9.085, "sm100_d192x128_swa_sink_v2_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa_long_cache", False): Entry(
+        "ge", 33.618, "sm100_d192x128_swa_sink_v2_20261121"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", True): Entry(
         "always", None, "sm100_d192x128_swa_sink_pack_20261118"
@@ -1916,7 +2026,10 @@ TABLE: Dict[Tuple, Entry] = {
         "always", None, "sm100_d192x128_swa_sink_pack_20261118"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", False): Entry(
-        "ge", 9.5, "sm100_d192x128_swa_sink_pack_20261118", "tiles"
+        "ge", 9.085, "sm100_d192x128_swa_sink_v2_20261121", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa_long_cache", False): Entry(
+        "ge", 33.618, "sm100_d192x128_swa_sink_v2_20261121"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 128), "prefill", "dense", "window", True, "gqa", True): Entry(
         "always", None, "sm100_d192x128_swa_sink_pack_20261118"
@@ -2264,6 +2377,84 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_bwd_sm120", (12, 0), "f16", (64, 64), "prefill", "dense", "window", False, "gqa", True): Entry("always", None, "sm120_bwd_f16_20261107"),
     ("sdpa_bwd_sm120", (12, 0), "f16", (64, 64), "prefill", "dense", "window", False, "mha", False): Entry("always", None, "sm120_bwd_f16_20261107"),
     ("sdpa_bwd_sm120", (12, 0), "f16", (64, 64), "prefill", "dense", "window", False, "mha", True): Entry("always", None, "sm120_bwd_f16_20261107"),
+    # study sm100_det_bwd_20261122: deterministic dense d64 / d128 backward on cc 10.0 and cc 10.3, the row's dK / dV + dQ kernel pair
+    # against the backend's deterministic engine. The row serves no bottom-right causal graph, so the causal classes answer squares and
+    # the windowed ones top-left graphs. Classes without an entry lost on GQA holdout cells with few KV heads (d64 causal GQA on both
+    # parts, d128 mask-free GQA on cc 10.0).
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "causal_br", False, "gqa", False): Entry(
+        "le", 10.5, "sm100_det_bwd_20261122", "kv", ("ge", 8.5, "tiles")
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 9.303, "sm100_det_bwd_20261122", "tiles"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "causal_br", False, "mha", False): Entry("le", 39.5, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm100_det_bwd_20261122"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "none", False, "mha", False): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "none", False, "mha", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "window", False, "gqa", False): Entry(
+        "ge", 10.161, "sm100_det_bwd_20261122", "tiles"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "window", False, "gqa", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "window", False, "mha", False): Entry(
+        "ge", 7.5, "sm100_det_bwd_20261122", "tiles"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (128, 128), "prefill_det", "dense", "window", False, "mha", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm100_det_bwd_20261122"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm100_det_bwd_20261122"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "none", False, "gqa", False): Entry("le", 7.5, "sm100_det_bwd_20261122", "q"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "none", False, "gqa", True): Entry(
+        "ge", 6.85, "sm100_det_bwd_20261122", "tiles"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "none", False, "mha", False): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "none", False, "mha", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "window", False, "gqa", False): Entry("ge", 29.161, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "window", False, "gqa", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "window", False, "mha", False): Entry("ge", 26.0, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 0), "bf16", (64, 64), "prefill_det", "dense", "window", False, "mha", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "causal_br", False, "gqa", False): Entry(
+        "le", 10.5, "sm100_det_bwd_20261122", "kv", ("ge", 8.5, "tiles")
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 9.303, "sm100_det_bwd_20261122", "tiles"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "causal_br", False, "mha", False): Entry("ge", 25.5, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm100_det_bwd_20261122"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "none", False, "gqa", False): Entry("ge", 30.161, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "none", False, "gqa", True): Entry("ge", 26.167, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "none", False, "mha", False): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "none", False, "mha", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "window", False, "gqa", False): Entry(
+        "ge", 10.161, "sm100_det_bwd_20261122", "tiles"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "window", False, "gqa", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "window", False, "mha", False): Entry(
+        "ge", 7.5, "sm100_det_bwd_20261122", "tiles"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (128, 128), "prefill_det", "dense", "window", False, "mha", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "causal_br", False, "mha", False): Entry("le", 40.5, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm100_det_bwd_20261122"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "none", False, "gqa", False): Entry(
+        "le", 17.792, "sm100_det_bwd_20261122", "rows", ("ge", 7.292, "tiles")
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "none", False, "gqa", True): Entry(
+        "ge", 6.85, "sm100_det_bwd_20261122", "tiles"
+    ),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "none", False, "mha", False): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "none", False, "mha", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "window", False, "gqa", False): Entry("ge", 29.161, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "window", False, "gqa", True): Entry("always", None, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "window", False, "mha", False): Entry("ge", 27.5, "sm100_det_bwd_20261122"),
+    ("sdpa_bwd_sm100_d128", (10, 3), "bf16", (64, 64), "prefill_det", "dense", "window", False, "mha", True): Entry("always", None, "sm100_det_bwd_20261122"),
     # GeForce RTX 4090, cuDNN 9.27.0: 20636 against backend engine 7, plain square full-tile MHA.
     # Per dtype: six training cases, two frozen holdout cases, graph-replay medians.
     # The class key restricts the entries to the measured square envelope.
