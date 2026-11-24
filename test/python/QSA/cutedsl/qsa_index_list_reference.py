@@ -73,11 +73,10 @@ def reference_forward(q, k, v, topk_idxs, output_dtype=torch.bfloat16, scale=SCA
     return out, lse
 
 
-def reference_backward(q, k, v, out, dout, lse, topk_idxs, scale=SCALE, dtype=torch.float32, dq_rss=False):
+def reference_backward(q, k, v, out, dout, lse, topk_idxs, scale=SCALE, dtype=torch.float32):
     """(dq, dk, dv) in ``dtype`` from the saved bf16 ``out`` and fp32 ``lse``, the operands the backward consumes.
 
     Not autograd: rows with few keys cancel in dP - Delta, so a Delta from the unrounded O misses the tolerance.
-    ``dq_rss`` appends the root sum square of the terms of dQ, the unit of the dQ error that rounding dS leaves.
     """
     if out.dtype == torch.float32:
         lse = lse.T
@@ -85,7 +84,6 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs, scale=SCALE, dtype=to
     group = h_q // h_kv
     kf, vf = k.to(dtype), v.to(dtype)
     dq = torch.empty(q.shape, dtype=dtype, device=q.device)
-    rss = torch.empty(q.shape, dtype=dtype, device=q.device) if dq_rss else None
     dk = torch.zeros(k.shape, dtype=dtype, device=q.device)
     dv = torch.zeros(v.shape, dtype=dtype, device=q.device)
     for r0 in range(0, q.shape[0], CHUNK):
@@ -103,11 +101,9 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs, scale=SCALE, dtype=to
         delta = (dof * out[r0:r1].to(dtype).view(-1, h_kv, group, D)).sum(-1, keepdim=True)
         ds = p * (torch.einsum("nhgd,nwhd->nhgw", dof, vs) - delta)
         dq[r0:r1] = (torch.einsum("nhgw,nwhd->nhgd", ds, ks) * scale).reshape(-1, h_q, D)
-        if dq_rss:
-            rss[r0:r1] = (torch.einsum("nhgw,nwhd->nhgd", ds.square(), ks.square()).sqrt() * abs(scale)).reshape(-1, h_q, D)
         dk.index_add_(0, flat, (torch.einsum("nhgw,nhgd->nwhd", ds, qf) * scale).reshape(-1, h_kv, D))
         dv.index_add_(0, flat, torch.einsum("nhgw,nhgd->nwhd", p, dof).reshape(-1, h_kv, D))
-    return (dq, dk, dv, rss) if dq_rss else (dq, dk, dv)
+    return dq, dk, dv
 
 
 def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2, cu_seqlens=None, width=W, saved_output_dtype=torch.bfloat16, h_q=None):

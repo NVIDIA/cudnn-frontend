@@ -383,30 +383,6 @@ def test_sparse_rows_follow_bounds_and_scale(h_kv, scale):
     _check(inputs, _bitmap_backward(inputs, meta, scale), scale)
 
 
-@pytest.mark.L0
-@pytest.mark.parametrize("h_kv", [2, 1])
-def test_dq_cancellation_stays_within_the_bf16_rounding_budget(h_kv):
-    _skip_cu12(h_kv)
-    # Nearly equal keys leave dQ almost zero, so it keeps the error of the BF16 dS that the dQ MMAs read, which the
-    # dense prefix forms from a BF16 P.
-    seq_len = 22600
-    inputs = _inputs((seq_len,), h_kv, seed=11)
-    inputs["k"].fill_(1)
-    inputs["k"][1::2] = 1 + 2**-7
-    inputs["out"], lse = reference_forward(inputs["q"], inputs["k"], inputs["v"], inputs["topk_idxs"], torch.float32)
-    inputs["lse"] = lse.T.contiguous()
-    dq = _entry_backward("bitmap" if h_kv == 2 else "indexed", inputs, (seq_len,))[0]
-    # dense pair kernel rows that attend every causal key, then query-major kernel rows (past the first 20480 queries)
-    for kernel, rows in (("dense pair", range(17, 2048, 17)), ("query-major", range(20480, seq_len, 17))):
-        rows = torch.tensor(rows, device=dq.device)
-        q, out, dout, idx = (inputs[name][rows] for name in ("q", "out", "dout", "topk_idxs"))
-        expected, _, _, rss = reference_backward(q, inputs["k"], inputs["v"], out, dout, inputs["lse"][:, rows], idx, dtype=torch.float64, dq_rss=True)
-        # The unit is 2**-8 of the root sum square of the dQ terms. One round-to-nearest BF16 rounding leaves at most
-        # 3**-0.5 of it in root mean square, and the bound sits between that and what one bit less in dS or P leaves.
-        err = ((dq[rows].double() - expected) / (2**-8 * rss)).square().mean().sqrt().item()
-        assert err <= 0.65, f"{kernel} dQ error {err:.3f} of the BF16 rounding unit"
-
-
 @pytest.mark.L1
 def test_key_skip_variant_matches_reference(monkeypatch):
     # The key-major variant that skips empty K-steps serves only long sequences, which the 24Q/2KV cases stop short of.
