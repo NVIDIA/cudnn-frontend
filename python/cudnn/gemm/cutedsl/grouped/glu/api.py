@@ -29,6 +29,7 @@ from ..backend_utils import (
     row_major_layout,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
+    execute_with_wrapper_workspace,
 )
 from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
 from ..moe_utils import MoEWeightMode
@@ -373,6 +374,7 @@ class GroupedGemmGluSm100(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         scheduler_counter_tensor: Optional[torch.Tensor] = None,
+        _workspace=None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -414,6 +416,7 @@ class GroupedGemmGluSm100(APIBase):
                 prob_tensor=prob_tensor,
                 linear_offset=linear_offset,
                 current_stream=current_stream,
+                _workspace=_workspace,
             )
         else:
             self._implementation.execute(
@@ -1230,7 +1233,9 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
     if memo_key is not None:
         _glu_wrapper_memo[memo_key] = (api, framework, valid_m, n_full, n_out, call.c_dtype, call.d_dtype)
 
-    api.execute(
+    execute_with_wrapper_workspace(
+        api,
+        framework,
         a_tensor=call.a_tensor,
         c_tensor=c_tensor,
         d_tensor=d_tensor,
@@ -1427,7 +1432,9 @@ def grouped_gemm_glu_wrapper_sm100(
         canonical = len(get_shape(a_tensor)) == 2
         c_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_full, canonical), memo_c_dtype, a_tensor.device)
         d_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_out, canonical), memo_d_dtype, a_tensor.device)
-        api.execute(
+        execute_with_wrapper_workspace(
+            api,
+            framework,
             a_tensor=a_tensor,
             c_tensor=c_out,
             d_tensor=d_out,

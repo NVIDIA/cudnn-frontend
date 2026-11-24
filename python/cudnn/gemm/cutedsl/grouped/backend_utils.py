@@ -11,7 +11,7 @@ from typing import Iterator, Optional, Sequence, Tuple
 from cuda.bindings import driver as cuda
 
 from cudnn.api_base import ceil_div
-from cudnn.tensor_adapter import get_device, get_shape, get_strides, is_torch_tensor
+from cudnn.tensor_adapter import default_stream, get_device, get_shape, get_strides, is_torch_tensor
 
 
 class GroupedGemmBackend(str, Enum):
@@ -179,6 +179,20 @@ def _jax_wrapper_workspace(nbytes: int, device, current_stream: cuda.CUstream):
         # Free is enqueued even when validation/launch raises; no host wait or GC
         # finalizer, and no mutable "latest workspace" on the cached plan.
         _ck(*cuda.cuMemFreeAsync(ptr, current_stream))
+
+
+def execute_with_wrapper_workspace(op, framework: str, **kwargs) -> None:
+    """``op.execute(**kwargs)`` with the plan's kernel scratch allocated per call on the launch stream.
+
+    The cached plan's own workspace would be shared by overlapping same-signature calls; the
+    BF16 implementations take this buffer as their private ``_workspace``. Plans without
+    ``_scratch_nbytes`` (or with 0) allocate nothing and get ``_workspace=None``.
+    """
+    nbytes = getattr(op._implementation, "_scratch_nbytes", 0)
+    current_stream = kwargs.get("current_stream")
+    launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+    with wrapper_workspace(framework, nbytes, kwargs["a_tensor"].device, launch_stream) as workspace:
+        op.execute(_workspace=workspace, **kwargs)
 
 
 def wrapper_operand_meta(tensor):
