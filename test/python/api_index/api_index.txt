@@ -162,6 +162,7 @@ cudnn.RmsNormSiluPadSm100
 cudnn.RopeQDQInplace
 cudnn.RowArgmaxDecode
 cudnn.RowQuantizeFp4Decode
+cudnn.RowQuantizeFp8Decode
 cudnn.SharedExpertDecode
 cudnn.SwigluFp4Decode
 cudnn.TailRoPEForward
