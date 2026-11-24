@@ -174,6 +174,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_mxfp8` with `causal_exclude_own_block=32` | fprop | MXFP8 E4M3 or E5M2 Q/K/V; E8M0 scales; BF16 O, FP32 Stats | Unsupported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unsupported |
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
+| `grouped_gemm_dglu_wrapper_sm100` with `deterministic=True`, BF16 kernel (`dswiglu`, `dgeglu`; Torch; no dbias) | bprop | BF16 A/B/C/D_row; FP32 dprob | Unsupported | Supported for dprob and D_row (SM100, tested configurations); SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
 | `cutemok_forward` / `cutemok_backward` | fprop, bprop | BF16; MXFP8 routed weights | Unsupported | Unverified (SM100 MXFP8 replay checked; batch invariance and SM103 unverified) | Unsupported |
 
@@ -391,12 +392,21 @@ for replay, batch-invariance, and stress-test results.
   failing case IDs and do not establish determinism. See the
   [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#simplified-sparse-attention-ci-failures--2026-11-20).
 
+- `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel: by default dprob combines its
+  N-tiles with an fp32 atomic, so it changes between runs once N spans more
+  than one tile (256 columns at the default tile). With `deterministic=True`,
+  dprob and D_row repeat byte for byte. They are also unchanged when experts
+  are reordered or duplicated, or their neighbors change. D_row does not
+  depend on the flag. dbias and JAX inputs raise under the flag. See the
+  [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#grouped-bf16-dglu-deterministic-dprob--sm100-2026-11-23-utc).
+
 - Canonical grouped GLU: the new branch-order option is distinct from the
   APIs' natural-rank tensor support. The forward suite checks C, both D
   orientations and their scale factors; backward checks both D orientations,
   scales, dprob and optional dbias. Deterministic dprob uses the existing
-  deterministic reduction for MXFP8/NVFP4 (`deterministic=True`). BF16 dprob
-  byte qualification is limited to the tested single-N-tile F=128 case.
+  deterministic reduction for MXFP8/NVFP4 and BF16 (`deterministic=True`).
+  With the flag, BF16 dprob is byte-qualified at four N-tiles (F=1024). Without
+  it, BF16 dprob byte qualification is limited to the tested single-N-tile F=128 case.
   Atomic dbias and legacy-alias atomic dprob are separate numerical checks
   and carry no new bitwise guarantee. SM100 passed independent references,
   replay and batch invariance; SM103 is unverified.
