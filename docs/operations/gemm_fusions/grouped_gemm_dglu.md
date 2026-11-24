@@ -740,12 +740,8 @@ partial goes to its own fp32 slot, and the slots are summed in a fixed order int
 launch stream; `use_dynamic_sched` stays supported and the other outputs are unchanged.
 
 Cost per call: a zeroed `valid_m x ceil(N / 256)` fp32 workspace (default tile and cluster) and a
-two-op reduction. Supported for the SM100 block-scaled kernel and for the SM100-family BF16 kernel
-(dSwiGLU or dGeGLU, either `glu_layout`), each with dense or discrete weights, torch tensors and
-no dbias; other configurations raise when the flag is set. The BF16 kernel sums a tile's subtiles
-in a fixed order already, so only the slots change. On SM100, at the DeepSeek-V3, Qwen3.5-397B and
-Qwen3-2.4T FC2 shapes (EP4 and EP8, 8192 tokens), the flag adds 8-10 us (0.4-1.6%) of GPU time and
-10-19 us (0.6-2.0%) back to back.
+two-op reduction. Supported for the SM100 block-scaled kernel (dense or discrete weights) with
+torch tensors and without dbias; other configurations raise when the flag is set.
 
 ### Wrapper Return Values
 

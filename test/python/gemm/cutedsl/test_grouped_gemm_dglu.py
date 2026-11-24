@@ -2801,7 +2801,7 @@ def test_grouped_gemm_dglu_deterministic_unsupported(request):
         _run_dglu_case(case, deterministic=True, generate_dbias=True)
 
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=False, b_major="k")
-    with pytest.raises(NotImplementedError, match="without dbias"):
+    with pytest.raises(NotImplementedError):
         cudnn.grouped_gemm_dglu_wrapper_sm100(
             a_tensor=problem["a"],
             c_tensor=problem["c"],
@@ -2813,7 +2813,6 @@ def test_grouped_gemm_dglu_deterministic_unsupported(request):
             dprob_tensor=problem["dprob"],
             b_tensor=problem["b"],
             sfb_tensor=None,
-            generate_dbias=True,
             d_dtype=torch.bfloat16,
             deterministic=True,
         )

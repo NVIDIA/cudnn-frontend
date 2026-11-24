@@ -302,7 +302,6 @@ class GroupedGemmDgluSm100(APIBase):
                     round_dgrad_to_input_dtype=kwargs["round_dgrad_to_input_dtype"],
                     sample_activation=kwargs["sample_activation"],
                     glu_layout=kwargs["glu_layout"],
-                    _deterministic=kwargs["_deterministic"],
                 )
             else:
                 if detect_framework(kwargs["sample_a"]) == "jax":
@@ -1216,8 +1215,6 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
     d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
         framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts, call.a_tensor, call.current_stream
     )
-    dprob_slots = _dglu_dprob_slots(call, n_weight, valid_m) if call.deterministic else None
-    dprob_kernel_tensor = call.dprob_tensor if dprob_slots is None else dprob_slots
 
     overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
     workspace_bytes = (128 * call.num_experts if call.weight_mode == MoEWeightMode.DISCRETE else 0) + (4 if call.use_dynamic_sched else 0)
@@ -1241,7 +1238,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
         _dglu_tensor_signature(call.alpha_tensor),
         _dglu_tensor_signature(call.beta_tensor),
         _dglu_tensor_signature(call.prob_tensor, dynamic_m=True),
-        _dglu_tensor_signature(dprob_kernel_tensor, dynamic_m=True),
+        _dglu_tensor_signature(call.dprob_tensor, dynamic_m=True),
         _dglu_tensor_signature(dbias_tensor),
         (_dglu_tensor_signature(call.b_ptrs) if call.b_ptrs is not None else None),
         call.acc_dtype,
@@ -1256,8 +1253,6 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
         ((get_device(call.a_tensor).type, get_device(call.a_tensor).index)),
         overlap_margin,
     )
-    if dprob_slots is not None:  # one slot has the same signature as dprob itself
-        cache_key = (*cache_key, "deterministic")
 
     if cache_key in _cache_of_GroupedGemmDgluSm100Objects:
         api = _cache_of_GroupedGemmDgluSm100Objects[cache_key]
@@ -1272,7 +1267,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
             sample_alpha=call.alpha_tensor,
             sample_beta=call.beta_tensor,
             sample_prob=call.prob_tensor,
-            sample_dprob=dprob_kernel_tensor,
+            sample_dprob=call.dprob_tensor,
             sample_b=call.b_tensor,
             sample_sfb=None,
             sample_dbias=dbias_tensor,
@@ -1301,14 +1296,13 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
             round_dgrad_to_input_dtype=call.round_dgrad_to_input_dtype,
             sample_activation=call.activation_tensor,
             glu_layout=call.glu_layout,
-            _deterministic=call.deterministic,
         )
         if not api.check_support():
             raise RuntimeError("Unsupported BF16 configuration")
         api.compile()
         _cache_of_GroupedGemmDgluSm100Objects[cache_key] = api
 
-    if memo_key is not None and dprob_slots is None:  # the memo fast path below has no slot reduction
+    if memo_key is not None:
         _dglu_wrapper_memo[memo_key] = (api, framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts)
 
     launch_stream = call.current_stream if call.current_stream is not None or framework == "torch" else default_stream(framework)
@@ -1321,7 +1315,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
             alpha_tensor=call.alpha_tensor,
             beta_tensor=call.beta_tensor,
             prob_tensor=call.prob_tensor,
-            dprob_tensor=dprob_kernel_tensor,
+            dprob_tensor=call.dprob_tensor,
             b_tensor=call.b_tensor,
             b_ptrs=call.b_ptrs,
             dbias_tensor=dbias_tensor,
@@ -1330,10 +1324,6 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
             workspace=workspace,
             activation_tensor=call.activation_tensor,
         )
-    if dprob_slots is not None:
-        from ..dsrelu.api import _reduce_dprob_slots
-
-        _reduce_dprob_slots(dprob_slots, normalize_prob(call.dprob_tensor)[1], launch_stream)
     return TupleDict(
         d_row_tensor=d_row_tensor,
         d_col_tensor=None,
@@ -1392,8 +1382,8 @@ def grouped_gemm_dglu_wrapper_sm100(
 ) -> TupleDict:
     """Dispatch grouped GEMM dGLU once from an immutable normalized call.
 
-    ``deterministic=True`` makes ``dprob`` bit-identical run to run (SM100 block-scaled or BF16
-    kernel, torch, no dbias). See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
+    ``deterministic=True`` makes ``dprob`` bit-identical run to run (block-scaled kernel, torch,
+    no dbias). See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
     ``glu_layout="gate_then_up"`` consumes canonical C and returns canonical
     gate/up halves in D, dbias and both D scale buffers. It is independent of
     the natural-rank tensor convention advertised by ``supports_canonical_layouts``.
@@ -1606,8 +1596,8 @@ def grouped_gemm_dglu_wrapper_sm100(
     if framework == "jax" and b_tensor is not None:
         raise ValueError(_JAX_DENSE_B_ERROR)
     normalized, backend = _normalize_dglu_call(call)
-    if deterministic and framework != "torch":
-        raise NotImplementedError("deterministic=True is implemented only with torch tensors")
+    if deterministic and (framework != "torch" or backend is GroupedGemmBackend.BF16):
+        raise NotImplementedError("deterministic=True is implemented only for the block-scaled kernel with torch tensors")
     if backend is GroupedGemmBackend.BF16:
         return _grouped_gemm_dglu_bf16_call(normalized, memo_key)
     if framework == "jax":
