@@ -70,6 +70,10 @@ def test_fixed_ids_and_default_placement(monkeypatch):
     ordinary = {name: eid for name, eid in offered.items() if not family.slots[name].opt_in}
     plans = heuristics.propose("A", facts, ordinary)
     assert [p.engine_id for p in plans if not is_backend_block(p) and not is_last_resort(p)] == [20632]
-    assert is_backend_block(plans[0])
+    # bf16 dense causal is a class study sm107_d256_bwd_causal_v2_20261122 measured: the 4x1 body leads. f16, which no study timed,
+    # keeps the trail-only row behind the backend.
+    assert plans[0].engine_id == 20632
+    f16 = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.HALF, device_cc=(10, 7))
+    assert is_backend_block(heuristics.propose("A", f16, ordinary)[0])
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert [p.engine_id for p in heuristics.recommend("A", facts, offered)] == [20632, 20633]
