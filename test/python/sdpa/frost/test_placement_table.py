@@ -61,12 +61,13 @@ def test_entries_are_well_formed_and_name_known_rows():
         assert (
             mask in ("none", "window", "window_narrow", "causal_br", "causal_tl")
             and isinstance(sink, bool)
-            and group in ("mha", "gqa", "gqa_unpacked", "gqa_split", "gqa_body", "gqa_partial")
+            and group in ("mha", "gqa", "gqa_unpacked", "gqa_split", "gqa_body", "gqa_partial", "gqa_long_cache")
         )
         assert mask != "window_narrow" or (row, phase) == ("sdpa_bwd_sm80", "prefill_det"), key  # a row-local key
         assert group != "gqa_body" or (row, layout, phase in ("mtp", "prefill")) == ("sdpa_fwd_prefill_sm120", "paged", True), key
         sm100_window_q1 = (row, phase, layout, mask) == ("sdpa_fwd_prefill_sm100", "q1", "paged", "window")
         assert group != "gqa_partial" or (row, phase) in (("sdpa_fwd_prefill_sm107", "verify"), ("sdpa_fwd_prefill_sm90", "q1")) or sm100_window_q1, key
+        assert group != "gqa_long_cache" or (row, heads, layout, mask, kv_off_tile) == ("sdpa_fwd_prefill_sm100", (192, 128), "dense", "window", False), key
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
@@ -137,6 +138,10 @@ def test_kv_off_the_tile_is_its_own_class_with_its_own_entry():
         if key[0] == "sdpa_bwd_sm89_f16_d64":
             # The dedicated Ada body requires a whole KV tile.
             assert key[-1] is False, key
+            continue
+        if key[8] == "gqa_long_cache":
+            # Keyed on the tile only: off it the graph keeps `gqa`, whose off-tile entry answers every cache length.
+            assert key[-1] is False and key[:8] + ("gqa", True) in pt.TABLE, key
             continue
         twin = key[:-1] + (not key[-1],)
         assert twin in pt.TABLE or twin in pt.HAND_RULE_SIDES, key
@@ -669,9 +674,66 @@ def test_sm80_prefill_gaps_follow_their_study(s_kv):
     assert pt.lookup(row, f(**small, h_q=8, h_kv=2)) is False
     assert pt.matched_entry(row, f(d_qk=128, d_v=128)) is None
     for over in (dict(d_qk=256, d_v=256, h_q=32, h_kv=2), dict(d_qk=192, d_v=128, h_q=64, h_kv=4)):
-        on_tile_d256 = over["d_qk"] == 256 and s_kv % 128 == 0
-        expected = "sm80_paged_d256_v7_pcie_20261118" if on_tile_d256 else "sm80_paged_d256_d192_v3_20261117"
+        on_tile_owner = {256: "sm80_paged_d256_v7_pcie_20261118", 192: "sm80_paged_d192x128_pcie_20261121"}[over["d_qk"]]
+        expected = on_tile_owner if s_kv % 128 == 0 else "sm80_paged_d256_d192_v3_20261117"
         assert pt.matched_entry(row, f(**over)).study == expected, over
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm80_paged_d256_window_prefill_follows_its_study(s_kv):
+    """sm80_paged_d256_swa_v4_pcie_20261121: SM80 paged THD-Q d256 windowed prefill is owned by its study on both tile sides, FROST's
+    lead never shrinks as the grid widens, and the narrowest grid keeps the backend while the widest leads."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_paged_d256_swa_v4_pcie_20261121"
+
+    def f(b, h_q, h_kv, s_q):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, d_qk=256, d_v=256, causal=True, bottom_right=True, device_cc=(8, 0))
+        base.update(page_size=16, padded=True, thd=True, max_total_seq_len_q=b * s_q, window_left=1023)
+        return _facts(**base)
+
+    for shape in [(b, h_q, h_kv, s_q) for b in (1, 4) for h_q, h_kv in ((8, 4), (16, 8), (32, 16)) for s_q in (512, 2048, 8192)]:
+        assert pt.matched_entry(row, f(*shape)).study == study, shape
+    for s_q in (512, 2048, 8192):
+        leads = [pt.lookup(row, f(b, 2 * h_kv, h_kv, s_q)) for b, h_kv in ((1, 1), (1, 4), (1, 16), (4, 16), (16, 16))]
+        assert leads == sorted(leads), (s_q, leads)
+    assert pt.lookup(row, f(1, 2, 1, 512)) is False
+    assert pt.lookup(row, f(16, 32, 16, 8192)) is True
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("off_tile", [False, True], ids=["on_tile", "off_tile"])
+def test_sm80_training_thd_and_d512_window_prefill_follow_their_study(off_tile):
+    """sm80_train_fwd_gaps_pcie_20261123 (A100 80GB PCIe): the training harness's equal-length THD d256, ragged THD MHA and dense d512
+    sliding-window prefill are owned by the study on both tile sides, and FROST's lead never shrinks as the grid widens. Equal-length THD
+    d128 and ragged THD d128 GQA keep no entry; ragged THD d256 GQA keeps its earlier study."""
+    row = "sdpa_fwd_prefill_sm80"
+    study = "sm80_train_fwd_gaps_pcie_20261123"
+
+    def thd(b, h_q, h_kv, s, d=256, ragged=False):
+        s += off_tile
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s, s_kv=s, d_qk=d, d_v=d, causal=True, device_cc=(8, 0), has_paged_kv=False, thd=True)
+        return _facts(**base, max_total_seq_len_q=b * s // 2 if ragged else b * s)
+
+    def window(b, h_q, h_kv, s, left=128):
+        s += off_tile
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s, s_kv=s, d_qk=512, d_v=512, causal=True, device_cc=(8, 0), has_paged_kv=False)
+        return _facts(**base, window_left=left - 1)
+
+    for facts in (thd(64, 32, 8, 1024), thd(16, 16, 16, 2048), thd(16, 16, 16, 2048, ragged=True), thd(16, 16, 16, 2048, d=128, ragged=True)):
+        assert pt.matched_entry(row, facts).study == study, facts
+    for facts in (window(2, 128, 1, 8192), window(2, 64, 1, 2048), window(4, 16, 16, 4096, left=1024)):
+        assert pt.matched_entry(row, facts).study == study, facts
+        assert pt.lookup(row, facts) is True, facts
+    for make in (lambda b, s: thd(b, 4 * b, b, s), lambda b, s: thd(b, 2 * b, 2 * b, s), lambda b, s: window(b, 8 * b, b, s)):
+        for s in (128, 1024, 8192):
+            leads = [pt.lookup(row, make(b, s)) for b in (1, 2, 4, 8, 16)]
+            assert leads == sorted(leads), (s, leads)
+    assert pt.lookup(row, thd(1, 4, 1, 128)) is False
+    assert pt.lookup(row, thd(64, 32, 8, 1024)) is True
+    assert pt.matched_entry(row, thd(16, 16, 4, 2048, d=128)) is None
+    assert pt.matched_entry(row, thd(16, 16, 4, 2048, d=128, ragged=True)) is None
+    assert pt.matched_entry(row, thd(16, 16, 4, 2048, ragged=True)).study == "sm80_thd_d256_v2_20261117"
 
 
 @pytest.mark.L0
@@ -760,8 +822,8 @@ def test_sm80_paged_d256_d192_prefill_follow_v3(d, s_kv):
         base.update(over)
         return _facts(**base)
 
-    on_tile_d256 = d == (256, 256) and s_kv % 128 == 0
-    assert pt.matched_entry(row, f()).study == ("sm80_paged_d256_v7_pcie_20261118" if on_tile_d256 else "sm80_paged_d256_d192_v3_20261117")
+    on_tile_owner = {(256, 256): "sm80_paged_d256_v7_pcie_20261118", (192, 128): "sm80_paged_d192x128_pcie_20261121"}[d]
+    assert pt.matched_entry(row, f()).study == (on_tile_owner if s_kv % 128 == 0 else "sm80_paged_d256_d192_v3_20261117")
     assert pt.lookup(row, f()) is True
     edge = f(b=32, h_q=64, h_kv=8, s_q=32, max_total_seq_len_q=32 * 32)
     assert pt.lookup(row, edge) is False
@@ -1106,8 +1168,8 @@ def test_sm80_deterministic_backward_follows_its_study(s):
 @pytest.mark.parametrize("s", [8192, 8100], ids=["on_tile", "off_tile"])
 def test_sm80_thd_d256_prefill_follows_its_v2_study(s):
     """Study sm80_thd_d256_v2_20261117 (A100) replaced sm80_thd_prefill_20261117, whose `always` entries lost below S_q 500: ragged
-    d256 THD causal prefill leads past a floor (S_q 2^7.5 on the tile, 2^9.09 tiles off it); equal lengths keep the trail-only row
-    (their off-tile holdout side reached 1.101)."""
+    d256 THD causal prefill leads past a floor (S_q 2^7.5 on the tile, 2^9.09 tiles off it). Equal lengths are keyed apart and belong to
+    sm80_train_fwd_gaps_pcie_20261123, which leads this wide grid."""
     from cudnn.sdpa.fwd import placement
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
@@ -1121,10 +1183,11 @@ def test_sm80_thd_d256_prefill_follows_its_v2_study(s):
 
     assert pt.matched_entry(row, thd(0.75)).study == "sm80_thd_d256_v2_20261117"
     assert pt.lookup(row, thd(0.75)) is True
-    assert pt.lookup(row, thd(1.0)) is None  # equal lengths: no entry
+    assert pt.matched_entry(row, thd(1.0)).study == "sm80_train_fwd_gaps_pcie_20261123"
+    assert pt.lookup(row, thd(1.0)) is True
     d256 = [spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_sm80_d256_kv_prefetch"]
     assert d256 and placement.place(d256[0], thd(0.75)) == placement.LEAD
-    assert placement.place(d256[0], thd(1.0)) == placement.TRAIL
+    assert placement.place(d256[0], thd(1.0)) == placement.LEAD
 
 
 @pytest.mark.L0
@@ -1338,7 +1401,7 @@ def test_sm107_paged_wide_head_verify_entries_lead(d, heads, s_qs):
 def test_sm100_paged_d192_prefill_entries_follow_the_study(device_cc):
     """Study sm100_prefill_d192_gaps_20261118 (B200, B300 transfer): paged THD d192 x 192 context (step5) leads with the full cache and
     with a window, on and off the tile, on cc 10.0 and 10.3. The mimo d192 x 128 classes failed their holdout there; paged d192 x 128
-    now has its own study (sm100_d192x128_paged_v2_20261118)."""
+    now has its own study (sm100_d192x128_paged_924_20261123)."""
     row = "sdpa_fwd_prefill_sm100"
 
     def paged(**over):
@@ -1350,7 +1413,7 @@ def test_sm100_paged_d192_prefill_entries_follow_the_study(device_cc):
     for over in (dict(), dict(s_q=512, s_kv=131072), dict(s_q=512, s_kv=131073), dict(window_left=511), dict(window_left=511, s_kv=131073, s_q=2048)):
         assert pt.lookup(row, paged(**over)) is True, over
         assert pt.matched_entry(row, paged(**over)).study == "sm100_prefill_d192_gaps_20261118"
-    assert pt.matched_entry(row, paged(d_v=128)).study == "sm100_d192x128_paged_v2_20261118"  # mimo d192 x 128: its own v2 study
+    assert pt.matched_entry(row, paged(d_v=128)).study == "sm100_d192x128_paged_924_20261123"  # mimo d192 x 128: its own study
     assert pt.lookup(row, paged(dtype=cudnn.data_type.HALF)) is None
 
 
@@ -1399,25 +1462,63 @@ def test_sm100_dense_d192x128_window_sink_prefill_entries_follow_the_study(devic
         base.update(over)
         return _facts(**base)
 
-    for over, key, lead in (
-        (dict(), "gqa", True),
-        (dict(h_q=128), "gqa", True),
-        (dict(h_q=16, h_kv=1), "gqa", False),
-        (dict(h_q=16, h_kv=2), "gqa", False),
-        (dict(h_q=16, h_kv=1, s_q=8192, s_kv=8192), "gqa", True),
-        (dict(h_q=16, h_kv=1, s_kv=2049), "gqa", True),
-        (dict(h_q=48), "gqa_unpacked", False),
-        (dict(h_q=96, s_q=16384, s_kv=16384, b=2), "gqa_unpacked", True),
-        (dict(h_q=48, s_kv=2049), "gqa_unpacked", True),
+    v1, v2 = "sm100_d192x128_swa_sink_pack_20261118", "sm100_d192x128_swa_sink_v2_20261121"  # v2 re-fit the packed side on the tile
+    for over, key, lead, study in (
+        (dict(), "gqa", True, v2),
+        (dict(h_q=128), "gqa", True, v2),
+        (dict(h_q=16, h_kv=1), "gqa", False, v2),
+        (dict(h_q=16, h_kv=2), "gqa", False, v2),
+        (dict(h_q=16, h_kv=1, s_q=8192, s_kv=8192), "gqa", True, v2),
+        (dict(h_q=16, h_kv=1, s_kv=2049), "gqa", True, v1),
+        (dict(h_q=48), "gqa_unpacked", False, v1),
+        (dict(h_q=96, s_q=16384, s_kv=16384, b=2), "gqa_unpacked", True, v1),
+        (dict(h_q=48, s_kv=2049), "gqa_unpacked", True, v1),
     ):
         facts = dense(**over)
         assert pt.class_key(row, facts)[8] == key, over
         assert pt.lookup(row, facts) is lead, over
-        assert pt.matched_entry(row, facts).study == "sm100_d192x128_swa_sink_pack_20261118"
+        assert pt.matched_entry(row, facts).study == study, over
     assert pt.class_key(row, dense(has_paged_kv=True, page_size=16, padded=True, thd=True, h_q=48))[8] == "gqa"
     for over in (dict(h_q=16, h_kv=1, s_q=8, s_kv=131072, b=128), dict(h_q=48, s_q=255)):  # below the measured S_q: the hand rules
         assert pt.class_key(row, dense(**over))[8] == "gqa_short", over
         assert pt.lookup(row, dense(**over)) is None, over
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_sm100_dense_d192x128_window_long_cache_follows_its_study(device_cc):
+    """Study sm100_d192x128_swa_sink_v2_20261121: on the tile, packed mimo swa dense d192 x 128 context over a cache of 2^16 keys or
+    more keys `gqa_long_cache`. FROST leads from a smaller grid there than over a short cache, and its lead only grows with the grid or
+    the cache. Off the tile, unpacked groups, paged caches and S_q below the measured floor keep their keys."""
+    row = "sdpa_fwd_prefill_sm100"
+
+    def f(b, h_q, h_kv, s_q, s_kv, **over):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, d_qk=192, d_v=128, causal=True, bottom_right=True, window_left=127, has_sink=True)
+        base.update(device_cc=device_cc, has_paged_kv=False)
+        base.update(over)
+        return _facts(**base)
+
+    long_key = pt.class_key(row, f(1, 16, 1, 512, 131072))
+    assert long_key == (row, device_cc, "bf16", (192, 128), "prefill", "dense", "window", True, "gqa_long_cache", False)
+    assert pt.matched_entry(row, f(1, 16, 1, 512, 131072)).study == "sm100_d192x128_swa_sink_v2_20261121"
+    assert pt.class_key(row, f(1, 16, 1, 512, 1 << 16))[8] == "gqa_long_cache"
+    assert pt.class_key(row, f(1, 16, 1, 512, (1 << 16) - 128))[8] == "gqa"
+    assert pt.class_key(row, f(1, 16, 1, 512, 131073))[8:] == ("gqa", True)
+    assert pt.class_key(row, f(1, 48, 8, 512, 131072))[8] == "gqa_unpacked"
+    assert pt.class_key(row, f(1, 16, 1, 255, 131072))[8] == "gqa_short"
+    assert pt.class_key(row, f(1, 16, 1, 512, 131072, has_paged_kv=True, page_size=16, padded=True, thd=True))[8] != "gqa_long_cache"
+    assert pt.class_key(row, f(1, 16, 1, 512, 131072, d_qk=128, d_v=128))[8] != "gqa_long_cache"
+    # the same chunk leads over a long cache but not over a short one
+    assert pt.lookup(row, f(1, 16, 1, 512, 131072)) is True
+    assert pt.lookup(row, f(1, 16, 1, 512, 32768)) is False
+    # both verdicts inside the class, and the lead is monotone in the grid and the cache
+    assert pt.lookup(row, f(1, 16, 1, 256, 1 << 16)) is False
+    for s_q, s_kv in ((256, 1 << 16), (512, 1 << 16), (256, 1 << 17), (1024, 1 << 17)):
+        leads = [pt.lookup(row, f(b, 16 * k, k, s_q, s_kv)) for b in (1, 2, 4) for k in (1, 2, 4)]
+        assert leads == sorted(leads), (s_q, s_kv)
+    for b, h_q, h_kv, s_q in ((1, 16, 1, 256), (1, 16, 2, 512), (2, 64, 8, 256)):
+        leads = [pt.lookup(row, f(b, h_q, h_kv, s_q, kv)) for kv in (1 << 16, 1 << 17, 1 << 18)]
+        assert leads == sorted(leads), (b, h_q, h_kv, s_q)
 
 
 @pytest.mark.L0
@@ -1460,8 +1561,9 @@ def test_sm100_window_decode_follows_its_study(device_cc):
 @pytest.mark.L0
 @pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
 def test_sm100_paged_d192x128_context_entries_follow_the_study(device_cc):
-    """Study sm100_d192x128_paged_v2_20261118: mimo full paged d192 x 128 context (THD Q) leads on the tile from S_q ~887 at enough
-    work, off the tile from S_q ~362; graphs below S_q 256 (spec-decode verify included) key `gqa_short` and keep the hand rules."""
+    """Study sm100_d192x128_paged_924_20261123 (cuDNN 9.24.0.43): mimo full paged d192 x 128 context (THD Q) leads from S_q 256 on and
+    off the tile, including the 512-query chunks over a 128k cache and the small squares the earlier pooled-build fit left on the
+    backend; graphs below S_q 256 (spec-decode verify included) key `gqa_short` and keep the hand rules."""
     row = "sdpa_fwd_prefill_sm100"
 
     def paged(**over):
@@ -1470,18 +1572,20 @@ def test_sm100_paged_d192x128_context_entries_follow_the_study(device_cc):
         base.update(over)
         return _facts(**base)
 
-    for over, lead in (
-        (dict(), True),
-        (dict(s_q=1024, s_kv=131072), True),
-        (dict(h_q=128, h_kv=8, s_q=32768, s_kv=32768), True),
-        (dict(s_q=512, s_kv=131072), False),
-        (dict(s_q=768, s_kv=768), False),
-        (dict(s_q=512, s_kv=131073), True),
+    for over in (
+        dict(),
+        dict(h_q=128, h_kv=8, s_q=32768, s_kv=32768),
+        dict(s_q=512, s_kv=131072),
+        dict(h_q=128, h_kv=8, s_q=512, s_kv=131072),
+        dict(s_q=768, s_kv=768),
+        dict(s_q=256, s_kv=256),
+        dict(s_q=256, s_kv=1024),
+        dict(s_q=300, s_kv=4097),
     ):
         facts = paged(**over)
         assert pt.class_key(row, facts)[8] == "gqa", over
-        assert pt.lookup(row, facts) is lead, over
-        assert pt.matched_entry(row, facts).study == "sm100_d192x128_paged_v2_20261118"
+        assert pt.lookup(row, facts) is True, over
+        assert pt.matched_entry(row, facts).study == "sm100_d192x128_paged_924_20261123"
     for short in (paged(s_q=8, s_kv=131072, thd=False), paged(s_q=255, s_kv=16384)):
         assert pt.class_key(row, short)[8] == "gqa_short"
         assert pt.lookup(row, short) is None
@@ -1935,7 +2039,8 @@ def test_sm90_paged_decode_gap_entries_follow_the_study(s_kv):
 
     study = "sm90_paged_decode_gaps_20261118"
     for s_q in (4, 8):
-        assert pt.lookup(row, g(s_q=s_q)) is True and pt.matched_entry(row, g(s_q=s_q)).study == study  # step37_swa b 128
+        owner = "sm90_paged_window_mtp_gaps_20261121" if s_q == 8 and s_kv % 128 else study  # off-tile windowed verify is the window study's
+        assert pt.lookup(row, g(s_q=s_q)) is True and pt.matched_entry(row, g(s_q=s_q)).study == owner  # step37_swa b 128
     assert pt.lookup(row, g(b=1)) is True  # MTP: always
     assert pt.lookup(row, g(s_q=8, b=1, h_q=16, h_kv=2)) is False  # verify: 2^7 query rows, under the floor
     step5 = dict(d_qk=192, d_v=192, h_q=64, h_kv=4)
@@ -1943,6 +2048,66 @@ def test_sm90_paged_decode_gap_entries_follow_the_study(s_kv):
         assert pt.lookup(row, g(**step5, s_q=s_q, window_left=None)) is True  # step5_full
         assert pt.lookup(row, g(**step5, s_q=s_q)) is True  # step5_swa
     assert pt.lookup(row, g(**{**step5, "b": 1, "h_q": 16, "h_kv": 1})) is (s_kv % 128 != 0)  # windowed MTP: one tile leads only off the KV tile
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm90_paged_window_and_unpacked_mtp_follow_their_study(s_kv):
+    """Study sm90_paged_window_mtp_gaps_20261121 owns paged d128 MTP whose group the decode tile does not divide (gqa_unpacked),
+    windowed d128 single-row decode, windowed d128 verify off the KV tile, and windowed d64 MTP and verify. Windowed d192 x 192 and
+    d64 single-row decode are not its."""
+    row = "sdpa_fwd_prefill_sm90"
+    study = "sm90_paged_window_mtp_gaps_20261121"
+    on_tile = s_kv % 128 == 0
+
+    def g(**over):
+        base = dict(b=1, h_q=40, h_kv=8, s_q=4, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True, window_left=None)
+        base.update(device_cc=(9, 0), has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for b in (1, 64):
+        mtp = g(b=b)  # group 5
+        assert pt.class_key(row, mtp)[8] == "gqa_unpacked" and pt.matched_entry(row, mtp).study == study
+    for b, h_q, h_kv in ((1, 10, 1), (128, 16, 2)):
+        assert pt.matched_entry(row, g(b=b, h_q=h_q, h_kv=h_kv, s_q=1, window_left=1023)).study == study
+    for b, h_q, h_kv in ((1, 10, 1), (4, 64, 8)):
+        verify = g(b=b, h_q=h_q, h_kv=h_kv, s_q=8, window_left=1023)
+        assert pt.matched_entry(row, verify).study == ("sm90_paged_decode_gaps_20261118" if on_tile else study)
+    for s_q, h_q, h_kv in ((4, 16, 2), (8, 16, 2), (4, 128, 16), (8, 128, 16)):
+        d64 = g(b=128, h_q=h_q, h_kv=h_kv, s_q=s_q, d_qk=64, d_v=64, window_left=2047)
+        assert pt.matched_entry(row, d64).study == study
+    for single_row in (g(s_q=1, d_qk=192, d_v=192, h_q=64, h_kv=4, window_left=511), g(s_q=1, d_qk=64, d_v=64, h_q=16, h_kv=2, window_left=2047)):
+        entry = pt.matched_entry(row, single_row)
+        assert entry is None or entry.study != study
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm90_paged_window_d192_decode_keys_by_pack_group(s_kv):
+    """Windowed paged d192 x 192 single-row decode keys by the row's pack group: a whole pack keys gqa, a partial pack (the packed
+    heads divide the tile but not the group) gqa_partial, and both belong to study sm90_paged_window_q1_v2_20261121. An unpacked
+    (odd) group, d192 without a window, dense d192 and d256 keep their keys and owners."""
+    row = "sdpa_fwd_prefill_sm90"
+    study = "sm90_paged_window_q1_v2_20261121"
+
+    def g(b, h_q, h_kv, **over):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=1, s_kv=s_kv, d_qk=192, d_v=192, causal=True, bottom_right=True, window_left=511)
+        base.update(device_cc=(9, 0), has_paged_kv=True, page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for b, h_q, h_kv in ((1, 64, 4), (128, 64, 4), (128, 16, 8), (64, 128, 4)):  # groups 16 / 16 / 2 / 32
+        whole = g(b, h_q, h_kv)
+        assert pt.class_key(row, whole)[8] == "gqa" and pt.matched_entry(row, whole).study == study
+    for b, h_q, h_kv in ((1, 48, 4), (64, 48, 4), (8, 96, 8), (16, 24, 2)):  # groups 12 / 12 / 12 / 12
+        partial = g(b, h_q, h_kv)
+        assert pt.class_key(row, partial)[8] == "gqa_partial" and pt.matched_entry(row, partial).study == study
+    assert pt.class_key(row, g(1, 40, 8))[8] == "gqa_unpacked" and pt.matched_entry(row, g(1, 40, 8)) is None
+    for other in (g(8, 48, 4, causal=False, bottom_right=False, window_left=None), g(8, 48, 4, has_paged_kv=False, page_size=0, padded=False)):
+        assert pt.class_key(row, other)[8] == "gqa" and pt.matched_entry(row, other) is None
+    d256 = g(8, 48, 4, d_qk=256, d_v=256, causal=False, bottom_right=False, window_left=None)
+    assert pt.class_key(row, d256)[8] == "gqa_partial" and pt.matched_entry(row, d256).study == "sm90_paged_decode_gaps_20261118"
 
 
 @pytest.mark.L0

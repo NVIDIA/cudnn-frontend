@@ -484,6 +484,7 @@ class IndexerTopKKernelVarlen:
                 )
                 s_histogram[i] = val + previous_sum
                 previous_sum = previous_sum + total_sum
+                cute.arch.barrier(barrier_id=2, number_of_threads=self.num_threads_per_cta)
             # sync among all threads in a cta.
             self.cta_sync(s_cta_mbarrier, sync_phase)
 
@@ -575,6 +576,7 @@ class IndexerTopKKernelVarlen:
                 )
                 s_histogram[i] = val + previous_sum
                 previous_sum = previous_sum + total_sum
+                cute.arch.barrier(barrier_id=2, number_of_threads=self.num_threads_per_cta)
             # sync among all threads in a cta.
             self.cta_sync(s_cta_mbarrier, sync_phase)
 

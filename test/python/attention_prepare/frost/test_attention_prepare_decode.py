@@ -1228,7 +1228,8 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
     pair: the second half is ``fma(partner, sin, own x cos)``) -- the two orders write other bytes where a product underflows, and
     a device cell of this module compares those bytes; two 32-bit global stores; ``.reqntid 128``; no ``mbarrier`` /
     ``cp.async`` / ``tcgen05``; NO integer ``div`` / ``rem`` (the page size is a compile-time power of two: a shift and a mask); the
-    symbol = the kernel's name + the form text inside the first 100 characters; thirty kernel parameters whatever the form.  THE
+    symbol = the kernel's name + the form text inside the first 100 characters; thirty kernel parameters, or twenty-nine when the
+    DSL omits the unused position-row stride of the 1d form.  THE
     LOAD WIDTHS follow the form's integer dtypes: an int64 ``positions`` / ``slot_mapping`` value is ONE ``ld.global.v2.b32`` (three
     position rows: three), an int32 one ONE ``ld.global.b32`` beside the form's 32-bit data loads (weights, row pair, copied pair;
     the table words: four with three position rows, two with one).  THE LAUNCH ARMS: ``griddepcontrol.wait`` exactly under ``pdl``
@@ -1303,7 +1304,8 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
         assert shuffles[4] < at["st.shared"] < at["bar.sync"] < at["ld.shared"] < shuffles[5], f"{what}: the two levels do not bracket the barrier"
         assert lines[at["ld.shared"]].startswith("ld.shared"), f"{what}: the slot load is under a predicate: {lines[at['ld.shared']]}"
         params = len(re.findall(r"^\s*\.param", ptx, re.M))
-        assert params == 30, f"{what}: {params} kernel parameters"
+        # Newer DSLs omit the position-row stride, which only the 3d form reads.
+        assert params in ((29, 30) if positions == "1d" else (30,)), f"{what}: {params} kernel parameters"
         symbol = re.search(r"\.entry\s+(\w+)", ptx).group(1)
         head = SYMBOL + str(_cfg(form, arm))
         assert symbol.startswith(head + "_") and len(head) <= 100, f"{what}: the symbol {symbol[:120]} does not carry the form in its first 100 characters"

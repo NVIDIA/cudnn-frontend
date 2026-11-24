@@ -265,6 +265,9 @@ navigation:
           - page: Engram Saved-State Gate
             path: ../../operations/pointwise/engram_saved_gate.md
             slug: engram_saved_gate
+          - page: Row Argmax Decode Step (SM100-class)
+            path: ../../operations/pointwise/row_argmax_decode.md
+            slug: row_argmax_decode
       - page: Resampling
         path: ../../operations/Resampling.md
         slug: operations/Resampling
