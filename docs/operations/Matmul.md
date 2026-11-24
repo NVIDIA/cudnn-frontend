@@ -59,7 +59,9 @@ g.build()
 
 On the same architecture and software stack, a row with identical inputs, weights
 and bias follows the same K16 FP32 accumulation order at any batch size or row
-position. The weight shape fixes the number and order of K chunks. To include
+position. The weight shape fixes the number and order of K chunks. The engine
+can change the tile shape, cluster layout and number of resident clusters to
+suit the GPU and the number of rows. To include
 a BF16 column bias, keep the matmul intermediate in FP32 and use `g.add` with
 FP32 compute before the BF16 output conversion.
 

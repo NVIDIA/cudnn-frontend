@@ -374,7 +374,8 @@ SOFTWARE.
 The batch-invariant GEMMs in python/cudnn/gemm/batch_invariant/ adapt
 Apache-2.0 sources from FlashInfer at commit e2d163fb3d46dfe251feba5b6652a08871f4a0b8.
 The BF16, FP8, groupwise FP8, MXFP8, NVFP4, MXFP4 and mixed MXFP8 x MXFP4
-kernels, K-chunk selection, block-scale layouts and ordered FP32 epilogues
+kernels, K-chunk selection, tile and cluster heuristics, persistent scheduling,
+block-scale layouts and ordered FP32 epilogues
 come from flashinfer/gemm/batch_invariant/. The CuteF32 arithmetic in
 _quantized/arithmetic.py also adapts flashinfer/batch_invariant/fp_interface/cute.py.
 The cuDNN Frontend port binds graph tensors and workspace through its own

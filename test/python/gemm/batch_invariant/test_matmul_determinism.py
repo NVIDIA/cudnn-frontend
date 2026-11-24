@@ -34,27 +34,29 @@ def test_batch_invariant_rows_and_replays(gemm_device, n, k, biased):
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
 def test_batch_invariant_matmul_pipeline_refill(gemm_device):
-    from cudnn.gemm.batch_invariant import chunks_for, schedule_for
+    from cudnn.gemm.batch_invariant._schedule import select_schedule
     from warm_stress import StressCase, assert_warm_stress, stress_validation
 
     m, n, k = 2048, 2048, 2048
-    chunks = chunks_for(n, k)
-    schedule = schedule_for(m, n, chunks)
+    schedule = select_schedule(m, n, k, "n", gemm_device.index)
     rng = torch.Generator().manual_seed(83)
     a, b = [torch.randint(-4, 5, shape, generator=rng).to(device=gemm_device, dtype=torch.bfloat16) for shape in ((m, k), (k, n))]
     run = build_matmul(a, b)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=gemm_device)
     expected = (a.double() @ b.double()).bfloat16()
+    cluster_size = schedule.knobs.cluster_m * schedule.knobs.cluster_n
+    # Even if A alone occupied all opt-in shared memory, the pipeline would wrap.
+    resident_k = torch.cuda.get_device_properties(gemm_device).shared_memory_per_block_optin // (a.element_size() * schedule.knobs.cta_tile_mn[0])
     assert_warm_stress(
         StressCase(
             "batch_invariant_bf16_pipeline",
             lambda: run(out),
             {"out": out},
-            thread_blocks=schedule.grid_x(m, n) * schedule.cluster_n * chunks,
-            refills_per_launch=k // (64 * chunks * schedule.stages) - 1,
+            thread_blocks=schedule.resident_clusters * cluster_size,
+            refills_per_launch=(k // schedule.chunks - 1) // resident_k,
             reference={"out": expected},
         ),
-        validation=stress_validation(gemm_device, cluster=schedule.mma_group * schedule.cluster_n),
+        validation=stress_validation(gemm_device, cluster=cluster_size),
     )
 
 

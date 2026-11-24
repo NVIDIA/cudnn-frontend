@@ -25,11 +25,13 @@ def test_batch_invariant_note_unlocks_gemm_and_preserves_the_contract_on_replay(
     """Exercise discovery and serialization on a CPU host. Only the device probe
     and kernel compilation are substituted; selection uses the shipped manifest."""
     from cudnn.engines.base import CompiledPlan, PlanConfig
-    from cudnn.gemm.batch_invariant import engine
+    from cudnn.gemm.batch_invariant import _schedule, engine
 
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
     monkeypatch.setattr(engine.devices, "current_device", lambda: 0)
     monkeypatch.setattr(engine.devices, "compute_capability", lambda device: (10, 0))
+    part = _schedule.PART_TABLE["sm_100"]
+    monkeypatch.setattr(_schedule, "_hardware", lambda device: (part, part.sm_count, part.l2_bytes, dict(part.capacity)))
     monkeypatch.setattr(engine, "cutedsl_state", lambda: (True, None))
     monkeypatch.setattr(engine, "cutedsl_requirement_error", lambda *args: None)
     monkeypatch.setattr(engine.BatchInvariantGemmEngine, "build_plan", lambda self, graph, plan, ctx: CompiledPlan())

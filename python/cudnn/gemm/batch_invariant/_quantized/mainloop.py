@@ -75,18 +75,33 @@ def mma_loop(
     acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, num_acc_stage)
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
-        ab_consumer, acc_state = mma_fold(
-            lowering,
-            k_tile_cnt,
-            is_leader_cta,
-            tiled_mma,
-            ab_consumer,
-            acc_pipeline,
-            acc_state,
-            tCrA,
-            tCrB,
-            tCtAcc_base,
-        )
+        if cutlass.const_expr(not cc):
+            ab_consumer, acc_state = mma_fold(
+                lowering,
+                k_tile_cnt,
+                is_leader_cta,
+                tiled_mma,
+                ab_consumer,
+                acc_pipeline,
+                acc_state,
+                tCrA,
+                tCrB,
+                tCtAcc_base,
+            )
+        else:
+            for _c in cutlass.range(0, chunks, 1, unroll=1):  # chunks ascending, each a fold from +0 into the next stage
+                ab_consumer, acc_state = mma_fold(
+                    lowering,
+                    k_tile_cnt,
+                    is_leader_cta,
+                    tiled_mma,
+                    ab_consumer,
+                    acc_pipeline,
+                    acc_state,
+                    tCrA,
+                    tCrB,
+                    tCtAcc_base,
+                )
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
     acc_pipeline.producer_tail(acc_state)

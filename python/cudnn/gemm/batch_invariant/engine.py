@@ -13,7 +13,6 @@ from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirem
 from cudnn.frost.workspace import Workspace, check_workspace_device
 from cudnn.graph_types import NodeType, Tensor, storage_geometry, storage_slot_bytes
 
-from . import chunks_for, schedule_for
 from ._graph import ScaledMatmul, is_scaled, match_scaled
 
 
@@ -51,7 +50,7 @@ def _match(graph) -> _Matmul | ScaledMatmul:
     kb, n = shape_b[-2:]
     if m <= 0 or min(k, n) <= 0 or k != kb or k % 8 or n % 8:
         raise NotImplementedError("batch_invariant_gemm requires M > 0 and positive matching K and N multiples of 8")
-    if max(m, n, k) >= 2**31 or schedule_for(m, n, chunks_for(n, k)).grid_x(m, n) >= 2**31:
+    if max(m, n, k) >= 2**31:
         raise NotImplementedError("batch_invariant_gemm exceeds the kernel's signed 32-bit shape or grid limits")
     matrix_shape = shape_a[:-2] + (m, n)
     if tuple(out.dim) != matrix_shape:
@@ -196,17 +195,21 @@ class BatchInvariantGemmEngine(BaseEngine):
         cc = devices.compute_capability(device)
         if cc not in ((10, 0), (10, 3), (10, 7)):
             raise NotImplementedError(f"batch_invariant_gemm requires SM100, SM103 or SM107, got {cc}")
-        if isinstance(op, ScaledMatmul):
-            from ._quantized.config import schedule_for as scaled_schedule
-
-            if op.kind == "mxfp8_mxfp4" and cc != (10, 7) and op.k % 128:
-                raise NotImplementedError("batch_invariant_gemm mixed MXFP8/MXFP4 on SM100/SM103 requires K aligned to 128")
-            scaled_schedule(op, cc, devices.multiprocessor_count(device))
         if not cutedsl_state()[0]:
             raise NotImplementedError("batch_invariant_gemm requires nvidia-cutlass-dsl >= 4.8.0")
         reason = cutedsl_requirement_error("batch_invariant_gemm", (4, 8, 0)) or cutedsl_arch_requirement_error(cc)
         if reason:
             raise NotImplementedError(reason)
+        if isinstance(op, ScaledMatmul):
+            from ._quantized.config import schedule_for as scaled_schedule
+
+            if op.kind == "mxfp8_mxfp4" and cc != (10, 7) and op.k % 128:
+                raise NotImplementedError("batch_invariant_gemm mixed MXFP8/MXFP4 on SM100/SM103 requires K aligned to 128")
+            scaled_schedule(op, device)
+        else:
+            from ._schedule import select_schedule
+
+            select_schedule(op.m, op.n, op.k, op.b_major, device)
         return op
 
     def build_plan(self, graph, plan, ctx=None):

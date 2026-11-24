@@ -71,20 +71,38 @@ def tma_producer_loop(
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
         coord = work_tile.tile_idx
-        tAgA_slice = tAgA[(None, coord[0] // atom_thr_size, None, coord[2])]
-        tBgB_slice = tBgB[(None, coord[1], None, coord[2])]
-        ab_producer = tma_produce_ktiles(
-            k_tile_cnt,
-            ab_producer,
-            tma_atom_a,
-            tma_atom_b,
-            tAgA_slice,
-            tBgB_slice,
-            tAsA,
-            tBsB,
-            a_mcast_mask,
-            b_mcast_mask,
-        )
+        if cutlass.const_expr(not cc):
+            # ((atom_v, rest_v), RestK): this tile's A rows / B columns, all k-tiles
+            tAgA_slice = tAgA[(None, coord[0] // atom_thr_size, None, coord[2])]
+            tBgB_slice = tBgB[(None, coord[1], None, coord[2])]
+            ab_producer = tma_produce_ktiles(
+                k_tile_cnt,
+                ab_producer,
+                tma_atom_a,
+                tma_atom_b,
+                tAgA_slice,
+                tBgB_slice,
+                tAsA,
+                tBsB,
+                a_mcast_mask,
+                b_mcast_mask,
+            )
+        else:
+            for c in cutlass.range(0, chunks, 1, unroll=1):  # chunks ascending: the batch mode of the split views
+                tAgA_slice = tAgA[(None, coord[0] // atom_thr_size, None, c)]
+                tBgB_slice = tBgB[(None, coord[1], None, c)]
+                ab_producer = tma_produce_ktiles(
+                    k_tile_cnt,
+                    ab_producer,
+                    tma_atom_a,
+                    tma_atom_b,
+                    tAgA_slice,
+                    tBgB_slice,
+                    tAsA,
+                    tBsB,
+                    a_mcast_mask,
+                    b_mcast_mask,
+                )
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
     ab_producer.tail()

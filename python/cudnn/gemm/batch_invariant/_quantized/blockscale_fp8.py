@@ -19,10 +19,9 @@ from cutlass.utils.blackwell_helpers import get_smem_store_op, get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from cudnn.frost.tile_dsl.barrier import named_barrier_sync_unaligned
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
-from .arithmetic import CuteF32
-from .arithmetic import Knobs, MainloopBlock
-from .arithmetic import BLOCK_K, SCALE_BLOCK_N, EpilogueChain
+from .arithmetic import BLOCK_K, SCALE_BLOCK_N, CuteF32, EpilogueChain, Knobs, MainloopBlock
 from .epilogue import apply_chain_pre_cvt
 from .mainloop import mma_fold
 from .operands import (
@@ -59,7 +58,7 @@ NUM_B_BLOCKS = 2  # B block scales per ring stage: a tile up to 256 wide spans t
 PROMO_BATCH = 2  # subtiles of a group's half loaded from TMEM before their fmas: the register budget's bound at the 256-wide tile
 NUM_SCALE_STAGES = 16  # the scale ring's depth in blocks: blocks whose scales wait in smem ahead of the promotion; deeper than the operand
 # ring plus the accumulator ring, so the operand stage is always the producer's binding wait (empirical)
-SCALE_GROUP_NATIVE_K = 4  # the K-native staging (a few rows, K-layout scales): blocks per ring stage, a row's four block scales one 16-byte copy
+SCALE_GROUP_NATIVE_K = 4  # the K-contiguous scale layout: blocks per ring stage, a row's four block scales one 16-byte copy
 
 
 def scale_ring_bytes(knobs: Knobs) -> int:
@@ -112,6 +111,12 @@ def blockscale_mma_loop(
     acc_pipeline.producer_tail(acc_state)
 
 
+def _vec4(t: cute.Tensor, coord):
+    """A 4-element view of ``t`` from ``coord`` along its contiguous mode (the 16-byte copy or read of four consecutive block scales);
+    the callers take this path only where the address is 16-byte aligned, which the pointer then asserts."""
+    return cute.make_tensor((t.iterator + cute.crd2idx(coord, t.layout)).align(16), cute.make_layout((4,)))
+
+
 def _elem(t: cute.Tensor, coord):
     """A one-element view of ``t`` at ``coord`` (the copy atoms move tensors)."""
     return cute.make_tensor(t.iterator + cute.crd2idx(coord, t.layout), cute.make_layout((1,)))
@@ -139,16 +144,27 @@ def blockscale_producer_loop(
     tCcC: cute.Tensor,
     native_k: cutlass.Constexpr,
 ):
-    """Stream operands and scales in ascending K-block order. In each scale ring stage the warp copies
-    one FP32 scale per A row and one per 128-column B block, clamping edge coordinates to the last valid index."""
+    """The dense TMA producer (`producer.tma_produce_ktiles`: one k-tile per operand stage, blocks ascending) plus the scale ring:
+    per block, the warp's 32 lanes ``cp.async`` the CTA tile's A row scales (``mSFA[(row, kb)]``, rows clamped to M - 1) and lane 0
+    the tile's B block scale (``mSFB[(n // 128, kb)]``, clamped to the tensor) into the next ring stage, whose barrier completes
+    when the copies land. For K-contiguous scales (``native_k``), a ring
+    stage holds ``SCALE_GROUP_NATIVE_K`` consecutive blocks, filled at the group's first block -- a row's four block scales one
+    16-byte copy where the row's address is 16-byte aligned, four 4-byte copies otherwise -- and the short last group block by
+    block. Order and staging only: no arithmetic."""
     lane = cute.arch.lane_idx()
     M = mSFA.shape[0]
     NB = mSFB.shape[0]
     rows_per_lane = cute.size(sSFA, mode=[0]) // 32
     atom_g2s = cute.make_copy_atom(cpasync.CopyG2SOp(), ACC_DTYPE, num_bits_per_copy=ACC_DTYPE.width)
+    atom_g2s4 = cute.make_copy_atom(cpasync.CopyG2SOp(), ACC_DTYPE, num_bits_per_copy=4 * ACC_DTYPE.width)
+    SCALE_GROUP = SCALE_GROUP_NATIVE_K
+    a_kmajor = mSFA.stride[1] == 1  # the K layout: a row's blocks contiguous
+    b_kmajor = mSFB.stride[1] == 1
+    k_whole = k_tile_cnt // SCALE_GROUP  # whole groups, then a short last group of k_tail blocks
+    k_tail = k_tile_cnt - k_whole * SCALE_GROUP
     scale_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Producer,
-        NUM_SCALE_STAGES,
+        NUM_SCALE_STAGES // (SCALE_GROUP if native_k else 1),
     )
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
@@ -160,43 +176,142 @@ def blockscale_producer_loop(
         nb = cutlass.min(c0[1] // SCALE_BLOCK_N, NB - 1)
         ab_producer.reset()
         peek_empty = ab_producer.try_acquire()
-        for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-            handle = ab_producer.acquire_and_advance(peek_empty)  # operand slot empty; the leader arms the tx barrier
-            cute.copy(
-                tma_atom_a,
-                tAgA_slice[(None, handle.count)],
-                tAsA[(None, handle.index)],
-                tma_bar_ptr=handle.barrier,
-                mcast_mask=a_mcast_mask,
-            )
-            cute.copy(
-                tma_atom_b,
-                tBgB_slice[(None, handle.count)],
-                tBsB[(None, handle.index)],
-                tma_bar_ptr=handle.barrier,
-                mcast_mask=b_mcast_mask,
-            )
-            scale_pipeline.producer_acquire(scale_state)  # ring stage free (the promotion released it)
-            for r in cutlass.range_constexpr(rows_per_lane):
-                i = r * 32 + lane
-                row = cutlass.min(c0[0] + i, M - 1)
+        if cutlass.const_expr(native_k):
+            for g in cutlass.range(0, k_whole, 1, unroll=1):  # the whole groups: one ring stage, then four operand stages
+                kb0 = g * SCALE_GROUP
+                scale_pipeline.producer_acquire(scale_state)  # ring stage free (the promotion released it)
+                for r in cutlass.range_constexpr(rows_per_lane):
+                    i = r * 32 + lane
+                    row = cutlass.min(c0[0] + i, M - 1)
+                    if a_kmajor and ((mSFA.iterator + row * mSFA.stride[0] + kb0).toint() % 16 == 0):
+                        cute.copy(
+                            atom_g2s4,
+                            _vec4(mSFA, (row, kb0)),
+                            _vec4(sSFA, (i, 0, scale_state.index)),
+                        )
+                    else:
+                        for j in cutlass.range_constexpr(SCALE_GROUP):
+                            cute.copy(
+                                atom_g2s,
+                                _elem(mSFA, (row, kb0 + j)),
+                                _elem(sSFA, (i, j, scale_state.index)),
+                            )
+                if lane < NUM_B_BLOCKS:  # the tile's B block scales, one lane each (clamped to the tensor)
+                    nb_l = cutlass.min(nb + lane, NB - 1)
+                    if b_kmajor and ((mSFB.iterator + nb_l * mSFB.stride[0] + kb0).toint() % 16 == 0):
+                        cute.copy(
+                            atom_g2s4,
+                            _vec4(mSFB, (nb_l, kb0)),
+                            _vec4(sSFB, (lane, 0, scale_state.index)),
+                        )
+                    else:
+                        for j in cutlass.range_constexpr(SCALE_GROUP):
+                            cute.copy(
+                                atom_g2s,
+                                _elem(mSFB, (nb_l, kb0 + j)),
+                                _elem(sSFB, (lane, j, scale_state.index)),
+                            )
+                scale_pipeline.producer_commit(scale_state)  # arrives when this lane's copies have landed
+                scale_state.advance()
+                for _j in cutlass.range_constexpr(SCALE_GROUP):  # the group's blocks: one operand stage each
+                    handle = ab_producer.acquire_and_advance(peek_empty)  # operand slot empty; the leader arms the tx barrier
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_slice[(None, handle.count)],
+                        tAsA[(None, handle.index)],
+                        tma_bar_ptr=handle.barrier,
+                        mcast_mask=a_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB_slice[(None, handle.count)],
+                        tBsB[(None, handle.index)],
+                        tma_bar_ptr=handle.barrier,
+                        mcast_mask=b_mcast_mask,
+                    )
+                    peek_empty = cutlass.Boolean(1)
+                    if handle.count + 1 < k_tile_cnt:
+                        peek_empty = ab_producer.try_acquire()
+            if k_tail > 0:  # the short last group: one stage, k_tail blocks, 4-byte copies
+                kb0 = k_whole * SCALE_GROUP
+                scale_pipeline.producer_acquire(scale_state)
+                # The consumer reads an aligned vector even on the tail. Duplicate the final valid scale in unused positions.
+                for r in cutlass.range_constexpr(rows_per_lane):
+                    i = r * 32 + lane
+                    row = cutlass.min(c0[0] + i, M - 1)
+                    for j in cutlass.range_constexpr(SCALE_GROUP):
+                        cute.copy(
+                            atom_g2s,
+                            _elem(mSFA, (row, kb0 + cutlass.min(j, k_tail - 1))),
+                            _elem(sSFA, (i, j, scale_state.index)),
+                        )
+                if lane < NUM_B_BLOCKS:
+                    nb_l = cutlass.min(nb + lane, NB - 1)
+                    for j in cutlass.range_constexpr(SCALE_GROUP):
+                        cute.copy(
+                            atom_g2s,
+                            _elem(mSFB, (nb_l, kb0 + cutlass.min(j, k_tail - 1))),
+                            _elem(sSFB, (lane, j, scale_state.index)),
+                        )
+                scale_pipeline.producer_commit(scale_state)
+                for _j in cutlass.range(0, k_tail, 1, unroll=1):
+                    handle = ab_producer.acquire_and_advance(peek_empty)
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_slice[(None, handle.count)],
+                        tAsA[(None, handle.index)],
+                        tma_bar_ptr=handle.barrier,
+                        mcast_mask=a_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB_slice[(None, handle.count)],
+                        tBsB[(None, handle.index)],
+                        tma_bar_ptr=handle.barrier,
+                        mcast_mask=b_mcast_mask,
+                    )
+                    peek_empty = cutlass.Boolean(1)
+                    if handle.count + 1 < k_tile_cnt:
+                        peek_empty = ab_producer.try_acquire()
+            scale_state.advance(cutlass.Int32(k_tail > 0))  # the tail's stage, when there is one
+        else:
+            for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                handle = ab_producer.acquire_and_advance(peek_empty)  # operand slot empty; the leader arms the tx barrier
                 cute.copy(
-                    atom_g2s,
-                    _elem(mSFA, (row, handle.count)),
-                    _elem(sSFA, (i, scale_state.index)),
+                    tma_atom_a,
+                    tAgA_slice[(None, handle.count)],
+                    tAsA[(None, handle.index)],
+                    tma_bar_ptr=handle.barrier,
+                    mcast_mask=a_mcast_mask,
                 )
-            if lane < NUM_B_BLOCKS:  # the tile's B block scales, one thread each (clamped to the tensor)
-                nb_l = cutlass.min(nb + lane, NB - 1)
                 cute.copy(
-                    atom_g2s,
-                    _elem(mSFB, (nb_l, handle.count)),
-                    _elem(sSFB, (lane, scale_state.index)),
+                    tma_atom_b,
+                    tBgB_slice[(None, handle.count)],
+                    tBsB[(None, handle.index)],
+                    tma_bar_ptr=handle.barrier,
+                    mcast_mask=b_mcast_mask,
                 )
-            scale_pipeline.producer_commit(scale_state)  # arrives when this thread's copies have landed
-            scale_state.advance()
-            peek_empty = cutlass.Boolean(1)
-            if handle.count + 1 < k_tile_cnt:
-                peek_empty = ab_producer.try_acquire()
+                scale_pipeline.producer_acquire(scale_state)  # ring stage free (the promotion released it)
+                for r in cutlass.range_constexpr(rows_per_lane):
+                    i = r * 32 + lane
+                    row = cutlass.min(c0[0] + i, M - 1)
+                    cute.copy(
+                        atom_g2s,
+                        _elem(mSFA, (row, handle.count)),
+                        _elem(sSFA, (i, scale_state.index)),
+                    )
+                if lane < NUM_B_BLOCKS:  # the tile's B block scales, one lane each (clamped to the tensor)
+                    nb_l = cutlass.min(nb + lane, NB - 1)
+                    cute.copy(
+                        atom_g2s,
+                        _elem(mSFB, (nb_l, handle.count)),
+                        _elem(sSFB, (lane, scale_state.index)),
+                    )
+                scale_pipeline.producer_commit(scale_state)  # arrives when this lane's copies have landed
+                scale_state.advance()
+                peek_empty = cutlass.Boolean(1)
+                if handle.count + 1 < k_tile_cnt:
+                    peek_empty = ab_producer.try_acquire()
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
     ab_producer.tail()
@@ -223,6 +338,7 @@ def blockscale_epilogue_loop(
     sSFB: cute.Tensor,
     k_tile_cnt: cutlass.Int32,
     native_k: cutlass.Constexpr,
+    rz,
 ):
     """The promotion and the store (module docstring) by two warpgroups, each owning one contiguous column half of the tile (both
     read the same TMEM lane quadrants -- the 32x32b atom -- at different columns; a tile of one epilogue subtile is group 0's
@@ -300,9 +416,10 @@ def blockscale_epilogue_loop(
     )
     assert st.num_c_stage >= NUM_PROMO_GROUPS, st.num_c_stage
     acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, st.num_acc_stage)
+    SCALE_GROUP = SCALE_GROUP_NATIVE_K
     scale_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer,
-        NUM_SCALE_STAGES,
+        NUM_SCALE_STAGES // (SCALE_GROUP if native_k else 1),
     )
     c_pipeline0 = pipeline.PipelineTmaStore.create(
         num_stages=1,
@@ -326,44 +443,128 @@ def blockscale_epilogue_loop(
         irow = tTR_cC[(None, None, None, 0, 0, mnl[0], mnl[1], mnl[2])][0][0] - tCcC[(None, None, mnl[0], mnl[1], mnl[2])][0][0]
         for i in cutlass.range_constexpr(VW):
             tTR_rSum[i] = CuteF32.const(0.0)  # acc_0 = +0
-        for _kb in range(k_tile_cnt):  # blocks ascending: the block fold digit
-            scale_pipeline.consumer_wait(scale_state)  # block kb's scales are in the ring
-            scale = CuteF32.mul(
-                sSFA[(irow, scale_state.index)],
-                sSFB[(gsel * blk_per_group, scale_state.index)],
-            )  # mul.rn(s_a[m, kb], s_b[n // 128, kb]), once
-            scale_pipeline.consumer_release(scale_state)  # read: the stage may take a later block
-            scale_state.advance()
-            acc_pipeline.consumer_wait(acc_state)  # block kb's fold is complete
-            if active:
-                tTR_tAcc = cute.group_modes(
-                    tTR_tAcc_base[(None, None, None, None, None, acc_state.index)],
-                    3,
-                    5,
-                )
-                for b0 in cutlass.range_constexpr(0, per_group, batch):  # the group's subtiles in batches: a batch's loads first
-                    for j in cutlass.range_constexpr(batch):
-                        cute.copy(
-                            tiled_copy_t2r,
-                            tTR_tAcc[(None, None, None, gsel * per_group + b0 + j)],
-                            bufs[j],
+        if cutlass.const_expr(native_k):
+            k_whole = k_tile_cnt // SCALE_GROUP  # whole groups, then a short last group
+            k_tail = k_tile_cnt - k_whole * SCALE_GROUP
+            for _g in cutlass.range(0, k_whole, 1, unroll=1):  # the ring's stages: groups of SCALE_GROUP blocks
+                scale_pipeline.consumer_wait(scale_state)  # the group's scales are in the ring
+                a4 = _vec4(sSFA, (irow, 0, scale_state.index)).load()  # this row's four block scales: one 16-byte read
+                b4 = _vec4(sSFB, (gsel * blk_per_group, 0, scale_state.index)).load()
+                consume_then_arrive(scale_pipeline.consumer_get_barrier(scale_state), (a4.ir_value(), b4.ir_value()), rz)
+                scale_state.advance()
+                for jb in cutlass.range_constexpr(SCALE_GROUP):  # blocks ascending: the block fold digit
+                    scale = CuteF32.mul(a4[jb], b4[jb])  # mul.rn(s_a[m, kb], s_b[n // 128, kb]), once
+                    acc_pipeline.consumer_wait(acc_state)  # block kb's fold is complete
+                    if active:
+                        tTR_tAcc = cute.group_modes(
+                            tTR_tAcc_base[(None, None, None, None, None, acc_state.index)],
+                            3,
+                            5,
                         )
-                    for j in cutlass.range_constexpr(batch):
-                        k = b0 + j
-                        for e in cutlass.range_constexpr(0, V, 2):
-                            # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2: each component the same correctly rounded fma on
-                            # the same operands (a packing placement, as the attention body's)
-                            r0, r1 = CuteF32.fma2(
-                                (scale, scale),
-                                (bufs[j][e], bufs[j][e + 1]),
-                                (tTR_rSum[k * V + e], tTR_rSum[k * V + e + 1]),
+                        for b0 in cutlass.range_constexpr(0, per_group, batch):  # the group's subtiles in batches: a batch's loads first
+                            for j in cutlass.range_constexpr(batch):
+                                cute.copy(
+                                    tiled_copy_t2r,
+                                    tTR_tAcc[(None, None, None, gsel * per_group + b0 + j)],
+                                    bufs[j],
+                                )
+                            for j in cutlass.range_constexpr(batch):
+                                k = b0 + j
+                                for e in cutlass.range_constexpr(0, V, 2):
+                                    # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2: each lane the same correctly rounded fma on
+                                    # the same operands (a packing placement, as the attention body's)
+                                    r0, r1 = CuteF32.fma2(
+                                        (scale, scale),
+                                        (bufs[j][e], bufs[j][e + 1]),
+                                        (tTR_rSum[k * V + e], tTR_rSum[k * V + e + 1]),
+                                    )
+                                    tTR_rSum[k * V + e] = r0
+                                    tTR_rSum[k * V + e + 1] = r1
+                    cute.arch.fence_view_async_tmem_load()  # this warp's reads of the partial are complete
+                    with cute.arch.elect_one():
+                        acc_pipeline.consumer_release(acc_state)  # one arrive per warp: the stage is free once all arrived
+                    acc_state.advance()
+            # Keep the last group's four scales in registers across the dynamically bounded tail.
+            tail_scales = cute.make_rmem_tensor((SCALE_GROUP,), ACC_DTYPE)
+            if k_tail > 0:
+                scale_pipeline.consumer_wait(scale_state)
+                a4 = _vec4(sSFA, (irow, 0, scale_state.index)).load()
+                b4 = _vec4(sSFB, (gsel * blk_per_group, 0, scale_state.index)).load()
+                consume_then_arrive(scale_pipeline.consumer_get_barrier(scale_state), (a4.ir_value(), b4.ir_value()), rz)
+                for j in cutlass.range_constexpr(SCALE_GROUP):
+                    tail_scales[j] = CuteF32.mul(a4[j], b4[j])
+            for jb in cutlass.range(0, k_tail, 1, unroll=1):
+                scale = tail_scales[jb]
+                acc_pipeline.consumer_wait(acc_state)  # block kb's fold is complete
+                if active:
+                    tTR_tAcc = cute.group_modes(
+                        tTR_tAcc_base[(None, None, None, None, None, acc_state.index)],
+                        3,
+                        5,
+                    )
+                    for b0 in cutlass.range_constexpr(0, per_group, batch):  # the group's subtiles in batches: a batch's loads first
+                        for j in cutlass.range_constexpr(batch):
+                            cute.copy(
+                                tiled_copy_t2r,
+                                tTR_tAcc[(None, None, None, gsel * per_group + b0 + j)],
+                                bufs[j],
                             )
-                            tTR_rSum[k * V + e] = r0
-                            tTR_rSum[k * V + e + 1] = r1
-            cute.arch.fence_view_async_tmem_load()  # this warp's reads of the partial are complete
-            with cute.arch.elect_one():
-                acc_pipeline.consumer_release(acc_state)  # one arrive per warp: the stage is free once all arrived
-            acc_state.advance()
+                        for j in cutlass.range_constexpr(batch):
+                            k = b0 + j
+                            for e in cutlass.range_constexpr(0, V, 2):
+                                # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2: each lane the same correctly rounded fma on
+                                # the same operands (a packing placement, as the attention body's)
+                                r0, r1 = CuteF32.fma2(
+                                    (scale, scale),
+                                    (bufs[j][e], bufs[j][e + 1]),
+                                    (tTR_rSum[k * V + e], tTR_rSum[k * V + e + 1]),
+                                )
+                                tTR_rSum[k * V + e] = r0
+                                tTR_rSum[k * V + e + 1] = r1
+                cute.arch.fence_view_async_tmem_load()  # this warp's reads of the partial are complete
+                with cute.arch.elect_one():
+                    acc_pipeline.consumer_release(acc_state)  # one arrive per warp: the stage is free once all arrived
+                acc_state.advance()
+            if k_tail > 0:
+                scale_state.advance()
+        else:
+            for _kb in range(k_tile_cnt):  # blocks ascending: the block fold digit
+                scale_pipeline.consumer_wait(scale_state)  # block kb's scales are in the ring
+                scale_a = sSFA[(irow, scale_state.index)]
+                scale_b = sSFB[(gsel * blk_per_group, scale_state.index)]
+                consume_then_arrive(scale_pipeline.consumer_get_barrier(scale_state), (scale_a, scale_b), rz)
+                scale = CuteF32.mul(scale_a, scale_b)
+                scale_state.advance()
+                acc_pipeline.consumer_wait(acc_state)  # block kb's fold is complete
+                if active:
+                    tTR_tAcc = cute.group_modes(
+                        tTR_tAcc_base[(None, None, None, None, None, acc_state.index)],
+                        3,
+                        5,
+                    )
+                    for b0 in cutlass.range_constexpr(0, per_group, batch):  # the group's subtiles in batches: a batch's loads first
+                        for j in cutlass.range_constexpr(batch):
+                            cute.copy(
+                                tiled_copy_t2r,
+                                tTR_tAcc[(None, None, None, gsel * per_group + b0 + j)],
+                                bufs[j],
+                            )
+                        for j in cutlass.range_constexpr(batch):
+                            k = b0 + j
+                            for e in cutlass.range_constexpr(0, V, 2):
+                                # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2: each lane the same correctly rounded fma on
+                                # the same operands (a packing placement, as the attention body's)
+                                r0, r1 = CuteF32.fma2(
+                                    (scale, scale),
+                                    (bufs[j][e], bufs[j][e + 1]),
+                                    (tTR_rSum[k * V + e], tTR_rSum[k * V + e + 1]),
+                                )
+                                tTR_rSum[k * V + e] = r0
+                                tTR_rSum[k * V + e + 1] = r1
+                cute.arch.fence_view_async_tmem_load()  # this warp's reads of the partial are complete
+                with cute.arch.elect_one():
+                    acc_pipeline.consumer_release(acc_state)  # one arrive per warp: the stage is free once all arrived
+                acc_state.advance()
         # the chain (one cvt.rn) and the store of this group's half of the tile's fold, subtile by subtile
         if active:
             for k in cutlass.range_constexpr(per_group):
@@ -408,7 +609,7 @@ class BlockScaleFp8Gemm:
 
     def __init__(self, knobs: Knobs, out_fmt: str, native_k: bool = False):
         self.knobs = knobs
-        self.native_k = native_k  # the K-native scale staging (the API's choice at a few rows in the K layout)
+        self.native_k = native_k
         self.cluster_shape_mn = knobs.cluster_shape_mn
         self.chain = EpilogueChain.for_class(out_fmt, False)
         assert not self.chain.scaled and self.chain.out_fmt == out_fmt, self.chain.describe()
@@ -422,6 +623,7 @@ class BlockScaleFp8Gemm:
         sfb: cute.Tensor,
         c: cute.Tensor,
         max_active_clusters: cutlass.Int32,
+        release_mask: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         assert a.element_type is IN_DT[IN_FMT] and b.element_type is IN_DT[IN_FMT], (
@@ -471,6 +673,7 @@ class BlockScaleFp8Gemm:
             st.c_smem_layout_staged,
             st.epi_tile,
             params,
+            release_mask,
         ).launch(
             grid=grid,
             block=[THREADS_BS, 1, 1],
@@ -496,7 +699,9 @@ class BlockScaleFp8Gemm:
         c_smem_layout_staged,
         epi_tile: cute.Tile,
         tile_sched_params: SchedParams,
+        release_mask: cutlass.Int32,
     ):
+        rz = release_zero(release_mask)
         st = self.st
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == TMA_WARP_BS:
@@ -573,16 +778,33 @@ class BlockScaleFp8Gemm:
         )
         # the scale ring: a stage holds the CTA tile's A row scales and the tile's B block scale
         tm_cta = st.cta_tile_shape_mnk[0]
-        sSFA = smem.allocate_tensor(
-            element_type=ACC_DTYPE,
-            layout=cute.make_layout((tm_cta, NUM_SCALE_STAGES)),
-            byte_alignment=16,
-        )
-        sSFB = smem.allocate_tensor(
-            element_type=ACC_DTYPE,
-            layout=cute.make_layout((NUM_B_BLOCKS, NUM_SCALE_STAGES)),
-            byte_alignment=16,
-        )
+        if cutlass.const_expr(self.native_k):
+            # a stage holds four blocks; a row's four slots are 16 contiguous bytes (one copy in, one read out)
+            G = SCALE_GROUP_NATIVE_K
+            sSFA = smem.allocate_tensor(
+                element_type=ACC_DTYPE,
+                layout=cute.make_layout((tm_cta, G, NUM_SCALE_STAGES // G), stride=(G, 1, tm_cta * G)),
+                byte_alignment=16,
+            )
+            sSFB = smem.allocate_tensor(
+                element_type=ACC_DTYPE,
+                layout=cute.make_layout(
+                    (NUM_B_BLOCKS, G, NUM_SCALE_STAGES // G),
+                    stride=(G, 1, NUM_B_BLOCKS * G),
+                ),
+                byte_alignment=16,
+            )
+        else:
+            sSFA = smem.allocate_tensor(
+                element_type=ACC_DTYPE,
+                layout=cute.make_layout((tm_cta, NUM_SCALE_STAGES)),
+                byte_alignment=16,
+            )
+            sSFB = smem.allocate_tensor(
+                element_type=ACC_DTYPE,
+                layout=cute.make_layout((NUM_B_BLOCKS, NUM_SCALE_STAGES)),
+                byte_alignment=16,
+            )
         a_full_mcast_mask = None
         b_full_mcast_mask = None
         if cutlass.const_expr(st.is_a_mcast or st.is_b_mcast or use_2cta_instrs):
@@ -698,6 +920,7 @@ class BlockScaleFp8Gemm:
                 sSFB,
                 k_tile_cnt,
                 self.native_k,
+                rz,
             )
             # the allocator warp alone frees the columns (`TmemAllocator.free`): the other warpgroup's last TMEM loads must be
             # complete first; its store barriers are its own, so the groups join here (the dense bodies' one epilogue group is

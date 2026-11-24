@@ -18,14 +18,22 @@ import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as bs_layout
 import cutlass.utils.rubin_helpers as rubin
 from cutlass import Float32, Int32
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import LayoutEnum
+from cutlass.utils.blackwell_helpers import get_smem_store_op, get_tmem_load_op
+from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-from .arithmetic import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC, EpilogueChain, Knobs, MainloopBlock
-from .epilogue import epilogue_loop
+from cudnn.frost.tile_dsl.barrier import named_barrier_sync_unaligned
+
+from .._knobs import BREUSE_FMTS, Knobs
+from .arithmetic import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC, CuteF32, EpilogueChain, MainloopBlock
+from .epilogue import apply_chain_pre_cvt, epilogue_loop
 from .operands import (
     ACC_DTYPE,
+    BAR_EPILOGUE,
     BAR_TMEM_ALLOC,
     EPILOGUE_WARPS,
     MBAR_RESERVE_BYTES,
@@ -138,15 +146,20 @@ class BlockScaledPlan:
         self.c_dtype, self.c_layout = c_dtype, c_layout
         self.use_2cta_instrs = knobs.use_2cta_instrs
         self.cluster_shape_mn = knobs.cluster_shape_mn
+        self.cluster_k = knobs.cluster_k
         self.cta_group = tcgen05.CtaGroup.TWO if knobs.use_2cta_instrs else tcgen05.CtaGroup.ONE
         # the B-reuse record (tile M = 2 x the instruction's M, the sm_107 class): two instructions per K step on the two
         # halves of the tile sharing one B fragment through the collector buffer (`tiled_mma_bkeep` FILL, `tiled_mma_breuse`
         # LASTUSE); the base tiled MMA (collector ops DISCARD) partitions the operands and the accumulator
         self.breuse = knobs.b_reuse
+        assert not self.breuse or self.IN_FMT in BREUSE_FMTS, (self.IN_FMT, knobs)
         # the instruction variant (A2 surface): kind::mxf8f6f4.block_scale, K = 32 (sm_100 op) or 64 (sm_107 op), SF UE8M0 / 32,
         # cta_group 1/2, tile MxN
         self.tiled_mma = self.make_tiled_mma(self.cta_group, knobs.mma_tiler_mn, self.breuse)
         self.tiled_mma_bkeep = self.tiled_mma_breuse = None
+        if self.breuse:
+            self.tiled_mma_bkeep = self.make_tiled_mma(self.cta_group, knobs.mma_tiler_mn, True, tcgen05.CollectorOp.FILL)
+            self.tiled_mma_breuse = self.make_tiled_mma(self.cta_group, knobs.mma_tiler_mn, True, tcgen05.CollectorOp.LASTUSE)
         inst_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
         assert inst_k == self.block.step, (inst_k, self.block.step)
         self.atom_thr_size = cute.size(self.tiled_mma.thr_id.shape)
@@ -160,7 +173,7 @@ class BlockScaledPlan:
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
-        tn = self.cta_tile_shape_mnk[1]
+        cta_m, tn = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
         # SFB is loaded in whole scale-factor atoms (128 rows of N) through a 1-CTA tiled MMA of that width (and of the
         # instruction's per-CTA M: 128 rows, half of a 2-CTA instruction, whatever the tile's M)
         self.sfb_tile_n = -(-tn // SF_ATOM_ROWS) * SF_ATOM_ROWS
@@ -183,6 +196,11 @@ class BlockScaledPlan:
         self.is_sfb_mcast = self.num_mcast_ctas_sfb > 1
         self.epi_tile = self.epilogue_tile()
         self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+        # the in-cluster split's mailbox: (cluster_k - 1) fp32 tiles (one slot per peer) and one mbarrier per epilogue subtile
+        self.subtile_elems = cute.size(self.epi_tile[0]) * cute.size(self.epi_tile[1])
+        self.num_subtiles = cta_m * tn // self.subtile_elems
+        self.mailbox_elems = (self.cluster_k - 1) * cta_m * tn if self.cluster_k > 1 else 0
+        self.reduce_bytes = self.mailbox_elems * 4 + (self.num_subtiles * 8 if self.cluster_k > 1 else 0)
         # the TMEM layouts of one stage of scale factors (the instruction reads SFA / SFB from TMEM), from the one-stage smem
         # layouts; the stage count does not enter them
         sfa_one = bs_layout.make_smem_layout_sfa(self.tiled_mma, self.mma_tiler, self.sf_vec, 1)
@@ -204,7 +222,7 @@ class BlockScaledPlan:
         self.num_sfa_tmem_cols, self.num_sfb_tmem_cols = self.sf_tmem_cols()
         # one accumulator stage = tile N columns (two tile-N blocks for the B-reuse record: one accumulator per 256-row half);
         # the in-CTA chunk fold adds one more accumulator-shaped buffer, the running sum (stage index `sum_stage`)
-        acc_cols = tn
+        acc_cols = tn * (2 if self.breuse else 1)
         n_sum = 1 if self.cta_chunks else 0
         self.num_acc_stage = 1 if acc_cols * (2 + n_sum) + self.num_sfa_tmem_cols + self.num_sfb_tmem_cols > self.TMEM_COLS else 2
         self.sum_stage = self.num_acc_stage if n_sum else None
@@ -223,7 +241,7 @@ class BlockScaledPlan:
         self.c_smem_layout_staged = utils.sm100.make_smem_layout_epi(c_dtype, c_layout, self.epi_tile, self.num_c_stage)
 
     def _stages(self) -> Tuple[int, int]:
-        """A/B/SFA/SFB ring depth from the smem budget after the barriers and two C
+        """A/B/SFA/SFB ring depth from the smem budget after the barriers (and the in-cluster split's mailbox) and two C
         stages; the leftover becomes extra C stages (the dense rule with the scale factors in the stage); the A ring
         below ``A_RING_MAX_BYTES``."""
         a_one = utils.sm100.make_smem_layout_a(self.tiled_mma, self.mma_tiler, self.a_smem_dtype, 1)
@@ -236,11 +254,12 @@ class BlockScaledPlan:
             a_bytes + cute.size_in_bytes(self.b_smem_dtype, b_one) + cute.size_in_bytes(self.sf_dtype, sfa_one) + cute.size_in_bytes(self.sf_dtype, sfb_one)
         )
         c_bytes_per_stage = cute.size_in_bytes(self.c_dtype, c_one)
-        reserved_bytes = MBAR_RESERVE_BYTES + c_bytes_per_stage * NUM_C_STAGE_MIN
-        num_ab = (self.smem_capacity // OCCUPANCY - reserved_bytes) // ab_bytes
+        c_bytes = c_bytes_per_stage * NUM_C_STAGE_MIN
+        reserve = MBAR_RESERVE_BYTES + self.reduce_bytes
+        num_ab = (self.smem_capacity // OCCUPANCY - (reserve + c_bytes)) // ab_bytes
         num_ab = min(num_ab, (A_RING_MAX_BYTES - 1) // a_bytes)
         assert num_ab >= 2, (self.knobs, num_ab)
-        num_c = NUM_C_STAGE_MIN + (self.smem_capacity - OCCUPANCY * ab_bytes * num_ab - OCCUPANCY * reserved_bytes) // (OCCUPANCY * c_bytes_per_stage)
+        num_c = NUM_C_STAGE_MIN + (self.smem_capacity - OCCUPANCY * ab_bytes * num_ab - OCCUPANCY * (reserve + c_bytes)) // (OCCUPANCY * c_bytes_per_stage)
         return num_ab, num_c
 
 
@@ -270,8 +289,14 @@ class BlockScaledPlanSM107(BlockScaledPlan):
         NVIDIA's and FlashInfer's Rubin kernels); ``b_collector`` FILL / LASTUSE for the two instructions of a step, DISCARD
         (default) for the partitioning MMA and the plain records."""
         kmaj = cute.nvgpu.OperandMajorMode.K
-        inst_m = tile_mn[0]
+        inst_m = tile_mn[0] // 2 if breuse else tile_mn[0]
         perm = None
+        if breuse and cta_group == tcgen05.CtaGroup.TWO:
+            perm = (
+                cute.make_layout((inst_m // 2, 2, 2), stride=(1, inst_m, inst_m // 2)),
+                tile_mn[1],
+                self.INST_K,
+            )
         return rubin.make_blockscaled_trivial_tiled_mma(
             self.A_DT,
             self.B_DT,
@@ -516,6 +541,51 @@ def s2t_copy_and_partition(
     return tiled_copy, tCsSF_s2t, tCtSF_s2t
 
 
+@dsl_user_op
+def _map_shared_rank(smem_ptr: cute.Pointer, peer_rank: Int32, *, loc=None, ip=None) -> Int32:
+    """``mapa.shared::cluster``: the address of ``smem_ptr`` in the peer CTA's shared memory."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_ptr.toint(loc=loc, ip=ip).ir_value(), peer_rank.ir_value()],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _store_remote_v4(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    smem_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    peer_rank: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Four fp32 bit patterns into a peer CTA's shared memory, completing 16 transaction bytes on the peer's mbarrier
+    (``st.async.shared::cluster.mbarrier::complete_tx``): a move of bits, no arithmetic."""
+    remote_smem = _map_shared_rank(smem_ptr, peer_rank, loc=loc, ip=ip).ir_value()
+    remote_mbar = _map_shared_rank(mbar_ptr, peer_rank, loc=loc, ip=ip).ir_value()
+    vals = [v.bitcast(Int32).ir_value(loc=loc, ip=ip) for v in (v0, v1, v2, v3)]
+    llvm.inline_asm(
+        None,
+        [remote_smem, *vals, remote_mbar],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [$0], {$1, $2, $3, $4}, [$5];",
+        "r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 @cute.jit
 def blockscaled_produce_ktiles(
     k_tile_cnt: Int32,
@@ -541,7 +611,7 @@ def blockscaled_produce_ktiles(
     SFA and SFB of a k-tile. Returns the producer (loop-carried)."""
     ab_producer.reset()
     peek_empty = ab_producer.try_acquire()
-    for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
         handle = ab_producer.acquire_and_advance(peek_empty)
         kt = k_tile0 + handle.count
         cute.copy(
@@ -616,26 +686,49 @@ def blockscaled_producer_loop(
         sfb_n = coord[1]
         if cutlass.const_expr(tn < 128):
             sfb_n = coord[1] // (SF_ATOM_ROWS // tn)  # 64-wide: half an atom; narrow (swap_ab): one tile at atom 0
-        ab_producer = blockscaled_produce_ktiles(
-            k_tile_cnt,
-            k_tile0,
-            ab_producer,
-            tma_atom_a,
-            tma_atom_b,
-            tma_atom_sfa,
-            tma_atom_sfb,
-            tAgA[(None, m_tile, None, coord[2])],
-            tBgB[(None, coord[1], None, coord[2])],
-            tAgSFA[(None, m_tile, None, coord[2])],
-            tBgSFB[(None, sfb_n, None, coord[2])],
-            tAsA,
-            tBsB,
-            tAsSFA,
-            tBsSFB,
-            a_mcast_mask,
-            b_mcast_mask,
-            sfb_mcast_mask,
-        )
+        if cutlass.const_expr(not cc):
+            ab_producer = blockscaled_produce_ktiles(
+                k_tile_cnt,
+                k_tile0,
+                ab_producer,
+                tma_atom_a,
+                tma_atom_b,
+                tma_atom_sfa,
+                tma_atom_sfb,
+                tAgA[(None, m_tile, None, coord[2])],
+                tBgB[(None, coord[1], None, coord[2])],
+                tAgSFA[(None, m_tile, None, coord[2])],
+                tBgSFB[(None, sfb_n, None, coord[2])],
+                tAsA,
+                tBsB,
+                tAsSFA,
+                tBsSFB,
+                a_mcast_mask,
+                b_mcast_mask,
+                sfb_mcast_mask,
+            )
+        else:
+            for c in cutlass.range(0, chunks, 1, unroll=1):  # chunks ascending: the batch mode of the split views
+                ab_producer = blockscaled_produce_ktiles(
+                    k_tile_cnt,
+                    k_tile0,
+                    ab_producer,
+                    tma_atom_a,
+                    tma_atom_b,
+                    tma_atom_sfa,
+                    tma_atom_sfb,
+                    tAgA[(None, m_tile, None, c)],
+                    tBgB[(None, coord[1], None, c)],
+                    tAgSFA[(None, m_tile, None, c)],
+                    tBgSFB[(None, sfb_n, None, c)],
+                    tAsA,
+                    tBsB,
+                    tAsSFA,
+                    tBsSFB,
+                    a_mcast_mask,
+                    b_mcast_mask,
+                    sfb_mcast_mask,
+                )
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
     ab_producer.tail()
@@ -689,7 +782,9 @@ def blockscaled_mma_fold(
     # tn < 64 (the swapped decode records): a single N tile (acceptance: all tokens fit it), so its scale factors are the
     # atom's first rows and the TMEM window needs no shift
     ab_consumer.reset()
-    peek_full = ab_consumer.try_wait() if is_leader_cta else cutlass.Boolean(1)
+    peek_full = cutlass.Boolean(1)
+    if is_leader_cta:
+        peek_full = ab_consumer.try_wait()
     if is_leader_cta:
         acc_pipeline.producer_acquire(acc_state)  # the epilogue has drained this TMEM buffer
     for k_tile in range(k_tile_cnt):  # blocks ascending (the lowering's outer loop)
@@ -700,16 +795,31 @@ def blockscaled_mma_fold(
             cute.copy(tiled_copy_sfb, tCsSFB_s2t[stage], tCtSFB_s2t)
             for j in lowering.inner_steps():  # the lowering's issue order inside a block
                 acc_on = lowering.accumulate(k_tile, j)  # off on the fold's first step only
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, acc_on)
-                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, j)].iterator)
-                tiled_mma.set(tcgen05.Field.SFB, tCtSFB_mma[(None, None, j)].iterator)
-                crd = (None, None, j, handle.index)
-                cute.gemm(tiled_mma, tCtAcc, tCrA[crd], tCrB[crd], tCtAcc)  # one fold step: MMA(D, A, SFA, B, SFB)
+                if cutlass.const_expr(st.breuse):
+                    for h, mma_h in (
+                        (0, tiled_mma_bkeep),
+                        (1, tiled_mma_breuse),
+                    ):  # the two 256-row halves, one B fragment
+                        mma_h.set(tcgen05.Field.ACCUMULATE, acc_on)
+                        mma_h.set(tcgen05.Field.SFA, tCtSFA[(None, h, j)].iterator)
+                        mma_h.set(tcgen05.Field.SFB, tCtSFB_mma[(None, 0, j)].iterator)
+                        cute.gemm(
+                            mma_h,
+                            tCtAcc[(None, h, 0)],
+                            tCrA[(None, h, j, handle.index)],
+                            tCrB[(None, 0, j, handle.index)],
+                            tCtAcc[(None, h, 0)],
+                        )  # one fold step of half the tile's rows
+                else:
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, acc_on)
+                    tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, j)].iterator)
+                    tiled_mma.set(tcgen05.Field.SFB, tCtSFB_mma[(None, None, j)].iterator)
+                    crd = (None, None, j, handle.index)
+                    cute.gemm(tiled_mma, tCtAcc, tCrA[crd], tCrB[crd], tCtAcc)  # one fold step: MMA(D, A, SFA, B, SFB)
             handle.release()
+            peek_full = cutlass.Boolean(1)
             if handle.count + 1 < k_tile_cnt:
                 peek_full = ab_consumer.try_wait()
-            else:
-                peek_full = cutlass.Boolean(1)
     if is_leader_cta:
         acc_pipeline.producer_commit(acc_state)  # accumulator complete: hand to the epilogue
     acc_state.advance()
@@ -753,41 +863,206 @@ def blockscaled_mma_loop(
     and the fold is issued once per chunk, chunks ascending, each from +0 into the next accumulator stage and committed to
     the epilogue, which folds the chunk partials in order (``blocks/epilogue.py``)."""
     assert cute.size(tCrA, mode=[2]) == lowering.inner, "one smem stage must hold exactly the lowering's inner steps"
-    assert cute.size(tCrA, mode=[1]) == 1, "two instructions along M for the B-reuse record only"
+    assert cute.size(tCrA, mode=[1]) == (2 if st.breuse else 1), "two instructions along M for the B-reuse record only"
     tiled_copy_sfa, tCsSFA_s2t, tCtSFA_s2t = s2t_copy_and_partition(sSFA, tCtSFA, st.cta_group, st.S2T_BROADCAST)
     tiled_copy_sfb, tCsSFB_s2t, tCtSFB_s2t = s2t_copy_and_partition(sSFB, tCtSFB, st.cta_group, st.S2T_BROADCAST)
     acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, st.num_acc_stage)
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
         n_tile = work_tile.tile_idx[1]
-        ab_consumer, acc_state = blockscaled_mma_fold(
-            lowering,
-            st,
-            k_tile_cnt,
-            is_leader_cta,
-            n_tile,
-            tiled_mma,
-            ab_consumer,
-            acc_pipeline,
-            acc_state,
-            tCrA,
-            tCrB,
-            tCtAcc_base,
-            acc_tmem_ptr,
-            tCtSFA,
-            tCtSFB,
-            tiled_copy_sfa,
-            tCsSFA_s2t,
-            tCtSFA_s2t,
-            tiled_copy_sfb,
-            tCsSFB_s2t,
-            tCtSFB_s2t,
-            tiled_mma_bkeep,
-            tiled_mma_breuse,
-        )
+        if cutlass.const_expr(not cc):
+            ab_consumer, acc_state = blockscaled_mma_fold(
+                lowering,
+                st,
+                k_tile_cnt,
+                is_leader_cta,
+                n_tile,
+                tiled_mma,
+                ab_consumer,
+                acc_pipeline,
+                acc_state,
+                tCrA,
+                tCrB,
+                tCtAcc_base,
+                acc_tmem_ptr,
+                tCtSFA,
+                tCtSFB,
+                tiled_copy_sfa,
+                tCsSFA_s2t,
+                tCtSFA_s2t,
+                tiled_copy_sfb,
+                tCsSFB_s2t,
+                tCtSFB_s2t,
+                tiled_mma_bkeep,
+                tiled_mma_breuse,
+            )
+        else:
+            for _c in cutlass.range(0, chunks, 1, unroll=1):  # chunks ascending, each a fold from +0 into the next stage
+                ab_consumer, acc_state = blockscaled_mma_fold(
+                    lowering,
+                    st,
+                    k_tile_cnt,
+                    is_leader_cta,
+                    n_tile,
+                    tiled_mma,
+                    ab_consumer,
+                    acc_pipeline,
+                    acc_state,
+                    tCrA,
+                    tCrB,
+                    tCtAcc_base,
+                    acc_tmem_ptr,
+                    tCtSFA,
+                    tCtSFB,
+                    tiled_copy_sfa,
+                    tCsSFA_s2t,
+                    tCtSFA_s2t,
+                    tiled_copy_sfb,
+                    tCsSFB_s2t,
+                    tCtSFB_s2t,
+                    tiled_mma_bkeep,
+                    tiled_mma_breuse,
+                )
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
     acc_pipeline.producer_tail(acc_state)
+
+
+@cute.jit
+def blockscaled_cluster_epilogue_loop(
+    st,
+    chain,
+    tidx: Int32,
+    warp_idx: Int32,
+    tile_sched,
+    tma_atom_c: cute.CopyAtom,
+    tCtAcc_base: cute.Tensor,
+    sC: cute.Tensor,
+    tCgC_base: cute.Tensor,
+    epi_tile: cute.Tile,
+    acc_pipeline,
+    alpha,
+    rank: Int32,
+    mailbox: cute.Tensor,
+    reduce_mbar: cute.Pointer,
+):
+    """The epilogue of the in-cluster split (``cluster_k = C``): the dense epilogue with the ``chunk`` fold of the class
+    ``kchunk[C]`` in front of the chain. Per epilogue subtile ``s`` the owner CTA is rank ``s % C``; every other CTA sends
+    its fp32 fragment of the subtile into the owner's mailbox slot (``st.async`` + the owner's mbarrier); the owner waits
+    for the ``C - 1`` fragments and folds ``acc = +0; for c in 0 .. C-1: acc = add.rn(acc, P_c)`` with ``P_c`` its own
+    registers for ``c = rank`` and the mailbox slot of rank ``c`` otherwise -- chunk order from +0, bit for bit the
+    workspace fixup (``fixup.SplitKFixup``) -- then the chain and the store. The subtile loop is static so the owner is a
+    compile-time rank per subtile; one tile per cluster, so every barrier is used once (phase 0)."""
+    C = st.cluster_k
+    tCgC = transform_partitioned_tensor_layout(tCgC_base)
+    tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
+    copy_atom_t2r = get_tmem_load_op(
+        st.cta_tile_shape_mnk,
+        st.c_layout,
+        st.c_dtype,
+        ACC_DTYPE,
+        epi_tile,
+        st.use_2cta_instrs,
+    )
+    tAcc_epi = cute.flat_divide(tCtAcc, epi_tile)
+    tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
+    thr_t2r = tiled_copy_t2r.get_slice(tidx)
+    tTR_tAcc_base = thr_t2r.partition_S(tAcc_epi)
+    tCgC_epi = cute.flat_divide(tCgC, epi_tile)
+    tTR_gC = thr_t2r.partition_D(tCgC_epi)
+    tTR_rAcc = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, ACC_DTYPE)
+    tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, st.c_dtype)
+    copy_atom_r2s = get_smem_store_op(st.c_layout, st.c_dtype, ACC_DTYPE, tiled_copy_t2r)
+    tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
+    thr_r2s = tiled_copy_r2s.get_slice(tidx)
+    tRS_sC = thr_r2s.partition_D(sC)
+    tRS_rC = tiled_copy_r2s.retile(tTR_rC)
+    bSG_sC, bSG_gC_all = cpasync.tma_partition(
+        tma_atom_c,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sC, 0, 2),
+        cute.group_modes(tCgC_epi, 0, 2),
+    )
+    acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, st.num_acc_stage)
+    c_pipeline = pipeline.PipelineTmaStore.create(
+        num_stages=st.num_c_stage,
+        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * len(EPILOGUE_WARPS)),
+    )
+    vpt = cute.size(tTR_rAcc)  # fp32 values of the subtile held by this thread
+    assert vpt % 4 == 0 and vpt * 32 * len(EPILOGUE_WARPS) == st.subtile_elems, (
+        vpt,
+        st.subtile_elems,
+    )
+    slot_elems = st.subtile_elems  # one peer's fragment of one subtile
+    work_tile = tile_sched.initial_work_tile_info()
+    while work_tile.is_valid_tile:
+        coord = work_tile.tile_idx
+        mnl = (coord[0], coord[1], coord[2])
+        tile_sched.advance_to_next_work()
+        work_tile = tile_sched.get_current_work()
+        bSG_gC = bSG_gC_all[(None, None, None, *mnl)]
+        tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_state.index)]
+        acc_pipeline.consumer_wait(acc_state)  # this CTA's chunk partial is complete in TMEM
+        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+        bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+        for s in cutlass.range_constexpr(st.num_subtiles):
+            owner = s % C
+            cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
+            mbar = reduce_mbar + s
+            if rank != owner:
+                # send this chunk's fragment to the owner: slot = rank, or rank - 1 past the owner (C - 1 slots);
+                # (rank + C - 1 - owner) // C is 1 exactly when rank > owner (rank < C)
+                slot = rank - (rank + (C - 1 - owner)) // C
+                base = (s * (C - 1) + slot) * slot_elems + tidx * vpt
+                for v in cutlass.range_constexpr(0, vpt, 4):
+                    _store_remote_v4(
+                        tTR_rAcc[v],
+                        tTR_rAcc[v + 1],
+                        tTR_rAcc[v + 2],
+                        tTR_rAcc[v + 3],
+                        mailbox.iterator + base + v,
+                        mbar,
+                        Int32(owner),
+                    )
+            else:
+                if warp_idx == EPILOGUE_WARPS[0]:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(mbar, (C - 1) * slot_elems * 4)
+                cute.arch.mbarrier_wait(mbar, 0)
+                # the chunk fold, in chunk order from +0 (the fixup's fold): P_c from the mailbox slot of rank c, own
+                # registers at c = rank
+                for i in cutlass.range_constexpr(vpt):
+                    acc = CuteF32.const(0.0)
+                    for c in cutlass.range_constexpr(C):
+                        if cutlass.const_expr(c == owner):
+                            acc = CuteF32.add(acc, tTR_rAcc[i])
+                        else:
+                            acc = CuteF32.add(
+                                acc,
+                                mailbox[(s * (C - 1) + (c - (1 if c > owner else 0))) * slot_elems + tidx * vpt + i],
+                            )
+                    tTR_rAcc[i] = acc
+                apply_chain_pre_cvt(chain, tTR_rAcc, alpha)
+                acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                tRS_rC.store(acc_vec.to(st.c_dtype))
+                # the owner stores every C-th subtile (s = rank, rank + C, ...): the staging buffer follows its own store
+                # count, as the pipeline's stage does, not the global subtile index (which would map every store of this
+                # CTA to one buffer whenever C and the stage count share a factor, under a store still in flight)
+                c_buffer = (s // C) % st.num_c_stage
+                cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
+                cute.arch.fence_proxy("async.shared", space="cta")
+                named_barrier_sync_unaligned(BAR_EPILOGUE, 32 * len(EPILOGUE_WARPS))
+                if warp_idx == EPILOGUE_WARPS[0]:
+                    cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, s)])
+                    c_pipeline.producer_commit()
+                    c_pipeline.producer_acquire()
+                named_barrier_sync_unaligned(BAR_EPILOGUE, 32 * len(EPILOGUE_WARPS))
+        named_barrier_sync_unaligned(BAR_EPILOGUE, 32 * len(EPILOGUE_WARPS))
+        with cute.arch.elect_one():
+            acc_pipeline.consumer_release(acc_state)
+        acc_state.advance()
+    c_pipeline.producer_tail()
 
 
 class BlockScaledGemm:
@@ -813,8 +1088,7 @@ class BlockScaledGemm:
         enable_pdl: bool = False,
     ):
         """``cta_chunks``: the in-CTA chunk fold (the operands are the split class's ``(rows, Kc, C)`` views with the chunk
-        count C as their batch extent, a runtime value; C has L = 1 and the CTA folds the chunks itself). The persistent
-        grid, the swizzle size and the raster order are Int32 arguments of the call (``blocks/scheduler.py``).
+        count C as their batch extent, a runtime value; C has L = 1 and the CTA folds the chunks itself). The scheduler uses the plan's swizzle and raster order.
         ``plan_cls``: the record's plan (default: the format's in :data:`PLANS`; the mixed classes hand over their own,
         the swapped decode records' with the operand formats exchanged: ``blocks/blockscaled_mx_mixed.py``).
         ``enable_pdl``: programmatic dependent launch -- the kernel waits for the preceding grid before its first operand
@@ -870,6 +1144,10 @@ class BlockScaledGemm:
         self.num_tma_load_bytes = tma.tx_bytes
         params, grid = build_grid(st, c, max_active_clusters)
         cluster = (*self.cluster_shape_mn, 1)
+        if cutlass.const_expr(st.cluster_k > 1):
+            # one tile per cluster: as many persistent "clusters" as tiles; the physical cluster is the K group
+            params, grid1 = build_grid(st, c, 1 << 24)
+            grid, cluster = (st.cluster_k, 1, grid1[2]), (st.cluster_k, 1, 1)
         # the in-CTA chunk fold's count: the operands' batch extent (dynamic)
         n_chunks = a.shape[2] if self.cta_chunks else None
         self.kernel(
@@ -956,19 +1234,45 @@ class BlockScaledGemm:
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
 
-        # --- barriers, pipelines, TMEM allocator
+        # --- scaffolding: barriers, pipelines, TMEM allocator (as the dense body); the in-cluster split adds its mailbox
+        C = st.cluster_k
         smem = cutlass.memory.SmemAllocator()
+        if cutlass.const_expr(C > 1):
 
-        @cute.struct
-        class SharedStorage:
-            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_ab_stage * 2]
-            acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_acc_stage * 2]
-            tmem_dealloc_mbar: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
+            @cute.struct
+            class SharedStorageCluster:
+                ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_ab_stage * 2]
+                acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_acc_stage * 2]
+                tmem_dealloc_mbar: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+                reduce_mbar: cute.struct.MemRange[cutlass.Int64, st.num_subtiles]
+                reduce_mailbox: cute.struct.Align[cute.struct.MemRange[Float32, st.mailbox_elems], 16]
 
-        storage = smem.allocate(SharedStorage)
+            storage = smem.allocate(SharedStorageCluster)
+        else:
+
+            @cute.struct
+            class SharedStorage:
+                ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_ab_stage * 2]
+                acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_acc_stage * 2]
+                tmem_dealloc_mbar: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+
+            storage = smem.allocate(SharedStorage)
+        rank = cta_rank_in_cluster  # the K chunk of this CTA when C > 1
         k_tile0 = Int32(0)
+        mailbox = None
+        reduce_mbar = None
+        if cutlass.const_expr(C > 1):
+            reduce_mbar = storage.reduce_mbar.data_ptr()
+            mailbox = storage.reduce_mailbox.get_tensor(cute.make_layout((st.mailbox_elems,)))
+            if warp_idx == TMA_WARP:
+                with cute.arch.elect_one():
+                    for s in cutlass.range_constexpr(st.num_subtiles):
+                        cute.arch.mbarrier_init(reduce_mbar + s, 1)
         sync_shape = self.cluster_shape_mn  # the physical cluster: the barrier inits must be visible cluster-wide
+        if cutlass.const_expr(C > 1):
+            sync_shape = (C, 1)
         ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=st.num_ab_stage,
@@ -1037,6 +1341,9 @@ class BlockScaledGemm:
         gSFB_nkl = cute.local_tile(mSFB_nkl, cute.slice_(st.mma_tiler_sfb, (0, None, None)), (None, None, None))
         gC_mnl = cute.local_tile(mC_mnl, cute.slice_(st.mma_tiler, (None, None, 0)), (None, None, None))
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        if cutlass.const_expr(C > 1):
+            k_tile_cnt = k_tile_cnt // C  # whole k-tiles per chunk (acceptance: K % (k_block C) == 0)
+            k_tile0 = rank * k_tile_cnt
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         thr_mma_sfb = tiled_mma_sfb.get_slice(mma_tile_coord_v)
         tCgA = thr_mma.partition_A(gA_mkl)
@@ -1101,6 +1408,9 @@ class BlockScaledGemm:
         # per cluster, the tile sequence shared by the C ranks); created (its first tile decoded) before the barrier init
         # completes, so the decode overlaps the wait
         sched_bidx, sched_grid = cute.arch.block_idx(), cute.arch.grid_dim()
+        if cutlass.const_expr(C > 1):
+            sched_bidx = (Int32(0), Int32(0), sched_bidx[2])
+            sched_grid = (Int32(1), Int32(1), sched_grid[2])
         tile_sched = TileScheduler.create(tile_sched_params, sched_bidx, sched_grid)
         pipeline_init_wait(cluster_shape_mn=sync_shape)
         tmem.allocate(st.num_tmem_alloc_cols)
@@ -1179,27 +1489,49 @@ class BlockScaledGemm:
         )
         if warp_idx < MMA_WARP:
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            epilogue_loop(
-                st,
-                self.chain,
-                atom_thr_size,
-                tidx,
-                warp_idx,
-                tile_sched,
-                tma_atom_c,
-                tCtAcc_base,
-                sC,
-                tCgC,
-                epi_tile,
-                acc_pipeline,
-                alpha,
-                chunks=chunk_count,
-                cc=cc,
-            )
+            if cutlass.const_expr(C > 1):
+                blockscaled_cluster_epilogue_loop(
+                    st,
+                    self.chain,
+                    tidx,
+                    warp_idx,
+                    tile_sched,
+                    tma_atom_c,
+                    tCtAcc_base,
+                    sC,
+                    tCgC,
+                    epi_tile,
+                    acc_pipeline,
+                    alpha,
+                    rank,
+                    mailbox,
+                    reduce_mbar,
+                )
+            else:
+                epilogue_loop(
+                    st,
+                    self.chain,
+                    atom_thr_size,
+                    tidx,
+                    warp_idx,
+                    tile_sched,
+                    tma_atom_c,
+                    tCtAcc_base,
+                    sC,
+                    tCgC,
+                    epi_tile,
+                    acc_pipeline,
+                    alpha,
+                    chunks=chunk_count,
+                    cc=cc,
+                )
 
         cute.arch.sync_threads()
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
+        if cutlass.const_expr(C > 1):
+            cute.arch.cluster_arrive()  # no CTA leaves while a peer may still address its smem
+            cute.arch.cluster_wait()
 
 
 class ScaledBlockScaledGemm(BlockScaledGemm):

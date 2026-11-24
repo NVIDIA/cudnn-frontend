@@ -19,6 +19,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import LayoutEnum
 
+from cudnn.frost.tile_dsl.barrier import named_barrier_sync_unaligned
+
 from .arithmetic import CuteF32
 from .arithmetic import Knobs, MainloopBlock
 from .arithmetic import EpilogueChain
@@ -45,9 +47,8 @@ class BlockGemm:
     in-CTA chunk fold of the split class (A and B as the split class's ``(rows, Kc, C)`` views, C with ``L = 1``; the
     chunk partials folded in order through the TMEM running sum; the count C is the operands' batch extent, a runtime
     value). ``in_fmt`` is the operand format (``bf16`` / ``e4m3`` / ``e5m2``); the chain is the specification's object
-    for the output format (unscaled and unbiased here; the subclasses set ``scaled`` / ``biased``). The persistent grid,
-    the swizzle size and the raster order are Int32 arguments of the call (``blocks/scheduler.py``): one object per
-    tile / cluster bucket."""
+    for the output format (unscaled and unbiased here; the subclasses set ``scaled`` / ``biased``). The persistent grid is bounded by the
+    resident-cluster count. The scheduler visits tiles in the placement's raster order."""
 
     scaled = False
     biased = False
@@ -212,7 +213,7 @@ class BlockGemm:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=BAR_TMEM_ALLOC, num_threads=THREADS)
+        tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(EPILOGUE_WARPS) + 1))
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -282,8 +283,9 @@ class BlockGemm:
         tile_sched = TileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         tmem.allocate(st.num_tmem_alloc_cols)
-        tmem.wait_for_alloc()
-        tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
+        # Only MMA and epilogue warps consume TMEM. The TMA warp can start its first transfer during allocation.
+        if warp_idx < TMA_WARP:
+            named_barrier_sync_unaligned(BAR_TMEM_ALLOC, tmem_alloc_barrier.num_threads)
 
         # --- roles
         if warp_idx == TMA_WARP:
@@ -304,7 +306,7 @@ class BlockGemm:
                 cc=cc,
             )
         if warp_idx == MMA_WARP:
-            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            tCtAcc_base = cute.make_tensor(tmem.retrieve_ptr(ACC_DTYPE), tCtAcc_fake.layout)
             mma_loop(
                 self.lowering,
                 st.num_acc_stage,
@@ -327,7 +329,7 @@ class BlockGemm:
             swizzle=c_smem_layout_staged.inner,
         )
         if warp_idx < MMA_WARP:
-            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            tCtAcc_base = cute.make_tensor(tmem.retrieve_ptr(ACC_DTYPE), tCtAcc_fake.layout)
             epilogue_loop(
                 st,
                 self.chain,
@@ -350,7 +352,7 @@ class BlockGemm:
 
         cute.arch.sync_threads()
         tmem.relinquish_alloc_permit()
-        tmem.free(tmem_ptr)
+        tmem.free(tmem.retrieve_ptr(ACC_DTYPE))
 
 
 class ScaledBlockGemm(BlockGemm):
@@ -380,3 +382,9 @@ class ScaledBlockGemm(BlockGemm):
             b_scale,
             None,
         )
+
+
+class BiasedBlockGemm(BlockGemm):
+    """Add the column bias to the completed FP32 sum before converting to BF16."""
+
+    biased = True

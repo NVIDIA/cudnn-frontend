@@ -131,12 +131,12 @@ def test_quantized_pipeline_refill(gemm_device, fmt):
     outputs = run()
     props = torch.cuda.get_device_properties(gemm_device)
     in_fmt = {"groupwise": "e4m3_block128", "mxfp8_mxfp4": "mxfp4w8a"}.get(fmt, fmt)
-    op = SimpleNamespace(m=m, n=n, k=k, batch=1, in_fmt=in_fmt)
-    schedule = schedule_for(op, (props.major, props.minor), props.multi_processor_count)
-    cluster_size = schedule.cluster[0] * schedule.cluster[1]
+    op = SimpleNamespace(m=m, n=n, k=k, batch=1, in_fmt=in_fmt, b_major="k")
+    schedule = schedule_for(op, gemm_device.index)
+    cluster_size = schedule.knobs.cluster_m * schedule.knobs.cluster_n
     assert schedule.chunks == 1
     # Even if A alone occupied all opt-in shared memory, its stages would wrap.
-    rows_per_block = schedule.tile[0] // schedule.cluster[0]
+    rows_per_block = schedule.knobs.inst_m // (2 if schedule.knobs.use_2cta_instrs else 1)
     bytes_per_k = rows_per_block * case.x.element_size() * case.x.size(-1) // k
     resident_k = props.shared_memory_per_block_optin // bytes_per_k
     assert_warm_stress(
