@@ -97,13 +97,22 @@ class PlanConfig:
     mode: Any = None
 
 
+def require_stream(stream: Any, owner: str) -> int:
+    """``ExecutionContext.stream`` as the int a launch takes. The graph always resolves one; a None
+    here is a caller that bypassed it, refused rather than launched on stream 0."""
+    if stream is None:
+        raise ValueError(f"{owner}: no launch stream; pass the graph's ExecutionContext.stream (a concrete CUDA stream handle)")
+    return int(stream)
+
+
 class ExecutionContext(NamedTuple):
     """Runtime context passed to a compiled plan at execute time.
 
     Everything an engine may need is explicit here — no engine should reach
     into private graph state, hard-code a stream, or allocate hidden workspace.
-    ``stream`` is resolved from the handle when available (classic
-    ``cudnn.set_stream(handle, ...)`` semantics).
+    The graph always passes a concrete ``stream``: the handle's (classic
+    ``cudnn.set_stream(handle, ...)`` semantics), else the caller's current
+    torch stream on the plan's device (0 when torch is not loaded).
 
     A ``NamedTuple`` (not a frozen dataclass): both immutable, but built on every
     execute, where the NamedTuple is ~220 ns/execute cheaper.

@@ -172,7 +172,7 @@ class SdpaDenseBinder {
                     flag("paged") || flag("ragged"))
                     invalid("native block-scaled output requires a non-paged unsplit dense plan");
             }
-            if (py::len(py::object(quant.attr("sf_sizes")))) mx_scales_ = std::make_unique<SdpaMxScaleBinding>(spec);
+            if (sf_count != 0) mx_scales_ = std::make_unique<SdpaMxScaleBinding>(spec);
             quant_offset_ = py::cast<int64_t>(quant.attr("scratch_offset"));
             add(quant_offset_, 8);
             has_amax_  = py::cast<bool>(quant.attr("has_amax"));
@@ -182,9 +182,11 @@ class SdpaDenseBinder {
         // Admitted split plans produce sink-free partials; combine folds it once.
         const auto dq = integer("d_qk"), dv = integer("d_v");
         const bool native_d576 =
-            !quantized_ && dq > 512 && dq <= 576 && dv > 256 && dv <= 512 && dq % 8 == 0 && dv % 8 == 0;
+            (!quantized_ && dq > 512 && dq <= 576 && dv > 256 && dv <= 512 && dq % 8 == 0 && dv % 8 == 0) ||
+            (quantized_ && !mx_scales_ && !block_output_ && dq == 576 && dv == 512);
         if (!native_d576 && (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8))
-            invalid("native dense binding requires a supported half attention head dimension pair");
+            invalid(quantized_ ? "native dense binding requires a supported quantized attention head dimension pair"
+                               : "native dense binding requires a supported half attention head dimension pair");
         fp32_partial_  = flag("fp32_partial");
         ragged_        = flag("ragged");
         ragged_q_lens_ = py::hasattr(spec, "ragged_q_lens") ? integer("ragged_q_lens") : 0;
@@ -1018,6 +1020,7 @@ init_sdpa_dense_binding(py::module_ &m) {
         .def_prop_ro_static("supports_combine_q_lens", [](py::object) { return true; })
         .def_prop_ro_static("supports_ragged_q_lens", [](py::object) { return true; })
         .def_prop_ro_static("supports_quantized_split_sink", [](py::object) { return true; })
+        .def_prop_ro_static("supports_fp8_d576", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
         .def_prop_ro_static("supports_d576_envelope", [](py::object) { return true; })
         .def_prop_ro_static("supports_fused_split", [](py::object) { return true; })

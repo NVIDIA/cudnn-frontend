@@ -83,6 +83,11 @@ delegates these exact cells and retains smaller flavors and head envelopes.
 The explicit row reports TILE_M=128 and physical TILE_CGA_M=4, with a fixed
 two-CTA MMA group. Its kernel, configuration, contract and host entry live in
 `sm100/d512_fp8_role_split/`; half and block-scaled kernels keep separate owners.
+Dense queries also support exact D576/V512 for absorbed MLA, including FP8 K/V
+views over one 576-element record. The 512-column V prefix retains the record
+stride in dense and paged storage. The D576 variant uses two score stages and
+requires the matching native dense binder. Paged and dense THD at D576 remain
+outside its domain.
 Dense Q over dense/paged KV retains masks, sinks, whole-group packing and split-KV;
 nonpaged THD retains its existing unsplit contract. Paged THD and block-scaled
 output remain declined. Central selection preserves the old candidate order,
@@ -112,8 +117,9 @@ E4M3/E5M2 with existing scalar FP16/BF16/E4M3/E5M2 outputs. The legacy
 The independent `sm100/d192_fp8_multi_q/` body/configuration/contract/host
 keeps one/two-CTA multi-Q variants and uses the shared graph binder/launcher.
 Public TILE_M=128 and TILE_CGA_M=1/2 name the physical cluster and MMA group;
-existing split plans require two CTAs. Paging and block-scaled O remain
-unsupported. Dense and nonpaged THD retain existing mask, packing, split,
+existing split plans require two CTAs. Dense Q supports paged K/V with independent
+page tables and pool strides. Paged THD and block-scaled O remain unsupported.
+Dense and nonpaged THD retain existing mask, packing, split,
 Stats and physical-origin restrictions. Central policy preserves candidate
 order and placement. Old exact-D192 20513 recipes must be replanned.
 No additional numerical, stride-override or determinism guarantee is introduced.
@@ -477,7 +483,7 @@ mask/sink, padded-Stats and changed-length replay tests exercise this support.
 
 Paged K and V may independently use HND or NHD physical storage on every
 existing paged forward row: SM100/SM103 half D64/D128/D192x128/D256/D512,
-per-tensor FP8 D64/D128/D256/D512, MXFP8 D128/D192x128/D256/D512; SM107 half THD
+per-tensor FP8 D64/D128/D192x128/D256/D512, MXFP8 D128/D192x128/D256/D512; SM107 half THD
 D128/D256 and D256 decode, plus MXFP8 D128/D256. Each operand's declared
 layout is recorded separately in the plan and checked by its native binder.
 TMA descriptors retain the existing shared coordinate order with each pool's

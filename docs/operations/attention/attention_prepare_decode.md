@@ -112,6 +112,27 @@ next call at that token count from ANY host thread. An entry-owned output is an 
 one: a call whose other operand overlaps an entry-owned output that the call does not pass is declined with
 `ValueError` before the launch. The pools are always the caller's.
 
+**A launch is ordered behind the stream work of an entry-owned pair's allocation.** The pair is allocated on torch's
+current stream of the entry's device at that moment. The entry does not initialize it, but that stream can still write
+it: under deterministic algorithms torch fills it, and a recycled block can carry a write the stream still owes it.
+Every launch that writes bytes of the pair waits for that work on whatever stream it runs and however the tensor
+reached the call: the entry's own output, a tensor taken with `outputs(tokens)` and passed back as `q_out` /
+`gate_out` or as a pool, whole or as a view, at this token count or another, by this entry or by another entry that
+orders its launches the same way (today `AddNormQuantDecode`, `AttentionPrepareDecode` and `AttentionGateQuantDecode`);
+the test is one of addresses. The launch stream waits for an event recorded behind the allocation, without a host
+wait and without synchronizing a stream or the device, so `compile(tokens)` may run on any stream; on the allocating
+stream itself the event is already behind the launch and the wait is free, and a stream that was given the raw handle
+of a destroyed allocating stream waits like any other. A captured call that finds the work still pending waits for
+that one event on the host before its launch (a capturing stream cannot wait for an event recorded outside its
+capture): set-up, never part of a replay, and not needed for a pair allocated before the capture once its stream's
+earlier work is done (`torch.cuda.graph` synchronizes when it is entered; a raw capture does not). Not ordered: a pair
+allocated inside a stream capture (nothing is recorded: allocate before the capture). An allocation on
+the legacy default stream while a blocking stream of another host thread captures raises torch's error: allocate
+before that capture or on a stream of your own. Once a call has seen the work complete nothing is kept of it; while
+it is pending on the device, every call of such an entry on that device reads the device's records. What stays the
+caller's: the operands a launch only reads, and the caller's own reads and writes of a returned tensor outside a
+call. `outputs(tokens)` returns a copy of the entry's table (the same tensors) without waiting.
+
 Everything the entry does not serve is declined by name. At construction, without torch and without the DSL:
 `TypeError` for a `geometry` that is not an `AttentionPrepareGeometry` of `int` fields or a launch knob that is not a
 `bool`; `ValueError` for a non-positive geometry field, an `eps` that is not a finite positive Python `float` or

@@ -60,9 +60,10 @@ class ProviderRow:
     # an entry that is called in several forms: (call site of the model's wiring, the further fields of the entry's form there).
     # ``None`` in place of the fields: the row serves no call at that site and hands it on to the next row that serves the run
     sites: Tuple[Tuple[str, Optional[Tuple[Tuple[str, object], ...]]], ...] = ()
-    # the layer widths the row's entry serves, where it serves some only: (field of the model's geometry, value) pairs.  A
-    # model that differs in one of them is not this row's, and the next row of the block is asked
-    widths: Tuple[Tuple[str, int], ...] = ()
+    # the layer widths the row's entry serves, where it serves some only: (field of the model's geometry, value) pairs -- a
+    # whole number, or the tuple of whole numbers such a field holds (the sections of a rotary width).  A model that
+    # differs in one of them is not this row's, and the next row of the block is asked
+    widths: Tuple[Tuple[str, Union[int, Tuple[int, ...]]], ...] = ()
 
     @property
     def stacks(self) -> Tuple[str, ...]:
@@ -218,6 +219,7 @@ class BySite:
 
     stored_weights = False  # asked of the parts: each reads its weight in its own form
     stored_layout = None
+    cache_page = None  # asked of the parts too: the session collects the page of the attention cache over every part of its plans
     batch_note = ""
 
     def __init__(self, name: str, parts: Sequence[tuple]):
@@ -337,6 +339,12 @@ class Plan(dict):
             else:
                 found += [(scoped(name, site), name, site, row, part) for site, row, part in split]
         return found
+
+    def announcements(self) -> list:
+        """What the first use of this plan will do beyond building an entry's kernel, one sentence per kind
+        (``Block.first_use_note``; a library that builds kernels of its own with the installed compiler), in table order.  A
+        sample prints them before it makes that first use (``first_use``): a first build prints nothing while it runs."""
+        return list(dict.fromkeys(note for _, _, _, _, block in self.parts() if (note := getattr(block, "first_use_note", ""))))
 
     def __eq__(self, other):
         """Two plans are equal when they hold the same blocks and the same decisions.  Against a plain mapping the comparison is

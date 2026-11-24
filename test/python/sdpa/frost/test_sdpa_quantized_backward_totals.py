@@ -124,6 +124,13 @@ def test_native_fp8_backward_declared_totals_preserve_results(monkeypatch, reque
     # including payloads, scales, offsets, O and Stats; NaN tails are compared
     # as bytes without treating unused storage as a finite output.
     assert_bitwise(runs[1][2], runs[0][2], "paired backward inputs")
-    assert runs[0][1] == runs[1][1], "native configuration or workspace changed"
+    plans = [[plan for plan, _ in records] for _, records, _ in runs]
+    workspaces = [[workspace for _, workspace in records] for _, records, _ in runs]
+    assert plans[0] == plans[1], "native configuration changed"
+    if hkv != cfg.h_q and cudnn.backend_version() >= 93000:
+        # the GQA dK/dV partials follow the declared totals
+        assert all(packed < envelope for envelope, packed in zip(*workspaces)), "declared totals did not shrink the workspace"
+    else:
+        assert workspaces[0] == workspaces[1], "native workspace changed"
     request.node.user_properties.append(("native_backward_records", str(runs[0][1])))
     assert_bitwise(runs[1][0], runs[0][0], "declaring backward packed totals")

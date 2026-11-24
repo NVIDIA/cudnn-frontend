@@ -3,7 +3,6 @@
 
 """Host-only CuTeDSL version gates for the Frost convolution variants."""
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -63,7 +62,6 @@ def test_build_plan_gates_before_importing_the_template(dsl_state, monkeypatch, 
     )
     dsl_state(True, ("nvidia-cutlass-dsl", version))
     monkeypatch.setattr(engine, "analyze", lambda graph: analysis)
-    monkeypatch.setattr(engine, "build_device", lambda device: nullcontext())
 
     with pytest.raises(NotImplementedError, match=error):
         engine.FrostConvEngine().build_plan(None, None)

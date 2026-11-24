@@ -25,6 +25,9 @@ def test_public_jax_export():
 
 def jax_inputs(inputs):
     tensors, metadata, upstream = inputs
+    # Initialize XLA before a DLPack export selects its tensor's CUDA device.
+    with torch.cuda.device(tensors[0].device):
+        jax.local_devices(backend="gpu")
 
     def convert(t):
         with torch.cuda.device(t.device):
@@ -60,8 +63,6 @@ def runner(topk=512, coefficient=0.1, triangular=False, backward=True):
 
 def execute(inputs, topk=512, coefficient=0.1, triangular=False, backward=True):
     with torch.cuda.device(inputs[0][0].device):
-        # Backend initialization can leave another CUDA device current.
-        jax.local_devices(backend="gpu")
         tensors, metadata, upstream = jax_inputs(inputs)
         result = jax.block_until_ready(runner(topk, coefficient, triangular, backward)(*tensors, *metadata, upstream))
         return dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), torch_outputs(result, inputs[0][0].device)))
@@ -189,7 +190,8 @@ def test_dlpack_device_context(monkeypatch):
 
 
 @pytest.mark.parametrize("fail", [False, True], ids=["success", "error"])
-def test_jax_initialization_restores_caller_device(monkeypatch, fail):
+@pytest.mark.parametrize("entry_point", [jax_inputs, execute], ids=["convert", "execute"])
+def test_jax_initialization_restores_caller_device(monkeypatch, fail, entry_point):
     from contextlib import contextmanager
 
     inputs = pack([sample(3)])
@@ -211,6 +213,8 @@ def test_jax_initialization_restores_caller_device(monkeypatch, fail):
         assert backend == "gpu"
         initialized = True
         current = torch.device("cuda:3")
+        if fail and entry_point is jax_inputs:
+            raise RuntimeError("JAX initialization failed")
         return ()
 
     def convert(tensor):
@@ -233,11 +237,14 @@ def test_jax_initialization_restores_caller_device(monkeypatch, fail):
     monkeypatch.setattr(jax, "block_until_ready", lambda x: x)
     monkeypatch.setitem(execute.__globals__, "runner", lambda *args: invoke)
     if fail:
-        with pytest.raises(RuntimeError, match="JAX execution failed"):
-            execute(inputs)
+        with pytest.raises(RuntimeError, match="JAX (?:initialization|execution) failed"):
+            entry_point(inputs)
     else:
-        actual = execute(inputs)
-        assert actual["output"] is inputs[0][0]
+        actual = entry_point(inputs)
+        if entry_point is execute:
+            assert actual["output"] is inputs[0][0]
+        else:
+            assert actual[0][0] is inputs[0][0]
     assert initialized
     assert current == caller
 

@@ -42,6 +42,7 @@ _OFFERED = {
     "sdpa_bwd_sm107_d256_f16_4x1": 20632,
     "sdpa_bwd_sm107_fp8": 20605,
     "sdpa_bwd_sm107_mxfp8": 20606,
+    "sdpa_bwd_sm107_d192": 20610,
     "sdpa_bwd_sm100_d256": 20607,
     "sdpa_bwd_sm107_d512": 20608,
     "sdpa_bwd_sm100_d128": 20609,
@@ -327,7 +328,7 @@ def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
 
 
 def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
-    """The default 16-bit rows with no measured lead shard sit after the LAST_RESORT marker: behind every requested mode's
+    """The default rows with no measured lead shard sit after the LAST_RESORT marker: behind every requested mode's
     backend block (a correctness fallback for graphs the backend declines); the FROST opt-in keeps them first."""
     from cudnn.engines.base import PlanConfig
     from cudnn.engines.heuristics import is_backend_block, is_last_resort
@@ -337,12 +338,17 @@ def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
     tag = lambda p: "backend" if is_backend_block(p) else "last_resort" if is_last_resort(p) else "frost"
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    specs = {s.name: s for s in bwd_engines.ENGINE_SPECS}
     for name in heuristics.TRAIL_ONLY_ROWS:
-        assert not family.slots[name].opt_in, name
-        eid = _OFFERED[name]
-        monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered, eid=eid: [PlanConfig(eid, None)])
-        # d256: no study timed these head dims, so no placement_table entry lifts the row
-        assert [tag(p) for p in heuristics.propose("A", _facts(d_qk=256, d_v=256), _OFFERED)] == ["backend", "last_resort", "frost"], name
+        # A delegating row never runs itself: its default-offered explicit owners are what trails.
+        owners = sorted(specs[name].capabilities.delegated) or [name]
+        offered = [n for n in owners if not family.slots[n].opt_in]
+        assert offered, name
+        for owner in offered:
+            eid = _OFFERED[owner]
+            monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered, eid=eid: [PlanConfig(eid, None)])
+            # d256: no study timed these head dims, so no placement_table entry lifts the row
+            assert [tag(p) for p in heuristics.propose("A", _facts(d_qk=256, d_v=256), _OFFERED)] == ["backend", "last_resort", "frost"], owner
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["frost"]
 
@@ -444,7 +450,13 @@ def test_rtx5090_backward_entries_lift_the_sm120_row_on_cc_12_0(monkeypatch):
             for s_q, s_kv in ((512, 1024), (1024, 512)):  # the key does not see squareness, the guard does
                 assert pt.lookup("sdpa_bwd_sm120", facts(dtype=dtype, d_qk=d, d_v=d, causal=False, s_q=s_q, s_kv=s_kv)) is True
                 assert order(dtype=dtype, d_qk=d, d_v=d, causal=False, s_q=s_q, s_kv=s_kv) == trails
-            assert order(dtype=dtype, d_qk=d, d_v=d, deterministic=True) == trails  # no study timed deterministic reductions
+            # Deterministic graphs are classes of their own (sm120_det_bwd_20261117, bf16 only; no holdout cell exercised d128 causal MHA).
+            det = order(dtype=dtype, d_qk=d, d_v=d, deterministic=True)
+            if (dtype, d) == (cudnn.data_type.BFLOAT16, 64):
+                assert det[0] == "frost", det
+            else:
+                assert det == trails, (dtype, d, det)
+            assert order(dtype=dtype, d_qk=d, d_v=d, deterministic=True, s_q=512, s_kv=1024) == trails  # square-only study
     assert order(d_qk=256, d_v=256) == trails  # head dims no study timed
     assert order(s_q=4, s_kv=4) == trails  # MTP-shaped
     assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout

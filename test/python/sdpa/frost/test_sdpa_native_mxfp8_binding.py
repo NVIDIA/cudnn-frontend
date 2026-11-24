@@ -56,6 +56,16 @@ def _fixture(thd=False, d=128, dv=128, split=1, output="bfloat16", carrier="uint
     return s, facts, frames, combined, roles
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("scale_count", [2, 3])
+def test_native_mxfp8_rejects_per_tensor_mla_width(scale_count):
+    spec, *_ = _fixture()
+    spec.d_qk, spec.d_v = 576, 512
+    spec.quant = spec.quant._replace(sf_sizes=spec.quant.sf_sizes[:scale_count])
+    with pytest.raises(ValueError, match="supported quantized attention head dimension pair"):
+        cudnn._pybind_module._SdpaDenseBinder(spec)
+
+
 def _execute(s, facts, roles, thd, workspace=0x50000000):
     pack = prep._native_pack_from_facts(facts, roles)
     indices = tuple(range(len(roles)))

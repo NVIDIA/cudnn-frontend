@@ -279,6 +279,12 @@ def scale_operand(scales: cute.Tensor, operand_shape: cute.Shape, k_offset=None)
 
 
 @cute.jit
+def offset_scale_rows(scales: cute.Tensor, rows: Int32) -> cute.Tensor:
+    """Shift whole 128-row tiles without decomposing negative offsets inside the scale atom."""
+    return cute.domain_offset((((0, 0), rows // Int32(128)), Int32(0)), scales)
+
+
+@cute.jit
 def make_sf_load_fns(
     collective,
     tiled_mma: cute.TiledMma,

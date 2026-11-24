@@ -140,7 +140,7 @@ def _validate_cfg_d512(cfg: CfgD512) -> None:
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d512: per-role regs must be multiples of 8"),
         (cfg.CGA_M == 4 and cfg.CGA_N == 1 and cfg.CTA_MMA == 2, "d512 flavor: cga4x1 / CTA_MMA=2 only"),
         (cfg.CGA_M // cfg.CTA_MMA == 2, "d512 flavor: exactly two sub-groups (CGA_M / CTA_MMA == 2)"),
-        (cfg.TILE_K == 512 and cfg.TILE_O == 512, "d512: d_qk = d_v = 512"),
+        (cfg.TILE_K in (512, 640) and cfg.TILE_O == 512, "wide FP8 requires a 512- or 640-column QK tile and 512-column output"),
         (cfg.TILES_Q == 1, "d512 (role-split): TILES_Q must be 1"),
         (cfg.SOFTMAX_WARPGROUPS == 1, "d512 (role-split): SOFTMAX_WARPGROUPS must be 1"),
         (cfg.CORRECTION_WARPS == 0, "d512 (role-split): CORRECTION_WARPS must be 0"),
@@ -162,11 +162,11 @@ def _validate_cfg_d512(cfg: CfgD512) -> None:
         # XFER_STAGES * TILE_N (S_acc parities) + TILE_K / (4 // BPE) (Q, moved
         # to TMEM by UTCCP).  f16: 2*128 + 256 = 512.  FP8 packs 4 elems per
         # 4-byte column, so Q costs only 128 cols and a third parity fits:
-        # 3*128 + 128 = 512.
-        (cfg.XFER_STAGES == (3 if _fp8 else 2), "d512 (SM100): XFER_STAGES must be 3 (fp8) / 2 (f16) — TMEM-cap driven"),
+        # 3*128 + 128 = 512. D576 uses two score slots and 160 Q columns.
+        (cfg.XFER_STAGES == (3 if _fp8 and cfg.TILE_K == 512 else 2), "wide FP8 needs three score slots at D512 and two at D576"),
         (
-            cfg.XFER_STAGES * cfg.TILE_N + cfg.TILE_K // (4 // cfg.BPE) == 512,
-            f"d512 (SM100): sg0 TMEM carve (S_acc {cfg.XFER_STAGES * cfg.TILE_N} + Q {cfg.TILE_K // (4 // cfg.BPE)}) must be exactly 512 cols",
+            cfg.XFER_STAGES * cfg.TILE_N + cfg.TILE_K // (4 // cfg.BPE) == (416 if cfg.TILE_K == 640 else 512),
+            f"d512 (SM100): sg0 TMEM carve (S_acc {cfg.XFER_STAGES * cfg.TILE_N} + Q {cfg.TILE_K // (4 // cfg.BPE)}) does not match the selected wide tile",
         ),
         (
             cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
@@ -195,7 +195,12 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
     # Rubin K=64 answer (see mma-tma-matrix.md § 1 "latent trap in the shared
     # helper") — k_dim=0 with TILE_K_HW=64 is the silently-wrong combination.
     tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
+    # A 576-wide record spans four full 128-byte swizzles and half of a fifth.
+    # The final half swizzle is zero-filled by the Q/K tensor maps, preserving
+    # both the caller's 576-element pitch and the V prefix's 512 logical values.
+    mla = params.d_flavor == 576
     cfg = CfgD512(
+        TILE_K=640 if mla else 512,
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
@@ -207,10 +212,10 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw_fp8,
         TILE_K_HW_BMM2=tile_k_hw_fp8,
-        # FP8 halves the K/V ring and the TMEM-resident Q, buying a third KV
-        # stage and a third S_acc parity under the same SMEM / TMEM caps.
+        # The larger MLA Q still permits three KV stages in SMEM. Its TMEM
+        # allocation fits two score slots instead of the three used at D512.
         STAGES_KV=3 if fp8 else 2,
-        XFER_STAGES=3 if fp8 else 2,
+        XFER_STAGES=3 if fp8 and not mla else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,

@@ -65,6 +65,29 @@ def pick_flavor(d_qk: int, d_v: int) -> str:
     raise ValueError(f"SM80 SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}).  Supported envelopes: {dims}.")
 
 
+def default_tile_m(d_qk: int, d_v: int, s_q: int, thd: bool) -> int:
+    """The query tile the adapter runs when the graph requests none; the split-KV cost model reads the same rule.
+
+    Smaller CTAs expose more parallelism for short dense queries. At D192, 64 rows also shrink the Q/V shared-memory
+    region. Sixteen rows per warp either way.
+    """
+    short_d256 = not thd and d_qk == d_v == 256 and s_q <= 128
+    if short_d256 or (not thd and ((d_qk == d_v == 128 and s_q <= 128) or (d_qk == 192 and d_v == 128 and s_q <= 64))):
+        return 64
+    return FLAVOR_CFGS[pick_flavor(d_qk, d_v)].TILE_M
+
+
+def default_tile_n(d_qk: int, d_v: int, s_q: int, thd: bool, tile_m: int) -> int:
+    """The KV tile the adapter runs when the graph requests none; the split-KV planner reads the same rule.
+
+    At D256 the 64-key double buffers still occupy 128 KiB. The short-d256 64-row Q tile pairs with 32-key buffers to reduce
+    that total to 64 KiB.
+    """
+    if not thd and d_qk == d_v == 256 and s_q <= 128 and tile_m == 64:
+        return 32
+    return FLAVOR_CFGS[pick_flavor(d_qk, d_v)].TILE_N
+
+
 def graph_tile_domains(d_qk: int, d_v: int) -> tuple[frozenset[int], frozenset[int]]:
     """Explicit graph tuning domain; this does not prescribe default tiles.
 

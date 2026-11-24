@@ -1695,10 +1695,14 @@ def test_the_models_stored_forms_and_the_drafter_loaded_together(tmp_path):
     assert drafter.geometry.layer_kinds == ("full_attention",) and model.geometry.layer_kinds == ("linear_attention", "full_attention")
     assert dataclasses.replace(drafter.geometry, layer_kinds=model.geometry.layer_kinds) == model.geometry, "the model's widths, one attention layer"
 
-    # the forms a native plan of the published widths keeps on compute capability 10.0: the weights its entries multiply on
-    native = plan(QwenDense.provider_table, QwenDense.regimes, DeviceFacts((10, 0)), 1, 1, "native", model=QwenDense.reduced())
-    kept = tuple(name for name, block in native.items() if block.stored_weights)
+    # the forms a plan of the cuDNN Frontend rows keeps on compute capability 10.0: the weights its entries multiply on; a plan of
+    # ``native`` keeps three more there, the weights its library rows multiply on
+    entries = plan(QwenDense.provider_table, QwenDense.regimes, DeviceFacts((10, 0)), 1, 1, "fe-entries", model=QwenDense.reduced())
+    kept = tuple(name for name, block in entries.items() if block.stored_weights)
     assert kept == ("projection.fp8.in", "mlp.gate_up")
+    native = plan(QwenDense.provider_table, QwenDense.regimes, DeviceFacts((10, 0)), 1, 1, "native", model=QwenDense.reduced())
+    on_stored = tuple(name for name, block in native.items() if block.stored_weights)
+    assert on_stored == ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp.down", "output_head")
     loaded = model.load(disk, "cpu", Stages(), stored=kept, uncopied=kept)
     assert loaded.stored == loaded.uncopied == kept and len(loaded.alone) == 4, "two layers, two weights each, on their stored format alone"
 
@@ -1970,6 +1974,8 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         "by name: the embedding lookup is PyTorch's gather, and the id of the chosen row and the concatenations launch other PyTorch kernels than the gather.",
         "A second run printed the same bytes.",
         "(reported; no line of it is a gate of this sample)",
+        # a dated run names the rows it ran on: the stack has had three library rows since, and its runs need the library's package
+        "The model decoded three prompts greedily on the cuDNN Frontend rows of the stack `native` (the rows `fe-entries` selects today without the attention preparation's row), "
         "70 new tokens each: the default prompt and two arithmetic word problems whose text is not part of this repository, 58, 117 and 78 prompt tokens.",
         "the 342 ids of six dump files, then the lowest ids; the default prompt is one of the three prompts behind those dumps, the other two are not.",
         "The first proposal equals the model's next token at 167 of 207 positions (46, 56 and 65 of 69 by prompt), "
@@ -2003,10 +2009,10 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     assert "(`DRAFTER_PROVIDERS`: 18 block calls a pass, every block a reference chain but the embedding lookup;" in area
     guide = " ".join((MODELS / "AGENTS.md").read_text().split())
     assert (
-        "The list of provider keys is closed; it changes only together with a kernel, or with the reference chain of a block that a kernel is to serve."
-        in guide
+        "The list of provider keys is closed; it changes only together with a kernel, with the reference chain of a block that a kernel is to serve, or "
+        "with a declared library entry." in guide
     )
-    assert "changes only together with a kernel, or with the reference chain of a block that a kernel is to serve" in " ".join(
+    assert "changes only together with a kernel, with the reference chain of a block that a kernel is to serve, or with a declared library entry" in " ".join(
         (providers.__doc__ or "").split()
     )
     assert "\n## What building the drafter's pass taught\n" in (MODELS / "AGENTS.md").read_text()

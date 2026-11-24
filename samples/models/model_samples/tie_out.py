@@ -80,8 +80,8 @@ arithmetic of a block, which both runs share.
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
-``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``swiglu_fp4`` = see below; ``same`` = the provider is the reference
-chain, nothing to compare.
+``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``swiglu_fp4`` = see below; ``attention_prepare`` = see below;
+``same`` = the provider is the reference chain, nothing to compare.
 
 **What a provider block is compared with.**  The reference block of the same name -- unless the provider's kernel rounds at
 other points than the reference chain: then the block names its twin (``Block.twin``), a reference block written at the
@@ -134,6 +134,29 @@ Every value finite.  The line prints how many block scales and codes are not tho
 kernel's points, and the largest share of its bound a code used; anything outside is a failure, never a share.  What
 this band cannot see is the entry's to hold: one bf16 unit of the product hides behind half a 4-bit code step, which
 the exact cells of the entry's own suite cover.
+
+``attention_prepare``, the band of the attention preparation entry, is that entry's documented numerics contract
+(``docs/operations/attention/attention_prepare_decode.md``).  Its kernel normalises a head row in fp32 with an approximate
+division and reciprocal root, rounds the normalised value once to bf16, rotates the rotary part of it with one fp32 product
+and one fused sum per element and rounds once more; the gate rows and the value rows are bit copies; and it writes the
+keys and values of a step's rows into the cache's pool in the same launch.  The twin has the same rounding points with
+the mean and the root evaluated in fp64, and writes the cache through its accessor at the positions of the call, which
+it is handed as a host integer.  Per call:
+
+* a query element that is not rotated: within one bf16 unit of the twin's, the unit taken at the larger magnitude;
+* a rotated one: inside that unit plus ``|cos|`` and ``|sin|`` times one unit of its two normalised operands (each may be
+  one unit off in the kernel; the twin keeps that part per element, ``torch_ref.prepare_rows``);
+* the gate rows: the twin's bytes;
+* the cache: the key rows at the positions of the call held as the query rows are, against the key rows the twin wrote;
+  their value rows the twin's bytes; and every other byte of the pool the byte the twin's pool has -- a row the kernel
+  wrote at another slot, or a row no position of the call names, fails here.  Which rows of the pool the positions of
+  the call are is formed from host integers: the position, the tokens per sequence and the shape of the pool.
+
+Every value a call wrote must be finite: the queries, the gate rows, and the key and the value rows at the positions of
+the call.  The gate rows and the value rows are held finite beside their bytes: the twin copies them from the same
+operand, so a NaN or an infinity there is the twin's byte too.  The line prints how many query and key elements are not
+the twin's byte -- the approximate root moves a few by a unit, inside their band; the entry's page states no share for
+them, and none is gated -- and how many of them are outside their band.
 
 ``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
 output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
@@ -216,6 +239,12 @@ BANDS = {
         "against the gate / up multiply with SiLU x up evaluated in fp64 on the dequantised operands, with the error bound of the kernel's contract: "
         "every block-scale byte inside the interval of bytes that bound admits for the largest magnitude of its block, every 4-bit code within half "
         "a code step of the fp64 value under the kernel's own block scale plus that bound; every value finite"
+    ),
+    "attention_prepare": (
+        "against the preparation at the kernel's rounding points (the norm's mean and root in fp64): every query element that is not rotated within one "
+        "bf16 unit at the larger magnitude, every rotated one inside that unit plus |cos| and |sin| times one unit of its two normalised operands; the gate "
+        "rows bitwise; in the cache, the key rows at the positions of the call held as the query rows, their value rows and every other byte of the pool "
+        "bitwise; every value finite"
     ),
 }
 
@@ -304,6 +333,9 @@ class BlockStats:
     blocks: int = 0  # swiglu_fp4: block scales judged, and those of them that are the byte of the fp64 chain
     blocks_equal: int = 0
     worst_share: float = 0.0  # swiglu_fp4: the largest distance of a code's value from the fp64 value, as a share of its bound
+    keys_outside: int = 0  # attention_prepare: key elements at the positions of a call outside their band (``outside``: query elements)
+    gates_equal: bool = True  # attention_prepare: the gate rows, byte for byte
+    values_equal: bool = True  # attention_prepare: the value rows at the positions of a call, byte for byte (``state_equal``: the rest of the pool)
     cells: Dict[int, _Cells] = field(default_factory=dict)
     cell_bytes: Dict[int, Tuple[float, str]] = field(default_factory=dict)  # layer -> (the smallest share of a cell, which cell)
     cell_state: Dict[int, Tuple[float, str]] = field(default_factory=dict)
@@ -346,6 +378,12 @@ class BlockStats:
                 f"{self.blocks:,} block scales, {self.blocks - self.blocks_equal:,} of them another byte than the fp64 chain's; {self.total_bytes:,} codes, "
                 f"{self.total_bytes - self.equal_bytes:,} of them another code than the fp64 chain's; the largest distance of a code from the fp64 value "
                 f"{self.worst_share:.0%} of its bound; {self.outside:,} outside their bounds{loud}"
+            )
+        if self.band == "attention_prepare":
+            return (
+                f"{self.elements:,} query and key elements, {self.other_value:,} of them not the twin's byte; "
+                f"{self.outside:,} query and {self.keys_outside:,} key elements outside their band; gate rows {'equal' if self.gates_equal else 'DIFFER'}; "
+                f"value rows {'equal' if self.values_equal else 'DIFFER'}; the rest of the pool {'untouched' if self.state_equal else 'WRITTEN'}{loud}"
             )
         share = self.off_by_one / max(self.elements, 1)
         state = "" if self.state_equal else "; STATE DIFFERS"
@@ -472,6 +510,9 @@ class BlockTap:
             stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)
             stats.ok = stats.ok and stats.state_equal
             return
+        if stats.band == "attention_prepare":
+            _judge_prepare(stats, out, ref, state, ref_state, twin)
+            return
         if stats.band == "gdn_step":
             codes, ref_codes = out[0], ref[0]
             (recurrent, conv), (ref_recurrent, ref_conv) = state[0], ref_state[0]
@@ -597,6 +638,54 @@ def _judge_norm(stats: BlockStats, out, ref, twin) -> None:
         stats.outside += int((~same & ~second).sum())
         stats.off_nearest += int((~same & second & ~loose).sum())
     stats.ok = stats.finite and stats.outside == 0 and stats.off_nearest == 0 and stats.not_of_out == 0 and stats.state_equal
+
+
+def _judge_prepare(stats: BlockStats, out, ref, state, ref_state, twin) -> None:
+    """One call of the attention preparation entry against its twin (band ``attention_prepare``): ``out`` / ``ref`` are the
+    queries and the gates of the two, ``state`` / ``ref_state`` the pool of the layer's cache as each left it; the twin
+    keeps the band of every rotated element, the key rows it wrote and the position of the call.  The rows of the pool
+    the call's positions name are formed here from host integers -- the position and the tokens per sequence of the
+    call, the sequences of the step and the shape of the pool -- and from no table and no accessor of the cache."""
+    from .providers import torch_ref
+
+    terms = getattr(twin, "terms", None)
+    if terms is None:  # a table that names this band for a block whose twin is another chain
+        raise ValueError(
+            "the band attention_prepare is judged against the preparation at the kernel's rounding points: the block's twin keeps no band of its rotated elements"
+        )
+    pools = [tensors[0] for tensors in (*state, *ref_state) if len(tensors) == 1 and tensors[0].dim() == 4]
+    if len(out) != 2 or len(ref) != 2 or any(o.shape != r.shape for o, r in zip(out, ref)) or len(pools) != 2 or pools[0].shape != pools[1].shape:
+        stats.outside += 1  # other outputs than the queries and the gates, or a cache that is no pool of pages: nothing can be compared
+        stats.ok = False
+        return
+
+    def held(got, want, band) -> int:
+        """The elements of ``got`` outside ``|got - want| <= unit(the larger magnitude) + band``; a value that is not finite is outside."""
+        g, w = got.double(), want.double()
+        stats.finite = stats.finite and bool(torch.isfinite(g).all())
+        stats.elements += g.numel()
+        stats.other_value += int((torch_ref._bf16_bits(got) != torch_ref._bf16_bits(want)).sum())
+        return int((~((g - w).abs() <= torch_ref.bf16_unit(torch.maximum(g.abs(), w.abs())) + band)).sum())  # element by element: outside for a NaN
+
+    (q, gate), (q_ref, gate_ref) = out, ref
+    stats.outside += held(q, q_ref, terms.q_band)
+    stats.gates_equal = stats.gates_equal and bytes_equal(gate, gate_ref)
+    pool, ref_pool = pools
+    tokens, page, width = terms.tokens, int(pool.shape[2]), int(pool.shape[-1]) // 2
+    sequences = int(q.shape[0]) // tokens
+    pages = int(pool.shape[0]) // sequences  # of one sequence: sequence i owns the pages i * pages .. (i + 1) * pages - 1
+    at = [(sequence * pages + (terms.position + token) // page, (terms.position + token) % page) for sequence in range(sequences) for token in range(tokens)]
+    index = torch.tensor(at, dtype=torch.long, device=pool.device)  # the row of the pool of every row of the step, in the step's order
+    written = pool[index[:, 0], :, index[:, 1]]  # [rows, key / value heads, 2 * head width]
+    stats.keys_outside += held(written[..., :width], terms.k, terms.k_band)
+    stats.values_equal = stats.values_equal and bytes_equal(written[..., width:], terms.v)
+    # the gate rows and the value rows are bit copies of the call's operand, which the twin copies too: a NaN or an infinity
+    # there is the twin's byte, so the two comparisons above do not see it
+    stats.finite = stats.finite and bool(torch.isfinite(gate).all()) and bool(torch.isfinite(written[..., width:]).all())
+    rest = torch.ones(pool.shape[0], page, dtype=torch.bool, device=pool.device)
+    rest[index[:, 0], index[:, 1]] = False
+    stats.state_equal = stats.state_equal and bytes_equal(pool.transpose(1, 2)[rest], ref_pool.transpose(1, 2)[rest])
+    stats.ok = stats.finite and stats.outside == 0 and stats.keys_outside == 0 and stats.gates_equal and stats.values_equal and stats.state_equal
 
 
 def _judge_swiglu(stats: BlockStats, out, ref, twin) -> None:
