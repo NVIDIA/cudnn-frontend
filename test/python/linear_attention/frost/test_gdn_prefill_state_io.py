@@ -515,7 +515,7 @@ _KERNEL_SRC = textwrap.dedent('''
 _KERNEL_STEPS = (
     (":", re.compile(r"^[$\w.]+:$")),  # a label: a block starts
     (">", re.compile(r"^(?:@!?%\w+\s+)?(?:bra|ret|trap|exit)\b")),  # a block ends
-    ("S", re.compile(r"^bar\.warp\.sync\b")),
+    ("S", re.compile(r"^bar\.warp\.sync\s+(?:-1|0[xX][fF]{8}|4294967295)\s*;")),  # every lane of the warp: the full mask
     ("P", re.compile(r"^st\.shared\.v2\.b64\b")),  # a lane puts a piece into the scratch
     ("T", re.compile(r"^ld\.shared\.v2\.b64\b")),  # a lane takes a piece out of it
     ("w", re.compile(r"^st\.shared\.b32\s+\[([^\]]+)\],\s*([^;\s]+)\s*;")),
@@ -551,9 +551,11 @@ def kernel_handovers(body, keys):
     state when global stores follow it and to a seed when the next exchange or the round's ``tcgen05.st`` does.
 
     The scheduler slot is the word the load warp's elected lane stores a fetched ticket into, in a block of its own.
-    Behind that store stands a synchronisation and behind it the warp's loads of the slot, with no label between the two.
-    A further store of the slot in front of the next ticket needs a synchronisation behind those loads, with no label
-    and no load of the slot between it and the store: every path into the store passes it behind every lane's load."""
+    Behind that block the lanes join at a label; there stands a synchronisation and behind it the warp's loads of the
+    slot, with no label between the two.  A further store of the slot in front of the next ticket is the elected lane's
+    again: a synchronisation stands behind the warp's loads where every lane passes it -- in front of the branch that
+    leaves the elected lane alone on the way to the store -- with no label and no load of the slot between it and the
+    store.  A synchronisation counts when it names every lane of the warp."""
     raw = []
     for line, text in body:
         if text and not text.startswith((".", "//")):
@@ -611,10 +613,10 @@ def kernel_handovers(body, keys):
         slot = steps[at + 1][2]
         behind = steps[at + 2 : tickets[n + 1] if n + 1 < len(tickets) else len(steps)]
         site = "".join({"w": "s", "r": "l"}[symbol] if address == slot else symbol for symbol, _, address in behind if symbol in ":>S" or address == slot)
-        loads = re.match(r":*Sl+", site)
+        loads = re.match(r":+Sl+", site)
         if not loads:
             violations.append(
-                f"line {line}: the slot's store is not followed by a warp synchronisation and, with no label between, the warp's loads -- {site[:24]}"
+                f"line {line}: the slot's store is not followed by the lanes' join, a warp synchronisation and, with no label between, the warp's loads -- {site[:24]}"
             )
             continue
         found["publications"] += 1
@@ -623,9 +625,9 @@ def kernel_handovers(body, keys):
             before, rest = rest.split("s", 1)
             found["slot_stored_again"] += 1
             last = before.rfind("S")
-            if last < 0 or ":" in before[last:] or "l" in before[last:]:
+            if last < 0 or not re.fullmatch(r">+", before[last + 1 :]):
                 violations.append(
-                    f"line {line}: the slot is stored again with no warp synchronisation that every path from the warp's loads passes -- {before[-24:]}s"
+                    f"line {line}: the slot is stored again with no warp synchronisation that every lane passes behind its load -- {before[-24:]}s"
                 )
     return found, violations
 
