@@ -637,8 +637,9 @@ a decode step and in a verify step of six tokens, the variant `MultiCtasKvCgaVar
 in grid (5 x T, 4, 1) at T tokens per sequence, block (512, 1, 1), with 178,456 B of shared memory. The row's `compute capability
 10.x` says where the table selects it, not where it ran: every run of this row is on compute capability 10.0 with 148
 SMs. On another 10.x class, or another SM count, the run holds that class's kernel binaries, judges the block in its
-band and holds the launch by the family's name, as on every class. Every run prints the kernel the library launched (`launched by
-the library for attention.core (printed, never gated)`). The order is held as for every exact row: nothing may be
+band and holds the launch by the family's name, as on every class. Every run prints the kernel the library launched on
+the row's own line of the kernel check (`.. by name; the library launched <kernel> x <n> over the traced steps`):
+printed, never gated. The order is held as for every exact row: nothing may be
 launched between the preparation's kernel and this one, or between this one and the gate's.
 
 The library states no batch invariance for this call and the sample states none: the bytes of one sequence alone can
@@ -673,16 +674,16 @@ one row more in every served-by table, `output_head.quantize  1  PyTorch  torch_
 chain`; the by-provider line, `fallbacks 9 (cuBLAS over copies 4, PyTorch chains 5)` where it read `fallbacks 8
 (cuBLAS over copies 4, PyTorch chains 4)` on `fe-cublas`, and `fallbacks 10 (PyTorch chains 10)` where it read
 `fallbacks 9 (PyTorch chains 9)` on `reference`; the block calls of a step, 21 where they were 20 (111 where they were
-110 in the speculative script); the batch-invariance line of `fe-cublas`, which counts and names one block more; and
+110 in the speculative script); the batch-invariance line of `fe-cublas`, which counts one block more; and
 the memory sentence of the plain script on `fe-cublas`, which names the part of the checks and asks for about 3.9 GiB
 where it asked for about 3.7. On `native` the block read 18,240 block scales at one sequence, none another byte than
 the twin's, and 291,840 codes, 581 of them the second code of their bracket and none outside (72,960 and 1,167,360 at
 four sequences, 2,181 second codes); the head behind the entry was the bytes of its twin, and the kernel check passed:
 a traced step of the two-layer model was 22 kernel launches and 1 copy, where it had been 69 and 4 with the attention
-core and this block on their reference chains, and 20 of 20 block calls of a step were on kernels,
+core and this block on their reference chains, and 20 of the 21 block calls of a step were on kernels,
 where 18 of 20 had been. On
 `fe-entries` the block read 556 and 2,326 second codes, none outside, and a traced step was 93 kernel launches, where
-it had been 130, with 14 of the 20 block calls of a step on kernels. No logits line of the plain script moved on `native`; on `fe-entries` the
+it had been 130, with 14 of the 21 block calls of a step on kernels. No logits line of the plain script moved on `native`; on `fe-entries` the
 head's line read 23.2% of elements one bf16 unit from the reference's at four sequences, where it had read 23.3%, at
 the same largest distance of one unit. In the speculative script the head's line of the verify steps read 23.2% on
 `fe-entries` as well, where it had read 23.3%; and on `native` the largest logit distance of the kept tokens from the
@@ -1870,8 +1871,8 @@ script's own, and the checks of every run.
 | `native` and `fe-entries`, and any stack with `--check-kernels` | also the kernel check of whole steps: the lookups of the drafter's passes and the verify plan's rows one by one, everything else a pass launches attributed to the drafter's fallback rows |
 
 On `native`, at one sequence of six tokens on compute capability 10.0 with 148 SMs, a run proves what the verify step
-proves -- on the 64-layer model the 484 block calls of a verify step on kernels, on the two-layer model of the default run 20 of 20; on `fe-entries`, without
-the library rows, 387 of the 484 and 15 of 20 -- now
+proves -- on the 64-layer model 484 of the 485 block calls of a verify step on kernels, on the two-layer model of the default run 20 of 21; on `fe-entries`, without
+the library rows, 387 of the 485 and 15 of 21 -- now
 behind a real
 prefill, in one session, with kept counts the comparison decides. No block of the drafter is on a kernel yet: the last line of a run before the verdict is "the
 drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)".

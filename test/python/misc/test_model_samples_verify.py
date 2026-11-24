@@ -1004,7 +1004,8 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert "126,512 B at six tokens and one sequence" in section
     assert "Session.verify" in " ".join(area.split()) and "verify.verify(ids, accept)" in family and "`fe.gdn_verify_fused`" in section
     entries = numbers["by_provider"]["cuDNN Frontend"]  # without PyTorch's gather: the launches of the cuDNN Frontend entries
-    assert f"serve {entries} of the 484 block calls of a verify step (with PyTorch's gather: {entries + 1})" in " ".join(area.split())
+    assert len(model.wiring()) == 485, "the block calls of a step: one launch each on a kernel or a fallback row, and the token choice on the host path"
+    assert f"serve {entries} of the 485 block calls of a verify step (with PyTorch's gather: {entries + 1})" in " ".join(area.split())
     # ... and names the entries that serve them: those of a decode plan, the fused verify entry in place of the fused decode step
 
     def on_entries(tokens):
@@ -1023,7 +1024,7 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert (
         "seven entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other six the same, the 8-bit projection entry there for the "
         "out-projection of the linear-attention layers as well -- serve "
-        "386 of the 484 block calls of a verify step (with PyTorch's gather: 387)" in " ".join(area.split())
+        "386 of the 485 block calls of a verify step (with PyTorch's gather: 387)" in " ".join(area.split())
     ), "the entries are named beside the count they serve"
     assert "the same seven entries" not in " ".join(area.split()), "the fused decode entry does not serve a verify step"
     # the form the entry takes between the step shapes at the ends of a row's range -- one thread block per SM, which a host

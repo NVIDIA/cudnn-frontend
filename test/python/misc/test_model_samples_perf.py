@@ -2318,7 +2318,7 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     )
     named = "added_time_partitions_the_union step_equation_only_where_the_remainder_exceeds_gpu_busy rows_by_wiring_position_not_by_name"
     named += " adjacent_fallback_blocks_share_a_row shares_sum_to_gpu_busy undeclared_record_prints_no_table whole_microsecond_stamps_print_no_us_per_launch"
-    assert all(callable(globals()[f"test_{name}"]) for name in [*named.split(), "table_of_a_python_step_carries_its_line", "dump_census_schema_2"])
+    assert all(callable(globals()[f"test_{name}"]) for name in [*named.split(), "table_of_a_python_step_carries_its_line", "dump_census_schema_3"])
     assert callable(test_the_remainder_is_formed_step_by_step_before_it_is_aggregated), "the step taken apart: its second test"
     assert perf.screen(json.loads(json.dumps(data))) == lines[lines.index("cuDNN Frontend model sample: decode performance report") :][: len(perf.screen(data))]
     _says("area", "The table says of itself what it is: its second line says that it is launched from Python:")
@@ -2330,9 +2330,9 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     _says("guide", "The two are never taken from one pass, and a report says which is which.")
 
 
-def test_dump_census_schema_2(monkeypatch, capsys, tmp_path):
+def test_dump_census_schema_3(monkeypatch, capsys, tmp_path):
     """``--dump-census`` writes every launch record with its start and its end, in milliseconds on the profiler's clock, and
-    says ``schema 2``: of an ordinary run and of the traced request of the performance mode."""
+    says ``schema 3``: of an ordinary run and of the traced request of the performance mode."""
     sites = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch")]
     traced, _ = _walked(sites, [_records(sites), _records(sites, start=1.0)])
     dumped = traced.dump()

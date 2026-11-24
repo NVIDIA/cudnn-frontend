@@ -1994,7 +1994,7 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     assert counted == (207, 204, 201, 198, 195) and sum(by_prompt) == 167 and sum(by_kept) == counted[4]
     assert f"{sum(kept * positions for kept, positions in enumerate(by_kept)) / sum(by_kept):.2f}" == "2.37", "drafted tokens kept, 0 to 5, by positions"
     assert drafter.memory_bytes(1, max(prompts) + new_tokens + 5 + 2) == 2135219200 and max(prompts) + new_tokens + 5 + 2 == 194
-    # no count of the launches of a pass, of any kind of them: the kernel census holds none, and the section states none
+    # no count of the launches of a pass, of any kind of them: the section states none
     counted = r"(?:[\d,]+|one|two|three|four|five|six|no|none) (?:kernel |gather |copy )?(?:launch(?:es)?|gathers?|kernels?|cop(?:y|ies))"
     assert re.findall(rf"\b{counted} (?:per|a|of a|of one|in a) (?:draft )?(?:pass|step|call)\b", section) == []
     assert re.findall(r"[\d,]+ (?:kernel )?launch(?:es)?\b|\blaunch(?:es)? (?:of|per) (?:a|one|the) (?:draft )?pass\b", section) == []
