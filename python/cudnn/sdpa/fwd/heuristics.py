@@ -284,14 +284,21 @@ _SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
 # holdout cells, no changed cell past 1.04 / 1.01 of today's choice. The 64-row tile keeps the shared model.
 _SM80_SPLIT_KV_CTA_COST = 3.0
 _SM80_SPLIT_KV_COMBINE_COST = 0.02
-# SM80 half d256 PAGED decode on the short-d256 tile (64-row Q tile, 32-key KV tiles): the wave model mis-splits it in both
-# directions, so it takes a direct rule (_sm80_paged_d256_split_choice): the largest power-of-two split that keeps >= 8 KV tiles
-# per split and <= 16 waves of CTAs. Study sm80_d256_decode_split_cal_20261118: regret vs the best forced split 1.388 -> 1.038 on
-# 60 train cells, 1.338 -> 1.033 on 30 holdout cells, no cell slower than today's choice. Dense d256 keeps the shared model.
-# Single-row decode on a one-CTA base grid (b 1, one KV head) may split to 128: 0.790 of split 64 on 18 fresh cells, none slower
-# (sm80_d256_split128_q1_20261118); at S_q 4 it was not always faster (sm80_d256_split128_base1_20261118: 1.101).
-_SM80_PAGED_D256_SPLIT_MIN_KV_TILES = 8
-_SM80_PAGED_D256_SPLIT_MAX_WAVES = 16
+# SM90 (H200, 132 SMs) half decode without a window (_sm90_decode_split): the shared model with these constants in place of SM100's.
+# With no per-wave combine term, the floor prices every partial. Fitted on a forced split ladder (study sm90_decode_split_cal_20261123,
+# two timing passes): regret 1.080 -> 1.052 on 157 train cells and 1.099 -> 1.073 on 64 holdout cells, no changed cell past 1.027 /
+# 0.946 of today's choice. Windowed graphs keep the shared constants (sm90_window_split_model_20261123 found none that fit).
+_SM90_SPLIT_KV_CTA_COST = 16.0
+_SM90_SPLIT_KV_COMBINE_COST = 0.0
+_SM90_SPLIT_KV_COMBINE_FLOOR = 0.2
+_SM90_DECODE_SPLIT_D_SHAPES = frozenset({(128, 128), (192, 128), (192, 192), (256, 256)})
+# SM80 half d256 decode on the short-d256 tile (64-row Q tile, 32-key KV tiles), paged at S_q <= 16 and dense single-row: the wave
+# model mis-splits it in both directions, so it takes a direct rule (_sm80_d256_decode_split_choice): the largest power-of-two split
+# that keeps >= 8 KV tiles per split and <= 16 waves of CTAs. Dense S_q 2-16 keeps the shared model: its S_q 16 cells conflict with
+# the rule. Single-row decode on a one-CTA base grid (b 1, one KV head) may split to 128; multi-row decode stays at 64, where a
+# 128 split did not always win.
+_SM80_D256_DECODE_SPLIT_MIN_KV_TILES = 8
+_SM80_D256_DECODE_SPLIT_MAX_WAVES = 16
 _SM80_SPLIT_PARTIAL_O_MAX_ELEMS = 1 << 31  # SM80 split-KV faults once the partial-O buffer reaches 2^31 elements
 # What ONE split adds to the combine's LATENCY, in the same units, when the
 # combine runs its serial one-warp-per-row form -- sm100/split_combine routes
@@ -2647,33 +2654,32 @@ def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
     return longest
 
 
-def _sm80_paged_d256_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
-    """SM80 half d256 paged decode on the short-d256 tile, the domain of _sm80_paged_d256_split_choice. S_q <= 16 and no window: the
-    range its study timed. A window caps the keys each row reads, but the rule counts the whole cache (gemma4's 1024-key window over
-    131k keys ran 1.35-1.94x slower at its split), so windowed and longer padded graphs keep the shared model."""
+def _sm80_d256_decode_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
+    """SM80 half d256 decode on the short-d256 tile, the domain of _sm80_d256_decode_split_choice: paged at S_q <= 16, dense at S_q 1,
+    no window. A window caps the keys each row reads, but the rule counts the whole cache, so windowed and longer padded graphs keep the
+    shared model."""
     return (
         caps.sm_hi == 80
         and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
         and facts.d_qk == facts.d_v == 256
         and not facts.thd
-        and facts.has_paged_kv
-        and facts.s_q <= 16
+        and (facts.s_q <= 16 if facts.has_paged_kv else facts.s_q == 1)
         and facts.window_left is None
         and (tile_m or _sm80_config.default_tile_m(facts.d_qk, facts.d_v, facts.s_q, facts.thd)) == 64
     )
 
 
-def _sm80_paged_d256_split_choice(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int, sm_count: int) -> int:
-    """The largest power-of-two split <= 64 (128 for single-row decode on a one-CTA grid) with >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES KV tiles
-    per split, <= _SM80_PAGED_D256_SPLIT_MAX_WAVES waves of CTAs and a partial-O buffer under _SM80_SPLIT_PARTIAL_O_MAX_ELEMS."""
+def _sm80_d256_decode_split_choice(facts, tile_m: Optional[int], tile_n: Optional[int], pack_g: int, sm_count: int) -> int:
+    """The largest power-of-two split <= 64 (128 for single-row decode on a one-CTA grid) with >= _SM80_D256_DECODE_SPLIT_MIN_KV_TILES KV tiles
+    per split, <= _SM80_D256_DECODE_SPLIT_MAX_WAVES waves of CTAs and a partial-O buffer under _SM80_SPLIT_PARTIAL_O_MAX_ELEMS."""
     kv_tiles = _ceil_div(facts.s_kv, tile_n or _sm80_config.default_tile_n(facts.d_qk, facts.d_v, facts.s_q, facts.thd, tile_m or 64))
     ctas = facts.b * (facts.h_q // pack_g) * _ceil_div(facts.s_q * pack_g, tile_m or 64)
     cap = 128 if facts.s_q == 1 and ctas == 1 else 64
     split = 1
     while (
         split < cap
-        and kv_tiles // (2 * split) >= _SM80_PAGED_D256_SPLIT_MIN_KV_TILES
-        and ctas * 2 * split <= _SM80_PAGED_D256_SPLIT_MAX_WAVES * sm_count
+        and kv_tiles // (2 * split) >= _SM80_D256_DECODE_SPLIT_MIN_KV_TILES
+        and ctas * 2 * split <= _SM80_D256_DECODE_SPLIT_MAX_WAVES * sm_count
         and 2 * split * facts.b * facts.s_q * facts.h_q * facts.d_v < _SM80_SPLIT_PARTIAL_O_MAX_ELEMS
     ):
         split *= 2
@@ -2738,6 +2744,35 @@ def _sm107_window_split(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: 
     while cap < tiles:
         cap *= 2
     return min(split, SM107_WINDOW_SPLIT_CAP_FACTOR * cap)
+
+
+def _sm90_decode_split(caps: Capabilities, facts) -> bool:
+    """SM90 half causal decode without a window or sink, S_q <= 16, not THD, on the head dims its study timed: the domain of the SM90
+    split constants (_SM90_SPLIT_KV_CTA_COST). A single-row graph counts as causal (its mask is a no-op, and the facts drop it).
+    Windowed graphs keep the shared constants."""
+    return (
+        caps.sm_lo == 90
+        and caps.sm_hi == 90
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and facts.window_left is None
+        and (facts.causal or facts.s_q == 1)
+        and not facts.has_sink
+        and not facts.thd
+        and facts.s_q <= 16
+        and (facts.d_qk, facts.d_v) in _SM90_DECODE_SPLIT_D_SHAPES
+    )
+
+
+def _split_model_overrides(caps: Capabilities, facts, tile_m: Optional[int]) -> dict:
+    """The constants choose_split_kv takes in place of the shared (SM100-fitted) ones, for the machines fitted on their own."""
+    if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8):
+        return dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
+    if _sm80_chunk_split(caps, facts, tile_m):
+        return dict(cta_cost=_SM80_SPLIT_KV_CTA_COST, combine_cost=_SM80_SPLIT_KV_COMBINE_COST)
+    if _sm90_decode_split(caps, facts):
+        return dict(cta_cost=_SM90_SPLIT_KV_CTA_COST, combine_cost=_SM90_SPLIT_KV_COMBINE_COST, combine_floor=_SM90_SPLIT_KV_COMBINE_FLOOR)
+    return {}
 
 
 def _sm80_chunk_split(caps: Capabilities, facts, tile_m: Optional[int]) -> bool:
@@ -2981,16 +3016,12 @@ def _split_points(
             combine_rows=facts.s_q * facts.h_q * facts.b,
             ctas_per_tile=split_launch.ctas_per_tile,
             unsplit_launch=unsplit_launch,
-            **(
-                dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
-                if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
-                else (dict(cta_cost=_SM80_SPLIT_KV_CTA_COST, combine_cost=_SM80_SPLIT_KV_COMBINE_COST) if _sm80_chunk_split(caps, facts, tile_m) else {})
-            ),
+            **_split_model_overrides(caps, facts, tile_m),
             serial_combine=facts.s_q >= _SERIAL_COMBINE_MIN_SQ,
             serial_combine_cost=_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED if (facts.is_fp8 or facts.is_mxfp8) else _SPLIT_KV_SERIAL_COMBINE_COST,
         )
 
-    split = _sm80_paged_d256_split_choice(facts, tile_m, tile_n, pack_g, sm_count) if _sm80_paged_d256_split(caps, facts, tile_m) else _choose(physical=True)
+    split = _sm80_d256_decode_split_choice(facts, tile_m, tile_n, pack_g, sm_count) if _sm80_d256_decode_split(caps, facts, tile_m) else _choose(physical=True)
     if _sm80_window_decode(caps, facts):
         split = min(split, _sm80_window_split_cap(facts, tile_m, tile_n, pack_g))
     if _sm107_window_decode(caps, facts):
@@ -3065,6 +3096,28 @@ SM100_PAGED_PACKED_SPLIT_WAVE_CCS = frozenset({(10, 0), (10, 3)})
 SM100_PAGED_PACKED_SPLIT_WAVE_Q = {(64, 64): 64, (256, 256): 128}
 SM100_PAGED_PACKED_SPLIT_D64_Q128_KV_TILES = 128
 SM100_PAGED_PACKED_SPLIT_WAVE_MAX = 4
+
+
+def sm80_dense_split_choice(facts) -> int:
+    """The KV split the SM80 k_prefetch engine leads with on ``facts`` (its first knob set; 1 = unsplit): the decision
+    placement keys the A100 dense chunk regime on, read from the planner rather than re-derived."""
+    from .kernels.sm80.f16_k_prefetch.contract import NAME
+
+    spec = next((s for s in ENGINE_SPECS if s.name == NAME), None)
+    if spec is None:
+        return 1
+    sets = _knob_sets(spec, facts)
+    return (sets[0].split_kv or 1) if sets else 1
+
+
+def sm100_dense_split_choice(row: str, facts) -> int:
+    """The KV split the SM100 / SM107 bf16 forward ``row`` leads with on ``facts`` (its first knob set; 1 = unsplit), read from
+    the planner as :func:`sm80_dense_split_choice` is. The SM107 row plans through its legacy policy spec."""
+    spec = sm100_legacy_policy_spec(row) if row == "sdpa_fwd_prefill_sm107" else next((s for s in ENGINE_SPECS if s.name == row), None)
+    if spec is None:
+        return 1
+    sets = _knob_sets(spec, facts)
+    return (sets[0].split_kv or 1) if sets else 1
 
 
 def sm100_paged_packed_split_choice(caps: Capabilities, facts) -> int:

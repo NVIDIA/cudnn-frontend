@@ -149,16 +149,19 @@ studies timed s_q == s_kv only, and an earlier single-timing sweep had 2 of 200 
 
 
 def _measured_lead(spec: EngineSpec, facts) -> bool:
-    """A trail-only row whose class a ``placement_table`` study measured as a lead goes ahead of the backend like any row. The
-    studies time full-length graphs, and ``class_key`` does not see runtime lengths, so a graph with them keeps trailing. The
-    same goes for a non-square graph whose entry comes from a study in :data:`SQUARE_ONLY_STUDIES`."""
+    """A trail-only row whose class a ``placement_table`` study measured as a lead goes ahead of the backend like any row. A
+    BSHD graph with runtime lengths (a padding mask, or ``seq_len_q`` without one) keeps trailing: ``class_key`` files it with
+    the full-length graphs its class's study timed and does not see the lengths. A THD graph keys ``thd`` / ``thd_ragged``,
+    classes only a study that timed THD graphs answers, so it follows its entry. A non-square graph whose entry comes from a
+    study in :data:`SQUARE_ONLY_STUDIES` keeps trailing too."""
     from cudnn.sdpa import placement_table
 
     name = _placement_row(spec)
     entry = placement_table.matched_entry(name, facts)
     if entry is not None and facts.s_q != facts.s_kv and entry.study.startswith(SQUARE_ONLY_STUDIES):
         return False
-    return not facts.padded and not facts.seq_q_trim and placement_table.lookup(name, facts) is True
+    runtime_lengths = (facts.padded and not facts.thd) or facts.seq_q_trim
+    return not runtime_lengths and placement_table.lookup(name, facts) is True
 
 
 D128_LEAD_CCS = ((10, 0), (10, 3), (10, 7))
