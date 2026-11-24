@@ -4,6 +4,12 @@
 """The backward engine behind ``cudnn.ops.qsa_backward`` and ``qsa_indexed_backward`` at the lengths the bitmap suite
 does not reach: the dense / sparse crossover, KV passes, record windows, packed documents and replay."""
 
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
 from math import prod
 
 import pytest
@@ -411,6 +417,69 @@ def test_key_skip_variant_matches_reference(monkeypatch):
     inputs = _inputs((24000,), 2, seed=17)
     _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (24000,))))
     assert [plan.key_name for plan in engine._PLANS.values()] == ["key_skip1"]
+
+
+# The child imports this process's cudnn, compiles for the given target and ends itself ahead of the parent's timeout.
+_QUERY_KERNEL_PROBE = """
+import faulthandler, json, os, sys
+faulthandler.dump_traceback_later(810, exit=True)
+dump, target, path, package = sys.argv[1:]
+sys.path[:] = json.loads(path)
+os.environ.update(CUTE_DSL_DUMP_DIR=dump, CUTE_DSL_KEEP="cubin", CUTE_DSL_ARCH=target, CUDNN_FRONTEND_DISABLE_COMPILED_CACHE="1")
+import cutlass.cute as cute
+from cudnn.QSA import _backward as engine
+assert engine.__file__ == package, engine.__file__
+cute.compile(*engine._compile_args(2, 12, False, 0)["query"], options="--enable-tvm-ffi --gpu-arch=" + target)
+"""
+
+
+def _unread_shared_loads(sass):
+    # (16-byte shared-memory loads, those with a word no tensor-memory store reads ahead of the next barrier arrive)
+    loads, unread, pending = 0, 0, set()
+    for opcode, operands in re.findall(r"/\*[0-9a-f]+\*/\s+(?:@!?U?P\w+\s+)?([A-Z][\w.]*)\s*([^;]*);", sass):
+        target = re.match(r"R(\d+)\b", operands)
+        if opcode.startswith("LDS") and opcode.endswith(".128"):
+            loads += 1
+            pending.add(int(target.group(1)))
+        elif opcode.startswith("STTM"):
+            source, width = re.search(r",\s*R(\d+)", operands), re.search(r"\.x(\d+)$", opcode)
+            if source and width:
+                first, count = int(source.group(1)), int(width.group(1))
+                pending -= {r for r in pending if first <= r and r + 4 <= first + count}
+        elif "SYNCS.ARRIVE" in opcode:
+            unread, pending = unread + len(pending), set()
+        elif target:
+            # a register written again ahead of the store no longer holds the loaded word
+            hit = {r for r in pending if r <= int(target.group(1)) < r + 4}
+            unread, pending = unread + len(hit), pending - hit
+    return loads, unread + len(pending)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("arch", [100, 103, 107])
+def test_query_kernel_stores_its_shared_loads_before_a_release(tmp_path, arch):
+    # python/cudnn/AGENTS.md Rule 11 on the copy warps of the two-KV-head query-major kernel, read from its disassembly:
+    # a tensor-memory store reads every word of every K / V load ahead of the next barrier arrive, the V release included.
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error
+    from cudnn.QSA import _backward as engine
+
+    reason = cutedsl_arch_requirement_error(divmod(arch, 10))
+    if reason:
+        pytest.skip(reason)
+    child = [sys.executable, "-c", _QUERY_KERNEL_PROBE, str(tmp_path), f"sm_{arch}a", json.dumps(sys.path), engine.__file__]
+    probe = subprocess.run(child, capture_output=True, text=True, timeout=900)
+    assert probe.returncode == 0, probe.stderr[-3000:]
+    (cubin,) = tmp_path.glob("*.cubin")
+    sass = ""
+    tools = [os.path.join(os.environ.get(root, ""), "bin", "nvdisasm") for root in ("CUDA_PATH", "CUDAToolkit_ROOT")]
+    for tool in (*tools, shutil.which("nvdisasm")):
+        if tool and os.path.isfile(tool) and not sass:
+            decoded = subprocess.run([tool, "-c", str(cubin)], capture_output=True, text=True, timeout=300)
+            sass = decoded.stdout if decoded.returncode == 0 else ""
+    if not sass:
+        pytest.skip(f"no nvdisasm on CUDA_PATH, CUDAToolkit_ROOT or PATH decodes the sm_{arch}a cubin")
+    # K and V each take four slabs of four 16-byte loads
+    assert _unread_shared_loads(sass) == (32, 0)
 
 
 @pytest.mark.L1
