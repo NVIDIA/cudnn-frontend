@@ -791,27 +791,29 @@ try:
 except ValueError as error:
     refused = str(error)
 hold("capacity", "positions per sequence" in refused and (recorded.replays, session.state.position) == (replays, position), f"a replay past the capacity is refused and launches nothing ({{refused[:60]}})")
-# a pass the installation declines: a block that reads the host inside the step
+# a pass the installation declines: a block that waits for its stream inside the step.  The CUDA runtime refuses the wait on a
+# capturing stream and invalidates the capture, and PyTorch's context then leaves the thread on that stream: the refusal
+# behind which the session itself has to put the stream back (a host read is refused by PyTorch, which puts it back)
 kind = type(session.plan["token_choice"])
 call = kind.__call__
 
 
-def reads_the_host(self, logits):
+def waits_for_its_stream(self, logits):
     out = call(self, logits)
-    out.tolist()
+    torch.cuda.current_stream().synchronize()
     return out
 
 
 session.reset(fresh=True)
 stream = torch.cuda.current_stream()
-kind.__call__ = reads_the_host
+kind.__call__ = waits_for_its_stream
 try:
     reason = session.record_step()
 finally:
     kind.__call__ = call
 say(f"[recorded] {{reason}}")
 declined = reason.startswith("the capture of the step was declined on this installation (") and session.recorded is None
-hold("declined", declined and torch.cuda.current_stream() == stream, "a pass with a host read inside is declined, no sequence is kept and PyTorch's current stream is the one it was")
+hold("declined", declined and torch.cuda.current_stream() == stream, "a pass the CUDA runtime refuses is declined, no sequence is kept and PyTorch's current stream is the one it was")
 hold("from python", equal(want, request(session)) and session.recorded is None, "the session then launches from Python and computes the request")
 session.close()
 say("[recorded] FAIL" if failed else "[recorded] PASS")
@@ -834,8 +836,9 @@ def test_a_recorded_request_equals_the_same_request_from_python(sequences):
     * a planted difference -- the length the attention reads, one too small from one position on -- moves the logits
       first at that step; the next request is the request again;
     * a replay past the capacity is refused and launches nothing;
-    * a pass with a host read inside it is declined: no sequence is kept, PyTorch's current stream is the one it was,
-      and the session computes the request from Python.
+    * a pass that waits for its stream inside the step is refused by the CUDA runtime, which leaves the thread on the
+      capture stream: it is declined, no sequence is kept, PyTorch's current stream is the one it was, and the session
+      computes the request from Python.
 
     The stack calls a library: skipped where that is absent, by the program's own line where the plan declines the GPU
     or a block of the stack is on a fallback row.  A skipped cell is uncovered, not passing."""
