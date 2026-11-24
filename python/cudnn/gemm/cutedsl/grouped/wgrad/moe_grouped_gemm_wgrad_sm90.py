@@ -48,9 +48,14 @@ from ..unfused.moe_grouped_gemm_sm90 import apply_schedule_override, pingpong_co
 from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
 
-def use_pingpong_wgrad(n: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]]) -> bool:
-    """The override, else pingpong for output N >= 2048 (from an H100 sweep over N) on the 128x192 / (2, 1) configuration only."""
-    return apply_schedule_override(n >= 2048 and pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
+def use_pingpong_wgrad(n: int, rows_per_expert: float, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]]) -> bool:
+    """The override, else the shape rule on the 128x192 / (2, 1) configuration only (from H100 sweeps over the output N,
+    the output M and the average rows per expert): pingpong for output N >= 2048, and for 768 <= N < 2048 when N is a
+    multiple of 192 (no partial 192-wide tile) or the average rows per expert is at most 1024 (a short mainloop, so the
+    overlapped epilogue outweighs the partial tile); cooperative for N >= 4096 with 4096 or more rows per expert."""
+    rule = n >= 2048 or (n >= 768 and (n % 192 == 0 or rows_per_expert <= 1024))
+    rule = rule and not (n >= 4096 and rows_per_expert >= 4096)
+    return apply_schedule_override(rule and pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
 
 
 class MoEGroupedGemmWgradBF16KernelSm90:

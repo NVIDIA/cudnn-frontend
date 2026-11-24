@@ -80,6 +80,7 @@ def get_grouped_gemm_wgrad_workspace_size_sm100(
 
 from ._bf16_api import GroupedGemmWgradBf16API
 from ..unfused.moe_grouped_gemm_sm90 import schedule_override
+from .moe_grouped_gemm_wgrad_sm90 import use_pingpong_wgrad
 from ._blockscaled_api import (
     GroupedGemmWgradBlockScaledAPI,
     _get_rubin_kernel,
@@ -482,8 +483,10 @@ def _grouped_gemm_wgrad_wrapper(
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        # The SM90 schedule is a function of the shapes and tile above plus the forced one.
+        # The SM90 schedule is a function of the shapes and tile above plus the forced one, and of the average rows per
+        # expert: the token dimension is dynamic above, so the key carries the schedule the rule picks.
         schedule_override(),
+        use_pingpong_wgrad(intermediate, tokens_sum / max(expert_cnt, 1), mma_tiler_mn, cluster_shape_mn) if op_class._ARCH == "sm90" else None,
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
