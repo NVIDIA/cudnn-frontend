@@ -34,6 +34,7 @@ from linear_attention.test_la import (
     run_fwd,
     state_pool,
 )
+from test_gdn_chain_rule import tail_scheme
 
 gdn_prefill_f16 = pytest.importorskip("cudnn.linear_attention.frost.kernel.gdn_prefill_f16")
 gdn_warmup_forward_f16 = pytest.importorskip("cudnn.linear_attention.frost.kernel.gdn_warmup_forward_f16")
@@ -168,11 +169,10 @@ def line_of(facts):
 
 
 def engine_tail(cell, chunks=None):
-    """The tail the engine's own rule gives the cell's sequences and heads (``chunks``: at another length), or None."""
-    tokens = cell.sequences * (cell.chunks if chunks is None else chunks) * B_T
-    return tail_rule.choose_tail(
-        num_seqs=cell.sequences, heads_out=cell.heads_out, num_sm=cell.sms, total_tokens=tokens, b_t=B_T, cadence_tokens=0, expand_num=1, dim_v=cell.d_v
-    )
+    """The tail the engine's own plan of the in-place call carries at the cell's sequences and heads (``chunks``: at another
+    length), or None: the tail rule's choice, a chain tail only where the chain pays (``tail_scheme``)."""
+    tokens = (cell.chunks if chunks is None else chunks) * B_T
+    return tail_scheme(cell.sms, [tokens] * cell.sequences, heads=cell.heads_key, value_heads=cell.heads_out, value_dim=cell.d_v)
 
 
 def tail_cells():
@@ -788,9 +788,9 @@ def test_a_plan_the_admission_refuses_builds_no_level_plan(monkeypatch, frost, p
 
 @pytest.mark.L0
 def test_levelled_plan_takes_the_tails_place_at_a_measured_cell(monkeypatch, frost):
-    """A measured cell whose tiles leave a partial last wave, planned for its part.  With the switches as they are
-    committed, and with the seed-copy form alone, the engine runs that wave as a tail: the main launch's table stops at
-    the full waves.  With the level switch on the whole batch runs levelled -- both tables as the host form has them
+    """A measured cell whose last partial wave the engine's own plan runs as a tail, planned for its part.  With the
+    switches as they are committed, and with the seed-copy form alone, the engine runs that tail: the main launch's table
+    stops at the full waves.  With the level switch on the whole batch runs levelled -- both tables as the host form has them
     -- and output and pool are bitwise those of the plan without a tail."""
     backend, built, regions = frost
     cell = smallest_cell([cell for cell, _ in tail_cells()])
