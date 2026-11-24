@@ -139,7 +139,8 @@ def test_sm90_wgrad_pingpong_expert_batch_invariance():
 
 # The tile-info slots (2 stages) turn over once per tile. 64 experts of 256 tokens (K = 256, four k-blocks) and a
 # 512 x 1536 dW per expert give 1536 (cooperative 128x256) or 2048 (pingpong 128x192) tiles, about 12 or 16 per CTA on
-# H100, so the scheduler warp waits on an empty slot at nearly every release (python/cudnn/AGENTS.md Rule 11).
+# H100, so the scheduler warp waits on an empty slot at nearly every release, and a refill that overtook a pending load
+# would show.
 WARM_STRESS = {
     "cooperative": dict(mma_tiler_mn=(128, 256), cluster_shape_mn=(2, 1)),
     "pingpong": dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1)),

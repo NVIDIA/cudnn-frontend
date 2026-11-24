@@ -49,7 +49,7 @@ from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
 
 def use_pingpong_wgrad(n: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]]) -> bool:
-    """The override, else pingpong for output N >= 2048 (s6 H100 sweep) on the 128x192 / (2, 1) configuration only."""
+    """The override, else pingpong for output N >= 2048 (from an H100 sweep over N) on the 128x192 / (2, 1) configuration only."""
     return apply_schedule_override(n >= 2048 and pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
 
 
@@ -392,7 +392,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
         rz_arg: cutlass.Int32,
     ):
         """GPU device kernel for MoE BF16 wgrad on SM90."""
-        # The release-zero (python/cudnn/AGENTS.md Rule 11): the host passes 0; its only use is this call.
+        # The release-zero argument of tile_dsl.consume: the host passes 0; its only use is this call.
         rz = release_zero(rz_arg)
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()

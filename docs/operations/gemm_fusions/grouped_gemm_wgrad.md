@@ -1,7 +1,7 @@
 # Grouped GEMM + WGrad (Unified)
 
 `GroupedGemmWgradSm100` and `grouped_gemm_wgrad_wrapper_sm100` are experimental
-SM100+ APIs for grouped MoE weight gradients, with SM90 twins for a BF16 subset
+SM100+ APIs for grouped MoE weight gradients, with SM90 counterparts for a BF16 subset
 (see [SM90 (Hopper)](#sm90-hopper)). The same public surface dispatches BF16 inputs
 to the BF16 kernel and preserves the legacy FP4/FP8 block-scaled backend.
 

@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileContributor: Wentao Guo, Phuong Nguyen
 
-"""Rule 11 rendering pin of the SM90 BF16 grouped GEMM wgrad (cooperative and pingpong), compile-only.
+"""Release-order check of the SM90 BF16 grouped GEMM wgrad (cooperative and pingpong), compile-only.
 
 Every consumer of a tile-info slot (TMA warp, MMA warp groups) loads the four words with one ``ld.shared.v4`` and
 releases the slot through ``tile_dsl.consume``: the arrive's address is computed from the four loaded registers through
-an ``and`` with the kernel's last parameter, the release-zero (python/cudnn/AGENTS.md Rule 11). The kernel is compiled
-for sm_90a from fake tensors, so the pin needs no H100. The disassembly proof is in the PR text.
+an ``and`` with the kernel's last parameter, the release-zero argument, so every loaded word is consumed before the slot
+is released. The kernel is compiled for sm_90a from fake tensors, so the check needs no H100. The disassembly proof is in the PR text.
 """
 
 from __future__ import annotations
