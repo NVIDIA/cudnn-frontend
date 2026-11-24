@@ -4,6 +4,25 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Quantized RL matmul (2026-11-24)
+
+The [RL suite](../rl/README.md) passed on SM100 (P2021, 68 SMs) and SM107
+(208 SMs) with cuDNN 9.29.0 and CuTe DSL 4.8.1. On both devices the forward
+comparison covered per-tensor E4M3/E5M2, groupwise E4M3, MXFP8, NVFP4, MXFP4
+and MXFP8 × MXFP4, with BF16 and FP16 outputs. A single FlashInfer rollout row
+and reordered or repeated rows matched direct training outputs and the original
+FlashInfer kernels. The tests exercised N=128 with K=512 and K=8192 (including
+split-K), the two-block MMA path at M=257 and N=264, and native cuDNN matmuls for
+dX and dW of the effective floating-point inputs. The tests fix the already
+quantized payload and logical scales before changing the batch.
+
+At M=1024, N=4096, K=8192, six refilled-pipeline cases per GPU completed 3,000
+warm and 3,000 shared-memory-poisoned launches each. Each result matched an
+independently decoded FP64 reference rounded to BF16. The unsafe control
+reproduced on both devices. Fourteen small quantized forward cases per GPU
+also passed strict [golden comparison](../rl/goldens/). SM103 hardware execution
+remains unverified.
+
 ### BF16 RL matmul (2026-11-23)
 
 On 2026-11-24, all 27 cases in the [RL test suite](../rl/README.md) passed on

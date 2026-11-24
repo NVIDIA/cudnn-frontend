@@ -7,10 +7,9 @@ import pytest
 import torch
 
 import cudnn
-from cudnn.engines import is_backend_engine
 from determinism_utils import assert_bitwise, assert_golden, assert_replays
 
-from .matmul import build_matmul
+from .matmul import build_matmul, execute_native, native_matmul
 
 pytestmark = pytest.mark.L0
 
@@ -59,33 +58,6 @@ def test_rl_matmul_pipeline_refill(rl_device):
     )
 
 
-def _execute_native(graph, bindings, device):
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    declined = []
-    for index, plan in enumerate(graph.plans):
-        if not is_backend_engine(plan.engine_id):
-            continue
-        try:
-            graph.build_plan_at_index(index)
-        except cudnn.cudnnGraphNotSupportedError as exc:
-            declined.append((plan.engine_id, str(exc)))
-            continue
-        assert graph.selected_engine is None
-        workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device=device)
-        graph.execute(bindings, workspace)
-        return
-    pytest.fail(f"No native cuDNN plan built. Declined backend plans: {declined}")
-
-
-def _native_matmul(a, b):
-    graph = cudnn.pygraph(compute_data_type=cudnn.data_type.FLOAT)
-    left, right = graph.tensor_like(a), graph.tensor_like(b)
-    product = graph.matmul(A=left, B=right).set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
-    out = a.new_empty((a.shape[0], a.shape[1], b.shape[2]))
-    _execute_native(graph, {left: a, right: b, product: out}, a.device)
-    return out
-
-
 def test_rl_forward_with_native_cudnn_linear_backward(rl_device):
     rng = torch.Generator(device=rl_device).manual_seed(101)
     x = torch.randn((136, 256), device=rl_device, dtype=torch.bfloat16, generator=rng) * 0.125
@@ -94,8 +66,8 @@ def test_rl_forward_with_native_cudnn_linear_backward(rl_device):
     y = build_matmul(x, weight.T, bias)()["out"]
     dy = y * 0.5  # gradient of sum(y ** 2) / 4
     dy3 = dy.unsqueeze(0)
-    dx = _native_matmul(dy3, weight.unsqueeze(0))
-    dw = _native_matmul(dy3.transpose(-1, -2), x.unsqueeze(0))
+    dx = native_matmul(dy3, weight.unsqueeze(0))
+    dw = native_matmul(dy3.transpose(-1, -2), x.unsqueeze(0))
     torch.testing.assert_close(dx[0].double(), dy.double() @ weight.double(), atol=0.008, rtol=0.008)
     torch.testing.assert_close(dw[0].double(), dy.double().T @ x.double(), atol=0.008, rtol=0.008)
 
@@ -104,7 +76,7 @@ def test_rl_forward_with_native_cudnn_linear_backward(rl_device):
     db = g.reduction(d, mode=cudnn.reduction_mode.ADD, out_dims=[1, 1, dy.shape[-1]])
     db.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     result = torch.empty((1, 1, dy.shape[-1]), dtype=torch.float32, device=rl_device)
-    _execute_native(g, {d: dy3, db: result}, rl_device)
+    execute_native(g, {d: dy3, db: result}, rl_device)
     torch.testing.assert_close(result.flatten().double(), dy.double().sum(0))
 
 

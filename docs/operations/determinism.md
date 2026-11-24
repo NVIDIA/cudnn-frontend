@@ -74,7 +74,8 @@ arbitrary user callbacks.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
-| `pygraph.matmul` with numerical note `RL`, optional column bias | fprop | BF16 inputs and output, FP32 accumulation | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Unverified |
+| `pygraph.matmul` with numerical note `RL`, optional column bias | fprop | BF16 inputs and output, FP32 accumulation | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
+| Scaled `pygraph.matmul` with numerical note `RL` | fprop | Per-tensor E4M3/E5M2, groupwise E4M3, MXFP8, NVFP4, MXFP4, MXFP8 × MXFP4. FP16/BF16 output | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
 | `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
 | `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |

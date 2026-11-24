@@ -754,10 +754,13 @@ class pygraph:
         compute_data_type: Any = None,
         padding: float = 0.0,
         name: str = "",
+        *,
+        enable_pdl: bool = False,
     ) -> Tensor:
         """Matrix multiplication: C = A @ B.
 
         A and B can be Tensor descriptors or framework tensors (torch, jax, etc.).
+        enable_pdl requests programmatic dependent launch for an RL mixed MXFP8/MXFP4 GEMM.
         """
         name = self._get_name("matmul", name)
         A = self._ensure_tensor(A, name=f"{name}::A")
@@ -767,6 +770,8 @@ class pygraph:
         node.inputs["A"] = A
         node.inputs["B"] = B
         node.params["padding"] = padding
+        if enable_pdl:
+            node.params["enable_pdl"] = True
 
         C = self._make_output(f"{name}::C")
         node.outputs["C"] = C
@@ -989,6 +994,8 @@ class pygraph:
         usage, and auto-marking it would make its uid required in the variant
         pack.
         """
+        if not self._requires_rl and any(node.node_type == NodeType.MATMUL and node.params.get("enable_pdl") for node in self._nodes):
+            raise cudnn_graph_not_supported("matmul enable_pdl requires the RL numerical note")
         try:
             for node in self._nodes:
                 node.infer_properties(self._context)
@@ -2302,7 +2309,8 @@ class pygraph:
         if self._requires_rl:
             # Keep the classic uint64 return type and distinguish an otherwise
             # identical matmul in downstream caches of complete graph objects.
-            return key ^ (1 << 63)
+            pdl = any(node.node_type == NodeType.MATMUL and node.params.get("enable_pdl") for node in self._nodes)
+            return key ^ (1 << 63) ^ (int(pdl) << 62)
         return key
 
     def create_execution_plan(self, engine_id: int, knobs: Any = None) -> "pygraph":

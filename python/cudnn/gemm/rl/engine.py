@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fixed-reduction BF16 matmul and matmul + column bias for RL forward graphs."""
+"""Fixed-reduction matmul engines for RL forward graphs."""
 
 from dataclasses import dataclass
 
@@ -11,9 +11,10 @@ from cudnn.engines.base import BaseEngine, CompiledPlan, require_stream
 from cudnn.frost import device as devices
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from cudnn.frost.workspace import Workspace
-from cudnn.graph_types import NodeType, Tensor
+from cudnn.graph_types import NodeType, Tensor, storage_geometry, storage_slot_bytes
 
 from . import chunks_for, schedule_for
+from ._graph import ScaledMatmul, is_scaled, match_scaled
 
 
 @dataclass(frozen=True)
@@ -29,13 +30,17 @@ class _Matmul:
     b_major: str
 
 
-def _match(graph) -> _Matmul:
+def _match(graph) -> _Matmul | ScaledMatmul:
     nodes = graph.nodes
-    if len(nodes) not in (1, 2) or nodes[0].node_type != NodeType.MATMUL:
-        raise NotImplementedError("rl_gemm requires matmul with an optional column bias")
     if any(graph._cpp_graph_kwargs.get(key) for key in ("is_dynamic_shape_enabled", "is_override_shape_enabled")):
         raise NotImplementedError("rl_gemm requires fixed matrix shapes")
+    if is_scaled(nodes):
+        return match_scaled(nodes)
+    if len(nodes) not in (1, 2) or nodes[0].node_type != NodeType.MATMUL:
+        raise NotImplementedError("rl_gemm requires a supported GEMM")
     mm = nodes[0]
+    if mm.params.get("enable_pdl"):
+        raise NotImplementedError("rl_gemm supports PDL for mixed MXFP8/MXFP4 GEMM")
     if mm.params["padding"] != 0 or mm.compute_data_type is None or _library_type(mm.compute_data_type) != data_type.FLOAT:
         raise NotImplementedError("rl_gemm requires FP32 matmul computation and zero padding")
     a, b, out = mm.inputs["A"], mm.inputs["B"], mm.outputs["C"]
@@ -111,22 +116,26 @@ class _RlGemmPlan(CompiledPlan):
         self.device = device
 
         def binding(tensor):
-            layout = _geometry(tensor.dim, tensor.stride)
-            nbytes = 2 * (1 + sum((size - 1) * step for size, step in layout))
-            return tensor.uid, nbytes, layout
+            dtype = tensor.get_data_type()
+            shape, strides = storage_geometry(tensor.dim, tensor.stride, dtype)
+            layout = _geometry(shape, strides)
+            nbytes = storage_slot_bytes(dtype) * (1 + sum((size - 1) * step for size, step in layout))
+            reordered = tensor.get_reordering_type() == tensor_reordering.F8_128x4
+            return tensor.uid, nbytes, layout, _dlpack_code_bits(dtype), 4 if dtype == data_type.FLOAT else 16, reordered
 
-        self.inputs = [binding(t) for t in (op.a, op.b, op.bias) if t is not None]
+        self.scaled = isinstance(op, ScaledMatmul)
+        extra = (op.sa, op.sb, op.alpha) if self.scaled else (op.bias,)
+        self.inputs = [binding(t) for t in (op.a, op.b, *extra) if t is not None]
         self.output = binding(op.out)
-        self.dtype = _dlpack_code_bits(data_type.BFLOAT16)
 
     def get_workspace_size(self):
         return self.kernel.workspace_bytes
 
-    def _buffer(self, pack, uid, nbytes, layout):
+    def _buffer(self, pack, uid, nbytes, layout, dtype, alignment, reordered):
         index = pack.index_of(uid)
         ptr = pack.native.pointer(index)
-        if not ptr or ptr % 16:
-            raise ValueError(f"rl_gemm: tensor UID {uid} requires a non-null 16-byte aligned pointer")
+        if not ptr or ptr % alignment:
+            raise ValueError(f"rl_gemm: tensor UID {uid} requires a non-null {alignment}-byte aligned pointer")
         observed = pack.observed_bytes(index)
         if observed >= 0 and observed < nbytes:
             raise ValueError(f"rl_gemm: tensor UID {uid} requires {nbytes} bytes, got {observed}")
@@ -134,8 +143,21 @@ class _RlGemmPlan(CompiledPlan):
         if kind >= 0 and (kind != 2 or ordinal != self.device):
             raise ValueError(f"rl_gemm: tensor UID {uid} must be on CUDA device {self.device}")
         if index not in pack.graph_described:
-            if pack.native.dtype(index) != self.dtype or _geometry(pack.native.shape(index), pack.native.stride(index)) != layout:
-                raise ValueError(f"rl_gemm: tensor UID {uid} must match its declared BF16 shape and strides")
+            actual = _geometry(pack.native.shape(index), pack.native.stride(index))
+            if reordered:
+                # F8_128x4 is a physical byte layout. Producers can present its
+                # contiguous storage as a flat blob or a transpose of a matrix.
+                extent = 1
+                for size, stride in sorted(actual, key=lambda axis: axis[1]):
+                    if stride != extent:
+                        raise ValueError(f"rl_gemm: reordered scale UID {uid} requires a dense buffer")
+                    extent *= size
+                if extent < nbytes:
+                    raise ValueError(f"rl_gemm: reordered scale UID {uid} requires {nbytes} bytes, got {extent}")
+            elif actual != layout:
+                raise ValueError(f"rl_gemm: tensor UID {uid} must match its declared shape and strides")
+            if pack.native.dtype(index) != dtype:
+                raise ValueError(f"rl_gemm: tensor UID {uid} must match its declared dtype")
         return ptr, ptr + nbytes
 
     def execute(self, graph, pack, ctx):
@@ -155,7 +177,11 @@ class _RlGemmPlan(CompiledPlan):
         for i, (begin, end) in enumerate(writes):
             if any(begin < hi and lo < end for lo, hi in reads + writes[:i]):
                 raise ValueError("rl_gemm: output and workspace must be disjoint from each other and all inputs")
-        self.kernel.execute(reads[0][0], reads[1][0], out[0], reads[2][0] if len(reads) == 3 else None, pack.workspace, require_stream(ctx.stream, "rl_gemm"))
+        stream = require_stream(ctx.stream, "rl_gemm")
+        if self.scaled:
+            self.kernel.execute(reads[0][0], reads[1][0], out[0], reads[2][0], reads[3][0], reads[4][0] if len(reads) == 5 else None, pack.workspace, stream)
+        else:
+            self.kernel.execute(reads[0][0], reads[1][0], out[0], reads[2][0] if len(reads) == 3 else None, pack.workspace, stream)
 
 
 class RlGemmEngine(BaseEngine):
@@ -168,9 +194,16 @@ class RlGemmEngine(BaseEngine):
 
     def _operation(self, graph):
         op = graph._facts_for(_match)
-        cc = devices.compute_capability(devices.current_device())
+        device = devices.current_device()
+        cc = devices.compute_capability(device)
         if cc not in ((10, 0), (10, 3), (10, 7)):
             raise NotImplementedError(f"rl_gemm requires SM100, SM103 or SM107, got {cc}")
+        if isinstance(op, ScaledMatmul):
+            from ._quantized.config import schedule_for as scaled_schedule
+
+            if op.kind == "mxfp8_mxfp4" and cc != (10, 7) and op.k % 128:
+                raise NotImplementedError("rl_gemm mixed MXFP8/MXFP4 on SM100/SM103 requires K aligned to 128")
+            scaled_schedule(op, cc, devices.multiprocessor_count(device))
         if not cutedsl_state()[0]:
             raise NotImplementedError("rl_gemm requires nvidia-cutlass-dsl >= 4.8.0")
         reason = cutedsl_requirement_error("rl_gemm", (4, 8, 0)) or cutedsl_arch_requirement_error(cc)
@@ -179,11 +212,16 @@ class RlGemmEngine(BaseEngine):
         return op
 
     def build_plan(self, graph, plan, ctx=None):
-        from .kernel import build
-
         if plan.knobs:
             raise NotImplementedError("rl_gemm accepts no tuning knobs")
         op = self._operation(graph)
         device = devices.current_device()
-        kernel = build(op.m, op.n, op.k, op.lda, op.b_major, op.bias is not None, device)
+        if isinstance(op, ScaledMatmul):
+            from .quantized import build
+
+            kernel = build(op, device)
+        else:
+            from .kernel import build
+
+            kernel = build(op.m, op.n, op.k, op.lda, op.b_major, op.bias is not None, device)
         return _RlGemmPlan(op, kernel, device)

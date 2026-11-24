@@ -8,5 +8,5 @@ import torch
 @pytest.fixture
 def rl_device():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("RL BF16 matmul requires SM100, SM103 or SM107")
+        pytest.skip("RL matmul requires SM100, SM103 or SM107")
     return torch.device("cuda", torch.cuda.current_device())
