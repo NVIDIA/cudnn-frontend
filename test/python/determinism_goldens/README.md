@@ -4,7 +4,7 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
-### H100 SM90 BF16 grouped GEMM determinism (2026-11-22, golden records dropped 2026-11-24)
+### H100 SM90 BF16 grouped GEMM determinism (2026-11-22)
 
 Forward and dgrad have no golden record. Replay, batch invariance and warm stress cover both
 directions and both warp-group schedules; `test_sm90_pingpong_matches_cooperative` checks that
@@ -17,10 +17,10 @@ compute-sanitizer 2026.1.1.0; source built from the commit under test.
 ```
 G=gemm/cutedsl
 F=$(ls $G/test_grouped_gemm*sm90*.py)
-CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -m L0 $F   # sharded over 5 GPUs
+CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -m L0 $F
 ```
 
-- L0 at `c36a50af`: 113 passed, 0 skipped. D is scaled once per row by `alpha * prob`,
+- L0: 113 passed, 0 skipped. D is scaled once per row by `alpha * prob`,
   at most one bf16 ulp from `(acc * alpha) * prob`.
 - Replay: 8 fresh-buffer launches against concurrent second-stream work. Batch invariance:
   alone, packed, reordered, duplicated, changed neighbors. Pingpong also: bytes equal to
@@ -28,8 +28,8 @@ CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -m L0 $F   # sharded over 5 GPUs
 - Warm stress (M = 8 x 512, N = 2048, K = 4096, 132 CTAs): 0 wrong of 3000 warm + 3000
   poisoned launches for forward and dgrad; the unsafe control failed 200 of 200.
   The tile-info case (`test_sm90_tile_info_warm_stress`: K = 64; about 12 (cooperative)
-  or 16 (pingpong) tiles per CTA) covers the Rule 11 release sites.
-- compute-sanitizer at `c36a50af`: racecheck and synccheck 0 errors; memcheck 0 device
+  or 16 (pingpong) tiles per CTA) covers the tile-info slot release sites.
+- compute-sanitizer: racecheck and synccheck 0 errors; memcheck 0 device
   errors (exit 99 on 28 host API messages: cuda-python requests CUDA 13030 > driver 13020).
 
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)

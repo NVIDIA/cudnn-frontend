@@ -2,7 +2,7 @@
 
 **This is an experimental API and subject to change.** `GroupedGemmSm100` and
 `grouped_gemm_wrapper_sm100` require an NVIDIA SM100-or-newer GPU; their SM90
-(Hopper) twins `GroupedGemmSm90` and `grouped_gemm_wrapper_sm90` cover the subset
+(Hopper) counterparts `GroupedGemmSm90` and `grouped_gemm_wrapper_sm90` cover the subset
 in [SM90 (Hopper)](#sm90-hopper). The CuTe DSL dependencies ship with the package:
 
 ```bash
