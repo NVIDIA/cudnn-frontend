@@ -907,7 +907,7 @@ eager.load()
 session.load()
 generator = torch.Generator().manual_seed(0)
 prompts = [torch.randint(0, vocab, (PROMPT,), generator=generator, dtype=torch.int32) for _ in range(SEQUENCES)]
-unseen = []
+unseen, returned = [], []
 
 
 def another(ids):  # another tensor that holds the changed ids
@@ -938,14 +938,17 @@ def request(of, change):
     # handed to every step, what the state kept of the step in front at that moment, the record's inputs, outputs and logits)
     of.reset(fresh=False)
     ids = of.prefill(prompts)
-    reads, handed, kept = [of.read(ids)], [], []
+    reads, handed, kept, back = [of.read(ids)], [], [], [ids]
     for _ in range(STEPS):
         ids = change(ids)
         handed.append(ids.tolist())
         kept.append(of.state.greedy.tolist())
         ids = of.step(ids)
+        back.append(ids)
         reads.append(of.read(ids))
     torch.cuda.synchronize()
+    if of is session:  # what the replayed prompt and every replayed step handed back to the loop
+        returned.extend(each is session.recorded.cursor.ids for each in back)
     count = of.record.count
     return reads, handed, kept, of.record.inputs[:count].clone(), of.record.outputs[:count].clone(), of.record.logits[:count].clone()
 
@@ -969,6 +972,7 @@ for name, change, what in (
     fed = [row.tolist() for row in got[3][PROMPT:]]
     held = equal(want, got) and fed == got[1] == want[1] and session.replays and session.recorded.cursor.ids is buffer
     hold(name, held, f"replayed steps handed {{what}}: the reads, the logits byte for byte and the record of the request launched from Python on the changed ids; the record's inputs are the ids handed over")
+hold("returned", len(returned) == 4 * (STEPS + 1) and all(returned), "the prompt and every step of the replayed requests returned the session's ids buffer itself: handed back, it is read as it then is and nothing is copied")
 hold("unseen", len(unseen) == STEPS and all(unseen), "no write through the alias was counted by the tensor's version counter")
 hold("replays", session.recorded.replays == 4 * (PROMPT + STEPS), f"{{session.recorded.replays}} replays of one recorded sequence")
 session.close()
@@ -993,7 +997,9 @@ def test_a_replayed_step_feeds_the_ids_it_is_handed_however_they_were_changed(se
     * a view of that tensor.
 
     In each the record's inputs are the ids that were handed over, and what the state keeps of the step in front -- the
-    ids as the token choice left them -- is not changed with the returned tensor.
+    ids as the token choice left them -- is not changed with the returned tensor.  The tensor the replayed prompt and
+    every replayed step return is the session's ids buffer itself: a session that returned a copy of it would compute
+    the same ids, with a copy launched from Python per token.
 
     Skipped as its neighbour is: where the library is absent, and by the program's own line where the plan declines the
     GPU or a block of the stack is on a fallback row.  A skipped cell is uncovered, not passing."""
@@ -1001,7 +1007,7 @@ def test_a_replayed_step_feeds_the_ids_it_is_handed_however_they_were_changed(se
     key = f"model sample qwen_dense: a recorded decode step on ids changed in place and handed back, {sequences} sequence(s), stack native"
     out = _program(HANDED_PROGRAM, "[handed]", key, "run of a recorded step on changed ids", unobserved="RAN (never printed: ", sequences=sequences)
     lines = out.splitlines()
-    for name in ("recorded", "python", "clone", "in place", "alias", "view", "unseen", "replays"):
+    for name in ("recorded", "python", "clone", "in place", "alias", "view", "returned", "unseen", "replays"):
         (line,) = [line for line in lines if line.startswith(f"  {name} ")]
         assert line.endswith("    PASS"), line
     assert (
