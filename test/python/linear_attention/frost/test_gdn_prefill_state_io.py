@@ -24,7 +24,6 @@ import sys
 import textwrap
 from pathlib import Path
 
-import cudnn
 import pytest
 import torch
 
@@ -639,7 +638,7 @@ def render_kernel(root, build):
     lines of the prefill entry."""
     dump = root / f"dump_{build}"
     dump.mkdir(exist_ok=True)
-    package = Path(cudnn.__file__).resolve()
+    package = Path(cpp_launcher.__file__).resolve().with_name("__init__.py")  # the package this process tests
     env = dict(
         os.environ,
         CUTE_DSL_KEEP="ptx",
