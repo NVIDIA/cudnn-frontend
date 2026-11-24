@@ -26,6 +26,7 @@ from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.device import device_context
+from cudnn.frost.tile_dsl.barrier import named_barrier_sync_unaligned
 
 from . import chunks_for, schedule_for
 
@@ -267,7 +268,6 @@ class _Gemm:
         to_smem = cute.make_tiled_copy_D(get_smem_store_op(self.c_layout, self.c_dtype, Float32, copy), copy)
         reg = to_smem.retile(result)
         smem = to_smem.get_slice(tid).partition_D(sC)
-        sync = pipeline.NamedBarrier(barrier_id=3, num_threads=128)
         stores = pipeline.PipelineTmaStore.create(num_stages=2, producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128))
         coords = None
         if cutlass.const_expr(bias is not None):
@@ -284,12 +284,12 @@ class _Gemm:
             reg.store(to_smem.retile(frag).load().to(self.c_dtype))
             cute.copy(to_smem, reg, smem[None, None, None, s % 2])
             cute.arch.fence_proxy("async.shared", space="cta")
-            sync.arrive_and_wait()
+            named_barrier_sync_unaligned(3, 128)
             if tid < 32:
                 cute.copy(atom_c, tSsC[None, s % 2], tSgC[None, s])
                 stores.producer_commit()
                 stores.producer_acquire()
-            sync.arrive_and_wait()
+            named_barrier_sync_unaligned(3, 128)
         if tid < 32:
             stores.producer_tail()
 

@@ -15,6 +15,8 @@ from cutlass.tensor_utils import LayoutEnum
 from cutlass.utils.blackwell_helpers import get_smem_store_op, get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
+from cudnn.frost.tile_dsl.barrier import named_barrier_sync_unaligned
+
 from .arithmetic import CuteF32
 from .arithmetic import Knobs, MainloopBlock
 from .arithmetic import BLOCK_K, SCALE_BLOCK_N, EpilogueChain
@@ -319,8 +321,6 @@ def blockscale_epilogue_loop(
         num_stages=1,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
     )
-    sync0 = pipeline.NamedBarrier(barrier_id=BAR_GROUP[0], num_threads=128)
-    sync1 = pipeline.NamedBarrier(barrier_id=BAR_GROUP[1], num_threads=128)
     gsel = g if groups == 2 else cutlass.Int32(0)
     active = (g == 0) if groups == 1 else (g >= 0)  # a one-subtile tile: group 1 has no columns
     work_tile = tile_sched.initial_work_tile_info()
@@ -384,9 +384,9 @@ def blockscale_epilogue_loop(
                 cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, gsel)])
                 cute.arch.fence_proxy("async.shared", space="cta")
                 if gsel == 0:
-                    sync0.arrive_and_wait()
+                    named_barrier_sync_unaligned(BAR_GROUP[0], 128)
                 else:
-                    sync1.arrive_and_wait()
+                    named_barrier_sync_unaligned(BAR_GROUP[1], 128)
                 if warp_idx == 4 * gsel:  # the group's leader warp issues the TMA store
                     cute.copy(
                         tma_atom_c,
@@ -400,9 +400,9 @@ def blockscale_epilogue_loop(
                         c_pipeline1.producer_commit()
                         c_pipeline1.producer_acquire()
                 if gsel == 0:
-                    sync0.arrive_and_wait()
+                    named_barrier_sync_unaligned(BAR_GROUP[0], 128)
                 else:
-                    sync1.arrive_and_wait()
+                    named_barrier_sync_unaligned(BAR_GROUP[1], 128)
     if gsel == 0:
         c_pipeline0.producer_tail()
     else:
@@ -558,7 +558,6 @@ class BlockScaleFp8Gemm:
             defer_sync=True,
         )
         tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=BAR_TMEM_ALLOC, num_threads=THREADS_BS)
-        promo_join = pipeline.NamedBarrier(barrier_id=BAR_PROMO_JOIN, num_threads=32 * NUM_PROMO_WARPS)
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -712,7 +711,7 @@ class BlockScaleFp8Gemm:
             # the allocator warp alone frees the columns (`TmemAllocator.free`): the other warpgroup's last TMEM loads must be
             # complete first; its store barriers are its own, so the groups join here (the dense bodies' one epilogue group is
             # joined by its store barrier already)
-            promo_join.arrive_and_wait()
+            named_barrier_sync_unaligned(BAR_PROMO_JOIN, 32 * NUM_PROMO_WARPS)
         if warp_idx > TMA_WARP_BS:
             cute.arch.setmaxregister_decrease(UNIFORM_REGS)  # the warps padding the last warpgroup: no role
 

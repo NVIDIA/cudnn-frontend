@@ -10,7 +10,7 @@ from cudnn.datatypes import _dlpack_code_bits, _library_type
 from cudnn.engines.base import BaseEngine, CompiledPlan, require_stream
 from cudnn.frost import device as devices
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
-from cudnn.frost.workspace import Workspace
+from cudnn.frost.workspace import Workspace, check_workspace_device
 from cudnn.graph_types import NodeType, Tensor, storage_geometry, storage_slot_bytes
 
 from . import chunks_for, schedule_for
@@ -170,9 +170,7 @@ class _RlGemmPlan(CompiledPlan):
         writes = [out]
         if self.kernel.workspace_bytes:
             Workspace.over(pack, self.kernel.workspace_bytes, "rl_gemm", align=16)
-            workspace_device = getattr(ctx.workspace, "__dlpack_device__", None)
-            if workspace_device is not None and tuple(workspace_device()) != (2, self.device):
-                raise ValueError(f"rl_gemm: workspace must be on CUDA device {self.device}")
+            check_workspace_device(ctx.workspace, pack.workspace, self.device, "rl_gemm")
             writes.append((pack.workspace, pack.workspace + self.kernel.workspace_bytes))
         for i, (begin, end) in enumerate(writes):
             if any(begin < hi and lo < end for lo, hi in reads + writes[:i]):

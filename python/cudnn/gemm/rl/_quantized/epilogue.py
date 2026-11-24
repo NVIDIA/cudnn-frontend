@@ -14,6 +14,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.utils.blackwell_helpers import get_smem_store_op, get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
+from cudnn.frost.tile_dsl.barrier import named_barrier_sync_unaligned
+
 from .arithmetic import CuteF32
 from .operands import ACC_DTYPE, BAR_EPILOGUE, EPILOGUE_WARPS
 
@@ -92,7 +94,6 @@ def epilogue_loop(
         num_stages=st.num_c_stage,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * len(EPILOGUE_WARPS)),
     )
-    sync = pipeline.NamedBarrier(barrier_id=BAR_EPILOGUE, num_threads=32 * len(EPILOGUE_WARPS))
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
         coord = work_tile.tile_idx
@@ -116,13 +117,13 @@ def epilogue_loop(
             c_buffer = (num_prev_subtiles + s) % st.num_c_stage
             cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
             cute.arch.fence_proxy("async.shared", space="cta")
-            sync.arrive_and_wait()
+            named_barrier_sync_unaligned(BAR_EPILOGUE, 32 * len(EPILOGUE_WARPS))
             if warp_idx == EPILOGUE_WARPS[0]:
                 cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, s)])
                 c_pipeline.producer_commit()
                 c_pipeline.producer_acquire()
-            sync.arrive_and_wait()
-        sync.arrive_and_wait()
+            named_barrier_sync_unaligned(BAR_EPILOGUE, 32 * len(EPILOGUE_WARPS))
+        named_barrier_sync_unaligned(BAR_EPILOGUE, 32 * len(EPILOGUE_WARPS))
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_state)  # TMEM buffer free for the next fold
         acc_state.advance()
