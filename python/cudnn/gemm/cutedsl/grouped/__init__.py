@@ -54,7 +54,9 @@ from .wgrad.api import (
 
 from .unfused.api import (
     GroupedGemmSm100,
+    GroupedGemmSm90,
     grouped_gemm_wrapper_sm100,
+    grouped_gemm_wrapper_sm90,
 )
 
 from .prepared import PreparedGroupedGemm, prepare_grouped_gemm
@@ -85,6 +87,8 @@ __all__ = [
     "grouped_gemm_wgrad_wrapper_sm100",
     "GroupedGemmSm100",
     "grouped_gemm_wrapper_sm100",
+    "GroupedGemmSm90",
+    "grouped_gemm_wrapper_sm90",
     "grouped_gemm_jax_sm100",
     "grouped_gemm_glu_jax_sm100",
     "grouped_gemm_dglu_jax_sm100",

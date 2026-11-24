@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Neutral public API for SM100 unfused BF16 grouped GEMM."""
+"""Public API for the unfused BF16 grouped GEMM: GroupedGemmSm100 (SM100+) and its SM90 (Hopper) twin GroupedGemmSm90."""
 
 from __future__ import annotations
 
+import inspect
 import os
 from typing import Any, Optional, Tuple
 
@@ -20,6 +21,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -27,6 +29,7 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
+from .moe_grouped_gemm_sm90 import schedule_override
 from ..backend_utils import execute_with_wrapper_workspace, row_major_layout
 from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
@@ -36,6 +39,8 @@ __all__ = ["GroupedGemmBf16API"]
 
 class GroupedGemmSm100(APIBase):
     """Public lifecycle facade with deferred BF16 descriptor initialization."""
+
+    _ARCH = "sm100"
 
     def __init__(
         self,
@@ -51,7 +56,7 @@ class GroupedGemmSm100(APIBase):
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
@@ -69,7 +74,7 @@ class GroupedGemmSm100(APIBase):
 
     def check_support(self) -> bool:
         if self._implementation is None:
-            self._implementation = GroupedGemmBf16API(**self._pending_init_kwargs)
+            self._implementation = GroupedGemmBf16API(arch=self._ARCH, **self._pending_init_kwargs)
             self._kernel = self._implementation._kernel
         supported = self._implementation.check_support()
         self._is_supported = self._implementation._is_supported
@@ -117,6 +122,12 @@ class GroupedGemmSm100(APIBase):
         )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
+
+
+class GroupedGemmSm90(GroupedGemmSm100):
+    """:class:`GroupedGemmSm100` on SM90 (Hopper): the same arguments and lifecycle, running the SM90 kernel."""
+
+    _ARCH = "sm90"
 
 
 _cache_of_GroupedGemmSm100Objects: dict[tuple, GroupedGemmSm100] = {}
@@ -215,6 +226,7 @@ def _normalize_call(
     m_aligned: int,
     framework: str,
     b_major: str = "k",
+    arch: str = "sm100",
 ) -> tuple[bool, int, int, int]:
     is_dense = b_tensor is not None
     is_discrete = b_ptrs is not None
@@ -248,7 +260,10 @@ def _normalize_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
-    if not has_tcgen05(major):
+    if arch == "sm90":
+        if not has_wgmma(major):
+            raise RuntimeError(f"GroupedGemmSm90 requires SM90 (WGMMA), found SM{compute_capability}")
+    elif not has_tcgen05(major):
         raise RuntimeError(f"GroupedGemmSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
     tensor_m, k = a_shape[:2]
@@ -293,7 +308,8 @@ def _normalize_call(
     return is_dense, tensor_m, n, experts
 
 
-def grouped_gemm_wrapper_sm100(
+def _grouped_gemm_wrapper(
+    op_class: type,
     a_tensor: torch.Tensor,
     padded_offsets: torch.Tensor,
     alpha_tensor: torch.Tensor,
@@ -310,7 +326,7 @@ def grouped_gemm_wrapper_sm100(
     c_tensor: Optional[torch.Tensor] = None,
     d_tensor: Optional[torch.Tensor] = None,
     cd_major: str = "n",
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     vector_f32: bool = False,
     m_aligned: int = 256,
@@ -326,6 +342,7 @@ def grouped_gemm_wrapper_sm100(
     # pointers the key deliberately omits. Caller-supplied c/d are part of the key, so a hit
     # reuses the _validate_output outcome for the same metadata.
     _memo_key = (
+        op_class,
         type(a_tensor),
         _operand_meta(a_tensor),
         _operand_meta(c_tensor),
@@ -343,13 +360,14 @@ def grouped_gemm_wrapper_sm100(
         c_dtype,
         d_dtype,
         cd_major,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         None if cluster_shape_mn is None else tuple(cluster_shape_mn),
         vector_f32,
         m_aligned,
         generate_c,
         use_dynamic_sched,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+        schedule_override(),
     )
     memo = _wrapper_memo.get(_memo_key)
     if memo is not None:
@@ -374,7 +392,7 @@ def grouped_gemm_wrapper_sm100(
 
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
-        raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_wrapper_sm100; pass torch tensors or JAX arrays")
+        raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_wrapper_{op_class._ARCH}; pass torch tensors or JAX arrays")
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype) if acc_dtype is not None else cutlass.Float32
     c_dtype = _convert_to_cutlass_data_type(c_dtype) if c_dtype is not None else cutlass.BFloat16
     d_dtype = _convert_to_cutlass_data_type(d_dtype) if d_dtype is not None else cutlass.BFloat16
@@ -397,6 +415,7 @@ def grouped_gemm_wrapper_sm100(
         m_aligned,
         framework,
         b_major,
+        op_class._ARCH,
     )
     expected_shape, expected_stride = row_major_layout(tensor_m, n_out, len(get_shape(a_tensor)) == 2)
 
@@ -435,6 +454,7 @@ def grouped_gemm_wrapper_sm100(
         (a_device.type, a_device.index),
     )
     cache_key = (
+        op_class._ARCH,
         "bf16",
         "dense" if is_dense else "discrete",
         *_tensor_signature(a_tensor, dynamic_m=True),
@@ -454,7 +474,7 @@ def grouped_gemm_wrapper_sm100(
         c_dtype,
         d_dtype,
         cd_major,
-        tuple(mma_tiler_mn),
+        tuple(mma_tiler_mn) if mma_tiler_mn is not None else None,
         tuple(cluster_shape_mn) if cluster_shape_mn is not None else None,
         vector_f32,
         m_aligned,
@@ -462,11 +482,13 @@ def grouped_gemm_wrapper_sm100(
         use_dynamic_sched,
         overlap_margin,
         workspace_signature,
+        # The SM90 schedule is a function of the shapes and tile above plus the forced one.
+        schedule_override(),
     )
 
     op = _cache_of_GroupedGemmSm100Objects.get(cache_key)
     if op is None:
-        op = GroupedGemmSm100(
+        op = op_class(
             sample_a=a_tensor,
             sample_c=internal_c,
             sample_d=d_tensor,
@@ -513,9 +535,49 @@ def grouped_gemm_wrapper_sm100(
     )
 
 
+def grouped_gemm_wrapper_sm100(
+    a_tensor: torch.Tensor,
+    padded_offsets: torch.Tensor,
+    alpha_tensor: torch.Tensor,
+    b_tensor: Optional[torch.Tensor] = None,
+    bias_tensor: Optional[torch.Tensor] = None,
+    b_ptrs: Optional[torch.Tensor] = None,
+    n: Optional[int] = None,
+    b_dtype: Optional[torch.dtype] = None,
+    b_major: str = "k",
+    prob_tensor: Optional[torch.Tensor] = None,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
+    c_tensor: Optional[torch.Tensor] = None,
+    d_tensor: Optional[torch.Tensor] = None,
+    cd_major: str = "n",
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    vector_f32: bool = False,
+    m_aligned: int = 256,
+    generate_c: bool = False,
+    use_dynamic_sched: bool = False,
+    current_stream: Optional[cuda.CUstream] = None,
+) -> TupleDict:
+    """BF16 grouped GEMM on SM100+ (tcgen05); see docs/operations/gemm_fusions/grouped_gemm.md."""
+    return _grouped_gemm_wrapper(GroupedGemmSm100, **locals())
+
+
+def grouped_gemm_wrapper_sm90(*args, **kwargs) -> TupleDict:
+    """:func:`grouped_gemm_wrapper_sm100` on SM90 (Hopper): the same arguments and outputs, running the SM90 kernel."""
+    return _grouped_gemm_wrapper(GroupedGemmSm90, *args, **kwargs)
+
+
+grouped_gemm_wrapper_sm90.__signature__ = inspect.signature(grouped_gemm_wrapper_sm100)
+
+
 grouped_gemm_wrapper_sm100.supports_bf16_canonical_layouts = True
+grouped_gemm_wrapper_sm90.supports_bf16_canonical_layouts = True
 
 __all__ = [
     "GroupedGemmSm100",
+    "GroupedGemmSm90",
     "grouped_gemm_wrapper_sm100",
+    "grouped_gemm_wrapper_sm90",
 ]
