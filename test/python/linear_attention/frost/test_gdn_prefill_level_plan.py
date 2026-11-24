@@ -34,7 +34,8 @@ from linear_attention.test_la import (
     run_fwd,
     state_pool,
 )
-from test_gdn_chain_rule import tail_scheme
+from test_gdn_chain_rule import group_scheme, tail_scheme
+from test_gdn_value_width_split import build_plan
 
 gdn_prefill_f16 = pytest.importorskip("cudnn.linear_attention.frost.kernel.gdn_prefill_f16")
 gdn_warmup_forward_f16 = pytest.importorskip("cudnn.linear_attention.frost.kernel.gdn_warmup_forward_f16")
@@ -184,6 +185,30 @@ def tail_cells():
         return [chunks for chunks in (cell.chunks + 1, cell.chunks - 1) if engine_tail(cell, chunks) and cell._replace(chunks=chunks) not in cells]
 
     return [(cell, beside(cell)) for cell in cells if engine_tail(cell)]
+
+
+def batches_without_the_chain_tail():
+    """Every measured cell, and the same sequences one chunk longer or shorter, where the tail rule alone names a chain
+    tail and the engine's own plan of the in-place call carries neither it -- the chain does not pay there
+    (``tail_scheme``) -- nor a chain group: as lines, measured or not."""
+    found = []
+    for cell in gdn_prefill_f16.LEVEL_MEASURED_CELLS:
+        heads = dict(heads=cell.heads_key, value_heads=cell.heads_out, value_dim=cell.d_v)
+        for chunks in (cell.chunks - 1, cell.chunks, cell.chunks + 1):
+            lengths = [chunks * B_T] * cell.sequences
+            ruled = tail_rule.choose_tail(
+                num_seqs=cell.sequences,
+                heads_out=cell.heads_out,
+                num_sm=cell.sms,
+                total_tokens=sum(lengths),
+                b_t=B_T,
+                cadence_tokens=0,
+                expand_num=1,
+                dim_v=cell.d_v,
+            )
+            if ruled is not None and not ruled.dv_split and tail_scheme(cell.sms, lengths, **heads) is None and not group_scheme(cell.sms, lengths, **heads):
+                found.append(cell._replace(chunks=chunks))
+    return sorted(set(found))
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -367,6 +392,22 @@ def test_a_measured_cell_ranks_above_the_tail(level_form):
         assert gdn_engine.level_plan_refusal(gdn_prefill_f16, facts_of(cell, tail=True, ragged_pieces=True)) == "tail"
         for chunks in beside:
             assert gdn_engine.level_plan_refusal(gdn_prefill_f16, facts_of(cell, tail=True, rows=cell.sequences * chunks * B_T)) == "tail"
+
+
+@pytest.mark.L0
+def test_admission_is_asked_for_the_plan_the_chain_rule_leaves(monkeypatch, level_form):
+    """Where the tail rule alone would run a batch's last partial wave as a chain and the chain rule drops that chain, the
+    plan the engine builds carries no tail, and that plan is the one its admission is asked for: a measured cell is
+    levelled, and a batch no line names keeps the uncut table for the reason a batch without a tail is given."""
+    batches = batches_without_the_chain_tail()
+    cells = set(gdn_prefill_f16.LEVEL_MEASURED_CELLS)
+    assert any(batch not in cells for batch in batches)
+    for batch in batches:
+        plan_for(monkeypatch, batch)
+        plan = build_plan([batch.chunks * B_T] * batch.sequences, heads=batch.heads_key, value_heads=batch.heads_out, value_dim=batch.d_v)
+        assert plan.tail is None, batch
+        assert plan.level_refusal == gdn_engine.level_plan_refusal(gdn_prefill_f16, facts_of(batch)), batch
+        assert plan.level_plan == (batch in cells), batch
 
 
 @pytest.mark.L0
