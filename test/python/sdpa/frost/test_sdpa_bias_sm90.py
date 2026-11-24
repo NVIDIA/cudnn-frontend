@@ -476,13 +476,19 @@ def test_sm90_bias_template_refuses_unserved_legs(change):
         config_sm90.validate_params(dataclasses.replace(config_sm90.TemplateParams(), bias_fp32=True))
 
 
+# Short-Q GQA over a long KV: every bias-free mode-A set of engine 20540 splits or packs, which the bias leg refuses.
+_SHORT_Q_GQA = {"b": 4, "h_q": 16, "h_kv": 4, "s_q": 32, "s_kv": 1024}
+_DECODE_GQA = {"b": 1, "h_q": 32, "h_kv": 4, "s_q": 1, "s_kv": 512}
+
+
 @pytest.mark.parametrize(
     "change",
-    [{}, {"s_q": 1}, {"h_q": 32, "h_kv": 4}, {"s_q": 4096, "s_kv": 4096, "d_qk": 256, "d_v": 256, "causal": True}],
-    ids=["prefill", "decode", "gqa8", "d256-causal"],
+    [{}, {"s_q": 1}, {"h_q": 32, "h_kv": 4}, {"s_q": 4096, "s_kv": 4096, "d_qk": 256, "d_v": 256, "causal": True}, _SHORT_Q_GQA],
+    ids=["prefill", "decode", "gqa8", "d256-causal", "short-q-gqa-long-kv"],
 )
 def test_sm90_bias_default_discovery_offers_the_d512_body(change):
-    """Automatic planning proposes only unsplit, unpacked engine-20540 plans for a bias graph, and at least one."""
+    """Automatic planning proposes only unsplit, unpacked engine-20540 plans for a bias graph, and at least one,
+    including where every bias-free set splits or packs."""
     from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.fwd import heuristics
 
@@ -491,6 +497,45 @@ def test_sm90_bias_default_discovery_offers_the_d512_body(change):
     assert plans
     for plan in plans:
         assert plan.engine_id == offered[THREE_WG], plan
+        assert (plan.knobs.split_kv or 1) == 1 and not plan.knobs.pack_gqa, plan
+
+
+_MODE_A_SHAPES = [
+    ("b4-h16-kv4-q32-k1k", _SHORT_Q_GQA),
+    ("b1-h32-kv4-q1-k512", _DECODE_GQA),
+    ("d256-q4-k4k", {**_DECODE_GQA, "s_q": 4, "s_kv": 4096, "d_qk": 256, "d_v": 256}),
+    ("q16-k32k", {**_DECODE_GQA, "s_q": 16, "s_kv": 32768}),
+]
+
+
+@pytest.mark.parametrize(
+    "change, bias_dtype",
+    [
+        pytest.param(change, dtype, id=f"{name}-{label}")
+        for name, change in _MODE_A_SHAPES
+        for label, dtype in (("fp32-bias", cudnn.data_type.FLOAT), ("io-bias", cudnn.data_type.BFLOAT16))
+    ]
+    + [pytest.param({**_DECODE_GQA, "s_q": 67, "s_kv": 4096, "d_qk": 512, "d_v": 512}, cudnn.data_type.BFLOAT16, id="d512-q67-k4k-io-bias")],
+)
+def test_sm90_bias_mode_a_keeps_an_unsplit_unpacked_plan(change, bias_dtype):
+    """Mode A still proposes a plan for a short-Q GQA bias graph whose bias-free sets all split or pack, and every plan it
+    proposes is unsplit and unpacked, the bias leg's domain (#2872 review: B1, H_q 32 / H_kv 4, S_q 1, S_kv 512)."""
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.fwd import heuristics
+
+    s_q, s_kv = change["s_q"], change["s_kv"]
+    pitch = -(-s_kv // 8) * 8
+    facts = _facts(
+        device_sm_count=132,
+        bias_t=_Bias(bias_dtype),
+        bias_dim=(1, 1, s_q, s_kv),
+        bias_stride=(s_q * pitch, s_q * pitch, pitch, 1),
+        **change,
+    )
+    offered = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()
+    plans = heuristics.recommend("A", facts, offered)
+    assert plans
+    for plan in plans:
         assert (plan.knobs.split_kv or 1) == 1 and not plan.knobs.pack_gqa, plan
 
 
