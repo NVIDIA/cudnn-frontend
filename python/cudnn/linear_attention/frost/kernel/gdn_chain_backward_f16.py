@@ -159,6 +159,7 @@ def chain_backward_head_host(
     l2norm_k: Optional[cute.Tensor] = None,
     l2norm_inv_q: Optional[cute.Tensor] = None,
     l2norm_inv_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
     gate_blocks: cutlass.Int32 = 0,
     gate_bwd_dgate: Optional[cute.Tensor] = None,
     gate_bwd_gate: Optional[cute.Tensor] = None,
@@ -250,6 +251,7 @@ def chain_backward_head_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     cu_full = None
     if cutlass.const_expr(tail):
@@ -898,11 +900,13 @@ def build_chain_backward(
     gate_blocks=0,
     post_buffers=(None,) * 16,
     m_count=None,
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan;
-    ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone
-    modules' builds so every kernel compiles as it does there.  ``has_chunk_factors`` / ``has_piece_transitions`` / ``has_piece_state_grads``: the T pass,
-    the transition arm and the leaf summary are skipped, their buffers the context's."""
+    ``pieces``, ``heads_out``, ``num_seqs`` and ``l2norm_eps`` (the q/k normalize's additive epsilon) are launch arguments.
+    The placeholders repeat the marks of the standalone modules' builds so every kernel compiles as it does there.
+    ``has_chunk_factors`` / ``has_piece_transitions`` / ``has_piece_state_grads``: the T pass, the transition arm and the leaf
+    summary are skipped, their buffers the context's."""
     DK = q.shape[2]
     DV = v.shape[-1]
     HO = gate.shape[1]
@@ -1161,6 +1165,7 @@ def build_chain_backward(
             l2norm_k_slots,
             l2norm_k_expand_num,
             *l2norm_placeholders,
+            float(l2norm_eps),
             cutlass.Int32(int(gate_blocks)),
             *post_placeholders,
             from_dlpack(m_count, assumed_align=4).mark_layout_dynamic() if m_count is not None else None,
@@ -1251,6 +1256,7 @@ def run_chain_backward(
     gate_blocks=0,
     post_buffers=(None,) * 16,
     m_count=None,
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its launches (the passes the summary's intermediates replace compiled out).  The
     plan validated the contract at build, so nothing here raises."""
@@ -1329,6 +1335,7 @@ def run_chain_backward(
         scheduler_summary,
         scheduler_bwd,
         *lead_buffers,
+        float(l2norm_eps),
         int(gate_blocks),
         *post_buffers,
         m_count,
@@ -1433,6 +1440,7 @@ def chain_summary_backward_host(
     l2norm_k: Optional[cute.Tensor] = None,
     l2norm_inv_q: Optional[cute.Tensor] = None,
     l2norm_inv_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
 ) -> None:
     """The chain of the backward summary node."""
     if cutlass.const_expr(l2norm_q is not None):
@@ -1458,6 +1466,7 @@ def chain_summary_backward_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     cu_full = None
     if cutlass.const_expr(tail):
@@ -1654,9 +1663,10 @@ def build_chain_summary_backward(
     tail=False,
     tail_enable=None,
     l2norm_buffers=(None,) * 4,
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ):
     """Compile (cached per static config) the backward summary chain launch over the buffers of one plan; ``pieces``,
-    ``heads_out`` and ``num_seqs`` are launch arguments."""
+    ``heads_out``, ``num_seqs`` and ``l2norm_eps`` (the q/k normalize's additive epsilon) are launch arguments."""
     DK = q.shape[2]
     DV = do.shape[2]
     HO = gate.shape[1]
@@ -1821,6 +1831,7 @@ def build_chain_summary_backward(
                 from_dlpack(buffer, assumed_align=16).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
                 for buffer in l2norm_buffers
             ),
+            float(l2norm_eps),
             cache_key=repr((__name__, key)),
             symbol="frost_la_gdn_chain_summary_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
@@ -1869,6 +1880,7 @@ def run_chain_summary_backward(
     first_head_lo=0,
     tail_enable=None,
     l2norm_buffers=(None,) * 4,
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ) -> None:
     """Replay the backward summary chain: one crossing into the DSL for its launches."""
     buffers = locals()
@@ -1884,4 +1896,5 @@ def run_chain_summary_backward(
         cuda.CUstream(int(stream)),
         tail_enable,
         *l2norm_buffers,
+        float(l2norm_eps),
     )

@@ -151,24 +151,13 @@ def unsupported_device_reason(device):
     return _DEVICE_FLOOR_ERROR[index]
 
 
-_HAS_TMEM = {}
-
-
 def has_tmem():
-    """Whether the current device has tensor memory (``tcgen05``): the SM10x/SM11x
-    parts. On SM90 the TMEM cache tiers are disabled and the smem tiers serve.
+    """Whether the build or current device has tensor memory (``tcgen05``): the SM10x/SM11x
+    parts. On SM90 the TMEM cache tiers are disabled and the smem tiers serve."""
+    from cudnn._device import device_info
+    from cudnn.frost.device import current_device
 
-    Cached per device ordinal: the kernels launch on the current device, and a
-    process can hold an SM100 and an SM90 part."""
-    import torch
-
-    device = torch.cuda.current_device()
-    if device not in _HAS_TMEM:
-        _HAS_TMEM[device] = torch.cuda.get_device_capability(device)[0] in (10, 11)
-    return _HAS_TMEM[device]
-
-
-_SMEM_PER_SM = None
+    return device_info(current_device()).compute_capability[0] in (10, 11)
 
 
 def smem_per_sm():
@@ -178,21 +167,15 @@ def smem_per_sm():
     more than ``smem_per_sm() // (occ + 1)`` so that only ``occ`` CTAs can co-reside,
     which is what makes the per-CTA TMEM budget enforceable. The CuTe DSL exposes only
     the per-BLOCK limit (232448 on sm_100) and this is the per-SM total (233472), so
-    it comes from the device properties -- still queried, not hardcoded.
+    it comes from the build or current device's properties -- still queried, not hardcoded.
     """
-    global _SMEM_PER_SM
-    if _SMEM_PER_SM is None:
-        import torch
+    from cudnn._device import device_info
+    from cudnn.frost.device import current_device
 
-        prop = torch.cuda.get_device_properties(0)
-        _SMEM_PER_SM = int(getattr(prop, "shared_memory_per_multiprocessor", 0)) or smem_capacity()
-    return _SMEM_PER_SM
+    return device_info(current_device()).shared_memory_per_multiprocessor or smem_capacity()
 
 
-_EXT_STREAMS: dict = {}
-
-
-def on_stream(raw):
+def on_stream(raw, device=None):
     """Context manager putting torch's current stream on the graph's execution stream.
 
     The engines reach the GPU two ways -- CuTe kernel launches and torch ``copy_``
@@ -209,26 +192,16 @@ def on_stream(raw):
     leaves whatever side stream happens to be current in force -- a producer
     queued on the requested default stream then goes unwaited for and the norm
     reads the stale input. The two cases look identical and behave oppositely,
-    so they are kept apart here.
-
-    ``ExternalStream`` objects are cached because building one per execute is
-    pure overhead on the hot path.
+    so they are kept apart here. ``device`` is the plan's GPU (the current one when None).
     """
-    import torch
+    from cudnn._torch_stream import _raw_current_stream, stream_context
 
-    if raw is None:
-        return torch.cuda.stream(None)  # no stream requested: leave the current one alone
-    handle = int(raw)
-    from cudnn._torch_stream import _raw_current_stream
+    if raw is not None:
+        import torch
 
-    if handle == _raw_current_stream(torch, torch.cuda.current_device()):
-        return nullcontext()  # the requested stream is already current (the usual call): entering it again is pure cost
-    if handle == 0:
-        return torch.cuda.stream(torch.cuda.default_stream())  # explicitly the default stream
-    s = _EXT_STREAMS.get(handle)
-    if s is None:
-        s = _EXT_STREAMS[handle] = torch.cuda.ExternalStream(handle)
-    return torch.cuda.stream(s)
+        if int(raw) == _raw_current_stream(torch, device):
+            return nullcontext()  # the usual call: skip the generator context entirely
+    return stream_context(raw, device)
 
 
 def fake_stream():

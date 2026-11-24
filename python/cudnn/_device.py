@@ -184,7 +184,7 @@ class DeviceInfo:
 
     Exposes both forms of compute capability that callers consume — the
     ``(major, minor)`` tuple and the packed ``sm_version`` int — plus the SM
-    count, the opt-in / oversized per-CTA SMEM ceilings, the L2 size and the name.
+    count, the per-SM and opt-in / oversized per-CTA SMEM ceilings, the L2 size and the name.
     """
 
     def __init__(self, ordinal: int):
@@ -214,6 +214,13 @@ class DeviceInfo:
     def shared_memory_per_block_optin(self) -> int:
         drv = _driver()
         return int(_ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, _device_handle(self.ordinal))))
+
+    @functools.cached_property
+    def shared_memory_per_multiprocessor(self) -> int:
+        drv = _driver()
+        return int(
+            _ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, _device_handle(self.ordinal)))
+        )
 
     @functools.cached_property
     def oversized_shared_memory_per_block(self) -> int:

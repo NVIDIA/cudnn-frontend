@@ -992,6 +992,12 @@ pytest core/test_determinism_utils.py
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
 | `conv/cutedsl/test_conv3d_postops_determinism.py` | Conv3D raw, norm/SiLU, prepared norm/SiLU, residual/spatial pad, C12 causal input, standalone norm/SiLU preparation | Output, cache, residual, padding and exposed workspace bytes | Unsupported (inference only) |
+| `gemm/cutedsl/test_grouped_gemm_wgrad_empty.py` | `grouped_gemm_wgrad_wrapper_sm100`, cold-empty compilation | — | exact-zero overwrite and unchanged accumulated dW bytes; nonempty reuse, mixed empty experts and CUDA Graph replay |
+| `gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py` | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | saved C, D in both directions, both scale planes | — |
+| `gemm/cutedsl/test_grouped_gemm_dglu_gate_then_up.py` | `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | — | D in both directions, both scale planes, dprob; dbias numerical reference |
+| `gemm/cutedsl/test_grouped_gemm_glu_hadamard_layout.py` | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | C, D, pre/post-RHT amax | — |
+| `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D/RHT payloads and scales, including standard GEMM-blocked column scales | — |
+| `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py` | `GroupedGemmGluHadamardQuantSm100` and its wrapper, natural tensor ranks with either GLU branch order | C, D/RHT payloads and scales; legacy-rank equality, replay, batch invariance and graph replay | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py` | `MoEGroupedGemmBf16Kernel`, `MoEGroupedGemmGluBiasBf16Kernel` with `streaming_signal_capacity` (host / device layout, PDL) or `streaming_output_notify=N_CHUNK` | BF16 C and D over the experts' rows | Unsupported (forward-only kernels) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -2736,6 +2742,42 @@ python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.p
 python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -k glu_hadamard_quant -m L0 -q -rs
 ```
 
+### Grouped wgrad empty inputs — validation, 2026-11-11
+
+`gemm/cutedsl/test_grouped_gemm_wgrad_empty.py` covers NVFP4 E2M1/E4M3
+and MXFP8 E4M3/E8M0 with BF16/FP32 outputs, dense/discrete output storage,
+matrix/flat scale buffers, 1CTA/2CTA tiles, and overwrite/accumulate modes.
+Each of its 64 cases starts with an empty wrapper cache. It checks exact-zero
+overwrite or byte-preserving accumulation (including negative zero), reuses
+the compiled artifact for nonempty and mixed-empty experts with compilation
+forbidden, rebinds fresh empty inputs, and replays a CUDA Graph twice.
+The independent reference uses exact unit operands/scales and per-expert token
+counts; empty outputs are compared directly to zero or the original bytes.
+No runtime-specific golden is required for these exact boundary identities.
+This qualifies the empty-expert contract, not general nonempty determinism.
+
+The cold NVFP4 case failed before the fix in
+`from_dlpack(...).mark_compact_shape_dynamic(...)`. Empty FP4 samples retain
+strides that do not describe a nonempty compact tensor, and Torch's empty
+`dim_order()` may ignore those strides. Compiling their logical descriptors
+with symbolic token extents avoids inferring a layout from the empty sample.
+The kernel's empty accumulate path also skips the output reduction: adding
+positive zero changed negative zero in the original output.
+
+Measured on GB200 SM100 with Torch `2.13.0a0+8145d630e8.nv26.06`, framework
+CUDA 13.3, cuDNN 92600, and CuTe DSL 4.8.0. Separate cold-cache CUDA 13.4
+and CUDA 12.9 DSL compiler runs each passed **131 cases**, with **45 existing
+skips** and **2 cases deselected** by the default selection. All 64 new cases passed in each lane.
+The runs took 101.48 s and 99.28 s respectively. SM103 and SM107 are unverified.
+From `test/python`, both compiler lanes ran:
+
+```bash
+python -m pytest -n0 -v --tb=short \
+  gemm/cutedsl/test_grouped_gemm_wgrad_empty.py \
+  gemm/cutedsl/test_grouped_gemm_wgrad.py \
+  gemm/cutedsl/test_wgrad_tensormap_acquire.py
+```
+
 ### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10
 
 `test_DSA_indexer_compressed_sm90_determinism.py` now covers the public
@@ -2780,6 +2822,146 @@ CUDNN_TEST_TIMEOUT=1800 CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -q -s \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_forward.py \
   -k "prepared_plan or sm90_compressed or api_is_split_from_top_k"
 ```
+
+### Canonical grouped GLU branch storage — SM100, 2026-11-10 UTC
+
+The new BF16, NVFP4 and MXFP8 suites exercise conventional `[gate | up]`
+storage in the existing SM100/103 GLU and dGLU kernels. They distinguish branch ordering
+from the APIs' existing natural-rank tensor support. Comparisons against the
+legacy interleaved path use independently permuted test data; independent
+numerical references separately check the GEMM/activation results. Quantized
+payloads and scale bytes remain fixed for replay and batch comparisons.
+Packed and discrete expert weights are covered, including empty experts.
+
+MXFP8/NVFP4 backward uses `deterministic=True` for dprob byte comparisons.
+BF16 dprob byte qualification is limited to the single-N-tile F=128 case. dbias
+retains the existing atomic reduction, so its check is numerical rather than
+a bitwise-determinism claim. The option does not remove the existing 256-row
+expert-token alignment or change the default interleaved layout.
+
+Run from `test/python` with the modified checkout imported:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py \
+  gemm/cutedsl/test_grouped_gemm_dglu_gate_then_up.py -m L0 -q -rs
+```
+
+Measured on NVIDIA GB200 SM100 (152 SMs), Torch
+`2.13.0a0+8145d630e8.nv26.06`, CUDA 13.3, driver API 13030,
+cuDNN 92600, CuTe DSL 4.8.0 with its CUDA 13.4 compiler, and TVM FFI 0.1.11.
+The modified frontend 1.33.0 source and matching rebuilt Python extension
+were imported. The initial qualification passed 66 forward and 35 backward
+cases without skips, including runtime-hash comparisons. Those snapshots are
+kept as external validation artifacts rather than committed fixtures. The
+corresponding tests retain their reference, replay and batch-invariance checks
+without requiring a runtime-specific baseline. Existing runtime records are unchanged.
+SM103 remains unverified; the option is unavailable on SM90 and SM107.
+
+The final source also passes ten allocator-poison CUDA Graph regressions:
+six forward cases (three precisions, one- and two-CTA tiles), and four
+block-scaled backward cases (NVFP4/MXFP8, both branch layouts). These exercise runtime TMA
+descriptor reuse after scale-buffer allocations change; the shared descriptor
+helper now publishes and acquires descriptors through the tensormap proxy.
+The original interleaved path reproduced the failure before this fix.
+
+The NVFP4 GLU+Hadamard sibling passed 13 cases. Its checks include
+dense/discrete weights, SMEM RHT, dense TMEM RHT, independent numerical
+references, replay, batch invariance and explicit rejection of
+canonical discrete weights with `use_tmem_post_rht_amax=True` (a compiler
+limitation; callers can select the existing SMEM path).
+
+GLU+Hadamard+quant covers BF16 row RHT and NVFP4 row/column RHT for
+both GLU input layouts. Columnwise scales use the shared standard GEMM-blocked
+output contract documented above. The 28-case branch-layout suite checks exact
+payload/scale bytes, independent GEMM/activation/Hadamard/dequantization
+references, changed-input graph replay and expert reorder/duplication.
+
+### GLU+Hadamard+quant natural tensor ranks — SM100, 2026-11-11
+
+The 52-case `test_grouped_gemm_glu_hadamard_quant_canonical.py` L0 suite
+qualifies the natural-rank adapter independently of GLU branch order. It covers
+`gate_then_up` and `interleaved_32`, dense/discrete NVFP4 E2M1 weights with E4M3
+MMA-packed scales, BF16/NVFP4 D and rowwise RHT, and standard GEMM-blocked
+colwise scales. Primary GEMMs use logical K=512, N=256/2048, and
+expert M=[256, 0, 512]; batch and dynamic-M cases vary those token counts.
+
+All output payload and scale bytes must equal the existing kernel-facing API.
+Independent GEMM/SwiGLU/Hadamard/dequantization references retain their previous
+tolerances. The suite separately checks three fresh-allocation/noise-stream
+replays, expert-alone/reorder/duplication/removal/changed-neighbor invariance,
+and changed A/B/scale CUDA Graph replay. These replay invocations are internal
+to the 52 pytest cases, not additional collected cases. Caller-owned flat and
+contiguous rank-six scale outputs, prepared execute without framework tensor
+view operations, malformed packed-scale spans, empty experts, entirely empty
+batches and no-RHT calls are also covered. The adapter does not change kernel
+arithmetic, and no runtime-specific golden was created or rewritten.
+
+The qualification of the edited `e0f75a6e` checkout with the column-scale
+correction passed **97 cases with 6 Rubin-only skips**, in 150.63 seconds:
+17 passes / 6 skips in the existing quantization suite, 28 passes in the
+branch-layout suite, and 52 passes in the natural-rank suite. Runtime was NVIDIA
+GB200 SM100, driver 580.126.20, Torch 2.13.0a0+8145d630e8.nv26.06 / CUDA 13.3,
+cuDNN backend 92600, and CuTe DSL 4.8.0 compiling with CUDA 13.4.
+The independent default-output qualification above records the later isolated
+scale fix separately. SM103, SM107 and CUDA 12 compilation remain unverified
+for this revised feature suite; earlier alternate-format counts do not qualify
+its current scale contract. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant.py \
+  gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py \
+  gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py -m L0 -q -rs
+```
+
+### Rebased grouped GLU stack — SM100, 2026-11-11
+
+The feature was rebuilt on develop `683f294b` with the default NVFP4 column-scale
+packing fix as a separate prerequisite. The tested stack `c6e49e62` passed
+**102 Torch cases with 6 Rubin-only skips**: 97 from the three quantization,
+branch-layout and natural-rank suites above (149.01 s), plus all 5 default-layout
+determinism cases (11.93 s). The JAX selection passed **16 cases** (45.26 s).
+Subsequent history cleanup moved API documentation into the prerequisite fix
+and clarified documentation; the tested feature source and tests are unchanged.
+The runtime was the same GB200 / CUDA 13.4 compiler environment documented above.
+
+Separate processes imported the standalone fix and feature stack, generated
+identical inputs, and compared raw-byte hashes of C, D, columnwise RHT and its
+scales. All outputs matched for the default `interleaved_32` path at expert
+M=[256,0,512], N=256/2048, K=512. Each process also checked an independent
+numerical reference. The 15-case TE integration selection passed (48.64 s)
+using TE Python source `21d47d4d` and its previously built native libraries;
+this was not a fresh full native rebuild. SM103/SM107 remain unverified.
+
+### Rebased grouped GLU stack — SM100, 2026-11-16
+
+The prerequisite column-scale fix and grouped GLU feature were rebased on
+develop `5304d19d`. On four GB200 GPUs (SM100), the standalone fix passed
+**24 Torch and 16 JAX cases**, with 6 SM107-only scale-format skips. The feature
+selection, including the current upstream Hadamard suite, passed **371 unique
+Torch cases and 16 JAX cases**, with the same 6 SM107-only skips. The two-device
+cache-isolation case was rerun with two visible GPUs and passed.
+
+The feature-layout reference now follows the upstream Hadamard contract:
+pre-RHT amax is the maximum of stored BF16 D, and post-RHT amax is the maximum
+after rounding the transformed values to BF16. Independent GEMM/activation
+checks remain in place; their tolerances were not relaxed. Separate processes
+again compared all default `interleaved_32` output bytes between the standalone
+fix and feature at expert M=[256,0,512], N=256/2048, K=512. Both comparisons
+matched, and each process checked its independent numerical reference.
+
+The FE binding and TE native libraries were freshly built against this stack.
+The TE integration selection on upstream main `f96e7b24` passed **115 unique
+cases**, with 6 existing bias-support skips. Four-rank Megatron integration on
+main `7c0fac79` passed **81 cases**: GTP 12, FSDP V2 11, FSDP V1 3, adapter/config
+51, CUDA graph 1, and canonical grouped MLP determinism replay 3. Counts are
+per test case, not multiplied by ranks. Tests that trace dispatch now include
+the Hadamard forward variants selected by TE.
+
+The runtime used Torch `2.13.0a0+8145d630e8.nv26.06` (CUDA 13.3), FE backend
+92600, CuTe DSL 4.8.0 and the CUDA 13.4 compiler. The optional NCCL EP extension
+was disabled in the fresh TE build. These are targeted numerical and replay
+checks, not a complete upstream CI run or a new performance measurement.
+SM103/SM107 remain unverified.
 
 ### Custom reduction — SM100 validation, 2026-11-09 (UTC)
 
@@ -3239,7 +3421,7 @@ saved baseline. The new head-layout, GDP step-count, isolated-loss, and QSA
 mask-replay cases also check an independent reference. A reference pass alone
 does not establish bitwise determinism.
 
-### Linear attention: 28 cases per family, plus four GDP cases
+### Linear attention: 28 cases per family, plus eight GDP cases
 
 The shared implementation is `linear_attention/determinism.py`. Each FROST
 wrapper pins one operation. Except where listed, inputs use BF16, two Q/K/V
@@ -3257,6 +3439,7 @@ heads, K=V=64, and a nonzero FP32 initial state.
 | `test_neighbor_isolation` | L0 | fprop/bprop; fixed 17-token target, changed 65- and 3-token neighbors | 2 |
 | `test_gradient_source` | L0 | bprop with output loss only or final-state loss only | 2 |
 | GDP `test_householder_steps` | L0 | fprop/bprop × 1/2 steps; the other GDP tests use 3 steps | +4 for GDP |
+| GDP `test_qk_l2norm` | L0 | fprop/bprop × the fused q/k normalization at the default epsilon and at `qk_l2norm_eps=1e-10`; lengths 65, 17, 3; rows scaled around both epsilons; reference, four executions, partitions | +4 for GDP |
 
 The three head layouts are `(Q/K heads, V heads, K dimension, V dimension)`:
 `(1, 4, 64, 128)`, `(4, 1, 128, 64)`, and `(2, 2, 128, 128)`.
@@ -8909,3 +9092,265 @@ This closes the native SM120 qualification gap for these direct-helper cases.
 It does not qualify full attention chains at the launch boundary, native
 SM103/SM107 boundary cases, or a new public API support row. Current-head
 review and integration CI remain separate from this bounded packet.
+
+### Canonical NVFP4 Hadamard paired-CTA SFB handoff — 2026-11-19
+
+The nonquant `grouped_gemm_glu_hadamard_wrapper_sm100` forward path now
+observes each CTA's own SFB TMA completion before in-place scale permutation.
+A per-stage, two-arrival ready barrier and cluster-scope acquire precede
+collective S2T. Stage reuse remains owned by the original AB pipeline.
+This changes synchronization, not the numerical formula or output scale
+format. The API has no backward entry point. The separate Hadamard+quant
+kernel is unchanged.
+
+Fresh validation used NVIDIA GB200 (SM100, 152 SMs), Torch
+2.13.0a0+8145d630e8.nv26.06, CUDA 13.3, cuDNN 9.25.1, and CuTe DSL 4.8.0
+(compiling with CUDA 13.4), job 9182480. The worktree was
+`glu_canonical_validation/pr_publication_20261110/worktrees/cudnn-frontend`
+at `ca3f85b6` with the local synchronization fix. Kernel source SHA256 was
+`15e2088c1539992fd0906f7daff550abc8575faa9dfc8dfec962555ac89c844f`;
+new determinism suite SHA256 was
+`3ecabd0f3b84ab54e294752704809fd5f082fd2a99160143163ce12fbab01143`.
+The launcher asserted the Python package/API paths and unchanged kernel
+hashes during each run; it reused the existing compiled cuDNN binding.
+
+Run from `test/python`, with `CUBLAS_WORKSPACE_CONFIG=:4096:8` and the
+worktree package selected explicitly (equivalent pytest arguments):
+
+```bash
+python -m pytest -v -m L0 gemm/cutedsl/test_grouped_gemm_glu_hadamard_layout.py
+python -m pytest -s -v -m L0 gemm/cutedsl/test_grouped_gemm_glu_hadamard_determinism.py
+python -m pytest -v -m L0 gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py
+```
+
+- Existing Hadamard layout/reference/replay/batch-invariance suite: **13 passed**.
+  Two cases check the existing rejection of canonical discrete-weight TMEM RHT.
+- New stage reuse/synchronization suite: **19 passed**. Twelve cases cover
+  K=1792/4096, static/dynamic scheduling, dense/discrete SMEM RHT and dense
+  TMEM RHT. Four inject a 20,000 ns nanosleep before either CTA's scale
+  permutation, for dense/discrete weights. Emitted PTX confirms all four
+  instrumented kernels contain the delay and the cluster acquire. The
+  instrumented subset was rerun separately: **4 passed, 15 deselected**;
+  this overlaps the 19-case result.
+- Three warm-stress cases use grouped M=[1024,0,2048], N=2048, K=4096,
+  five input stages and persistent scheduling. Each completed 3,000 warm
+  and 3,000 poisoned launches with zero differing bytes. The helper's unsafe
+  ring control failed 200/200 launches. The target uses 152 resident CTAs
+  (one per SM), versus 456 for the control; these bounded measurements do
+  not exhaust possible schedules. Cold-launch byte references supplement
+  the independent FP64 GEMM/SwiGLU and explicit H16 numerical checks.
+- Separate unchanged Hadamard+quant suites: **33 passed**, including row/column
+  payloads/scales, changed-input graphs, batch invariance and warm stress.
+- No failures or skips in those completed runs. An initial launcher attempt
+  failed argument parsing because pytest-xdist was absent; removing `-n0`
+  allowed the serial runs above. No numerical tolerance or golden changed.
+
+The independent numerical checks retain C rtol/atol=0.01/0.005,
+D=0.015/0.005, exact stored-D amax, and post-RHT amax=1e-4/1e-4.
+All replay, input-preservation and legacy-layout comparisons use exact bytes.
+The six pre-existing modified files were verified unchanged by SHA256.
+For dense/discrete SMEM and dense TMEM, legacy interleave32 PTX is identical
+before/after after normalizing entry-symbol names and removing source comments.
+Canonical PTX confirms group-one SFB multicast completion, permutation stores
+before release, and cluster acquire before group-two S2T.
+
+No old-kernel timing failure was reproduced; the fix closes the synchronization
+contract gap. The generic unsafe-ring control is not a reproduction of that
+specific defect. SM103 and untested shapes remain unverified.
+Evidence (logs, XML, provenance, before/after sources and PTX) is under
+`glu_canonical_validation/hadamard_sync_fix_20261119/` in the validation workspace.
+
+### SM107 D256 per-tensor FP8 two-warpgroup body — 2026-11-19
+
+The two-warpgroup D256 per-tensor FP8 body (Q resident in TMEM, one softmax
+warpgroup per KV-step parity) is selected through the standalone adapter
+on an explicit `cga=2` with `softmax_precision=HALF`; the public record keeps
+`cga=1`. `TestMidFp8Implementation` in `sdpa/frost/test_sdpa_fp8_sm107.py`
+gained the admission test (route assertion, declines, default width), the
+fp64 reference + replay cases (odd and even step counts, a zero-Q/K run that
+never rescales O, causal, bottom-right causal with keyless Q tiles handed
+over under the cluster launch control, and window, per-batch length and sink
+masks), batch-isolation cases (a sequence alone, reordered within the batch,
+next to changed neighbors; dense, causal, and bottom-right with a window,
+per-batch lengths and a sink), a PTX pin of the four shared-memory slot
+credits that depend on their loaded words through the release-zero argument
+(eight rendering families covering every input type, mask form, output type
+and Stats / Amax_O setting), and a warm-stress case over the refilled alpha /
+running-max / final-stat slots (2048 CTAs, eight KV steps per tile).
+
+Run on native cc 10.7 (208 SMs) with Torch 2.12.1+cu130, cuDNN 9.30.0 and
+CuTe DSL 4.8.0a0 (CUDA 13.4 compiler): all cases pass; the warm-stress control
+reproduced the unsafe twin's failure on the same device. No goldens were
+recorded.
+
+## Simplified sparse attention CI failures — 2026-11-20
+
+Audited all 18 `python/misc/cutedsl:be-*-cutedsl-*` jobs in
+pipeline 84114932,
+source `6d739b867aa5ca1006767296a94f6687d9b71786`. The three version columns
+below use cuDNN 9.28.1 / DSL 4.8.0, cuDNN 9.29i / DSL 4.8.0, and
+cuDNN 9.30i / DSL 4.9.0a0, respectively. Results are retained CI evidence,
+not reruns of the skip change.
+
+| Lane | 9.28.1 / 4.8.0 | 9.29i / 4.8.0 | 9.30i / 4.9.0a0 |
+| --- | --- | --- | --- |
+| SM80 | Canceled before start (job 563000189) | Canceled before start (job 563000177) | Canceled before start (job 563000201) |
+| SM90 | 4098 passed (job 563000190) | 4098 passed (job 563000179) | 4098 passed (job 563000203) |
+| SM100 | 4 failed (job 563000193) | 4 failed (job 563000181) | 4 failed (job 563000206) |
+| SM103 | 30 failed (job 563000195) | 31 failed (job 563000183) | 30 failed (job 563000209) |
+| SM107 | Resource-wait timeout (job 563000196) | Resource-wait timeout (job 563000185) | Resource-wait timeout (job 563000211) |
+| SM120 | 3 failed (job 563000198) | 18 failed (job 563000187) | 9 failed (job 563000213) |
+
+### Failure classification
+
+- SM100: each lane has three raw-byte determinism failures (dense KL indexer
+  H96 forward replay, dense KL indexer H16 Torch forward batch invariance,
+  JAX attention H16 forward batch invariance) and one JAX invalid-input
+  `BufferError`: expected CUDA device 0, current device 3. The invalid-input
+  parameters differ by lane (`denominator`, `empty`, `bounds`). That device
+  mismatch is not a determinism failure and remains active.
+- SM103: all 30/31/30 failures are raw-byte replay or batch-invariance
+  mismatches in the three simplified sparse attention determinism suites.
+  The middle lane also fails the PyTorch H96 backward golden's replay check.
+  Across the lanes, the union is 31 failing case IDs. Golden failures occur
+  before golden comparison; golden hashes were not changed.
+- SM120-tagged lanes: all 3/18/9 failures are capability or compilation
+  failures. NSA Top-K requires tcgen05, which is unavailable on SM12.x.
+  CSA backward exceeds the device's 101376-byte shared-memory limit; DSL 4.9
+  also fails to compile six configurations for this reason. The 9.29i lane
+  has 15 paged QSA score failures because deterministic Top-K limits FP32
+  columns to 16384 while those cases request 32768. These are not measured
+  raw-byte failures, including cases whose names contain `deterministic`,
+  and remain active. The NSA log identifies SM121 in the middle lane and
+  SM120 in the other two; the CI lane tag alone does not identify the GPU.
+- SM107: all three jobs exhaust the one-hour CI limit while Slurm reports
+  `queued and waiting for resources`. No tests ran. SM80 jobs were canceled
+  before starting. Neither result establishes a determinism status.
+
+Job 563000195 (job 563000195)
+ran on `theia0118` (NVIDIA GB300, SM103), driver 620.78 (CUDA 13.5).
+Its result was **30 failed, 5719 passed, 1938 skipped, 1 xfailed** in
+1310.01 seconds. All 30 failures were raw-byte mismatches, with no JUnit
+errors: dense KL indexer 4 replay / 7 batch-invariance failures, PyTorch
+attention 5 / 4, and JAX attention 6 / 4. Each case stops at its first
+mismatch; later comparisons are unmeasured. These logs establish the failure
+types, not their kernel or test-setup cause.
+
+### Temporary skip scope
+
+At the user's request, only the measured determinism failures are temporarily
+skipped: three case IDs on SM100 and 31 on SM103. The architecture-specific
+lists are in `simplified_sparse_attention/conftest.py`; the reason starts with
+`skip until fix: known determinism failure`. Other case IDs, GPUs, independent
+correctness suites, and golden files remain active. Remove these skips with
+the fixes and rerun replay, batch invariance, and independent reference checks
+before upgrading support status.
+
+Host validation compares the configured IDs with the union of raw-byte
+failures in all six SM100/SM103 JUnit artifacts. With mocked GPU capabilities,
+the fixture skips exactly 3 IDs on SM100 and 31 on SM103, and none on SM90,
+SM107, or SM120. JAX invalid-input and passing golden controls remain active.
+This is a fixture check, not a GPU test run. The local Python environment has
+no Torch, so the GPU suites and collection were not rerun. Pre-commit and
+`git diff --check` passed. `fern check --warnings` reported no errors; its
+redirect check could not reach FDR (HTTP 403).
+
+## Misc CuTeDSL CI device and capacity fixes — 2026-11-20
+
+Follow-up to pipeline 84114932:
+
+- The JAX invalid-input tests call `jax_inputs` directly. Its first DLPack
+  conversion could initialize XLA after entering a tensor's CUDA device guard,
+  changing the current device before export. Initialize XLA in a separate
+  restoring guard before conversion; exercise direct conversion and execution,
+  including initialization and execution errors.
+- The NSA THD Top-K test now uses the existing tcgen05 capability gate.
+  Paged QSA's FP32 deterministic Top-K capacity gate now covers SM121 as well
+  as SM120, matching the API's architecture check.
+- CSA ratio-128 backward support checks one compressed-row schedule, but
+  compilation previously built both small and default schedules. The unused
+  default could exceed SM12.x shared memory even when the declared shape fit.
+  Compile only the validated shape's schedule; empty plans compile no kernel.
+  Batch-invariance checks apply the existing shared-memory gate separately
+  to each packed backward layout. Unsupported shapes are skipped as unsupported,
+  without claiming byte determinism or extending the supported envelope.
+
+Validation used SM100, driver 610.11, Torch `2.14.0a0+b2c75dd062.nv26.09`,
+CUDA 13.4, cuDNN 92700, JAX 0.11.2, and CuTe DSL 4.8.0, in the
+cuDNN 9.27.0.42 / CUDA 13.4.1 amd64 CI image.
+The test runner prepended `/workspace/python/cudnn` to the installed package's
+search path and loaded the checkout's JAX version constants. Changed Python
+APIs and kernels resolved to `/workspace`; the container retained its installed
+1.28.0 native extension. These checks do not validate a new C++ build or the
+CI backend/DSL combinations. Base source was `fdae16db7dd55dc69ba8da4026bca272177948d5`
+plus this change.
+
+Run from `test/python`, with `CUDNN_TEST_NO_ISOLATION=1`,
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`, and `XLA_PYTHON_CLIENT_PREALLOCATE=false`:
+
+| Selection | Result |
+| --- | --- |
+| Targeted JAX device, NSA capability, QSA column-limit, CSA compilation and packed-layout memory regressions (`-m L0`) | 34 passed |
+| Complete `simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py` (`-m L0`) | 27 passed, 1 skipped in 156.96 s |
+| CSA backward batch-invariance cases and packed-layout memory regression (`-m L0 -k test_batch_invariance`) | 18 passed, 1 xpassed in 10.69 s |
+| CSA ratio-128 replay and CUDA Graph capture (`-m L0 -k 'replay_determinism_r128 or cuda_graph_capture_r128'`) | 2 passed in 2.30 s |
+| CSA ratio-128 schedule envelope (`-m 'L0 or L1' -k r128_envelope_execution`) | 10 passed in 10.55 s |
+| NSA THD noninterference, CSA compile-capacity and shared-memory checks, and CSA batch invariance (earlier bounded run) | 29 passed, 1 xpassed in 11.98 s |
+
+The one JAX skip requires a second visible CUDA device. The known CSA forward
+schedule-boundary xfail happened to pass; it remains a known failure and was
+not removed. The envelope checks retain independent FP32/FP64 references and
+existing replay comparisons. No golden files or numerical tolerances changed.
+
+A negative control restored the previous JAX conversion helper, CSA compile
+method, and paged QSA capacity helper while retaining the new tests: **10 failed,
+10 passed** in 3.52 s. The corrected versions passed the targeted regression run.
+Mocked capability cases cover SM120 and SM121, but no SM12.x GPU or DSL 4.9
+run was available. Those execution scopes remain unverified.
+
+## MoE MXFP8 scale-row offsets — 2026-11-21
+
+The fused Gate/Up scale loader shifted a blocked scale layout by a signed
+scalar row offset. For CTA 1 of an even FC1 tile, that offset is -128.
+Decomposing it inside the 128-row scale atom under CuTe DSL 4.9 corrupted
+alternate Up tiles. The loader now applies whole-tile offsets to the outer
+row mode, retaining zero coordinates inside the atom.
+
+On one SM100 GPU with 148 SMs, driver 610.11, PyTorch 2.14.0a0,
+CUDA/compiler 13.4 and cuDNN 9.27.0, the original DSL 4.9 forward had relative L1 error 0.367806
+against the independent PyTorch reference. The fixed forward has error
+0.0346925, within the unchanged 0.1 bound. Its output, quantized weights,
+and every saved forward-context tensor match the original DSL 4.8 run
+byte for byte for the fixed seed-40, 1024-token, four-expert case.
+
+`moe_ep/cutemok/test_cutemok.py::test_cuda_graph[mxfp8-False]` now uses
+`determinism_utils.assert_replays`: eight executions with fresh outputs,
+fixed inputs and gradients, and concurrent GPU work. It compares output,
+input and router gradients, and all six routed/shared weight gradients as
+raw bytes. Changed-input and changed-routing graph replay also compares
+raw bytes. The separate `test_forward_backward[mxfp8]` retains its numerical
+reference and error bounds.
+
+Commands from `test/python`, with `CUDNN_TEST_NO_ISOLATION=1`:
+
+```bash
+python -m pytest moe_ep/cutemok/test_cutemok.py -q -rs --tb=short
+python -m pytest attention_prepare/frost/test_attention_prepare_decode.py -k rendering_pins -q --tb=short
+```
+
+The replay scope is one rank. Batch insertion, removal and reordering,
+multiple ranks, warm-stress qualification, and SM103 execution remain
+unverified. The API support row remains unverified.
+
+Measured from `ad170f52` plus this fix:
+
+| CuTe DSL | Full MoE suite | Cross-target rendering checks |
+| --- | --- | --- |
+| 4.8.0 | 30 passed, 1 skipped; 80.13 s | 3 passed; 18.67 s |
+| 4.9.0a0+20261120230000.ecb3b50 | 30 passed, 1 skipped; 75.60 s | 3 passed; 19.21 s |
+
+The skip is the existing multi-rank barrier-wrap case: one rank launches
+no communication barrier. Each rendering check covers 15 forms/launch arms
+for one of SM100, SM103 and SM107, including instruction and SASS checks;
+rendering another target does not establish GPU execution on that target.
+The model report suite on current develop also passes: 51 passed, 35.16 s.

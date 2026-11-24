@@ -35,6 +35,7 @@ from cudnn.tensor_adapter import (
 from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
+from ..glu_layout import validate_glu_layout
 from .moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
 
 
@@ -67,6 +68,7 @@ class GroupedGemmGluBf16API(APIBase):
         act_func: str = "swiglu",
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        glu_layout: str = "interleaved_32",
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -125,6 +127,7 @@ class GroupedGemmGluBf16API(APIBase):
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.generate_c = generate_c
+        self.glu_layout = validate_glu_layout(glu_layout)
         self.act_func = act_func
         self.b_major = b_major
         self.use_dynamic_sched = use_dynamic_sched
@@ -293,6 +296,14 @@ class GroupedGemmGluBf16API(APIBase):
         if not has_tcgen05(major):
             raise RuntimeError(f"GroupedGemmGluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
+        if self.glu_layout == "gate_then_up":
+            self._not_implemented_error_if(compute_capability not in (100, 103), "gate_then_up GLU requires SM100/103")
+            self._not_implemented_error_if(n % 256 != 0 or self.mma_tiler_mn[1] != 256, "gate_then_up GLU requires N divisible by 256 and tile_N=256")
+            self._not_implemented_error_if(self.b_major != "k" or self.act_func != "swiglu", "gate_then_up GLU requires K-major weights and swiglu")
+            self._not_implemented_error_if(
+                self.c_desc.dtype != cutlass.BFloat16 or self.d_desc.dtype != cutlass.BFloat16,
+                "gate_then_up BF16 GLU requires BF16 C/D",
+            )
         self._is_supported = True
         return True
 
@@ -313,6 +324,7 @@ class GroupedGemmGluBf16API(APIBase):
             act_func=self.act_func,
             enable_bias=self._has_bias,
             generate_c=self.generate_c,
+            glu_layout=self.glu_layout,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()

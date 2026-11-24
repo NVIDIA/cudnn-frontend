@@ -32,6 +32,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import vector
 
 from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
+from ..glu_layout import interleaved_glu_view, validate_glu_layout
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -137,6 +138,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         glu_clamp_max: float = 7.0,
         glu_clamp_min: float = -7.0,
         round_dgrad_to_input_dtype: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         # Validate FIX_PAD_SIZE compatibility with tile size
         mma_tile_m = mma_tiler_mn[0]
@@ -151,6 +153,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         if act_func not in ["dswiglu", "dgeglu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
 
+        self.glu_layout = validate_glu_layout(glu_layout)
         self.expert_cnt = expert_cnt
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -549,6 +552,10 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
 
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            c = interleaved_glu_view(c, axis=1)
+            d = interleaved_glu_view(d, axis=1)
+
         # Setup TMA load for C
         c_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
         self.tma_c_load_bytes = cute.size_in_bytes(self.c_dtype, c_smem_layout)
@@ -761,6 +768,9 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                 sum_b = sum_b + rDst_b[i]
 
         n_offset = (n_base_d1 + 2 * lane_idx) if lane_idx < 16 else (n_base_d2 + 2 * (lane_idx - 16))
+        valid_n_offset = n_offset < dbias_n_total
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            n_offset = (n_offset // 64) * 32 + n_offset % 32 + ((n_offset // 32) % 2) * (dbias_n_total // 2)
 
         if cutlass.const_expr(self.dbias_cross_warp_reduce):
             reduce_base = sDbias.iterator
@@ -783,11 +793,11 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     cute.copy_atom_call(copy_64bit_atom, sSrc_w, rDst_w)
                     cta_sum_a = cta_sum_a + rDst_w[0]
                     cta_sum_b = cta_sum_b + rDst_w[1]
-                if n_offset < dbias_n_total:
+                if valid_n_offset:
                     gmem_ptr = dbias_gmem_2d[(expert_idx, n_offset, None)].iterator.llvm_ptr
                     atomic_add_bf16x2(gmem_ptr, cta_sum_a, cta_sum_b)
         else:
-            if n_offset < dbias_n_total:
+            if valid_n_offset:
                 gmem_ptr = dbias_gmem_2d[(expert_idx, n_offset, None)].iterator.llvm_ptr
                 atomic_add_bf16x2(gmem_ptr, sum_a, sum_b)
 

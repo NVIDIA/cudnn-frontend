@@ -25,6 +25,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import cudnn
+from cudnn._device import device_info
 from cudnn._sdpa_tail import GateTail, match_gate_tail
 from cudnn.sdpa import band
 from cudnn.sdpa.layout import dense_layout_ok
@@ -85,51 +86,25 @@ def to_torch_dtype(dt):
 _REQ_STRIDE_ORDER = (3, 1, 2, 0)
 
 
-def _device_props():
-    """The current device as cuDNN describes it, or None without a device.
+def _device_fact(name: str):
+    """``name`` of the GPU the facts describe -- the build scope's (the graph handle's) device,
+    else the current one -- or None without a visible device."""
+    from cudnn.frost.device import current_device
 
-    cudnn.create_device_properties() is the backend's OWN device descriptor —
-    the same object the C++ deviceless-AoT path serializes and replays. Reading
-    it here instead of torch.cuda keeps the facts path framework-neutral, and
-    is the step that makes a deviceless python engine possible at all: facts
-    computed from a serialized descriptor need no live device.
-
-    Cached per device id: the descriptor costs a backend call and the device
-    does not change under a process.
-    """
-    import json
-
-    from cudnn.frost.buffers import current_device_id
-
-    dev = current_device_id()
-    if dev is None:
+    try:
+        return getattr(device_info(current_device()), name)
+    except (NotImplementedError, RuntimeError, ValueError):
         return None
-    cached = _DEVICE_PROPS_CACHE.get(dev)
-    if cached is None:
-        try:
-            cached = json.loads(cudnn.create_device_properties(dev).serialize())
-        except Exception:  # noqa: BLE001 — no device / older backend: facts stay device-less
-            cached = {}
-        _DEVICE_PROPS_CACHE[dev] = cached
-    return cached or None
-
-
-_DEVICE_PROPS_CACHE: dict = {}
 
 
 def _device_cc() -> Optional[tuple]:
-    """Compute capability of the current CUDA device, or None without CUDA."""
-    props = _device_props()
-    if not props or "deviceVer" not in props:
-        return None
-    ver = int(props["deviceVer"])  # 1000 == SM 10.0
-    return (ver // 100, (ver % 100) // 10)
+    """Compute capability of the device the facts describe, or None without CUDA."""
+    return _device_fact("compute_capability")
 
 
 def _device_sm_count() -> Optional[int]:
-    """SM count of the current CUDA device, or None without CUDA."""
-    props = _device_props()
-    return int(props["multiProcessorCount"]) if props and "multiProcessorCount" in props else None
+    """SM count of the device the facts describe, or None without CUDA."""
+    return _device_fact("sm_count")
 
 
 def _stride_order(dim: tuple, stride: tuple) -> tuple:
@@ -854,8 +829,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid("sdpa_fp8_backward requires " + " / ".join(_FP8_BWD_SCALARS))
 
     def _real_output(t):
-        """The op RETURNS its amax ports unconditionally; only a real
-        (non-virtual, set_output(True)) tensor is a requested output."""
+        """A returned optional port is observable only when marked as a graph output."""
         return t if (t is not None and not getattr(t, "is_virtual", True)) else None
 
     _quant_bwd = is_mxfp8_bwd or is_fp8_bwd
@@ -978,6 +952,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
             wants_stats = False
         if wants_stats and stats is None:
             return _invalid("generate_stats=True but no Stats tensor was returned")
+        # The recognized forward graphs have no consumer of Stats. A virtual Stats
+        # (e.g. FlashInfer FP8 prefill with return_lse=False) needs no external store.
+        wants_stats = wants_stats and _real_output(stats) is not None
 
     attn_scale = rec.get("attn_scale")
     dynamic_scale = attn_scale is not None and not isinstance(attn_scale, (int, float))

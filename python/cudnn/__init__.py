@@ -245,6 +245,22 @@ def load_cudnn():
     _pybind_module._set_dlhandle_cudnn(handle)
 
 
+def _cudnn_wheel_lib_on_sys_path():
+    """The nvidia-cudnn-cuXX (or nvidia-cudnn-jit) wheel's libcudnn.so.x in any
+    sys.path entry, for wheels installed outside purelib: ``pip install --user``,
+    ``pip install --target`` plus PYTHONPATH, or the base environment of a
+    ``--system-site-packages`` venv."""
+    for sub in ("nvidia/cudnn/lib", "nvidia/cudnn_jit/lib"):
+        for base in sys.path:
+            # The import system only looks at str entries, so skip the rest too.
+            if not base or not isinstance(base, str):
+                continue
+            lib_path = glob.glob(os.path.join(base, sub, "libcudnn.so.*[0-9]"))
+            if lib_path:
+                return lib_path
+    return []
+
+
 def _dlopen_cudnn():
     # Honor the dynamic linker search path before packaged cuDNN so local backend
     # builds can override the wheel dependency during development.
@@ -265,6 +281,9 @@ def _dlopen_cudnn():
 
     if not lib_path:
         lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"))
+
+    if not lib_path:
+        lib_path = _cudnn_wheel_lib_on_sys_path()
 
     if lib_path:
         assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."

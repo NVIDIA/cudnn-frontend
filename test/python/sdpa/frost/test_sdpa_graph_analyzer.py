@@ -862,17 +862,17 @@ def test_resolve_padding_mask_with_seq_len_kv():
     assert _sm100_half_owner(g) in _eligible(g)
 
 
-def test_resolve_generate_stats():
+@pytest.mark.parametrize("materialize", [True, False])
+def test_resolve_generate_stats(materialize):
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
     o, stats = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, generate_stats=True)
     _finish_output(o, dims, strides)
-    if stats is not None:
-        stats.set_output(True).set_dim((B, H, S, 1)).set_stride((H * S, S, 1, 1))
-        stats.set_data_type(cudnn.data_type.FLOAT)
+    if materialize:
+        stats.set_output(True).set_dim((B, H, S, 1)).set_stride((H * S, S, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     cfg = _facts(g)
-    assert cfg.wants_stats is True
-    assert cfg.stats_t is not None
+    assert cfg.wants_stats is materialize
+    assert cfg.stats_t is (stats if materialize else None)
 
 
 def test_probe_rejects_bottom_right_swa_only():

@@ -139,6 +139,7 @@ def warmup_forward_host(
     l2norm_k: Optional[cute.Tensor] = None,
     l2norm_inv_q: Optional[cute.Tensor] = None,
     l2norm_inv_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
     tail_unit_chunks: cutlass.Constexpr[int] = 0,
     tail_chain_rows: cutlass.Constexpr[int] = 0,
     tail_tinv_cfg: cutlass.Constexpr = None,
@@ -258,6 +259,7 @@ def warmup_forward_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     gate_sms = num_sms if cutlass.const_expr(item_limit_word is not None) else 0
     if cutlass.const_expr(split):
@@ -591,10 +593,12 @@ def build_warmup_forward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags, the split-K geometry, the d_v split, state and checkpoint
     presence, device) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat the marks
-    of the standalone split-table and prefill builds so every kernel compiles as it does there."""
+    of the standalone split-table and prefill builds so every kernel compiles as it does there.  ``l2norm_eps`` (the q/k
+    normalize's additive epsilon) is a launch argument, absent from the key."""
     DK = q.shape[2]
     DV = v.shape[-1]
     if not safe_gate:
@@ -970,6 +974,7 @@ def build_warmup_forward(
             from_dlpack(l2norm_k, assumed_align=16).mark_layout_dynamic(leading_dim=len(l2norm_k.shape) - 1) if l2norm_k is not None else None,
             from_dlpack(l2norm_inv_q, assumed_align=16).mark_layout_dynamic(leading_dim=1) if l2norm_inv_q is not None else None,
             from_dlpack(l2norm_inv_k, assumed_align=16).mark_layout_dynamic(leading_dim=1) if l2norm_inv_k is not None else None,
+            float(l2norm_eps),
             *tail_constexprs,
             *tail_placeholders,
             *ragged_constexprs,
@@ -1020,6 +1025,7 @@ def run_warmup_forward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches.  The
     plan validated the contract at build, so nothing here raises."""
@@ -1068,6 +1074,7 @@ def run_warmup_forward(
         item_limit_word,
         tail_enable,
         *lead_buffers,
+        float(l2norm_eps),
         *tail_scalars,
         *tail_buffers,
         *((*ragged_scalars, *ragged_buffers, ragged_enable) if ragged_buffers else ()),
@@ -1155,6 +1162,7 @@ def warmup_summary_host(
     l2norm_k_slots: cutlass.Constexpr[int] = 1,
     l2norm_k_expand_num: cutlass.Constexpr[int] = 1,
     l2norm_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
     tail_unit_chunks: cutlass.Constexpr[int] = 0,
     tail_chain_rows: cutlass.Constexpr[int] = 0,
     tail_summary_cfg: cutlass.Constexpr = None,
@@ -1204,6 +1212,7 @@ def warmup_summary_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     gdn_tinv_f16.host(tinv_cfg, True, k, tinv_words, gate, a_log, dt_bias, beta, cu_seqlens, tinv, tinv_rows, tinv_row_count, stream)
     if cutlass.const_expr(split):
@@ -1424,8 +1433,10 @@ def build_warmup_summary(
     tail_chain_rows=0,
     tail_scalars=(),
     tail_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ):
-    """Compile (cached per static config) the summary launch over the buffers of one plan."""
+    """Compile (cached per static config) the summary launch over the buffers of one plan; ``l2norm_eps`` (the k normalize's
+    additive epsilon) is a launch argument, absent from the key."""
     DK = k.shape[-1]
     DV = v.shape[-1]
     if not safe_gate:
@@ -1656,6 +1667,7 @@ def build_warmup_summary(
             l2norm_k_slots,
             l2norm_k_expand_num,
             from_dlpack(l2norm_k, assumed_align=16).mark_layout_dynamic(leading_dim=len(l2norm_k.shape) - 1) if l2norm_k is not None else None,
+            float(l2norm_eps),
             *tail_constexprs,
             *tail_placeholders,
             cache_key=repr((__name__, "summary", key)),
@@ -1695,6 +1707,7 @@ def run_warmup_summary(
     l2norm_k=None,
     tail_scalars=(),
     tail_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ) -> None:
     """Replay the summary launch: one crossing into the DSL."""
     cpp_launcher.launch(
@@ -1737,6 +1750,7 @@ def run_warmup_summary(
         cuda.CUstream(int(stream)),
         item_limit_word,
         l2norm_k,
+        float(l2norm_eps),
         *tail_scalars,
         *tail_buffers,
     )

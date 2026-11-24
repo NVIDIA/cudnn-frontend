@@ -291,17 +291,13 @@ def validate_toolchain_snapshot(
 def _runtime_toolchain_snapshot(device) -> None:
     import torch
 
-    spec = importlib.util.find_spec("cutlass")
+    # Namespace extensions can add operators without providing another DSL.
     roots: list[str] = []
-    if spec is not None:
-        candidates = []
-        if spec.origin:
-            candidates.append(spec.origin)
-        if spec.submodule_search_locations:
-            candidates.extend(str(item) for item in spec.submodule_search_locations)
-        for candidate in candidates:
-            path = Path(candidate).resolve()
-            roots.append(str(path.parent if path.name == "__init__.py" else path))
+    for module_name in ("cutlass", "cutlass.cute", "cutlass.base_dsl"):
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or not spec.origin:
+            raise ToolchainMismatchError(f"cannot determine CUTLASS DSL origin for {module_name}")
+        roots.append(str(Path(spec.origin).resolve().parents[module_name.count(".")]))
     validate_toolchain_snapshot(
         cuda_version=torch.version.cuda,
         capability=_device_capability(device),

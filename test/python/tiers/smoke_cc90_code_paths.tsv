@@ -1,0 +1,61 @@
+nodeid	code_path
+sdpa/frost/test_sdpa_native_d64_sm90.py::test_native_d64_forward_and_changed_input_replay[70-100-False-False-False-1-dtype0]	d64 one_wg | d64 unmasked fp16 MHA eager+replay
+sdpa/frost/test_sdpa_native_d64_sm90.py::test_native_d64_forward_and_changed_input_replay[70-100-True-False-True-4-dtype1]	d64 one_wg | d64 causal TL bf16 GQA4 + stats
+sdpa/frost/test_sdpa_native_d64_sm90.py::test_native_d64_forward_and_changed_input_replay[70-100-True-True-False-1-dtype0]	d64 one_wg | d64 causal BR fp16
+sdpa/frost/test_sdpa_native_d64_sm90.py::test_native_d64_forward_and_changed_input_replay[100-70-True-False-False-1-dtype1]	d64 one_wg | d64 causal TL sq>skv bf16
+sdpa/frost/test_sdpa_native_d64_sm90.py::test_native_d64_graph_uses_prepared_native_body[False-True-dtype0]	d64 one_wg | d64 graph API -> prepared body
+sdpa/frost/test_sdpa_native_d64_sm90.py::test_native_d64_zero_and_negative_scale_reference_and_replay[negative-dtype0]	d64 one_wg | d64 negative scale
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_graph_api[dense-fp16]	d128 multi_q | d128 graph dense fp16
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_graph_api[causal-bf16]	d128 multi_q | d128 graph causal bf16
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_graph_mask_families[none-gqa4]	d128 multi_q | d128 GQA4 unmasked
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_graph_mask_families[causal_br-mha]	d128 multi_q | d128 causal BR
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_graph_strided_stats[log2]	d128 multi_q | d128 strided stats log2
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_layouts_are_bitwise_equal[sbhd]	d128 multi_q | d128 sbhd layout
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_unmasked_tiles_match_the_reference[b1h2-sq1-skv1]	d128 multi_q | d128 decode sq=1
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_persistent_is_bitwise_ov[pa-ring-wrap-grid1]	d128 multi_q | d128 persistent scheduler
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_paired_walk_is_bitwise_ov[pairs-t10-grid1]	d128 multi_q | d128 paired walk scheduler
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_natural_stride_is_bitwise_ov[t1-tl-mha-grid3]	d128 multi_q | d128 natural stride scheduler
+sdpa/frost/test_sdpa_fwd_d128_sm90.py::test_d128_claim_counter_is_bitwise_ov[pc1-t8-br-gqa-grid1]	d128 multi_q | d128 claim counter scheduler
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_native_graph[full-fp16-dims0]	f16 three_wg | three_wg 128/128 unmasked
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_native_graph[causal-bf16-dims1]	f16 three_wg | three_wg 256/256 causal
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_native_graph[swa-fp16-dims2]	f16 three_wg | three_wg 192/128 SWA
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_native_graph[bottom-right-bf16-dims3]	f16 three_wg | three_wg envelope 120/72 BR
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_native_graph[full-bf16-dims4]	f16 three_wg | three_wg envelope 248/136
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_layouts_and_masks[dense-padded-fp16-128]	f16 three_wg | three_wg dense padded lengths
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_layouts_and_masks[thd-causal_br-bf16-128]	f16 three_wg | three_wg THD causal BR
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_thd_physical_origins[head_major-128]	f16 three_wg | three_wg THD physical origins
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_multiple_stages[1-br_window--0.125-128]	f16 three_wg | three_wg multi-stage BR window
+sdpa/frost/test_sdpa_fwd_native_heads_sm90.py::test_partial_pack_replay[12-128]	f16 three_wg | three_wg partial PackGQA
+sdpa/frost/test_sdpa_fwd_paged_sm90.py::test_paged_replay[8-dims0-none-False-1-67-0-fp16]	f16 three_wg | paged 128/128
+sdpa/frost/test_sdpa_fwd_paged_sm90.py::test_paged_replay[16-dims1-br_swa-True-3-5-1-bf16]	f16 three_wg | paged packed split BR-SWA
+sdpa/frost/test_sdpa_fwd_paged_sm90.py::test_paged_replay[32-dims2-band-False-1-65-2-fp16]	f16 three_wg | paged band 256/256
+sdpa/frost/test_sdpa_fwd_paged_sm90.py::test_paged_admission_and_optional_stats	f16 three_wg | paged optional stats
+sdpa/frost/test_sdpa_fwd_split_sm90.py::test_dense_split_partial_initialization[False-False-False-dtype0-dims0]	f16 three_wg | split-KV dense 512/512
+sdpa/frost/test_sdpa_fwd_split_sm90.py::test_partial_pack_graph_binding[False-12]	f16 three_wg | split-KV partial pack graph
+sdpa/frost/test_sdpa_fwd_dsl_sm90.py::test_dsl_sm90_mask_families[dense-band]	f16 three_wg | dsl dense band
+sdpa/frost/test_sdpa_fwd_dsl_sm90.py::test_dsl_sm90_mask_families[thd-swa_br]	f16 three_wg | dsl THD SWA BR
+sdpa/frost/test_sdpa_fwd_dsl_sm90.py::test_dsl_sm90_decode_sink[packed]	f16 three_wg | decode with sink, packed
+sdpa/frost/test_sdpa_fwd_dsl_sm90.py::test_dsl_sm90_decode_sink_thd[token_major]	f16 three_wg | decode sink THD
+sdpa/frost/test_sdpa_fwd_dsl_sm90.py::test_dsl_sm90_thd_cu_ragged	f16 three_wg | THD cu ragged
+sdpa/frost/test_sdpa_fwd_dsl_sm90.py::test_dsl_sm90_gemma4_full_attention[packed-rsqrt_d]	f16 three_wg | gemma4 full attention
+sdpa/frost/test_sdpa_fwd_thd_sm90_offsets.py::test_sm90_thd_reads_ragged_offsets[elements-te-padded]	f16 three_wg | THD ragged offsets
+sdpa/frost/test_sdpa_fwd_thd_sm90_offsets.py::test_sm90_thd_ragged_offsets_masked[causal_br]	f16 three_wg | THD ragged offsets causal BR
+sdpa/frost/test_sdpa_fwd_thd_sm90_offsets.py::test_sm90_thd_int32_offsets[elements]	f16 three_wg | THD int32 offsets
+sdpa/frost/test_sdpa_bwd_sm90.py::test_chain_matches_fp64[d128-dense-bf16]	bwd | bwd d128 unmasked
+sdpa/frost/test_sdpa_bwd_sm90.py::test_chain_matches_fp64[d128-mqa8-causal-bf16]	bwd | bwd d128 MQA causal
+sdpa/frost/test_sdpa_bwd_sm90.py::test_chain_matches_fp64[d64-dense-fp16]	bwd | bwd d64 unmasked
+sdpa/frost/test_sdpa_bwd_sm90.py::test_chain_matches_fp64[d64-4of2-causal-fp16]	bwd | bwd d64 GQA causal
+sdpa/frost/test_sdpa_bwd_sm90.py::test_bottom_right_matches_fp64[diagonal-before-q-tile-bf16]	bwd | bwd causal BR
+sdpa/frost/test_sdpa_bwd_sm90.py::test_multiwave_grid_matches_fp64_and_repeats[d64-bottom-right-gqa-144cta]	bwd | bwd multiwave grid
+sdpa/frost/test_sdpa_bwd_sm90.py::test_three_launches_without_allocation_or_sync	bwd | bwd capture: no alloc/sync
+sdpa/frost/test_sdpa_native_sm90_binding.py::test_standalone_native_route_fresh_storage_scale_and_replay[512-512-0.0-thd]	native binding THD
+sdpa/frost/test_sdpa_native_sm90_binding.py::test_graph_native_route_without_python_facts[thd]	graph native route
+sdpa/frost/test_sdpa_prepared_sm90.py::test_prepared_rebind_capture_and_no_tensor_launch[dense]	prepared rebind dense
+sdpa/frost/test_sdpa_prepared_sm90.py::test_prepared_d128_causal_persistent_rebind_capture_no_sync_no_alloc[causal-walk]	prepared d128 persistent
+sdpa/frost/test_sdpa_sm90_padding_nan.py::test_runtime_kv_padding_nan_rebind_replay[False-33-65-dtype0-320-320]	KV padding NaN rebind
+sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py::test_d128_forward_replay_and_batch_invariance[fwd-nomask-mha-float16-h8x8-q500-kv500-b40-persistent]	d128 determinism
+sdpa/frost/test_sdpa_fwd_sm90_owned_determinism.py::test_owned_d128_replay_and_batch_invariance[fwd-nomask-h8x8-q500-kv500-b40-float16]	owned d128 determinism
+sdpa/frost/test_sdpa_fwd_sm90_implementation_determinism.py::test_fixed_d64_replay_and_batch_invariance[natural-causal-fp16]	d64 determinism
+sdpa/frost/test_sdpa_fwd_sm90_implementation_contract.py::test_public_recipe_replay_keeps_fixed_body_and_capture[False-False-fp16]	public recipe replay
+sdpa/frost/test_sdpa_fwd_sm90_wide_implementation.py::test_public_body_replay_matches_parent_parameters_and_bytes[d128-claim-fp16]	wide body replay d128
+sdpa/frost/test_sdpa_fwd_sm90_wide_implementation.py::test_public_body_replay_matches_parent_parameters_and_bytes[three-wg-d512-fp16]	wide body replay d512

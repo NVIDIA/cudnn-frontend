@@ -12,6 +12,7 @@ back instead of each parsing the node.
 
 from __future__ import annotations
 
+import numbers
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -31,6 +32,45 @@ BUFFER_NAME_FROM_CUDNN = {
 def to_buffer_dtype(dt) -> str:
     """cudnn.data_type -> the buffer-level dtype name (``buffers.DTYPES`` vocabulary)."""
     return BUFFER_NAME_FROM_CUDNN[dt]
+
+
+# Default epsilon of the in-kernel q/k L2 normalization, ``x / sqrt(sum(x * x) + eps)``, used when a graph does not set
+# ``qk_l2norm_eps``.  It must equal ``cudnn.frost.tile_dsl.pointwise.L2_NORM_EPS``, which cannot be imported here because
+# that module needs the CuTe DSL; ``test_gdp_qk_l2norm_eps_default_matches_kernels`` checks that the two are equal.
+DEFAULT_QK_L2NORM_EPS = 1.0e-6
+# Smallest positive normal and largest finite float32 values.  The kernel adds the epsilon in float32, where a value
+# outside this range becomes zero, a subnormal or infinity.
+FP32_MIN_NORMAL = 1.1754943508222875e-38
+FP32_MAX = 3.4028234663852886e38
+
+
+def qk_l2norm_eps(params) -> float:
+    """A node's ``qk_l2norm_eps`` attribute, or ``DEFAULT_QK_L2NORM_EPS`` when the graph sets none."""
+    eps = params.get("qk_l2norm_eps")
+    return DEFAULT_QK_L2NORM_EPS if eps is None else float(eps)
+
+
+def qk_l2norm_eps_error(eps, use_qk_l2norm) -> Optional[str]:
+    """Check a ``qk_l2norm_eps`` value.  Returns the error message, or None when the value is valid.
+
+    ``use_qk_l2norm`` (``use_qk_l2norm_in_kernel`` in the torch ops) turns the in-kernel q/k normalization on;
+    ``qk_l2norm_eps`` is the epsilon that normalization adds, and ``None`` means the default.
+
+    The message is returned, not raised, because the graph analyzer reports it in ``LaGraphFacts.invalid``.  The torch
+    ops call this same function and raise the message as a ``ValueError``."""
+    if eps is None:
+        return None
+    if isinstance(eps, bool) or not isinstance(eps, numbers.Real):
+        return f"qk_l2norm_eps must be a real number, got {type(eps).__name__}"
+    eps = float(eps)
+    # The value has to be usable in float32.  A NaN fails this comparison too.
+    if not FP32_MIN_NORMAL <= eps <= FP32_MAX:
+        return f"qk_l2norm_eps must be a finite, positive, normal float32 value, got {eps!r}"
+    # With the normalization off the epsilon is never used, so a custom value is an error rather than ignored.  The
+    # default value is accepted: it is the same as not setting the epsilon.
+    if eps != DEFAULT_QK_L2NORM_EPS and not use_qk_l2norm:
+        return f"qk_l2norm_eps={eps!r} requires the in-kernel q/k normalization (use_qk_l2norm, or use_qk_l2norm_in_kernel in the torch ops)"
+    return None
 
 
 # node type -> (op family, is_bwd)
@@ -139,6 +179,7 @@ class LaGraphFacts:
     # attributes
     scale: Optional[float] = None
     use_qk_l2norm: bool = False
+    qk_l2norm_eps: float = DEFAULT_QK_L2NORM_EPS  # additive epsilon of the in-kernel q/k normalization (GDP sets it)
     safe_gate: bool = False
     gate_domain: str = "log"
     use_beta_sigmoid: bool = False
@@ -223,6 +264,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     input_context = bool(params.get("input_context", False))
     context_from_forward = bool(params.get("context_from_forward", False))
     cu_dim = ins["cu_seqlens"].dim if ins.get("cu_seqlens") is not None else None
+    eps_error = qk_l2norm_eps_error(params.get("qk_l2norm_eps"), bool(params.get("use_qk_l2norm", False)))
 
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
@@ -306,6 +348,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "output_context covers one local sequence"
     elif input_context and not is_bwd and not bool(params.get("use_qk_l2norm", False)):
         invalid = "a forward's context holds the normalized k rows, so input_context requires use_qk_l2norm"
+    elif eps_error is not None:
+        invalid = eps_error
     elif output_context and input_context:
         invalid = "a forward reads its summary's context or leaves one for the backward, not both"
     elif context_from_forward and not input_context:
@@ -494,6 +538,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         composed_transition_dtype=in_dt.get(composed_transition_port),
         scale=float(scale) if scale is not None else None,
         use_qk_l2norm=bool(params.get("use_qk_l2norm", False)),
+        qk_l2norm_eps=qk_l2norm_eps(params),
         safe_gate=safe_gate,
         gate_domain=gate_domain,
         use_beta_sigmoid=bool(params.get("use_beta_sigmoid", False)),

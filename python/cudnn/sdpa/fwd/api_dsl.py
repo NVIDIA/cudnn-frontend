@@ -2471,6 +2471,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (self.cga == 1 or self.pack_gqa)
         )
 
+    def _d256_fp8_pair_leg(self) -> bool:
+        """The cc 10.7 per-tensor FP8 d256 leg that also builds at cga 2 (the two-warpgroup body), on an explicit request only:
+        HALF softmax, dense queries, unsplit, nonpaged, unpacked, ungated.  Every other per-tensor d256 leg keeps cga 1."""
+        from cudnn import data_type
+
+        return (
+            self._device_cc == (10, 7)
+            and self._fp8
+            and self._pertensor
+            and self.flavor == (256, 256)
+            and self.softmax_precision == data_type.HALF
+            and not self.thd
+            and not self.paged
+            and self.split_kv == 1
+            and not self.pack_gqa
+            and self.gate_desc is None
+            and not self.packed_thd_split
+        )
+
     def _sm100_nonpaged_thd_single_cta_leg(self) -> bool:
         """The SM100 single-CTA D128 half THD prefill leg (``config_sm100.supports_sm100_nonpaged_d128_thd_single_cta``)."""
         return not self.softmax_scale_prefolded and supports_sm100_nonpaged_d128_thd_single_cta(
@@ -3168,6 +3187,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # This adapter parameter names the MMA group. Wide explicit
             # engines expose the physical cluster and lower its fixed pair.
             supported_cgas = (getattr(selected_kernel, "cta_group", selected_kernel.cga),)
+        elif self._d256_fp8_pair_leg():
+            supported_cgas = (1, 2)
         self._value_error_if(
             self.cga is not None and self.cga not in supported_cgas,
             f"SM100 DSL SDPA only supports cga in {supported_cgas}",
@@ -7876,21 +7897,15 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
-        tile_m_default, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
-        # Smaller CTAs expose more parallelism for short dense queries. At
-        # D192, 64 rows also shrink the Q/V shared-memory region. Keep sixteen
-        # rows per warp and leave explicit TILE_M requests intact.
-        short_d256 = not self.thd and d_qk == d_v == 256 and s_qo <= 128
-        if short_d256 or (not self.thd and ((d_qk == d_v == 128 and s_qo <= 128) or (d_qk == 192 and d_v == 128 and s_qo <= 64))):
-            tile_m_default = 64
+        _, num_warps_default, _ = _SM80_FLAVOR_KNOBS[self.flavor]
+        # The shared rule (the split-KV model reads it too); explicit TILE_M requests stay intact.
+        tile_m_default = _sm80_config.default_tile_m(d_qk, d_v, s_qo, self.thd)
         self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
         self.kernel_num_warps = 4 if self.flavor in ("llama", "dsv3", "qwen") and self.kernel_tile_m == 64 else num_warps_default
         if self.flavor not in ("wide512", "mla576") and self.kernel_tile_m in (16, 32):
             self.kernel_num_warps = self.kernel_tile_m // 16
-        # At D256 the 64-key double buffers still occupy 128 KiB. Pair the
-        # smaller Q tile with 32-key buffers to reduce that total to 64 KiB.
-        if short_d256 and self.kernel_tile_m == 64:
-            tile_n_default = 32
+        # Shared with the split-KV planner, like the Q tile.
+        tile_n_default = _sm80_config.default_tile_n(d_qk, d_v, s_qo, self.thd, self.kernel_tile_m)
         self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
         self._value_error_if(
             self.flavor in ("wide512", "mla576") and (self.kernel_tile_m, self.kernel_tile_n, self.kernel_num_warps) != (32, 16, 4),

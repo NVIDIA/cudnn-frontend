@@ -48,6 +48,29 @@ packed in the required MMA-tiled physical order. With 2-D `A`, the wrapper retur
 `C` `(valid_m, N)` and a 2-D `D`. Legacy layouts are unchanged. The wrapper
 advertises `supports_canonical_layouts`.
 
+### Gate-then-up branch storage
+
+The Torch wrapper and `GroupedGemmGluHadamardSm100` class accept the appended
+`glu_layout` option. Its default, `"interleaved_32"`, preserves the existing
+32-column gate/up representation. `glu_layout="gate_then_up"` accepts weights,
+weight scales, optional bias, and intermediate `C` in ordinary `[gate | up]`
+order. TMA views and an in-kernel shared-memory scale permutation adapt this
+storage to the existing fused GEMM. No global weight repacking or implicit
+padding is performed. `D`, `amax`, and `post_rht_amax` retain their usual meaning.
+
+This branch-storage option currently supports SwiGLU on SM100/103 with NVFP4
+E2M1 inputs, E4M3 scales, `sf_vec_size=16`, and BF16 `C`/`D`. Each branch width
+must be divisible by 128. It uses `mma_tiler_mn=(256, 256)` and
+`cluster_shape_mn=(2, 1)` for both dense and discrete weights. The API advertises
+these limits through `supports_gate_then_up_precisions` and
+`supports_gate_then_up_mma_tilers`.
+
+For canonical discrete weights, use `use_tmem_post_rht_amax=False`, the default
+shared-memory RHT path. Combining canonical discrete weights with
+`use_tmem_post_rht_amax=True` raises `NotImplementedError` because the current
+compiler cannot compile that combination. Dense canonical weights support both
+RHT implementations. JAX dispatch does not yet expose this branch-storage option.
+
 ### Equations
 
 For rows belonging to expert `g`:

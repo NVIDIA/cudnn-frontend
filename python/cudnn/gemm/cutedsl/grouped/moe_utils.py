@@ -61,6 +61,7 @@ def store_tma_desc(
     tma_atom: cute.CopyAtom,
     dest_ptr: Pointer,
     *,
+    publish: bool = True,
     loc=None,
     ip=None,
 ) -> None:
@@ -71,6 +72,8 @@ def store_tma_desc(
 
     :param tma_atom: The non-exec TMA CopyAtom containing the descriptor
     :param dest_ptr: Destination gmem pointer (must have >= TensormapDescBytes space)
+    :param publish: False only when this thread publishes the store with a later
+        tensormap release before any consumer can access the descriptor.
     """
     i64_ty = ir.IntegerType.get_signless(64)
     llvm_struct_full_ty = ir.Type.parse("!llvm.struct<(array<16 x i64>)>")
@@ -102,6 +105,10 @@ def store_tma_desc(
     # dst_llvm_ptr = dest_ptr.to_llvm_ptr(loc=loc, ip=ip)
     dst_llvm_ptr = dest_ptr.llvm_ptr
     llvm.store(store_struct, dst_llvm_ptr, alignment=TensormapDescBytes, loc=loc, ip=ip)
+    # Runtime descriptors are written through the generic proxy. Publish them
+    # before a subsequent kernel acquires them through the tensormap proxy.
+    if publish:
+        cpasync.fence_tma_desc_release(loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -195,6 +202,10 @@ def tensormap_ptr_for_copy(raw_ptr: Pointer, *, loc=None, ip=None) -> Pointer:
     :rtype: Pointer
     """
     generic_ptr = gmem_ptr_to_generic(raw_ptr, loc=loc, ip=ip)
+    # Kernel launch ordering does not invalidate the tensormap proxy cache.
+    # A graph replay may rebuild this descriptor with a different allocation
+    # address, so acquire the current descriptor before each expert's TMA use.
+    cpasync.fence_tma_desc_acquire(generic_ptr, loc=loc, ip=ip)
     tma_desc_ptr_ty = _cute_ir.PtrType.get(
         _cute_nvgpu_ir.TmaDescriptorTiledType.get(),
         generic_ptr.memspace,

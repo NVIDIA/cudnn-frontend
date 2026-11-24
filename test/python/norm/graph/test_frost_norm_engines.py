@@ -208,17 +208,19 @@ def test_frost_norm_engines():
 
 @pytest.mark.L0
 def test_has_tmem_follows_the_current_device(monkeypatch):
-    """The BatchNorm TMEM tier follows the current device: with an SM100 and an SM90
+    """The BatchNorm TMEM tier follows the build or current device: with an SM100 and an SM90
     part in one process, each gets its own answer, in either query order."""
+    from types import SimpleNamespace
+
+    import cudnn._device
+    import cudnn.frost.device
     from cudnn.norm import utils
 
     caps = {0: (10, 0), 1: (9, 0)}
     current = [0]
-    monkeypatch.setattr(utils, "_HAS_TMEM", {})
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: caps[current[0] if device is None else device])
+    monkeypatch.setattr(cudnn.frost.device, "current_device", lambda: current[0])
+    monkeypatch.setattr(cudnn._device, "device_info", lambda device: SimpleNamespace(compute_capability=caps[device]))
     for order in ((0, 1), (1, 0)):
-        utils._HAS_TMEM.clear()
         for device in order:
             current[0] = device
             assert utils.has_tmem() is (caps[device][0] == 10), (order, device)

@@ -98,16 +98,12 @@ class FrostGemmEngine(BaseEngine):
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .graph_analyzer import build_gemm_plan
-        from cudnn.frost.device import build_device
 
         knobs = plan.knobs if plan is not None else None
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
         try:
             if isinstance(knobs, dict):  # a replayed public record, not yet converted
                 knobs = self.knobs_from_public(knobs)  # a malformed record is a decline, not an abort
-            with build_device(device):
-                return _FrostGemmPlan(build_gemm_plan(graph, knobs=knobs))
+            return _FrostGemmPlan(build_gemm_plan(graph, knobs=knobs))
         except (NotImplementedError, ValueError) as exc:
             raise NotImplementedError(f"frost_gemm: {exc}") from exc
 
