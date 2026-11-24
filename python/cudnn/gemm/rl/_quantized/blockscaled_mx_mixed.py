@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import cutlass
 
-from .arithmetic import Knobs
 from .arithmetic import SF_VEC
 from .blockscaled import E8M0_DTYPE, BlockScaledPlan, BlockScaledPlanSM107
 

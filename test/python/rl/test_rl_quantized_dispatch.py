@@ -5,8 +5,8 @@ import pytest
 import torch
 
 import cudnn
-from cudnn import data_type as dt
 
+dt = cudnn.data_type
 pytestmark = pytest.mark.L0
 
 

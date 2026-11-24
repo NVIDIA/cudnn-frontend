@@ -29,9 +29,7 @@ def mma_fold(
     names the loop body stores)."""
     tCtAcc = tCtAcc_base[(None, None, None, acc_state.index)]
     ab_consumer.reset()
-    peek_full = cutlass.Boolean(1)
-    if is_leader_cta:
-        peek_full = ab_consumer.try_wait()
+    peek_full = ab_consumer.try_wait() if is_leader_cta else cutlass.Boolean(1)
     if is_leader_cta:
         acc_pipeline.producer_acquire(acc_state)  # the epilogue has drained this TMEM buffer
     for k_tile in range(k_tile_cnt):  # blocks ascending (the lowering's outer loop)
@@ -42,9 +40,10 @@ def mma_fold(
                 crd = (None, None, j, handle.index)
                 cute.gemm(tiled_mma, tCtAcc, tCrA[crd], tCrB[crd], tCtAcc)  # one fold step
             handle.release()
-            peek_full = cutlass.Boolean(1)
             if handle.count + 1 < k_tile_cnt:
                 peek_full = ab_consumer.try_wait()
+            else:
+                peek_full = cutlass.Boolean(1)
     if is_leader_cta:
         acc_pipeline.producer_commit(acc_state)  # accumulator complete: hand to the epilogue
     acc_state.advance()

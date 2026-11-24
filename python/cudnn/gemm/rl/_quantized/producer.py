@@ -25,7 +25,7 @@ def tma_produce_ktiles(
     """The k-tiles of one tile (or of one chunk of a tile), ascending, into the ring. Returns the producer (loop-carried)."""
     ab_producer.reset()
     peek_empty = ab_producer.try_acquire()
-    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+    for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
         handle = ab_producer.acquire_and_advance(peek_empty)  # slot empty; leader arms the tx barrier
         cute.copy(
             tma_atom_a,

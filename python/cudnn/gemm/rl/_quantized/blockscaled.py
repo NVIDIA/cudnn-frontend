@@ -18,16 +18,11 @@ from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import LayoutEnum
-from cutlass.utils.blackwell_helpers import get_smem_store_op, get_tmem_load_op
-from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-from .arithmetic import CuteF32
-from .arithmetic import Knobs, MainloopBlock
-from .arithmetic import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC, EpilogueChain  # noqa: F401  (sf_bytes re-exported)
-from .epilogue import apply_chain_pre_cvt, epilogue_loop
+from .arithmetic import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC, EpilogueChain, Knobs, MainloopBlock
+from .epilogue import epilogue_loop
 from .operands import (
     ACC_DTYPE,
-    BAR_EPILOGUE,
     BAR_TMEM_ALLOC,
     EPILOGUE_WARPS,
     MBAR_RESERVE_BYTES,
@@ -140,7 +135,6 @@ class BlockScaledPlan:
         self.c_dtype, self.c_layout = c_dtype, c_layout
         self.use_2cta_instrs = knobs.use_2cta_instrs
         self.cluster_shape_mn = knobs.cluster_shape_mn
-        self.cluster_k = knobs.cluster_k
         self.cta_group = tcgen05.CtaGroup.TWO if knobs.use_2cta_instrs else tcgen05.CtaGroup.ONE
         # the B-reuse record (tile M = 2 x the instruction's M, the sm_107 class): two instructions per K step on the two
         # halves of the tile sharing one B fragment through the collector buffer (`tiled_mma_bkeep` FILL, `tiled_mma_breuse`
@@ -163,7 +157,7 @@ class BlockScaledPlan:
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
-        cta_m, tn = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
+        tn = self.cta_tile_shape_mnk[1]
         # SFB is loaded in whole scale-factor atoms (128 rows of N) through a 1-CTA tiled MMA of that width (and of the
         # instruction's per-CTA M: 128 rows, half of a 2-CTA instruction, whatever the tile's M)
         self.sfb_tile_n = -(-tn // SF_ATOM_ROWS) * SF_ATOM_ROWS
@@ -186,11 +180,6 @@ class BlockScaledPlan:
         self.is_sfb_mcast = self.num_mcast_ctas_sfb > 1
         self.epi_tile = self.epilogue_tile()
         self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
-        # the in-cluster split's mailbox: (cluster_k - 1) fp32 tiles (one slot per peer) and one mbarrier per epilogue subtile
-        self.subtile_elems = cute.size(self.epi_tile[0]) * cute.size(self.epi_tile[1])
-        self.num_subtiles = cta_m * tn // self.subtile_elems
-        self.mailbox_elems = 0
-        self.reduce_bytes = self.mailbox_elems * 4 + (0)
         # the TMEM layouts of one stage of scale factors (the instruction reads SFA / SFB from TMEM), from the one-stage smem
         # layouts; the stage count does not enter them
         sfa_one = bs_layout.make_smem_layout_sfa(self.tiled_mma, self.mma_tiler, self.sf_vec, 1)
@@ -231,7 +220,7 @@ class BlockScaledPlan:
         self.c_smem_layout_staged = utils.sm100.make_smem_layout_epi(c_dtype, c_layout, self.epi_tile, self.num_c_stage)
 
     def _stages(self) -> Tuple[int, int]:
-        """A/B/SFA/SFB ring depth from the smem budget after the barriers (and the in-cluster split's mailbox) and two C
+        """A/B/SFA/SFB ring depth from the smem budget after the barriers and two C
         stages; the leftover becomes extra C stages (the dense rule with the scale factors in the stage); the A ring
         below ``A_RING_MAX_BYTES``."""
         a_one = utils.sm100.make_smem_layout_a(self.tiled_mma, self.mma_tiler, self.a_smem_dtype, 1)
@@ -244,12 +233,11 @@ class BlockScaledPlan:
             a_bytes + cute.size_in_bytes(self.b_smem_dtype, b_one) + cute.size_in_bytes(self.sf_dtype, sfa_one) + cute.size_in_bytes(self.sf_dtype, sfb_one)
         )
         c_bytes_per_stage = cute.size_in_bytes(self.c_dtype, c_one)
-        c_bytes = c_bytes_per_stage * NUM_C_STAGE_MIN
-        reserve = MBAR_RESERVE_BYTES + self.reduce_bytes
-        num_ab = (self.smem_capacity // OCCUPANCY - (reserve + c_bytes)) // ab_bytes
+        reserved_bytes = MBAR_RESERVE_BYTES + c_bytes_per_stage * NUM_C_STAGE_MIN
+        num_ab = (self.smem_capacity // OCCUPANCY - reserved_bytes) // ab_bytes
         num_ab = min(num_ab, (A_RING_MAX_BYTES - 1) // a_bytes)
         assert num_ab >= 2, (self.knobs, num_ab)
-        num_c = NUM_C_STAGE_MIN + (self.smem_capacity - OCCUPANCY * ab_bytes * num_ab - OCCUPANCY * (reserve + c_bytes)) // (OCCUPANCY * c_bytes_per_stage)
+        num_c = NUM_C_STAGE_MIN + (self.smem_capacity - OCCUPANCY * ab_bytes * num_ab - OCCUPANCY * reserved_bytes) // (OCCUPANCY * c_bytes_per_stage)
         return num_ab, num_c
 
 
@@ -550,7 +538,7 @@ def blockscaled_produce_ktiles(
     SFA and SFB of a k-tile. Returns the producer (loop-carried)."""
     ab_producer.reset()
     peek_empty = ab_producer.try_acquire()
-    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+    for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
         handle = ab_producer.acquire_and_advance(peek_empty)
         kt = k_tile0 + handle.count
         cute.copy(
@@ -698,9 +686,7 @@ def blockscaled_mma_fold(
     # tn < 64 (the swapped decode records): a single N tile (acceptance: all tokens fit it), so its scale factors are the
     # atom's first rows and the TMEM window needs no shift
     ab_consumer.reset()
-    peek_full = cutlass.Boolean(1)
-    if is_leader_cta:
-        peek_full = ab_consumer.try_wait()
+    peek_full = ab_consumer.try_wait() if is_leader_cta else cutlass.Boolean(1)
     if is_leader_cta:
         acc_pipeline.producer_acquire(acc_state)  # the epilogue has drained this TMEM buffer
     for k_tile in range(k_tile_cnt):  # blocks ascending (the lowering's outer loop)
@@ -717,9 +703,10 @@ def blockscaled_mma_fold(
                 crd = (None, None, j, handle.index)
                 cute.gemm(tiled_mma, tCtAcc, tCrA[crd], tCrB[crd], tCtAcc)  # one fold step: MMA(D, A, SFA, B, SFB)
             handle.release()
-            peek_full = cutlass.Boolean(1)
             if handle.count + 1 < k_tile_cnt:
                 peek_full = ab_consumer.try_wait()
+            else:
+                peek_full = cutlass.Boolean(1)
     if is_leader_cta:
         acc_pipeline.producer_commit(acc_state)  # accumulator complete: hand to the epilogue
     acc_state.advance()
@@ -966,8 +953,7 @@ class BlockScaledGemm:
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
 
-        # --- scaffolding: barriers, pipelines, TMEM allocator (as the dense body); the in-cluster split adds its mailbox
-        C = st.cluster_k
+        # --- barriers, pipelines, TMEM allocator
         smem = cutlass.memory.SmemAllocator()
 
         @cute.struct
@@ -978,10 +964,7 @@ class BlockScaledGemm:
             tmem_holding_buf: cutlass.Int32
 
         storage = smem.allocate(SharedStorage)
-        rank = cta_rank_in_cluster  # the K chunk of this CTA when C > 1
         k_tile0 = Int32(0)
-        mailbox = None
-        reduce_mbar = None
         sync_shape = self.cluster_shape_mn  # the physical cluster: the barrier inits must be visible cluster-wide
         ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),

@@ -21,7 +21,7 @@ from ._quantized.blockscaled import PLANS, BlockScaledGemm, ScaledBlockScaledGem
 from ._quantized.blockscaled_mx_mixed import PLANS as MIXED_PLANS
 from ._quantized.config import schedule_for
 from ._quantized.kernel import BlockGemm, ScaledBlockGemm
-from ._quantized.operands import ALIGN, IN_DT, OUT_DT
+from ._quantized.operands import IN_DT, OUT_DT
 
 
 def _tensor(dtype, address, shape, stride, align=16):

@@ -108,7 +108,6 @@ def epilogue_loop(
         bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         num_prev_subtiles = num_tiles_executed * subtile_cnt
-        tTR_cC = None
         for s in range(subtile_cnt):
             cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
             apply_chain_pre_cvt(chain, tTR_rAcc, alpha)  # the chain's fp32 ops (mul.rn alpha when scaled)

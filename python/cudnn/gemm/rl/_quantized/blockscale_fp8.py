@@ -136,24 +136,13 @@ def blockscale_producer_loop(
     tCcC: cute.Tensor,
     native_k: cutlass.Constexpr,
 ):
-    """The dense TMA producer (`producer.tma_produce_ktiles`: one k-tile per operand stage, blocks ascending) plus the scale ring:
-    per block, the warp's 32 threads ``cp.async`` the CTA tile's A row scales (``mSFA[(row, kb)]``, rows clamped to M - 1) and thread 0 in that warp copies
-    the tile's B block scale (``mSFB[(n // 128, kb)]``, clamped to the tensor) into the next ring stage, whose barrier completes
-    when the copies land. The K-native staging (``native_k``: a few rows, the caller's K-layout scales read as they are): a ring
-    stage holds ``SCALE_GROUP_NATIVE_K`` consecutive blocks, filled at the group's first block -- a row's four block scales one
-    16-byte copy where the row's address is 16-byte aligned, four 4-byte copies otherwise -- and the short last group block by
-    block. Order and staging only: no arithmetic."""
+    """Stream operands and scales in ascending K-block order. In each scale ring stage the warp copies
+    one FP32 scale per A row and one per 128-column B block, clamping edge coordinates to the last valid index."""
     lane = cute.arch.lane_idx()
     M = mSFA.shape[0]
     NB = mSFB.shape[0]
     rows_per_lane = cute.size(sSFA, mode=[0]) // 32
     atom_g2s = cute.make_copy_atom(cpasync.CopyG2SOp(), ACC_DTYPE, num_bits_per_copy=ACC_DTYPE.width)
-    atom_g2s4 = cute.make_copy_atom(cpasync.CopyG2SOp(), ACC_DTYPE, num_bits_per_copy=4 * ACC_DTYPE.width)
-    SCALE_GROUP = SCALE_GROUP_NATIVE_K
-    a_kmajor = mSFA.stride[1] == 1  # the K layout: a row's blocks contiguous
-    b_kmajor = mSFB.stride[1] == 1
-    k_whole = k_tile_cnt // SCALE_GROUP  # whole groups, then a short last group of k_tail blocks
-    k_tail = k_tile_cnt - k_whole * SCALE_GROUP
     scale_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Producer,
         NUM_SCALE_STAGES,
@@ -168,7 +157,7 @@ def blockscale_producer_loop(
         nb = cutlass.min(c0[1] // SCALE_BLOCK_N, NB - 1)
         ab_producer.reset()
         peek_empty = ab_producer.try_acquire()
-        for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+        for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
             handle = ab_producer.acquire_and_advance(peek_empty)  # operand slot empty; the leader arms the tx barrier
             cute.copy(
                 tma_atom_a,
@@ -308,7 +297,6 @@ def blockscale_epilogue_loop(
     )
     assert st.num_c_stage >= NUM_PROMO_GROUPS, st.num_c_stage
     acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, st.num_acc_stage)
-    SCALE_GROUP = SCALE_GROUP_NATIVE_K
     scale_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer,
         NUM_SCALE_STAGES,

@@ -13,12 +13,7 @@ import cutlass.utils as utils
 
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .arithmetic import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
-from .arithmetic import (  # noqa: F401  (k_granule re-exported: the body's K granule, also the API's)
-    BLOCK_K,
-    BLOCK_SCALED,
-    FP8_BLOCKSCALE_FMTS,
-)
+from .arithmetic import MMA_K_BLOCKS, Knobs
 
 ACC_DTYPE = cutlass.Float32
 IN_DT = {
