@@ -246,10 +246,17 @@ does not hold is printed as not known and ignored, so a new name for one of them
       addresses (`state.Cursor`) and the step's own last launches write them. What a step launched from Python has
       for free is code in front of every replay, each with a host test: the capacity test, the ids the caller handed
       over, the host integer of the cursor against the state's position, the state the sequence was recorded on.
-    - The record of a replayed step holds the ids the loop HANDED to it, never the buffer the lookup read. The checks
-      launch the recorded steps again from Python and hold ids AND logits byte for byte (a wrong length moved the
-      logits of a step and no token); the step's own tail is read behind the request; the replayed steps of the
-      traced pass are held to the traced steps launched from Python, launch by launch.
+    - A replayed step returns the ids buffer its next lookup reads, and the session copies into that buffer any
+      other tensor it is handed. What a caller hands back is then fed by construction, however it was changed.
+      Never skip that copy on the word that a tensor is unchanged -- that it is the one a step returned, or that
+      its version counter has not moved: a write through another library or a kernel moves neither. No step reads
+      ids on the host to compare them. A host test and a GPU test hold a returned tensor that was changed in place
+      to the step launched from Python on the changed ids.
+    - The record of a replayed step holds the ids the loop HANDED to it, copied from the tensor that was handed over
+      in front of the replay, and the ids the step chose as the token choice left them, never as the buffer holds
+      them. The checks launch the recorded steps again from Python and hold ids AND logits byte for byte (a wrong
+      length moved the logits of a step and no token); the step's own tail is read behind the request; the replayed
+      steps of the traced pass are held to the traced steps launched from Python, launch by launch.
     - In the performance mode the requests of a run that records its step are replays; its traced request stays
       launched from Python (the kernel check and the per-kernel table need the call log) and a second traced request
       replays the first steps, whose GPU busy the `step` line prints. No launch overhead is formed for a replayed step.

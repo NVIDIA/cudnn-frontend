@@ -99,7 +99,9 @@ The recorded-step cells run no script either: a small program in a fresh interpr
 (``Session(capture=True)``) -- and holds a replayed request to the same request launched from Python: the ids, the
 logits byte for byte, the end-state digest, at 1 and at 4 sequences; then that a planted difference is found at its
 step, that a replay past the capacity launches nothing, and that a declined recording leaves PyTorch's current stream
-where it was.  They run where the library is installed, as the ``native`` cell does.
+where it was.  A second program holds that a replayed step feeds the ids it is handed: the tensor such a step returns,
+changed in place and handed back, gives the request launched from Python on the changed ids.  They run where the
+library is installed, as the ``native`` cell does.
 
 Every line of a run is read from standard error, which is not the sample's alone: a library may print there first, and
 behind the run's last line.  A cell that reads the header of a run finds it by the script's tag (``_header``), and
@@ -771,7 +773,9 @@ got = [request(session) for _ in range(3)]
 steps = want[3].shape[0]
 hold("replayed", all(equal(want, each) for each in got) and recorded.replays == 3 * steps, f"three replayed requests against it, {{steps}} steps each: the ids of every read, the ids fed and chosen, the logits byte for byte, the end-state digest")
 cursor = recorded.cursor
-hold("tail", cursor.holds() and cursor.position == session.state.position == steps and got[-1][0][-1] == cursor.ids.tolist(), f"behind a request the ids buffer holds the last chosen ids and the position rows stand at position {{cursor.position}}")
+# the buffer against the ids as the token choice left them: the tensor the state keeps and the record's last row, never a read of the buffer
+last = recorded.next_ids.tolist()
+hold("tail", cursor.holds() and cursor.position == session.state.position == steps and cursor.ids.tolist() == last == got[-1][2][-1].tolist() and session.state.greedy is recorded.next_ids, f"behind a request the ids buffer holds the last chosen ids and the position rows stand at position {{cursor.position}}")
 
 
 def planted(index):
@@ -852,6 +856,157 @@ def test_a_recorded_request_equals_the_same_request_from_python(sequences):
     assert "the logits differ first at step [31]" in out and "three replayed requests against it, 96 steps each" in out
     stated = next(line for line in lines if line.startswith("[recorded] the sequence holds, as this installation states it: "))
     frost_routing.measured(key + ": the recorded sequence", stated[len("[recorded] ") :])
+
+
+HANDED_PROGRAM = """
+import faulthandler, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import tie_out
+from model_samples.qwen_dense import QwenDense
+
+SEQUENCES, PROMPT, STEPS = {sequences}, 26, 12
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+failed = []
+
+
+def hold(name, held, text):
+    say(f"  {{name:<10}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+model = QwenDense.reduced()
+vocab = model.geometry.vocab
+text = model_samples.TextIO.synthetic(vocab)
+common = dict(sequences=SEQUENCES, stack="native", device="cuda:0", capacity=PROMPT + STEPS)
+eager = model_samples.Session(model, text, **common)
+session = model_samples.Session(model, text, share=eager, capture=True, **common)
+try:
+    for note in dict.fromkeys(eager.resolve().announcements()):
+        say(f"[handed] planning: {{note}}")
+    say(eager.plan_table([session]))
+except NotImplementedError as error:
+    say(f"[handed] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[handed] {{model_samples.check_environment().header()}}")
+if session.recordable():  # a class on which a block of the stack is on a fallback row: its step is not recorded there
+    say(f"[handed] SKIP the step of the stack native is not recorded on this GPU: {{session.recordable()}}")
+    raise SystemExit(0)
+eager.load()
+session.load()
+generator = torch.Generator().manual_seed(0)
+prompts = [torch.randint(0, vocab, (PROMPT,), generator=generator, dtype=torch.int32) for _ in range(SEQUENCES)]
+unseen = []
+
+
+def another(ids):  # another tensor that holds the changed ids
+    return (ids + 1) % vocab
+
+
+def clone(ids):  # an equal clone of the tensor the step returned, changed
+    return ids.clone().add_(1).remainder_(vocab)
+
+
+def in_place(ids):  # the tensor the step returned, changed in place
+    return ids.add_(1).remainder_(vocab)
+
+
+def alias(ids):  # ... changed through an alias of its memory: a write its version counter does not count
+    version = ids._version
+    torch.from_dlpack(ids).add_(1).remainder_(vocab)
+    unseen.append(ids._version == version)
+    return ids
+
+
+def view(ids):  # ... changed in place and handed back as a view of it
+    return ids.add_(1).remainder_(vocab)[:]
+
+
+def request(of, change):
+    # a prompt and STEPS steps behind it, every one of them on the ids the step in front chose, CHANGED: (the reads, the ids
+    # handed to every step, what the state kept of the step in front at that moment, the record's inputs, outputs and logits)
+    of.reset(fresh=False)
+    ids = of.prefill(prompts)
+    reads, handed, kept = [of.read(ids)], [], []
+    for _ in range(STEPS):
+        ids = change(ids)
+        handed.append(ids.tolist())
+        kept.append(of.state.greedy.tolist())
+        ids = of.step(ids)
+        reads.append(of.read(ids))
+    torch.cuda.synchronize()
+    count = of.record.count
+    return reads, handed, kept, of.record.inputs[:count].clone(), of.record.outputs[:count].clone(), of.record.logits[:count].clone()
+
+
+def equal(a, b):
+    return a[:3] == b[:3] and all(tie_out.bytes_equal(x, y) for x, y in zip(a[3:], b[3:]))
+
+
+hold("recorded", session.python_reason == "" and session.recorded is not None, f"the step was recorded by the load ({{session.python_reason or 'a stage of its own'}})")
+want = request(eager, another)
+changed = all(fed != read for fed, read in zip(want[1], want[0])) and want[2] == want[0][:-1]
+hold("python", changed and equal(want, request(eager, another)) and not eager.replays, f"the request launched from Python twice, every step behind the prompt on ids changed behind the step in front: {{STEPS}} steps, the first on {{want[1][0]}} for {{want[0][0]}}")
+buffer = session.recorded.cursor.ids
+for name, change, what in (
+    ("clone", clone, "an equal clone of the changed ids"),
+    ("in place", in_place, "the tensor the step in front returned, changed in place"),
+    ("alias", alias, "that tensor, changed through an alias of its memory that its version counter does not count"),
+    ("view", view, "that tensor, changed in place and handed back as a view"),
+):
+    got = request(session, change)
+    fed = [row.tolist() for row in got[3][PROMPT:]]
+    held = equal(want, got) and fed == got[1] == want[1] and session.replays and session.recorded.cursor.ids is buffer
+    hold(name, held, f"replayed steps handed {{what}}: the reads, the logits byte for byte and the record of the request launched from Python on the changed ids; the record's inputs are the ids handed over")
+hold("unseen", len(unseen) == STEPS and all(unseen), "no write through the alias was counted by the tensor's version counter")
+hold("replays", session.recorded.replays == 4 * (PROMPT + STEPS), f"{{session.recorded.replays}} replays of one recorded sequence")
+session.close()
+say("[handed] FAIL" if failed else "[handed] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sequences", [1, 4])
+def test_a_replayed_step_feeds_the_ids_it_is_handed_however_they_were_changed(sequences):
+    """``Session.step`` feeds the ids it is handed, on a session that replays its recorded step as on one launched from
+    Python.  The tensor a replayed step returns is the buffer the next replay's lookup reads, so ids changed IN PLACE in
+    it and handed back are fed.  A small program in a fresh interpreter runs, on the stack ``native`` at 1 and at 4
+    sequences, a prompt of 26 tokens and 12 steps behind it, every step on the ids the step in front chose, changed; and
+    holds the replayed request to the same request launched from Python -- the ids of every host read, the logits of
+    every step byte for byte, the record's inputs and outputs -- where the changed ids are handed over as
+
+    * an equal clone;
+    * the returned tensor itself, changed in place;
+    * that tensor, changed through an alias of its memory, a write its version counter does not count;
+    * a view of that tensor.
+
+    In each the record's inputs are the ids that were handed over, and what the state keeps of the step in front -- the
+    ids as the token choice left them -- is not changed with the returned tensor.
+
+    Skipped as its neighbour is: where the library is absent, and by the program's own line where the plan declines the
+    GPU or a block of the stack is on a fallback row.  A skipped cell is uncovered, not passing."""
+    _needs_the_library()
+    key = f"model sample qwen_dense: a recorded decode step on ids changed in place and handed back, {sequences} sequence(s), stack native"
+    out = _program(HANDED_PROGRAM, "[handed]", key, "run of a recorded step on changed ids", unobserved="RAN (never printed: ", sequences=sequences)
+    lines = out.splitlines()
+    for name in ("recorded", "python", "clone", "in place", "alias", "view", "unseen", "replays"):
+        (line,) = [line for line in lines if line.startswith(f"  {name} ")]
+        assert line.endswith("    PASS"), line
+    assert (
+        "replayed steps handed the tensor the step in front returned, changed in place: " in out and f"{4 * (26 + 12)} replays of one recorded sequence" in out
+    )
 
 
 CORE_PROGRAM = """

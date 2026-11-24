@@ -282,10 +282,17 @@ integer. The token a step is fed and the rows of the position it stands at -- th
 attention preparation reads, the lengths the attention core reads -- stand at fixed addresses, set from the state's
 tables and moved on in place by the step's own last launches. Four things a step launched from Python has for free
 are code in front of every replay: the capacity test (a replay past the capacity is refused and launches nothing),
-the ids the loop hands over (copied into the buffer unless they are what the last replay chose), the position rows
-(one host integer says where they stand, and they are set again where it is not the state's position), and the
-state (a sequence replays on the state it was recorded on, and a fresh state gets a sequence of its own at its
-first replay).
+the ids the loop hands over (copied into the buffer the lookup reads, unless the loop hands over that buffer
+itself), the position rows (one host integer says where they stand, and they are set again where it is not the
+state's position), and the state (a sequence replays on the state it was recorded on, and a fresh state gets a
+sequence of its own at its first replay).
+
+The tensor a replayed step returns is that buffer: the step's own last copy has written the chosen ids into it, the
+loop reads them from it, and handed back it is what the next step's lookup reads, as it then is. So a step is fed
+the ids it is handed whatever they are: ids changed in place in the returned tensor are fed without a copy and
+without a test that could miss the change, and any other tensor is copied in. The next step writes the buffer
+again, so a caller that keeps the ids of a step past the next one copies them. What the state and the record keep
+of a step are the ids as the token choice left them, in a tensor of the sequence's own.
 
 Whether a step can be recorded is the plan's data, decided before anything is loaded: every block of the plan says
 whether a recorded sequence can hold its calls -- an adapter to an entry or to a library call, the lookup and the

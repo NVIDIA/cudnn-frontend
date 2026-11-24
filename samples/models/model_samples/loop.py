@@ -56,12 +56,14 @@ Python runs nothing between two tokens but the caller's one host read.  Whether 
 tokens, no drafter, no copies made per call); a session whose step cannot be launches from Python and says why
 (``python_reason``).  The step is recorded at the first replay of a state (``record_step`` brings that forward), on that
 state: a recorded launch keeps the addresses of its operands, so the token and the position rows a step reads stand at
-fixed addresses (``state.Cursor``) and the step's own last launches write the chosen ids and move the rows on.  Four
-things an eager step has for free are code here, in front of every replay: the capacity test, the ids the caller
-handed over, the cursor at the state's position, and the state the sequence was recorded on.  The record of a replayed
-step holds the ids its caller handed over, and the checks of a run launch the recorded steps again from Python
-(``tie_out.run_checks``): what a replay computed is held to that, ids and logits, byte for byte.  Every step with a tap
-or a call log, the traced pass and the checks' own passes are launched from Python.
+fixed addresses (``state.Cursor``) and the step's own last launches write the chosen ids and move the rows on.  A
+replayed step returns that ids buffer, so what its caller hands back is what the next lookup reads, however it was
+changed in between; any other tensor is copied into the buffer.  Four things an eager step has for free are code
+here, in front of every replay: the capacity test, the ids the caller handed over, the cursor at the state's
+position, and the state the sequence was recorded on.  The record of a replayed step holds the ids its caller handed
+over, and the checks of a run launch the recorded steps again from Python (``tie_out.run_checks``): what a replay
+computed is held to that, ids and logits, byte for byte.  Every step with a tap or a call log, the traced pass and
+the checks' own passes are launched from Python.
 
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
@@ -194,7 +196,11 @@ class Recorded:
     again where the pass allocated them.  ``calls``: the block calls of the step; ``launches``: what the sequence holds,
     as the CUDA runtime states it and held against the plan (``census.recorded_launches``), or ``None`` where the
     installation does not state it; ``seconds`` and ``pool_bytes``: what recording took, and what PyTorch reserved
-    for the sequence's own pool, in which the working memory of one step stays for as long as the sequence lives."""
+    for the sequence's own pool, in which the working memory of one step stays for as long as the sequence lives.
+
+    The ids buffer is also what a replayed step hands back to its caller (``Session.step``): the sequence's own last
+    copy has written the chosen ids into it, and handed back it is read as it then is.  The chosen ids as the token
+    choice left them (``next_ids``) stay the sequence's own: the state and the record read those."""
 
     def __init__(self, graph, state: DecodeState, cursor: Cursor, next_ids, logits, hidden, calls: int, launches=None, seconds=0.0, pool_bytes=0, planned=0):
         self.graph, self.state, self.cursor = graph, state, cursor
@@ -202,13 +208,15 @@ class Recorded:
         self.calls, self.launches, self.seconds, self.pool_bytes = calls, launches, seconds, pool_bytes
         self.planned = planned  # the launches of the step's blocks on exact rows, as the plan has them
         self.replays = 0
-        #: whether the ids buffer holds what the last replay chose: the step's own last copy wrote them, nothing since
+        #: whether a replay was the last to write the ids buffer for this session -- the step's own copy of the ids it
+        #: chose -- and nothing has been fed since: what the tail of a request is read on (``Session.read_tail``)
         self.chosen = False
 
     def feed(self, ids: torch.Tensor) -> None:
-        """The ids the next replay's lookup reads are the ids its caller hands over: one copy into the buffer -- unless
-        they are the tensor the last replay returned and the buffer still holds that replay's own copy of them."""
-        if not (ids is self.next_ids and self.chosen):
+        """The ids the next replay's lookup reads are the ids its caller hands over: one copy into the ids buffer --
+        unless the caller hands over that buffer itself, the tensor a replayed step returns.  The lookup then reads
+        what the buffer holds, whatever has written it since: no copy, and nothing to compare."""
+        if ids is not self.cursor.ids:
             self.cursor.ids.copy_(ids)
         self.chosen = False
 
@@ -355,7 +363,7 @@ class Session:
         (``prefill``, ``step``).  It is recorded where the plan says it can be (``recordable``); a session whose step
         cannot be, or whose recording the installation declines, launches every step from Python as a session without
         the flag does, and says why (``python_reason``).  Under replay the tensor ``prefill`` and ``step`` return is
-        the sequence's own: the next replay writes the next ids into it."""
+        the session's ids buffer: the next step reads the ids it is fed from it and writes the next ids into it."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if on_demand is not None and (share is None or stack != REFERENCE):
@@ -995,12 +1003,15 @@ class Session:
         return not self.record_step()
 
     def _replay(self, ids: torch.Tensor) -> torch.Tensor:
-        """One decode step as one replay of the recorded step: ``ids`` are fed, the next ids returned -- the sequence's own
-        tensor, which the next replay writes again.  In front of it what a step launched from Python has for free:
-        the capacity test (a replay past the capacity is the same ``ValueError`` and launches nothing), the ids the
-        caller handed over, the cursor at the state's position, the state the sequence was recorded on.  The record
-        holds, for a recorded step, the ids the caller HANDED OVER -- copied before the replay, which may write the
-        very tensor -- and the logits and the ids the replay left."""
+        """One decode step as one replay of the recorded step: ``ids`` are fed, the next ids returned -- in the session's
+        ids buffer, into which the sequence's own last copy has written them and which the next replay's lookup
+        reads.  Handed back, that tensor is fed as it then is; any other tensor is copied into it first.  In front
+        of the replay what a step launched from Python has for free: the capacity test (a replay past the capacity
+        is the same ``ValueError`` and launches nothing), the ids the caller handed over, the cursor at the state's
+        position, the state the sequence was recorded on.  The record holds, for a recorded step, the ids the caller
+        HANDED OVER -- copied before the replay, which writes the buffer -- and the logits and the ids the replay
+        left: the ids as the token choice wrote them, the tensor the state keeps too (``state.greedy``), never the
+        buffer."""
         self._fits(1)
         recorded, record, state = self.recorded, self.record, self.state
         kept = record.count < record.inputs.shape[0]
@@ -1017,7 +1028,7 @@ class Session:
         record.count += 1
         self._calls += recorded.calls
         self._report.replayed, self._report.launches = True, None if recorded.launches is None else recorded.launches["launches"]
-        return recorded.next_ids
+        return recorded.cursor.ids
 
     @property
     def replays(self) -> bool:
@@ -1186,8 +1197,10 @@ class Session:
 
     def step(self, ids: torch.Tensor) -> torch.Tensor:
         """One decode step for every sequence: the ids to feed ``[sequences]`` -> the next ids ``[sequences]``, on the GPU.
-        On a session that records its step this is one replay, and the tensor returned is the sequence's own (the next
-        replay writes it); the ids handed over are fed whatever they are."""
+        The ids handed over are fed whatever they are.  On a session that records its step this is one replay, and
+        the tensor returned is the session's ids buffer: the next step reads the ids it is fed from it and writes
+        the ids it chooses into it.  Handed back, it is fed as it then is, changed in place or not; any other tensor
+        is copied into it.  A caller that keeps the ids of a step past the next one copies them."""
         if self.drafter is not None:
             raise ValueError(
                 "behind its prompt a session with a drafter runs steps of speculative decoding (Session.speculate); a decode step behind a keep is not built"

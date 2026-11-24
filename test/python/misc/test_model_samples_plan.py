@@ -2657,13 +2657,14 @@ def test_a_replay_past_the_capacity_is_refused_and_launches_nothing(monkeypatch)
 
 def test_a_replayed_step_feeds_what_it_is_handed(monkeypatch):
     """``Session.step(ids)`` feeds ``ids``.  A recorded sequence feeds on its own buffer, which its last launch but three
-    writes with the ids it chose: handed the tensor the last replay returned the session copies nothing, and handed
-    anything else -- other ids, a clone, the same tensor behind a prompt token -- it copies that into the buffer first.
-    The record holds the ids that were handed over, and the step computed on them."""
+    writes with the ids it chose, and a replayed step returns that buffer: handed it back the session copies nothing,
+    and handed anything else -- other ids, ids of another type, the ids as the token choice left them -- it copies
+    that into the buffer first.  The record holds the ids that were handed over, and the step computed on them."""
     with _recording(monkeypatch, sequences=2) as (session, graphs):
         ids = session.prefill(_prompts(session, 5))
         recorded, buffer = session.recorded, session.recorded.cursor.ids
-        assert ids is recorded.next_ids and recorded.chosen and _same(buffer, ids), "the step's own copy: the buffer holds what it chose"
+        assert ids is buffer and recorded.chosen and _same(buffer, recorded.next_ids), "a replayed step returns the ids buffer, which holds what it chose"
+        assert session.state.greedy is recorded.next_ids is not buffer, "the state keeps the ids as the token choice left them"
         writes = []
         copy = type(buffer).copy_
 
@@ -2674,32 +2675,87 @@ def test_a_replayed_step_feeds_what_it_is_handed(monkeypatch):
 
         monkeypatch.setattr(torch.Tensor, "copy_", counted)
         chosen = ids.clone()
-        ids = session.step(ids)  # the tensor the last replay returned: nothing is copied by the session (the one write is the step's own)
-        assert len(writes) == 1 and writes[0] is not chosen and _same(session.record.inputs[5], chosen)
+        ids = session.step(ids)  # the buffer, handed back: nothing is copied by the session (the one write is the step's own)
+        assert ids is buffer and len(writes) == 1 and writes[0] is not chosen and _same(session.record.inputs[5], chosen)
         other = torch.tensor([7, 9], dtype=torch.int32)
         del writes[:]
         session.step(other)  # other ids: copied in, fed, recorded
         assert writes[0] is other and len(writes) == 2 and _same(session.record.inputs[6], other)
+        wide = torch.tensor([11, 13])  # ids of another type: copied in as the buffer's
+        del writes[:]
+        session.step(wide)
+        assert writes[0] is wide and len(writes) == 2 and session.record.inputs[7].tolist() == [11, 13]
+        del writes[:]
+        left = recorded.next_ids.clone()
+        session.step(recorded.next_ids)  # the ids as the token choice left them: another tensor than the buffer, copied in
+        assert writes[0] is recorded.next_ids and len(writes) == 2 and _same(session.record.inputs[8], left)
         monkeypatch.undo()
-        # the same request launched from Python on those ids gives the step the replay gave
-        logits = session.record.logits[:7].clone()
+        # the same request launched from Python on those ids gives the steps the replays gave
+        logits = session.record.logits[:9].clone()
     with _recording(monkeypatch, sequences=2, capture=False) as (eager, _):
-        ids = eager.prefill(_prompts(eager, 5))
-        eager.step(eager.step(ids) * 0 + torch.tensor([7, 9], dtype=torch.int32))
-        assert _same(eager.record.logits[:7], logits)
-    with _recording(monkeypatch, sequences=2) as (session, graphs):
-        ids = session.prefill(_prompts(session, 5))
-        recorded = session.recorded
-        recorded.cursor.ids.fill_(3)  # something else wrote the buffer behind the replay: ``chosen`` no longer stands
-        recorded.chosen = False
-        kept = ids.clone()
-        session.step(ids)
-        assert _same(session.record.inputs[5], kept), "the tensor the last replay returned is copied in where the buffer may not hold it"
-        want = session.record.logits[5].clone()
+        eager.step(eager.prefill(_prompts(eager, 5)))
+        eager.step(torch.tensor([7, 9], dtype=torch.int32))
+        eager.step(eager.step(torch.tensor([11, 13], dtype=torch.int32)))
+        assert _same(eager.record.logits[:9], logits)
+
+
+def test_a_replayed_step_feeds_the_returned_ids_as_they_were_changed_in_place(monkeypatch):
+    """The tensor a replayed step returns is the buffer the next replay's lookup reads, so ids CHANGED IN PLACE in it and
+    handed back are the ids the step is fed: changed through the tensor itself, through an alias of its memory whose
+    writes the tensor's version counter never sees, or handed back as a view of it.  Each such step is the step
+    launched from Python on the changed ids and the replayed step that is handed an equal clone, logits byte for byte,
+    and the record holds the changed ids as the step's input.  What the state and the record keep of the step in front
+    -- the ids as the token choice left them -- is not changed with the returned tensor."""
+
+    def changed(session, change):
+        """A prompt of five tokens and the step behind it, on ids that ``change`` makes of what the prompt's last step
+        returned: (the ids handed over, the record's input, the logits, the ids read behind the step, and what the
+        prompt's last step chose -- as it was read, as the state keeps it and as the record holds it -- taken behind
+        the change and in front of the step)."""
         session.reset(fresh=False)
         ids = session.prefill(_prompts(session, 5))
-        session.step(ids.clone())  # a clone of it: copied in, the same step
-        assert _same(session.record.logits[5], want)
+        chose = ids.clone()
+        fed = change(ids, session.model.geometry.vocab)
+        handed = fed.clone()
+        kept = (chose, session.state.greedy.clone(), session.record.outputs[4].clone())
+        read = session.read(session.step(fed))
+        return handed, session.record.inputs[5].clone(), session.record.logits[5].clone(), read, kept
+
+    def unseen(ids, vocab):
+        alias, version = torch.from_dlpack(ids), ids._version
+        alias.add_(1).remainder_(vocab)  # a write to the tensor's memory that its version counter does not count
+        assert ids._version == version and alias is not ids
+        return ids
+
+    with _recording(monkeypatch, sequences=2, capture=False) as (eager, _):
+        want = changed(eager, lambda ids, vocab: (ids + 1) % vocab)
+        assert not eager.replays and _same(want[1], want[0]) and not torch.equal(want[0], want[4][0]), "the ids were changed"
+    with _recording(monkeypatch, sequences=2) as (session, graphs):
+        buffer = session.recorded.cursor.ids
+        arms = {
+            "an equal clone": lambda ids, vocab: ids.clone().add_(1).remainder_(vocab),
+            "the returned tensor, changed in place": lambda ids, vocab: ids.add_(1).remainder_(vocab),
+            "the returned tensor, changed through an alias of its memory": unseen,
+            "a view of the returned tensor, changed in place": lambda ids, vocab: ids.add_(1).remainder_(vocab)[:],
+        }
+        for name, change in arms.items():
+            handed, recorded, logits, read, kept = changed(session, change)
+            assert session.replays and _same(handed, want[0]), name
+            assert _same(recorded, handed), f"{name}: the record holds the ids that were handed over"
+            assert _same(logits, want[2]) and read == want[3], f"{name}: the step launched from Python on the changed ids"
+            assert all(_same(each, want[4][0]) for each in kept), f"{name}: what the step in front chose stays what it chose"
+        assert len(graphs.built) == 1 and graphs.built[0].replays == 4 * 6 and session.recorded.cursor.ids is buffer
+        # a step launched from Python behind replays (a tap asks for it) reads the returned tensor as it reads any other
+        session.reset(fresh=False)
+        ids = session.prefill(_prompts(session, 5))
+        ids.add_(1).remainder_(session.model.geometry.vocab)
+        session.tap = lambda name, layer, block, operands: block(*operands)
+        try:
+            read = session.read(session.step(ids))
+        finally:
+            session.tap = None
+        assert ids is buffer and graphs.built[0].replays == 4 * 6 + 5, "the prompt by replay, the step behind it from Python"
+        assert _same(session.record.inputs[5], want[0]) and _same(session.record.logits[5], want[2]) and read == want[3]
 
 
 def test_the_cursor_follows_the_states_position_in_front_of_every_replay(monkeypatch):

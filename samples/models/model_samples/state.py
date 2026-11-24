@@ -227,7 +227,8 @@ class Cursor:
     """What a recorded decode step reads at FIXED addresses: the ids it is fed and the rows of the position it stands at.
 
     ``ids`` ``[sequences]`` int32: the ids the step's lookup reads; the step's own last copy writes the ids it chose into
-    it, so the next replay feeds on them.  ``positions`` ``[3, rows]`` int64, ``slots`` ``[rows]`` int64 and ``lengths``
+    it, so the next replay feeds on them -- and on whatever the caller, who is handed this tensor behind a replay, has
+    written into it since.  ``positions`` ``[3, rows]`` int64, ``slots`` ``[rows]`` int64 and ``lengths``
     ``[sequences rounded up to four]`` int32 (``None`` on a state without that table): the rows ``PagedKvCache.at`` and
     ``.attended`` hand out for one position, as copies of the table's rows in allocations of their own -- the same
     dtypes, shapes and alignment, so a kernel reads them as it reads a row of the table.  ``position`` is the host's
