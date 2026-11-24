@@ -9,16 +9,22 @@ copy engine.  None may change a word of the output or of a state.
 
 The coalesced path moves a state through a per-warp shared-memory scratch in which a lane loads words other lanes of its
 warp stored, and the seed copy keeps a warp's final-state keys in words every lane of the warp stores and loads.  Lanes
-of a warp are not ordered against each other, so each such hand-over is held by a host-only pin of its rendering (a
-trace-compile for ``sm_100a``; no device, nothing is launched): a warp synchronisation stands between the stores and the
-loads and again between the loads and the next stores."""
+of a warp are not ordered against each other, so each such hand-over is held in its rendering: a warp synchronisation
+stands between the stores and the loads and again between the loads and the next stores.  A host-only pin renders the
+helpers that make a hand-over (a trace-compile for ``sm_100a``; no device, nothing is launched); a device case builds
+the forward through the op with each switch setting and reads the prefill kernel's own PTX, so that a place of the
+kernel that goes round the helpers is seen, and with it the scheduler slot the load warp's lanes load and its elected
+lane stores."""
 
+import json
 import os
 import re
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
+import cudnn
 import pytest
 import torch
 
@@ -439,3 +445,294 @@ def test_lanes_hand_over_through_shared_memory_behind_a_warp_synchronisation(han
         ), f"{form}: the arrive stands in the last round's first exchange, between the synchronisation behind its stores and its loads -- {runs_of(steps)}"
     else:
         assert not arrives, f"{form}: {runs_of(steps)}"
+
+
+# ---- the rendering of the prefill kernel itself (on the device) ------------------------------------------------------
+
+# The switch settings the forward is built with, (STATE_IO_COALESCED, TILE_HANDOVER_EARLY, STATE_SEED_COPY, LEVEL_PLAN):
+# every switch off, the settings of ``SWITCHES`` and the level plan on top of the last of them.
+KERNEL_BUILDS = {"off": OFF + (False,), **{name: setting + (False,) for name, setting in SWITCHES.items()}, "level_plan": (True, True, True, True)}
+KERNEL_RENDER_BUDGET_S = 600  # one child process: its imports, the compile of one forward and the one launch behind it
+FINAL_STATE_STORES = 2  # an item with chunks and an item without each store their final state, the item's key in front of it
+
+_KERNEL_SRC = textwrap.dedent('''
+    """Child: one GDN forward through the op with the prefill kernel's build switches as given, on a batch of the level
+    plan's smallest measured cell, planned for that cell's part.  The DSL keeps the PTX of what it compiles (CUTE_DSL_KEEP
+    and CUTE_DSL_DUMP_DIR, set by the parent in front of the DSL's import).  Prints what the prefill build configurations
+    of the call say about the hand-overs."""
+    import json
+    import sys
+    from pathlib import Path
+
+    print("STAGE import", flush=True)
+    import cudnn
+    import torch
+
+    package, switches = sys.argv[1], [flag == "1" for flag in sys.argv[2:6]]
+    assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
+    from linear_attention.test_la import Backend, make_case, op_args, pinned_op, random_state, state_pool  # overlays the source package first
+
+    from cudnn.linear_attention.frost import gdn_engine
+    from cudnn.linear_attention.frost.kernel import gdn_prefill_f16 as kernel
+
+    cell = min(kernel.LEVEL_MEASURED_CELLS, key=lambda cell: cell.sequences * cell.chunks)
+    gdn_engine.multiprocessor_count = lambda device: cell.sms
+    gdn_engine.compute_capability = lambda device: cell.compute_capability
+    kernel.STATE_IO_COALESCED, kernel.TILE_HANDOVER_EARLY, kernel.STATE_SEED_COPY, kernel.LEVEL_PLAN = switches
+    built = []
+    real_build_cfg = kernel.build_cfg
+
+
+    def build_cfg(*args, **kwargs):
+        cfg = real_build_cfg(*args, **kwargs)
+        built.append(cfg)
+        return cfg
+
+
+    kernel.build_cfg = build_cfg
+    case = make_case("gdn", getattr(torch, cell.io), seq_lens=[cell.chunks * kernel.CFG.B_T] * cell.sequences, H=cell.heads_key, HV=cell.heads_out, K=cell.d_k, V=cell.d_v, lo=0.9)
+    pool, indices, _ = state_pool(case, random_state(case))
+    print("STAGE compile and launch", flush=True)
+    pinned_op(Backend("frost"), "gdn")(*op_args(case), initial_state=pool, state_indices=indices, output_final_state=True)
+    torch.cuda.synchronize()
+    print("STAGE done", flush=True)
+    (d_k,) = {cfg.d_k for cfg in built}
+    (scheduler_stages,) = {cfg.scheduler_stages for cfg in built}
+    config = dict(
+        d_k=d_k,
+        scheduler_stages=scheduler_stages,
+        state_io_coalesced=any(cfg.state_io_coalesced for cfg in built),
+        tile_handover_early=any(cfg.tile_handover_early for cfg in built),
+        state_seed_copy=any(cfg.state_seed_copy for cfg in built),
+        seed_alias_guard=any(cfg.seed_alias_guard for cfg in built),
+        level_orders=any(kernel.level_orders(cfg) for cfg in built),
+    )
+    print("CONFIG", json.dumps(config))
+    ''')
+
+# What a line of the prefill entry is for the walk.  The state scratch is the shared memory the kernel accesses in
+# 16-byte pieces of two 64-bit words; a final-state key and the scheduler slot are 32-bit words, told by their address.
+_KERNEL_STEPS = (
+    (":", re.compile(r"^[$\w.]+:$")),  # a label: a block starts
+    (">", re.compile(r"^(?:@!?%\w+\s+)?(?:bra|ret|trap|exit)\b")),  # a block ends
+    ("S", re.compile(r"^bar\.warp\.sync\b")),
+    ("P", re.compile(r"^st\.shared\.v2\.b64\b")),  # a lane puts a piece into the scratch
+    ("T", re.compile(r"^ld\.shared\.v2\.b64\b")),  # a lane takes a piece out of it
+    ("w", re.compile(r"^st\.shared\.b32\s+\[([^\]]+)\],\s*([^;\s]+)\s*;")),
+    ("r", re.compile(r"^ld\.shared\.b32\s+[^,]+,\s*\[([^\]]+)\]\s*;")),
+    ("a", re.compile(r"^atom\.global\.add\.")),  # the load warp's elected lane fetches a ticket
+    ("G", re.compile(r"^st\.global\.v2\.b64\b")),  # pieces of a final state leave for global memory
+    ("W", re.compile(r"^tcgen05\.st\b")),  # a round of a seed enters tensor memory
+)
+
+
+def prefill_entries(ptx):
+    """The lines ``(line number, text)`` of every entry of ``ptx`` that is the prefill kernel's, found by its name."""
+    prefill, prologue = gdn_prefill_f16.frost_gdn_prefill.__name__, gdn_prefill_f16.frost_gdn_prefill_prologue.__name__
+    lines = ptx.splitlines()
+    starts = [(at, match.group(1)) for at, line in enumerate(lines) for match in [re.search(r"\.entry\s+(\w+)", line)] if match]
+    bodies = []
+    for n, (at, name) in enumerate(starts):
+        if prefill in name and prologue not in name:
+            end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+            bodies.append([(row + 1, lines[row].strip()) for row in range(at + 1, end)])
+    return bodies
+
+
+def kernel_handovers(body, keys):
+    """The walk over the prefill entry ``body`` of a build whose compute-group-1 warps keep ``keys`` final-state keys
+    each: ``(found, violations)``.
+
+    The scratch and the keys are accessed by every lane of a warp in straight-line code.  An access is open until the
+    next warp synchronisation; while one is open, an access of the other kind or to the other buffer, or the end of the
+    block (a label, a branch), is a violation.  So on every path a synchronisation stands between the stores and the
+    loads and between the loads and the next stores, and a store of a key is followed by its own.  An exchange through
+    the scratch is a run of stores, the synchronisation, a run of loads, the synchronisation; it belongs to the final
+    state when global stores follow it and to a seed when the next exchange or the round's ``tcgen05.st`` does.
+
+    The scheduler slot is the word the load warp's elected lane stores a fetched ticket into, in a block of its own.
+    Behind that store stands a synchronisation and behind it the warp's loads of the slot, with no label between the two.
+    A further store of the slot in front of the next ticket needs a synchronisation behind those loads, with no label
+    and no load of the slot between it and the store: every path into the store passes it behind every lane's load."""
+    raw = []
+    for line, text in body:
+        if text and not text.startswith((".", "//")):
+            raw += [(symbol, line, match.groups()) for symbol, pattern in _KERNEL_STEPS for match in [pattern.match(text)] if match][:1]
+
+    def displacement(address):
+        match = re.search(r"\+(\d+)$", address)
+        return int(match.group(1)) if match else 0
+
+    violations = []
+    # The keys' words: where the warp stores the empty key in front of its first item, one store per word.
+    empty = sorted(displacement(groups[0]) for symbol, _, groups in raw if symbol == "w" and groups[1] == str(gdn_prefill_f16.STATE_SEED_KEY_NONE))
+    if len(empty) != keys or empty != [empty[0] + 4 * entry for entry in range(keys)]:
+        violations.append(f"the stores of the empty key are at the words {empty}, not at {keys} words one behind another")
+    key_words = range(empty[0], empty[0] + 4 * keys) if empty else range(0)
+    steps = []
+    for symbol, line, groups in raw:
+        if symbol in "wr":
+            symbol = {"w": "k", "r": "t"}[symbol] if displacement(groups[0]) in key_words else symbol
+        steps.append((symbol, line, groups[0] if symbol in "wr" else None))
+
+    name = {"P": "store to the scratch", "T": "load from the scratch", "k": "store of a key", "t": "load of a key"}
+    open_access = None
+    for symbol, line, _ in steps:
+        if symbol in ":>":
+            if open_access:
+                violations.append(
+                    f"line {line}: the block ends with the {name[open_access[0]]} of line {open_access[1]} not followed by a warp synchronisation"
+                )
+            open_access = None
+        elif symbol == "S":
+            open_access = None
+        elif symbol in name:
+            if open_access and open_access[0] != symbol:
+                violations.append(
+                    f"line {line}: a {name[symbol]} while the {name[open_access[0]]} of line {open_access[1]} is not followed by a warp synchronisation"
+                )
+            open_access = (symbol, line)
+
+    text = "".join(symbol for symbol, _, _ in steps if symbol in ":>SPTktGW")
+    found = dict(seed=0, final=0, other=0, synchronisations=text.count("S"))
+    for exchange in re.finditer(r"P+ST+S", text):
+        found[{"G": "final", "P": "seed", "W": "seed"}.get(text[exchange.end() : exchange.end() + 1], "other")] += 1
+    found.update(store_runs=len(re.findall(r"P+", text)), load_runs=len(re.findall(r"T+", text)))
+    found.update(key_stores=text.count("k"), key_stores_synchronised=len(re.findall(r"kS", text)))
+    found.update(key_compares=len(re.findall(r"t+", text)), key_compares_synchronised=len(re.findall(r"t+S", text)))
+
+    tickets = [at for at, (symbol, _, _) in enumerate(steps) if symbol == "a"]
+    found.update(publications=0, slot_stored_again=0)
+    for n, at in enumerate(tickets):
+        line = steps[at][1]
+        if at + 1 == len(steps) or steps[at + 1][0] != "w":
+            violations.append(f"line {line}: the ticket is not stored to a shared-memory word right behind its fetch")
+            continue
+        slot = steps[at + 1][2]
+        behind = steps[at + 2 : tickets[n + 1] if n + 1 < len(tickets) else len(steps)]
+        site = "".join({"w": "s", "r": "l"}[symbol] if address == slot else symbol for symbol, _, address in behind if symbol in ":>S" or address == slot)
+        loads = re.match(r":*Sl+", site)
+        if not loads:
+            violations.append(
+                f"line {line}: the slot's store is not followed by a warp synchronisation and, with no label between, the warp's loads -- {site[:24]}"
+            )
+            continue
+        found["publications"] += 1
+        rest = site[loads.end() :]
+        while "s" in rest:
+            before, rest = rest.split("s", 1)
+            found["slot_stored_again"] += 1
+            last = before.rfind("S")
+            if last < 0 or ":" in before[last:] or "l" in before[last:]:
+                violations.append(
+                    f"line {line}: the slot is stored again with no warp synchronisation that every path from the warp's loads passes -- {before[-24:]}s"
+                )
+    return found, violations
+
+
+def render_kernel(root, build):
+    """``(config, body)`` of the forward built through the op with the switches of ``build``, in a child process whose
+    DSL keeps its PTX in a folder of its own under ``root``; the compiled cache and the launcher's recordings are off, so
+    the child compiles what it runs.  ``config``: what the child's prefill build configurations say; ``body``: the
+    lines of the prefill entry."""
+    dump = root / f"dump_{build}"
+    dump.mkdir(exist_ok=True)
+    package = Path(cudnn.__file__).resolve()
+    env = dict(
+        os.environ,
+        CUTE_DSL_KEEP="ptx",
+        CUTE_DSL_DUMP_DIR=str(dump),
+        CUDNN_FRONTEND_DISABLE_COMPILED_CACHE="1",
+        CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO="0",
+        CUDNN_FRONTEND_CPP_LAUNCHER="0",
+    )
+    # The child imports the package this process tests and, beside it, only the test helpers.
+    env["PYTHONPATH"] = os.pathsep.join([str(package.parent.parent), str(Path(__file__).resolve().parents[2]), env.get("PYTHONPATH", "")])
+    # The child dumps its stack before the parent's deadline: a stall names its stage, import, compile or launch.
+    preamble = f"import faulthandler\nfaulthandler.dump_traceback_later({KERNEL_RENDER_BUDGET_S * 0.9!r})\n"
+    argv = [sys.executable, "-u", "-c", preamble + _KERNEL_SRC, str(package), *("1" if on else "0" for on in KERNEL_BUILDS[build])]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=KERNEL_RENDER_BUDGET_S, env=env, cwd=root)
+    except subprocess.TimeoutExpired as exc:
+        streams = [stream.decode("utf-8", errors="replace") if isinstance(stream, bytes) else (stream or "") for stream in (exc.stdout, exc.stderr)]
+        raise AssertionError(f"the build {build} did not return within {KERNEL_RENDER_BUDGET_S} s\n{streams[0][-3000:]}\n{streams[1][-6000:]}") from None
+    assert proc.returncode == 0, f"the build {build} failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-6000:]}"
+    reported = [line[len("CONFIG ") :] for line in proc.stdout.splitlines() if line.startswith("CONFIG ")]
+    assert len(reported) == 1, f"the build {build} reported no configuration:\n{proc.stdout[-3000:]}"
+    config = json.loads(reported[0])
+    files = sorted(dump.glob("*.ptx"))
+    bodies = [body for file in files for body in prefill_entries(file.read_text())]
+    assert len(bodies) == 1, f"the build {build} left {len(bodies)} prefill entries in {[file.name for file in files]}: the cell's plan runs one prefill kernel"
+    return config, bodies[0]
+
+
+@pytest.fixture(scope="module")
+def kernel_rendering(tmp_path_factory):
+    """``render(build)``: ``(config, found, violations)`` of the prefill kernel of a setting of ``KERNEL_BUILDS``, each
+    built once for the module."""
+    reason = frost_la_unavailable()
+    if reason:
+        pytest.skip(reason)
+    root = tmp_path_factory.mktemp("prefill_rendering")
+    rendered = {}
+
+    def render(build):
+        if build not in rendered:
+            try:
+                config, body = render_kernel(root, build)
+                rendered[build] = (config,) + kernel_handovers(body, config["scheduler_stages"] + 1 if config["seed_alias_guard"] else 0)
+            except AssertionError as failure:
+                rendered[build] = failure
+        if isinstance(rendered[build], AssertionError):
+            raise rendered[build]
+        return rendered[build]
+
+    return render
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("build", list(KERNEL_BUILDS))
+def test_kernel_hands_over_between_lanes_behind_a_warp_synchronisation(kernel_rendering, build):
+    """The prefill kernel as the op builds it, read from its own PTX, for every switch off, each setting of the state
+    I/O switches and the level plan on top of them.
+
+    The walk (``kernel_handovers``) finds no hand-over without its synchronisations, and what it finds is what the
+    build's configuration says the kernel compiles.  A state of ``d_k`` key columns is ``d_k / STATE_XFER_ROW_WORDS``
+    exchanges through the scratch in one direction.  The coalesced path moves an item's seed at the item's start (with
+    the seed copy: only where the keys' compare selects a reload) and its final state; the early hand-over without the
+    seed copy also moves the next item's seed at the item's end.  Under the seed copy's guard a warp keeps one key per
+    scheduler stage and one more: each is stored empty once, an item's key is stored in front of either final-state
+    store, and one compare loads them.  A block publishes its tickets at one place, a level plan at two (its first
+    item comes by the ticket as well), and a level plan stores the slot once more behind the warp's loads.
+
+    The count of warp synchronisations in the entry is the switched-off build's -- one per publication, nothing else
+    synchronises a warp there -- plus what the switches add: two per exchange, one per store of a key, one per compare,
+    and for the level plan one more publication's and one per second store of the slot."""
+    _, off, off_violations = kernel_rendering("off")
+    config, found, violations = kernel_rendering(build)
+    coalesced, early, seed_copy, level = KERNEL_BUILDS[build]
+    assert (config["state_io_coalesced"], config["tile_handover_early"], config["state_seed_copy"], config["level_orders"]) == KERNEL_BUILDS[build], config
+    print(f"\n{build}: {config}\n{found}")
+    assert not violations, f"{build}: {len(violations)} hand-overs without their synchronisation -- " + "; ".join(violations[:8])
+
+    exchanges = config["d_k"] // gdn_prefill_f16.STATE_XFER_ROW_WORDS
+    seeds = (1 if coalesced else 0) + (1 if early and not seed_copy else 0)
+    finals = 1 if coalesced else 0
+    assert (found["seed"], found["final"], found["other"]) == (seeds * exchanges, finals * exchanges, 0), f"{build}: {found}"
+    assert found["store_runs"] == found["load_runs"] == (seeds + finals) * exchanges, f"{build}: an access to the scratch outside an exchange -- {found}"
+
+    keys = config["scheduler_stages"] + 1 if config["seed_alias_guard"] else 0
+    assert config["seed_alias_guard"] == seed_copy
+    key_stores = keys + FINAL_STATE_STORES if keys else 0
+    assert found["key_stores"] == found["key_stores_synchronised"] == key_stores, f"{build}: {found}"
+    assert found["key_compares"] == found["key_compares_synchronised"] == (1 if keys else 0), f"{build}: {found}"
+
+    publications = 2 if level else 1
+    assert (found["publications"], found["slot_stored_again"]) == (publications, publications if level else 0), f"{build}: {found}"
+
+    assert off["synchronisations"] == off["publications"] and not off_violations, f"off: {off}; {off_violations[:8]}"
+    scheduler = publications * (2 if level else 1) - off["publications"]
+    added = 2 * exchanges * (seeds + finals) + key_stores + (1 if keys else 0) + scheduler
+    assert (
+        found["synchronisations"] == off["synchronisations"] + added
+    ), f"{build}: {found['synchronisations']} warp synchronisations, the switched-off build's {off['synchronisations']} + {added} expected"
