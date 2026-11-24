@@ -1258,14 +1258,14 @@ def test_the_memory_sentence_holds_what_a_run_of_85_sequences_takes(sample):
     peak = float(out.split("GPU memory: PyTorch peak ", 1)[1].split(" GiB allocated", 1)[0])
     assert 0.0 < peak < need, f"PyTorch held {peak} GiB at its peak; the memory sentence states {need} GiB"
     # the arithmetic of the sentence's parts, without its allowances: the weights and the state of this GPU's plan, and the count
-    import model_samples
+    from model_samples import Session, TextIO
     from model_samples.qwen_dense import QwenDense
 
     request = re.search(r"decoding: (\d+) prompt tokens through the decode step, then (\d+) new tokens", out)
     capacity = int(request.group(1)) + int(request.group(2))  # the positions of the run: its prompt and its new tokens
     model = QwenDense.reduced(2)
-    text = model_samples.TextIO.synthetic(model.geometry.vocab)
-    session = model_samples.Session(model, text, sequences=85, stack="fe-entries", device=f"cuda:{torch.cuda.current_device()}", capacity=capacity)
+    text = TextIO.synthetic(model.geometry.vocab)
+    session = Session(model, text, sequences=85, stack="fe-entries", device=f"cuda:{torch.cuda.current_device()}", capacity=capacity)
     session.resolve()  # the tables of this GPU: nothing is built or loaded
     held = model.copy_bytes(session.uncopied_weights()) + model.stored_bytes(session.stored_weights())
     page = session.cache_page()
