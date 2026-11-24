@@ -6,9 +6,42 @@ This report holds test coverage, measured results, and failure diagnostics.
 
 ### BF16 grouped GEMM sReLU forward
 
-Split validation (2026-11-23): pre-commit and `git diff --check` pass. Fern
-reports zero errors and one authentication-related redirect-check warning. GPU
-execution of the split revision remains pending; the six goldens are unchanged.
+Independent forward-slice validation (2026-11-23) at `64729ac5` on GB300
+(SM103, 152 SMs): **85 functional passes** and **7 non-golden determinism
+passes**, including explicit-stream capture and warm stress. This source
+snapshot does not include the BF16 backward implementation. Its source package
+and native extension were verified before testing. Runtime: Torch
+`2.12.0a0+0291f960b6.nv26.04.48445190` with CUDA 13.2, driver API 13050,
+cuDNN 92500, CuTe DSL 4.8.0 with its CUDA 13.4 compiler, tvm-ffi 0.1.16,
+and JAX 0.11.1 with the CUDA 13 plugin.
+
+The six strict golden checks fail because runtime `fa4355032a14e6f5` has no
+committed baseline. They are not byte-comparison passes. The original six
+records remain unchanged; no goldens were recorded. The independent branch's
+block-scaled/workspace regressions report **238 passed, 160 skipped** for
+unsupported configurations; existing JAX regressions report **6 passed**, and
+kernel scanners **34 passed**.
+
+In the combined split at `32255350`, the same forward implementation reports
+**85 functional passes** and **7 non-golden determinism passes** in each of
+these additional lanes: GB300/SM103 with the CUDA 12.9 compiler, and
+GB200/SM100 (152 SMs) with both CUDA 12.9 and CUDA 13.4 compilers. Framework,
+backend and dependency versions match the independent run above. The cu12
+lanes qualify the DSL compiler under a CUDA 13 framework. On GB200, all six
+strict forward golden checks also fail for a missing runtime baseline
+(`ba252fda3f535655`); cu12 did not compare the historical cu13 baselines.
+
+Commands from `test/python`, with recording unset:
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_TEST_NO_ISOLATION=1
+python -m pytest gemm/cutedsl/test_grouped_gemm_srelu_bf16.py -m 'L0 or L1'
+python -m pytest gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py -m L0 -k 'not golden'
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py -m L0 -k golden
+```
+
+Local formatting checks pass. Fern reports zero errors and one
+authentication-related redirect-check warning.
 
 `gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py` checks BF16 C/D replay,
 batch invariance and independent references for plain and clamped sReLU, with
@@ -20,8 +53,9 @@ Historical evidence: PR #2737 run H (`f0a7d2b8`, GB300/SM103, CuTe DSL 4.8.0
 cu13) reported 13 forward determinism passes, including six strict golden
 checks; run I (`3c5c77fe`, cu12 compiler flavor) reported seven non-golden
 passes. These measurements precede the split and are not results for its new
-commits. SM100 is unverified. BF16 backward is provided by the dependent
-dSReLU change; this forward slice does not claim backward coverage.
+commits. The measurements above provide the split revision's SM100/SM103
+coverage. BF16 backward is provided by the dependent dSReLU change; this
+forward slice does not claim backward coverage.
 
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
