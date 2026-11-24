@@ -747,6 +747,38 @@ def test_gemm_glu_forward_geglu_quant(ab_dtype, sf_dtype, sf_vec_size, c_dtype, 
 
 
 @pytest.mark.L0
+def test_gemm_glu_forward_keeps_positional_order():
+    pytest.importorskip("cudnn.gemm.cutedsl.dense.glu.api")
+    import inspect
+    from cudnn.ops import gemm_glu_forward
+
+    names = list(inspect.signature(gemm_glu_forward).parameters)
+    assert names == [
+        "a_tensor",
+        "b_tensor",
+        "alpha",
+        "c_major",
+        "ab12_dtype",
+        "c_dtype",
+        "acc_dtype",
+        "mma_tiler_mn",
+        "cluster_shape_mn",
+        "sfa_tensor",
+        "sfb_tensor",
+        "norm_const_tensor",
+        "sf_vec_size",
+        "vector_f32",
+        "ab12_stages",
+        "stream",
+        "act_func",
+        "linear_offset",
+        "geglu_alpha",
+        "glu_clamp_max",
+        "glu_clamp_min",
+    ]
+
+
+@pytest.mark.L0
 def test_gemm_glu_forward_rejects_unsupported_activation():
     skip_unless_tcgen05()
     from cudnn.ops import gemm_glu_forward

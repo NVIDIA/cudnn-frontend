@@ -649,12 +649,12 @@ def gemm_glu_forward(
     sf_vec_size: int = 16,
     vector_f32: bool = False,
     ab12_stages: int = 4,
+    stream: Optional[cuda.CUstream] = None,
     act_func: str = "swiglu",
     linear_offset: Optional[float] = None,
     geglu_alpha: float = 1.702,
     glu_clamp_max: float = 7.0,
     glu_clamp_min: float = -7.0,
-    stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Dense GEMM fused with a GLU activation on SM100+.
 

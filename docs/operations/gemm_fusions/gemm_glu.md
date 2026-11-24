@@ -107,8 +107,8 @@ result = gemm_glu_forward(
     acc_dtype=torch.float32,
     mma_tiler_mn=(128, 128),
     cluster_shape_mn=(1, 1),
-    act_func="swiglu",
     stream=None,
+    act_func="swiglu",
 )
 ab12, c, sfc, amax = result
 # Note: sfc and amax are always None in standard mode
