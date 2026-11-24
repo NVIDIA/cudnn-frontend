@@ -1258,7 +1258,7 @@ def tcgen05_mma_warp(
                 # A seeded item's seed fills stand in ring order in front of its first chunk: the look-ahead index passes
                 # them here, the chunk index behind this product.
                 if item_is_seeded(cfg, compute_start):
-                    for _fill in cutlass.range_constexpr(cfg.seed_fills):
+                    for _ in cutlass.range_constexpr(cfg.seed_fills):
                         kq_cg0_index = advance(kq_cg0_index, cfg.smem_kq_stages)
             kq_cg0_idx = kq_cg0_index.idx
             bars.mb_kq_ready[kq_cg0_idx].wait(kq_cg0_index.phase)
@@ -1270,7 +1270,7 @@ def tcgen05_mma_warp(
                 bars.mb_cg0_acc_ready[cg0_acc_idx].arrive(cta_group=1)
             if cutlass.const_expr(cfg.state_seed_copy):
                 if item_is_seeded(cfg, compute_start):
-                    for _fill in cutlass.range_constexpr(cfg.seed_fills):
+                    for _ in cutlass.range_constexpr(cfg.seed_fills):
                         kq_index = advance(kq_index, cfg.smem_kq_stages)
         if n_local > 1:
             cg0_acc_idx = cg0_acc_index.idx
