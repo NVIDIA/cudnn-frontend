@@ -4615,6 +4615,23 @@ combinations, SM100/SM103 and SM107 are unverified for this change. No golden
 record is added because these plan-dependent backward bits already have no
 golden contract; replay and the independent reference are the qualification.
 
+### Standalone DSA Top-K with per-row starts
+
+`deepseek_sparse_attention/cutedsl/test_DSA_indexer_top_k.py` covers FP32,
+FP16 and BF16 against a per-interval reference, including unaligned starts,
+empty rows, cutoff ties and speculative groups. Deterministic output indices
+and values are byte-identical after isolating, reordering and duplicating rows.
+Standalone index selection has no backward operator.
+
+`pytest -q deepseek_sparse_attention/cutedsl/test_DSA_indexer_top_k.py -k
+'starts or accepts_strided_inputs'` passed 17 cases on SM90 (PyTorch 2.8.0
+cu128, DSL 4.8.1) and SM103 (PyTorch 2.12.1 cu130, DSL 4.8.0 and 4.8.1).
+The SM103 checks exercised both the CUDA 12.9 and 13.4 DSL compiler flavors.
+On SM100 with DSL 4.8.0, the same 17 cases passed. Additional bitmap checks
+at K=512 passed for all three dtypes and both tie directions. Memcheck reported
+driver API errors during compilation, so the SM100 sanitizer result is inconclusive.
+SM107 and SM12x interval coverage remains unverified.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
