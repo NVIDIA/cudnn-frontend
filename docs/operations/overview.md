@@ -39,6 +39,7 @@ The experimental API catalog includes:
 - [Attention Preparation Decode Step (SM100-class)](/operations/Attention/attention_prepare_decode) — per token of a decode step the RMSNorm of every query and key head row, the rotation of its rotary part by the token's position (one or three position rows), the gate rows copied beside the queries and the keys and values written into paged pools at the token's slot, at decode-time token counts (1 .. 1024), as one FROST launch (bf16 in and out), bitwise repeatable and batch-invariant
 - [FP4 Row Quantization Decode Step (SM100-class)](/operations/BlockScaling/row_quantize_fp4_decode) — the block-scaled FP4 (NVFP4) quantization of bf16 rows under a global scale (E2M1 codes, one E4M3 block scale per sixteen elements in the 128 x 4 scale layout) at decode-time row counts (1 .. 1024) as one FROST launch; no numerics knob, bitwise repeatable and batch-invariant
 - [FP8 Row Quantization Decode Step (SM100-class)](/operations/Pointwise/row_quantize_fp8_decode) — the dynamic FP8 (E4M3) quantization of bf16 rows, each under its own scale (the row maximum over 448 with a floor; E4M3 codes and one fp32 scale per row), at decode-time row counts (1 .. 1024) as one FROST launch; every step exactly specified, no numerics knob, bitwise repeatable and batch-invariant
+- [Row Argmax Decode Step (SM100-class)](/operations/Pointwise/row_argmax_decode) — per row of a bf16 slab the lowest column of the row maximum, or the entry of an int32 / int64 id table at that column (ties to the lowest column, a NaN never chosen), at decode-time row counts (1 .. 1024) as one FROST launch; exact, bitwise repeatable and batch-invariant
 - [LayerNorm and RMSNorm in JAX](/operations/Normalizations/norm_jax) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/normalizations/norm_jax.md))
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
@@ -80,6 +81,7 @@ The experimental API catalog includes:
 - [Aligned HCA Backward](/operations/sparse_attention/csa/aligned_hca_backward)
 - [DSv4.1 Vision RoPE Backward](/operations/RoPE/vision_rope_backward)
 - [Engram Saved-State Gate](/operations/Pointwise/engram_saved_gate)
+- [Row Argmax Decode Step (SM100-class)](/operations/Pointwise/row_argmax_decode)
 - [RMSNorm + RHT + Amax](/operations/Normalizations/rmsnorm_rht_amax)
 - [Ahead-of-time attention for SM120 (C/C++ API)](/operations/Attention/aot_sm120_attention)
 - [SDPA Backward, d = 128, dense and THD MHA/GQA/MQA (SM100 / SM103)](/operations/Attention/sdpa_bwd_sm100_d128)

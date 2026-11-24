@@ -118,7 +118,8 @@ it: under deterministic algorithms torch fills it, and a recycled block can carr
 Every launch that writes bytes of the pair waits for that work on whatever stream it runs and however the tensor
 reached the call: the entry's own output, a tensor taken with `outputs(tokens)` and passed back as `q_out` /
 `gate_out` or as a pool, whole or as a view, at this token count or another, by this entry or by another entry that
-orders its launches the same way (today `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode` and `RowQuantizeFp8Decode`);
+orders its launches the same way (through `cudnn.frost.init_order`; rule 16 of `python/cudnn/frost/README.md` lists
+the entries that do and those that do not yet);
 the test is one of addresses. The launch stream waits for an event recorded behind the allocation, without a host
 wait and without synchronizing a stream or the device, so `compile(tokens)` may run on any stream; on the allocating
 stream itself the event is already behind the launch and the wait is free, and a stream that was given the raw handle

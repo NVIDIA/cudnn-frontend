@@ -111,19 +111,29 @@ call's are never written. An output the caller does not pass is the entry's: one
 allocated by `compile(rows)` / `outputs(rows)` or at the first call of that row count. `compile()` without a row count
 allocates the pair of ONE row (2,560 code bytes and one 128-row scale band): the compile binds it, also for a caller that
 passes its own outputs on every call. Call `compile(rows)` for every row
-count before a CUDA-graph capture; it may run on any stream. The initialization of a pair (its allocation and the zero-fill)
-is stream work of torch's current stream of the entry's device at that moment, and every launch of the entry that writes one
-of the pair's tensors is ordered behind it on whatever stream it runs, however the tensor reached the call: the entry's own
-output of the row count, or a tensor taken with `outputs(rows)` and passed back as an explicit output, whole or as a view, at
-this row count or another. On the same stream the order is stream order; on another stream it is a stream-side wait for an
-event recorded behind the initialization. The host does not wait, and no stream and no device is synchronized. A capturing
-stream cannot wait for an event recorded outside the capture, so a captured call that finds the initialization still pending
-waits for that one event on the host before its captured launch. A pair allocated before `torch.cuda.graph` is entered is
-complete by then (the context synchronizes the device); an initialization started inside the context on another stream or by
-another host thread, or met under a capture begun another way, can still be pending. Once a launch has seen the
-initialization complete, calls do nothing for it. `outputs(rows)` returns the pair without waiting: a caller that reads or
-writes the returned tensors itself, outside a call of the entry, while their initialization may be pending, does that on the
-stream that was current when they were allocated, or orders its own stream behind that one. Entry-owned outputs are valid
+count before a CUDA-graph capture; it may run on any stream. The initialization of a pair is stream work of torch's current
+stream of the entry's device at that moment -- the allocation, the zero-fill of `scales`, a fill torch adds to `codes` under
+deterministic algorithms, a write the stream still owes a recycled block -- and every launch that writes bytes of the pair is
+ordered behind it on whatever stream it runs, however the tensor reached the call: the entry's own output of the row count, a
+tensor taken with `outputs(rows)` and passed back as an explicit output, whole or as a view, at this row count or another, by
+this entry or by another entry that orders its launches the same way (through `cudnn.frost.init_order`; rule 16 of
+`python/cudnn/frost/README.md` lists the entries that do and those that do not yet); the test is one of addresses. The
+launch stream waits for an event recorded behind the
+initialization, without a host wait and without synchronizing a stream or the device; on the allocating stream itself the
+event is already behind the launch and the wait is free, and a stream that was given the raw handle of a destroyed
+allocating stream waits like any other. A capturing stream cannot wait for an event recorded outside the capture, so a
+captured call that finds the initialization still pending waits for that one event on the host before its captured launch.
+That is set-up, never part of a replay, and a pair allocated before the capture needs no wait once its stream's earlier work
+is done (`torch.cuda.graph` synchronizes the device when it is entered; a raw capture does not). Not ordered: a pair
+allocated inside a stream capture (nothing is recorded; its fill is part of that graph and runs at each replay). An
+allocation on the legacy default stream while a blocking stream of another host thread captures raises torch's error:
+allocate before that capture or on a stream of your own. Once a call
+has seen an initialization complete nothing is kept of it and a warm call does nothing for it; while one is pending on the
+device, every call of every such entry on that device reads the device's records. `outputs(rows)` returns a copy of the
+entry's table (the same tensors) without waiting: a caller that reads or writes the returned tensors itself, outside a call of
+an entry, while their initialization may be pending, does that on the stream that was current when they were allocated, or
+orders its own stream behind that one; the operands a launch only reads (`x`, `scale`) stay the caller's too. Entry-owned
+outputs are valid
 until the entry's next call at that row count from ANY host thread: stream order does not serialize host calls, so two host
 threads that share one entry pass their own outputs or build one entry each. The entry's first use is not serialized either:
 `compile()` -- and `compile(rows)` or `outputs(rows)` for every row count whose entry-owned pair is used -- runs in one host
