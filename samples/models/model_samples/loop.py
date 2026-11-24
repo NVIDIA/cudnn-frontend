@@ -1040,7 +1040,8 @@ class Session:
         position)`` -- whether the ids buffer holds the ids the last replay chose (its own copy of them), whether the
         position rows stand at the state's position (its own adds), and that position.  Kept on the session
         (``tail``) for the checks' line; ``None`` where the request was not replayed.  Host reads: behind a request,
-        in front of anything that replays again."""
+        in front of anything that replays again -- and of any write of the caller's to the tensor the last step
+        returned, which is that buffer."""
         recorded = self.recorded
         if not self.replays or recorded is None or recorded.state is not self.state:
             return None

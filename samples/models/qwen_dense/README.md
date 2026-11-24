@@ -306,7 +306,8 @@ from Python). The count of the first line is the CUDA runtime's where the instal
 holds, and is then held against the plan kernel by kernel; elsewhere it is the plan's count, and worded so.
 
 A replayed step is held to the same step launched from Python. The record of a run holds the ids the loop handed to
-every step, and the checks launch those steps again from Python from a fresh state: ids and logits, byte for byte
+every step, and the checks launch those steps again from Python from a fresh state, each step behind the prompt on
+the ids the step in front of it chose, as the loop feeds it: the ids fed, the ids chosen and the logits, byte for byte
 (`recorded step`; with a checkpoint from position 0 through the first eight steps that feed on their own token and
 across the first page boundary of the attention cache; the seeded run, every step). Behind the request the run reads
 the step's own tail, which no recomputation sees: the ids buffer holds the last chosen ids and the position rows

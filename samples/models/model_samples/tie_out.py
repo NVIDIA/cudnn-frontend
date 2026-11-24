@@ -1126,7 +1126,9 @@ def run_checks(
     of the reference stack's own pass -- and every step of it is held to what the replay left, ids and logits, byte
     for byte.  So the recomputation can reach steps that feed on their own token and a page boundary of the attention
     cache where the block check covers the first steps alone; it ends at the last recorded step where the run
-    recorded fewer.
+    recorded fewer.  Behind the prompt (``prompt_tokens``) a step is launched again as the loop launched it, on the
+    ids the step in front of it chose, and the ids every step was fed are held with its logits and the ids it chose:
+    a replayed step that was fed other ids than the step in front of it chose differs at that step.
 
     **A run that replayed its steps** has another first check line, named for what it is: ``recorded step``, the replayed
     steps launched again from Python from a fresh state, with the positions that were recomputed and, where it fails,
@@ -1229,17 +1231,24 @@ def run_checks(
             session.tap = prompt_tap if t < judged_prompt else None
             prompt_tap.step = t
             session._feed(prompt[:, t].contiguous())
+        own = None  # of a replayed run: the ids the step in front chose, as this pass computed them
         for t in range(last):  # every step again, from Python; the blocks judged at the first ``steps``, or at the judged positions alone
             session.tap = tap if (t < steps if judged_at is None else t in judged_at) else None
             tap.step = t
-            session._advance(inputs[t], accepted[t])
+            # a step of a replayed run behind its prompt is launched again as the loop launched it: on the ids the step in front
+            # of it chose.  A replayed step that was fed anything else -- an ids buffer that did not hold them -- differs from here on
+            feeds = own if replays and own is not None and t >= prompt_tokens else inputs[t]
+            own = session._advance(feeds, accepted[t])
     finally:
         session.tap = None
-    replay_ok = bytes_equal(session.record.logits[:last], logits) and bytes_equal(session.record.outputs[:last], ids)
+    compared = [(session.record.logits, logits), (session.record.outputs, ids)]
+    if replays:  # ... and the ids every step was fed, with the logits and the ids it chose
+        compared.append((session.record.inputs, inputs))
+    replay_ok = all(bytes_equal(mine[:last], theirs[:last]) for mine, theirs in compared)
     # of a replayed run, the first step whose recomputation from Python is not what the replay left
     first_wrong = None
     if replays and not replay_ok:
-        first_wrong = next(t for t in range(last) if not (bytes_equal(session.record.logits[t], logits[t]) and bytes_equal(session.record.outputs[t], ids[t])))
+        first_wrong = next(t for t in range(last) if not all(bytes_equal(mine[t], theirs[t]) for mine, theirs in compared))
     end_state = digest(session.state) if digest is not None and last == main.count else None  # behind every recorded step, launched from Python
     logits, ids = logits[:steps], ids[:steps]  # the reference stack's own pass stays on the first ``steps``
     if proposals is not None:  # ... and what the drafter proposed in front of every step

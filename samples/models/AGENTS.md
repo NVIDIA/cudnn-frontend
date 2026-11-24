@@ -255,7 +255,8 @@ does not hold is printed as not known and ignored, so a new name for one of them
     - The record of a replayed step holds the ids the loop HANDED to it, copied from the tensor that was handed over
       in front of the replay, and the ids the step chose as the token choice left them, never as the buffer holds
       them. The checks launch the recorded steps again from Python and hold ids AND logits byte for byte (a wrong
-      length moved the logits of a step and no token); the step's own tail is read behind the request; the replayed
+      length moved the logits of a step and no token), each step behind the prompt on the ids the step in front of
+      it chose: a step that was fed anything else differs there. The step's own tail is read behind the request; the replayed
       steps of the traced pass are held to the traced steps launched from Python, launch by launch.
     - In the performance mode the requests of a run that records its step are replays; its traced request stays
       launched from Python (the kernel check and the per-kernel table need the call log) and a second traced request

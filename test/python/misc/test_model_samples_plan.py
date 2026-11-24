@@ -2962,7 +2962,8 @@ def test_the_checks_of_a_replayed_run_launch_its_steps_again_from_python(monkeyp
     launched again from Python from a fresh state, ids and logits byte for byte, with the positions that were
     recomputed -- the block check's steps, and past them as far as ``reach`` asks, never past what was recorded -- and
     under it the step's own tail as ``Session.read_tail`` read it behind the request.  A replay that left other logits
-    from one step on fails with that step named; a tail that was not read, an ids buffer that does not hold the last
+    from one step on fails with that step named, and so does a step behind the prompt that was fed other ids than the
+    step in front of it chose; a tail that was not read, an ids buffer that does not hold the last
     chosen ids and position rows that do not stand at the last position each fail the line and the run.  A run
     launched from Python keeps the ``replay`` line it had."""
     from model_samples import tie_out
@@ -3008,6 +3009,22 @@ def test_the_checks_of_a_replayed_run_launch_its_steps_again_from_python(monkeyp
         request(session)
         failed = tie_out.run_checks(session, prompt_tokens=60, max_steps=16, reach=68)
         assert not failed.ok and failed.lines[1].endswith("ids and logits byte-identical    FAIL (first at step 61)"), failed.lines[1]
+        # an ids buffer that held other ids than the step chose, ONCE, behind the step at position 62: the loop read them and handed
+        # them back, so the step at 63 was fed them.  The steps launched again from Python feed on their own token: step 63 differs
+        session.record_step()
+        graph = graphs.built[-1]
+        replay = graph.replay
+
+        def stale_once():
+            replay()
+            if graph.replays == 63:
+                session.recorded.cursor.ids.add_(1).remainder_(session.model.geometry.vocab)
+
+        graph.replay = stale_once
+        request(session)
+        stale = tie_out.run_checks(session, prompt_tokens=60, max_steps=16, reach=68)
+        assert not stale.ok and stale.lines[1].endswith("ids and logits byte-identical    FAIL (first at step 63)"), stale.lines[1]
+        assert stale.lines[2].endswith("where the request left the state    PASS"), "the buffer held the last chosen ids again: the tail alone does not see it"
         # the tail: not read; a buffer that does not hold the last chosen ids; rows that do not stand at the last position
         session.record_step()
         session.reset(fresh=False)
