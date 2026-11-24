@@ -36,7 +36,7 @@ from ..srelu._bf16_api import Bf16SreluLaunchMixin, check_bf16_srelu_device, mn1
 from ..srelu._bf16_options import resolve_bf16_srelu_options
 from ._blockscaled_api import _dprob_n_slots
 from ._dprob_fold import compile_dprob_fold, fold_dprob_slots
-from .moe_grouped_gemm_dsrelu import FIX_PAD_SIZE, MoEGroupedGemmDsreluBf16Kernel
+from .moe_grouped_gemm_dsrelu import MoEGroupedGemmDsreluBf16Kernel
 
 # TMA extents and the batch-mode strides of the compact operands are 32-bit in this kernel family.
 _INT32_LIMIT = 2**31
@@ -252,19 +252,21 @@ class GroupedGemmDsreluBf16API(Bf16SreluLaunchMixin, APIBase):
 
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
-        if self.m_aligned != FIX_PAD_SIZE:
-            raise ValueError(f"m_aligned must be {FIX_PAD_SIZE}, got {self.m_aligned}")
+        if self.m_aligned != MoEGroupedGemmDsreluBf16Kernel.FIX_PAD_SIZE:
+            raise ValueError(f"m_aligned must be {MoEGroupedGemmDsreluBf16Kernel.FIX_PAD_SIZE}, got {self.m_aligned}")
         if self.b_major not in ("k", "n"):
             raise ValueError(f"b_major must be 'k' or 'n', got {self.b_major}")
         if self.expert_cnt <= 0 or self.expert_cnt > 1024:
             raise ValueError(f"expert count must be in [1, 1024], got {self.expert_cnt}")
-        if tensor_m % FIX_PAD_SIZE != 0:
-            raise ValueError(f"sample_a M dimension must be a multiple of {FIX_PAD_SIZE}, got {tensor_m}")
+        if tensor_m % MoEGroupedGemmDsreluBf16Kernel.FIX_PAD_SIZE != 0:
+            raise ValueError(f"sample_a M dimension must be a multiple of {MoEGroupedGemmDsreluBf16Kernel.FIX_PAD_SIZE}, got {tensor_m}")
         if tensor_m * max(n, k, slots) >= _INT32_LIMIT or self.expert_cnt * n * k >= _INT32_LIMIT:
             raise ValueError(f"M*N, M*K, M*slots and E*N*K must each be below 2**31 elements, got M={tensor_m}, N={n}, K={k}, E={self.expert_cnt}")
         self.tanh_clamp_scale, self.tanh_mode = resolve_bf16_srelu_options(self.tanh_clamp_scale, self.tanh_mode)
 
-        if not self._kernel.can_implement(self.use_2cta_instrs, self.mma_tiler_mn, self.cluster_shape_mn, max(tensor_m, FIX_PAD_SIZE), n, k, self.expert_cnt):
+        if not self._kernel.can_implement(
+            self.use_2cta_instrs, self.mma_tiler_mn, self.cluster_shape_mn, max(tensor_m, MoEGroupedGemmDsreluBf16Kernel.FIX_PAD_SIZE), n, k, self.expert_cnt
+        ):
             raise ValueError(
                 f"Unsupported BF16 grouped GEMM dSReLU tile/cluster configuration mma_tiler_mn={self.mma_tiler_mn}, cluster_shape_mn={self.cluster_shape_mn}"
             )
@@ -310,7 +312,7 @@ class GroupedGemmDsreluBf16API(Bf16SreluLaunchMixin, APIBase):
             # (M, cols, 1) with strides (cols, 1, M * cols); M symbolic and a multiple of 256.
             return cute.runtime.make_fake_compact_tensor(
                 dtype=dtype,
-                shape=(cute.sym_int(divisibility=FIX_PAD_SIZE), cols, 1),
+                shape=(cute.sym_int(divisibility=MoEGroupedGemmDsreluBf16Kernel.FIX_PAD_SIZE), cols, 1),
                 stride_order=(1, 0, 2),
                 assumed_align=16,
             )
@@ -319,7 +321,7 @@ class GroupedGemmDsreluBf16API(Bf16SreluLaunchMixin, APIBase):
         c_fake = compact(cutlass.BFloat16, n)
         d_fake = compact(cutlass.BFloat16, n)
         h_fake = compact(cutlass.BFloat16, n) if self.generate_d_srelu else None
-        valid_m = cute.sym_int(divisibility=FIX_PAD_SIZE)
+        valid_m = cute.sym_int(divisibility=MoEGroupedGemmDsreluBf16Kernel.FIX_PAD_SIZE)
         prob_fake = cute.runtime.make_fake_tensor(dtype=cutlass.Float32, shape=(valid_m, 1, 1), stride=(1, 1, 1), assumed_align=16)
         dprob_fake = cute.runtime.make_fake_compact_tensor(
             dtype=cutlass.Float32,
@@ -427,8 +429,8 @@ class GroupedGemmDsreluBf16API(Bf16SreluLaunchMixin, APIBase):
         tensor_m, k, _ = a_desc.shape
         n = c_desc.shape[1]
         slots = self._dprob_slots()
-        if tensor_m % FIX_PAD_SIZE != 0:
-            raise ValueError(f"a_tensor M dimension must be a multiple of {FIX_PAD_SIZE}, got {tensor_m}")
+        if tensor_m % MoEGroupedGemmDsreluBf16Kernel.FIX_PAD_SIZE != 0:
+            raise ValueError(f"a_tensor M dimension must be a multiple of {MoEGroupedGemmDsreluBf16Kernel.FIX_PAD_SIZE}, got {tensor_m}")
         for desc, expected_shape, expected_stride, name in (
             (a_desc, (tensor_m, k, 1), (k, 1, tensor_m * k), "a_tensor"),
             (c_desc, (tensor_m, n, 1), (n, 1, tensor_m * n), "c_tensor"),
