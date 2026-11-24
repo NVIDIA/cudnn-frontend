@@ -1219,8 +1219,15 @@ result = DSA.indexer_top_k_wrapper(
 indices, values = result["indices"], result["values"]
 ```
 
+The PyTorch wrapper accepts keyword-only `starts`, an optional INT32 vector of
+length `n_rows` on the scores device. Row `r` selects from
+`[starts[r], effective_end[r])` and returns column ids relative to the original
+score row. Bounds are in `[0, num_cols]`; an end at or below the start
+produces an empty row. The valid ids and matching values precede the
+`-1` / `-inf` padding. Omitting `starts` uses zero for every row.
+
 `IndexerTopK` owns no device memory. `execute(input_values, seq_lens,
-out_indices, out_values=None, current_stream=None, workspace=None)` writes into
+current_stream=None, *, out_indices, out_values=None, workspace=None, starts=None)` writes into
 caller-owned outputs: `out_indices` is `(n_rows, top_k)` INT32 and `out_values`
 is `(n_rows, top_k)` in the input dtype, both contiguous and on `input_values`'
 device. `out_values` is required when the object was built with
@@ -1228,6 +1235,8 @@ device. `out_values` is required when the object was built with
 `workspace`, a CUDA `uint8` tensor of at least `scratch_workspace_bytes()` bytes
 (`n_rows * (2 for FP32, else 1) * num_cols * 4`, rounded up to 128) that is
 32-byte aligned; an absent or undersized workspace raises before launch.
+Build the plan with `has_starts=True` to bind a contiguous `starts` tensor at
+execution. Its contents may change between CUDA Graph replays.
 The writable `out_indices`, optional `out_values`, and carved scratch byte
 ranges must not overlap one another or the read-only inputs. Disjoint views of
 the same backing allocation are valid. The class API also requires a 32-byte

@@ -59,7 +59,7 @@ def _tensor_byte_span(tensor: Optional[torch.Tensor]) -> Optional[Tuple[int, int
 
 
 def _check_no_write_overlap(
-    read_only: Tuple[Tuple[str, torch.Tensor], ...],
+    read_only: Tuple[Tuple[str, Optional[torch.Tensor]], ...],
     writable: Tuple[Tuple[str, Optional[torch.Tensor]], ...],
 ) -> None:
     """Reject overlapping writable ranges while allowing disjoint storage views."""
@@ -108,6 +108,11 @@ class IndexerTopK(APIBase):
     ``seq_lens[b] - next_n + (task_id % next_n) + 1`` (i.e. the first row in
     a group sees the shortest prefix, the last row sees the full
     ``seq_lens[b]``).
+
+    With ``has_starts=True``, each row selects from ``[starts[row], effective_end)``
+    in original score-column coordinates. Bind one contiguous CUDA INT32 start
+    per input row on the input device, in ``[0, num_cols]``. An end at or below
+    the start gives an empty row. The default lower bound is zero.
 
     Use cases:
 
@@ -163,6 +168,8 @@ class IndexerTopK(APIBase):
         num_copy_bits: int = 256,
         tie_break: int = 0,
         deterministic: bool = False,
+        *,
+        has_starts: bool = False,
     ):
         """Create a plan from sample tensor metadata and immutable options.
 
@@ -182,6 +189,7 @@ class IndexerTopK(APIBase):
         self._scratch_bytes = None
         self.tie_break = tie_break
         self.deterministic = bool(deterministic)
+        self.has_starts = bool(has_starts)
 
     def check_support(self) -> bool:
         """Validate the plan-time tensor signature, shape domain, and device."""
@@ -273,6 +281,7 @@ class IndexerTopK(APIBase):
                 num_copy_bits=self.num_copy_bits,
                 tie_break=self.tie_break,
                 deterministic=self.deterministic,
+                has_starts=self.has_starts,
             )
 
     def execute(
@@ -284,6 +293,7 @@ class IndexerTopK(APIBase):
         out_indices: torch.Tensor,
         out_values: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
+        starts: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Launch into the caller's ``out_indices`` / ``out_values``; returns them.
 
@@ -291,8 +301,9 @@ class IndexerTopK(APIBase):
         and must be ``None`` otherwise. ``workspace`` is a CUDA uint8 tensor of at
         least :meth:`scratch_workspace_bytes` bytes on ``input_values``' device.
         After compilation/warmup, calls with stable tensor addresses are safe to
-        capture and replay in a CUDA Graph; replay reads current input and length
-        contents and writes the caller-owned outputs.
+        capture and replay in a CUDA Graph; replay reads the current scores, lengths,
+        and optional starts and writes the caller-owned outputs.
+        Bind ``starts`` exactly when the plan was built with ``has_starts=True``.
         """
         self._logger.debug("Entering execute")
         self._ensure_support_checked()
@@ -305,6 +316,10 @@ class IndexerTopK(APIBase):
             f"input_values must be {_kernel_module().INPUT_ALIGN}-byte aligned; got data_ptr=0x{input_values.data_ptr():x}",
         )
         _check_execute_tensor(seq_lens, "seq_lens", self.seq_lens_desc.shape, torch.int32, device)
+        if self.has_starts:
+            _check_execute_tensor(starts, "starts", (n_rows,), torch.int32, device)
+        elif starts is not None:
+            raise ValueError("starts requires a plan built with has_starts=True")
         _check_execute_tensor(out_indices, "out_indices", (n_rows, self.top_k), torch.int32, device)
         if self.return_val:
             self._value_error_if(out_values is None, "out_values is required: this IndexerTopK was built with return_val=True")
@@ -322,7 +337,7 @@ class IndexerTopK(APIBase):
             f"IndexerTopK workspace must be {kernel_module.BUFFER_ALIGN}-byte aligned; got data_ptr=0x{buffer.data_ptr():x}",
         )
         _check_no_write_overlap(
-            (("input_values", input_values), ("seq_lens", seq_lens)),
+            (("input_values", input_values), ("seq_lens", seq_lens), ("starts", starts)),
             (("out_indices", out_indices), ("out_values", out_values), ("workspace scratch", buffer)),
         )
 
@@ -332,12 +347,12 @@ class IndexerTopK(APIBase):
         # The compiled kernel launches on the TVM-FFI environment stream, i.e.
         # torch's current stream: enter the caller's stream so it is honored.
         with _torch_stream_context(current_stream, device):
-            kernel_module.launch_topk_kernel(self._compiled_kernel, input_values, seq_lens, out_indices, out_values, buffer, self.next_n)
+            kernel_module.launch_topk_kernel(self._compiled_kernel, input_values, seq_lens, out_indices, out_values, buffer, self.next_n, starts=starts)
 
         # TVM-FFI launches are invisible to the caching allocator: record every
         # tensor the kernel touches on the launch stream (R1).
         consumer = launch_stream(current_stream, device)
-        for tensor in (input_values, seq_lens, out_indices, out_values, workspace):
+        for tensor in (input_values, seq_lens, starts, out_indices, out_values, workspace):
             if tensor is not None:
                 tensor.record_stream(consumer)
         return out_indices, out_values
@@ -356,6 +371,8 @@ def indexer_top_k_wrapper(
     stream: Optional[cuda.CUstream] = None,
     tie_break: int = 0,
     deterministic: bool = False,
+    *,
+    starts: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """High-level wrapper returning ``{'indices', 'values'}``.
 
@@ -366,6 +383,12 @@ def indexer_top_k_wrapper(
     For "independent top-K over every row" set ``next_n=1`` and make
     ``seq_lens`` a length-``n_rows`` tensor. See :class:`IndexerTopK` for
     full details.
+
+    Optional ``starts`` is an INT32 vector of shape ``(n_rows,)`` on the input
+    device (strided views are staged). Each entry in ``[0, num_cols]`` is the
+    inclusive lower bound for that row; the upper bound retains the ``next_n``
+    stagger. Indices refer to the original score columns. Empty or short
+    intervals have a valid prefix followed by ``-1`` indices and ``-inf`` values.
 
     ``values`` is ``None`` when ``return_val=False``. The outputs and the
     :meth:`IndexerTopK.scratch_workspace_bytes` workspace are allocated here
@@ -389,6 +412,11 @@ def indexer_top_k_wrapper(
     if input_values.device != seq_lens.device:
         raise ValueError(f"seq_lens must be on {input_values.device}, got {seq_lens.device}")
 
+    if starts is not None:
+        if starts.shape != (input_values.size(0),) or starts.dtype != torch.int32 or starts.device != input_values.device:
+            raise ValueError("starts must be an int32 tensor of shape (n_rows,) on the input device")
+        starts = contiguous_on_stream(starts, stream, starts.device)
+
     # R1 staging: the originals are record_stream'ed on `stream` before they are rebound.
     input_values = _aligned_contiguous_on_stream(input_values, stream, _kernel_module().INPUT_ALIGN)
     seq_lens = contiguous_on_stream(seq_lens, stream, seq_lens.device)
@@ -404,6 +432,7 @@ def indexer_top_k_wrapper(
         int(num_copy_bits),
         tie_break,
         bool(deterministic),
+        starts is not None,
     )
     obj = _cache_of_IndexerTopKObjects.get(cache_key)
     if obj is None:
@@ -416,6 +445,7 @@ def indexer_top_k_wrapper(
             num_copy_bits=num_copy_bits,
             tie_break=tie_break,
             deterministic=deterministic,
+            has_starts=starts is not None,
         )
         assert obj.check_support()
         obj.compile()
@@ -428,7 +458,7 @@ def indexer_top_k_wrapper(
         indices = torch.empty(n_rows, top_k, dtype=torch.int32, device=device)
         values = torch.empty(n_rows, top_k, dtype=input_values.dtype, device=device) if return_val else None
         workspace = torch.empty(obj.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
-        obj.execute(input_values, seq_lens, out_indices=indices, out_values=values, current_stream=stream, workspace=workspace)
+        obj.execute(input_values, seq_lens, out_indices=indices, out_values=values, current_stream=stream, workspace=workspace, starts=starts)
     return TupleDict(indices=indices, values=values)
 
 
