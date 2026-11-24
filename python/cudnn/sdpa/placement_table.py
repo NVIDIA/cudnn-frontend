@@ -1639,8 +1639,12 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "mtp", "dense", "causal_br", False, "gqa", True): Entry("always", None, "sm90_decode_20261112"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "mtp", "paged", "causal_br", False, "gqa", False): Entry("always", None, "sm90_decode_20261112"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm90_decode_20261112"),
-    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 27.001, "sm90_decode_20261112"),
-    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("ge", 2.0, "sm90_decode_20261112", "tiles"),
+    # study sm90_q1_decode_resplit_20261124 (H200, under the SM90 decode split constants): paged d256 single-row decode leads from
+    # 2^24.503 cost on the tile, and off it from 2^24.004 cost with at least 2^1.5 parallel tiles.
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 24.503, "sm90_q1_decode_resplit_20261124"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry(
+        "ge", 24.004, "sm90_q1_decode_resplit_20261124", "cost", ("ge", 1.5, "tiles")
+    ),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "verify", "dense", "causal_br", False, "gqa", False): Entry("always", None, "sm90_decode_20261112"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "verify", "dense", "causal_br", False, "gqa", True): Entry("always", None, "sm90_decode_20261112"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (256, 256), "verify", "paged", "causal_br", False, "gqa", False): Entry("always", None, "sm90_decode_20261112"),

@@ -2165,6 +2165,27 @@ def test_sm90_decode_gaps_follow_their_study(s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm90_paged_d256_single_row_decode_follows_its_resplit_study(s_kv):
+    """sm90_q1_decode_resplit_20261124 (H200, under the SM90 decode split constants): paged d256 single-row decode, packed whole, leads
+    from 2^24.503 cost on the tile and from 2^24.004 cost with at least 2^1.5 parallel tiles off it. The qwen3.5 one-KV-head rows (b 1
+    over 128k keys, cost 2^27) sit just under the earlier on-tile floor (2^27.001) and now lead; short caches keep the backend."""
+    row = "sdpa_fwd_prefill_sm90"
+    on_tile = s_kv % 128 == 0
+
+    def f(**over):
+        base = dict(b=1, h_q=8, h_kv=1, s_q=1, s_kv=s_kv, d_qk=256, d_v=256, causal=False, bottom_right=False)
+        base.update(device_cc=(9, 0), page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, f()).study == "sm90_q1_decode_resplit_20261124"
+    assert pt.lookup(row, f()) is on_tile  # one parallel tile: off the tile it needs 2^1.5
+    assert pt.lookup(row, f(b=4)) is True
+    assert pt.lookup(row, f(s_kv=1024 + s_kv % 2)) is False
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [32768, 32769], ids=["on_tile", "off_tile"])
 def test_sm90_dense_d256_single_row_decode_keys_partial_packs_apart(s_kv):
     """Study sm90_dense_d256_q1_fullpack_h100_20261118 (H100): whole-group packs lead once the decode carries enough work (FROST 0.81-0.83
