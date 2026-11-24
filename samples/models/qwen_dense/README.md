@@ -13,14 +13,14 @@ global scale). Area rules, the helper layer and the words a run uses: [../README
 | `02_speculative_decode.py` | speculative decoding with the checkpoint's drafter, one request in one process: the prompt through decode steps, then per step the drafter's passes on reference blocks, one verify step and one host read; on the reduced seeded model self-checking against decode steps of the same tokens, with `--model` text out and the tokens a step kept | the section "Speculative decoding" |
 
 ```bash
-python samples/models/qwen_dense/00_decode.py                          # 2 layers, 1 and 4 sequences, 32 tokens each
+python samples/models/qwen_dense/00_decode.py                          # the stack native: 2 layers, 1 and 4 sequences, 32 tokens each, the step recorded and replayed
 python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
+python samples/models/qwen_dense/00_decode.py --no-capture             # the same stack, every block launched from Python
+python samples/models/qwen_dense/00_decode.py --stack fe-entries       # a functional-validation stack: no package beyond cuDNN Frontend and PyTorch
 python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: RAN, never PASS
-python samples/models/qwen_dense/00_decode.py --check-kernels          # also: every launch of the traced steps against the plan
-python samples/models/qwen_dense/00_decode.py --stack native           # every block on a kernel that works on the stored weights
 
-# A checkpoint is your own download: the sample fetches nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
-# with about 57 GiB free (about 60 GiB on 12.x); about two and a half minutes for the first run below ("A checkpoint from local disk" has the details).
+# A checkpoint is your own download: the sample fetches nothing. 22 GB of disk; a GPU of compute capability 10.x with
+# about 28 GiB free on 10.0 and about 32 GiB on the other 10.x classes ("A checkpoint from local disk" has the details).
 pip install -r samples/models/requirements.txt                         # tokenizers, jinja2, safetensors; brings the hf command
 hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-tokens 256
@@ -241,6 +241,14 @@ hub; an automatic choice of the stack.
 
 ## What the default run is
 
+A run that names no stack is a run of the stack `native` ("The stack `native`: every block on a kernel" below): every
+block of a decode step on a kernel entry of cuDNN Frontend or on a call of FlashInfer, on the stored weights, and the
+step recorded once as a launch sequence and replayed for every token ("The recorded step" below). That holds with a
+checkpoint and without one. A package the stack calls that is not installed stops the run before anything is loaded:
+one `[00] ERROR` line that names the package and the command that installs it, exit code 1. No other stack takes its
+place: the stacks `fe-entries`, `fe-cublas` and `reference` are for functional validation and run only where `--stack`
+names one.
+
 The reduced model keeps every layer width and reduces what the run prints as reductions: 2 of 64 layers (one linear-attention
 and one attention layer), a vocabulary of 15,520 ids, seeded weights and a synthetic byte-level tokenizer. The weights are drawn
 on the CPU generator and stored in the model's three formats, so the 8-bit and 4-bit paths are exercised. Two properties of
@@ -249,11 +257,66 @@ of the unit scale, and the output head is a seeded permutation of the embedding 
 decidable by a wide margin, and it means the produced ids are a walk through that permutation: with seeded weights the layers
 move the logits, not the choice. The layers are verified block by block.
 
-The stack `fe-cublas` is a reference path, not a fast path. The linear-attention step runs on cuDNN Frontend's fused kernel;
+The stack `fe-cublas` is a functional-validation stack, not a fast path, taken by `--stack fe-cublas` alone. The
+linear-attention step runs on cuDNN Frontend's fused kernel;
 every multiply runs on cuBLAS over a bf16 copy of the quantised weights, which moves 2 bytes per weight element where the
 stored formats hold 1 or 0.56; the rest runs in PyTorch; and every launch is issued from Python, one block after the other.
-It exists to prove the loader, the loop, the state handling and the tie-out, and it is the correctness oracle of the stacks
-that follow. Its timings are for orientation only.
+It exists to prove the loader, the loop, the state handling and the tie-out, and it is the correctness oracle of the
+stack `native`. So is `fe-entries`, the cuDNN Frontend rows of `native` with every other block on a fallback row, and
+`reference`, every block in PyTorch. A run of one of them says so in one line behind its load (`launched from Python:
+fe-cublas is a functional-validation stack, taken by --stack alone ...`). Their timings are for orientation only.
+
+### The recorded step
+
+On the stack `native` the plain decode records its step once and replays it. The load ends in a stage of its own,
+`capture`: one pass of the step's Python on PyTorch's capture stream, in which every launch of the step is recorded and
+none runs -- every block's launch, the token choice, a copy of the chosen ids into the buffer the lookup reads, and
+the adds that move the position rows on. From then on a token is one launch of that sequence and one host read of
+4 bytes per sequence: no Python runs between two blocks. `--no-capture` launches every block from Python instead:
+the same kernels, the same tokens.
+
+What a recorded launch keeps is the address of every operand, so nothing a step reads may be selected by a host
+integer. The token a step is fed and the rows of the position it stands at -- the position rows and slots the
+attention preparation reads, the lengths the attention core reads -- stand at fixed addresses, set from the state's
+tables and moved on in place by the step's own last launches. Four things a step launched from Python has for free
+are code in front of every replay: the capacity test (a replay past the capacity is refused and launches nothing),
+the ids the loop hands over (copied into the buffer unless they are what the last replay chose), the position rows
+(one host integer says where they stand, and they are set again where it is not the state's position), and the
+state (a sequence replays on the state it was recorded on, and a fresh state gets a sequence of its own at its
+first replay).
+
+Whether a step can be recorded is the plan's data, decided before anything is loaded: every block of the plan says
+whether a recorded sequence can hold its calls -- an adapter to an entry or to a library call, the lookup and the
+token choice can; a reference chain and a multiply over a copy cannot, because they form a table or a scalar on the
+host per call or shape their launches by the position -- and only the plain decode step is recorded: one token per
+sequence, no draft tokens, no drafter. A run prints exactly one line behind each load: `step recorded: ...`, with what
+the recorded sequence holds, or `launched from Python: ...` with the reason -- a functional-validation stack,
+`--no-capture`, a block of the plan on a fallback row, a step of speculative decoding, or a recording this
+installation declined (the session is then left as it was, PyTorch's current stream put back, and the run goes on
+from Python). The count of the first line is the CUDA runtime's where the installation states what the sequence
+holds, and is then held against the plan kernel by kernel; elsewhere it is the plan's count, and worded so.
+
+A replayed step is held to the same step launched from Python. The record of a run holds the ids the loop handed to
+every step, and the checks launch those steps again from Python from a fresh state: ids and logits, byte for byte
+(`recorded step`; with a checkpoint from position 0 through the first eight steps that feed on their own token and
+across the first page boundary of the attention cache; the seeded run, every step). Behind the request the run reads
+the step's own tail, which no recomputation sees: the ids buffer holds the last chosen ids and the position rows
+stand where the request left the state. Under the kernel check a line holds two replayed steps of the traced pass to
+the same steps launched from Python: the same kernels and copies, in their order and launch shapes, and behind them
+the copy of the chosen ids and the position updates. A recorded step that does not compute what the steps launched
+from Python compute is a failed check and a failed run, never a fall-back. The report prints the GPU-busy time of
+both forms under the profiler, each with its launches, and states nothing about what bounds a step.
+
+What a recorded sequence keeps: the tensors of the recorded pass stay in a pool of the sequence's own for as long as
+it lives, in whole blocks of PyTorch's allocator. The memory sentence counts it (`QwenDense.recorded_step_bytes`: one
+block of 2 MiB, and for the logits of a step a block of 20 MiB from 1 MiB on): 2 MiB at 1 sequence of the published
+model and 22 MiB at 4 and at 8, 2 MiB at 1, 4 and 8 sequences of the two-layer model -- what PyTorch's reservation
+grew by in runs at each of those counts on compute capability 10.0 (2026-11-24). It is an allowance from those runs:
+at more sequences the activations of a step are not counted, and a run prints what its recordings took beside what
+its plan counted (`recorded step, memory in a pool of its own`).
+
+No CI lane of this repository runs a recorded step: the stack calls a library that the runners do not have. The cells
+of the GPU test that hold it run where the library is installed.
 
 ## The stack `native`: every block on a kernel
 
@@ -430,7 +493,7 @@ as not run on a device: on those classes a cell of this sample is its first run.
 The kernel rounds at other points than the reference chain: its norm is fp32 arithmetic with an approximate root and
 one rounding to bf16, and a rotated value is rounded once where the chain rounds it three times. Its band is therefore
 the entry's own contract against a twin at the kernel's rounding points ("The checks of a run" below), and its bytes
-are not the chain's: on the seeded model the ids hash is the default stack's, and a greedy run on a checkpoint follows
+are not the chain's: on the seeded model the ids hash is the stack `fe-cublas`'s, and a greedy run on a checkpoint follows
 its first other token.
 
 What ran with this row (2026-11-20; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `fe-entries` in
@@ -517,8 +580,9 @@ place, with the kernel the library launched printed on the line of its row. For 
 all of it holds per call site. A
 difference fails the run with a sentence that names the block, and for a form the call and its site.
 
-**What this stack is not, today.** It is not a fast path: it issues every launch from Python, and no launch
-sequence of it is captured. And where a neighbour is on a fallback row a kernel's launch knobs change nothing: the
+**What this stack is not, today.** Its step is recorded and replayed on compute capability 10.0 alone, the class on
+which every block of it is a kernel: where a block is on a fallback row the step is launched from Python, and the run
+says so. And where a neighbour is on a fallback row a kernel's launch knobs change nothing: the
 fused step, the norm, the in-projection and the quantise of the head's operand wait for the launch before them and
 release the launch after them, the
 fused gate / up step waits for the launch before it, the
@@ -561,7 +625,7 @@ Three blocks of the stack are multiplies of a library on the stored weights, and
 for the output head (the same call on the vocabulary's weight), and `flashinfer.bmm_fp8` for the out-projection (in a verify step behind the projection entry's
 rows, which keep the linear-attention layers' call). A fourth is the attention core, `flashinfer.decode_attention`: the
 library's paged decode attention over the pool of pages the attention preparation writes ("The attention core on the
-library" below). FlashInfer is an optional package of this stack alone. It is
+library" below). FlashInfer is a package of this stack alone: the sample's own stack calls it, the `nvidia-cudnn-frontend` package does not depend on it. It is
 imported inside the adapters of the rows that call it, on a device; no other stack and no plan on stated device facts
 imports it. Such a plan is made through the helper layer (`model_samples.blocks.plan` with a `DeviceFacts` of your
 own; the script has no flag for it) and shows these rows without the package -- as `unverified in CI`, because no
@@ -581,10 +645,12 @@ environment that has another PyTorch the line replaces it, and its cuDNN with it
 place for `native`. FlashInfer requires `nvidia-cudnn-frontend` itself; run `pip install -e .` again if pip lists
 that package among what it installed. The adapters hold the version of FlashInfer alone, to a validated one
 (`VALIDATED` in
-`model_samples/providers/flashinfer_calls.py`). Without either package, or with another version of one, `--stack native`
-on compute capability 10.x ends in `[00] SKIP` before anything is loaded, exit code 0; the line names what is missing,
-its command above and `--stack fe-entries`, which runs the cuDNN Frontend rows of the stack without them. On
-compute capability 12.x no row of the library serves, and the stack runs without the package.
+`model_samples/providers/flashinfer_calls.py`). Without either package a run on compute capability 10.x stops before
+anything is loaded: `[00] ERROR the stack native cannot run:` and one sentence that names the package that is
+missing, its command above and `--stack fe-entries`, the functional-validation stack that runs the cuDNN Frontend rows
+without them; exit code 1, and no other stack takes the place of the sample's own. With the packages installed and
+with another version of one it ends in `[00] SKIP` before anything is loaded, exit code 0, by a sentence that names the
+version. On compute capability 12.x no row of the library serves, and the stack runs without the package.
 
 The 4-bit multiply is held exactly. The library picks the kernel of a call itself, by the shape and the GPU -- one of
 two kernel classes, in a grid of its own choice -- and that pick is a function of the call as long as nothing has
@@ -805,9 +871,9 @@ copies made on demand. From 33 sequences the in-projections have their copies, a
 
 | run | result |
 |---|---|
-| the default run with the library rows, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 118 kernel launches and 4 copies; 17 are judged one by one: the ten launches of the cuDNN Frontend entries in the launch shape their entries state, the gather and the library's launches by name -- the two down multiplies in the library's kernel class `Sm100BlockScaledSplitKGemmKernel`, grid (40, 1, 2), block (192, 1, 1), 231,424 B of shared memory. The three library rows were inside the band of the reference multiply: the out-projection and the down multiply over 114 calls each, the largest distance one bf16 unit on fewer than 0.05 % of the elements; the output head over 57 calls, every element equal. The kernel the library chose for the out-projection was its own CUTLASS multiply at both call sites. The run kept all 9 weights of its multiplies on their stored format alone, and at 1 sequence the reference read 1,035 copies made on demand |
+| the default run with the library rows, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the stack `fe-cublas`. A traced step of the two-layer model is 118 kernel launches and 4 copies; 17 are judged one by one: the ten launches of the cuDNN Frontend entries in the launch shape their entries state, the gather and the library's launches by name -- the two down multiplies in the library's kernel class `Sm100BlockScaledSplitKGemmKernel`, grid (40, 1, 2), block (192, 1, 1), 231,424 B of shared memory. The three library rows were inside the band of the reference multiply: the out-projection and the down multiply over 114 calls each, the largest distance one bf16 unit on fewer than 0.05 % of the elements; the output head over 57 calls, every element equal. The kernel the library chose for the out-projection was its own CUTLASS multiply at both call sites. The run kept all 9 weights of its multiplies on their stored format alone, and at 1 sequence the reference read 1,035 copies made on demand |
 | the checkpoint with the library rows, `--stack native`, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 451 launches of every one of the 32 traced steps on exact rows, in the wiring order; the library launched the 64 down multiplies in its split-K kernel class and the output head in its persistent one, grid (1, 1, 148). 1,422 kernel launches and 5 copies per traced step in all. Replay held; 8 of 8 provider blocks inside their bands; the 257 weights held the bytes of their load before and after the checks, and the reference read 12,850 copies made on demand, the largest 2.37 GiB; the token line reported. The memory lines are in the section on checkpoints |
-| the default run, `--stack native` on 2026-11-17 | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 179 kernel launches and 13 copies (303 and 25 with the gate / up block on its fallback row); 12 are judged one by one.  The norm entry was inside its band in the four forms this model calls -- over 285 calls at 1 sequence 583,680 normed elements, 4 of them on the other bf16 value around the normalised value, and 1,203,840 codes and block scales, each that of the nearest value; nothing outside -- and equal alone and among 4. The projection entry was inside the band of the reference multiply at both weight shapes (114 calls; the largest distance one bf16 unit, on fewer than 0.05 % of the elements, where the multiply over a copy it replaces is one unit off on 25.9 %), and equal alone and among 4. The fused gate / up entry was inside its band over 114 calls: at 1 sequence 124,032 block scales, each the byte of the fp64 chain, and 1,984,512 codes, 1,927 of them another code than the fp64 chain's, the farthest at 89 % of its bound; at 4 sequences 7,758 of 7,938,048 codes; nothing outside, and equal alone and among 4. The gate entry was inside its band (350,208 bytes at 1 sequence, each the code of the nearest bf16 value; 1,400,832 at 4, one of them the code of the other value around the gated value, inside the margin), and equal alone and among 4. At each count the reference read 460 copies of in-projection and gate / up weights made on demand (four per step and reader, 0.33 GiB the larger), and the four weights held the bytes of their load before and after the checks (`stored weights`) |
+| the default run, `--stack native` on 2026-11-17 | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the stack `fe-cublas`. A traced step of the two-layer model is 179 kernel launches and 13 copies (303 and 25 with the gate / up block on its fallback row); 12 are judged one by one.  The norm entry was inside its band in the four forms this model calls -- over 285 calls at 1 sequence 583,680 normed elements, 4 of them on the other bf16 value around the normalised value, and 1,203,840 codes and block scales, each that of the nearest value; nothing outside -- and equal alone and among 4. The projection entry was inside the band of the reference multiply at both weight shapes (114 calls; the largest distance one bf16 unit, on fewer than 0.05 % of the elements, where the multiply over a copy it replaces is one unit off on 25.9 %), and equal alone and among 4. The fused gate / up entry was inside its band over 114 calls: at 1 sequence 124,032 block scales, each the byte of the fp64 chain, and 1,984,512 codes, 1,927 of them another code than the fp64 chain's, the farthest at 89 % of its bound; at 4 sequences 7,758 of 7,938,048 codes; nothing outside, and equal alone and among 4. The gate entry was inside its band (350,208 bytes at 1 sequence, each the code of the nearest bf16 value; 1,400,832 at 4, one of them the code of the other value around the gated value, inside the margin), and equal alone and among 4. At each count the reference read 460 copies of in-projection and gate / up weights made on demand (four per step and reader, 0.33 GiB the larger), and the four weights held the bytes of their load before and after the checks (`stored weights`) |
 | the four-layer model, `--stack native --layers 4 --sequences 1` | `[00] PASS`: all five forms a 64-layer model calls (the input norm of a later linear-attention layer is the fifth), four in-projections, three at 16384 x 5120 from one instance and one at 14336 x 5120 from the other, and four gate / up calls; 22 launches of a step judged one by one, each entry's in the launch shape the entry states. Its memory sentence asked for about 4.4 GiB; PyTorch reserved 4.4 GiB and the device grew by 4.6 GiB -- on the reduced models the sentence is an estimate (the last section has the runs) |
 | the one-layer model, `--stack native --layers 1 --sequences 1` | `[00] PASS`: the sixth form, `full_attention.first` -- the model is one attention layer, so the first norm of a step is its input norm. 7 launches of a step judged one by one (the gather, three norm calls, the in-projection at the attention layer's weight shape, the gate / up call and the gate), each entry's in the launch shape the entry states; the three norm calls served by three instances, and the symbol of the first carries its form (`store`, `e4m3_static`, wait + release). The norm entry inside its band over 171 calls: 291,840 normed elements, 4 of them on the other bf16 value around the normalised value, and 601,920 codes and block scales, all those of the nearest value; the projection entry inside its band over 57 calls; the gate / up entry inside its band over 57 calls |
 | the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 322 launches of every one of the 32 traced steps on exact rows, in the wiring order, each entry's in the launch shape the entry states; 2,908 kernel launches and 200 copies per traced step in all (6,876 and 584 with the gate / up block on its fallback row). The call log of a step: the five forms of the norm entry served 1, 47, 16, 64 and 1 calls, each from its own instance, and the two instances of the projection entry 48 and 16. Replay held; 8 of 8 provider blocks inside their bands; the norm entry over 2,064 calls with 4,014,080 normed elements, 40 of them on the other bf16 value, and 10,813,440 codes and block scales, 3 of them not those of the nearest value, nothing outside; the projection entry over 1,024 calls, the largest distance one bf16 unit on fewer than 0.05 % of the elements; the fused gate / up entry over 1,024 calls with 1,114,112 block scales, each the byte of the fp64 chain, and 17,825,792 codes, 12,528 of them another code than the fp64 chain's, the farthest at 96 % of its bound, nothing outside; the gate entry over 256 calls with 1 of its 1,572,864 bytes the code of the other bf16 value around the gated value, inside the margin; the token line reported. The reference read 6,400 copies of in-projection and gate / up weights made on demand, and the 128 weights held the bytes of their load before and after the checks; the memory lines are in the section on checkpoints |
@@ -1734,8 +1800,8 @@ kernel check and the coverage line of such a session are about its verify
 steps: the decode steps of its prompt are replayed in front of the traced window and their kernels are not observed,
 which the run says beside its kernel verdict; what they launch was compared with a plain session's step in the runs
 above, by the driver of those runs. In `fe-entries`, the attention core, the attention
-layers' out-projection and the MLP's down multiply, which `native` runs on the library's kernels. A captured verify
-step. A verify step of more than eight tokens per sequence, of more than 16 sequences, or of more than 4 at six tokens
+layers' out-projection and the MLP's down multiply, which `native` runs on the library's kernels. A recorded verify
+step: only the plain decode step is recorded and replayed. A verify step of more than eight tokens per sequence, of more than 16 sequences, or of more than 4 at six tokens
 and more: declined by name. The verify step
 has run on compute capability 10.0 only; every other class is uncovered, not passing -- the rows of the
 out-projection on compute capability 10.3 and 10.7 among them.
@@ -1750,19 +1816,19 @@ checkpoint's drafter", every block of it a reference chain in every stack but it
 `Session.speculate` of the section "The verify step". The loop itself is in the script.
 
 ```bash
-python samples/models/qwen_dense/02_speculative_decode.py                  # 2 layers, seeded weights, a seeded drafter: self-checking
-python samples/models/qwen_dense/02_speculative_decode.py --stack native   # the verify step and the prompt's decode steps on the stack's kernels
+python samples/models/qwen_dense/02_speculative_decode.py                      # the stack native: 2 layers, seeded weights, a seeded drafter: self-checking
+python samples/models/qwen_dense/02_speculative_decode.py --stack fe-entries   # a functional-validation stack: no package beyond cuDNN Frontend and PyTorch
 
 # with a checkpoint: the packages and the download of the first command block of this page, and a draft vocabulary
-python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native \
+python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-27B-NVFP4 \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}' \
     --draft-vocab draft_vocab.json --messages request.json --max-tokens 256 > answer.txt
 ```
 
 | you need | |
 |---|---|
-| for the default run | this checkout and a GPU of compute capability 10.x or 12.x: no checkpoint, no extra package |
-| for `--stack native` on compute capability 10.x | also FlashInfer at a validated version (the section "The rows a library serves"): the verify step and the decode steps call its multiplies on the stored weights. Without it the run ends in `[02] SKIP` before anything is loaded, exit code 0; `--stack fe-entries` runs the cuDNN Frontend rows without the package |
+| for the default run | this checkout and a GPU of compute capability 10.x or 12.x: no checkpoint. The stack is `native`, as for `00_decode.py` |
+| for the stack `native` on compute capability 10.x | FlashInfer at a validated version (the section "The rows a library serves"): the verify step and the decode steps call its multiplies on the stored weights. Without it the run stops before anything is loaded with `[02] ERROR the stack native cannot run:` and the package's name, exit code 1; `--stack fe-entries`, a functional-validation stack, runs the cuDNN Frontend rows without the package |
 | with `--model` | the packages of `samples/models/requirements.txt`, the checkpoint on local disk (22 GB), and a draft vocabulary: a JSON list of token ids, `--draft-vocab FILE`. The recipe of the section "The checkpoint's drafter" makes one from the files `--dump-tokens` writes, of this script or of `00_decode.py`. Without a list the run ends in one `ERROR` line that names that recipe |
 | GPU memory with the 27B checkpoint | with a list of 65,536 ids and the default context length a run asks for about 61 GiB free on the stack `fe-cublas` (about 64 GiB on compute capability 12.x); on the stack `fe-entries` for about 44 GiB on compute capability 10.0, about 48 GiB on the other 10.x classes and about 64 GiB elsewhere; on the stack `native`, whose library rows need FlashInfer and its kernel-binary package (the section "The rows a library serves"), for about 33 GiB and about 37 GiB there. That is the model as `00_decode.py` holds it, a state of six tokens per sequence, and the drafter with the bf16 copies its reference blocks multiply on. These are arithmetic on stated facts; the runs at the end of this section measured compute capability 10.0 |
 
@@ -1896,7 +1962,7 @@ of the table above passed, `acceptance` with 10 of 10 steps on their scheduled c
 and was reported on the other three. On `native` and `fe-entries` the kernel check passed over 10 traced steps, with
 13 of the 20 block calls of the verify step on kernels. On `native`, three drafted tokens (`"num_speculative_tokens": 3`) passed in 13 steps; eight ended in `[02] SKIP cudnn.GdnVerifyFused serves 8 tokens per
 sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per sequence` before anything was loaded. The
-four-layer model (`--layers 4`, on the default stack) passed. The memory sentence of the default run asked for about
+four-layer model (`--layers 4`, on the stack `fe-cublas`) passed. The memory sentence of the default run asked for about
 6.3 GiB on `fe-cublas` and `reference` and about 6.1 GiB on `native` and `fe-entries`; PyTorch reserved between 3.8
 and 4.6 GiB in the four runs, and the device grew by about 0.2 GiB more in each.
 
@@ -1923,7 +1989,7 @@ published checkpoint; cuDNN Frontend
 1.34.0, CuTe DSL 4.8.0, PyTorch 2.13.0; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native`
 selected those rows then, as `fe-entries` does today without the attention preparation's row; the third command of this
 section as it is
-written, and once more on the default stack `fe-cublas`: the default prompt as a chat request body with `max_tokens`
+written, and once more on the stack `fe-cublas`: the default prompt as a chat request body with `max_tokens`
 256, 58 tokens through the prompt, five drafted tokens, the draft vocabulary of this README's recipe with 65,536 ids).
 Both runs ended in `[02] PASS`, and both stopped at the end token. On `native` the loop wrote 204 new tokens in 63
 steps: 3.22 kept tokens a step (1 + 140 accepted drafted tokens / 63 steps); 14, 11, 11, 9, 10 and 8 steps kept one to
@@ -1955,7 +2021,7 @@ steps' on the same tokens, the first that differs kept token 17. The kernel chec
 sentence asked for about 32.2 GiB.
 
 **What is not here.** The drafter on kernels: every block of it but its embedding lookup is a reference chain. More than one request: `--sequences` is
-accepted at 1. A rate. A count or a position per sequence. A captured step. `--dump-census`. A text equal to the plain
+accepted at 1. A rate. A count or a position per sequence. A recorded step: every step of this script is launched from Python, and a run says so in one line. `--dump-census`. A text equal to the plain
 script's on a checkpoint. Any GPU class but compute capability 10.0: the script has run there only, and a class it has
 not run on is uncovered, not passing.
 
@@ -2019,7 +2085,7 @@ well: cuDNN Frontend 1; fallbacks 9 (cuBLAS over copies 4, PyTorch chains 5).
 
 | GPU classes | sequences | regime | note |
 |---|---|---|---|
-| any | 1 and more | launch-bound | every block of these stacks is launched from Python, one launch or more per block; no byte-bound form is declared, and the sequence count at which one would win is not measured on any class |
+| any | 1 and more | launch-bound | a step is one launch or more per block, issued from Python or replayed as one recorded sequence; no byte-bound form is declared, and the sequence count at which one would win is not measured on any class |
 
 ## The checks of a run
 
@@ -2186,7 +2252,7 @@ GPU class") -- and the checks print what the copies cost:
 ```
 
 A run in which every weight has its copy prints the memory sentence without that part and neither of the two lines:
-the default stack's output is what it was. Only the reference session of the checks makes copies per call: a session
+the output of the stack `fe-cublas` is what it was. Only the reference session of the checks makes copies per call: a session
 whose own steps are timed, traced or checked is refused such a maker when it is built.
 
 ## The kernel check
@@ -2236,7 +2302,7 @@ trace that cannot be exported or read, records without launch arguments), the li
 and the run ends in `[00] RAN fe-cublas stack (kernels not observed: <reason>)` with exit code 0: its other checks
 held, the one that was asked for observed nothing. The reason names no path. A failed check is `[00] FAIL` either way.
 
-The default run with `--check-kernels` was last run on compute capability 10.0 (2026-11-13, a 148-SM part, PyTorch
+The seeded run of the stack `fe-cublas` with `--check-kernels` was last run on compute capability 10.0 (2026-11-13, a 148-SM part, PyTorch
 2.13.0, CuTe DSL 4.8.0): `[00] PASS` at 1 and at 4 sequences, with the ids hash, the replay and the batch invariance of
 the run without the flag. A traced step of the two-layer model is 471 kernel launches and 40 copies there. Two are
 judged one by one: the gather, and the fused step, which the entry states and the profiler recorded as grid (96, 1, 1),
@@ -2381,7 +2447,7 @@ while the second one is reset. The comparison of a verify session with its decod
 section "The verify step"), nor are the records of the prompt of a session that verifies behind its prompt. And a
 context beyond about 2,000 positions at many sequences rests on the attention chain's term alone.
 Until 2026-11-21 the sentence counted the state alone and was short from about 33 rows of a step -- 33 sequences of a
-decode step, sequences x tokens per sequence of a verify step --, on every stack. At 64 sequences the default stack
+decode step, sequences x tokens per sequence of a verify step --, on every stack. At 64 sequences the stack `fe-cublas`
 asked for about 3.9 GiB, reserved
 6.6 GiB and grew the device by 6.8 GiB; the cuDNN Frontend rows (`fe-entries` today without the attention preparation's
 row) asked for about 3.8 GiB,

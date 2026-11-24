@@ -2114,9 +2114,10 @@ def test_the_speculative_scripts_flags_say_what_they_apply_to(tmp_path, monkeypa
     from model_samples import loop
 
     sample = _sample_on_the_cpu(monkeypatch, loads=False, script="02_speculative_decode.py")
-    assert sample.serving_options is serving_options and sample.TAG == "[02]" and sample.STACKS == loop.STACKS
+    assert sample.serving_options is serving_options and sample.TAG == "[02]" and set(sample.STACKS) == set(loop.STACKS)
+    assert sample.STACKS == (sample.SAMPLE_STACK, *sample.VALIDATION_STACKS) and sample.SAMPLE_STACK == "native", "the sample's stack first, the default"
     seeded = sample._arguments([])
-    assert (seeded.model, seeded.sequences, seeded.layers, seeded.force_tokens, seeded.stack) == (None, 1, 2, 32, "fe-cublas")
+    assert (seeded.model, seeded.sequences, seeded.layers, seeded.force_tokens, seeded.stack) == (None, 1, 2, 32, "native")
     assert (seeded.speculative_config, seeded.draft_vocab, seeded.max_new_tokens, seeded.max_model_len) == (None, None, 256, 2051)
     config = '{"method": "mtp", "num_speculative_tokens": 3, "use_local_argmax_reduction": true}'
     real = sample._arguments(["--model", "d", "--draft-vocab", "ids.json", "--speculative-config", config, "--max-tokens", "8", "--stack", "native"])
@@ -2540,7 +2541,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     commands = [shlex.split(line, comments=True) for line in block.splitlines() if line.startswith("python samples/models/qwen_dense/02_speculative_decode.py")]
     assert len(commands) == 3 and all(command[:2] == ["python", "samples/models/qwen_dense/02_speculative_decode.py"] for command in commands)
     default, native, real = (sample._arguments([word for word in command[2:] if word not in (">", "answer.txt")]) for command in commands)
-    assert (default.model, default.stack, native.stack, default.speculative_config) == (None, "fe-cublas", "native", None)
+    assert (default.model, default.stack, native.stack, default.speculative_config) == (None, "native", "fe-entries", None)
     assert (real.model, real.stack, real.draft_vocab, real.messages, real.max_new_tokens) == (
         "/data/Qwen3.8-27B-NVFP4",
         "native",
@@ -2642,7 +2643,8 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "A prompt of N tokens is N decode steps and N - 1 passes of the drafter before the first token; then every step is five draft passes and one "
         "verify step of six tokens, and keeps one to six of them.",
         "**What is not here.** The drafter on kernels: every block of it but its embedding lookup is a reference chain.",
-        "More than one request: `--sequences` is accepted at 1. A rate. A count or a position per sequence. A captured step. `--dump-census`.",
+        "More than one request: `--sequences` is accepted at 1. A rate. A count or a position per sequence. A recorded step: every step of this "
+        "script is launched from Python, and a run says so in one line. `--dump-census`.",
         "Any GPU class but compute capability 10.0: the script has run there only, and a class it has not run on is uncovered, not passing.",
     ):
         assert sentence in text, sentence
@@ -2668,9 +2670,10 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, "
         'the fifth in 10 of 17 -- the counts of the library loop on `native` in the section "The verify step".',
         "`tokens` was reported -- 39 of 45 kept tokens were the decode steps' on the same tokens, the first that differs kept token 17.",
-        '| for `--stack native` on compute capability 10.x | also FlashInfer at a validated version (the section "The rows a library serves"): the '
-        "verify step and the decode steps call its multiplies on the stored weights. Without it the run ends in `[02] SKIP` before anything is loaded, "
-        "exit code 0; `--stack fe-entries` runs the cuDNN Frontend rows without the package |",
+        '| for the stack `native` on compute capability 10.x | FlashInfer at a validated version (the section "The rows a library serves"): the '
+        "verify step and the decode steps call its multiplies on the stored weights. Without it the run stops before anything is loaded with "
+        "`[02] ERROR the stack native cannot run:` and the package's name, exit code 1; `--stack fe-entries`, a functional-validation stack, runs "
+        "the cuDNN Frontend rows without the package |",
         "so the tokens a checkpoint run writes are held by no line of that run: the loop that writes them is the one the default run proves.",
         "the stack `reference` serves any count (the seeded run as far as the new tokens its schedule needs fit the context length).",
         "a prompt of 26 tokens, then 32 new tokens in 10 steps scheduled to keep 0, 1, 2, 3, 4, 5, 0, 1, 2 and 3 drafted tokens -- ended in `[02] PASS` on "
@@ -2679,7 +2682,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "--sequences 1 --force-tokens 32 --stack native` printed), nothing was written to standard output, and every gated line of the table above "
         "passed, `acceptance` with 10 of 10 steps on their scheduled count. `bytes` passed on `reference` and was reported on the other three.",
         "eight ended in `[02] SKIP cudnn.GdnVerifyFused serves 8 tokens per sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per "
-        "sequence` before anything was loaded. The four-layer model (`--layers 4`, on the default stack) passed.",
+        "sequence` before anything was loaded. The four-layer model (`--layers 4`, on the stack `fe-cublas`) passed.",
         "asked for about 6.3 GiB on `fe-cublas` and `reference` and about 6.1 GiB on `native` and `fe-entries`; PyTorch reserved between 3.8 and 4.6 GiB "
         "in the four runs, and the device grew by about 0.2 GiB more in each.",
         "A drafted token written out where the verify step chose another failed `ids` alone; one drafted token kept beyond the compared count failed "

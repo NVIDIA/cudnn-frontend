@@ -37,6 +37,17 @@ pytestmark = [pytest.mark.L0]
 MODELS = Path(__file__).resolve().parents[3] / "samples" / "models"
 GIB = 1024**3
 
+
+#: the stack the host runs of this module are planned on where a run names none: a functional-validation stack, as the
+#: stand-ins and the stated plans of these tests are.  The sample's own stack is named where a test runs it
+VALIDATION_STACK = ("--stack", "fe-cublas")
+
+
+def _stacked(arguments):
+    """The arguments of a host run, with the validation stack named where they name no stack."""
+    return list(arguments) if "--stack" in arguments else [*VALIDATION_STACK, *arguments]
+
+
 # kernel names as the profiler reports them (heads of the names of one traced default run; a name is matched by its head)
 SYMBOL = (
     "cudnn_kernel_frost_gdn_decode_fused_CfgTHREADS256TPR4K_RESIDENTTrueWARPGROUP_SPLITTrueCTAS_PER_SM0STATE_LOAD_PATHbulkSTATE_STREAMFalse"
@@ -162,7 +173,8 @@ ROW_QUANTIZE_CALLS = []
 AREA_POLICY = (
     "FlashInfer is imported inside the adapters of the rows that call it, on a device, in the stack `native` alone; no other stack and no plan on "
     "stated device facts imports it.",
-    "FlashInfer is an optional package of that stack alone; the stack `fe-entries` runs the cuDNN Frontend rows without it.",
+    "FlashInfer is a package of that stack: where it is not installed a run stops before anything is loaded with `[NN] ERROR`, one line that names "
+    "the package and the command that installs it, and no other stack takes its place.",
     "no requirement file of this repository's tests names the package `native` needs (FlashInfer), which is why `fe-entries` exists. The GPU test "
     "has an L0 cell for `native` that runs where the package is installed at a validated version and is skipped elsewhere: skipped is uncovered, "
     "not passing",
@@ -2644,9 +2656,11 @@ def test_the_samples_flags_for_the_kernel_check(monkeypatch, capsys):
         sample._writable("--dump-census", "/nowhere/at/all/census.json")
 
 
-def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB, script="00_decode.py"):
+def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB, script="00_decode.py", stacked=True):
     """``main()`` of a sample script on stated device facts (compute capability 10.0), up to its first load.  ``total``:
-    the device's memory as a real device reports it; 0 states the facts only, and nothing is asked of an entry."""
+    the device's memory as a real device reports it; 0 states the facts only, and nothing is asked of an entry.
+    A run that names no stack is planned on the validation stack of this module (``_stacked``); ``stacked=False`` hands
+    the arguments over as they are: the run of the sample's own default."""
     import importlib.util
 
     from model_samples import blocks
@@ -2666,7 +2680,7 @@ def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB, script=
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.main(arguments), capsys.readouterr().err
+        return module.main(_stacked(arguments) if stacked else list(arguments)), capsys.readouterr().err
     finally:
         sys.path[:] = paths
 
@@ -2748,7 +2762,7 @@ def _sample_run(monkeypatch, capsys, arguments, cc=(10, 0), sms=148, **stand_in)
     capsys.readouterr()
     try:
         spec.loader.exec_module(module)
-        code = module.main(["--force-tokens", "4", *arguments])
+        code = module.main(_stacked(["--force-tokens", "4", *arguments]))
     finally:
         sys.path[:] = paths
     return code, capsys.readouterr().err.splitlines()
@@ -2765,6 +2779,16 @@ def test_the_last_line_of_a_run_that_checks_its_kernels(monkeypatch, capsys, tmp
     code 0 -- never ``PASS``, also where only ONE of the run's sequence counts could not be observed."""
     code, lines = _sample_run(monkeypatch, capsys, ["--check-kernels", "--sequences", "2"])
     assert code == 0 and lines[-1] == "[00] PASS", lines[-3:]
+    # one line behind the load says how the steps are launched: this run is of a functional-validation stack, by its name
+    told = [line for line in lines if line.startswith(("[00] launched from Python: ", "[00] step recorded: "))]
+    assert len(told) == 1 and told[0].startswith("[00] launched from Python: fe-cublas is a functional-validation stack, taken by --stack alone -- "), told
+    assert (
+        told[0].endswith("no speed stated; the sample's stack is native")
+        and lines.index(told[0]) == next(i for i, l in enumerate(lines) if l.startswith("[00] stage ")) + 1
+    )
+    assert any(line.endswith("| stack fe-cublas") for line in lines) and not any(
+        "not captured" in line for line in lines
+    ), "the header names the stack and no more"
     (line,) = _kernel_lines(lines)
     assert line.endswith("    PASS") and "2 on exact rows, in the wiring order" in line, line
     assert any(line.startswith("kernels, planned (decided before the load") for line in lines) and "[00] seeded weights" in lines[-2]
@@ -3267,6 +3291,15 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     target = tmp_path / "census.json"
     code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1", "--dump-census", str(target)])
     assert code == 0 and lines[-1] == "[00] PASS", lines[-4:]
+    # the sample's own stack on a device no sequence is recorded on: one line says so, and the run is launched from Python
+    told = [line for line in lines if line.startswith(("[00] launched from Python: ", "[00] step recorded: "))]
+    assert told == ["[00] launched from Python: a launch sequence is recorded on a CUDA device"], told
+    code, flagged = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1", "--no-capture"])
+    assert (
+        code == 0
+        and flagged[-1] == "[00] PASS"
+        and [line for line in flagged if line.startswith("[00] launched from Python: ")] == ["[00] launched from Python: --no-capture"]
+    )
     planned = lines.index(next(line for line in lines if line.startswith("kernels, planned (decided before the load")))
     assert lines[planned + 1].split()[-1] == "checked" and "stack native" in lines[planned]
     assert lines[planned + 15] == "  add_norm_quantize at linear_attention.first: [ADD False, STORE_RESIDUAL True, BF16_OUT True, QUANT e4m3_static]"
@@ -3402,21 +3435,30 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
         code == 1 and lines[-1] == "[00] FAIL" and quantised.endswith("[band: row_quantize_fp4]  FAIL") and " 0 of them not the twin's byte" not in quantised
     ), quantised
 
-    # kernel binaries that are not on the machine as their manifest lists them -- no manifest; the binary the library would
-    # launch, in whose place it would launch another kernel and print a path -- are a SKIP before anything is loaded,
-    # in the sample's own words: the library is not called, no line follows, no path is printed
-    for defect, binaries, sentence in (
-        ({"manifest": False}, (None, False), f"{ATTENTION_ENTRY} needs the kernel-binary package flashinfer-cubin 0.7.2.post1, which is not installed: "),
+    # kernel binaries that are not on the machine as their manifest lists them, before anything is loaded and in the sample's
+    # own words: the library is not called, no line follows, no path is printed.  With no kernel-binary package installed
+    # the run STOPS -- the stack cannot run, one ERROR line that names the package, exit code 1.  With the package installed
+    # and a binary missing -- the one the library would launch, in whose place it would launch another kernel and print a
+    # path -- it is a SKIP: the package is there, and what it holds is the installation's
+    for defect, binaries, sentence, ended in (
+        (
+            {"manifest": False},
+            (None, False),
+            f"{ATTENTION_ENTRY} needs the kernel-binary package flashinfer-cubin 0.7.2.post1, which is not installed: ",
+            (1, "[00] ERROR the stack native cannot run: "),
+        ),
         (
             {"without": [FI_ATTENTION]},
             (VALIDATED_LIBRARY, True),
             f"{ATTENTION_ENTRY}: the installed flashinfer-cubin 0.7.2.post1 does not hold the kernel binaries the library's table names for this call's "
             "data types, head width, paging and page on this GPU's class ",
+            (0, "[00] SKIP "),
         ),
     ):
         directory = _kernel_binaries(tmp_path / f"binaries_{len(defect)}_{binaries[1]}", **defect)
         code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], kernel_binaries=directory, library_binaries=binaries)
-        assert code == 0 and lines[-1].startswith(f"[00] SKIP {sentence}") and "/a/local/path" not in "\n".join(lines), lines[-1]
+        assert code == ended[0] and lines[-1].startswith(f"{ended[1]}{sentence}") and "/a/local/path" not in "\n".join(lines), lines[-1]
+        assert sum(line.startswith(("[00] ERROR", "[00] SKIP")) for line in lines) == 1, "one message"
         assert ATTENTION_CALLS == [], "the library's attention was not called"
         assert lines[-1].endswith("--stack fe-entries runs the cuDNN Frontend rows of this stack without the package") and not any(
             line.startswith(("checks", "[00] stage")) for line in lines
@@ -3457,23 +3499,108 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     assert "mlp.gate_up equal (gated)" in invariance, "and the row of the fused gate / up entry"
     assert "output_head.quantize equal (gated)" in invariance, "and the row of the head's quantise"
 
-    # the default stack is untouched by all of this: no kernel line without the flag
+    # the stack fe-cublas is untouched by all of this: no kernel line without the flag
     code, lines = _sample_run(monkeypatch, capsys, ["--sequences", "1"])
     assert code == 0 and lines[-1] == "[00] PASS" and _kernel_lines(lines) == [] and not any(line.startswith("kernels, ") for line in lines)
+
+
+def test_the_recorded_step_line_against_the_traced_step():
+    """``census.recorded_step``: the launch records of a replayed step against those of the same step launched from Python.
+    The sequence's own records are those that carry its graph id; they are the step's kernels and copies in its order,
+    name and launch shape each, a copy as a copy in either spelling, and behind them the copy of the chosen ids and
+    the position updates and nothing else.  What was issued from Python around the replay -- the copy of the ids the
+    step is fed, the host read -- is not compared.  One launch missing, one more, two exchanged, another grid, another
+    shared memory, a tail without its copy, a tail with a launch too many: each fails with its sentence.  Records
+    without a graph id, and no step to hold a replay against, are reported as not observed."""
+    from model_samples import census
+    from model_samples.census import Launch
+
+    def kernel(name, grid=(1, 1, 1), block=(128, 1, 1), shared=0, graph=0):
+        return Launch(name, "kernel", 0.0, 0.0, grid, block, shared, 16, (graph, 1 if graph else 0))
+
+    def copy(name="Memcpy DtoD (Device -> Device)", graph=0):
+        return Launch(name, "copy", 0.0, 0.0, graph=(graph, 1 if graph else 0))
+
+    read = copy("Memcpy DtoH (Device -> Pinned)")
+    add = "void at::native::vectorized_elementwise_kernel<2, at::native::CUDAFunctorOnSelf_add<long>>"
+    names = [
+        "void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::BFloat16>",
+        "cudnn_kernel_frost_gdn_decode_fused_Cfg",
+        "fmhaSm100fKernel_QkvBfloat16OBfloat16H256PagedKvCausalP64",
+    ]
+    step = [kernel(names[0]), kernel(names[1], (2, 1, 1), (256, 1, 1), 4096), copy("Memset (Device)"), kernel(names[2], (1, 1, 148)), read]
+
+    def replayed(blocks=None, tail=None):
+        blocks = [record._replace(graph=(7, 1)) for record in step[:-1]] if blocks is None else blocks
+        tail = [kernel("memcpy32_post", graph=7), *(kernel(add, graph=7) for _ in range(3))] if tail is None else tail  # the copy node as a kernel record
+        return [copy(), *blocks, *tail, read]  # in front: the copy of the ids the step is fed, issued from Python
+
+    status, line = census.recorded_step([step, step], [replayed(), replayed()])
+    assert (status, line) == (
+        "PASS",
+        "the recorded step: 2 replayed steps launch the 4 kernels and copies of the same steps launched from Python, in their order and launch shapes, "
+        "and behind them 1 copy of the chosen ids and 3 position updates",
+    )
+    blocks = [record._replace(graph=(7, 1)) for record in step[:-1]]
+    for wrong, sentence in (
+        (
+            replayed(blocks[:1] + blocks[2:]),
+            "replayed step 0 launches a copy at launch 1, where the step launched from Python launches 'cudnn_kernel_frost_gdn_decode_fused_Cfg'",
+        ),
+        (
+            replayed([blocks[0], blocks[0], *blocks[1:]]),
+            "at launch 1, where the step launched from Python launches 'cudnn_kernel_frost_gdn_decode_fused_Cfg' (grid (2, 1, 1)",
+        ),
+        (
+            replayed([blocks[1], blocks[0], *blocks[2:]]),
+            "replayed step 0 launches 'cudnn_kernel_frost_gdn_decode_fused_Cfg' (grid (2, 1, 1), block (256, 1, 1), shared memory 4,096 B) at launch 0",
+        ),
+        (
+            replayed([blocks[0], blocks[1]._replace(grid=(3, 1, 1)), *blocks[2:]]),
+            "(grid (3, 1, 1), block (256, 1, 1), shared memory 4,096 B) at launch 1, where the step launched from Python launches",
+        ),
+        (replayed([blocks[0], blocks[1]._replace(shared_memory=8192), *blocks[2:]]), "shared memory 8,192 B) at launch 1"),
+        (replayed(tail=[kernel(add, graph=7)] * 3), "behind the 4 launches of the step launched from Python replayed step 0 holds"),
+        (
+            replayed(tail=[kernel("memcpy32_post", graph=7), *[kernel(add, graph=7)] * 4]),
+            "where the recorded step has 1 copy of the chosen ids and 3 position updates",
+        ),
+        (replayed(blocks[:3], tail=[]), "replayed step 0 holds 3 launches where the step launched from Python has 4: it ends in front of"),
+    ):
+        status, line = census.recorded_step([step, step], [wrong, replayed()])
+        assert status == "FAIL" and sentence in line and line.startswith("the recorded step: 2 replayed steps: ") and "replayed step 0 " in line, line
+    status, line = census.recorded_step([step, step], [replayed(), replayed(blocks[:1] + blocks[2:])])
+    assert status == "FAIL" and "replayed step 1 launches a copy at launch 1" in line, "the second replayed step is held as the first"
+    without = [record._replace(graph=(0, 0)) for record in replayed()]
+    assert census.recorded_step([step], [without]) == (
+        "NOT OBSERVED",
+        "the recorded step: 1 replayed step: not observed: the profiler's records of a replayed step carry no graph id",
+    )
+    assert census.recorded_step([step], [replayed(), replayed()])[0] == "NOT OBSERVED" and census.recorded_step([], [])[0] == "NOT OBSERVED"
+    # through a traced pass: the replayed steps are kept apart, the line stands under the kernel check and fails it
+    sites = _sites()
+    traced = census.Traced.of(sites, [[], []], [*step, *step, *replayed(), *replayed()], 2, "", 1, tail=2)
+    assert len(traced.steps) == 2 and len(traced.replayed) == 2 and traced.recorded_step()[0] == "PASS"
+    assert census.Traced.of(sites, [[], []], [*step, *step], 2, "", 1).recorded_step() == ("", ""), "a pass that replayed nothing has no such line"
+    short = census.Traced.of(sites, [[], []], [*step, *step, *replayed()], 2, "", 1, tail=2)
+    assert short.steps is None and short.undeclared == "the records show 3 host reads for 4 traced steps"
+    assert short.recorded_step() == ("NOT OBSERVED", "the recorded step: not observed: the launch records cannot be cut into the traced steps")
 
 
 def test_native_and_fe_entries_always_check_their_kernels(monkeypatch, capsys):
     from model_samples import Session, TextIO, loop
 
     sample = _sample_script(monkeypatch)
-    assert sample.STACKS == loop.STACKS == ("fe-cublas", "native", "fe-entries", "reference")
+    assert sample.STACKS == ("native", "fe-entries", "fe-cublas", "reference") and set(sample.STACKS) == set(loop.STACKS)
     assert sample._arguments(["--stack", "native"]).stack == "native" and sample._arguments(["--stack", "fe-entries"]).stack == "fe-entries"
     with pytest.raises(SystemExit):
         sample._arguments(["--help"])
     shown = " ".join(capsys.readouterr().out.split())
     for part in (
-        "native: every block on a kernel that works on the stored weights (entries of cuDNN Frontend and four calls of FlashInfer)",
-        "fe-entries: the cuDNN Frontend rows of native",
+        "native (default): the sample's stack, every block on a kernel that works on the stored weights (entries of cuDNN Frontend and four calls of FlashInfer)",
+        "its step recorded once and replayed",
+        "a package the stack calls that is not installed stops the run",
+        "The other stacks are for functional validation, launched from Python: fe-entries, the cuDNN Frontend rows of native",
         "always on in the stacks native and fe-entries",
     ):
         assert part in shown, part
@@ -4141,9 +4268,11 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         monkeypatch.setattr(Step, "decline", "")
         monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: True)
 
-    # (5) the library's package on such a device: missing, or another version than the validated one.  A SKIP that names the
-    # version, the command and the stack that runs without the package -- before the memory sentence, nothing built, nothing
-    # loaded; the sample's last line is that sentence and its exit code 0
+    # (5) the library's package on such a device: missing, or another version than the validated one.  A sentence that names
+    # the version, the command and the stack that runs without the package -- before the memory sentence, nothing built,
+    # nothing loaded.  A missing package STOPS the sample: its last line is ``ERROR the stack native cannot run:`` and that
+    # sentence, exit code 1 -- no other stack takes the place of the sample's own.  Another version than the validated one
+    # is a SKIP with that sentence, exit code 0
     fix = "pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt"
     without = "--stack fe-entries runs the cuDNN Frontend rows of this stack without the package"
     validated = "flashinfer-python 0.7.2.post1, the version this stack was run and checked with"
@@ -4156,9 +4285,18 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         with pytest.raises(NotImplementedError) as skipped:
             run("native", 1, 4)
         assert str(skipped.value) == declined and events == [], "the first library row of the table names what is missing: nothing was asked of the GPU"
-        with monkeypatch.context() as scoped:
-            code, out = _sample_main(scoped, capsys, ["--stack", "native"], total=180 * GIB, free=80 * GIB)
-        assert code == 0 and out.splitlines()[-1] == f"[00] SKIP {declined}" and "first use of FlashInfer" not in out, out
+        from model_samples.blocks import MissingPackage
+
+        missing = isinstance(skipped.value, MissingPackage)
+        assert missing == (version is None) and getattr(skipped.value, "package", None) == ("flashinfer-python" if missing else None)
+        ended = (1, f"[00] ERROR the stack native cannot run: {declined}") if missing else (0, f"[00] SKIP {declined}")
+        for named in (["--stack", "native"], ["--sequences", "1,4"]):  # by name, and as the default of a run that names no stack
+            with monkeypatch.context() as scoped:
+                code, out = _sample_main(scoped, capsys, named, total=180 * GIB, free=80 * GIB, stacked=False)
+            assert (code, out.splitlines()[-1]) == ended and "first use of FlashInfer" not in out, out
+            assert (
+                "| stack native" in out and "\n[00] stage " not in out and out.count("[00] ERROR") + out.count("[00] SKIP") == 1
+            ), "one message, nothing loaded"
         del events[:]
         _, table = run("fe-entries", 1, 4)
         assert "FlashInfer" not in table and events == [
@@ -5395,7 +5533,8 @@ def test_the_loader_keeps_each_weight_in_the_forms_the_plans_read(monkeypatch):
         f"weight of a multiply on its stored codes there: {(whole['copies'] + whole['state']) / 1e9:.1f} GB per step, the model's own bytes",
     ):
         assert said in readme, said
-    assert f"about {asked[0] / GIB:.0f} GiB and about {asked[1] / GIB:.0f} GiB there" in script, "the help's figures for native"
+    figures = f"about {asked[0] / GIB:.0f} GiB of free GPU memory on compute capability 10.0 and about {asked[1] / GIB:.0f} GiB on the other 10.x classes"
+    assert figures in script, "the help's figures for native"
 
 
 def test_a_run_keeps_no_copy_of_a_weight_that_every_plan_multiplies_on_its_stored_format(monkeypatch):
@@ -7403,7 +7542,7 @@ def _speculative_run(monkeypatch, capsys, arguments, **stand_in):
     capsys.readouterr()
     try:
         spec.loader.exec_module(module)
-        code = module.main(["--force-tokens", "24", *arguments])
+        code = module.main(_stacked(["--force-tokens", "24", *arguments]))
     finally:
         sys.path[:] = paths
     captured = capsys.readouterr()
@@ -7454,7 +7593,7 @@ def test_the_speculative_sample_on_native_to_its_last_line(monkeypatch, capsys):
     assert _kernel_lines(lines) == [f"kernels           not observed: {reason}    NOT OBSERVED"]
     assert f"traced pass           not available: {reason}" in lines
 
-    # the default configuration on the default stack, with its kernels checked: five lookups of the passes and the model's
+    # the default configuration on the stack fe-cublas, with its kernels checked: five lookups of the passes and the model's
     code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "fe-cublas", "--check-kernels"])
     assert (code, lines[-1], out) == (0, "[02] PASS", ""), lines[-6:]
     assert _kernel_lines(lines)[0].endswith("    PASS")
@@ -7969,8 +8108,11 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
         "A third-party provider may build its own kernels at its first use; a sample makes that first use while the run is planned, before anything "
         "is loaded, and says so in one line.",
         "A third-party provider is imported inside its adapter, on a device; its version is read from the distribution's metadata there and held to "
-        "the validated list, and a missing or unvalidated version is a `SKIP` that names it, the requirement file and the nearest command that runs "
-        "without it. A plan on stated device facts imports no third-party package.",
+        "the validated list: a missing package stops the run (rule 1), an unvalidated version is a `SKIP`, and either sentence names the version, the "
+        "requirement file and the nearest command that runs without it. A plan on stated device facts imports no third-party package.",
+        "A package the run's stack calls that is not installed is not a `SKIP`: the run stops while it is planned, before anything is loaded, with one "
+        "`[NN] ERROR the stack <stack> cannot run:` line that names the package and the command that installs it, exit code 1 (`blocks.MissingPackage`). "
+        "No other stack takes the stack's place.",
         'A library whose kernels a stack calls has a requirement file of its own, a lower bound with its "Validated with" line '
         "(`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the versions the stack `native` "
         "was last run and checked with. The maintainers of this area own that list; a version joins it with a run of the stack on it, never with an "
@@ -7983,14 +8125,15 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
         "is loaded, and says so in one line.",
         "A provider's precompiled kernel binaries are not built: they come from a package of that provider at a pinned version "
         "(`constraints-native.txt`) or from a directory the user filled beforehand, never from a fetch inside a run -- a sample switches the "
-        "provider's own download off before its first use, and a binary that is not on the machine is a `SKIP` that names what is missing and the fix.",
+        "provider's own download off before its first use, and a binary that is not on the machine is named with the fix: a `SKIP` where a package "
+        "or a directory is there and does not hold it, the stop of rule 1 where no package of the binaries is installed.",
     )
     joined, exception = (
         "The maintainers of this area own that list; a version joins it with a run of the stack on it, never with an update of the pin alone.",
         "The library's kernel-binary package (`requirements-flashinfer-cubin.txt`) is one of the pins, at the library's own version: the one "
         "version at which the library reads it.",
     )
-    assert f"{built} {fetched} 6. **The stack is explicit.**" in guide and guide.count(fetched) == 1, "rule 5 and its exception, in front of rule 6"
+    assert f"{built} {fetched} 6. **The sample's stack is `native`.**" in guide and guide.count(fetched) == 1, "rule 5 and its exception, in front of rule 6"
     assert f"{joined} {exception} 13. **The report's GPU side" in guide and guide.count(exception) == 1, "rule 12 and its exception, in front of rule 13"
     assert (
         "FlashInfer is imported inside the adapters of the rows that call it, on a device, in the stack `native` alone; no other stack and no plan on "
@@ -8005,7 +8148,8 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     # where the area README's first paragraph goes on from the library rows to speculative decoding, and where its table of modules has the adapter
     assert (
         "The kernels of the attention core are precompiled binaries of the library's kernel-binary package: a run reads them and never fetches "
-        "one. A captured decode step (a step recorded once and replayed without Python between its launches) follows in that stack. Speculative "
+        "one. The decode step of the plain sample is recorded once and replayed without Python between its launches; `--no-capture` launches every "
+        "block from Python, as the checks' own passes, the traced steps and the speculative sample do. Speculative "
         "decoding has its first pieces: the loader of the "
         "checkpoint's drafter (its tensors, its rows of the output head, its 8-bit weights); the drafter's draft pass on reference blocks,"
     ) in area
@@ -8023,14 +8167,19 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
         "| `providers/flashinfer_calls.py` | adapters to library kernels of FlashInfer on the stored weights: the 4-bit multiply (`flashinfer.gemm.mm_fp4`,"
         in area
     )
-    assert "FlashInfer is an optional package of this stack alone." in family
+    assert "FlashInfer is a package of this stack alone: the sample's own stack calls it, the `nvidia-cudnn-frontend` package does not depend on it." in family
     script = " ".join((MODELS / "qwen_dense" / "00_decode.py").read_text().split())
     assert fix in area and fix in family and fix in script
     assert "### The rows a library serves" in (MODELS / "qwen_dense" / "README.md").read_text()
-    skipped = "`--stack native` on compute capability 10.x ends in `[00] SKIP` before anything is loaded, exit code 0"
-    assert f"Without either package, or with another version of one, {skipped}" in family
-    assert "on compute capability 10.x ``--stack native`` is a ``SKIP`` before anything is loaded" in script
-    assert "# without the two packages, on compute capability 10.x: SKIP before anything is loaded" in (MODELS / "README.md").read_text()
+    stopped = "a run on compute capability 10.x stops before anything is loaded: `[00] ERROR the stack native cannot run:`"
+    assert f"Without either package {stopped}" in " ".join(family.split())
+    assert "with another version of one it ends in `[00] SKIP` before anything is loaded, exit code 0" in " ".join(family.split())
+    assert "Without either, on compute capability 10.x, the run stops with ``[00] ERROR`` and names the package" in script
+    assert "with a version this area has not validated it is a ``SKIP`` before anything is loaded" in script
+    assert (
+        "# without the two packages, on compute capability 10.x: ERROR, a line that names the package, before anything is loaded"
+        in (MODELS / "README.md").read_text()
+    )
     assert (
         flashinfer_calls.BINARIES_INSTALL in area and flashinfer_calls.BINARIES_INSTALL in family
     ), "the install line of the kernel-binary package, as it is typed"
@@ -8133,10 +8282,10 @@ def test_the_level_of_the_librarys_own_lines_through_a_run_and_a_text_that_names
         code, lines = _sample_run(monkeypatch, capsys, [*run, "--provider", "attention.core=torch_ref.attention"])
         assert code == 1 and lines[-1].endswith(sentence) and not any("declined the operands" in line for line in lines), lines[-1]
         assert "flashinfer" not in sys.modules and LIBRARY_CALLS == []
-        # where the library is not installed nothing would import it, so its level is not asked: the SKIP of the missing package
+        # where the library is not installed nothing would import it, so its level is not asked: the stop of the missing package
         fresh("loud")
         code, lines = _sample_run(monkeypatch, capsys, run, library_installed=None)
-        assert code == 0 and lines[-1].startswith("[00] SKIP flashinfer.") and "which is not installed" in lines[-1], lines[-1]
+        assert code == 1 and lines[-1].startswith("[00] ERROR the stack native cannot run: flashinfer.") and "which is not installed" in lines[-1], lines[-1]
         # a plan on stated device facts makes no first use and asks nothing of the environment: the same text, and the row is planned
         model, stated = _tiny_model(), blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
         rows = blocks.plan(model.provider_table, model.regimes, stated, 1, 1, "native", model=model, options={"device": "cpu"}).rows

@@ -2,11 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """GPU smoke of the dense Qwen model sample (``samples/models/qwen_dense/00_decode.py``): the script is loaded by path and its
-``main()`` is called as a user's default run -- the reduced seeded model, 1 and 4 sequences, the sample's own checks against its
+``main()`` is called -- the reduced seeded model, 1 and 4 sequences, the sample's own checks against its
 fp64-accumulated reference (replay, every provider block teacher-forced, the greedy tokens, each sequence alone against the
 same sequence in the batch).  The run must print ``[00] PASS`` and the environment line; on a GPU, a library version or a
 free-memory budget the sample does not serve it prints ``[00] SKIP <requirement>`` and the cell is reported as skipped with
-that sentence -- unless a check failed before it: a skip never covers a failure.  Every line of the run is read from
+that sentence -- unless a check failed before it: a skip never covers a failure.
+
+The sample's stack is ``native``, the default of a run that names none: its step is recorded once and replayed.  That
+stack calls a library, so the cell of the default run runs where the library is installed and is skipped elsewhere --
+uncovered, not passing.  Every other stack is one for functional validation and is run here by its name (``--stack
+fe-cublas``, ``--stack fe-entries``): the in-process cell of this module is the run on ``fe-cublas``.  One cell holds what
+a default run does where a package of the stack is missing, without uninstalling anything: one ``[NN] ERROR`` line that
+names the package, exit code 1, nothing loaded.  Every line of the run is read from
 standard error, and standard output must stay empty: it is kept for generated text, which a seeded run does not have.
 Each sequence count also reports its
 traced pass (GPU busy, idle and launches per step from kernel activity records, or the reason there are none) and the
@@ -28,7 +35,7 @@ Where the profiler's records cannot be had the sample ends in ``[00] RAN fe-entr
 the cell then passes on the other checks and the recorded line says that the kernels were not observed -- uncovered
 there, not verified.
 
-The ``native`` cell runs the default run on the stack ``native`` itself, which has four rows more: three multiplies of a
+The ``native`` cell is the default run -- no flag -- on the stack ``native`` itself, which has four rows more: three multiplies of a
 library, FlashInfer, on the stored weights, and the attention core on that library's paged decode attention.
 FlashInfer is an optional package of that stack alone, so the cell runs where it is installed at a validated version with
 its kernel-binary package and is skipped elsewhere -- by this module where the library is absent, by the sample's own
@@ -191,6 +198,9 @@ def _fresh_interpreter(arguments, script=SCRIPT, tag="[00]", environment=None):
     return done.returncode, done.stderr, done.stdout
 
 
+FE_CUBLAS_STACK = ["--stack", "fe-cublas"]  # the functional-validation stack the in-process cells run, by its name
+
+
 def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, unobserved=False):
     """Run the sample's ``main()`` and hold its output; with ``sample`` None, run the script in a fresh interpreter instead.
     ``unobserved`` accepts, beside ``[00] PASS``, the verdict of a run whose kernel check could not look (``RAN <stack> stack
@@ -221,18 +231,88 @@ def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, un
     assert code == 0 and held, out[-6000:]
     assert "distribution" in versions and "source hash" in versions, "the environment check ran and its line was printed"
     assert by_provider in out
-    for check in ("replay", "blocks", "tokens"):
+    first = "recorded step" if "[00] step recorded: " in out else "replay"  # of a replayed run: the replayed steps launched again from Python
+    for check in (first, "blocks", "tokens"):
         assert out.count(f"  {check} ") == 2 and f"  {check} " in out, f"the {check} check ran at both sequence counts"
     assert "linear_attention.step equal (gated)" in out or "REPORTED" in out, "batch invariance was checked at 4 sequences"
     assert out.count("\ntraced pass ") == 2 and out.count("\nbytes per step ") == 2, "each count reports its traced pass (or why there is none) and its bytes"
     assert " FAIL" not in out
+    # every session says in one line whether its step is recorded or launched from Python, and a validation stack says what it is
+    launch = [line for line in out.splitlines() if line.startswith(("[00] step recorded: ", "[00] launched from Python: "))]
+    assert len(launch) == 2, launch
+    if stack != "native":
+        told = f"[00] launched from Python: {stack} is a functional-validation stack, taken by --stack alone -- "
+        assert all(line.startswith(told) and line.endswith("; the sample's stack is native") for line in launch), launch
     return out
 
 
 @pytest.mark.L0
-def test_default_run_passes_its_own_checks(sample, capsys):
-    out = _run(sample, capsys, [])
+def test_the_run_on_the_fe_cublas_stack_passes_its_own_checks(sample, capsys):
+    """``--stack fe-cublas``, a functional-validation stack, loaded by path and run in this process: launched from Python,
+    and it says so in one line behind each load."""
+    out = _run(sample, capsys, FE_CUBLAS_STACK)
     assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "21 block calls per step" in out
+    assert "| stack fe-cublas\n" in out and "[00] step recorded: " not in out and "\n  recorded step " not in out, "nothing of a recorded step"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("script", ["00_decode.py", "02_speculative_decode.py"])
+def test_a_default_run_without_a_package_of_its_stack_stops_and_names_the_package(script, monkeypatch, capsys):
+    """A run that names no stack is a run of ``native``, and where a package that stack calls is not installed it stops:
+    one ``[NN] ERROR`` line that names the package and the command that installs it, exit code 1, before anything is
+    built or loaded -- never a ``SKIP``, and never another stack in its place.  The package's absence is stated to the
+    adapter (its reader of the distribution's metadata answers "not installed"): nothing is uninstalled.  Then the
+    kernel-binary package alone is missing: the same stop, by that package's name.  A functional-validation stack is
+    untouched by either (the run on ``fe-entries`` plans to its load).  On a class the library's rows do not claim the
+    stack needs no package: skipped by name there."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the library rows of the stack native claim compute capability 10.x: on this class the stack calls no package")
+    module = next(_loaded(monkeypatch, MODELS / "qwen_dense" / script))
+    tag = module.TAG
+    from model_samples import Session
+    from model_samples.providers import flashinfer_calls
+
+    def no_load(session):
+        raise AssertionError("reached a load")
+
+    monkeypatch.setattr(Session, "load", no_load)
+    monkeypatch.setattr(flashinfer_calls, "installed", lambda: None)
+    code = module.main([])
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith(f"{tag} ")]
+    stop = (
+        f"{tag} ERROR the stack native cannot run: flashinfer.gemm.bmm_fp8 needs flashinfer-python 0.7.2.post1, which is not installed: "
+        "pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt; "
+        "--stack fe-entries runs the cuDNN Frontend rows of this stack without the package"
+    )
+    frost_routing.measured(f"model sample qwen_dense {script} (default), the library not installed", lines[-1])
+    assert code == 1 and lines[-1] == stop and captured.out == "", captured.err[-4000:]
+    assert sum(" ERROR " in line for line in lines) == 1 and not any(" SKIP " in line or "stage " in line for line in lines), "one message, nothing loaded"
+    assert any(line.endswith("| stack native") for line in lines), "the run was the sample's own stack"
+    # a functional-validation stack does not call the package: its run plans to its load
+    with pytest.raises(AssertionError, match="reached a load"):
+        module.main(["--stack", "fe-entries"])
+    capsys.readouterr()
+    # the kernel-binary package alone is missing: found where the attention core holds its binaries, before anything is loaded
+    monkeypatch.undo()
+    module = next(_loaded(monkeypatch, MODELS / "qwen_dense" / script))
+    from model_samples import Session as Again
+    from model_samples.providers import flashinfer_calls as calls
+
+    if calls.installed() not in calls.VALIDATED:
+        return  # the library itself is not installed here: the stop above is this installation's own
+    monkeypatch.setattr(Again, "load", no_load)
+    monkeypatch.setattr(calls, "binaries_package", lambda: (None, False))
+    monkeypatch.setattr(calls, "hold_binaries", lambda folder, family, cc, manifest=None: "its manifest is not there")
+    monkeypatch.delenv(calls.BINARIES_DIRECTORY, raising=False)
+    code = module.main([])
+    captured = capsys.readouterr()
+    last = [line for line in captured.err.splitlines() if line.startswith(f"{tag} ")][-1]
+    frost_routing.measured(f"model sample qwen_dense {script} (default), the kernel-binary package not installed", last)
+    head = f"{tag} ERROR the stack native cannot run: flashinfer.decode.trtllm_batch_decode_with_kv_cache needs the kernel-binary package flashinfer-cubin "
+    assert code == 1 and last.startswith(head) and ", which is not installed: pip install --no-deps --index-url " in last, captured.err[-4000:]
 
 
 @pytest.mark.L0
@@ -482,8 +562,25 @@ def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
     Skipped where the library is absent, and by the sample's own line where a kernel binary is."""
     _needs_the_library()
     cc100 = tuple(torch.cuda.get_device_capability()) == (10, 0)
-    out = _run(None, capsys, ["--stack", "native"], "native", NATIVE_CC100 if cc100 else NATIVE, unobserved=True)
-    assert "stack native" in out and out.count("[00] planning: first use of FlashInfer ") == 1, "the library's first use is announced once, while the run plans"
+    out = _run(None, capsys, [], "native", NATIVE_CC100 if cc100 else NATIVE, unobserved=True)  # no flag: the sample's stack is the default
+    assert (
+        "| stack native\n" in out and out.count("[00] planning: first use of FlashInfer ") == 1
+    ), "the library's first use is announced once, while the run plans"
+    if cc100:  # every row of the stack is a kernel here: the step is recorded once per sequence count and replayed
+        recorded = [line for line in out.splitlines() if line.startswith("[00] step recorded: ")]
+        assert len(recorded) == 2 and all(
+            line.endswith("replayed once per token (--no-capture launches every block from Python)") for line in recorded
+        ), recorded
+        assert out.count(" | capture ") == 2, "recording the step is a stage of each load"
+        held = [line for line in out.splitlines() if line.startswith("  recorded step ")]
+        assert len(held) == 2 and all(
+            "launched again from Python from a fresh state: ids and logits byte-identical    PASS" in line for line in held
+        ), "the replayed steps were launched again from Python, at both sequence counts"
+        tails = [
+            line for line in out.splitlines() if "behind the request the ids buffer held the last chosen ids and the position rows stood at position " in line
+        ]
+        assert len(tails) == 2 and all(line.endswith("    PASS") for line in tails), "the step's own tail was held behind each request"
+        assert out.count("one replay of ") == 2 and "\nnote  " not in out, "the step line names the replay; a replayed run prints no note"
     assert out.count("[00] planning: first use of the paged decode attention of FlashInfer ") == 1, "and so is the first use of its attention"
     core = [line for line in out.splitlines() if line.split()[:1] == ["attention.core"] and "calls" in line and "[band: " in line]
     assert len(core) == 2 and all(
@@ -518,6 +615,9 @@ def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
         assert sum(line.startswith(counted) for line in out.splitlines()) == 2, "the count of a step under the kernel table, at both sequence counts"
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
     if len(observed) == 2 and all(line.endswith("    PASS") for line in observed):  # the kernels of the traced steps were observed
+        if cc100:  # ... and the replayed steps of the traced pass against them
+            again = [line for line in out.splitlines() if line.strip().startswith("the recorded step: 2 replayed steps launch the ")]
+            assert len(again) == 2 and all(line.endswith("position updates    PASS") for line in again), again
         launched = [line.strip().split(": ", 1)[0] for line in out.splitlines() if "; the library launched " in line]
         rows = ["projection.fp8.out at linear_attention.out", "mlp.down", "attention.core", "projection.fp8.out at full_attention.out", "output_head"]
         assert launched == rows * 2, "the line of every row the library serves names the kernel the library launched, at both sequence counts"
@@ -1156,7 +1256,7 @@ def test_the_memory_sentence_holds_what_a_run_of_85_sequences_takes(sample):
 
 @pytest.mark.L1
 def test_four_layer_run_passes_its_own_checks(sample, capsys):
-    out = _run(sample, capsys, ["--layers", "4"])
+    out = _run(sample, capsys, [*FE_CUBLAS_STACK, "--layers", "4"])  # in this process: the functional-validation stack, by its name
     assert "4 of 64 layers (3 linear-attention + 1 attention)" in out and "35 block calls per step" in out
 
 
@@ -1880,16 +1980,19 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
 
 
 @pytest.mark.L0
-def test_the_speculative_default_run_passes_its_own_checks(speculative, capsys):
-    """The default run of ``02_speculative_decode.py``, loaded by path, in this process: the stack ``fe-cublas``, both
+def test_the_speculative_run_on_the_fe_cublas_stack_passes_its_own_checks(speculative, capsys):
+    """``02_speculative_decode.py --stack fe-cublas``, a functional-validation stack, loaded by path, in this process, both
     streams held.  It is the only L0 cell that launches the fused verify step and the fused decode step on token 0 of a
-    state of six tokens per sequence in the form of the default stack; what their first launches took is recorded.  The
-    kernels are not checked on this stack unless asked: no kernel line, and no statement about the drafter's kernels."""
-    out = _speculative_run(speculative, capsys, [])
+    state of six tokens per sequence in the form of that stack; what their first launches took is recorded.  The
+    kernels are not checked on this stack unless asked: no kernel line, and no statement about the drafter's kernels.
+    The run says in one line that it is launched from Python and what its stack is."""
+    out = _speculative_run(speculative, capsys, FE_CUBLAS_STACK)
     lines = out.splitlines()
+    told = "[02] launched from Python: fe-cublas is a functional-validation stack, taken by --stack alone -- "
+    assert sum(line.startswith(told) and line.endswith("; the sample's stack is native") for line in lines) == 1
     assert "stack fe-cublas, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused " in out and "cudnn.GdnDecodeFused " in out
     assert "[PDL " not in out, "an entry's form is printed with the kernel table, which this stack prints on request"
-    assert "\n  kernels  " not in out and "\nkernels, planned" not in out, "the kernels of the default stack are checked on request"
+    assert "\n  kernels  " not in out and "\nkernels, planned" not in out, "the kernels of this stack are checked on request"
     stages = next(line for line in lines if line.startswith("[02] the session with the drafter: stage  "))
     forms = [part.strip() for part in stages.split("stage  ", 1)[1].split(" | ") if part.strip().startswith("compile and first launch linear_attention.step ")]
     assert [form.rsplit(" ", 2)[0] for form in forms] == [
@@ -1898,7 +2001,24 @@ def test_the_speculative_default_run_passes_its_own_checks(speculative, capsys):
     ], "the decode step on token 0 of the state of six tokens, then the verify step"
     # an entry builds its kernel at the plan (its first use) and launches it once at the load: both are recorded with their seconds
     plan = next(part.strip() for line in lines if line.startswith("[02] stage  ") for part in line.split(" | ") if part.strip().startswith("plan "))
-    frost_routing.measured("model sample qwen_dense 02_speculative_decode (default): the two forms this cell alone launches", "; ".join([plan, *forms]))
+    frost_routing.measured("model sample qwen_dense 02_speculative_decode --stack fe-cublas: the two forms this cell alone launches", "; ".join([plan, *forms]))
+
+
+@pytest.mark.L0
+def test_the_speculative_default_run_is_the_native_stack_launched_from_python(capsys):
+    """The default run of ``02_speculative_decode.py`` -- no flag: the stack ``native`` --, in a fresh interpreter, both
+    streams held, where the library the stack calls is installed.  A step of speculative decoding is not recorded: the
+    run says so in one line, with the reason, and passes its checks on steps launched from Python."""
+    _needs_the_library()
+    out = _speculative_run(None, capsys, [], "native")
+    lines = out.splitlines()
+    assert any(line.startswith("[02] ") and line.endswith("| stack native") for line in lines), "the sample's stack, by default"
+    told = [line for line in lines if line.startswith("[02] launched from Python: ")]
+    assert told == [
+        "[02] launched from Python: a step of speculative decoding is not recorded: the drafter's passes run on reference blocks, "
+        "which a recorded launch sequence cannot hold"
+    ], told
+    assert "step recorded" not in out
 
 
 @pytest.mark.L1

@@ -99,6 +99,8 @@ ONE_SEQUENCE = "a session with a drafter serves one sequence: one request, as th
 CHECK_POOL = 0.4
 
 
+#: the steps of a traced pass that a session which replays its step runs once more as replays, behind those launched from Python
+REPLAYED_TRACED = 2
 #: why a session's steps are launched from Python where recording was not asked for
 NOT_ASKED = "recording the step was not asked for (Session(capture=True))"
 #: ... and where the step is not the plain decode step: the kinds of session whose step is not recorded
@@ -194,10 +196,11 @@ class Recorded:
     installation does not state it; ``seconds`` and ``pool_bytes``: what recording took, and what PyTorch reserved
     for the sequence's own pool, in which the working memory of one step stays for as long as the sequence lives."""
 
-    def __init__(self, graph, state: DecodeState, cursor: Cursor, next_ids, logits, hidden, calls: int, launches=None, seconds=0.0, pool_bytes=0):
+    def __init__(self, graph, state: DecodeState, cursor: Cursor, next_ids, logits, hidden, calls: int, launches=None, seconds=0.0, pool_bytes=0, planned=0):
         self.graph, self.state, self.cursor = graph, state, cursor
         self.next_ids, self.logits, self.hidden = next_ids, logits, hidden
         self.calls, self.launches, self.seconds, self.pool_bytes = calls, launches, seconds, pool_bytes
+        self.planned = planned  # the launches of the step's blocks on exact rows, as the plan has them
         self.replays = 0
         #: whether the ids buffer holds what the last replay chose: the step's own last copy wrote them, nothing since
         self.chosen = False
@@ -224,6 +227,23 @@ class Recorded:
         self.cursor.position = state.position + 1  # the sequence's own last launches moved the rows on
         self.replays += 1
         self.chosen = True
+
+    def text(self) -> str:
+        """What the recorded step holds, for the line a run prints behind its load.  Where the installation states the
+        sequence (``launches``) the count is the CUDA runtime's, with what of it was held to the plan kernel by kernel;
+        where it does not, the count is worded as the plan's: ``planned`` launches of its blocks."""
+        tail = f"{self.cursor.launches()} position updates"
+        if self.launches is None:
+            return (
+                f"step recorded: by the plan {self.planned} launches of its blocks, then the token choice, 1 copy of the chosen ids and {tail} "
+                "(this installation does not state what the recorded sequence holds); replayed once per token"
+            )
+        held = self.launches
+        return (
+            f"step recorded: {held['launches']} launches, as the CUDA runtime states the recorded sequence -- {held['held']} of the plan's block "
+            f"launches held kernel by kernel, the lookup, {held['token_choice']} of the token choice, {held['copies']} copy of the chosen ids "
+            f"and {tail} -- replayed once per token"
+        )
 
     def release(self) -> None:
         self.graph.reset()
@@ -422,6 +442,10 @@ class Session:
         self.recorded: Optional[Recorded] = None  # the recorded step of the session's present state, once it has one
         #: why the steps of this session are launched from Python; "" while they are replayed, or will be at the first replay
         self.python_reason = "" if self.capture else NOT_ASKED
+        #: of a request that was replayed, read behind it (``read_tail``): whether the ids buffer held the ids the last
+        #: replay chose, whether the position rows stood where the request left the state, and that position
+        self.tail: Optional[tuple] = None
+        self.pool_bytes: List[int] = []  # of every recording of this session: what PyTorch reserved for the sequence's own pool
         self._running: Optional[blocks.Plan] = None  # the plan of the step that is running, and its rows
         self._rows = self.sequences * self.tokens
         self._open = False  # a verify step has run and has not been told how many of its tokens are kept
@@ -654,7 +678,8 @@ class Session:
         plans are resolved here too, and the memory sentence then covers the whole run -- this session's need plus their
         state -- against what is free now: every decline of a run comes before its first load, none after it.
 
-        The sentence also counts what the checks of the run hold for every sequence beyond the first (``_check_rows``:
+        The sentence counts what a session that records its step keeps in the pool of its recorded sequence
+        (``_recorded_bytes``: the family's arithmetic), and what the checks of the run hold for every sequence beyond the first (``_check_rows``:
         the family's arithmetic, nothing at one sequence and nothing on the reference stack, which runs no checks),
         names that part, and adds a share of it for PyTorch's pool (``CHECK_POOL``).  ``references``: how many reference
         stacks the checks of the run replay (2 for a run that checks a second one).
@@ -689,6 +714,7 @@ class Session:
             # a session whose blocks ask for a paged attention cache holds a pool and its tables where a plain one holds two tensors a layer
             need += sum(session.model.state_bytes(session.sequences, session.capacity, **session._per_token(), **session._paged()) for session in later)
             need += sum(session._drafter_bytes() for session in (self, *later))
+            need += sum(session._recorded_bytes() for session in (self, *later))  # what a recorded step keeps in a pool of its own
             # one state per session: a session that feeds its prompt through decode steps runs them on the state of its verify
             # steps, so it is counted once.  Nothing is added for its second plan either: what a first launch of the fused step
             # reserves outside the pool is reserved once in a process, and the sentence carries it once (``Plan.memory``)
@@ -744,6 +770,12 @@ class Session:
         if self.drafter is None:
             return 0
         return self.drafter.memory_bytes(self.sequences, self.capacity) + self.drafter.working_bytes()
+
+    def _recorded_bytes(self) -> int:
+        """What this session's recorded step adds to the need of a run, in bytes; 0 for a session that records none
+        (``recordable``) and for a family that states no such figure (``recorded_step_bytes``)."""
+        count = getattr(self.model, "recorded_step_bytes", None)
+        return count(self.sequences) if self.capture and count is not None and not self.recordable() else 0
 
     def _tables(self) -> str:
         """The served-by table of this session's step; for a session built with ``draft_tokens=`` the table of its verify
@@ -848,6 +880,7 @@ class Session:
             self.record.accepted_all.clear()
             if self.prompt_record is not None:
                 self.prompt_record.count, self.prompt_record.prompt = 0, None
+        self.tail = None
         steps = self.record_steps if recorded else 0
         if self.record.inputs.shape[0] != steps:  # a request that keeps nothing, or the first one behind it that records again
             self.record, self.prompt_record = self._record(steps), self._prompt_record(steps)
@@ -942,13 +975,15 @@ class Session:
         seconds = now() - started
         pool = max(torch.cuda.memory_reserved(self.device) - reserved, 0) if cuda else 0
         launches, differs = None, []
-        nodes = graph.nodes()
+        sites, nodes = census.expected(self.plan, self.model), graph.nodes()
         if nodes is not None:
-            launches, differs = census.recorded_launches(nodes, census.expected(self.plan, self.model), copies=1, updates=cursor.launches())
+            launches, differs = census.recorded_launches(nodes, sites, copies=1, updates=cursor.launches())
         if differs:
             graph.reset()
             raise ValueError("the recorded step does not hold the launches of the plan: " + "; ".join(differs))
-        self.recorded = Recorded(graph, state, cursor, next_ids, logits, normed, made, launches, seconds, pool)
+        planned = sum(kernel.launches for site in sites for kernel in site.kernels if kernel.relation == "exact")
+        self.recorded = Recorded(graph, state, cursor, next_ids, logits, normed, made, launches, seconds, pool, planned)
+        self.pool_bytes.append(pool)
         return ""
 
     def _replays(self) -> bool:
@@ -981,7 +1016,27 @@ class Session:
             record.accepted.append(0)
         record.count += 1
         self._calls += recorded.calls
+        self._report.replayed, self._report.launches = True, None if recorded.launches is None else recorded.launches["launches"]
         return recorded.next_ids
+
+    @property
+    def replays(self) -> bool:
+        """Whether the steps of the request this session has run were replays of its recorded step."""
+        return self._report.replayed
+
+    def read_tail(self) -> Optional[tuple]:
+        """Behind a replayed request, the step's own tail, which no recomputation from Python sees: ``(ids, rows,
+        position)`` -- whether the ids buffer holds the ids the last replay chose (its own copy of them), whether the
+        position rows stand at the state's position (its own adds), and that position.  Kept on the session
+        (``tail``) for the checks' line; ``None`` where the request was not replayed.  Host reads: behind a request,
+        in front of anything that replays again."""
+        recorded = self.recorded
+        if not self.replays or recorded is None or recorded.state is not self.state:
+            return None
+        cursor = recorded.cursor
+        ids = bool(recorded.chosen) and cursor.ids.tolist() == recorded.next_ids.tolist()
+        self.tail = (ids, cursor.position == self.state.position and cursor.holds(), self.state.position)
+        return self.tail
 
     # ------------------------------------------------------------------ run
     def _call(self, name: str, layer: int, *operands):
@@ -1266,6 +1321,11 @@ class Session:
         recorded verify steps with their kept counts under it.  The launch records are those of verify steps alone, held
         against the verify plan; the kernels of the prompt's decode steps are not observed.
 
+        On a session that replayed its request the pass runs ``REPLAYED_TRACED`` steps more: the first traced steps
+        again as replays of the recorded step, on the run's own state from zero (saved before, written back after).
+        The report then has the GPU-busy figure and the launches of both forms (``Trace.replayed``), and the launch
+        records of the replays are kept beside those of the steps launched from Python (``Traced.replayed``).
+
         With a drafter a traced step is the step ``speculate`` runs, fed the recorded drafted tokens: the passes, the
         window, the verify step and the pair, ended by the host read of the pair.  The sites of such a step are, for
         every pass, the drafter's wiring with the pass's number in the place of the layer, then the model's.  The passes
@@ -1289,6 +1349,14 @@ class Session:
         inputs, accepted, calls = self.record.inputs[:count], list(self.record.accepted[:count]), self._calls
         kept = (self.state, self.record, self.prompt_record)
         prompt = None if self.prompt_record is None else self.prompt_record.prompt
+        # a session that replayed its request: the first of the traced steps once more as replays, in the same pass, on the
+        # run's own state -- the one the sequence was recorded on -- from zero; what that state held is saved and written back
+        own, live = self.state, self.recorded
+        tail = min(REPLAYED_TRACED, count) if self.replays and live is not None and live.state is own else 0
+        saved = own.snapshot() if tail else None
+        if tail:  # in front of the profiler: the traced replays then hold a step's launches and nothing of this
+            own.clear()
+            live.cursor.set(0)
         self.state = self._fresh_state()
         self.record = self._record(0)
         self.prompt_record = self._prompt_record(0)
@@ -1296,6 +1364,10 @@ class Session:
         launches: list = []
 
         def step(i: int) -> None:
+            if i >= count:  # the tail: step ``i - count`` again, by replay, ended by its host read
+                self.state, self._call_log = own, None
+                self._replay(inputs[i - count]).tolist()
+                return
             if records:
                 self._call_log = []
                 call_log.append(self._call_log)
@@ -1311,14 +1383,19 @@ class Session:
                     # ... ended as the loop ends a prompt, by the host read of its last ids: none of its kernels is in flight when the window opens
                     if t + 1 == prompt.shape[1]:
                         next_ids.tolist()
+            more = {"tail": tail} if tail else {}  # a pass without replays is asked for as it always was
             if records:
-                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device, records=launches)
+                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device, records=launches, **more)
             else:
-                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device)
+                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device, **more)
         finally:
             (self.state, self.record, self.prompt_record), self._calls, self._call_log = kept, calls, None
+            if saved is not None:
+                own.restore(saved)
         if records:
-            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens)
+            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens, **more)
+            if tail:  # what the recorded step launches behind its blocks: the copy of the chosen ids, the position updates
+                self.traced.own_tail = (1, live.cursor.launches())
 
     def trace_request(self, step, steps: int) -> None:
         """The traced steps of a request that is running (the performance mode's traced request): ``step(i)`` for ``i`` in

@@ -69,6 +69,14 @@ run prints the kernel the library launched on the block's own line of the check 
 such a row beyond that is the sample's own: the form it passes (item 0), the library's version (the adapter's), and the
 block's output inside its band.
 
+**A recorded step.**  A session that records its decode step once and replays it traces a few steps a second time, as
+replays, behind the steps launched from Python (``Traced.replayed``).  A replay runs no Python, so it has no call log and
+is held to nothing a row states; it is held to the traced step launched from Python at the same place of the run
+(:func:`recorded_step`): the sequence's own records -- those that carry its graph id -- are that step's kernels and
+copies in its order, each with its name and launch shape, and behind them the step's own tail and nothing else: the
+copy of the chosen ids and the position updates.  A launch that left the sequence, one more, two exchanged or another
+launch shape fails with its sentence; records without a graph id are reported as not observed.
+
 A session with a drafter traces whole steps of speculative decoding: the sites of such a step are, for every draft
 pass, the drafter's wiring with the pass's number in the place of the layer (:func:`passes`), then the model's.
 
@@ -725,6 +733,70 @@ def _sequence_sentences(planned, found, anchors, sites, records) -> List[str]:
     return sentences
 
 
+def _launched(record: Launch) -> tuple:
+    """A launch record as two launch lists are compared on it: a copy as a copy in either spelling, a kernel by its name,
+    its grid, its block and its shared memory."""
+    if canonical(record) == COPY:
+        return (COPY,)
+    return (record.name, record.grid, record.block, record.shared_memory)
+
+
+def _worded(key: tuple) -> str:
+    """Such a record in a sentence: its name and, where the record carries one, its launch shape."""
+    if key == (COPY,):
+        return "a copy"
+    name, *shape = key
+    return _short(name, 72) + (f" ({shape_text(shape)})" if None not in shape else "")
+
+
+def recorded_step(python: Sequence[Sequence[Launch]], replayed: Sequence[Sequence[Launch]], copies: int = 1, updates: int = 3) -> Tuple[str, str]:
+    """A recorded step against the same step launched from Python: ``(PASS | FAIL | NOT OBSERVED, the line's text)``.
+    ``python[i]`` and ``replayed[i]`` are the launch records of step ``i`` of a traced pass in the two forms, each ended by
+    its host read.  Of a replayed step the records that carry a graph id are the sequence's own; whatever else it
+    holds was issued from Python around the replay (the copy of the ids it is fed, the host read) and is not compared.
+
+    Held, step by step: the sequence's records are the kernels and copies of the step launched from Python -- everything
+    in front of its host read -- in its order, each with its name, grid, block and shared memory, a copy as a copy in
+    either spelling; and behind them stands the recorded step's own tail and nothing else: ``copies`` copies (of the
+    chosen ids) and ``updates`` kernels of PyTorch's (the position updates).  The first difference is the sentence."""
+    count = len(replayed)
+    head = f"the recorded step: {count} replayed step{'s' if count != 1 else ''}"
+    if not count or len(python) < count:
+        return (
+            NOT_OBSERVED,
+            f"{head}: not observed: the pass holds {len(python)} step{'s' if len(python) != 1 else ''} launched from Python to hold them against",
+        )
+    planned = 0
+    for index, (step, again) in enumerate(zip(python, replayed)):
+        want = [_launched(record) for record in step[:-1]]  # everything in front of the host read
+        inside = [record for record in again if record.graph[0]]
+        if not inside:
+            return NOT_OBSERVED, f"{head}: not observed: the profiler's records of a replayed step carry no graph id"
+        got = [_launched(record) for record in inside]
+        blocks, own = got[: len(want)], inside[len(want) :]
+        where = f"replayed step {index}"
+        if blocks != want:
+            at = next((i for i, (a, b) in enumerate(zip(blocks, want)) if a != b), min(len(blocks), len(want)))
+            if at >= len(blocks):
+                return (
+                    FAIL,
+                    f"{head}: {where} holds {len(got)} launches where the step launched from Python has {len(want)}: it ends in front of {_worded(want[at])}",
+                )
+            return FAIL, f"{head}: {where} launches {_worded(blocks[at])} at launch {at}, where the step launched from Python launches {_worded(want[at])}"
+        tail = [canonical(record) for record in own]
+        if tail != [COPY] * copies + ["pytorch"] * updates:
+            found = ", ".join(_worded(_launched(record)) for record in own) or "nothing"
+            return FAIL, (
+                f"{head}: behind the {len(want)} launches of the step launched from Python {where} holds {found}, where the recorded step has "
+                f"{copies} cop{'ies' if copies != 1 else 'y'} of the chosen ids and {updates} position updates"
+            )
+        planned = len(want)
+    return PASS, (
+        f"{head} launch the {planned} kernels and copies of the same steps launched from Python, in their order and launch shapes, and behind them "
+        f"{copies} cop{'ies' if copies != 1 else 'y'} of the chosen ids and {updates} position updates"
+    )
+
+
 # ---------------------------------------------------------------------------------------------------------- a traced pass
 @dataclass
 class Traced:
@@ -741,17 +813,36 @@ class Traced:
     unobserved: str = ""  # the reason of NOT OBSERVED
     differences: int = 0  # the lines judge() returned
     result: Optional[Comparison] = None
+    #: of a session that replays its step: the launch records of the first traced steps run once more as replays, step by
+    #: step, and what the recorded step launches behind its blocks, ``(copies, updates)``
+    replayed: Optional[List[List[Launch]]] = None
+    own_tail: Tuple[int, int] = (1, 3)
 
     @classmethod
-    def of(cls, sites, call_log, records: Sequence[Launch], count: int, missing: str, rows: int) -> "Traced":
-        """From the launch records of a pass of ``count`` steps (``records`` empty: ``missing`` says why)."""
+    def of(cls, sites, call_log, records: Sequence[Launch], count: int, missing: str, rows: int, tail: int = 0) -> "Traced":
+        """From the launch records of a pass of ``count`` steps (``records`` empty: ``missing`` says why); ``tail``: the steps
+        the pass ran behind them as replays of a recorded step, whose records are kept apart (``replayed``)."""
+        replayed = [] if tail else None  # of a pass that replayed steps and has no records of them: its line says not observed
         if not records:
-            return cls(sites, call_log, missing=missing or "the profiler recorded no kernel activity on this GPU", rows=rows)
+            return cls(sites, call_log, missing=missing or "the profiler recorded no kernel activity on this GPU", rows=rows, replayed=replayed)
         steps, _ = split_steps(records)
-        if len(steps) != count:  # a block read the device inside a step: an undeclared copy, and no step can be told from the next
-            undeclared = f"the records show {len(steps)} host reads for {count} traced steps"
-            return cls(sites, call_log, undeclared=undeclared, rows=rows)
-        return cls(sites, call_log, steps, rows=rows)
+        if len(steps) != count + tail:  # a block read the device inside a step: an undeclared copy, and no step can be told from the next
+            undeclared = f"the records show {len(steps)} host reads for {count + tail} traced steps"
+            return cls(sites, call_log, undeclared=undeclared, rows=rows, replayed=replayed)
+        return cls(sites, call_log, steps[:count], rows=rows, replayed=steps[count:] if tail else None)
+
+    def recorded_step(self) -> Tuple[str, str]:
+        """The line of the recorded step under the kernel check, ``(PASS | FAIL | NOT OBSERVED, its text)``: the replayed
+        steps of this pass against the traced steps launched from Python (:func:`recorded_step`).  ``("", "")`` for a
+        pass that replayed nothing."""
+        if self.replayed is None:
+            return "", ""
+        if self.steps is None:
+            return (
+                NOT_OBSERVED,
+                f"the recorded step: not observed: {self.unobserved or self.missing or 'the launch records cannot be cut into the traced steps'}",
+            )
+        return recorded_step(self.steps, self.replayed, *self.own_tail)
 
     def judge(self) -> Tuple[str, List[str]]:
         """Run the kernel check on this pass: ``(PASS | FAIL | NOT OBSERVED, the lines under the check's own line)``.  Where the

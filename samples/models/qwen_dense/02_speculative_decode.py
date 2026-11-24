@@ -10,7 +10,14 @@ keeps them.  Every token after the first is a greedy token of a verify step; the
 keeps, never which.  Every block of the drafter is a reference chain in every stack (its embedding lookup is PyTorch's
 gather): this script states no speed and prints no rate.
 
-The default run needs no checkpoint and no extra package: the reduced seeded model with its seeded drafter.  Seeded
+The stack of the model's blocks is ``native`` unless ``--stack`` names another, as in ``00_decode.py``: the verify step and
+the prompt's decode steps on kernels of cuDNN Frontend and of FlashInfer.  A package that stack calls that is not
+installed stops the run before anything is loaded (``[02] ERROR``, one line that names the package, exit code 1); the
+other stacks are for functional validation and are taken by ``--stack`` alone.  A step of speculative decoding is not
+recorded as a launch sequence: the drafter's passes run on reference blocks, which a recorded sequence cannot hold, so
+every step of this script is launched from Python, and a run says so in one line.
+
+The default run needs no checkpoint: the reduced seeded model with its seeded drafter.  Seeded
 weights draft nothing a model accepts, so the run schedules: a plain session decodes the token stream first, and the
 drafted tokens of every step are replaced by that stream's tokens for 0, 1, .., 5 positions in turn and by another token
 behind them (the drafter still runs every pass; the kept count is the comparison's, never the schedule's).  The run is held
@@ -32,8 +39,8 @@ ignored, because each selects what is launched.  ``--messages``, ``--max-tokens`
 ``00_decode.py``.
 
     python samples/models/qwen_dense/02_speculative_decode.py
-    python samples/models/qwen_dense/02_speculative_decode.py --stack native      # the verify step on the stack's kernels
-    python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native \\
+    python samples/models/qwen_dense/02_speculative_decode.py --stack fe-entries  # a functional-validation stack: no package beyond cuDNN Frontend and PyTorch
+    python samples/models/qwen_dense/02_speculative_decode.py --model /data/Qwen3.8-27B-NVFP4 \\
         --speculative-config '{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}' \\
         --draft-vocab draft_vocab.json --messages request.json --max-tokens 256 > answer.txt
 """
@@ -58,7 +65,10 @@ for _path in (_HELPERS, _HERE):  # and this folder: serving_options, the module 
 import serving_options  # noqa: E402  the standard library only: cudnn and PyTorch are imported in main(), in their order
 
 TAG = "[02]"
-STACKS = ("fe-cublas", "native", "fe-entries", "reference")
+#: the sample's stack, the default of every run; and the stacks an explicit ``--stack`` names, for functional validation
+SAMPLE_STACK = "native"
+VALIDATION_STACKS = ("fe-entries", "fe-cublas", "reference")
+STACKS = (SAMPLE_STACK, *VALIDATION_STACKS)
 DEFAULT_PROMPT = "Why is the sky blue?"
 CHECKED_PROMPT_STEPS = 16  # with a checkpoint: the prompt steps under the block check; the others are replayed in front of the steps
 CHECKED_STEPS = 8  # ... and the steps of speculative decoding under it
@@ -106,7 +116,9 @@ def _ids_hash(ids) -> str:
 
 
 EPILOG = """\
-The default run needs no checkpoint and no extra package; it needs a GPU of compute capability 10.x or 12.x.
+The stack of every run is native unless --stack names another; a package it calls that is not installed stops the run
+with an ERROR that names it (00_decode.py --help has the command).  Every step of this script is launched from Python.
+The default run needs no checkpoint; it needs a GPU of compute capability 10.x or 12.x.
 With --model: pip install -r samples/models/requirements.txt first, and a draft vocabulary (--draft-vocab FILE).  The
 checkpoint is your own download (nothing is fetched).  With the 27B checkpoint, a list of 65,536 ids and the default
 context length a run asks for about 61 GiB of free GPU memory on the stack fe-cublas (about 64 GiB on compute capability
@@ -187,11 +199,12 @@ def _arguments(argv):
     parser.add_argument("--layers", type=int, default=None, metavar="N", help="layers of the reduced model (default 2); not with --model")
     parser.add_argument(
         "--stack",
-        default="fe-cublas",
+        default=SAMPLE_STACK,
         choices=STACKS,
-        help="the stack of the MODEL's blocks, as in 00_decode.py: fe-cublas (default), native (the verify step and the prompt's decode "
-        "steps on the stack's kernels, a block no kernel serves on its fallback row; the kernel check always on), fe-entries, reference "
-        "(every block in PyTorch).  The drafter's blocks are reference chains in every stack",
+        help="the stack of the MODEL's blocks, as in 00_decode.py: native (default: the verify step and the prompt's decode steps on the "
+        "stack's kernels, a block no kernel serves on its fallback row; the kernel check always on; a package it calls that is not "
+        "installed stops the run), or a functional-validation stack: fe-entries, fe-cublas, reference (every block in PyTorch).  The "
+        "drafter's blocks are reference chains in every stack, and every step of this script is launched from Python",
     )
     parser.add_argument(
         "--provider",
@@ -247,6 +260,17 @@ def _arguments(argv):
         parser.error("--layers, --max-tokens, --max-model-len and --force-tokens take positive integers")
     args.layers = 2 if args.layers is None else args.layers
     return args
+
+
+def _launch_line(session, stack: str) -> str:
+    """The one line a run prints behind its load: its steps are launched from Python, and why -- the stack is one for
+    functional validation, or the session's own reason (a step of speculative decoding is not recorded)."""
+    if stack in VALIDATION_STACKS:
+        return (
+            f"launched from Python: {stack} is a functional-validation stack, taken by --stack alone -- what the checks compare against, "
+            f"no step recorded, no speed stated; the sample's stack is {SAMPLE_STACK}"
+        )
+    return f"launched from Python: {session.recordable()}"
 
 
 def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str:
@@ -376,7 +400,7 @@ def main(argv=None) -> int:
         _say(f"{TAG} SKIP needs nvidia-cudnn-frontend and PyTorch ({error}): see samples/models/README.md")
         return 0
     from model_samples import Checkpoint, EnvironmentMismatch, Session, StopRule, TextIO, census, check_environment, loop, sampling, tie_out
-    from model_samples.blocks import DeviceFacts, parse_overrides
+    from model_samples.blocks import DeviceFacts, MissingPackage, parse_overrides
     from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
 
     if not torch.cuda.is_available():
@@ -441,9 +465,7 @@ def main(argv=None) -> int:
     what = checkpoint.summary() if real else "reduced model: " + "; ".join((*model.reductions, scheduled))
     _say(f"{TAG} {model.name} speculative decode | {what} | the drafter runs on reference blocks")
     plural = "s" if drafted > 1 else ""
-    _say(
-        f"{TAG} {facts.name} ({facts.class_text}, {facts.sm_count} SMs) | 1 sequence, {drafted} drafted token{plural} a step | stack {args.stack} | launched from Python, not captured"
-    )
+    _say(f"{TAG} {facts.name} ({facts.class_text}, {facts.sm_count} SMs) | 1 sequence, {drafted} drafted token{plural} a step | stack {args.stack}")
     if real:
         _say(f"{TAG} {text.name}")
         _say(f"{TAG} {serving_options.greedy_line(text.generation_defaults)}")
@@ -507,6 +529,9 @@ def main(argv=None) -> int:
             _say(f"{TAG} planning: {note}", flush=True)
         tables = [plain.plan_table([session]), session.plan.table(), loop.PROMPT_ROWS, session.prefill_plan.table()]
         tables += [loop.DRAFTER_ROWS.format(calls=drafter.calls_per_pass()), session.draft_plan.table()]
+    except MissingPackage as error:  # a package the stack calls is not installed: the run stops here, and no other stack takes its place
+        _say(f"{TAG} ERROR the stack {args.stack} cannot run: {error}")
+        return 1
     except NotImplementedError as error:
         _say(f"{TAG} SKIP {error}")
         return 0
@@ -533,6 +558,7 @@ def main(argv=None) -> int:
     session.load()  # the drafter is loaded here, with the model's embedding table
     _say(f"{TAG} {plain.stages.line()}")
     _say(f"{TAG} the session with the drafter: {session.stages.line()}")
+    _say(f"{TAG} {_launch_line(session, args.stack)}")
     if session.check_kernels:  # second part: what the entries, now built, state about their launches
         _say(census.stated(session.plan))
 

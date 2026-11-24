@@ -989,6 +989,35 @@ def on_demand_line(cost: OnDemand, blocks=()) -> str:
     )
 
 
+def recomputed_text(steps: int, prompt_tokens: int, page: Optional[int] = None) -> str:
+    """What the ``recorded step`` line of a replayed run says was recomputed: the replayed steps at positions 0 to ``steps -
+    1`` launched again from Python from a fresh state, with what those positions are -- the prompt positions among them,
+    the steps behind the prompt, which feed on their own token, and whether they cross the first page boundary of the
+    attention cache (``page``: its positions; ``None``: a cache without pages)."""
+    prompt = min(prompt_tokens, steps)
+    parts = [f"{prompt} prompt position{'s' if prompt != 1 else ''}"]
+    if steps > prompt:
+        own = steps - prompt
+        parts.append(f"{own} step{'s' if own != 1 else ''} that feed{'s' if own == 1 else ''} on {'its' if own == 1 else 'their'} own token")
+    if page is not None and steps > page:
+        parts.append(f"across the page boundary at position {page}")
+    return f"the replayed steps at positions {positions_text(range(steps))} ({', '.join(parts)}) launched again from Python from a fresh state"
+
+
+def tail_line(tail: Optional[tuple]) -> Tuple[bool, str]:
+    """The line under ``recorded step``: what ``Session.read_tail`` read behind the replayed request -- ``(held, text)``.  A
+    request whose tail was not read holds nothing: the part of a recorded step no recomputation from Python sees was
+    then not looked at, and the line fails."""
+    if tail is None:
+        return False, "the step's own tail was not read behind the request (Session.read_tail): the ids buffer and the position rows were not held"
+    ids, rows, position = tail
+    buffer = "held the last chosen ids" if ids else "did NOT hold the last chosen ids"
+    stood = (
+        f"stood at position {position}, where the request left the state" if rows else f"did NOT stand at position {position}, where the request left the state"
+    )
+    return bool(ids and rows), f"behind the request the ids buffer {buffer} and the position rows {stood}"
+
+
 def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
     """The kernel check on what the session's traced pass kept: ``(PASS | FAIL | NOT OBSERVED, why not observed, lines)``.  A
     session whose traced pass kept no launch records (it was not asked to) has observed nothing."""
@@ -999,6 +1028,11 @@ def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
     status, sentences = traced.judge()
     lines = [f"  kernels           {traced.summary()}    {status}"]
     lines += [f"    kernels: {sentence}" for sentence in sentences]
+    recorded, text = traced.recorded_step()  # of a session that replays its step: the replayed steps against those launched from Python
+    if recorded:
+        lines.append(f"    {text}    {recorded}")
+        if recorded == census.FAIL:
+            status = census.FAIL
     lines += [f"    {detail}" for detail in traced.details()]
     return status, traced.unobserved if status == census.NOT_OBSERVED else "", lines
 
@@ -1059,6 +1093,7 @@ def run_checks(
     kernels: Optional[object] = None,  # True | False | DEFERRED; None: the session's own decision
     max_prompt_steps: Optional[int] = None,
     positions: Optional[Sequence[int]] = None,
+    reach: Optional[int] = None,
 ) -> Checks:
     """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded: its recorded steps, or the first
     ``max_steps`` of them (a long run of a deep model is checked on its first steps).  Leaves the session reset.
@@ -1079,6 +1114,20 @@ def run_checks(
     line of the checks then names the positions, and ``Checks.positions`` holds them: what was judged, for a caller that
     says so.  A position the run did not record is a ``ValueError``, never left out; so is a session built with
     ``draft_tokens=``.
+
+    ``reach`` is for a run whose steps were replays of a recorded step (``Session.replays``): the recorded run is launched
+    again from Python up to that step (exclusive) -- past ``max_steps``, which stays the bound of the block check and
+    of the reference stack's own pass -- and every step of it is held to what the replay left, ids and logits, byte
+    for byte.  So the recomputation can reach steps that feed on their own token and a page boundary of the attention
+    cache where the block check covers the first steps alone; it ends at the last recorded step where the run
+    recorded fewer.
+
+    **A run that replayed its steps** has another first check line, named for what it is: ``recorded step``, the replayed
+    steps launched again from Python from a fresh state, with the positions that were recomputed and, where it fails,
+    the first step that differs; and under it the step's own tail, read behind the request (``Session.read_tail``):
+    the ids buffer held the last chosen ids and the position rows stood where the request left the state.  A recorded
+    step that does not compute what the same steps compute from Python fails the run.  The recomputation, the block
+    check, the reference passes and the traced steps the kernel check judges are all launched from Python.
 
     ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
     reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
@@ -1112,6 +1161,9 @@ def run_checks(
     if judged_at and not 0 <= min(judged_at) <= max(judged_at) < last:  # a position that was asked for is judged, or the run says no
         raise ValueError(f"judged positions {positions_text(judged_at)}: the run recorded {last} steps, the positions 0 to {last - 1}")
     last = steps if judged_at is None else max(steps, max(judged_at, default=-1) + 1)
+    if reach is not None:  # the recomputation of a replayed run reaches further than its block check; never past what was recorded
+        last = max(last, min(int(reach), main.count, main.inputs.shape[0]))
+    replays, tail = session.replays, session.tail  # read now: the session is reset below
     inputs, logits, ids = main.inputs[:last].clone(), main.logits[:last].clone(), main.outputs[:last].clone()
     accepted = list(main.accepted[:last])  # per step the tokens behind the first that the run kept: 0 for a decode step
     proposals = None if main.proposals is None else main.proposals[:steps].clone()  # of a session with a drafter: what it proposed
@@ -1167,13 +1219,17 @@ def run_checks(
             session.tap = prompt_tap if t < judged_prompt else None
             prompt_tap.step = t
             session._feed(prompt[:, t].contiguous())
-        for t in range(last):  # every step replayed; the blocks judged at every one, or at the judged positions alone
-            session.tap = tap if judged_at is None or t in judged_at else None
+        for t in range(last):  # every step again, from Python; the blocks judged at the first ``steps``, or at the judged positions alone
+            session.tap = tap if (t < steps if judged_at is None else t in judged_at) else None
             tap.step = t
             session._advance(inputs[t], accepted[t])
     finally:
         session.tap = None
     replay_ok = bytes_equal(session.record.logits[:last], logits) and bytes_equal(session.record.outputs[:last], ids)
+    # of a replayed run, the first step whose recomputation from Python is not what the replay left
+    first_wrong = None
+    if replays and not replay_ok:
+        first_wrong = next(t for t in range(last) if not (bytes_equal(session.record.logits[t], logits[t]) and bytes_equal(session.record.outputs[t], ids[t])))
     logits, ids = logits[:steps], ids[:steps]  # the reference stack's own pass stays on the first ``steps``
     if proposals is not None:  # ... and what the drafter proposed in front of every step
         replay_ok = replay_ok and bytes_equal(session.record.proposals[:steps], proposals)
@@ -1240,7 +1296,17 @@ def run_checks(
         lines[0] = lines[0][:-1] + f"; behind a prompt of {fed} decode steps{some})"
         taps = [("the prompt's decode steps: ", prompt_tap), ("the verify steps: ", tap)]
     what = "ids and logits" if proposals is None else "ids, logits and the drafter's proposals"
-    lines.append(f"  replay            {what} byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
+    tail_ok = True
+    if replays:  # the record came out of replays: the line says what it holds, and the step's own tail stands under it
+        page = session.cache_page()
+        lines.append(
+            f"  recorded step     {recomputed_text(last, prompt_tokens, page)}: ids and logits byte-identical    {_verdict(replay_ok)}"
+            + ("" if replay_ok else f" (first at step {first_wrong})")
+        )
+        tail_ok, text = tail_line(tail)
+        lines.append(f"                    {text}    {_verdict(tail_ok)}")
+    else:
+        lines.append(f"  replay            {what} byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
     blocks_ok, judged = True, 0
     for what, each in taps:
         held, count, block_lines = _block_lines(each, session.reference_precision, what)
@@ -1268,7 +1334,7 @@ def run_checks(
                 f"    the prompt's decode steps: {fed} replayed in front of the traced window, their kernels not observed (the check is of the verify steps)"
             )
     session.reset(fresh=True)
-    ok = replay_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
+    ok = replay_ok and tail_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
     return Checks(lines, ok, judged, status, unobserved, cost, tuple(sorted(judged_at or ())))
 
 

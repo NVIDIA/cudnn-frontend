@@ -21,12 +21,14 @@ git clone https://github.com/NVIDIA/cudnn-frontend && cd cudnn-frontend
 python -m pip install --upgrade pip      # --group needs pip 25.1 or newer
 pip install --group torch
 pip install -e .                         # a minute or two; deprecation warnings of the build backend are expected
+pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt   # the kernel library the sample's stack calls
+pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt
 python samples/models/qwen_dense/00_decode.py
 ```
 
-The default run needs no checkpoint and no extra package. It ends in `[00] PASS`, or in `[00] SKIP` followed by the requirement, with exit code 0, on a GPU, a library version or a free-memory budget it does not serve. So does `python samples/models/qwen_dense/02_speculative_decode.py`, with the tag `[02]`. The fused linear-attention step serves compute capability 10.x and 12.x.
+The default run needs no checkpoint. Its stack is `native`: every block of a decode step is a kernel entry of cuDNN Frontend or a call of a kernel library, FlashInfer, and the step is recorded once as a launch sequence and replayed for every token. Where a package of that stack is not installed the run stops before anything is loaded with `[00] ERROR`, one line that names the package and the command that installs it; no other stack takes its place. It ends in `[00] PASS`, or in `[00] SKIP` followed by the requirement, with exit code 0, on a GPU, a library version or a free-memory budget it does not serve. So does `python samples/models/qwen_dense/02_speculative_decode.py`, with the tag `[02]`. The fused linear-attention step serves compute capability 10.x and 12.x.
 
-To run a checkpoint from local disk, install the sample-only packages, fetch the checkpoint and pass its directory. The sample downloads nothing: fetching a checkpoint is your own step, and its weights carry their own licence. The checkpoint the sample was last run with is `nvidia/Qwen3.8-27B-NVFP4` on the Hugging Face hub, a checkpoint of this architecture: 22 GB of disk, and on the stack `fe-cublas` a GPU of compute capability 10.x or 12.x with about 57 GiB of free memory. The run below takes about two and a half minutes.
+To run a checkpoint from local disk, install the sample-only packages, fetch the checkpoint and pass its directory. The sample downloads nothing: fetching a checkpoint is your own step, and its weights carry their own licence. The checkpoint the sample was last run with is `nvidia/Qwen3.8-27B-NVFP4` on the Hugging Face hub, a checkpoint of this architecture: 22 GB of disk, and a GPU of compute capability 10.x with about 28 GiB of free memory on compute capability 10.0.
 
 ```bash
 pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safetensors; brings the hf command
@@ -48,7 +50,7 @@ On standard error, in this order (standard output carries the generated text of 
 - **Steps**: period, time in the step, turnaround; from one traced pass of 32 steps under the profiler: GPU busy, idle inside the step, host-exposed time, kernel launches per step; the bytes a step moves against the bytes the model needs in its stored formats.
 - **Text out** and the **checks**: replay, every provider block against the reference, the greedy tokens (judged against a declared band on the seeded model, reported on a checkpoint), each sequence alone against the same sequence in a batch.
 
-The stack of the first sample, `fe-cublas`, is a reference path: every quantised weight is held as a bf16 copy and every launch is issued from Python. Its timings are for orientation only; performance numbers are published through the formal mode of the `benchmark/` folder.
+The other stacks of the sample are for functional validation and are taken by an explicit `--stack` alone: `fe-entries` runs the cuDNN Frontend entries without the library, `fe-cublas` holds every quantised weight as a bf16 copy and multiplies on cuBLAS, `reference` is every block in PyTorch; each is launched from Python and says so in one line of its run. Timings printed by a sample are for orientation only; performance numbers are published through the formal mode of the `benchmark/` folder.
 
 ## Tests
 

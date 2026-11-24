@@ -1083,7 +1083,7 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert not any("flashinfer." in row.key for _, _, _, row, _ in _plan(1, 6, "fe-entries")[0].parts())
     assert (
         "In `fe-entries`, the attention core, the attention layers' out-projection and the MLP's down multiply, which "
-        "`native` runs on the library's kernels. A captured verify step." in section
+        "`native` runs on the library's kernels. A recorded verify step: only the plain decode step is recorded and replayed." in section
     )
     assert "at every step shape that ran --" not in section, "16 sequences of three, four and five tokens ran too, and their kept state was not gated"
     in_projection = "projection.fp8.in"

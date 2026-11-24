@@ -11,6 +11,8 @@ the run.  Nothing is chosen at run time and nothing falls back on failure:
 
 * ``NotImplementedError`` from a selection or from ``Block.check_support`` means "not served here": the sample prints
   ``[NN] SKIP <sentence>`` and exits 0;
+* :class:`MissingPackage`, a ``NotImplementedError`` of its own kind, means that a package the stack calls is not
+  installed: nothing takes the place of the stack, so a sample stops there with ``[NN] ERROR`` and exit code 1;
 * ``ValueError`` means the caller violated a contract (an unknown stack, a provider key that is not a declared row).
 
 The stack is explicit (``"fe-cublas"``, ``"native"``, ``"fe-entries"``, ``"reference"``): a row outside the requested stack is
@@ -38,6 +40,17 @@ from typing import Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple,
 from .census import Kernel
 
 GIB = 1024**3
+
+
+class MissingPackage(NotImplementedError):
+    """A package that a block of the plan calls is not installed (``package``: its distribution's name).  Its sentence names
+    the package and the command that installs it.  It is a ``NotImplementedError``, so whoever plans without running
+    reads it as any decline of the installation; a sample that was asked to run the stack stops on it -- before
+    anything is loaded, with the sentence and a non-zero exit code -- because no other stack takes that stack's place."""
+
+    def __init__(self, sentence: str, package: str):
+        super().__init__(sentence)
+        self.package = package
 
 
 @dataclass(frozen=True)

@@ -99,6 +99,7 @@ import re
 import sys
 from typing import Dict, Optional, Tuple
 
+from ..blocks import MissingPackage
 from ..census import FAMILIES, Kernel
 from ..state import PagedKvCache, PageTable
 from ..weights import BLOCK, BlockScaledTensor, Dequantized, ScaledTensor, TiledBlockScaledTensor, TiledBlockScaledWeight, tile_scales
@@ -168,12 +169,14 @@ def installed() -> Optional[str]:
 
 
 def check_package(entry: str) -> str:
-    """The validated version that is installed.  ``NotImplementedError`` (a SKIP) for a missing package and for a version
-    that is not validated: the sentence names it, the fix and the stack that runs without the package."""
+    """The validated version that is installed.  ``NotImplementedError`` for a missing package and for a version that is
+    not validated: the sentence names it, the fix and the stack that runs without the package.  A missing package is
+    the ``MissingPackage`` of that kind -- a sample that runs the stack stops on it; a version that is not validated is
+    a SKIP."""
     version, validated = installed(), " or ".join(VALIDATED)
     fix = f"pip install -c {CONSTRAINTS} -r {REQUIREMENTS}"
     if version is None:
-        raise NotImplementedError(f"{entry} needs {DISTRIBUTION} {validated}, which is not installed: {fix}; {WITHOUT}")
+        raise MissingPackage(f"{entry} needs {DISTRIBUTION} {validated}, which is not installed: {fix}; {WITHOUT}", DISTRIBUTION)
     if version not in VALIDATED:
         raise NotImplementedError(
             f"{entry} needs {DISTRIBUTION} {validated}, the version this stack was run and checked with; this is {version}: {fix}; {WITHOUT}"
@@ -289,6 +292,17 @@ def missing_binaries(entry: str, found: str) -> str:
             f"package: {BINARIES_INSTALL}; {WITHOUT}"
         )
     return f"{entry} needs the kernel-binary package {BINARIES_DISTRIBUTION} {' or '.join(VALIDATED)}, which is not installed: {BINARIES_INSTALL}; {WITHOUT}"
+
+
+def binaries_decline(sentence: str) -> NotImplementedError:
+    """The exception of a run whose kernel binaries are not on the machine, with the sentence of ``missing_binaries``: the
+    ``MissingPackage`` where the installation holds no kernel-binary package at all -- neither its distribution nor its
+    module -- and names no directory in its place; a plain ``NotImplementedError`` (a SKIP) for every other state: a
+    package or a directory that is there and does not hold what its manifest lists."""
+    version, module = binaries_package()
+    if version is None and not module and not os.environ.get(BINARIES_DIRECTORY):
+        return MissingPackage(sentence, BINARIES_DISTRIBUTION)
+    return NotImplementedError(sentence)
 
 
 def kernel_set(header: str, family: "re.Pattern", cc: Tuple[int, int]) -> Dict[str, str]:
@@ -517,7 +531,11 @@ class LibraryBlock(BlockBase):
         except (TypeError, ValueError, NotImplementedError):
             raise
         except Exception as error:  # noqa: BLE001 -- whatever keeps the library from importing, building or launching: the installation's
-            raise NotImplementedError(self._unavailable(error)) from None
+            raise self._decline(error) from None
+
+    def _decline(self, error: Exception) -> NotImplementedError:
+        """What ``_reach`` raises for whatever kept the library from its first use: the SKIP of ``_unavailable``."""
+        return NotImplementedError(self._unavailable(error))
 
     def _unavailable(self, error: Exception) -> str:
         """The sentence of the SKIP for what kept the library from its first use: the type of the exception, never its text."""
@@ -815,7 +833,14 @@ class DecodeAttentionBlock(LibraryBlock):
             self._first = False
         found = hold_binaries(folder, dict(FAMILIES)[self.kernels[0].id], tuple(self.facts.cc), manifest)
         if found:
-            raise NotImplementedError(missing_binaries(self.entry, found))
+            raise binaries_decline(missing_binaries(self.entry, found))
+
+    def _decline(self, error: Exception) -> NotImplementedError:
+        """As for every row; a file the library did not find is the decline of ``binaries_decline``: a missing package
+        where the installation holds none."""
+        text = self._unavailable(error)
+        missing = type(error) is RuntimeError and str(error).startswith((MISSING_FILE, MISSING_KERNEL))
+        return binaries_decline(text) if missing else NotImplementedError(text)
 
     def _unavailable(self, error: Exception) -> str:
         """A file the library did not find with its download refused is the SKIP that names what is missing and the fix;

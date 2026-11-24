@@ -17,9 +17,9 @@ prompt of N tokens takes as long as N new tokens before the first new token appe
 checkpoint, on compute capability 10.0: 4.3 s for a prompt of 29 tokens on the stack `fe-cublas`, 7.8 s for the 58
 tokens of the default prompt on the cuDNN Frontend rows of the stack `native`, the rows `fe-entries` selects today
 without the attention preparation's row;
-orientation values of single runs). Both run by default on the
-stack `fe-cublas`, which is a reference path: it holds every quantised weight as a bf16 copy and issues every launch from
-Python. The second stack, `native`, runs every block on a kernel that works on the stored weights. Seven are entries of
+orientation values of single runs, each launched from Python). Both run on the sample's
+stack, `native`, unless `--stack` names another: it runs every block on a kernel that works on the stored weights, and
+the plain decode records its step once as a launch sequence and replays it for every token. Seven are entries of
 cuDNN Frontend: the fused linear-attention step, the residual add + RMSNorm + quantise in its five forms, the 8-bit
 in-projection (on compute capability 10.0), the fused 4-bit gate / up step of the MLP, the attention preparation, which
 writes the attention cache as a pool of pages, the attention gate + quantise and the 4-bit quantise in front of the
@@ -30,11 +30,16 @@ that ran, a step of the 64-layer model is 484 launches on these kernels (cuDNN F
 gather 1) and no block is on a fallback row. Every block is checked against the reference, every launch of the traced
 steps against the plan, and an entry's kernel by its name, its order, its count and the launch shape the entry itself
 states; which of its kernels the library launches for a call is the library's choice, and a run prints it.
-FlashInfer is an optional package of that stack alone; the stack `fe-entries` runs the cuDNN Frontend rows without it.
-A step of `fe-entries` is 339 launches on kernels, with 145 block calls on fallback rows.
+FlashInfer is a package of that stack: where it is not installed a run stops before anything is loaded with
+`[NN] ERROR`, one line that names the package and the command that installs it, and no other stack takes its place.
+The other stacks are for functional validation and are taken by `--stack` alone, each launched from Python:
+`fe-entries` runs the cuDNN Frontend rows without the library (a step of it is 339 launches on kernels, with 145 block
+calls on fallback rows), `fe-cublas` holds every quantised weight as a bf16 copy and multiplies on cuBLAS, `reference`
+is every block in PyTorch.
 The kernels of the attention core are precompiled binaries of the library's kernel-binary package: a run reads them
-and never fetches one. A captured decode
-step (a step recorded once and replayed without Python between its launches) follows in that stack. Speculative decoding
+and never fetches one. The decode
+step of the plain sample is recorded once and replayed without Python between its launches; `--no-capture` launches
+every block from Python, as the checks' own passes, the traced steps and the speculative sample do. Speculative decoding
 has its first pieces: the loader of the checkpoint's drafter
 (its tensors, its rows of the output head, its 8-bit weights); the drafter's draft pass on reference blocks, reached
 from the library (`QwenDenseDrafter.body`, `propose`, `draft`: every block of it a reference chain in every stack, its
@@ -80,17 +85,8 @@ pip 25.1 or newer; the pip a new virtual environment starts with is often older,
 python -m pip install --upgrade pip                # --group needs pip 25.1 or newer
 pip install --group torch
 pip install -e .                                   # a minute or two; deprecation warnings of the build backend are expected
-python samples/models/qwen_dense/00_decode.py      # 2 layers, seeded weights, self-check: no checkpoint, no extra package
-python samples/models/qwen_dense/02_speculative_decode.py   # the same model with a seeded drafter: speculative decoding, self-check
 
-# A checkpoint is your own download: the samples fetch nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
-# with about 57 GiB free; about two and a half minutes for the run below (qwen_dense/README.md has the details).
-pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safetensors: only for a checkpoint; brings the hf command
-hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
-python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-tokens 256
-python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages request.json > answer.txt   # the request body of a chat client
-
-# The stack native calls FlashInfer for three multiplies and the attention core: an optional package of that stack alone.
+# The sample's stack, native, calls FlashInfer for three multiplies and the attention core: a package of that stack.
 # The constraints pin PyTorch 2.14.0, CuTe DSL 4.8.0, FlashInfer 0.7.2.post1 and apache-tvm-ffi 0.1.11, the versions the
 # stack was last run and checked with: in an environment with another PyTorch the line replaces it and its cuDNN, so give
 # native an environment of its own (run `pip install -e .` again if pip lists nvidia-cudnn-frontend among what it installed).
@@ -98,7 +94,17 @@ pip install -c samples/models/constraints-native.txt -r samples/models/requireme
 # The kernels of the attention core are precompiled binaries: the library's kernel-binary package, at the library's own
 # version, which is published on the library's release index and not on PyPI. A run reads them and never fetches one.
 pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt
-python samples/models/qwen_dense/00_decode.py --stack native           # without the two packages, on compute capability 10.x: SKIP before anything is loaded
+# without the two packages, on compute capability 10.x: ERROR, a line that names the package, before anything is loaded
+python samples/models/qwen_dense/00_decode.py      # 2 layers, seeded weights, self-check: no checkpoint; the step recorded once and replayed
+python samples/models/qwen_dense/02_speculative_decode.py   # the same model with a seeded drafter: speculative decoding, self-check, launched from Python
+python samples/models/qwen_dense/00_decode.py --stack fe-entries   # a functional-validation stack: the cuDNN Frontend rows, no package beyond cuDNN Frontend and PyTorch
+
+# A checkpoint is your own download: the samples fetch nothing. 22 GB of disk; a GPU of compute capability 10.x with
+# about 28 GiB free on 10.0 (qwen_dense/README.md has the details).
+pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safetensors: only for a checkpoint; brings the hf command
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-tokens 256
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages request.json > answer.txt   # the request body of a chat client
 ```
 
 PyTorch warns once on stderr that NumPy is missing (`Failed to initialize NumPy`); the samples need none. On the stack
@@ -149,7 +155,7 @@ checkpoint (`ERROR`) is reported before the GPU class is.
 ## The helper layer
 
 `model_samples/` is one importable package shared by every family. It is sample code: not installed, not part of the wheel,
-and for a default run it imports nothing beyond cuDNN Frontend, PyTorch and the standard library.
+and for a run on a functional-validation stack it imports nothing beyond cuDNN Frontend, PyTorch and the standard library.
 FlashInfer is imported inside the adapters of the rows that call it, on a device, in the stack `native` alone; no other
 stack and no plan on stated device facts imports it.
 
@@ -178,12 +184,14 @@ the helper layer messages, tool schemas and template options.
 
 Every line below is printed, on standard error, by every run of a provider stack (`fe-cublas`, `native`, `fe-entries`);
 `--stack reference` prints no `checks` and no `first launch` line. A run on the reduced model prefixes its times with "reduced model" and prints no rate. None of it is
-a measurement of record: no clock is locked, and the stack is launched from Python.
+a measurement of record: no clock is locked.
 
 Words a run and these pages use. *Sequence*: one text being generated. *Row*: one token position of a step; a plain decode
 has one row per sequence. *Step*: one pass of the model over all rows. *Period*: from the first launch of one step to the
-first launch of the next. *Captured*: recorded once and replayed without Python between the launches; these stacks are
-launched from Python instead, one launch after the other. *Clock not locked*: the GPU's clock frequency is left as it
+first launch of the next. *Recorded* (captured): a decode step recorded once as a launch sequence and replayed for
+every token, without Python between its launches: the plain decode on the stack `native`. *Launched from Python*: every
+block's launch issued by the loop, one after the other: `--no-capture`, the functional-validation stacks, the checks'
+own passes and the traced steps. *Clock not locked*: the GPU's clock frequency is left as it
 is, one reason no timing here is a measurement of record. *Teacher-forced*: a provider block and its reference block are
 run on the same operands and the same state, call by call, so that an error cannot accumulate from block to block.
 
@@ -201,22 +209,23 @@ mode observes it, and an operator may declare a lock applied outside.
 |---|---|
 | header | the model (the reductions of the default run, or the checkpoint's directory name, shard count, size and manifest hash), the GPU, the sequence counts, the stack; the `cudnn` version, editable checkout or wheel, a source hash, the installed distribution; the reference's accumulation precision |
 | `served by` | per block: calls per step, provider, entry, the rows the entry serves, and the entry's published record (the GPU class and rows of a published measurement of that entry, `none`, or the reason a row is a fallback: not a measurement of this run or this GPU); the declared regime; then the memory the run needs against what is free, in GiB (2^30 bytes) -- and, where the run keeps a weight on its stored format alone, the part of that need which is the checks' (the reference's bf16 copy of one such weight at a time). Decided and printed before anything is loaded |
-| `stage` | seconds of import, describe (a checkpoint's tokenizer, chat template and shard headers; no weights), plan, read (or draw), merge, dequantise, lay out (a stored weight brought into the row order its kernel multiplies on) and checksum (of every weight the run keeps on its stored format alone) where the stack has such weights, compile and first launch of each compiled form, warm-up |
+| `stage` | seconds of import, describe (a checkpoint's tokenizer, chat template and shard headers; no weights), plan, read (or draw), merge, dequantise, lay out (a stored weight brought into the row order its kernel multiplies on) and checksum (of every weight the run keeps on its stored format alone) where the stack has such weights, compile and first launch of each compiled form, warm-up, and capture: the decode step recorded as a launch sequence, where the run records it |
+| `step recorded` or `launched from Python` | exactly one of the two, behind the `stage` line of every session: that the decode step is recorded once and replayed for every token, with what the recorded sequence holds -- the CUDA runtime's count where the installation states the sequence, held against the plan kernel by kernel; else the plan's count, worded so -- or that every step is launched from Python, and why: a functional-validation stack, `--no-capture`, a block of the plan on a fallback row, a step that is not the plain decode step, a recording the installation declined |
 | `greedy decoding`, a request body's line, `first token:` (with a checkpoint, before anything is loaded) | the decoding rule beside the sampling settings the checkpoint's own `generation_config.json` names, which are not applied; for a request body, every field of it and what the sample does with it; and what the prompt costs before the first new token: one decode step per prompt token, as a count. The family README has the three ("A request body and its options") |
 | `decoding`, `checks on` | two lines that say what comes next, printed before the phases in which a run prints nothing on standard error: the prompt and the decode loop, and the checks. The first says where the text goes: with a checkpoint to standard output, piece by piece as it is generated (or once after the report with `--no-stream`, or to the file of `--text-out`); a seeded run writes its text nowhere |
 | `text path` | render = chat messages to prompt text; tokenize = prompt text to ids, also per prompt token; ids to GPU = the copy of the prompt's ids to the device; text out = ids to text per produced token, inside the loop, with the write of the piece where the text is written as it is generated. With a checkpoint, the first call of the process and the same call repeated |
-| `first token` | the prefill route and its time. While the prompt goes through the decode step, one step per token, this is not a time to first token of record |
-| `steps` | period = from one step's first launch to the next step's, median and mean; in the step = from the first launch to the ids on the host; turnaround = from the ids on the host to the next launch (detokenise, the write of the text piece where the text is written as it is generated, stop check); block calls per step |
-| `traced pass` | the first 32 steps again, from a zero state, under the PyTorch profiler with kernel activity records only. The period under the profiler comes first, with its stretch against the untraced one. GPU busy = the union of the intervals of the step's kernels and copies; idle inside the traced step = the step's span on the GPU less GPU busy (the two are parts of the traced step); kernel launches and copies per step; host-exposed = the untraced period - GPU busy. Where the records cannot be had the line says why |
+| `first token` | the prefill route and its time. While the prompt goes through the decode step, one step per token (of a replayed run: one replayed step per token), this is not a time to first token of record |
+| `steps` | period = from one step's first launch to the next step's, median and mean; in the step = from the first launch to the ids on the host; turnaround = from the ids on the host to the next launch (detokenise, the write of the text piece where the text is written as it is generated, stop check); block calls per step -- or, of a replayed run, one replay and one host read per step, with the launches of the recorded sequence where the installation states them |
+| `traced pass` | the first 32 steps again, from a zero state, under the PyTorch profiler with kernel activity records only. The period under the profiler comes first, with its stretch against the untraced one. GPU busy = the union of the intervals of the step's kernels and copies; idle inside the traced step = the step's span on the GPU less GPU busy (the two are parts of the traced step); kernel launches and copies per step; host-exposed = the untraced period - GPU busy. Of a replayed run the line prints two GPU-busy figures in the place of those: of the first 32 steps launched from Python under the profiler and, on a line of its own, of 2 of them replayed under it, each with its kernel launches and copies per step; nothing is set against the period. Where the records cannot be had the line says why |
 | `rate` | tokens produced / wall time of the decode loop, per sequence |
 | `bytes per step` | arithmetic on the model's tensor list: the bytes of the weights a step reads in their stored formats plus the state it reads and writes, against the same with the weights as this stack reads them (bf16 copies, and the stored format where a block of the stack multiplies on it); in GB (10^9 bytes), as a checkpoint's size in the header |
-| `note` | what bounds a step of this run, from the traced pass: the launch path from Python where host-exposed time is the larger part of the period, the stack's GPU work where GPU busy is; "not measured" without a traced pass. An ordinary run prints no time per block; the performance mode prints the device time of every block's kernels. Neither prints a limit (floor, speed-of-light figure) |
+| `note` | what bounds a step of this run, from the traced pass: the launch path from Python where host-exposed time is the larger part of the period, the stack's GPU work where GPU busy is; "not measured" without a traced pass. A replayed run prints no note: the two GPU-busy figures of its traced pass stand beside its period, and nothing is asserted. An ordinary run prints no time per block; the performance mode prints the device time of every block's kernels. Neither prints a limit (floor, speed-of-light figure) |
 | `text out` | how many tokens sequence 0 produced, why it ended and where its text went (standard output, or the file of `--text-out`; as it was generated, or after this report); the text itself is not repeated on standard error. For a seeded run, the first characters of what its ids decode to |
 | `ids hash` | in the last line before the verdict: a SHA-256 over the produced ids of every sequence of the run, its first 12 hex digits; equal between two runs that produced the same tokens. The other two hashes of a run are in its header: the manifest hash of a checkpoint (its layout, not its values) and the source hash of the package files the cuDNN Frontend provider runs |
-| `checks` | replay, blocks, tokens, batch invariance (the family README has the bands; a run prints each band's text once, under the block lines); with a checkpoint, on the first 16 steps of every prompt, and the token line is `REPORTED`, not judged against a band. Where the run keeps a weight without its bf16 copy, two lines under them. `stored weights`, a verdict: every such weight still holds the bytes of its load, before the checks and after them -- the reference's copy of it is made from the bytes its own block multiplies on, so a block that wrote into its weight fails the run here, by block and layer. `on demand`: how many copies the reference made for itself, the largest, their bytes in all and the seconds (no verdict: it is what the checks cost). With `--check-kernels`, and always in the stacks `native` and `fe-entries`, a fifth line, `kernels`: see below |
+| `checks` | replay, blocks, tokens, batch invariance (the family README has the bands; a run prints each band's text once, under the block lines); with a checkpoint, on the first 16 steps of every prompt, and the token line is `REPORTED`, not judged against a band. Of a replayed run the first line is `recorded step` in the place of `replay`: the replayed steps launched again from Python from a fresh state, ids and logits byte for byte, with the positions that were recomputed -- every step of a seeded run; with a checkpoint from position 0 through the first eight steps that feed on their own token and across the first page boundary of the attention cache -- and, where it fails, the first step that differs; under it the step's own tail, read behind the request: the ids buffer held the last chosen ids and the position rows stood where the request left the state. A recorded step that does not compute what the same steps compute from Python fails the run. Where the run keeps a weight without its bf16 copy, two lines under them. `stored weights`, a verdict: every such weight still holds the bytes of its load, before the checks and after them -- the reference's copy of it is made from the bytes its own block multiplies on, so a block that wrote into its weight fails the run here, by block and layer. `on demand`: how many copies the reference made for itself, the largest, their bytes in all and the seconds (no verdict: it is what the checks cost). With `--check-kernels`, and always in the stacks `native` and `fe-entries`, a fifth line, `kernels`: see below |
 | `kernels, planned`, `kernels, as the entries state them` | with `--check-kernels`, and always in the stacks `native` and `fe-entries`. Before the load, from the plan alone: per block the kernels one call launches and how they are judged -- `name and launch shape, as the entry states them` (an entry of cuDNN Frontend: its own symbol, grid, block and shared memory), `name` (a kernel known by its name alone), `by family` (a fallback row: a reference chain or a multiply over a copy launches kernels of PyTorch and cuBLAS, how many is not a fact of the row), `host path, not compared`. After the load: what each entry states for this run's row count -- its launch shape and the symbol of the kernel it compiled.  The planned table ends in its count of a step: the launches on exact rows, and the block calls on fallback rows. A row whose entry a step calls in several forms prints the form of every call site under the planned table, and after the load the launch each of those forms states |
-| `kernels` (a line of `checks`) | only with `--check-kernels`: every launch of the traced steps against the plan. The form a provider row names is compared on the objects: with the entry's own form, and with what the entry instance that served each call of the traced steps states (the call log: one per traced step, and a step without its log fails); a row of an entry that states its launch and names no form fails. Every exact kernel must be there once per call, in the wiring order, under the entry's own symbol and with exactly the entry's grid, block and shared memory; every other launch must belong to a family that a fallback row or the host path at that place declares; copies are counted, and one between two exact rows is not declared. For a block whose entry is called in several forms all of this holds per call site: a call is held to the form of its own site and to the entry instance of that form, and a line says which instance served how many calls of a step. `PASS`, `FAIL` with one line per kind of difference, or `NOT OBSERVED` with the reason.  The line of a row a library serves names the kernel the library launched for it, and the kernels a library chose inside the fallback rows are listed: printed, not gated |
-| `GPU memory`, `first launch` | PyTorch's peak and the growth on the device since the plan, in GiB; what the first launch of a compiled form took outside PyTorch's pool, in MiB |
+| `kernels` (a line of `checks`) | only with `--check-kernels`: every launch of the traced steps against the plan. The form a provider row names is compared on the objects: with the entry's own form, and with what the entry instance that served each call of the traced steps states (the call log: one per traced step, and a step without its log fails); a row of an entry that states its launch and names no form fails. Every exact kernel must be there once per call, in the wiring order, under the entry's own symbol and with exactly the entry's grid, block and shared memory; every other launch must belong to a family that a fallback row or the host path at that place declares; copies are counted, and one between two exact rows is not declared. For a block whose entry is called in several forms all of this holds per call site: a call is held to the form of its own site and to the entry instance of that form, and a line says which instance served how many calls of a step. `PASS`, `FAIL` with one line per kind of difference, or `NOT OBSERVED` with the reason.  The line of a row a library serves names the kernel the library launched for it, and the kernels a library chose inside the fallback rows are listed: printed, not gated. Of a replayed run a line under it holds the recorded step: the replayed steps of the traced pass launch the kernels and copies of the same steps launched from Python, in their order and launch shapes, and behind them the copy of the chosen ids and the position updates |
+| `GPU memory`, `recorded step, memory`, `first launch` | PyTorch's peak and the growth on the device since the plan, in GiB; of a run that recorded its step, what PyTorch reserved for the pool of each recorded sequence beside what the plan counted for it, in MiB; what the first launch of a compiled form took outside PyTorch's pool, in MiB |
 
 ## The performance mode
 
@@ -412,7 +421,11 @@ by the text the run produces, read by a person, and by comparing the ids of `--d
 the host tests verify the reader on a checkpoint they generate.
 
 No tokenizer, template or weight file of a real checkpoint is committed. A default run that skips on a GPU class is
-uncovered there, not passing. The family README lists, per GPU class, whether the default run has been verified.
+uncovered there, not passing. No CI lane of this repository runs a recorded step: the default run is the stack
+`native`, whose library the runners do not have, so the cells of the GPU test that hold a recorded step, and the cell
+of the default run itself, run where that library is installed and are skipped -- uncovered -- elsewhere. What a
+default run does without the library is held on every runner of compute capability 10.x: the one `ERROR` line that
+names the package. The family README lists, per GPU class, whether the default run has been verified.
 
 Version updates for `samples/models/requirements.txt` come from the `pip` entry for `/samples/models` in
 `.github/dependabot.yml`, as pull requests, and are handled by the maintainers of this repository, as for its other

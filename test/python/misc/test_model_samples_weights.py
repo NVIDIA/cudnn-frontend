@@ -30,6 +30,18 @@ torch = pytest.importorskip("torch")
 pytestmark = [pytest.mark.L0]
 
 MODELS = Path(__file__).resolve().parents[3] / "samples" / "models"
+
+
+#: the stack the host runs of this module are planned on where a run names none: a functional-validation stack, as the
+#: stand-ins and the stated plans of these tests are.  The sample's own stack is named where a test runs it
+VALIDATION_STACK = ("--stack", "fe-cublas")
+
+
+def _stacked(arguments):
+    """The arguments of a host run, with the validation stack named where they name no stack."""
+    return list(arguments) if "--stack" in arguments else [*VALIDATION_STACK, *arguments]
+
+
 #: the eight magnitudes of an E2M1 code by its three low bits; bit 3 is the sign
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -718,6 +730,8 @@ def _sample_on_stated_facts(tmp_path, monkeypatch, free):
     spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_with_a_checkpoint", MODELS / "qwen_dense" / "00_decode.py")
     sample = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sample)
+    main = sample.main
+    sample.main = lambda arguments: main(_stacked(arguments))  # the figures these tests hold are those of the stack fe-cublas
     return sample, directory
 
 

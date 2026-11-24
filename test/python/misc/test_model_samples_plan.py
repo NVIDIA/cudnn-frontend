@@ -26,6 +26,16 @@ MODELS = Path(__file__).resolve().parents[3] / "samples" / "models"
 GIB = 1024**3
 
 
+#: the stack the host runs of this module are planned on where a run names none: a functional-validation stack, as the
+#: stand-ins and the stated plans of these tests are.  The sample's own stack is named where a test runs it
+VALIDATION_STACK = ("--stack", "fe-cublas")
+
+
+def _stacked(arguments):
+    """The arguments of a host run, with the validation stack named where they name no stack."""
+    return list(arguments) if "--stack" in arguments else [*VALIDATION_STACK, *arguments]
+
+
 @pytest.fixture(scope="module", autouse=True)
 def helper_layer():
     """``samples/models`` on ``sys.path`` for this module only: the path and every ``model_samples`` module leave with it."""
@@ -415,7 +425,7 @@ def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, envi
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.main(arguments), capsys.readouterr().err
+        return module.main(_stacked(arguments)), capsys.readouterr().err
     finally:
         sys.path[:] = paths
 
@@ -997,7 +1007,10 @@ def test_the_samples_flags_say_what_they_apply_to_and_none_is_ignored_in_silence
     requirement file, what a checkpoint run needs and where the rest is written."""
     sample = _sample_script(monkeypatch)
     seeded = sample._arguments([])
-    assert (seeded.model, seeded.sequences, seeded.layers, seeded.force_tokens, seeded.max_new_tokens, seeded.stack) == (None, [1, 4], 2, 32, 256, "fe-cublas")
+    assert (seeded.model, seeded.sequences, seeded.layers, seeded.force_tokens, seeded.max_new_tokens, seeded.stack) == (None, [1, 4], 2, 32, 256, "native")
+    assert sample.SAMPLE_STACK == "native" and sample.STACKS == ("native", *sample.VALIDATION_STACKS) and not seeded.no_capture
+    assert sample._arguments(["--model", "some-directory"]).stack == "native", "the sample's stack is the default with a checkpoint too"
+    assert sample._arguments(["--no-capture"]).no_capture and sample._arguments(["--stack", "fe-cublas"]).stack == "fe-cublas"
     real = sample._arguments(["--model", "some-directory"])
     assert (real.sequences, real.force_tokens, real.max_new_tokens, real.reference_precision) == ([1], None, 256, "fp64")
     assert sample._arguments(["--model", "d", "--max-new-tokens", "8"]).max_new_tokens == 8
@@ -1021,12 +1034,16 @@ def test_the_samples_flags_say_what_they_apply_to_and_none_is_ignored_in_silence
         "pip install -r samples/models/requirements.txt",
         "The checkpoint is your own download (nothing is fetched)",
         "compute capability 10.x or 12.x",
-        "about 57 GiB of free GPU memory",
+        "about 28 GiB of free GPU memory on compute capability 10.0",
+        "fe-cublas, which holds a bf16 copy of every weight, about 57 GiB",
+        "a run without them stops with an ERROR that names the package",
         "samples/models/qwen_dense/README.md",
         "--sequences N[,N...]",
         "--layers N",
         '(default "Why is the sky blue?")',
-        "fe-cublas (default): cuDNN Frontend + cuBLAS + PyTorch",
+        "native (default): the sample's stack",
+        "cuDNN Frontend's fused step + cuBLAS over bf16 copies + PyTorch",
+        "launch every block of every step from Python instead of recording the step once and replaying it",
         "not with --model",
         "an unknown block or key prints the declared ones",
     ):
@@ -2553,7 +2570,8 @@ def _recording(monkeypatch, sequences=1, capacity=80, capture=True, **more):
         def reads_the_rows(self, qkv, cache, position, params):
             _, positions, slots = cache.at(position)
             _, lengths = cache.attended(position)
-            rows = [(i, t) for i in range(cache.sequences) for t in range(cache.tokens)]  # a step's rows stand sequence by sequence
+            # a step's rows stand sequence by sequence; a window of the cache (a check runs some sequences alone) keeps its own slots
+            rows = [(cache.first + i, t) for i in range(cache.sequences) for t in range(cache.tokens)]
             assert positions.tolist() == [[position + t for _, t in rows]] * 3, f"the position rows at {position}: {positions.tolist()}"
             assert slots.tolist() == [i * cache.pages * PAGE + position + t for i, t in rows], f"the slots at {position}: {slots.tolist()}"
             assert lengths.tolist() == [position + cache.tokens] * cache.sequences, f"the lengths at {position}: {lengths.tolist()}"
@@ -2881,6 +2899,186 @@ def test_what_a_recorded_sequence_holds_is_held_against_the_plan(monkeypatch):
             == "the recorded step does not hold the launches of the plan: the recorded sequence holds 0 launches of gdn_decode_fused, the plan 1"
         )
         assert session.recorded is None and graphs.built[-1].released and session.python_reason == ""
+
+
+def test_the_checks_of_a_replayed_run_launch_its_steps_again_from_python(monkeypatch):
+    """``tie_out.run_checks`` on a run whose steps were replays.  Its first line is ``recorded step``: the replayed steps
+    launched again from Python from a fresh state, ids and logits byte for byte, with the positions that were
+    recomputed -- the block check's steps, and past them as far as ``reach`` asks, never past what was recorded -- and
+    under it the step's own tail as ``Session.read_tail`` read it behind the request.  A replay that left other logits
+    from one step on fails with that step named; a tail that was not read, an ids buffer that does not hold the last
+    chosen ids and position rows that do not stand at the last position each fail the line and the run.  A run
+    launched from Python keeps the ``replay`` line it had."""
+    from model_samples import tie_out
+
+    def request(session, steps=12):
+        session.reset(fresh=False)
+        _decoded(session, _prompts(session, 60), steps)
+        return session.read_tail()
+
+    with _recording(monkeypatch, sequences=2) as (session, graphs):
+        assert request(session) == (True, True, 72)
+        checks = tie_out.run_checks(session, prompt_tokens=60, max_steps=16, reach=68)
+        assert checks.ok and checks.lines[0] == "checks (2 sequences, the first 16 steps: 16 prompt + 0 decode)", checks.text()
+        assert checks.lines[1] == (
+            "  recorded step     the replayed steps at positions 0-67 (60 prompt positions, 8 steps that feed on their own token, across the page boundary "
+            "at position 64) launched again from Python from a fresh state: ids and logits byte-identical    PASS"
+        )
+        assert (
+            checks.lines[2]
+            == "                    behind the request the ids buffer held the last chosen ids and the position rows stood at position 72, where the request left the state    PASS"
+        )
+        assert (
+            not any(line.startswith("  replay ") for line in checks.lines) and session.recorded is None
+        ), "the checks leave a fresh state, which has no sequence yet"
+        # the reach ends at what the run recorded; without one the recomputation covers the block check's steps
+        session.record_step()
+        request(session)
+        assert "positions 0-71 (60 prompt positions, 12 steps that feed on their own token, across" in tie_out.run_checks(session, 60, 16, reach=500).lines[1]
+        session.record_step()
+        request(session)
+        assert "positions 0-15 (16 prompt positions) launched again" in tie_out.run_checks(session, 60, 16).lines[1]
+        # a replay that leaves other logits from step 61 on: the first step that differs is named, and the run fails
+        session.record_step()
+        graph = graphs.built[-1]
+        replay = graph.replay
+
+        def wrong():
+            replay()
+            if graph.replays > 61:
+                graph.out[1][..., 0] += 1.0  # one logit of every row
+
+        graph.replay = wrong
+        request(session)
+        failed = tie_out.run_checks(session, prompt_tokens=60, max_steps=16, reach=68)
+        assert not failed.ok and failed.lines[1].endswith("ids and logits byte-identical    FAIL (first at step 61)"), failed.lines[1]
+        # the tail: not read; a buffer that does not hold the last chosen ids; rows that do not stand at the last position
+        session.record_step()
+        session.reset(fresh=False)
+        _decoded(session, _prompts(session, 60), 12)
+        unread = tie_out.run_checks(session, prompt_tokens=60, max_steps=16)
+        assert (
+            not unread.ok
+            and unread.lines[1].endswith("    PASS")
+            and unread.lines[2].endswith(
+                "the step's own tail was not read behind the request (Session.read_tail): the ids buffer and the position rows were not held    FAIL"
+            )
+        )
+        for spoil, sentence in (
+            (
+                lambda cursor: cursor.ids.add_(1),
+                "the ids buffer did NOT hold the last chosen ids and the position rows stood at position 72, where the request left the state    FAIL",
+            ),
+            (
+                lambda cursor: cursor.lengths.sub_(1),
+                "the ids buffer held the last chosen ids and the position rows did NOT stand at position 72, where the request left the state    FAIL",
+            ),
+        ):
+            session.record_step()
+            session.reset(fresh=False)
+            _decoded(session, _prompts(session, 60), 12)
+            spoil(session.recorded.cursor)
+            session.read_tail()
+            spoiled = tie_out.run_checks(session, prompt_tokens=60, max_steps=16)
+            assert not spoiled.ok and spoiled.lines[2].endswith(sentence), spoiled.lines[2]
+        session.close()
+    with _recording(monkeypatch, sequences=2, capture=False) as (eager, _):
+        _decoded(eager, _prompts(eager, 60), 12)
+        assert eager.read_tail() is None and not eager.replays
+        plain = tie_out.run_checks(eager, prompt_tokens=60, max_steps=16)
+        assert plain.ok and plain.lines[1] == "  replay            ids and logits byte-identical on a second run from a fresh state    PASS"
+    assert tie_out.recomputed_text(1, 60) == "the replayed steps at positions 0 (1 prompt position) launched again from Python from a fresh state"
+    assert "positions 0-60 (60 prompt positions, 1 step that feeds on its own token) launched" in tie_out.recomputed_text(61, 60, 64)
+    assert tie_out.tail_line((True, True, 9)) == (
+        True,
+        "behind the request the ids buffer held the last chosen ids and the position rows stood at position 9, where the request left the state",
+    )
+
+
+def test_the_report_of_a_replayed_run_and_how_far_its_recomputation_reaches(monkeypatch):
+    """The report of a run whose steps were replays, on constructed stamps: the first-token line counts replayed steps, the
+    step line names the replay with the launches of the recorded sequence -- or the recorded step, where the
+    installation states none --, the traced pass prints two GPU-busy figures with their launches and nothing set
+    against the period, and no note says what bounds a step.  A run launched from Python prints the lines it printed.
+    And the decode script's own arithmetic: how many steps a replayed checkpoint run records and recomputes."""
+    from model_samples.timing import Report, Trace
+
+    def report(replayed, launches=None, tail=True):
+        made = Report("qwen_dense", reduced=False)
+        made.prompt_tokens, made.prefill_seconds, made.calls_per_step = 58, 0.25, 485
+        made.clock.launch, made.clock.ids = [0.0, 0.004, 0.008, 0.012], [0.0039, 0.0079, 0.0119, 0.0159]
+        made.trace = Trace(32, 4.6, 80.0, 486, 2, 90.0, replayed=Trace(2, 4.2, 0.1, 489, 4, 4.3) if replayed and tail else None)
+        made.replayed, made.launches = replayed, launches
+        return made.text().splitlines()
+
+    lines = report(True, 491)
+    assert lines[0] == "first token           prefill route: decode step, 58 tokens x one replayed step; not a time to first token of record (250.0 ms)"
+    assert lines[1].endswith("| turnaround 0.100 ms | one replay of 491 launches and one host read per step") and lines[1].startswith(
+        "steps (4)            period 4.000 ms median"
+    )
+    assert (
+        lines[2]
+        == "traced pass (32)      the first 32 steps again, launched from Python under the profiler: GPU busy 4.600 ms | 486 kernel launches + 2 copies per step"
+    )
+    assert lines[3] == "                      2 of them replayed under the profiler: GPU busy 4.200 ms | 489 kernel launches + 4 copies per step"
+    assert lines[4].startswith("rate                  ") and not any(line.startswith("note") for line in lines), lines
+    assert not any("host-exposed" in line or "idle inside" in line for line in lines), "nothing of a traced step is set against the replayed period"
+    assert report(True)[1].endswith("| one replay of the recorded step and one host read per step")
+    assert len(report(True, 491, tail=False)) == len(lines) - 1, "a traced pass without its replayed steps prints the one line"
+    eager = report(False)
+    assert eager[0].endswith("58 tokens x one step; not a time to first token of record (250.0 ms)") and eager[1].endswith("| 485 block calls per step")
+    assert "host-exposed" in eager[2] and eager[-1].startswith("note                  GPU busy "), eager
+    assert all(len(line) < 400 for line in lines)
+    # how far a replayed checkpoint run records and recomputes: the block check's steps, eight steps behind the prompt, the first page boundary
+    sample = _sample_script(monkeypatch)
+    assert (sample.CHECKED_STEPS, sample.TRACED_STEPS, sample.SELF_FED_STEPS) == (16, 32, 8)
+    assert [sample._reach(prompt, 64) for prompt in (58, 5, 60, 200)] == [66, 66, 68, 208], "the default prompt: through position 65"
+    assert sample._reach(5, None) == 16 and sample._reach(30, None) == 38
+    assert sample._record_steps(True, False, 58, 64) == 66 and sample._record_steps(True, False) == 32 and sample._record_steps(True, False, 5, None) == 32
+    assert sample._record_steps(False, False, 58, 64) is None and sample._record_steps(True, True, 58, 64) is None
+
+
+def test_the_memory_sentence_counts_what_a_recorded_step_keeps(monkeypatch):
+    """``QwenDense.recorded_step_bytes``: what a recorded sequence keeps in a pool of its own, in whole blocks of PyTorch's
+    allocator -- 2 MiB, and for the logits of a step 20 MiB from 1 MiB on, their own size in blocks of 2 MiB where that
+    is more.  At the six counts that were run on a device it is what PyTorch's reservation grew by.  A session that records
+    its step adds it to the need of its run, one that does not adds nothing, and the memory sentence holds the
+    difference."""
+    import model_samples
+    from model_samples import loop
+    from model_samples.qwen_dense import QwenDense
+
+    mib = 1 << 20
+    full, reduced = QwenDense(), QwenDense.reduced()
+    assert [full.recorded_step_bytes(n) // mib for n in (1, 4, 8)] == [2, 22, 22] and [reduced.recorded_step_bytes(n) // mib for n in (1, 4, 8)] == [2, 2, 2]
+    assert (
+        (2 * full.geometry.vocab * 2 < mib <= 2 * full.geometry.vocab * 3)
+        and full.recorded_step_bytes(2) == 2 * mib
+        and full.recorded_step_bytes(3) == 22 * mib
+    )
+    assert full.recorded_step_bytes(21) == full.recorded_step_bytes(41) == 22 * mib and full.recorded_step_bytes(43) == (2 + 22) * mib
+    assert full.recorded_step_bytes(1024) == (2 + 486) * mib, "the logits of 1,024 sequences, in whole blocks of 2 MiB"
+    assert all(full.recorded_step_bytes(n) <= full.recorded_step_bytes(n + 1) for n in range(1, 1100)), "more sequences never keep less"
+    with _recording(monkeypatch, sequences=2) as (session, _):
+        assert session._recorded_bytes() == session.model.recorded_step_bytes(2) == 2 * mib and session.pool_bytes == [0]
+        session.reset(fresh=True)
+        session.record_step()
+        assert session.pool_bytes == [0, 0], "one figure per recording"
+    with _recording(monkeypatch, sequences=2, capture=False) as (eager, _):
+        assert eager._recorded_bytes() == 0 and eager.pool_bytes == []
+    # through the sentence, on stated facts of a GPU: the need of a run that records against the same run that does not
+    monkeypatch.setattr(loop.LaunchGraph, "serves", staticmethod(lambda device: True))
+    needs = []
+    for capture in (False, True):
+        asked = []
+        monkeypatch.setattr(model_samples.blocks.Plan, "memory", lambda self, need, *more, asked=asked: asked.append(need) or "sentence")
+        session = model_samples.Session(
+            full, model_samples.TextIO.synthetic(full.geometry.vocab), sequences=4, stack="native", device="cuda:0", capture=capture
+        )
+        session.plan = _plan(stack="native", sequences=4, layers=64)
+        session.plan_table()
+        needs.append(asked[0])
+    assert needs[1] - needs[0] == full.recorded_step_bytes(4) == 22 * mib
 
 
 def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_reads_them(monkeypatch):
@@ -3588,7 +3786,7 @@ def test_the_plan_of_a_step_stack_by_stack():
         assert row.key == "fe.swiglu_fp4_decode" and dict(row.form)["TOKEN_TILE"] == tile and row.rows == (first, last), sequences
     other = said(_stated_plan(cc=(12, 0), sms=170)[0], tail=False).replace("By provider: ", "")
     assert f"the reference chains of `fe-cublas` as well: {other}." in flat and other.startswith("cuDNN Frontend 1; fallbacks 9 "), "compute capability 12.x"
-    assert f"35 on the four-layer one. {said(_stated_plan(stack='fe-cublas')[0])}" in flat, "the sentence under the table of the default stack"
+    assert f"35 on the four-layer one. {said(_stated_plan(stack='fe-cublas')[0])}" in flat, "the sentence under the table of the stack fe-cublas"
     # compute capability 12.x: no entry row but the fused step's serves there, and every other block stays on its fallback row
     plan12, _ = _stated_plan(2, cc=(12, 0), sms=170)
     assert plan12.rows["attention.gate_quantize"].key == "torch_ref.gate_quantize" and plan12.rows["linear_attention.step"].form == (

@@ -598,6 +598,23 @@ class QwenDense:
             held = max(held, 5 * term["record"] + 2 * term["reference"] + term["chain"])
         return held
 
+    def recorded_step_bytes(self, sequences: int) -> int:
+        """What a decode step that is recorded as a launch sequence keeps for itself, in bytes: the tensors of the recorded
+        pass stay in a pool of the sequence's own for as long as it lives, and that pool is whole blocks of PyTorch's
+        allocator -- one block of 2 MiB for the tensors under 1 MiB, and for the logits of a step, the largest of them
+        (2 bytes per id and sequence), a block of 20 MiB from 1 MiB on, or their own size in whole blocks of 2 MiB where
+        that is more.  What a pass frees inside the recording is used again inside it.
+
+        An allowance from runs, not a bound: on compute capability 10.0 PyTorch's reservation grew by 2 MiB at 1 sequence
+        and by 22 MiB at 4 and at 8 sequences of the published model, and by 2 MiB at 1, 4 and 8 sequences of the
+        two-layer model with its reduced vocabulary -- this arithmetic at each of the six.  Its reach ends there: at
+        more sequences the activations of a step pass 1 MiB as well and are not counted, and a run prints what its
+        recordings took beside what its plan counted."""
+        mib = 1 << 20
+        logits = 2 * self.geometry.vocab * sequences
+        large = 0 if logits < mib else max(20 * mib, -(-logits // (2 * mib)) * 2 * mib)
+        return 2 * mib + large
+
     def memory_bytes(
         self,
         sequences: int,

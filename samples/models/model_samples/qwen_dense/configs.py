@@ -575,8 +575,8 @@ REGIMES = [
         ("any",),
         (1, None),
         "launch-bound",
-        "every block of these stacks is launched from Python, one launch or more per block; no byte-bound form is declared, "
-        "and the sequence count at which one would win is not measured on any class",
+        "a step is one launch or more per block, issued from Python or replayed as one recorded sequence; no byte-bound form is "
+        "declared, and the sequence count at which one would win is not measured on any class",
     ),
 ]
 

@@ -750,7 +750,7 @@ def test_checks_lines_say_what_was_judged(monkeypatch, tmp_path):
 def test_the_kernels_lines_state_the_launches_of_the_plan():
     """Statistic 16 on the family's own tables: the 64-layer model on compute capability 10.0 with 148 SMs, planned on
     stated facts -- the launches of a step on exact rows, by provider, and the block calls on fallback rows -- on
-    ``native``, on the cuDNN Frontend rows alone (``fe-entries``) and on the default stack: two lines in one form."""
+    ``native``, on the cuDNN Frontend rows alone (``fe-entries``) and on the stack ``fe-cublas``: two lines in one form."""
     from model_samples import Session, TextIO, blocks, perf
     from model_samples.qwen_dense import QwenDense
 
@@ -2389,7 +2389,10 @@ def _sample_script(monkeypatch):
 def _sample_on_the_cpu(monkeypatch, events, loads=True, **stand_in):
     """The sample script as a module whose runs stay on the CPU: stated device facts (compute capability 10.0), the tiny
     geometry in the place of the reduced model, every session on the CPU and planned on the stand-ins of
-    :func:`_stand_ins`, the environment check answered.  With ``loads`` false a load is an ``AssertionError``."""
+    :func:`_stand_ins`, the environment check answered.  With ``loads`` false a load is an ``AssertionError``.
+
+    The stand-ins are those of the stack ``fe-cublas``, a functional-validation stack: a run through this module's
+    ``main`` that names no stack is run with ``--stack fe-cublas`` (``VALIDATION_STACK``), never on the sample's own."""
     from model_samples import blocks
     from model_samples.qwen_dense import QwenDense
 
@@ -2419,7 +2422,14 @@ def _sample_on_the_cpu(monkeypatch, events, loads=True, **stand_in):
         monkeypatch.setattr(real_session, "load", no_load)
     monkeypatch.setattr(model_samples, "Session", session)
     monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=None: _tiny_model()))
-    return _sample_script(monkeypatch)
+    script = _sample_script(monkeypatch)
+    main = script.main
+    monkeypatch.setattr(script, "main", lambda arguments: main(list(arguments) if "--stack" in arguments else [*VALIDATION_STACK, *arguments]))
+    return script
+
+
+#: the stack the host runs of this module are planned on: the stand-ins are its rows
+VALIDATION_STACK = ("--stack", "fe-cublas")
 
 
 def test_perf_flags_refused_before_load(monkeypatch, capsys, tmp_path):
@@ -2776,7 +2786,7 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
     assert "model_samples.perf" not in sys.modules and not hasattr(package, "perf"), "an ordinary run does not import the mode's module"
     assert (sample._record_steps(True, False), sample._record_steps(False, False)) == (32, None), "what an ordinary run records, as before"
     assert sample._record_steps(True, True) is None, "with a checkpoint the mode's checked request is recorded whole: the checks replay all of it"
-    _says("guide", "An ordinary run prints what it printed before the mode existed and does not import the mode's module:")
+    _says("guide", "An ordinary run prints nothing of the mode and does not import the mode's module:")
     _says("guide", "the mode is a branch of its own in the script, and a pull request that touches the loop, the census, the checks or the timing shows")
     assert not any("performance" in line or line.startswith(("record class", "scope ", "decode rate")) for line in lines)
     for start in ("text path ", "first token ", "steps (", "traced pass (", "rate ", "bytes per step ", "note ", "text out "):

@@ -26,6 +26,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
    count of the run (`Session.plan_table(later)`: one memory sentence for the whole run). Print `[NN] SKIP <requirement>`
    naming the fix and exit 0. After the plan nothing skips, and no `SKIP` follows a check that ran; a test that honours a
    `SKIP` looks for a failed check in the output first.
+   - A package the run's stack calls that is not installed is not a `SKIP`: the run stops while it is planned, before
+     anything is loaded, with one `[NN] ERROR the stack <stack> cannot run:` line that names the package and the command
+     that installs it, exit code 1 (`blocks.MissingPackage`). No other stack takes the stack's place.
    - A provider that declines the operands an adapter built is an `ERROR`, never a `SKIP`. So is an entry that declines
      the geometry or row count of a row that claims the device (a wrong table).
    - An adapter asks its entry at plan time, on the real device, for the launch at the run's row count, and builds the
@@ -52,10 +55,17 @@ does not hold is printed as not known and ignored, so a new name for one of them
      A provider's precompiled kernel binaries are not built: they come from a package of that provider at a pinned
      version (`constraints-native.txt`) or from a directory the user filled beforehand, never from a fetch inside a run
      -- a sample switches the provider's own download off before its first use, and a binary that is not on the machine
-     is a `SKIP` that names what is missing and the fix.
-6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `native` is
-   every block on a kernel that works on the stored weights; `fe-entries` is its cuDNN Frontend rows with every other block on a
-   fallback row, so it runs without further packages. `--stack reference` reports `[NN] RAN reference stack (no provider
+     is named with the fix: a `SKIP` where a package or a directory is there and does not hold it, the stop of rule 1
+     where no package of the binaries is installed.
+6. **The sample's stack is `native`.** It is the default of every script, with a checkpoint and without one, and its
+   plain decode step is recorded once and replayed (rule 20); never chosen by what is installed, and never replaced:
+   a missing package of it stops the run (rule 1). `native` is every block on a kernel that works on the stored
+   weights. Every other stack is for functional validation, runs only where `--stack` names it, is launched from
+   Python and says so in one line of its run; no text states a speed of one. `fe-entries` is the cuDNN Frontend rows
+   of `native` with every other block on a fallback row, so it runs without further packages; `fe-cublas` is the
+   fused step on its entry and every multiply on cuBLAS over a copy. A test of a validation stack names its stack;
+   a test of the default run is a test of `native`, and a required cell that needs the library and is skipped where
+   it is not installed is uncovered. `--stack reference` reports `[NN] RAN reference stack (no provider
    checked)`, never `PASS`; so does a run whose `--provider` flags leave no provider block to judge (`[NN] RAN (no
    provider block was judged)`, blocks line `REPORTED`). `PASS` means provider blocks were compared and held.
 7. **Provider selection is data.** A family's `configs.py` holds ordered `ProviderRow`s per block; the first row whose GPU
@@ -66,8 +76,9 @@ does not hold is printed as not known and ignored, so a new name for one of them
      against and below any row of the same key that an existing `--provider` command selects; name its tie-out band;
      regenerate the family README tables (`configs.readme_table`). A host test keeps them in agreement.
    - A third-party provider is imported inside its adapter, on a device; its version is read from the distribution's
-     metadata there and held to the validated list, and a missing or unvalidated version is a `SKIP` that names it, the
-     requirement file and the nearest command that runs without it. A plan on stated device facts imports no third-party
+     metadata there and held to the validated list: a missing package stops the run (rule 1), an unvalidated version
+     is a `SKIP`, and either sentence names the version, the requirement file and the nearest command that runs
+     without it. A plan on stated device facts imports no third-party
      package.
 8. **Bands are never widened in place.** The band of a block against the reference is named in its provider row
    (`tie_out.BANDS`).
@@ -212,8 +223,8 @@ does not hold is printed as not known and ignored, so a new name for one of them
     report never prints the word 'locked'. The rate of a run that is not a controlled run says so in its own line, and
     line 2 says it of every other number. A report holds no speed-up, no baseline and no figure of a second GPU class.
     The screen is rendered from the data the report file holds and from nothing else, at no more than 110 characters a
-    line; a line of it that would be longer breaks at a separator or between two words. An ordinary run prints what it
-    printed before the mode existed and does not import the mode's module: the mode is a branch of its own in the
+    line; a line of it that would be longer breaks at a separator or between two words. An ordinary run prints nothing
+    of the mode and does not import the mode's module: the mode is a branch of its own in the
     script, and a pull request that touches the loop, the census, the checks or the timing shows the area's plain runs
     line by line against the tree it started from (`test/python/misc/test_model_samples_perf.py`).
     The GPU is observed through the driver's `nvidia-smi` tool in child processes, with no package added, and never by
@@ -226,6 +237,28 @@ does not hold is printed as not known and ignored, so a new name for one of them
     carries a reason from a closed list, never the tool's path or its own words; no process name is asked for, and
     the report keeps no id of another process. A lock is the operator's declaration: it is printed as declared, held
     against the observed clock in both directions, and never set.
+20. **A replayed step is the step, and it is held to the step launched from Python.** Whether a step is recorded is the
+    plan's data (`Block.captures`, `Plan.recordable`), decided before the load; only the plain decode step is. Every
+    session prints exactly one line behind its load: that its step is recorded, or that it is launched from Python,
+    with the reason. A recording the installation declines is a net under that data: the session is left as it was,
+    PyTorch's current stream put back, the reason printed.
+    - Nothing a recorded step reads is selected by a host integer: the ids and the position rows stand at fixed
+      addresses (`state.Cursor`) and the step's own last launches write them. What a step launched from Python has
+      for free is code in front of every replay, each with a host test: the capacity test, the ids the caller handed
+      over, the host integer of the cursor against the state's position, the state the sequence was recorded on.
+    - The record of a replayed step holds the ids the loop HANDED to it, never the buffer the lookup read. The checks
+      launch the recorded steps again from Python and hold ids AND logits byte for byte (a wrong length moved the
+      logits of a step and no token); the step's own tail is read behind the request; the replayed steps of the
+      traced pass are held to the traced steps launched from Python, launch by launch.
+    - A recorded step that does not compute what the steps launched from Python compute is a failed check, never a
+      fall-back. A count of what a recorded sequence holds is printed as observed only where the installation
+      states the sequence, and is then held against the plan; a report sets no GPU-busy figure against a period and
+      asserts nothing about what bounds a step.
+    - A sampling rule with state on the host is not recorded until that state is device memory. The compile, the first
+      launches and the warm-up step come before the recording: a buffer first made inside the recorded pass is
+      never initialised.
+    - A test that keeps a session with a recorded step releases it (`Session.close`): a sequence the collector
+      destroys inside a later recording invalidates that recording.
 
 ## Checks, tests and kernels: lessons
 
