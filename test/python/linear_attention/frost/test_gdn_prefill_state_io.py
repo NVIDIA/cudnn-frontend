@@ -638,7 +638,7 @@ def render_kernel(root, build):
     lines of the prefill entry."""
     dump = root / f"dump_{build}"
     dump.mkdir(exist_ok=True)
-    package = Path(cpp_launcher.__file__).resolve().with_name("__init__.py")  # the package this process tests
+    package = Path(sys.modules["cudnn"].__file__).resolve()  # the entry file of the package this process imported
     env = dict(
         os.environ,
         CUTE_DSL_KEEP="ptx",
