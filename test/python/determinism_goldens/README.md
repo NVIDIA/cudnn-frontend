@@ -100,6 +100,26 @@ lanes qualify the DSL compiler under a CUDA 13 framework. On GB200, all six
 strict forward golden checks also fail for a missing runtime baseline
 (`ba252fda3f535655`); cu12 did not compare the historical cu13 baselines.
 
+Original-runtime strict validation (2026-11-23) of the forward portion in
+combined revision `35173f66`: **13 passed, 0 failed, 0 skipped**, including
+all six original golden comparisons and seven replay/batch-invariance/stress
+cases. The runtime key is `da1753675488f6a3`: GB300/SM103 with 152 SMs,
+Torch `2.13.0a0+9186a08b2c.nv26.07`, CUDA 13.3, driver API 13030, cuDNN
+92400, CuTe DSL 4.8.0 with the CUDA 13.4 compiler, and tvm-ffi 0.1.12.
+Pytest is 9.1.1; GPU 1 was selected on an exclusive four-GPU node. Both the
+source package and freshly built native extension resolved inside the tested
+snapshot. No golden was recorded or modified. This checks the original
+runtime; the missing baselines for the newer runtimes above remain gaps.
+
+The combined strict run at `35173f66` executed both directions in one process
+(**31 passed**, of which 13 are forward):
+
+```bash
+export CUDA_VISIBLE_DEVICES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_TEST_NO_ISOLATION=1
+unset CUDNN_DETERMINISM_RECORD
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest gemm/cutedsl/test_grouped_gemm_srelu_bf16_determinism.py gemm/cutedsl/test_grouped_gemm_dsrelu_bf16_determinism.py -m L0
+```
+
 Commands from `test/python`, with recording unset:
 
 ```bash
