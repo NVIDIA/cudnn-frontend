@@ -14,7 +14,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils as utils
 from cutlass._mlir.dialects import arith, llvm, nvvm, vector
-from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 
 class FlashAttentionDSABackwardSm100H16:
@@ -96,10 +96,6 @@ class FlashAttentionDSABackwardSm100H16:
 
         self.num_tmem_alloc_cols = 512
 
-        self.tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=2,
-            num_threads=self.threads_per_warp * (self.num_compute_warps + self.num_reduce_warps + 1),
-        )
         self.compute_sync_barrier = pipeline.NamedBarrier(
             barrier_id=3,
             num_threads=self.num_compute_warps * self.threads_per_warp,
@@ -951,11 +947,7 @@ class FlashAttentionDSABackwardSm100H16:
         )
         compute_tmastore_dQ_pipeline = self.make_and_init_compute_tmastore_dQ_pipeline()
 
-        tmem = TmemAllocator(
-            storage.tmem_holding_buf.ptr,
-            barrier_for_retrieve=self.tmem_alloc_barrier,
-            allocator_warp_id=self.compute_warp_id[0],
-        )
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
 
         pipeline.pipeline_init_arrive(is_relaxed=True)
 
@@ -1002,7 +994,12 @@ class FlashAttentionDSABackwardSm100H16:
         sdQ4_ptr = cute.recast_ptr(sK.iterator, dQ4_smem_layout_staged.inner)
         sdQ4 = cute.make_tensor(sdQ4_ptr, dQ4_smem_layout_staged.outer)
 
+        # Publish the TMEM allocation at the existing single-CTA pipeline
+        # initialization barrier, before the consumer warp roles diverge.
+        if warp_idx == self.compute_warp_id[0]:
+            cute.arch.alloc_tmem(Int32(self.num_tmem_alloc_cols), tmem_holding_buf)
         pipeline.pipeline_init_wait()
+        tmem_ptr_base = cute.arch.retrieve_tmem_ptr(self.acc_dtype, alignment=16, ptr_to_buffer_holding_addr=tmem_holding_buf)
 
         tile_count = cute.ceil_div(topk, self.block_tile)
 
@@ -1028,8 +1025,6 @@ class FlashAttentionDSABackwardSm100H16:
 
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_mma)
-            tmem.wait_for_alloc()
-            tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
 
             tStS, tdPtdP, tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdQtdQ0, tdQtdQ1, tdQtdQ2, tdQtdQ3, tdKVtdKV4, tdQtdQ4 = self.get_tmem_tensor(
                 QK_tiled_mma, dOV_tiled_mma, QdS_tiled_mma, KdS_tiled_mma, dKV4_tiled_mma, dQ4_tiled_mma, tmem_ptr_base
@@ -1121,10 +1116,6 @@ class FlashAttentionDSABackwardSm100H16:
 
         elif warp_idx in self.compute_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
-            if warp_idx == self.compute_warp_id[0]:
-                tmem.allocate(self.num_tmem_alloc_cols)
-            tmem.wait_for_alloc()
-            tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
 
             tStS, tdPtdP, tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdQtdQ0, tdQtdQ1, tdQtdQ2, tdQtdQ3, tdKVtdKV4, tdQtdQ4 = self.get_tmem_tensor(
                 QK_tiled_mma, dOV_tiled_mma, QdS_tiled_mma, KdS_tiled_mma, dKV4_tiled_mma, dQ4_tiled_mma, tmem_ptr_base
@@ -1173,8 +1164,6 @@ class FlashAttentionDSABackwardSm100H16:
 
         elif warp_idx in self.reduce_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
-            tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
 
             tStS, tdPtdP, tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdQtdQ0, tdQtdQ1, tdQtdQ2, tdQtdQ3, tdKVtdKV4, tdQtdQ4 = self.get_tmem_tensor(
                 QK_tiled_mma, dOV_tiled_mma, QdS_tiled_mma, KdS_tiled_mma, dKV4_tiled_mma, dQ4_tiled_mma, tmem_ptr_base
