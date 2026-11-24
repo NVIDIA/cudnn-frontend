@@ -43,14 +43,15 @@ def _dtype_name(dtype) -> Optional[str]:
     return None
 
 
-DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120", "sdpa_bwd_sm80", "sdpa_bwd_sm100_d128"})
+DETERMINISTIC_KEYED_ROWS = frozenset({"sdpa_bwd_sm120", "sdpa_bwd_sm80", "sdpa_bwd_sm100_d128", "sdpa_bwd_sm100_d256"})
 SM80_DET_NARROW_WINDOW_MAX_LEFT = 383  # window_left at or below keys `window_narrow` on sdpa_bwd_sm80 prefill_det (256 measured, 512 not)
 SM120_PAGED_BODY_MAX_S_Q = 16  # sdpa_fwd_prefill_sm120 paged d128 up to this s_q, off the decode tile, keys `gqa_body`
 SM100_WINDOW_PREFILL_MIN_S_Q = 256  # the smallest S_q the SM100 windowed packing studies timed (sm100_d192x128_swa_sink_pack_20261118)
 SM100_WINDOW_LONG_CACHE_MIN_S_KV = 1 << 16  # dense d192 x 128 windowed packed prefill from this KV length keys `gqa_long_cache`
 """Rows whose deterministic graphs are classes of their own (phase ``<phase>_det``): the row's deterministic body is a different kernel
 (SM120: the two-kernel dS / dQ split; SM100 d64 / d128: the dense dK / dV + dQ kernel pair), so those graphs neither share the default
-classes' entries nor count as unmeasured."""
+classes' entries nor count as unmeasured. The SM100 d256 body is deterministic by construction, but its classes are decided against
+the backend's deterministic engine, which a study times separately."""
 
 
 def _unmeasured(facts, row: Optional[str] = None) -> bool:
@@ -2219,8 +2220,8 @@ TABLE: Dict[Tuple, Entry] = {
         "always", None, "sm100_d192x128_swa_sink_pack_20261118"
     ),
     # study sm103_d256_bwd_v2_20261031, THD half (B300 SXM6 1100 W, cuDNN 9.28.0.38; 129 train cases: S 128-32k, b 1-128, GQA 16/2 /
-    # 32/4 / 32/1 / 64/2 and MHA 16/16; 24 off-lattice holdout cases). The dense classes have no entry: they lost on small-work
-    # holdout cases there, and their refit (study sm103_d256_bwd_v3_20261031) lost again on its own holdout.
+    # 32/4 / 32/1 / 64/2 and MHA 16/16; 24 off-lattice holdout cases). Its dense classes lost on small-work holdout cases there, and
+    # their refit (study sm103_d256_bwd_v3_20261031) lost again on its own holdout; the dense causal entries below are a later study's.
     ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm103_d256_bwd_v2_20261031"
     ),
@@ -2262,6 +2263,62 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "none", False, "mha", True): Entry(
         "ge", 30.374, "sm103_d256_bwd_thd_offtile_20261031"
+    ),
+    # study sm100_d256_bwd_dense_20261122: dense d256 backward on cc 10.0 and cc 10.3, deterministic graphs as classes of their own.
+    # Small work, short queries and short key ranges keep the backend. On cc 10.0 the non-deterministic entries answer before
+    # bwd.heuristics._d256_leads' box. Classes without an entry lost on short-query holdout cells (mask-free on cc 10.3, and
+    # deterministic mask-free on cc 10.0) or had no holdout cell the rule changed (non-deterministic causal GQA on cc 10.0).
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "mha", False): Entry(
+        "ge", 26.5, "sm100_d256_bwd_dense_20261122", "cost", ("ge", 8.0, "kv")
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "mha", True): Entry(
+        "ge", 7.006, "sm100_d256_bwd_dense_20261122", "q"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "gqa", False): Entry(
+        "always", None, "sm100_d256_bwd_dense_20261122"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "gqa", True): Entry("ge", 31.002, "sm100_d256_bwd_dense_20261122"),
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "mha", False): Entry(
+        "ge", 7.5, "sm100_d256_bwd_dense_20261122", "kv"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "mha", True): Entry(
+        "ge", 9.501, "sm100_d256_bwd_dense_20261122", "q"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill_det", "dense", "causal_br", False, "gqa", False): Entry(
+        "ge", 26.292, "sm100_d256_bwd_dense_20261122"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill_det", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 8.003, "sm100_d256_bwd_dense_20261122", "q"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill_det", "dense", "causal_br", False, "mha", False): Entry(
+        "ge", 26.5, "sm100_d256_bwd_dense_20261122", "cost", ("ge", 8.0, "kv")
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 0), "bf16", (256, 256), "prefill_det", "dense", "causal_br", False, "mha", True): Entry(
+        "ge", 9.001, "sm100_d256_bwd_dense_20261122", "q"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "ge", 26.292, "sm100_d256_bwd_dense_20261122"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 8.003, "sm100_d256_bwd_dense_20261122", "q"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "mha", False): Entry(
+        "ge", 26.5, "sm100_d256_bwd_dense_20261122", "cost", ("ge", 8.0, "kv")
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "mha", True): Entry(
+        "ge", 9.001, "sm100_d256_bwd_dense_20261122", "q"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill_det", "dense", "causal_br", False, "gqa", False): Entry(
+        "ge", 26.292, "sm100_d256_bwd_dense_20261122"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill_det", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 8.003, "sm100_d256_bwd_dense_20261122", "q"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill_det", "dense", "causal_br", False, "mha", False): Entry(
+        "ge", 26.5, "sm100_d256_bwd_dense_20261122", "cost", ("ge", 8.0, "kv")
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill_det", "dense", "causal_br", False, "mha", True): Entry(
+        "ge", 9.001, "sm100_d256_bwd_dense_20261122", "q"
     ),
     # study sm103_d128_fwd_chunk_20261031, GQA half (B300 SXM6 1100 W, cuDNN 9.28.0.38; dense K/V, bottom-right causal chunks
     # s_q < s_kv: 84 train cases, s_q 128-2048 over S_kv 2048-32768 on the 128-key tile and 3000 / 10000 off it, b 1 / 4, GQA 32/8 /

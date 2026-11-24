@@ -334,8 +334,8 @@ def test_sm100_d128_deterministic_entries_key_apart(monkeypatch):
 
 def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
     """The default d256 backward row ranks ahead of the backend for d256 on cc 10.0 and behind it for D192x128, other parts,
-    unmeasured features and mask-free ragged THD past S_q 4096; on cc 10.3 the placement table decides bf16 THD graphs. The
-    FROST opt-in keeps it first everywhere."""
+    unmeasured features and mask-free ragged THD past S_q 4096; on cc 10.3 the placement table decides bf16 THD graphs, and on
+    both parts it decides the dense classes study sm100_d256_bwd_dense_20261122 shipped. The FROST opt-in keeps it first everywhere."""
     from cudnn.engines.base import PlanConfig
     from cudnn.engines.heuristics import is_backend_block
     from cudnn.engines.manifest import MANIFEST
@@ -360,8 +360,11 @@ def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
     assert order(thd=True, causal=False, max_total_seq_len_q=6 * 4096) == trail  # mask-free ragged past 4096
     assert order(thd=True, max_total_seq_len_q=6 * 4096) == lead  # causal ragged
     assert order(d_qk=192, d_v=128, h_kv=16) == trail
-    assert order(device_cc=(10, 3)) == trail  # dense on cc 10.3: no table entry, and the box is cc 10.0's
-    for unmeasured in (dict(deterministic=True), dict(has_bias=True), dict(has_dropout=True), dict(window_left=1024), dict(has_sink=True)):
+    assert order(device_cc=(10, 3)) == lead  # dense causal on cc 10.3: a table entry
+    assert order(device_cc=(10, 3), causal=False) == trail  # dense mask-free on cc 10.3: no entry, and the box is cc 10.0's
+    assert order(deterministic=True) == lead  # deterministic dense causal: a class of its own, with an entry
+    assert order(deterministic=True, causal=False) == trail  # deterministic dense mask-free: no entry
+    for unmeasured in (dict(has_bias=True), dict(has_dropout=True), dict(window_left=1024), dict(has_sink=True)):
         assert order(**unmeasured) == trail, unmeasured
     # cc 10.3 bf16 THD on the 128-key tile: the placement table's own entries (study sm103_d256_bwd_v2_20261031) decide
     thd103 = dict(device_cc=(10, 3), thd=True, max_total_seq_len_q=8 * 4096)
@@ -374,9 +377,57 @@ def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
     assert order(device_cc=(10, 3), thd=True, s_q=4000, s_kv=4000, max_total_seq_len_q=8 * 4000) == lead
     assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=16, h_kv=16, s_q=3000, s_kv=3000, max_total_seq_len_q=3000) == lead
     assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=8, h_kv=8, s_q=1000, s_kv=1000, max_total_seq_len_q=1000) == trail
-    assert order(device_cc=(10, 3), s_q=4000, s_kv=4000) == trail  # dense off the tile: no entry
+    assert order(device_cc=(10, 3), s_q=4000, s_kv=4000) == lead  # dense causal off the tile: a table entry
+    assert order(device_cc=(10, 3), causal=False, s_q=4000, s_kv=4000) == trail  # dense mask-free off the tile: no entry
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert order(d_qk=192, d_v=128, h_kv=16) == lead
+
+
+def test_sm100_d256_dense_entries_key_deterministic_graphs_apart(monkeypatch):
+    """Study sm100_d256_bwd_dense_20261122 owns the dense d256 bf16 classes it shipped on cc 10.0 and cc 10.3. The row is in
+    ``DETERMINISTIC_KEYED_ROWS``, so a deterministic graph keys ``prefill_det`` and only a deterministic entry answers it. Each entry
+    leads a large graph of its class. The probe's small causal square (b 8, 8/8, S 128), slower on FROST on both parts, keeps the
+    backend in both modes, including cc 10.0's non-deterministic graph, which the hand-written box led before the study."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.bwd import heuristics
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    row, study = "sdpa_bwd_sm100_d256", "sm100_d256_bwd_dense_20261122"
+    eid = _OFFERED[row]
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
+    assert row in pt.DETERMINISTIC_KEYED_ROWS
+
+    def facts(**over):
+        base = dict(d_qk=256, d_v=256, dtype=cudnn.data_type.BFLOAT16, b=4, h_q=32, h_kv=8, s_q=8192, s_kv=8192)
+        return _facts(**{**base, **over})
+
+    def first(f):
+        return "backend" if is_backend_block(heuristics.propose("A", f, _OFFERED)[0]) else "frost"
+
+    entries = {k: e for k, e in pt.TABLE.items() if e.study == study}
+    assert len(entries) == 18
+    for key, entry in entries.items():
+        _, cc, _, _, phase, layout, mask, _, group, off = key
+        assert layout == "dense" and mask in ("causal_br", "none") and group in ("gqa", "mha")
+        s = 8192 + off
+        f = facts(device_cc=cc, causal=mask == "causal_br", h_kv=8 if group == "gqa" else 32, s_q=s, s_kv=s, deterministic=phase == "prefill_det")
+        assert pt.class_key(row, f) == key
+        assert pt.matched_entry(row, f) is entry
+        assert first(f) == "frost", key
+    small = dict(b=8, h_q=8, h_kv=8, s_q=128, s_kv=128, causal=True)
+    qwen = dict(b=1, h_q=32, h_kv=2, causal=True)  # the GB nightlies' d256 training backward rows
+    for cc in ((10, 0), (10, 3)):
+        for det in (False, True):
+            assert pt.matched_entry(row, facts(device_cc=cc, deterministic=det, **small)).study == study
+            assert first(facts(device_cc=cc, deterministic=det, **small)) == "backend", (cc, det)
+            assert first(facts(device_cc=cc, deterministic=det, **qwen)) == "frost", (cc, det)
+    # classes the study did not ship, and graphs it did not time, keep the backend first on cc 10.3
+    assert pt.matched_entry(row, facts(device_cc=(10, 3), causal=False)) is None
+    assert first(facts(device_cc=(10, 3), causal=False)) == "backend"
+    assert first(facts(device_cc=(10, 3), causal=True, thd=True, max_total_seq_len_q=4 * 8192, deterministic=True)) == "backend"
+    assert first(facts(device_cc=(10, 3), causal=True, dtype=cudnn.data_type.HALF)) == "backend"
 
 
 def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
