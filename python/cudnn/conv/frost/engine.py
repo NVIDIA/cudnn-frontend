@@ -18,10 +18,10 @@ import cutlass
 from cuda.bindings import driver as _cuda
 from cudnn import behavior_note, GraphContext, data_type
 from cudnn.datatypes import _cudnn_to_frost_dtype_name
-from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
+from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig, require_stream
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
-from cudnn.frost.device import build_device, current_device
+from cudnn.frost.device import current_device
 from cudnn.conv.frost.graph_analyzer import analyze, ConvGraph
 from cudnn._pygraph import pygraph
 
@@ -358,7 +358,7 @@ class _Sm100FrostConvPlan(CompiledPlan):
             image.permute(0, 2, 3, 4, 1),
             weight.permute(0, 2, 3, 4, 1),
             output.permute(0, 2, 3, 4, 1),
-            _cuda.CUstream(ctx.stream or 0),
+            _cuda.CUstream(require_stream(ctx.stream, "frost_conv")),
             *self._conv_params,
         )
         if self._workspace_bytes:
@@ -512,7 +512,7 @@ class _Sm100FrostBlockScaleConvPlan(CompiledPlan):
             None,
             None,
             *(cutlass.Int32(value) for value in (*self._upper_padding, *self._lower_padding, *self._stride, *self._dilation)),
-            _cuda.CUstream(ctx.stream or 0),
+            _cuda.CUstream(require_stream(ctx.stream, "frost_conv")),
         )
 
     @staticmethod
@@ -670,51 +670,48 @@ class FrostConvEngine(BaseEngine):
         post_padding = _tuple_param(node, "post_padding", _ZERO)
         stride = _tuple_param(node, "stride", _ONE)
         dilation = _tuple_param(node, "dilation", _ONE)
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            if analysis.block_scale_data is not None:
-                _check_cutedsl("frost_conv block-scale convolution", BLOCK_SCALE_CUTEDSL_MIN_VERSION)
-                # Keep compiler-template imports lazy so engine discovery does not load them.
-                from .templates.sm100_block_scale_conv import compile
+        if analysis.block_scale_data is not None:
+            _check_cutedsl("frost_conv block-scale convolution", BLOCK_SCALE_CUTEDSL_MIN_VERSION)
+            # Keep compiler-template imports lazy so engine discovery does not load them.
+            from .templates.sm100_block_scale_conv import compile
 
-                compiled = compile(
-                    ncdhw=ncdhw,
-                    ktrs=ktrs,
-                    upper_padding_dhw=post_padding,
-                    lower_padding_dhw=pre_padding,
-                    stride_dhw=stride,
-                    dilation_dhw=dilation,
-                    epilogue=analysis.epilogue,
-                    d_dtype=_cutlass_block_scale_output_dtype(output.data_type),
-                    epilogue_attrs=analysis.epilogue_attrs,
-                )
-                return _Sm100FrostBlockScaleConvPlan(
-                    compiled,
-                    analysis,
-                    (post_padding, pre_padding, stride, dilation),
-                    current_device(),
-                )
-            else:
-                _check_cutedsl("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
-                # Keep compiler-template imports lazy so engine discovery does not load them.
-                from .templates.sm100_conv import compile
+            compiled = compile(
+                ncdhw=ncdhw,
+                ktrs=ktrs,
+                upper_padding_dhw=post_padding,
+                lower_padding_dhw=pre_padding,
+                stride_dhw=stride,
+                dilation_dhw=dilation,
+                epilogue=analysis.epilogue,
+                d_dtype=_cutlass_block_scale_output_dtype(output.data_type),
+                epilogue_attrs=analysis.epilogue_attrs,
+            )
+            return _Sm100FrostBlockScaleConvPlan(
+                compiled,
+                analysis,
+                (post_padding, pre_padding, stride, dilation),
+                current_device(),
+            )
+        else:
+            _check_cutedsl("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
+            # Keep compiler-template imports lazy so engine discovery does not load them.
+            from .templates.sm100_conv import compile
 
-                ab_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(image.data_type)]
-                c_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(output.data_type)]
-                compiled = compile(
-                    ncdhw=ncdhw,
-                    ktrs=ktrs,
-                    upper_padding_dhw=post_padding,
-                    lower_padding_dhw=pre_padding,
-                    stride_dhw=stride,
-                    dilation_dhw=dilation,
-                    epilogue=analysis.epilogue,
-                    epilogue_attrs=analysis.epilogue_attrs,
-                    ab_dtype=ab_dtype,
-                    c_dtype=c_dtype,
-                )
-                return _Sm100FrostConvPlan(compiled, (image, weight, output), current_device(), (post_padding, pre_padding, stride, dilation))
+            ab_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(image.data_type)]
+            c_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(output.data_type)]
+            compiled = compile(
+                ncdhw=ncdhw,
+                ktrs=ktrs,
+                upper_padding_dhw=post_padding,
+                lower_padding_dhw=pre_padding,
+                stride_dhw=stride,
+                dilation_dhw=dilation,
+                epilogue=analysis.epilogue,
+                epilogue_attrs=analysis.epilogue_attrs,
+                ab_dtype=ab_dtype,
+                c_dtype=c_dtype,
+            )
+            return _Sm100FrostConvPlan(compiled, (image, weight, output), current_device(), (post_padding, pre_padding, stride, dilation))
 
 
 def FrostConvEngines(ids: dict[str, int]) -> list[BaseEngine]:

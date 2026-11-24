@@ -47,10 +47,19 @@ a consumer launched without the attribute is unaffected.
 
 Rules 1-5 on the execute path: views only (``view(torch.uint8)``, ``reshape(1)``), no conversion, no copy, no device allocation, no
 device read; the launch goes onto torch's current stream of the entry's device.
+
+``out`` CAN BE A BUFFER ANOTHER DIRECT-CALL ENTRY OF THE DEVICE ALLOCATED FOR ITSELF AND RECORDED
+(``cudnn.frost.init_order``), whose initialization (a zero-fill, a fill torch adds under deterministic algorithms, a write its stream
+still owes a recycled block) is still queued on the stream that allocated it.  This entry allocates nothing, but its launch is ordered
+behind every such pending initialization of the bytes it writes, on whatever stream it runs: the launch stream waits for the event
+recorded behind the allocation -- no host wait, never a synchronization of a stream or of the device; under a stream capture the call
+waits for that ONE event on the host before its captured launch; nothing is read once the device has no pending record.  The operands
+the launch only reads stay the caller's to order.
 """
 
 from typing import Any, Dict, Optional, Tuple
 
+from cudnn.frost import init_order  # imports no framework at module level
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
@@ -325,6 +334,8 @@ class Fp8ProjectionDecode:
         self.cfgs: Dict[int, Cfg] = {rows: self._resolve(rows) for rows in range(1, MAX_ROWS + 1)}
         self.compiled: Dict[Cfg, Any] = {}
         self._kernel_module = None
+        #: the device's records of entry-owned allocations whose initialization may be pending (shared by every entry of the device)
+        self._pending = init_order.pending_of(self.device)
 
     def _resolve(self, rows: int) -> Cfg:
         """The validated rendering of one row count: the given form, or the pick on this part's readings."""
@@ -419,5 +430,8 @@ class Fp8ProjectionDecode:
         # operands are built under the same guard -- their export negotiates with the current device, which need not be the entry's.
         with torch.cuda.device(self.device):
             args = self._kernel_module.launch_args(weight.view(torch.uint8), activation.view(torch.uint8), out, scale.reshape(1))
-            self.compiled[cfg](*args, cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
+            stream = torch.cuda.current_stream(self.device)
+            if self._pending:  # empty in the steady state: a warm call does nothing here
+                init_order.order_behind(self._pending, stream, (init_order.span(out),))
+            self.compiled[cfg](*args, cuda.CUstream(stream.cuda_stream))
         return out

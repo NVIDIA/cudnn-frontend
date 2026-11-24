@@ -15,6 +15,9 @@ a binding unconverted fails loudly rather than being silently coerced.
 
 from __future__ import annotations
 
+import threading
+import weakref
+
 # The device-fact layer lives in cudnn._device (the FE's single owner of a GPU's
 # properties); Handle.device is the DeviceInfo for the handle's ordinal.
 from ._device import DeviceInfo, device_info
@@ -80,3 +83,58 @@ def to_backend_handle(handle):
         f"expected a cudnn.Handle (from cudnn.create_handle()) or None, got {type(handle).__name__}; "
         "raw backend handles are no longer accepted -- wrap one with cudnn.Handle(backend_handle, ordinal, stream)"
     )
+
+
+class _Lease:
+    """Lives exactly as long as the thread-local state that took a handle."""
+
+
+class ThreadHandlePool:
+    """One cuDNN handle per (thread-local state, device) -- cuDNN forbids sharing one across threads.
+
+    A handle outlives the state that took it: a graph lowered with it may still run, so it is never
+    destroyed while the process runs. Instead the lease ends with that thread-local state (a thread
+    exit, or a foreign native thread whose Python state is rebuilt on every callback entry) and the
+    handle serves the next state that asks for that device; the pool is bounded by peak concurrency.
+    ``clear()`` hands every handle to an owner to release at interpreter exit.
+    """
+
+    def __init__(self):
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._leases: dict = {}  # device -> [[weakref to the holder's _Lease, Handle], ...]
+
+    def get(self, device, create) -> "Handle":
+        """This thread's handle for ``device``; ``create()`` makes one when no ended lease left one."""
+        local = self._local
+        by_device = getattr(local, "by_device", None)
+        if by_device is None:
+            by_device = local.by_device = {}
+            local.lease = _Lease()
+        handle = by_device.get(device)
+        if handle is None:
+            token = weakref.ref(local.lease)
+            with self._lock:
+                leases = self._leases.setdefault(device, [])
+                for lease in leases:
+                    if lease[0]() is None:
+                        lease[0], handle = token, lease[1]
+                        break
+            if handle is None:
+                handle = create()
+                with self._lock:
+                    leases.append([token, handle])
+            by_device[device] = handle
+        return handle
+
+    def handles(self) -> list:
+        with self._lock:
+            return [lease[1] for leases in self._leases.values() for lease in leases]
+
+    def clear(self) -> list:
+        """Forget every handle and return them for the caller to release."""
+        with self._lock:
+            handles = [lease[1] for leases in self._leases.values() for lease in leases]
+            self._leases.clear()
+        self._local = threading.local()
+        return handles

@@ -277,3 +277,24 @@ def test_summaries_are_replayed(monkeypatch, variant, layout):
         return lambda: (*run_summary(case), run_summary_bwd(case, d_o))
 
     assert_replays(monkeypatch, BODIES[variant][2:], draw)
+
+
+def test_gdp_qk_l2norm_eps_is_part_of_the_recorded_call(monkeypatch):
+    """GDP's ``qk_l2norm_eps`` is part of the call the launcher records: two epsilons are two recordings, and the replay
+    of each matches the op's Python at that epsilon."""
+    case = make_case("gdp", torch.bfloat16, T=2048, H=8)
+    for x in (case.q, case.k):  # rows with a squared norm near the epsilons, so that the output changes with the epsilon
+        x[:, 0::4] *= 1e-4
+        x[:, 1::4] *= 1e-5
+    run = functools.partial(op("gdp"), *op_args(case), use_qk_l2norm_in_kernel=True, plan_name="gdp_frost")
+    epsilons = (1e-8, 1e-10)
+    with monkeypatch.context() as python_only:
+        python_only.setattr(cpp_launcher, "HOT_CALLS", 1 << 30)  # nothing recorded and nothing hot: the op's Python
+        want = {eps: run(qk_l2norm_eps=eps)[0] for eps in epsilons}
+    assert not torch.equal(want[epsilons[0]], want[epsilons[1]])
+    gdp.run_gdp_fwd.recordings.clear()
+    for _ in range(4):
+        for eps in epsilons:
+            assert_bitwise([run(qk_l2norm_eps=eps)[0]], [want[eps]])
+    assert len(gdp.run_gdp_fwd.recordings) == len(epsilons)
+    gdp.run_gdp_fwd.recordings.clear()

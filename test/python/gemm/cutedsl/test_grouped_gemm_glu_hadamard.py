@@ -808,8 +808,8 @@ def test_grouped_gemm_glu_hadamard_wrapper_canonical_matches_legacy(request, ab_
 #
 # 1. D is evaluated from C *as stored in c_dtype*, so a consumer that recomputes the activation
 #    from the saved C (the dSReLU backward, activation recomputation) reproduces D bit for bit.
-# 2. Amax is the amax of D as stored in d_dtype, and PostRhtAmax is the amax of the transformed
-#    values after rounding to BF16 -- the values the downstream NVFP4 quantizer actually sees.
+# 2. Amax describes stored D; PostRhtAmax uses BF16 input/output rounding around the
+#    transform, matching the downstream NVFP4 quantizer.
 # 3. tanh_clamp_scale and rht_sign_mask are trace-time constants: both must reach the kernel
 #    and both must be part of the wrapper's cache key.
 # 4. All of the above hold on both post-RHT paths (shared-memory FWHT and TMEM).
@@ -957,11 +957,11 @@ def _assert_amax_is_stored_d_amax(inputs, outputs, d: torch.Tensor) -> None:
 
 
 def _post_rht_amax_ref(inputs, d: torch.Tensor, rht_sign_mask: int = 0) -> Dict[int, float]:
-    """Per-expert amax of the randomized Hadamard transform of the stored D, rounded to BF16.
+    """Per-expert Hadamard amax with BF16 input/output rounding.
 
-    Bit ``i`` of ``rht_sign_mask`` negates element ``i`` of each 16-token block before the
-    normalized 16-point transform. Computed in FP64, where the transform of BF16/FP16 inputs
-    is exact, then rounded to BF16 as the consumer's BF16 transform output is.
+    Round stored D to BF16, apply the normalized 16-point transform in FP64,
+    then round to BF16 before reducing. Bit ``i`` of ``rht_sign_mask`` negates
+    element ``i`` of each input block.
     """
     from cudnn.gemm.cutedsl.grouped.glu_hadamard.hadamard_utils import HADAMARD_SIZE, hadamard_matrix
 
@@ -971,10 +971,17 @@ def _post_rht_amax_ref(inputs, d: torch.Tensor, rht_sign_mask: int = 0) -> Dict[
     for expert, rows, group_m in _expert_slices(inputs):
         if group_m == 0:
             continue
-        blocks = d[rows].double().T.reshape(d.shape[1], group_m // HADAMARD_SIZE, HADAMARD_SIZE) * signs
+        blocks = d[rows].to(torch.bfloat16).double().T.reshape(d.shape[1], group_m // HADAMARD_SIZE, HADAMARD_SIZE) * signs
         transformed = (blocks @ hadamard) * (HADAMARD_SIZE**-0.5)
         ref[expert] = transformed.to(torch.bfloat16).float().abs().max().item()
     return ref
+
+
+@pytest.mark.L0
+def test_post_rht_amax_ref_rounds_fp16_inputs_to_bf16():
+    # Direct FP16 input gives 80.5; the BF16-rounded input gives 80.0.
+    d = torch.tensor([20.0625] * 15 + [20.125], dtype=torch.float16).reshape(16, 1)
+    assert _post_rht_amax_ref({"aligned_group_m_list": [16]}, d) == {0: 80.0}
 
 
 def _assert_post_rht_amax(inputs, outputs, d: torch.Tensor, rht_sign_mask: int = 0) -> None:

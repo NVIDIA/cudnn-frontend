@@ -97,6 +97,10 @@ class TestSparseDecodeForwardRegressions:
     test_sparse_dense_reference = staticmethod(_sparse.test_identity_vs_the_dense_kernel_below_the_bound)
     test_decode_qwen_token_tile = staticmethod(_decode.test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units)
     test_decode_independent_pool_layouts = staticmethod(_decode.test_paged_decode_independent_pool_layouts)
+    test_decode_wide_output_replay = staticmethod(_decode.test_decode_64_column_tile_wide_output_replays)
+    test_wide_tile_no_spill = staticmethod(_decode.test_sm107_decode_wide_tile_renderings_carry_no_spill)
+    test_column_groups = staticmethod(_decode.test_decode_kernel_four_column_groups)
+    test_source_twin = staticmethod(_decode.test_sm107_decode_body_matches_the_sm100_body)
 
 
 @requires_rubin
@@ -2288,6 +2292,11 @@ class TestMidFp8Implementation:
         test_public_record_rebuild_rebind_and_retained_capture as _record,
         test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
         test_mid_fp8_refilled_stage_warm_stress as _warm,
+        test_d256_pair_admission as _pair_admission,
+        test_d256_pair_body_reference_and_replay as _pair_replay,
+        test_d256_pair_refilled_stage_warm_stress as _pair_warm,
+        test_d256_pair_release_dependence as _pair_release,
+        test_d256_pair_batch_invariance as _pair_batch,
         test_d192_cga1_causal_public_record as _cga1,
         test_wide_envelopes_keep_the_adapter_block_output_decline as _block_output,
     )
@@ -2295,6 +2304,11 @@ class TestMidFp8Implementation:
     test_public_record = staticmethod(_record)
     test_retired_record = staticmethod(_retired)
     test_warm_stress = staticmethod(_warm)
+    test_d256_pair_admission = staticmethod(_pair_admission)
+    test_d256_pair_replay = staticmethod(_pair_replay)
+    test_d256_pair_warm_stress = staticmethod(_pair_warm)
+    test_d256_pair_release_dependence = staticmethod(_pair_release)
+    test_d256_pair_batch_invariance = staticmethod(_pair_batch)
     test_cga1 = staticmethod(_cga1)
     test_block_output_decline = staticmethod(_block_output)
 

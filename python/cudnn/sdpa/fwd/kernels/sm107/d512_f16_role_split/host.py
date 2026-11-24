@@ -6,6 +6,8 @@
 from .contract import NAME
 from ..d512_half_contract import explicit_geometry
 
+PACKED_HN_STATS_OVERRIDE = True
+
 
 def lower(spec, facts, knobs, *, lower_impl, knob_type):
     geometry = explicit_geometry(NAME, facts)

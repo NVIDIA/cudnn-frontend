@@ -271,6 +271,8 @@ compiled dynamically, and the wrapper cache abstracts the token-sized axes of A
 and B while retaining static dimensions, layouts, dtypes, output descriptors,
 tiling, cluster shape, input order, and accumulation mode in its key. A changed
 static contract creates a different cached operator or fails validation.
+BF16 wrapper calls allocate their tensor maps per call, so same-signature
+wrapper calls may overlap on different streams.
 
 The APIs reject unsupported dtypes or layouts, malformed/unaligned offsets or
 pointers, mixed devices, forbidden BF16 scale controls, unsupported tiling, use

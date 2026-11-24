@@ -5885,6 +5885,26 @@ def test_DSA_sparse_attention_backward_sm90_saturating_attn_sink(sink_value, emp
     assert torch.equal(dkv, torch.zeros_like(dkv))
 
 
+@pytest.mark.L1
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("has_lengths", [False, True])
+def test_h16_dkv_read_acknowledges_every_tmem_word(dtype, has_lengths, monkeypatch, tmp_path):
+    """Even lanes with invalid Top-K rows must consume the T2R fragment before slot reuse."""
+    _require_sm100_family()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+    from warm_stress import release_dependence
+
+    options = interface.compile_options
+    monkeypatch.setattr(interface, "compile_options", lambda **kw: options(f'--keep-ptx --dump-dir="{tmp_path}"', **kw))
+    compiled = interface._compile_nondeterministic_sm100.__wrapped__(
+        torch.cuda.current_device(), torch.cuda.get_device_capability(), "h16_m128", dtype, 576, 512, 16, 513, has_lengths, 128
+    )
+    (bwd,) = (entry for entry in compiled.__ptx__.split(".visible .entry") if entry.lstrip().startswith("kernel_cutlass_bwd_"))
+    for barrier, words in ((8, 32), (10, 128)):
+        (site,) = release_dependence(bwd, named_barrier=barrier)
+        assert site.dependent and site.loaded_registers == words, site
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=434)
 @pytest.mark.parametrize(

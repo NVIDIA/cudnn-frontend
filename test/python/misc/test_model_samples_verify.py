@@ -27,6 +27,7 @@
 
 No GPU, no weights on disk, no profiler."""
 
+import contextlib
 import re
 import sys
 from pathlib import Path
@@ -57,6 +58,7 @@ GATHER = "void at::native::(anonymous namespace)::indexSelectSmallIndex<BFloat16
 ELEMENTWISE = "void at::native::vectorized_elementwise_kernel<2, at::native::CUDAFunctorOnSelf_add<double>, std::array<char*, 2ul> >(int, ...)"
 HOST_READ = "Memcpy DtoH (Device -> Pageable)"
 WHOLE = "the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): "
+PAGE = 64  # positions of a page of a paged attention cache
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -88,15 +90,39 @@ def _tiny_model(kinds=("linear_attention", "full_attention", "linear_attention")
     return QwenDense(geometry, reductions=("tiny geometry",))
 
 
-def _pair(sequences, tokens, steps=32):
+@contextlib.contextmanager
+def _a_block_asks_for_a_page(page=PAGE, key="torch_ref.attention_prepare"):
+    """Inside: a plan that is resolved serves the block of ``key`` with a stand-in that runs the reference chain under another
+    type and asks for an attention cache in pages of ``page`` positions (``Block.cache_page``) -- what the adapter of a
+    kernel that writes a paged pool states.  A session whose plan has it builds a paged state."""
+    from model_samples import providers
+
+    registry = providers.factories
+    served = registry()[key]
+
+    class AsksForAPage(served):
+        cache_page = page
+
+    providers.factories = lambda: dict(registry(), **{key: AsksForAPage})
+    try:
+        yield AsksForAPage
+    finally:
+        providers.factories = registry
+
+
+def _pair(sequences, tokens, steps=32, page=None):
     """A decode session that has run ``steps`` decode steps, and a verify session of ``tokens`` tokens per sequence on its
-    weights: the reference stack on the CPU."""
+    weights: the reference stack on the CPU.  ``page``: the verify session's attention cache is paged (a block of its
+    plan asks for pages of that many positions); the decode session's stays plain."""
     from model_samples import Session, TextIO
 
     model = _tiny_model()
     text = TextIO.synthetic(model.geometry.vocab)
     decode = Session(model, text, sequences=sequences, stack="reference", device="cpu", capacity=steps + tokens)
     verify = Session(model, text, sequences=sequences, stack="reference", device="cpu", capacity=steps + tokens, share=decode, tokens=tokens)
+    if page is not None:
+        with _a_block_asks_for_a_page(page):
+            verify.resolve()
     decode.plan_table([verify])
     decode.load()
     verify.load()
@@ -792,12 +818,17 @@ def test_the_census_of_a_verify_step_and_its_three_numbers():
     parts = section["rows"]["6"]
     assert (
         target.numbers(parts, Geometry().layer_kinds)
-        == (484, 162, 321, 1)
+        == (484, 146, 337, 1)
         == tuple(section["numbers"][name] for name in ("launches", "code", "port", "stand_in"))
     )
-    assert target.numbers(parts, QwenDense.reduced().geometry.layer_kinds) == (20, 8, 11, 1)
+    assert target.numbers(parts, QwenDense.reduced().geometry.layer_kinds) == (20, 7, 12, 1)
     plain = target.data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]
-    assert target.numbers(plain, Geometry().layer_kinds) == (484, 210, 273, 1), "the decode step's section is what it was"
+    assert target.numbers(plain, Geometry().layer_kinds) == (
+        484,
+        194,
+        289,
+        1,
+    ), "the decode step's section: the same kernels but the two this step has others for"
     # per layer kind what differs from the decode step: the fused step is the verify kernel, and the out-projection of a
     # linear-attention layer is a kernel of cuDNN Frontend there
     step = {entry[0]: entry for entry in parts["linear_attention_layer"]}
@@ -826,20 +857,20 @@ def test_the_census_of_a_verify_step_and_its_three_numbers():
     for model, whole, reached, not_yet, entries_reached, entries_not_yet, vocab in (
         (
             QwenDense(),
-            "484 launches per step = 162 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results + 1 declared stand-in",
-            "451 of 484 launches of a step are target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)",
-            "attention.prepare 16, attention.core 16",
-            "370 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)",
-            "mlp.down 64, attention.prepare 16, attention.core 16, projection.fp8.out 16, output_head 1",
+            "484 launches per step = 146 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results + 1 declared stand-in",
+            "467 of 484 launches of a step are target kernels (130 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results)",
+            "attention.core 16",
+            "386 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results)",
+            "mlp.down 64, attention.core 16, projection.fp8.out 16, output_head 1",
             [],
         ),
         (
             QwenDense.reduced(),
-            "20 launches per step = 8 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results + 1 declared stand-in",
-            "17 of 20 launches of a step are target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)",
-            "attention.prepare 1, attention.core 1",
-            "13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)",
-            "mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1",
+            "20 launches per step = 7 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results + 1 declared stand-in",
+            "18 of 20 launches of a step are target kernels (6 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results)",
+            "attention.core 1",
+            "14 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results)",
+            "mlp.down 2, attention.core 1, projection.fp8.out 1, output_head 1",
             [other_vocab],
         ),
     ):
@@ -1105,26 +1136,26 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     target = QwenDense.target()
     plan, model = _plan(1, 6, model=QwenDense())
     reached_native = target.claim(plan, model, census.configuration_of(plan), installed=RECORDED).numbers()
-    assert (reached_native["launches"], reached_native["target_code"], reached_native["target_port"]) == (484, 130, 321), "with the library's 81 calls"
+    assert (reached_native["launches"], reached_native["target_code"], reached_native["target_port"]) == (484, 130, 337), "with the library's 81 calls"
     # the texts below state what the cuDNN Frontend entries serve: the rows of fe-entries, which native shares
     plan, model = _plan(1, 6, "fe-entries", model=QwenDense())
     numbers = target.claim(plan, model, census.configuration_of(plan), installed=RECORDED).numbers()
     assert (numbers["launches"], numbers["code"], numbers["port"], numbers["stand_ins"], numbers["target_code"], numbers["target_port"]) == (
         484,
-        162,
-        321,
+        146,
+        337,
         1,
         49,
-        321,
+        337,
     )
     family = (MODELS / "qwen_dense" / "README.md").read_text(encoding="utf-8")
     area = (MODELS / "README.md").read_text(encoding="utf-8")
     guide = (MODELS / "AGENTS.md").read_text(encoding="utf-8")
     section = " ".join(family.split("## The verify step", 1)[1].split("\n## ", 1)[0].split())
-    whole = "484 launches per step = 162 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results + 1 declared stand-in"
-    reached = "370 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)"
+    whole = "484 launches per step = 146 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results + 1 declared stand-in"
+    reached = "386 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results)"
     assert whole in section and reached in section, "the family README: the verify step's target and what is reached of it, each with its split"
-    assert "the whole is 162 + 321 + 1 where the decode step's is 210 + 273 + 1" in section and "126,512 B at six tokens and one sequence" in section
+    assert "the whole is 146 + 337 + 1 where the decode step's is 194 + 289 + 1" in section and "126,512 B at six tokens and one sequence" in section
     assert "Session.verify" in " ".join(area.split()) and "verify.verify(ids, accept)" in family and "`fe.gdn_verify_fused`" in section
     entries = numbers["target_code"] - 1  # without PyTorch's gather: the launches of the cuDNN Frontend entries
     assert (
@@ -1145,18 +1176,18 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
 
     decode_blocks, verify_blocks = on_target(1), on_target(6)
     decode_entries, verify_entries = ({entry for _, entry in found} for found in (decode_blocks, verify_blocks))
-    assert len(decode_entries) == len(verify_entries) == 5 and len(decode_entries & verify_entries) == 4
+    assert len(decode_entries) == len(verify_entries) == 6 and len(decode_entries & verify_entries) == 5
     assert (decode_entries - verify_entries, verify_entries - decode_entries) == ({"cudnn.GdnDecodeFused"}, {"cudnn.GdnVerifyFused"})
-    # ... and one of the five serves a second block in a verify step: the 8-bit projection entry, the out-projection
+    # ... and one of the six serves a second block in a verify step: the 8-bit projection entry, the out-projection
     assert {name for name, entry in decode_blocks if entry == "cudnn.Fp8ProjectionDecode"} == {"projection.fp8.in"}
     assert {name for name, entry in verify_blocks if entry == "cudnn.Fp8ProjectionDecode"} == {"projection.fp8.in", "projection.fp8.out"}
     assert (
-        "five entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other four the same, the 8-bit projection entry there for the "
+        "six entries -- `cudnn.GdnVerifyFused` in place of the fused decode step, the other five the same, the 8-bit projection entry there for the "
         "out-projection of the linear-attention layers as well -- serve "
-        "369 of the 484 launches of a verify step, 48 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results "
-        "(with PyTorch's gather: 370 = 49 + 321)" in " ".join(area.split())
+        "385 of the 484 launches of a verify step, 48 the target's own compiled kernels + 337 cuDNN Frontend entries with byte-equal results "
+        "(with PyTorch's gather: 386 = 49 + 337)" in " ".join(area.split())
     ), "the entries are named beside the count they serve, and the count carries its split"
-    assert "the same five entries" not in " ".join(area.split()), "the fused decode entry does not serve a verify step"
+    assert "the same six entries" not in " ".join(area.split()), "the fused decode entry does not serve a verify step"
     # the form the entry takes between the step shapes at the ends of a row's range -- one thread block per SM, which a host
     # entry keeps at every step shape (it has no SM count to pick another by): its shared memory at six and at eight
     # tokens as the family README states them, and eight tokens as the most that form holds, the last count of the rows
@@ -1187,13 +1218,13 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert "at every step shape that ran up to 32 rows -- 2, 6, 8, 9, 12, 16, 18, 24, 28 and 32 rows --" in section
     # those runs name their rows: the stack has had three library rows since (the decode session of such a run multiplied over copies)
     assert (
-        "On compute capability 10.0 (a 148-SM part), on the cuDNN Frontend rows of the stack `native` -- the rows `fe-entries` selects today; these "
+        "On compute capability 10.0 (a 148-SM part), on the cuDNN Frontend rows of the stack `native` -- the rows `fe-entries` selects today without the attention preparation's row; these "
         "runs were made before the stack had its library rows --, the two-layer seeded model: at every step shape that ran up to 32 rows" in section
     )
     assert "The figures of this paragraph are those of the runs on the cuDNN Frontend rows, above. Up to 32 rows of a step PyTorch reserved" in section
     # ... and what the stack ran with its library rows: the step shapes, and the counts of the one shape the census has a section for
     assert (
-        "With its library rows the stack ran seven of these step shapes on 2026-11-18 (PyTorch 2.14.0, FlashInfer 0.7.2.post1) -- one sequence of two, "
+        "With its library rows the stack ran seven of these step shapes on 2026-11-18 (PyTorch 2.14.0, FlashInfer 0.7.2.post1; the attention preparation on its reference chain) -- one sequence of two, "
         "six and eight tokens, two and four sequences of six, four of eight and 16 of two --: every greedy token of the verify steps was the decode "
         "steps', the recurrent state of the kept tokens was within the band, and the kernel check passed, at one sequence of six tokens with 17 of 20 "
         "launches of a step target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results), 15 of them in "
@@ -1201,7 +1232,8 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     )
     six, six_model = _plan(1, 6)
     held = QwenDense.target().claim(six, six_model, census.configuration_of(six), installed=RECORDED)
-    assert (held.numbers()["target_code"], held.numbers()["target_port"], len(held.recorded)) == (6, 11, 15)
+    # (the plan of today holds one launch more than that run of 2026-11-18 did: the attention preparation's, on its entry)
+    assert (held.numbers()["target_code"], held.numbers()["target_port"], len(held.recorded)) == (6, 12, 16)
     # ... and what is not here is what no stack has: the two multiplies of the library are rows of `native`
     library = {label: row.key for label, _, _, row, _ in _plan(1, 6)[0].parts() if "flashinfer." in row.key}
     assert library == {
@@ -1211,7 +1243,7 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     }
     assert not any("flashinfer." in row.key for _, _, _, row, _ in _plan(1, 6, "fe-entries")[0].parts())
     assert (
-        "The attention blocks on their target kernels; and, in `fe-entries`, the attention layers' out-projection and the MLP's down multiply, which "
+        "The attention core on its target kernel; and, in `fe-entries`, the attention layers' out-projection and the MLP's down multiply, which "
         "`native` runs on the library's kernels. A captured verify step." in section
     )
     assert "at every step shape that ran --" not in section, "16 sequences of three, four and five tokens ran too, and their kept state was not gated"
@@ -1250,14 +1282,14 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     assert "with 13 launches of a step in the shapes the census records (2 the target's own compiled kernels + 11 cuDNN Frontend entries" in section
     assert "Today three kinds of row do that" in " ".join(family.split()) and "its forms are kept per call site" in " ".join(family.split())
     # ... and the by-provider sentence of a verify plan: the plan's own line on compute capability 10.0 and on another 10.x class
-    counted = "cuDNN Frontend 5; fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2)"
-    for cc, sms, tokens, frontend in (((10, 0), 148, 6, 5), ((10, 0), 148, 1, 5), ((10, 3), 152, 6, 5), ((10, 3), 152, 1, 4), ((10, 7), 212, 6, 5)):
+    counted = "cuDNN Frontend 6; fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1)"
+    for cc, sms, tokens, frontend in (((10, 0), 148, 6, 6), ((10, 0), 148, 1, 6), ((10, 3), 152, 6, 6), ((10, 3), 152, 1, 5), ((10, 7), 212, 6, 6)):
         line = _plan(1, tokens, "fe-entries", cc=cc, sms=sms, model=QwenDense())[0].by_provider()
-        assert line == f"by provider: cuDNN FE {frontend} | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2", (cc, tokens)
+        assert line == f"by provider: cuDNN FE {frontend} | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2", (cc, tokens)
         assert " | FlashInfer 3 | " in _plan(1, tokens, cc=cc, sms=sms, model=QwenDense())[0].by_provider(), "native: the library's three rows beside them"
     assert f"a verify plan of `fe-entries` with such a row counts what the decode plan counts on compute capability 10.0 -- {counted} --" in section
     assert "A plan of `native` counts FlashInfer 3 beside them at either step shape, and one fallback multiply fewer per library row." in section
-    assert "makes the verify plan cuDNN Frontend 5 where the decode plan is cuDNN Frontend 4, with the same fallbacks" in section
+    assert "makes the verify plan cuDNN Frontend 6 where the decode plan is cuDNN Frontend 5, with the same fallbacks" in section
     assert "Beyond 33 rows of a step -- 33 sequences of a decode step, sequences x tokens per sequence of a verify step --" in " ".join(family.split())
     decline = "cudnn.GdnVerifyFused serves 6 tokens per sequence of 2-8, sequences 1-4; this run has 5 sequences x 6 tokens per sequence"
     assert decline in section, "the decline the README quotes is the plan's own sentence"
@@ -1284,7 +1316,7 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         "`kept state`: as for a verify session, above.",
         "What ran (compute capability 10.0, 148 SMs; a shared GPU: correctness only).",
         (
-            "On the published checkpoint (`native` on 2026-11-17, the rows `fe-entries` selects today; one sequence of six tokens, the default prompt of "
+            "On the published checkpoint (`native` on 2026-11-17, the rows `fe-entries` selects today without the attention preparation's row; one sequence of six tokens, the default prompt of "
             "58 tokens through `prefill`,"
         ),
         "**Memory.**",
@@ -1329,10 +1361,12 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     # the coverage of the verify plan of such a session, each count with its split: the two-layer model of the runs, the published one
     small, small_model = _plan(1, 6, "fe-entries")
     two = target.claim(small, small_model, census.configuration_of(small), installed=RECORDED).numbers()
-    assert (two["launches"], two["target_code"], two["target_port"]) == (20, 2, 11)
+    # (the runs of the three sentences below were made before the attention preparation had its row: one launch of a two-layer
+    # step fewer than today's plans, 16 of the published model's)
+    assert (two["launches"], two["target_code"], two["target_port"]) == (20, 2, 12)
     with_library, _ = _plan(1, 6)
     more = target.claim(with_library, small_model, census.configuration_of(with_library), installed=RECORDED).numbers()
-    assert (more["launches"], more["target_code"], more["target_port"]) == (20, 6, 11), "native: the four calls of the library on top"
+    assert (more["launches"], more["target_code"], more["target_port"]) == (20, 6, 12), "native: the four calls of the library on top"
     assert (
         "with 17 of 20 launches of a verify step target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)"
         in section
@@ -1341,7 +1375,10 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
         "with 13 of 20 launches of a verify step target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)"
         in section
     )
-    assert "with " + reached.replace("launches of a step are target kernels", "launches of a verify step target kernels") in section
+    dated = "370 of 484 launches of a verify step target kernels (49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results)"
+    assert "with " + dated in section and reached.startswith("386 of 484 launches of a step are target kernels (49 ")
+    today, then = (int(sentence.split(" of 484 launches of a ", 1)[0]) for sentence in (reached, dated))  # the counts as the two sentences state them
+    assert today - then == 16, "the dated run: one launch per attention layer of the published model fewer than a step reaches today"
     # what the two runs asked for is the tree's arithmetic at their capacities: a plain session and such a session on one load, one
     # state of six tokens per sequence beside the plain session's (prompt + 32 new tokens + two windows of five drafted tokens)
     kept, alone = ("projection.fp8.in", "projection.fp8.out at linear_attention.out", "mlp.gate_up"), ("projection.fp8.in", "mlp.gate_up")
@@ -1353,7 +1390,7 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     # ... and the figures of the runs, as the section states them beside the class they ran on
     assert "What ran (compute capability 10.0, 148 SMs; a shared GPU: correctness only)." in section
     assert (
-        "These are runs of 2026-11-17: `native` selected the cuDNN Frontend rows then, the rows of `fe-entries` today, and what this passage states for "
+        "These are runs of 2026-11-17: `native` selected the cuDNN Frontend rows then, the rows of `fe-entries` today without the attention preparation's row, and what this passage states for "
         "`native` -- memory, launches, coverage -- is of those rows unless a sentence names the library rows." in section
     )
     # the schedule of those runs is arithmetic: counts 0 to 5 in turn give 32 new tokens -- the prompt's first and 31 kept rows -- in 10 steps
@@ -1392,9 +1429,9 @@ def test_the_memory_of_a_state_of_several_tokens_and_the_texts_that_state_the_ve
     behind = Session(wide, TextIO.synthetic(wide.geometry.vocab), share=first, draft_tokens=1, **several)
     sentence = first.plan_table([behind]).splitlines()[-1]
     assert (
-        "this stack needs about 3.6 GiB on this GPU for a plain session of 16 sequences and a session of 16 sequences x 2 tokens behind its prompt, "
+        "this stack needs about 3.7 GiB on this GPU for a plain session of 16 sequences and a session of 16 sequences x 2 tokens behind its prompt, "
         "one after the other" in sentence
-    )
+    ), "today a pool of whole pages, 64 positions where the cache of that run held 42: the 3.6 GiB of the dated sentence below, and 0.1 more"
     assert (
         "At 16 sequences of two tokens the run asked for about 3.6 GiB, reserved 4.3 GiB and grew the device by 4.4 GiB: the comparison keeps what the "
         "session stands on after each step it replays -- 21 steps of 16 sequences in that run -- until its second replay has ended, and the memory "
@@ -1573,13 +1610,13 @@ def test_the_rows_of_the_out_projection_of_a_verify_step():
         LA_OUT: f"{LA_OUT} 1 cuDNN FE cudnn.Fp8ProjectionDecode rows 2-8 of 2-16 of a step of several tokens per sequence, the linear-attention layers' weight 5120 x 6144 none",
         FA_OUT: f"{FA_OUT} 1 FlashInfer flashinfer.gemm.bmm_fp8 any row count, weight 5120 x 6144 none; unverified in CI",
     }
-    assert plan.by_provider() == "by provider: cuDNN FE 5 | FlashInfer 3 | fallbacks 2 (PyTorch chains 2) | PyTorch 2 | unverified in CI: 3"
-    other_class = "by provider: cuDNN FE {} | FlashInfer 3 | fallbacks 3 (cuBLAS over copies 1, PyTorch chains 2) | PyTorch 2 | unverified in CI: 3"
-    assert _plan(1, 6, cc=(10, 3), sms=152)[0].by_provider() == other_class.format(5)
-    assert _plan(1, 1, cc=(10, 3), sms=152)[0].by_provider() == other_class.format(4)
-    entries = "by provider: cuDNN FE {} | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
-    assert _plan(1, 6, "fe-entries")[0].by_provider() == _plan(1, 6, "fe-entries", cc=(10, 3), sms=152)[0].by_provider() == entries.format(5)
-    assert _plan(1, 1, "fe-entries", cc=(10, 3), sms=152)[0].by_provider() == entries.format(4), "the cuDNN Frontend rows alone are the lines they were"
+    assert plan.by_provider() == "by provider: cuDNN FE 6 | FlashInfer 3 | fallbacks 1 (PyTorch chains 1) | PyTorch 2 | unverified in CI: 3"
+    other_class = "by provider: cuDNN FE {} | FlashInfer 3 | fallbacks 2 (cuBLAS over copies 1, PyTorch chains 1) | PyTorch 2 | unverified in CI: 3"
+    assert _plan(1, 6, cc=(10, 3), sms=152)[0].by_provider() == other_class.format(6)
+    assert _plan(1, 1, cc=(10, 3), sms=152)[0].by_provider() == other_class.format(5)
+    entries = "by provider: cuDNN FE {} | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
+    assert _plan(1, 6, "fe-entries")[0].by_provider() == _plan(1, 6, "fe-entries", cc=(10, 3), sms=152)[0].by_provider() == entries.format(6)
+    assert _plan(1, 1, "fe-entries", cc=(10, 3), sms=152)[0].by_provider() == entries.format(5), "the cuDNN Frontend rows alone are the lines they were"
     full = _plan(1, 6, model=QwenDense())[0]
     assert (full.calls[LA_OUT], full.calls[FA_OUT]) == ("48", "16"), "the calls of a step of the 64-layer model at each call site"
     kernels = census.table(plan, QwenDense.target().claim(plan, model, "verify", installed=RECORDED))
@@ -1589,14 +1626,14 @@ def test_the_rows_of_the_out_projection_of_a_verify_step():
         LA_OUT: f"{LA_OUT} 1 cuDNN FE cudnn.Fp8ProjectionDecode {form} fp8_projection 1 name and launch shape, as the entry states them target",
         FA_OUT: f"{FA_OUT} 1 FlashInfer flashinfer.gemm.bmm_fp8 [BACKEND auto] cublaslt_fp8_gemm, cublas 1 name target",
     }, "the part of a call site prints its form whole"
-    assert "per step: 17 launches on 10 exact rows, checked one by one in the wiring order; the launches of 2 fallback calls" in kernels
+    assert "per step: 18 launches on 11 exact rows, checked one by one in the wiring order; the launches of 1 fallback call " in kernels
     entries_plan, _ = _plan(1, 6, "fe-entries")
     entries_kernels = census.table(entries_plan, QwenDense.target().claim(entries_plan, model, "verify", installed=RECORDED))
     entries_lines = [" ".join(line.split()) for line in entries_kernels.splitlines()]
     assert (
         f"{FA_OUT} 1 cuBLAS torch.matmul over a bf16 copy cublas, pytorch -- by family not yet (bf16 copy of 8-bit weights)" in entries_lines
     ), "fe-entries: the attention layers' call on its copy"
-    assert "per step: 13 launches on 7 exact rows, checked one by one in the wiring order; the launches of 6 fallback calls" in entries_kernels
+    assert "per step: 14 launches on 8 exact rows, checked one by one in the wiring order; the launches of 5 fallback calls" in entries_kernels
     assert "projection.fp8.out at linear_attention.out:" not in kernels, "no line of forms by call site under the table: the part's line has it"
 
     # a step of one token per sequence has one row at both call sites, on every stack: the library's multiply in native, the
@@ -2039,11 +2076,13 @@ def test_a_row_that_hands_a_call_site_on_and_the_parts_of_its_block():
 
 
 # ---------------------------------------------------------------- one session for the prompt's decode steps and the verify steps
-def _speculative(sequences, drafted, new=24, prompt=5, drafter=None, **more):
+def _speculative(sequences, drafted, new=24, prompt=5, drafter=None, page=None, **more):
     """A plain session and a session built with ``draft_tokens=drafted`` on its weights -- the reference stack on the CPU,
     the tiny geometry -- both loaded; the prompts; and the plain run's new tokens of every sequence (``new`` and the
     ``drafted - 1`` more the last window reads): ``(plain, session, prompts, stream)``.  ``drafter``: what makes the
-    session's drafter from the model (``QwenDenseDrafter.seeded``, or a wrong one's); left out, the session has none."""
+    session's drafter from the model (``QwenDenseDrafter.seeded``, or a wrong one's); left out, the session has none.
+    ``page``: the session's attention cache is paged -- a block of both of its plans asks for pages of that many
+    positions -- while the plain session's stays plain."""
     from model_samples import Session, TextIO
 
     model = _tiny_model()
@@ -2053,6 +2092,9 @@ def _speculative(sequences, drafted, new=24, prompt=5, drafter=None, **more):
     common = dict(sequences=sequences, stack="reference", device="cpu", capacity=prompt + new + drafted)
     plain = Session(model, text, **common)
     session = Session(model, text, share=plain, draft_tokens=drafted, **common, **more)
+    if page is not None:
+        with _a_block_asks_for_a_page(page):
+            session.resolve()
     plain.plan_table([session])
     plain.load()
     session.load()
@@ -3438,7 +3480,7 @@ def test_the_memory_sentence_with_the_drafter(monkeypatch):
     assert QwenDenseDrafter.seeded(model, rows=4096).working_bytes() == drafter.working_bytes(), "the listed head rows are not the widest product"
     for stack, with_drafter, without, alone, alone_without in (
         ("native", "32.4", "29.1", "32.0", "28.7"),
-        ("fe-entries", "43.6", "40.2", "43.1", "39.8"),
+        ("fe-entries", "43.6", "40.2", "43.2", "39.8"),  # 43.1 alone before its attention cache was whole pages
         ("fe-cublas", "61.2", "57.9", "60.8", "57.5"),
     ):
         common = dict(sequences=1, stack=stack, device="cuda:0", capacity=2051)
@@ -3726,12 +3768,12 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     # the runs, as they were printed
     printed = (
         "What ran (2026-11-18; compute capability 10.0, 148 SMs; a shared GPU: correctness only; `native` with its library rows in PyTorch 2.14.0 "
-        "with FlashInfer 0.7.2.post1, every other stack in PyTorch 2.13.0).",
+        "with FlashInfer 0.7.2.post1, every other stack in PyTorch 2.13.0; the attention preparation on its reference chain on every stack).",
         "a prompt of 8 tokens and 32 new tokens through 10 steps of `speculate(force=)` whose drafted tokens were scheduled to be kept 0 to 5 in turn:",
         "`drafter cache` and `draft proposals` in 10 of 10 steps;",
         "the kernel check passed over 10 traced steps --",
         # the checkpoint: the run of the cuDNN Frontend rows names its rows, and the run of `native` with its library rows stands beside it
-        "On the published checkpoint (the cuDNN Frontend rows -- the rows `native` selected when this run was made and `fe-entries` selects today; "
+        "On the published checkpoint (the cuDNN Frontend rows -- the rows `native` selected when this run was made and `fe-entries` selects today without the attention preparation's row; "
         "PyTorch 2.13.0 --, one sequence, five drafted tokens; the default prompt, 58 tokens through `prefill`; then the loop above on the drafter's "
         "own proposals until the end token or 256 new tokens;",
         "On the first 16 steps `drafter cache`, `draft proposals`, `position`, `prompt`, `recorded` and `rejected rows` passed;",
@@ -3759,7 +3801,7 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
         "With its library rows `native` runs three multiplies on other kernels -- inside the band of the reference multiply, not to the bytes of a "
         "multiply over a copy -- and a greedy run on a checkpoint follows its first other token: the plain run of the default prompt is another text "
         "there, and so is the loop.",
-        "The same loop on `native` (PyTorch 2.14.0, FlashInfer 0.7.2.post1) ended at the end token after 231 new tokens in 71 steps and kept 3.27 "
+        "The same loop on `native` (PyTorch 2.14.0, FlashInfer 0.7.2.post1; the attention preparation on its reference chain) ended at the end token after 231 new tokens in 71 steps and kept 3.27 "
         "tokens a step (1 + 161 accepted drafted tokens / 71 steps); 9, 16, 20, 9, 7 and 10 steps kept one to six tokens; the first drafted token was "
         "accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, the fifth in 10 of 17.",
         "With the passes handed something else it kept 1.05, 1.04 and 1.00 tokens a step, 2.58 with a later pass fed the model's row again and 3.31 "
@@ -3797,7 +3839,8 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     ]
     # what the two plans of the checkpoint run count and ask for, from the tree: the verify plan's three numbers and where they are held
     # (the census section of one sequence of six tokens), and the memory sentence of the run at its capacity
-    for stack, numbers, compared, by_membership in (("native", (484, 130, 321), 435, 16), ("fe-entries", (484, 49, 321), 370, 0)):
+    # (today's plans: the 16 launches of the attention preparation, on its entry, more than the dated sentences above state)
+    for stack, numbers, compared, by_membership in (("native", (484, 130, 337), 451, 16), ("fe-entries", (484, 49, 337), 386, 0)):
         published, published_model = _plan(1, 6, stack, model=QwenDense())
         claim = QwenDense.target().claim(published, published_model, census.configuration_of(published), installed=RECORDED)
         counted = claim.numbers()
@@ -3825,11 +3868,12 @@ def test_the_readme_says_what_the_speculative_step_is_and_its_loop_runs_as_writt
     guide_text = (MODELS / "AGENTS.md").read_text(encoding="utf-8")
     guide = " ".join(guide_text.split())
     sections = [section.split("\n", 1)[0] for section in guide_text.rstrip().split("\n## ")[1:]]
-    assert sections[-3:] == [
+    assert sections[-4:] == [
         "What the speculative step taught",
         "What building the speculative script taught",
         "What the rows a library serves taught",
-    ], "the section, and the script's behind it; the last three sections of the guide, in the order they were built"
+        "What the attention preparation's row taught",
+    ], "the section, and the script's behind it; the last four sections of the guide, in the order they were built"
     speculative = guide_text.split("\n## What the speculative step taught\n", 1)[1].split("\n## ", 1)[0]
     assert "(`Session._weights_owner`)" in speculative, "the lesson of the drafter's load stands in the speculative step's section, where it was appended"
     lessons = (
@@ -4080,3 +4124,193 @@ def test_a_snapshot_behind_a_step_that_kept_drafted_tokens_gives_the_steps_behin
     state.restore(dict(snap, accepted=0))
     wrong, misdrafted = two_steps()
     assert wrong[0, 0, 0, 0] != behind[0, 0, 0, 0] and not torch.equal(misdrafted[0], drafted[0]), "what the kept count of a restore decides"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The verify step on a paged attention cache (``state.PagedKvCache``): the steps below cross positions 63 / 64, the first
+# boundary between two pages of a sequence, and reject drafted rows on both sides of it.
+
+
+def _pools(state):
+    """The pools of the attention layers of a paged state."""
+    from model_samples.state import PagedKvCache
+
+    return [layer.pool for layer in state.layers if isinstance(layer, PagedKvCache)]
+
+
+@pytest.mark.parametrize("sequences, tokens", [(3, 4), (1, 5)])
+def test_a_verify_step_on_a_paged_cache_is_that_many_decode_steps_across_a_page_boundary(sequences, tokens):
+    """A verify session whose cache is paged against a decode session on the plain cache, on one load: 80 decode steps go
+    through verify steps that keep every possible number of tokens in turn, among them steps that write rows of two
+    pages.  Tokens, logits and the kept state are the decode steps', byte for byte, and the session's own checks hold."""
+    from model_samples import tie_out
+    from model_samples.state import KvCache, PagedKvCache
+
+    decode, verify = _pair(sequences, tokens, steps=80, page=PAGE)
+    assert isinstance(decode.state.layers[1], KvCache) and isinstance(verify.state.layers[1], PagedKvCache), "two sessions on one load: a layout each"
+    assert (verify.state.pages, verify.state.table.tokens, verify.cache_page(), decode.cache_page()) == (2, tokens, PAGE, None)
+    stream = tie_out.Stream.of(decode)
+    schedule = tie_out.accept_schedule(tokens, stream.steps)
+    straddle = [(start, kept) for start, kept in schedule if start < PAGE <= start + tokens - 1]
+    assert straddle and any(start + kept + 1 < PAGE for start, kept in straddle), "a step writes rows of two pages and rejects rows on both sides"
+    checks = tie_out.verify_checks(verify, decode, stream)
+    rows = sequences * tokens * len(schedule)
+    assert checks.ok and checks.judged == 2, checks.text()
+    assert f"{rows} of {rows} greedy tokens equal to those of the decode steps of the same tokens; {rows} of {rows} decidable" in checks.lines[1]
+    assert "largest logit distance 0 = 0.00 bf16 units" in checks.lines[1] and checks.lines[1].endswith("    PASS")
+    assert "cached keys and values byte-equal in 1 of 1 attention layers" in checks.lines[2] and checks.lines[2].endswith("    PASS")
+    own = tie_out.run_checks(verify, prompt_tokens=0)
+    assert own.ok and own.lines[1].endswith("byte-identical on a second run from a fresh state    PASS"), own.text()
+    assert f"{rows} of {rows} greedy tokens equal to the reference stack's" in own.text()
+    if sequences > 1:  # one sequence alone runs on its window of the pool
+        assert f"one sequence alone vs among {sequences} (step t: sequence t mod {sequences})" in own.text() and "12 of 12 blocks equal" in own.text()
+
+
+def test_the_verify_loop_on_a_paged_cache_keeps_every_count_and_reads_no_rejected_row():
+    """One session for a prompt and its verify steps on a paged cache, two sequences, a prompt of 57 tokens: the third step
+    starts at position 60, keeps two drafted tokens and rejects the rows of positions 63, 64 and 65 -- the last row of a
+    page and the first two of the next.  Nothing is restored: the next step starts at 63 and writes 63 to 68, so every
+    rejected row is written again before a row past the kept position is read.  Held here by filling those rows with
+    NaN behind the step: the run's tokens are the plain run's, no logit is a NaN, and the comparison with decode
+    steps holds on every line."""
+    from model_samples import sampling, tie_out
+
+    drafted, new, prompt = 5, 24, 57
+    plain, session, prompts, stream = _speculative(2, drafted, new, prompt, page=PAGE)
+    pools, pages, vocab = _pools(session.state), session.state.pages, session.model.geometry.vocab
+    assert len(pools) == 1 and pages == 2 and session.state.table.first_token().tokens == 1
+    out = [[token] for token in session.read(session.prefill(prompts))]
+    scheduled, done, filled, fills = [], 1, None, 0
+    while done < new:
+        length = len(scheduled) % (drafted + 1)
+        windows = [[out[i][-1], *tie_out.forced_drafts(stream[i][done:], length, drafted, vocab)] for i in range(2)]
+        start = session.state.position
+        greedy = session.read(session.verify(torch.tensor(windows, dtype=torch.int32)))
+        kept = sampling.accepted(windows, greedy)
+        session.accept(kept)
+        if filled is not None:  # the step behind the one whose rejected rows were filled: it wrote every one of them
+            assert start == filled[0] and set(filled) <= set(range(start, start + drafted + 1))
+            assert all(bool(torch.isfinite(pool.float()).all()) for pool in pools), "no rejected row is left: each was written again"
+            filled = None
+        if (start, kept) == (60, 2):  # rows of positions 60 to 65 written, 60 to 62 kept
+            filled, fills = list(range(start + kept + 1, start + drafted + 1)), fills + 1
+            assert filled == [63, 64, 65] and session.state.position == 63
+            for pool in pools:
+                for sequence in range(2):
+                    for position in filled:
+                        assert bool(pool[sequence * pages + position // PAGE, :, position % PAGE].any()), "what a rejected token wrote"
+                        pool[sequence * pages + position // PAGE, :, position % PAGE] = float("nan")
+            read = session.state.layers[1].keys(66, torch.bfloat16)  # what a reader of position 65 would be handed
+            assert bool(torch.isnan(read[:, :, 63:]).all()) and bool(torch.isfinite(read[:, :, :63].float()).all())
+        for i in range(2):
+            out[i] += greedy[i][: kept + 1]
+        scheduled.append(length)
+        done += kept + 1
+    assert fills == 1, "the step at position 60 that keeps two drafted tokens never came: no rejected row was filled, and nothing below could see one read"
+    assert [row[:new] for row in out] == [row[:new] for row in stream], "the ids are the plain session's"
+    assert session.record.accepted == scheduled and set(scheduled) == set(range(drafted + 1)), "every count from 0 to the drafted tokens was kept"
+    assert bool(torch.isfinite(session.record.logits[: session.record.count].float()).all()), "no row read what a rejected token left"
+    checks = tie_out.speculative_checks(session, plain, scheduled)
+    assert checks.ok, checks.text()
+    for name in ("tokens", "kept state", "position", "prompt", "recorded", "bytes", "rejected rows", "acceptance"):
+        assert _line(checks, name).endswith("    PASS"), _line(checks, name)
+    assert "in 3 of 3 layers (states and caches); ids and logits of 57 of 57 prompt steps" in _line(checks, "prompt")
+    own = tie_out.run_checks(session, prompt_tokens=prompt)
+    assert own.ok and own.lines[1].endswith("byte-identical on a second run from a fresh state    PASS"), own.text()
+
+
+def test_a_snapshot_of_a_paged_state_gives_the_steps_behind_it_again():
+    """``snapshot`` / ``restore`` on a paged state that stands behind a step with rejected rows in two pages: the pool is
+    saved and written back in place, the tables are not part of it, and the steps behind the restored state give what
+    they gave the first time."""
+    from model_samples import tie_out
+
+    plain, session, prompts, stream = _speculative(2, 5, 24, 57, page=PAGE)
+    vocab, state = session.model.geometry.vocab, session.state
+    out = [[token] for token in session.read(session.prefill(prompts))]
+    done = 1
+    for length in (0, 1, 2):
+        windows = [[out[i][-1], *tie_out.forced_drafts(stream[i][done:], length, 5, vocab)] for i in range(2)]
+        greedy = session.read(session.verify(torch.tensor(windows, dtype=torch.int32), length))
+        for i in range(2):
+            out[i] += greedy[i][: length + 1]
+        done += length + 1
+    snap = state.snapshot()
+    (pool,) = _pools(state)
+    assert (
+        (state.position, state.accepted, snap["accepted"]) == (63, 2, 2) and len(snap["layers"][1]) == 1 and snap["layers"][1][0].data_ptr() != pool.data_ptr()
+    )
+
+    def two_steps():
+        made, at, kept_tokens = [], done, [list(row) for row in out]
+        for length in (3, 4):
+            windows = [[kept_tokens[i][-1], *tie_out.forced_drafts(stream[i][at:], length, 5, vocab)] for i in range(2)]
+            greedy = session.verify(torch.tensor(windows, dtype=torch.int32), length)
+            made.append(greedy.clone())
+            for i in range(2):
+                kept_tokens[i] += greedy[i, : length + 1].tolist()
+            at += length + 1
+        return torch.stack(made), pool.clone()
+
+    behind, written = two_steps()
+    assert state.position == 72 and not torch.equal(written, snap["layers"][1][0])
+    state.restore(snap)
+    assert (state.position, state.accepted) == (63, 2) and _pools(state)[0] is pool and torch.equal(pool, snap["layers"][1][0])
+    again, rewritten = two_steps()
+    assert torch.equal(again, behind) and torch.equal(rewritten, written), "behind the restored state: the same greedy ids, the same pool"
+
+
+#: the three wrong loops that kept every greedy token of the seeded model at the published widths ("What one session for a
+#: prompt and its verify steps taught"), on a paged cache and across a page boundary: the line that fails and its sentence
+PAGED_LOOPS = {
+    "the position moved by the kept count alone": (
+        "position",
+        "after step 1 the session stands at position 57, the decode steps at 58; the prompt's tokens and the kept ones are 58",
+    ),
+    "the prompt's attention cache is not the verify steps'": ("prompt", "is the decode session's bytes in 2 of 3 layers"),
+    "a row attends over the whole window": ("rejected rows", "byte-identical to the first replay after 0 of 8 steps"),
+}
+
+
+@pytest.mark.parametrize("defect", list(PAGED_LOOPS))
+def test_the_three_wrong_loops_fail_on_a_paged_cache_as_they_do_on_the_plain_one(monkeypatch, defect):
+    """The loops of ``test_a_wrong_loop_fails_the_line_that_sees_it`` that a comparison of tokens does not see at the
+    published widths, on a session whose cache is paged and whose steps cross positions 63 / 64: each fails the line that
+    is there for it, with its sentence, and leaves the other two of the three lines standing."""
+    from model_samples import state, tie_out
+    from model_samples.providers import torch_ref
+
+    failing, sentence = PAGED_LOOPS[defect]
+    if defect == "the position moved by the kept count alone":
+        accept = state.DecodeState.accept
+
+        def wrong(self, count):
+            accept(self, count)
+            self.position -= 1
+
+        monkeypatch.setattr(state.DecodeState, "accept", wrong)
+    elif defect == "the prompt's attention cache is not the verify steps'":  # the prompt's decode steps write a pool of their own
+
+        def apart(self):
+            return state.PagedKvCache(self.pool.clone(), self.pages, self.table.first_token(), 1, self.first, self.sequences)
+
+        monkeypatch.setattr(state.PagedKvCache, "first_token", apart)
+    else:  # a kept row reads the keys a rejected token wrote
+
+        def wrong(q, cache, position, tokens, acc):
+            rows = q.unflatten(0, (-1, tokens))
+            return torch.stack([torch_ref.attention(rows[:, t], cache, position + tokens - 1, acc) for t in range(tokens)], dim=1).flatten(0, 1)
+
+        monkeypatch.setattr(torch_ref, "attention_tokens", wrong)
+    plain, session, prompts, stream = _speculative(1, 5, prompt=57, page=PAGE)
+    assert _pools(session.state) and not _pools(plain.state), "the session's cache is paged, the decode session's plain"
+    try:
+        _, scheduled = _scheduled_loop(session, prompts, stream)
+    except ValueError as error:  # a run that left the plain run's tokens has no schedule to follow to its end: what it recorded is compared
+        assert "needs the tokens behind the kept one" in str(error) or "positions per sequence" in str(error), error
+        session._open, scheduled = False, None
+    checks = tie_out.speculative_checks(session, plain, None if scheduled is None or len(scheduled) != session.record.count else scheduled)
+    line = _line(checks, failing)
+    assert not checks.ok and line.endswith("    FAIL") and sentence in line, f"{defect}:\n{checks.text()}"
+    others = {"position", "prompt", "rejected rows"} - {failing}
+    assert all(_line(checks, name).endswith("    PASS") for name in others), f"{defect}: only its own line of the three fails\n{checks.text()}"

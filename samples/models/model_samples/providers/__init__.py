@@ -21,7 +21,10 @@ copy of that weight only where another block of the run's plans reads one.  An a
 layout of its own also says how the layout is made (``stored_layout(merged)``, its entry's own load-time helper): the
 loader then keeps the weight in that layout and in no other stored form.  An adapter to an entry of a step that feeds
 several tokens per sequence takes the step's slot table where the decode step's adapter takes slot ids
-(``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).
+(``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).  An adapter whose
+entry reads or writes the attention cache as a pool of pages says so (``cache_page``): the session then builds its state
+in that layout, and the adapter takes the pool's two halves and the rows of the state's tables from the cache it is handed
+(``state.PagedKvCache.at``), never from the position.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from ..census import Kernel
 ENTRY_NAMES: Dict[str, str] = {
     "fe.gdn_decode_fused": "cudnn.GdnDecodeFused",
     "fe.gdn_verify_fused": "cudnn.GdnVerifyFused",
+    "fe.attention_prepare_decode": "cudnn.AttentionPrepareDecode",
     "fe.attention_gate_quant_decode": "cudnn.AttentionGateQuantDecode",
     "fe.add_norm_quant_decode": "cudnn.AddNormQuantDecode",
     "fe.fp8_projection_decode": "cudnn.Fp8ProjectionDecode",
@@ -152,6 +156,11 @@ class BlockBase:
     #: statement, as a run prints it beside the batch-invariance line and wherever it compares such a block across row
     #: counts.  Empty: the entry states no such difference
     batch_note = ""
+    #: for a block whose kernel reads or writes the attention cache as a pool of pages: the positions of a page.  A session
+    #: collects it over its plans and builds its state in that layout (``state.PagedKvCache``); two blocks of one session
+    #: that name two pages are a wrong table.  ``None``: the block reaches the cache through its accessors alone, in
+    #: either layout -- every reference chain
+    cache_page = None
     #: for a block whose first use does more than build an entry's kernel -- a library that builds kernels of its own with
     #: the installed compiler: the sentence a sample prints before the plan makes that first use.  Empty: nothing to announce
     first_use_note = ""
@@ -209,6 +218,7 @@ def factories() -> Dict[str, Callable]:
     return {
         "fe.gdn_decode_fused": fe.GdnDecodeFusedBlock,
         "fe.gdn_verify_fused": fe.GdnVerifyFusedBlock,
+        "fe.attention_prepare_decode": fe.AttentionPrepareDecodeBlock,
         "fe.attention_gate_quant_decode": fe.AttentionGateQuantDecodeBlock,
         "fe.add_norm_quant_decode": fe.AddNormQuantDecodeBlock,
         "fe.fp8_projection_decode": fe.Fp8ProjectionDecodeBlock,

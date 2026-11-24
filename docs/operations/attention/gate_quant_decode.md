@@ -78,8 +78,24 @@ kernel module is imported.
 never written. Without it the entry returns a view of ONE entry-owned `[160, width]` buffer whose bytes are valid until
 the entry's NEXT call from any host thread. Stream order does not serialize host calls, so two host threads that share
 one entry, on one stream or two, pass their own `out` (or build one entry each). The entry-owned buffer is allocated
-at the first `compile()` or call that passes no `out`; compile without `out` before a CUDA-graph capture if a captured
-call will use it.
+at the first `compile()`, `output(rows)` or call that passes no `out` and is not declined (every decline runs before
+the allocation: a declined one allocates nothing); compile without `out` before a CUDA-graph capture if a captured
+call will use it. The buffer is allocated on torch's current stream of the entry's device at
+that moment and that stream can still write it (torch fills it under deterministic algorithms; a recycled block can
+carry a write the stream still owes it): every launch that writes its bytes, by default or as a view passed back as
+`out`, by this entry or by another entry that orders its launches the same way (through `cudnn.frost.init_order`;
+rule 16 of `python/cudnn/frost/README.md` lists the entries that do and those that do not yet), is ordered behind
+that work on whatever stream it runs. The
+launch stream waits for an event recorded behind the allocation, without a host wait and without synchronizing a
+stream or the device (on the allocating stream itself the event is already behind the launch and the wait is free; a
+stream that was given the raw handle of a destroyed allocating stream waits like any other); a captured call that
+finds the work still pending waits for that one event on the host before its launch (set-up, never part of a replay;
+not needed for a buffer allocated before the capture once its stream's earlier work is done). Not ordered: a buffer
+allocated inside a stream capture (nothing is recorded: allocate before the capture). An allocation on the legacy
+default stream while a blocking stream of another host thread captures raises torch's error: allocate before that
+capture or on a stream of your own. Once a call has seen it complete nothing is kept of it; while it is pending on the
+device, every call of such an entry on that device reads the device's records. The caller's: `attn`, `gate` and
+`scale`, which a launch only reads, and its own reads and writes of the returned view outside a call.
 
 **Layout.** `attn`, `gate` and `out` are contiguous and start at a 16-byte aligned address (`scale`: 4-byte); every
 operand lives on the entry's device.

@@ -23,6 +23,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from determinism_utils import assert_bitwise, assert_replays
+
 import cudnn.moe_ep.cutemok as public
 from cudnn._tupledict import TupleDict
 from cudnn.moe_ep._cutemok import functional
@@ -371,7 +373,10 @@ def test_cuda_graph(group, precision, gated):
         grads = cutemok_backward(d_output, x, router_weights, *shared, *backward_routed, schedule, saved, plan=plan, config=config, **gate)
         return [output, *list(grads)[: 9 if gated else 8]]
 
+    names = ("output", *GRADIENT_NAMES, *(("d_w_output_gate",) if gated else ()))
     step()  # warm-up
+    if precision == "mxfp8":
+        assert_replays(lambda: dict(zip(names, step(), strict=True)))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = step()
@@ -381,8 +386,9 @@ def test_cuda_graph(group, precision, gated):
             static.copy_(value)
         eager = [t.clone() for t in step()]
         graph.replay()
-        for index, (expected, actual) in enumerate(zip(eager, captured, strict=True)):
-            assert torch.equal(expected, actual), f"{precision}{' gated' if gated else ''}: seed {seed}, result {index} differs from eager"
+        assert_bitwise(
+            dict(zip(names, captured, strict=True)), dict(zip(names, eager, strict=True)), f"{precision}{' gated' if gated else ''}: seed {seed} vs eager"
+        )
     del graph
     dist.barrier()
 
@@ -719,3 +725,43 @@ def test_public_exports():
     path = os.pathsep.join(filter(None, (os.path.dirname(os.path.dirname(cudnn.__file__)), os.environ.get("PYTHONPATH"))))
     result = subprocess.run([sys.executable, "-c", textwrap.dedent(code)], env=dict(os.environ, PYTHONPATH=path), capture_output=True, text=True, timeout=300)
     assert result.returncode == 0 and result.stdout.startswith("OK"), result.stdout + result.stderr
+
+
+@pytest.fixture
+def toolchain_snapshot(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from cudnn.moe_ep._cutemok.cutedsl import persistent_bf16_bwd as backward
+
+    root = tmp_path / "dsl" / "cutlass"
+    specs = {
+        name: SimpleNamespace(origin=str(root.joinpath(*name.split(".")[1:], "__init__.py")), submodule_search_locations=[str(root)])
+        for name in ("cutlass", "cutlass.cute", "cutlass.base_dsl")
+    }
+    find_spec = backward.importlib.util.find_spec
+    monkeypatch.setattr(backward.importlib.util, "find_spec", lambda name: specs[name] if name in specs else find_spec(name))
+    monkeypatch.setattr(backward, "_device_capability", lambda device: backward.TARGET_CAPABILITY)
+    monkeypatch.setattr(torch.version, "cuda", "13.4")
+    return backward, specs
+
+
+@pytest.mark.parametrize("extra_roots", [0, 1, 2])
+def test_toolchain_allows_namespace_extensions(toolchain_snapshot, tmp_path, extra_roots):
+    backward, specs = toolchain_snapshot
+    specs["cutlass"].submodule_search_locations.extend(str(tmp_path / f"extension{i}" / "cutlass") for i in range(extra_roots))
+    backward._runtime_toolchain_snapshot(torch.device("cuda:0"))
+
+
+@pytest.mark.parametrize("module", ["cutlass.cute", "cutlass.base_dsl"])
+def test_toolchain_rejects_mixed_dsl_modules(toolchain_snapshot, tmp_path, module):
+    backward, specs = toolchain_snapshot
+    specs[module].origin = str(tmp_path.joinpath("other_dsl", *module.split("."), "__init__.py"))
+    with pytest.raises(backward.ToolchainMismatchError, match="exactly one active CUTLASS DSL origin"):
+        backward._runtime_toolchain_snapshot(torch.device("cuda:0"))
+
+
+@pytest.mark.parametrize("module", ["cutlass", "cutlass.cute", "cutlass.base_dsl"])
+def test_toolchain_requires_concrete_dsl_origins(toolchain_snapshot, module):
+    backward, specs = toolchain_snapshot
+    specs[module].origin = None
+    with pytest.raises(backward.ToolchainMismatchError, match=f"cannot determine CUTLASS DSL origin for {module}"):
+        backward._runtime_toolchain_snapshot(torch.device("cuda:0"))

@@ -40,11 +40,20 @@ starts after this one has completed.  There is no release knob: the release poin
 
 Rules 1-5 on the execute path: views only (``view(torch.uint8)``, ``reshape(-1)`` of a contiguous tensor), no conversion, no copy, no
 device allocation, no device read; the launch goes onto torch's current stream of the entry's device.  The entry owns no device memory.
+
+``out`` OR ``out_scale`` CAN BE A BUFFER ANOTHER DIRECT-CALL ENTRY OF THE DEVICE ALLOCATED FOR ITSELF AND RECORDED
+(``cudnn.frost.init_order``), whose initialization (a zero-fill, a fill torch adds under deterministic algorithms, a write its stream
+still owes a recycled block) is still queued on the stream that allocated it.  This entry allocates nothing, but its launch is ordered
+behind every such pending initialization of the bytes it writes, on whatever stream it runs: the launch stream waits for the event
+recorded behind the allocation -- no host wait, never a synchronization of a stream or of the device; under a stream capture the call
+waits for that ONE event on the host before its captured launch; nothing is read once the device has no pending record.  The operands
+the launch only reads stay the caller's to order.
 """
 
 from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
+from cudnn.frost import init_order  # imports no framework at module level
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
@@ -371,6 +380,8 @@ class SwigluFp4Decode:
         self.forms: Dict[int, Cfg] = {tile: self._resolve(tile) for tile in TOKEN_TILES if tile >= self.floor}
         self.compiled: Dict[Cfg, Any] = {}
         self._kernel_module = None
+        #: the device's records of entry-owned allocations whose initialization may be pending (shared by every entry of the device)
+        self._pending = init_order.pending_of(self.device)
 
     @staticmethod
     def _reference_readings() -> Dict[str, int]:
@@ -472,5 +483,8 @@ class SwigluFp4Decode:
                 out_scale.view(torch.uint8),
                 out_global_scale,
             )
-            self.compiled[form](*args, cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
+            stream = torch.cuda.current_stream(self.device)
+            if self._pending:  # empty in the steady state: a warm call does nothing here
+                init_order.order_behind(self._pending, stream, (init_order.span(out), init_order.span(out_scale)))
+            self.compiled[form](*args, cuda.CUstream(stream.cuda_stream))
         return out, out_scale

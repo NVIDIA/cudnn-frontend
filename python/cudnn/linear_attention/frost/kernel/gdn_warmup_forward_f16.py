@@ -127,6 +127,7 @@ def warmup_forward_host(
     v_slots: cutlass.Constexpr[int] = 1,
     item_limit_word: Optional[cute.Tensor] = None,
     tail_enable: Optional[cute.Tensor] = None,
+    level_order: Optional[cute.Tensor] = None,
     fold_rows: cutlass.Constexpr[int] = 0,
     fold_update: Optional[cute.Tensor] = None,
     fold_transition: Optional[cute.Tensor] = None,
@@ -139,6 +140,7 @@ def warmup_forward_host(
     l2norm_k: Optional[cute.Tensor] = None,
     l2norm_inv_q: Optional[cute.Tensor] = None,
     l2norm_inv_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
     tail_unit_chunks: cutlass.Constexpr[int] = 0,
     tail_chain_rows: cutlass.Constexpr[int] = 0,
     tail_tinv_cfg: cutlass.Constexpr = None,
@@ -258,6 +260,7 @@ def warmup_forward_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     gate_sms = num_sms if cutlass.const_expr(item_limit_word is not None) else 0
     if cutlass.const_expr(split):
@@ -325,6 +328,10 @@ def warmup_forward_host(
         gate_sms=gate_sms,
         gate_chain_pieces=ragged_gate_pieces,
         gate_tail=tail_prefill_cfg is not None,
+        level_blocks=prefill_cfg.max_active_clusters if cutlass.const_expr(prefill_cfg.level_plan) else 0,
+        level_order=level_order,
+        level_group=prefill_cfg.level_group,
+        level_pool_rows=seed_indices if cutlass.const_expr(prefill_cfg.level_plan) else None,
     )
     gdn_prefill_f16.host(
         prefill_cfg,
@@ -350,6 +357,7 @@ def warmup_forward_host(
         scale,
         workspace,
         stream,
+        level_order,
     )
     if cutlass.const_expr(tail_summary_cfg is not None):
         gdn_chain_forward_f16.chain_forward_host(
@@ -591,12 +599,24 @@ def build_warmup_forward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
+    level_plan=False,
+    level_group=1,
+    level_order=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags, the split-K geometry, the d_v split, state and checkpoint
-    presence, device) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat the marks
-    of the standalone split-table and prefill builds so every kernel compiles as it does there."""
+    presence, device, ``level_plan``) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat the marks
+    of the standalone split-table and prefill builds so every kernel compiles as it does there.  ``l2norm_eps`` (the q/k
+    normalize's additive epsilon) is a launch argument, absent from the key.  ``level_plan``: the uncut prologue writes the
+    levelled work-item table for ``num_sm`` CTAs, in groups of ``level_group`` tiles, and its order entries into
+    ``level_order`` -- or the uncut table where the batch's lengths or pool rows cannot take the levelled one -- and the
+    prefill runs it (``gdn_prefill_f16.LEVEL_PLAN``); ``scheduler`` then carries a level word per CTA behind the ticket
+    words."""
     DK = q.shape[2]
     DV = v.shape[-1]
+    if level_plan and (item_limit_word is not None or tail_enable is not None):
+        # the levelled table is written by two CTAs of the prologue: both take the item number from its argument
+        raise ValueError("a level plan has no tail: its prologue takes no item-limit word and no tail-enable word")
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -676,6 +696,11 @@ def build_warmup_forward(
             if ragged_pieces
             else None
         ),
+        # build_cfg reads the prefill kernel's build switches: they select the compiled code.
+        bool(gdn_prefill_f16.STATE_IO_COALESCED),
+        bool(gdn_prefill_f16.TILE_HANDOVER_EARLY),
+        bool(gdn_prefill_f16.STATE_SEED_COPY),
+        gdn_prefill_f16.level_build_key(bool(level_plan), level_group),
     )
     if key not in warmup_forward_cache:
         prefill_cfg = gdn_prefill_f16.build_cfg(
@@ -701,6 +726,8 @@ def build_warmup_forward(
             k_slots=k_slots,
             v_slots=v_slots,
             beta_slots=beta_slots,
+            level_plan=bool(level_plan),
+            level_group=level_group,
         )
 
         gate_table_placeholder = None
@@ -961,6 +988,7 @@ def build_warmup_forward(
             v_slots,
             from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
             from_dlpack(tail_enable, assumed_align=16).mark_layout_dynamic() if tail_enable is not None else None,
+            from_dlpack(level_order, assumed_align=4).mark_layout_dynamic() if level_plan else None,
             fold_rows,
             *fold_placeholders,
             l2norm_k_slots,
@@ -970,6 +998,7 @@ def build_warmup_forward(
             from_dlpack(l2norm_k, assumed_align=16).mark_layout_dynamic(leading_dim=len(l2norm_k.shape) - 1) if l2norm_k is not None else None,
             from_dlpack(l2norm_inv_q, assumed_align=16).mark_layout_dynamic(leading_dim=1) if l2norm_inv_q is not None else None,
             from_dlpack(l2norm_inv_k, assumed_align=16).mark_layout_dynamic(leading_dim=1) if l2norm_inv_k is not None else None,
+            float(l2norm_eps),
             *tail_constexprs,
             *tail_placeholders,
             *ragged_constexprs,
@@ -1020,6 +1049,8 @@ def run_warmup_forward(
     ragged_enable=None,
     ragged_scalars=(),
     ragged_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
+    level_order=None,
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches.  The
     plan validated the contract at build, so nothing here raises."""
@@ -1067,7 +1098,9 @@ def run_warmup_forward(
         cuda.CUstream(int(stream)),
         item_limit_word,
         tail_enable,
+        level_order,
         *lead_buffers,
+        float(l2norm_eps),
         *tail_scalars,
         *tail_buffers,
         *((*ragged_scalars, *ragged_buffers, ragged_enable) if ragged_buffers else ()),
@@ -1155,6 +1188,7 @@ def warmup_summary_host(
     l2norm_k_slots: cutlass.Constexpr[int] = 1,
     l2norm_k_expand_num: cutlass.Constexpr[int] = 1,
     l2norm_k: Optional[cute.Tensor] = None,
+    l2norm_eps: cutlass.Float32 = l2norm.L2_NORM_EPS,
     tail_unit_chunks: cutlass.Constexpr[int] = 0,
     tail_chain_rows: cutlass.Constexpr[int] = 0,
     tail_summary_cfg: cutlass.Constexpr = None,
@@ -1204,6 +1238,7 @@ def warmup_summary_host(
             l2norm_k_slots,
             l2norm_k_expand_num,
             stream,
+            l2norm_eps,
         )
     gdn_tinv_f16.host(tinv_cfg, True, k, tinv_words, gate, a_log, dt_bias, beta, cu_seqlens, tinv, tinv_rows, tinv_row_count, stream)
     if cutlass.const_expr(split):
@@ -1424,8 +1459,10 @@ def build_warmup_summary(
     tail_chain_rows=0,
     tail_scalars=(),
     tail_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ):
-    """Compile (cached per static config) the summary launch over the buffers of one plan."""
+    """Compile (cached per static config) the summary launch over the buffers of one plan; ``l2norm_eps`` (the k normalize's
+    additive epsilon) is a launch argument, absent from the key."""
     DK = k.shape[-1]
     DV = v.shape[-1]
     if not safe_gate:
@@ -1656,6 +1693,7 @@ def build_warmup_summary(
             l2norm_k_slots,
             l2norm_k_expand_num,
             from_dlpack(l2norm_k, assumed_align=16).mark_layout_dynamic(leading_dim=len(l2norm_k.shape) - 1) if l2norm_k is not None else None,
+            float(l2norm_eps),
             *tail_constexprs,
             *tail_placeholders,
             cache_key=repr((__name__, "summary", key)),
@@ -1695,6 +1733,7 @@ def run_warmup_summary(
     l2norm_k=None,
     tail_scalars=(),
     tail_buffers=(),
+    l2norm_eps=l2norm.L2_NORM_EPS,
 ) -> None:
     """Replay the summary launch: one crossing into the DSL."""
     cpp_launcher.launch(
@@ -1737,6 +1776,7 @@ def run_warmup_summary(
         cuda.CUstream(int(stream)),
         item_limit_word,
         l2norm_k,
+        float(l2norm_eps),
         *tail_scalars,
         *tail_buffers,
     )

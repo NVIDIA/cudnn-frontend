@@ -129,8 +129,8 @@ def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tenso
 
 def attention_prepare(qkv: torch.Tensor, cache, position: int, p, eps: float, acc):
     """Split the in-projection's row into query, gate, key and value, norm query and key per head, rotate both, and insert key and
-    value at ``position`` of the layer's cache.  The row is ``[q | gate]`` per query head, then the keys, then the values.
-    Returns ``(q [rows, heads, D] bf16, gate [rows, heads * D] bf16)``."""
+    value at ``position`` of the layer's cache (``cache.write``).  The row is ``[q | gate]`` per query head, then the keys, then
+    the values.  Returns ``(q [rows, heads, D] bf16, gate [rows, heads * D] bf16)``."""
     rows, H, HK, D = qkv.shape[0], p.heads, p.kv_heads, p.head_dim
     q_gate = qkv[:, : 2 * H * D].view(rows, H, 2 * D)
     q, gate = q_gate[..., :D], q_gate[..., D:]
@@ -139,18 +139,89 @@ def attention_prepare(qkv: torch.Tensor, cache, position: int, p, eps: float, ac
     cos, sin = rope_cos_sin(position, p.rotary_dim, p.rope_theta, qkv.device)
     q = rotate(rms_norm(q.float(), p.q_norm, eps, acc), cos, sin)
     k = rotate(rms_norm(k.float(), p.k_norm, eps, acc), cos, sin)
-    cache.k[:, :, position] = k
-    cache.v[:, :, position] = v
+    cache.write(position, k, v)
     return q, gate.reshape(rows, H * D)
+
+
+def bf16_unit(value: torch.Tensor) -> torch.Tensor:
+    """One bf16 unit in the last place at the magnitude of ``value`` (fp64): ``2 ** (e - 7)`` for ``2 ** e <= |value| < 2 **
+    (e + 1)``, and not below the unit of the smallest normal fp32 value.  Exact on every device: the power of two is built
+    from its bits.  (A power function is not: on a CUDA device ``torch.pow(2.0, k)`` is one fp64 unit low for some whole
+    ``k``, and a band with such a unit refuses an element that is exactly one unit away.)"""
+    exponent = torch.frexp(value.abs().double()).exponent.clamp(min=-125)
+    return ((exponent.to(torch.int64) + (1023 - 8)) << 52).view(torch.float64)  # 2 ** (exponent - 8): the fp64 with that exponent field
+
+
+def prepare_rows(x: torch.Tensor, weight: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, eps: float, order: str = "3d"):
+    """The norm and the rotation of head rows at the rounding points of a kernel that normalises in fp32, rounds the normalised
+    value ONCE to bf16 and each rotated value once more (``cudnn.AttentionPrepareDecode``): ``(out, band)`` for rows ``x``
+    ``[rows, heads, D]`` bf16 with one ``weight`` ``[D]`` and per row the cosines and sines of its position ``[rows, 1,
+    half]`` bf16.  The twin of that entry's own suite, statement by statement
+    (``test/python/attention_prepare/frost/attention_prepare_utils.py``): the mean of squares and its reciprocal root
+    are evaluated in fp64 and rounded to fp32 once -- whatever precision the run's reference accumulates in: the
+    kernel's contract is stated against that evaluation -- the two products of the norm are fp32 products, and a
+    rotated value is one fp32 product and one fused sum (formed exactly, rounded to fp32 and then to bf16).  ``order``
+    is the position form of the kernel, which decides which product of the second rotary half is the fused one.
+    ``band`` (fp64) is what the two normalised operands of a rotated element may move it by, each one bf16 unit off:
+    ``|cos| unit(n1) + |sin| unit(n2)`` with the units taken one unit up; zero for an element that is not rotated."""
+    half = cos.shape[-1]
+    xf = x.float()
+    eps32 = float(torch.tensor(eps, dtype=torch.float32).double())  # the fp32 value the kernel adds
+    mean = (xf.double() ** 2).sum(dim=-1, keepdim=True) / x.shape[-1]
+    inv = (1.0 / torch.sqrt(mean + eps32)).float()  # the root in fp64, rounded to fp32 once
+    normed = ((xf * inv) * (weight.float().reshape(1, 1, -1) + 1.0)).to(BF16)  # fp32 products, ONE rounding to bf16
+    n1, n2 = normed[..., :half].float(), normed[..., half : 2 * half].float()
+    c, s = cos.float(), sin.float()
+    first = (n1.double() * c.double() - (n2 * s).double()).float().to(BF16)  # one fp32 product, the fused sum, one bf16 rounding
+    if order == "3d":
+        second = (n2.double() * c.double() + (n1 * s).double()).float().to(BF16)
+    else:
+        second = (n1.double() * s.double() + (n2 * c).double()).float().to(BF16)
+    n = normed.double()
+
+    def up(v):  # the unit one unit up: the kernel's operand may be the neighbour
+        return bf16_unit(v.abs() + bf16_unit(v))
+
+    spread = c.double().abs() * up(n[..., :half]) + s.double().abs() * up(n[..., half : 2 * half])
+    band = torch.cat((spread, spread, torch.zeros_like(n[..., 2 * half :])), dim=-1)
+    return torch.cat((first, second, normed[..., 2 * half :]), dim=-1), band
+
+
+def attention_prepare_rounded(qkv: torch.Tensor, cache, position: int, tokens: int, p, eps: float, order: str = "3d"):
+    """:func:`attention_prepare` at the rounding points of ``cudnn.AttentionPrepareDecode``, for a step of ``tokens`` tokens
+    per sequence whose rows are sequence by sequence: ``(q, gate, terms)``.  Token ``t`` of every sequence is prepared
+    for ``position + t`` -- the host integer the step hands the block, with the cosines and sines the reference chain
+    forms for it (:func:`rope_cos_sin`) -- and its key and value rows are inserted there through the cache's own
+    accessor (``cache.write``): nothing of this function reads a table of the state.  ``terms`` is what the band of the
+    entry is judged with beside the outputs: the band of every query element, the key rows it wrote with their band
+    and the value rows, in the step's row order, and the position and the tokens per sequence of the call."""
+    from types import SimpleNamespace
+
+    rows, H, HK, D = qkv.shape[0], p.heads, p.kv_heads, p.head_dim
+    q_gate = qkv[:, : 2 * H * D].view(rows, H, 2 * D)
+    q, gate = q_gate[..., :D], q_gate[..., D:]
+    k = qkv[:, 2 * H * D : (2 * H + HK) * D].view(rows, HK, D)
+    v = qkv[:, (2 * H + HK) * D :].view(rows, HK, D)
+    pairs = [rope_cos_sin(position + token, p.rotary_dim, p.rope_theta, qkv.device) for token in range(tokens)]
+    cos = torch.stack([pair[0] for pair in pairs]).repeat(rows // tokens, 1)[:, None]  # row (sequence, token): the position of its token
+    sin = torch.stack([pair[1] for pair in pairs]).repeat(rows // tokens, 1)[:, None]
+    q_out, q_band = prepare_rows(q, p.q_norm, cos, sin, eps, order)
+    k_out, k_band = prepare_rows(k, p.k_norm, cos, sin, eps, order)
+    keys, values = k_out.unflatten(0, (-1, tokens)), v.unflatten(0, (-1, tokens))
+    for token in range(tokens):
+        cache.write(position + token, keys[:, token], values[:, token])
+    terms = SimpleNamespace(q_band=q_band, k=k_out, k_band=k_band, v=v, position=int(position), tokens=int(tokens))
+    return q_out, gate.reshape(rows, H * D), terms
 
 
 def attention(q: torch.Tensor, cache, position: int, acc) -> torch.Tensor:
     """Scaled dot-product attention of one new token per sequence over the cached keys and values up to ``position``; every
-    query head reads the key/value head of its group.  Returns ``[rows, heads * D]`` bf16."""
+    query head reads the key/value head of its group.  Returns ``[rows, heads * D]`` bf16.  The cache is read through its
+    own accessors (``keys`` / ``values``: ``[rows, kv heads, positions, D]`` in ``acc``), whatever its layout."""
     rows, H, D = q.shape
-    HK = cache.k.shape[1]
-    k = cache.k[:, :, : position + 1].to(acc)
-    v = cache.v[:, :, : position + 1].to(acc)
+    k = cache.keys(position + 1, acc)
+    v = cache.values(position + 1, acc)
+    HK = k.shape[1]
     qg = q.to(acc).view(rows, HK, H // HK, D)
     p = torch.softmax(torch.einsum("bhgd,bhtd->bhgt", qg, k) * D**-0.5, dim=-1)
     return torch.einsum("bhgt,bhtd->bhgd", p, v).reshape(rows, H * D).to(BF16)
@@ -582,6 +653,27 @@ class AttentionPrepare(_Reference):
         if tokens > 1:
             return attention_prepare_tokens(qkv, cache, position, tokens, params, self.eps, self.acc)
         return attention_prepare(qkv, cache, position, params, self.eps, self.acc)
+
+
+class AttentionPrepareRounded(_Reference):
+    """The attention preparation at the rounding points of a kernel that normalises in fp32, rounds the normalised value ONCE
+    to bf16 and each rotated value once more, and writes the keys and values of a step's rows into the cache in one
+    launch (``cudnn.AttentionPrepareDecode``).  The reference chain (``attention_prepare``) rounds a rotated value
+    three times and takes its norm from the run's accumulation precision: another function.  This block is the twin of
+    that entry's adapter, not a row of any table.  It works from the host integer the step hands it and writes through
+    the cache's accessor, on either layout of the cache; it reads no table of the state, so a wrong position or slot row
+    cannot move it.  ``order`` is the position form of the adapter's row; ``terms`` keeps of the last call what the
+    band of the entry is judged with (``tie_out``: ``attention_prepare``)."""
+
+    entry = "torch_ref.attention_prepare at the kernel's rounding points"
+    per_row = (0, 1)
+    state_args = (1,)
+    order = "3d"
+    terms = None
+
+    def __call__(self, qkv, cache, position, params):
+        q, gate, self.terms = attention_prepare_rounded(qkv, cache, position, getattr(cache, "tokens", 1), params, self.eps, self.order)
+        return q, gate
 
 
 class Attention(_Reference):

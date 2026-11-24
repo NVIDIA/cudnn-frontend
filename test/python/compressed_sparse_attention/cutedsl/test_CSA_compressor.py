@@ -93,9 +93,8 @@ def _bwd_smem_need_and_limit(ratio, d, coff, total_comp):
 
 
 def _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp):
-    """Skip where the ratio=128 backward's CTA does not fit the device's per-CTA shared memory (for example d=512 coff=2
-    on cc 12.x): check_support() declines that plan with NotImplementedError instead of launching it."""
-    if ratio != 128:
+    """Skip nonempty backward plans that exceed the device's shared-memory limit."""
+    if ratio != 128 or total_comp == 0:
         return
     need, limit = _bwd_smem_need_and_limit(ratio, d, coff, total_comp)
     if need > limit:
@@ -302,6 +301,7 @@ def _run_batch_invariance_target(samples, target_position, d, ratio, coff, backw
         begin, end = comp_prefix[target_position : target_position + 2]
         return snapshot({"out": out[begin:end]})
 
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
     grads = compressor.csa_compressor_backward_wrapper(
         kv.view(total_tokens, -1),
         score.view(total_tokens, -1),
@@ -322,6 +322,16 @@ def _run_batch_invariance_target(samples, target_position, d, ratio, coff, backw
             "grad_ape": grads["grad_ape"],
         }
     )
+
+
+@pytest.mark.L0
+def test_batch_invariance_backward_checks_layout_memory(monkeypatch):
+    _require_csa_device(128)
+    monkeypatch.setitem(_run_batch_invariance_target.__globals__, "_bwd_smem_need_and_limit", lambda *args: (105024, 101376))
+    ape = torch.zeros(128, 1024, dtype=torch.float32, device="cuda")
+    target = _make_batch_invariance_sample(128, 512, 128, 2, ape, 20261120)
+    with pytest.raises(pytest.skip.Exception, match="105024 B.*101376 B"):
+        _run_batch_invariance_target([target], 0, 512, 128, 2, True)
 
 
 _BATCH_INVARIANCE_CASES = [
@@ -2184,6 +2194,38 @@ def test_r128_backward_shared_memory_gate_spares_empty_output(monkeypatch, deter
     rows = compressor.CSACompressorBackward(**_meta_samples(total=1024, d=512, ratio=128, coff=2), ratio=128, coff=2, deterministic=deterministic)
     with pytest.raises(NotImplementedError, match="shared memory per CTA"):
         rows.check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic", [False, True], ids=["atomic", "deterministic"])
+@pytest.mark.parametrize("total_comp,smem_limit", [(0, 1), (64, 101376), (193, 101376), (193, 232448)])
+def test_r128_backward_compiles_only_the_validated_schedule(monkeypatch, deterministic, total_comp, smem_limit):
+    import types
+    from cudnn.csa.compressor import api as csa_api
+    from cudnn.csa.compressor.compressor_sm100_r128 import bwd_smem_bytes_r128
+
+    _require_csa_device(128)
+    monkeypatch.setattr(csa_api, "device_info", lambda index: types.SimpleNamespace(shared_memory_per_block_optin=smem_limit))
+    plan = csa_api.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=total_comp, d=128, ratio=128, coff=2), ratio=128, coff=2, deterministic=deterministic
+    )
+    compiled = []
+
+    def precompile(ratio, d, coff, device, *, nb_total=None, deterministic=False):
+        assert nb_total == total_comp
+        assert bwd_smem_bytes_r128(ratio, d, coff, nb_total) <= smem_limit
+        compiled.append(nb_total)
+
+    monkeypatch.setattr(csa_api, "precompile_bwd_r128", precompile)
+    if total_comp and bwd_smem_bytes_r128(128, 128, 2, total_comp) > smem_limit:
+        with pytest.raises(NotImplementedError, match="shared memory per CTA"):
+            plan.check_support()
+        assert not compiled
+    else:
+        assert plan.check_support()
+        plan.compile()
+        plan.compile()
+        assert compiled == ([total_comp] if total_comp else [])
 
 
 @pytest.mark.L0

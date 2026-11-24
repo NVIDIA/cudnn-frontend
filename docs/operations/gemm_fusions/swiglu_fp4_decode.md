@@ -52,6 +52,14 @@ count, contiguity, alignment) before the compiled kernel is looked up; the host 
 copy, no device allocation, no device read. `alpha` and `out_global_scale` are read on the device. The launch goes to
 torch's current stream of the entry's device. `out` or `out_scale` overlapping an input is undefined (not checked).
 
+`out` or `out_scale` can be a buffer another direct-call entry of the device allocated for itself and recorded with
+`cudnn.frost.init_order` (for example an output of `cudnn.AddNormQuantDecode`; rule 16 of `python/cudnn/frost/README.md`
+lists the entries that record and those that do not yet), whose initialization is still queued on the stream that
+allocated it. The entry allocates nothing, but its launch is ordered behind every such pending initialization of the bytes
+it writes, on whatever stream it runs: the launch stream waits for an event recorded behind the allocation, without a host
+wait and without synchronizing a stream or the device; under a stream capture the call waits for that one event on the
+host before its captured launch. The operands the launch only reads stay the caller's to order.
+
 **The row count is a runtime value.** The kernel is compiled once per token tile, not per row count: `compile()` builds the
 four forms, after which a launch at any served row count is a cache hit that compiles nothing; `compile(rows)` builds the
 form of one row count. A launch of a form that was never compiled compiles it on first use; a serving path should not rely
@@ -91,7 +99,7 @@ the operand values on one runtime, and of nothing else:
   of bytes its propagated error admits, and every code is within half a code step of its own block scale plus that error
   (the test utilities derive both bounds). Operands whose every intermediate is exact -- integer sums, bf16 ties of both
   roundings in both directions, a gate of zero, power-of-two scales -- give a host-built expectation byte for byte.
-- This rounding chain is the entry's own. `cudnn.ops.nvfp4_block_scale_quantize` applies its encode scale to the elements
+- This rounding chain is the entry's own. `cudnn.ops.nvfp4_block_scale_quantize_forward` applies its encode scale to the elements
   before the block maximum, and it and the grouped GLU + Hadamard + quant fusion clamp the reciprocal of a zero block
   scale to the largest fp32 where this entry writes zero codes: the bytes of those APIs are not this entry's.
 - Not a contract: equal bytes across GPU architectures or CuTe DSL compilers (the exponential, the division and the
