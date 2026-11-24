@@ -450,3 +450,38 @@ The port contains no code from Mixture-of-Kittens' ThunderKittens dependency.
 Copyright 2026 Cursor Research
 
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+-------------------------------------------------------------------------------
+15. Cephes tanhf
+    https://github.com/jeremybarnes/cephes/blob/master/single/tanhf.c
+    https://github.com/jeremybarnes/cephes/blob/master/readme
+
+The accurate tanh polynomial coefficients and range split in
+python/cudnn/gemm/cutedsl/grouped/srelu/moe_grouped_gemm_srelu.py
+are adapted from the single-precision tanhf implementation. NVIDIA's
+PTX implementation changes are licensed under Apache-2.0.
+
+License: LicenseRef-Cephes (upstream permission notice below)
+
+Original source notice:
+
+Cephes Math Library Release 2.2:  June, 1992
+Copyright 1984, 1987, 1989, 1992 by Stephen L. Moshier
+Direct inquiries to 30 Frost Street, Cambridge, MA 02140
+
+Original README:
+
+   Some software in this archive may be from the book _Methods and
+Programs for Mathematical Functions_ (Prentice-Hall or Simon & Schuster
+International, 1989) or from the Cephes Mathematical Library, a
+commercial product. In either event, it is copyrighted by the author.
+What you see here may be used freely but it comes with no support or
+guarantee.
+
+   The two known misprints in the book are repaired here in the
+source listings for the gamma function and the incomplete beta
+integral.
+
+
+   Stephen L. Moshier
+   moshier@na-net.ornl.gov

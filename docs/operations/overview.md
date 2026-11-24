@@ -56,8 +56,8 @@ The experimental API catalog includes:
 - [Grouped GEMM + dGLU (Unified)](/operations/Matmul/gemm_fusions/grouped_gemm_dglu)
 - [Grouped GEMM + SwiGLU (Legacy, Contiguous-only)](/operations/Matmul/gemm_fusions/grouped_gemm_swiglu)
 - [Grouped GEMM + dSwiGLU (Legacy, Contiguous-only)](/operations/Matmul/gemm_fusions/grouped_gemm_dswiglu)
-- [Grouped GEMM + sReLU (Unified)](/operations/Matmul/gemm_fusions/grouped_gemm_srelu) — optionally tanh
-  soft-clamped via `tanh_clamp_scale`
+- [Grouped GEMM + sReLU (Unified)](/operations/Matmul/gemm_fusions/grouped_gemm_srelu) — BF16 and block-scaled,
+  optionally tanh soft-clamped via `tanh_clamp_scale`
 - [Grouped GEMM + dsReLU (Unified)](/operations/Matmul/gemm_fusions/grouped_gemm_dsrelu)
 - [Discrete Grouped GEMM + SwiGLU](/operations/Matmul/gemm_fusions/discrete_grouped_gemm_swiglu)
 - [Discrete Grouped GEMM + dSwiGLU](/operations/Matmul/gemm_fusions/discrete_grouped_gemm_dswiglu)

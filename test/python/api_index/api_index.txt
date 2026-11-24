@@ -899,6 +899,7 @@ cudnn.gemm.cutedsl.grouped.GroupedGemmSreluSm100
 cudnn.gemm.cutedsl.grouped.GroupedGemmSreluSm100.check_support
 cudnn.gemm.cutedsl.grouped.GroupedGemmSreluSm100.compile
 cudnn.gemm.cutedsl.grouped.GroupedGemmSreluSm100.execute
+cudnn.gemm.cutedsl.grouped.GroupedGemmSreluSm100.scratch_workspace_bytes
 cudnn.gemm.cutedsl.grouped.GroupedGemmSwigluSm100
 cudnn.gemm.cutedsl.grouped.GroupedGemmSwigluSm100.check_support
 cudnn.gemm.cutedsl.grouped.GroupedGemmSwigluSm100.compile
