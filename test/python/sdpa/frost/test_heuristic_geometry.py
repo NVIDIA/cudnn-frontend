@@ -818,6 +818,36 @@ def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc
 
 
 @requires_dsl
+@pytest.mark.parametrize(
+    "s_q,causal,window,sink,d,sm90",
+    [
+        (1, False, None, False, 128, True),  # a single-row graph's facts drop its no-op causal mask
+        (4, True, None, False, 128, True),
+        (16, True, None, False, 256, True),
+        (4, True, 128, False, 128, False),
+        (4, True, None, True, 128, False),
+        (32, True, None, False, 128, False),
+        (4, True, None, False, 64, False),
+    ],
+)
+def test_sm90_decode_split_uses_its_own_constants(monkeypatch, s_q, causal, window, sink, d, sm90):
+    """SM90 half decode (S_q <= 16, no window or sink, the calibrated head dims) hands the chooser SM90's constants; the rest of the
+    row keeps the shared ones."""
+    from cudnn.sdpa.fwd.engines import _sm90_spec
+
+    spec = _sm90_spec()
+    seen = []
+    real = heur.choose_split_kv
+    monkeypatch.setattr(heur, "choose_split_kv", lambda **kw: seen.append(kw) or real(**kw))
+    facts = _facts(b=1, h_q=16, h_kv=2, s_q=s_q, s_kv=32768, d_qk=d, d_v=d, causal=causal, bottom_right=True, window_left=window, has_sink=sink)
+    heur._knob_sets(spec, replace(facts, device_cc=(9, 0), device_sm_count=132))
+    want = (heur._SM90_SPLIT_KV_CTA_COST, heur._SM90_SPLIT_KV_COMBINE_COST, heur._SM90_SPLIT_KV_COMBINE_FLOOR) if sm90 else (None, None, None)
+    assert seen or not sm90
+    for kw in seen:
+        assert (kw.get("cta_cost"), kw.get("combine_cost"), kw.get("combine_floor")) == want
+
+
+@requires_dsl
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("s_q,window", [(1, None), (1, 128), (4, None), (4, 128)])
 @pytest.mark.parametrize("sink", [True, False])

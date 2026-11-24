@@ -2719,7 +2719,7 @@ def _dense_rows_load(dst, tmap, s, hk, g, bar, GH: cutlass.Constexpr[int]):
 # In the deterministic mode (DET) the pairs that add to one fp32 row add in a fixed order. A pair runs the unit of the
 # ticket it draws at its start and waits only for lower tickets, which already run, so no dispatch order deadlocks.
 DP_SYNC = 32  # dense_sync words per unit after the ticket counter's line, 16 per rank
-DP_SYNC_DQ = 0  # + drain warp: the groups whose dQ^T reduce has completed
+DP_SYNC_DQ = 0  # + issuer: the unit's steps whose dQ^T reduces have completed
 DP_SYNC_KV = 4  # + softmax warp: set once the warp's dK / dV rows are flushed
 DP_SYNC_TICKET = 15  # of the physical pair: the ticket it drew
 DP_KV_ORDER = 4  # words of a unit's flush order in shared memory
@@ -2848,7 +2848,7 @@ def _kv_done(p_order, p_sync, slot, lane):
 
 
 @cute.jit
-def _dq_turn(p_sync, slot, g, n_lo, n_top, Ut, nparts, tile, hk, pr, nb_seen, np_seen, ntiles, HKV: cutlass.Constexpr[int]):
+def _dq_turn(p_sync, slot, g, n_lo, n_top, Ut, nparts, tile, hk, pr, nb_seen, np_seen, ntiles, HKV: cutlass.Constexpr[int], NI: cutlass.Constexpr[int]):
     # The previous tile adds group g to dQ first, as step kn of its band bn, whose progress as last read is np_seen.
     if (g >= n_lo) & (g < n_top):
         bn = (n_top - 1 - g) // Ut
@@ -2861,20 +2861,74 @@ def _dq_turn(p_sync, slot, g, n_lo, n_top, Ut, nparts, tile, hk, pr, nb_seen, np
         nu = _unit_ticket(bn, tile - 1, hk, ntiles, HKV)
         # A lower ticket already runs. Tables no valid input gives must not end in a wait on a unit that never starts.
         if (np_seen <= kn) & (nu < pr):
-            np_seen = _wait_above(p_sync + (nu * DP_SYNC + slot), kn)
+            np_seen = _wait_above(p_sync + (nu * DP_SYNC + slot + kn % NI), kn)
         # the acquire load ordered that reduce before this thread, the fence orders this thread's reduce after it
         prims.fence_proxy(prims.Proxy.ASYNC_GLOBAL)
     return nb_seen, np_seen
 
 
 @cute.jit
-def _dq_done(p_sync, pr, slot, k, lane):
+def _dq_done(p_sync, pr, slot, k):
     # A completed reduce is visible to this thread alone. The fence and the release store order it before the acquire
     # load of the next tile.
     prims.cp_async_bulk_wait_group(0)
-    if lane == 0:
-        prims.fence_proxy(prims.Proxy.ASYNC_GLOBAL)
-        _publish(p_sync + (pr * DP_SYNC + slot), k + 1)
+    prims.fence_proxy(prims.Proxy.ASYNC_GLOBAL)
+    _publish(p_sync + (pr * DP_SYNC + slot), k + 1)
+
+
+def _dq_issuers(GH):
+    # Threads per CTA that add to dQ. A twelve-head group reduces twice the bytes of a six-head one, so it gets one more.
+    return 3 if GH == GQ else 2
+
+
+@cute.jit
+def _dq_issue(
+    tma_dq,
+    p_sync,
+    sbase,
+    b_stg,
+    b_stf,
+    par,
+    rank,
+    hk,
+    pr,
+    tile,
+    nk,
+    g_top,
+    n_lo,
+    n_top,
+    Ut,
+    nparts,
+    ntiles,
+    HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
+):
+    # Issuer par adds every NI-th step of the unit to dQ. It issues the reduces itself because only the issuing thread
+    # can wait for them before it publishes the step.
+    NI = _dq_issuers(GH)
+    slot = rank * 16 + DP_SYNC_DQ
+    nb_seen = I32(-1)
+    np_seen = I32(0)
+    for k in cutlass.range(par, nk, NI, unroll=1):
+        g = g_top - 1 - k
+        _wait(b_stg.subview(par), (k // NI) & 1)
+        nb_seen, np_seen = _dq_turn(p_sync, slot, g, n_lo, n_top, Ut, nparts, tile, hk, pr, nb_seen, np_seen, ntiles, HKV, NI)
+        # the drain warps staged step k in their box k & 1
+        box = sbase + (DP_OFF_ST // 4 + (k & 1) * ((DP_OFF_DS - DP_OFF_ST) // 4 + rank * (DP_CM // 4)))
+        for qd in cutlass.range_constexpr(4):
+            if cutlass.const_expr(GH == GQ):
+                prims.cp_async_bulk_tensor_reduce(tma_dq.get_ptr(), box + qd * (DP_ST_W // 4), prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GQ, g * DP_G])
+            else:
+                # the GH real head rows of every query of the group
+                for qq in cutlass.range_constexpr(DP_G):
+                    prims.cp_async_bulk_tensor_reduce(
+                        tma_dq.get_ptr(), box + qd * (DP_ST_W // 4) + qq * GQ * 32, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GH, g * DP_G + qq]
+                    )
+        prims.cp_async_bulk_commit_group()
+        # the drain warps may stage into the boxes again once the reduces have read them
+        prims.cp_async_bulk_wait_group(0, read=True)
+        prims.mbarrier_arrive(b_stf.subview(k & 1))
+        _dq_done(p_sync, pr, slot + par, k)
 
 
 @cute.kernel
@@ -2983,6 +3037,8 @@ def qsa_bwd_dense_pair_kernel(
         tmem_slot = cutlass.Array(I32, 1, space=cutlass.AddressSpace.smem, alignment=4)
         if cutlass.const_expr(DET):
             kv_order = cutlass.Array(I32, DP_KV_ORDER, space=cutlass.AddressSpace.smem, alignment=16)
+            b_stg = cutlass.Array(cutlass.Int64, _dq_issuers(GH), space=cutlass.AddressSpace.smem, alignment=8)
+            b_stf = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
 
         sbase = smem.data_ptr()
         if cutlass.const_expr(GH < GQ):
@@ -2994,6 +3050,10 @@ def qsa_bwd_dense_pair_kernel(
             if prims.elect_sync():
                 if cutlass.const_expr(DET):
                     _kv_order(kv_order.data_ptr(), band, tile, hk, rank, pr, g_lo, t_lo, ntiles, HKV)
+                    for s in cutlass.range_constexpr(_dq_issuers(GH)):
+                        prims.mbarrier_init(b_stg.subview(s), 4)
+                    for s in cutlass.range_constexpr(2):
+                        prims.mbarrier_init(b_stf.subview(s), 1)
                 prims.prefetch_tensormap(tma_kd.get_ptr())
                 prims.prefetch_tensormap(tma_qd.get_ptr())
                 prims.prefetch_tensormap(tma_dod.get_ptr())
@@ -3041,6 +3101,19 @@ def qsa_bwd_dense_pair_kernel(
         p_dense_dv_acc = g_dense_dv_acc.iterator.raw_ptr()
         p_k = g_k.iterator.raw_ptr()
         p_v = g_v.iterator.raw_ptr()
+
+        if cutlass.const_expr(DET):
+            # The wait for the previous tile, the reduce and its release store outlast a group. Issuers (lane 0 of the idle
+            # warp 2 and of the extra warps) overlap them off the path of the drain warps.
+            par = I32(-1)
+            if warp == 2:
+                par = I32(0)
+            if warp >= DP_THREADS // 32:
+                par = warp - (DP_THREADS // 32 - 1)
+                # the extra warps take no branch of the roles below
+                warp = I32(2)
+            if (par >= 0) & (lane == 0):
+                _dq_issue(tma_dq, p_sync, sbase, b_stg, b_stf, par, rank, hk, pr, tile, nk, g_top, n_lo, n_top, Ut, nparts, ntiles, HKV, GH)
 
         if warp == 0:
             if prims.elect_sync():
@@ -3466,9 +3539,8 @@ def qsa_bwd_dense_pair_kernel(
             # box per drain warp and the reduce of group k-1 may still be reading while k is staged.
             stg1 = sbase + (DP_OFF_DS + qd * DP_ST_W) // 4
             if cutlass.const_expr(DET):
-                dq_slot = rank * 16 + DP_SYNC_DQ + qd
-                nb_seen = I32(-1)
-                np_seen = I32(0)
+                # rank 1's dS slot is the first DP_CM bytes of its dS region, so both ranks have a second box
+                stg1 = stg1 + rank * (DP_CM // 4)
             for k in cutlass.range(nk, unroll=1):
                 g = g_top - 1 - _rot(k, off, nk)
                 _wait(b_dqf, k & 1)
@@ -3483,7 +3555,13 @@ def qsa_bwd_dense_pair_kernel(
                 # the reduce that last used this staging box must have finished reading it. Rank 0 has two boxes, so one
                 # reduce may stay in flight. Rank 1 has one.
                 stg = stg0
-                if rank == 0:
+                if cutlass.const_expr(DET):
+                    # an issuer adds the staged group to dQ and says when its reduces have read the box
+                    if (k & 1) == 1:
+                        stg = stg1
+                    if k >= 2:
+                        _wait(b_stf.subview(k & 1), ((k >> 1) - 1) & 1)
+                elif rank == 0:
                     if (k & 1) == 1:
                         stg = stg1
                     prims.cp_async_bulk_wait_group(1, read=True)
@@ -3498,9 +3576,10 @@ def qsa_bwd_dense_pair_kernel(
                     (stg + n * 32 + lane).store(prims.mov_b32(val, target_type=I32))
                 prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
                 prims.bar_warp_sync(0xFFFFFFFF)
-                if lane == 0:
-                    if cutlass.const_expr(DET):
-                        nb_seen, np_seen = _dq_turn(p_sync, dq_slot, g, n_lo, n_top, Ut, nparts, tile, hk, pr, nb_seen, np_seen, ntiles, HKV)
+                if cutlass.const_expr(DET):
+                    if prims.elect_sync():
+                        prims.mbarrier_arrive(b_stg.subview(k % _dq_issuers(GH)))
+                elif lane == 0:
                     if cutlass.const_expr(GH == GQ):
                         prims.cp_async_bulk_tensor_reduce(tma_dq.get_ptr(), stg, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GQ, g * DP_G])
                     else:
@@ -3509,9 +3588,8 @@ def qsa_bwd_dense_pair_kernel(
                             prims.cp_async_bulk_tensor_reduce(
                                 tma_dq.get_ptr(), stg + qq * GQ * 32, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GH, g * DP_G + qq]
                             )
-                prims.cp_async_bulk_commit_group()
-                if cutlass.const_expr(DET):
-                    _dq_done(p_sync, pr, dq_slot, k, lane)
+                if cutlass.const_expr(not DET):
+                    prims.cp_async_bulk_commit_group()
             prims.cp_async_bulk_wait_group(0)
 
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -3615,7 +3693,13 @@ def _dpair_host(
         HKV,
         GH,
         DET,
-    ).launch(grid=(nparts * ntiles * 2 * HKV, 1, 1), block=(DP_THREADS, 1, 1), cluster=(2, 1, 1), stream=stream, use_pdl=(PDL == 1))
+    ).launch(
+        grid=(nparts * ntiles * 2 * HKV, 1, 1),
+        block=(DP_THREADS + 32 * (_dq_issuers(GH) - 1) * DET, 1, 1),
+        cluster=(2, 1, 1),
+        stream=stream,
+        use_pdl=(PDL == 1),
+    )
 
 
 # Tuned dense/sparse crossover: below it row i selects 2048 of its i + 1 tokens, dense enough that keeping dK/dV on

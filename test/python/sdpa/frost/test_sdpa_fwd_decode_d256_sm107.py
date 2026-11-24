@@ -2769,6 +2769,63 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits, dtype):
 
 
 @_gpu
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_decode_64_column_tile_wide_output_replays(dtype):
+    """The spill-free 64-column epilogue retains 64-bit physical O offsets."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, KH, SQ, SKV = 4, 32, 2, 4, 129
+    batch_stride = 2**31 - 65536
+    required = ((B - 1) * batch_stride + SQ * H * D) * 2
+    if torch.cuda.mem_get_info()[0] < required + 2**30:
+        pytest.skip("wide output stride storage unavailable")
+    torch.manual_seed(1741)
+    q = torch.randn(B, SQ, H, D, device="cuda", dtype=dtype)
+    k = torch.randn(B, SKV, KH, D, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    try:
+        o = torch.empty_strided((B, SQ, H, D), (batch_stride, H * D, D, 1), device="cuda", dtype=dtype)
+    except torch.OutOfMemoryError:
+        raise pytest.skip.Exception("wide output stride storage unavailable at allocation") from None
+    lse = torch.empty(B, H, SQ, device="cuda")
+    seq_kv = torch.tensor([129, 65, 1, 0], device="cuda", dtype=torch.int32)
+    qv, kv, vv, ov = (t.transpose(1, 2) for t in (q, k, v, o))
+    api = SdpaFwdDslSm100(sample_q=qv, sample_k=kv, sample_v=vv, sample_o=ov, sample_lse=lse, seq_kv_lens_present=True, pack_gqa=True, split_kv=1)
+    assert api.check_support()
+    api.compile()
+    assert api.kernel_template == DECODE and api._k_mod.N_Q == 64 and api._k_mod.HEADS_PER_TILE == 16
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+
+    def execute():
+        api.execute(qv, kv, vv, ov, lse_tensor=lse, seq_kv_lens=seq_kv, workspace=ws)
+
+    execute()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            execute()
+        for lengths in ([129, 65, 1, 0], [0, 1, 127, 129]):
+            seq_kv.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
+            v.mul_(0.75)
+            o.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref(q, k, v, lengths, None, 1 / math.sqrt(D))
+            torch.testing.assert_close(o.float(), ref_o, atol=2e-2, rtol=0)
+            live = ~torch.isinf(ref_lse)
+            torch.testing.assert_close(lse[live], ref_lse[live], atol=5e-3, rtol=0)
+            assert torch.isneginf(lse[~live]).all()
+            for b, length in enumerate(lengths):
+                if length == 0:
+                    assert (o[b] == 0).all()
+    finally:
+        graph.reset()
+
+
+@_gpu
 @pytest.mark.parametrize("page", [0, 16], ids=["dense_padded", "page16_HND"])
 def test_decode_graph_mtp_32_2_s_q_four_rides_the_64_column_tile_in_one_unit(page):
     """32/2 at S_q = 4 (64 packed rows) on the PRODUCTION route: ONE unit of the 64-column tile, four tokens x 16 heads (no

@@ -75,8 +75,10 @@ from row_quantize_fp4_decode_utils import (  # noqa: E402  (the launch arms, the
     unpack_e2m1,
 )
 
+from cudnn.frost import init_order  # noqa: E402
 from cudnn.row_quantize.frost import row_quantize_fp4_decode as entry  # noqa: E402
 from cudnn.row_quantize.frost.kernel import row_quantize_fp4_decode_config as kcfg  # noqa: E402
+from init_order_schedules import host_allocations, park, pooled, settled_records, spans_of, stand_ins  # noqa: E402, F401  (settled_records is a fixture)
 from launch_records import assert_facts_equal_the_launch  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
@@ -345,276 +347,152 @@ def test_compile_and_outputs_decline_a_bad_row_count():
     assert not k.compiled and not k.buffers, "a declined compile allocates nothing"
 
 
-def _ordering_stand_ins(monkeypatch):
-    """Stand-ins for what the ordering step touches -- an event, the streams, the driver's capture-mode exchange -- with ONE log
-    of their calls (``calls``); ``capturing[0]`` is what ``torch.cuda.is_current_stream_capturing`` answers; a synchronization of
-    a stream or of the device raises."""
-    calls, capturing = [], [False]
-
-    class Event:
-        def __init__(self, complete, fails=False):
-            self.complete, self.fails = complete, fails
-
-        def query(self):
-            calls.append("query")
-            if self.fails:
-                raise RuntimeError("the event's query failed")
-            return self.complete
-
-        def synchronize(self):
-            calls.append("synchronize")
-            self.complete = True
-
-    class Stream:
-        def __init__(self, name):
-            self.name = name
-
-        def wait_event(self, event):
-            calls.append(("wait_event", self.name, event))
-
-        def synchronize(self):
-            raise AssertionError("a stream was synchronized")
-
-        wait_stream = synchronize
-
-    class Driver:
-        class CUstreamCaptureMode:
-            CU_STREAM_CAPTURE_MODE_RELAXED = "relaxed"
-
-        mode, fails = "global", False
-
-        @classmethod
-        def cuThreadExchangeStreamCaptureMode(cls, mode):
-            if cls.fails:
-                return 1, cls.mode
-            previous, cls.mode = cls.mode, mode
-            calls.append(("capture mode", mode))
-            return 0, previous
-
-    def no_device_synchronization(*args, **kwargs):
-        raise AssertionError("the device was synchronized")
-
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
-    monkeypatch.setattr(torch.cuda, "synchronize", no_device_synchronization)
-    return calls, capturing, Event, Stream, Driver
+def test_outputs_records_the_initialization_before_the_pair_is_published(monkeypatch):
+    """The record of a pair's initialization, on stand-ins (no device): under the entry's device ``codes`` is allocated,
+    ``scales`` is zero-filled, and only THEN the event is recorded on the stream that is current at that moment -- with the byte
+    range of both tensors, and BEFORE the pair is in the entry's table (a host thread that finds the tensors finds the record).
+    A second ``outputs`` of the row count allocates and records nothing and returns a COPY of the entry's table over the same
+    tensors; inside a stream capture the pair is allocated and nothing is recorded (the fill is a node of the captured graph);
+    an entry on a device without streams records nothing.  The records are the device's (``init_order.pending_of``), which
+    every entry of the device walks."""
+    s = stand_ins(monkeypatch)
+    dev = torch.device("cuda", 5)
+    host_allocations(monkeypatch, dev, s.calls)
+    monkeypatch.setattr(entry, "device_context", init_order.device_context)  # the stand-in: the pair is allocated under the entry's device
+    k, records = make_entry(dev), init_order.pending_of(dev)
+    published, real = [], init_order.record
+    monkeypatch.setattr(init_order, "record", lambda pending, tensors: (published.append(dict(k.buffers)), real(pending, tensors)))
+    pair = k.outputs(3)
+    recorded = [("enter", dev), ("record", 100), ("leave", dev)]
+    assert s.calls == [("enter", dev), ("empty", (3, WIDTH // 2)), ("zeros", (128, BLOCKS)), *recorded, ("leave", dev)]
+    assert published == [{}], "the record is made before the pair is in the entry's table"
+    ((_, handle, spans),) = records.values()
+    assert handle == 100 and spans == spans_of(pair.values())
+    assert bool((pair["scales"].view(U8) == 0).all()) and pair["scales"].dtype == E4M3 and pair["codes"].dtype == U8
+    s.calls.clear()
+    again = k.outputs(3)
+    assert again is not pair and again is not k.buffers[3] and all(again[name] is pair[name] for name in ("codes", "scales"))
+    assert not s.calls and len(records) == 1, "the pair of a row count is allocated and recorded once"
+    s.capturing.add(100)
+    k.outputs(4)
+    assert [what for what, _ in s.calls] == ["enter", "empty", "zeros", "enter", "leave", "leave"] and 4 in k.buffers and len(records) == 1
+    host = make_entry("cpu")
+    host.outputs(3), host.outputs(4)
+    assert not init_order.pending_of(host.device), "an entry on a device without streams records no initialization"
 
 
-def _spans(pair):
-    """The address ranges of a pair's two tensors, written out here: what a record of its initialization holds."""
-    return tuple((t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in (pair["codes"], pair["scales"]))
-
-
-def test_initialization_order_is_decided_per_pair_and_waits_for_one_event_at_most(monkeypatch):
-    """What a call does for ONE pair whose initialization may be pending, on stand-ins for the event, the streams and the driver
-    (no device; the device cells run the schedules).  Complete: the record is dropped.  Pending on the launch stream: nothing is
-    enqueued and the record stays.  Pending on another stream: THAT stream waits for the event and the record stays for the next
-    stream.  Pending under a capture: the host waits for this one event, without querying it first, and the record is dropped.
-    No branch synchronizes a stream or the device; every read of the event runs with the thread's capture check relaxed, and the
-    check is restored also when the read raises.  A pair of another row count is never touched, and an entry on a device without
-    streams records nothing.  A record that is gone when the pair is looked up -- another host thread's launch saw the
-    initialization complete and dropped it -- is nothing to order behind: no event and no capture check is read; a record that
-    the other thread drops WHILE this call reads its event is dropped without an error.  The initialization's stream is the
-    same stream also when it arrives as another object (``torch.cuda.current_stream`` returns a new one on every call)."""
-    calls, capturing, Event, Stream, Driver = _ordering_stand_ins(monkeypatch)
+def _launch_intercepted(monkeypatch):
+    """``(stand-ins, entry, the device's records)``: a host entry whose launch is intercepted; ``_flat`` hands a tensor through."""
+    s = stand_ins(monkeypatch)
     k = make_entry("cpu")
-    k.outputs(3), k.outputs(4)
-    assert k._init == {}, "an entry on a device without streams records no initialization"
-    init, other, untouched = Stream("init"), Stream("other"), (Event(False), Stream("of another row count"), ())
-
-    def decide(event, stream, captured=False):
-        calls.clear()
-        capturing[0] = captured
-        k._init = {3: (event, init, ()), 4: untouched}
-        k._order_behind_init(3, stream, Driver)
-        assert calls[0] == ("capture mode", "relaxed") and calls[-1] == ("capture mode", "global") and Driver.mode == "global"
-        assert k._init[4] is untouched
-        return calls[1:-1], 3 in k._init
-
-    pending = Event(False)
-    assert decide(pending, init) == (["query"], True)
-    assert decide(pending, other) == (["query", ("wait_event", "other", pending)], True)
-    assert decide(pending, other, captured=True) == (["synchronize"], False)
-    assert decide(Event(False), init, captured=True) == (["synchronize"], False)
-    assert decide(Event(True), other) == (["query"], False)
-
-    class SameStream(Stream):  # the same stream as another object
-        def __eq__(self, o):
-            return isinstance(o, Stream) and o.name == self.name
-
-        def __ne__(self, o):
-            return not self == o
-
-        __hash__ = None
-
-    assert decide(Event(False), SameStream("init")) == (["query"], True), "the initialization's stream as another object: nothing is enqueued"
-    k._init = {3: (Event(False, fails=True), init, ())}
-    with pytest.raises(RuntimeError, match="the event's query failed"):
-        k._order_behind_init(3, other, Driver)
-    assert Driver.mode == "global", "the capture check is restored behind a failed read"
-    calls.clear()
-    k._init = {4: untouched}
-    k._order_behind_init(3, other, Driver)
-    assert not calls and k._init == {4: untouched} and Driver.mode == "global", "a record that is gone: nothing is read, nothing raises"
-
-    class DroppedMeanwhile(Event):  # another thread's launch drops the record between this call's lookup and its own drop
-        def query(self):
-            k._init.pop(3)
-            return super().query()
-
-    k._init = {3: (DroppedMeanwhile(True), init, ()), 4: untouched}
-    k._order_behind_init(3, other, Driver)
-    assert k._init == {4: untouched} and Driver.mode == "global", "a record dropped while this call read its event: its own drop does not raise"
-    k._init = {3: (Event(False), init, ())}
-    Driver.fails = True
-    calls.clear()
-    with pytest.raises(RuntimeError, match="cuThreadExchangeStreamCaptureMode failed"):
-        k._order_behind_init(3, other, Driver)
-    assert not calls and 3 in k._init, "nothing is read and nothing is dropped when the capture check cannot be relaxed"
+    monkeypatch.setattr(entry, "_flat", lambda t: t)
+    k.compiled[k.key()] = lambda *args: s.calls.append(("launch", int(args[-1])))
+    return s, k, init_order.pending_of(k.device)
 
 
-def test_a_launch_is_ordered_behind_every_pending_pair_it_writes_and_behind_no_other(monkeypatch):
-    """WHICH pending initializations a launch is ordered behind, on host tensors and the stand-ins (no device): those of the
-    pairs that hold bytes the launch WRITES, however the tensor reached the call -- the entry's own output by default or the
-    pair passed back (the same tensors), one of the two beside a caller-owned output, a view or a slice of one, the pair of
-    ANOTHER row count whole or sliced, outputs of two pairs at once -- and no other.  The test is one of ADDRESSES: the bytes a
-    launch of ``rows`` rows writes (not the tensor's size: rows past the call's are not written) against the pair's two
-    allocations, half-open -- EVERY written range against BOTH allocations, so a written operand that lies over the OTHER
-    tensor of a pair (the codes over a pair's scale bytes, the scales over a pair's code bytes) is ordered too.  A caller-owned
-    output is ordered behind nothing and reads no event, with records present; the per-pair decision is the one of the case
-    above (a pending pair on another stream: that stream waits and the record stays; a complete one: dropped), taken for every
-    pair that is hit and for no other -- and a record that another host thread dropped behind the walk's snapshot is skipped
-    without ending the walk."""
-    calls, capturing, Event, Stream, Driver = _ordering_stand_ins(monkeypatch)
-    k = make_entry("cpu")
-    own, nine, big = k.outputs(3), k.outputs(9), k.outputs(200)
-    mine = _host_operands(3, extra_rows=2)
-    init, launch = Stream("init"), Stream("launch")
+def test_a_call_orders_its_launch_behind_a_pending_record_over_any_output_it_writes(monkeypatch):
+    """The wiring, on stand-ins with the launch intercepted (no device): IN FRONT of the launch and on the LAUNCH stream, a call
+    is ordered behind a pending record of its device over the bytes of an output it WRITES -- passed, or the entry's own of
+    the row count -- and behind none over an operand it only reads; without a record nothing but the launch happens.  An
+    entry that holds no pair orders its launch into a passed output the same way: the records are the device's."""
+    s, k, records = _launch_intercepted(monkeypatch)
+    ops, owned = _host_operands(3), k.outputs(3)
 
-    def ordered_behind(rows, **written):
-        """The row counts a launch of ``rows`` rows into ``written`` is ordered behind, with every pair's record pending on
-        another stream; no record may be dropped and no other event read."""
-        calls.clear()
-        events = {r: Event(False) for r in (3, 9, 200)}
-        k._init = {r: (events[r], init, _spans(k.outputs(r))) for r in (3, 9, 200)}
-        k._order_behind_pending(rows, written, launch, Driver)
-        waited_for = [c[2] for c in calls if isinstance(c, tuple) and c[0] == "wait_event"]
-        assert set(k._init) == {3, 9, 200} and calls.count("query") == len(waited_for)
-        return [next(r for r, event in events.items() if event is waited) for waited in waited_for]
+    def ordering_of_a_call(over=None, by=k, **change):
+        records.clear()
+        event = s.Event(False)
+        if over is not None:
+            records[0] = (event, 7, spans_of((over,)))
+        s.calls.clear()
+        call = dict(ops, **change)
+        by(call["x"], call["scale"], call["codes"], call["scales"])
+        return [c for c in s.calls if c[0] in ("wait_event", "launch")], [("wait_event", 100, event), ("launch", 100)]
 
-    whole = dict(codes=own["codes"], scales=own["scales"])
-    assert ordered_behind(3, **whole) == [3], "the entry's own outputs, by default or passed back whole"
-    assert ordered_behind(3, codes=mine["codes"], scales=own["scales"]) == [3], "the scales passed back beside caller-owned codes"
-    assert ordered_behind(3, codes=own["codes"], scales=mine["scales"]) == [3], "the codes passed back beside caller-owned scales"
+    for name in ("codes", "scales"):
+        got, ordered = ordering_of_a_call(ops[name])
+        assert got == ordered, f"a record over the passed {name}"
+        got, ordered = ordering_of_a_call(owned[name], **{name: None})
+        assert got == ordered, f"a record over the entry-owned {name}"
+    for name in ("x", "scale"):
+        assert ordering_of_a_call(ops[name])[0] == [("launch", 100)], f"{name} is only read"
+    assert ordering_of_a_call()[0] == [("launch", 100)] and s.calls == [("launch", 100)], "without a record: the launch alone"
+    another = make_entry("cpu")
+    another.compiled[another.key()] = k.compiled[k.key()]
+    got, ordered = ordering_of_a_call(ops["scales"], by=another)
+    assert got == ordered and not another.buffers, "a passed output, by an entry that holds no pair"
+
+
+def test_a_launch_is_ordered_by_the_bytes_it_writes_of_its_resolved_outputs(monkeypatch):
+    """WHICH bytes a call is ordered by, on stand-ins with the launch intercepted (no device), HOWEVER the tensor reached the
+    call: the code bytes of the live rows (rows past the call's are not written) and the whole padded scale bands of the
+    outputs as RESOLVED for the call -- the entry's own pair, taller caller-owned tensors, views, slices that start inside the
+    pair of another row count, the scale bytes of a pair bound as the call's codes.  A pending record over the first or over
+    the last such byte orders the launch; one over the byte behind the last, where that byte is the operand's, does not."""
+    s, k, records = _launch_intercepted(monkeypatch)
+    x, scale = _host_operands(3, own=False).values()
+    own, big, mine = k.outputs(3), k.outputs(200), _host_operands(3, extra_rows=2)
+    code_bytes, band_bytes = 3 * (WIDTH // 2), 128 * BLOCKS
+
+    def ordered_behind(byte, codes, scales):
+        """Whether a call of three rows with these outputs waits for a pending record over the ONE byte at ``byte``."""
+        records.clear()
+        records[0] = (s.Event(False), 7, ((byte, byte + 1),))
+        s.calls.clear()
+        k(x, scale, codes, scales)
+        return [c[0] for c in s.calls if c[0] in ("wait_event", "launch")] == ["wait_event", "launch"]
+
+    def written(label, codes, scales, bound=None, taller=()):
+        """``bound``: the tensors the call writes when they are not the ones it passes (the entry's own); ``taller``: the
+        outputs that hold bytes of their own behind the written ones."""
+        at = dict(codes=(codes if bound is None else bound["codes"]).data_ptr(), scales=(scales if bound is None else bound["scales"]).data_ptr())
+        for name, size in (("codes", code_bytes), ("scales", band_bytes)):
+            assert ordered_behind(at[name], codes, scales), f"{label}: the first byte the launch writes of {name}"
+            assert ordered_behind(at[name] + size - 1, codes, scales), f"{label}: the last byte the launch writes of {name}"
+            if name in taller:
+                assert not ordered_behind(at[name] + size, codes, scales), f"{label}: the byte behind the last written one of {name}"
+
+    written("the entry's own pair", None, None, bound=own)
+    assert mine["codes"].shape[0] == 5 and mine["scales"].numel() > band_bytes
+    written("taller caller-owned outputs", mine["codes"], mine["scales"], taller=("codes", "scales"))
     views = dict(codes=own["codes"][:], scales=own["scales"].view(U8)[:].view(E4M3))
     assert views["codes"] is not own["codes"] and views["scales"] is not own["scales"]
-    assert ordered_behind(3, **views) == [3], "views: other tensor objects over the pair's bytes"
-    assert ordered_behind(3, codes=nine["codes"], scales=nine["scales"]) == [9], "the pair of another row count"
-    assert ordered_behind(3, codes=big["codes"][100:], scales=big["scales"][128:]) == [200], "slices that start inside another pair"
-    assert ordered_behind(3, codes=nine["codes"], scales=own["scales"]) == [3, 9], "outputs of two pairs: both are waited for"
+    written("views of the entry's own pair", **views)
+    inside = dict(codes=big["codes"][100:], scales=big["scales"][128:])
+    assert inside["codes"].data_ptr() > big["codes"].data_ptr() and inside["scales"].data_ptr() > big["scales"].data_ptr()
+    written("slices that start inside the pair of another row count", **inside, taller=("codes",))
     over_scales = big["scales"].view(U8).reshape(32, WIDTH // 2)  # the scale bytes of a pair, bound as the call's CODES
-    assert ordered_behind(3, codes=over_scales, scales=mine["scales"]) == [200], "a written operand over the OTHER tensor of a pair"
-    over_codes = big["codes"].view(E4M3)[:16].reshape(128, BLOCKS)  # the code bytes of a pair, bound as the call's SCALES
-    assert ordered_behind(3, codes=mine["codes"], scales=over_codes) == [200], "the scales over the code bytes of a pair"
-    assert ordered_behind(3, codes=mine["codes"], scales=mine["scales"]) == [], "caller-owned outputs"
-    assert not calls, "a call with caller-owned outputs read an event or the capture check"
-
-    # by address, half-open, over the bytes the launch writes: a record whose range only TOUCHES the written bytes is not hit
-    first, last = mine["codes"].data_ptr(), mine["codes"].data_ptr() + 3 * (WIDTH // 2)
-
-    def hit(*span):
-        calls.clear()
-        k._init = {77: (Event(False), init, (span,))}
-        k._order_behind_pending(3, dict(codes=mine["codes"], scales=mine["scales"]), launch, Driver)
-        return "query" in calls
-
-    assert not hit(first - 64, first) and hit(first - 64, first + 1), "a range that ends where the written bytes begin"
-    assert hit(last - 1, last + 64) and not hit(last, last + 64), "the code rows past the call's row count are not written"
-    assert not hit(last, last + 2 * (WIDTH // 2)) and mine["codes"].shape[0] == 5
-
-    # the decision per pair that is hit: pending on another stream -> that stream waits, kept; complete -> dropped; a third untouched
-    calls.clear()
-    pending, complete, untouched = Event(False), Event(True), (Event(False), init, _spans(big))
-    k._init = {3: (complete, init, _spans(own)), 9: (pending, init, _spans(nine)), 200: untouched}
-    k._order_behind_pending(3, dict(codes=nine["codes"], scales=own["scales"]), launch, Driver)
-    relaxed, restored = ("capture mode", "relaxed"), ("capture mode", "global")
-    assert calls == [relaxed, "query", restored, relaxed, "query", ("wait_event", "launch", pending), restored]
-    assert set(k._init) == {9, 200} and k._init[200] is untouched and Driver.mode == "global"
-    capturing[0] = True
-    calls.clear()
-    k._order_behind_pending(3, dict(codes=nine["codes"], scales=mine["scales"]), launch, Driver)
-    assert calls == [relaxed, "synchronize", restored] and set(k._init) == {200}, "under a capture: the host waits for the ONE event"
-
-    # two host threads on one pending pair: the record of pair 3 is dropped by the OTHER thread (its launch saw the initialization
-    # complete) behind this walk's snapshot, here at the moment this walk reads pair 9's event.  Nothing is read for pair 3,
-    # nothing raises, and the walk goes on to the next record that is hit (a second record over the bytes of pair 9).
-    class DropsPairThree(Event):
-        def query(self):
-            k._init.pop(3)
-            return super().query()
-
-    capturing[0] = False
-    calls.clear()
-    racing, last = DropsPairThree(False), Event(False)
-    k._init = {9: (racing, init, _spans(nine)), 3: (Event(False), init, _spans(own)), 77: (last, init, _spans(nine)), 200: untouched}
-    k._order_behind_pending(3, dict(codes=nine["codes"], scales=own["scales"]), launch, Driver)
-    waits = [relaxed, "query", ("wait_event", "launch", racing), restored, relaxed, "query", ("wait_event", "launch", last), restored]
-    assert calls == waits and set(k._init) == {9, 77, 200} and Driver.mode == "global", "a record dropped behind the snapshot"
-    k._init = {}
-    calls.clear()
-    k._order_behind_pending(3, whole, launch, Driver)
-    assert not calls, "without a record nothing is read"
+    written("the scale bytes of a pair as the call's codes", over_scales, mine["scales"], taller=("codes", "scales"))
 
 
-def test_outputs_records_the_event_behind_the_allocation_and_the_fill(monkeypatch):
-    """The record of a pair's initialization, on stand-ins for the allocation, the stream and the event (no device).  Under the
-    entry's device ``codes`` is allocated, ``scales`` is zero-filled, and only THEN the event is recorded, on the stream that is
-    current at that moment: an event recorded in front of the fill would be complete while the fill is still queued.  The record
-    holds that event, that stream and the address ranges of the pair's two tensors.  A second ``outputs`` of the row count
-    allocates and records nothing; inside a stream capture the pair is allocated and nothing is recorded (the fill is a node of
-    the captured graph)."""
-    from contextlib import contextmanager
+def test_a_device_without_a_record_costs_a_call_one_truth_test(monkeypatch):
+    """The steady state, on stand-ins with the launch intercepted (no device): while the entry's device holds no record a call
+    -- with the entry-owned pair or with caller-owned outputs -- reads the truth of the device's records and nothing else of
+    the ordering.  The ordering step, a record and the range arithmetic of the ordering raise here if they are entered,
+    whatever the records of ANOTHER device hold."""
+    s, k, records = _launch_intercepted(monkeypatch)
+    ops = _host_operands(3)
 
-    log, capturing = [], [False]
-    dev, stream = torch.device("cuda", 0), object()
+    def calls():
+        k(ops["x"], ops["scale"])
+        k(ops["x"], ops["scale"], ops["codes"], ops["scales"])
 
-    def allocation(name, real):
-        def allocate(*shape, device=None, **kw):
-            if device != dev:
-                return real(*shape, device=device, **kw)
-            log.append((name, shape))
-            return real(*shape, **kw)  # host memory stands in for the device's
+    calls()  # the first calls: the entry-owned pair exists behind them
+    init_order.pending_of(torch.device("cuda", 6))[0] = (s.Event(False), 7, ((0, 1 << 62),))  # another device's, over every address
+    assert not records
 
-        return allocate
+    def entered(what):
+        def raises(*args, **kwargs):
+            raise AssertionError(f"{what} was entered without a record of the device")
 
-    class Event:
-        def record(self, on):
-            log.append(("record", on))
+        return raises
 
-    @contextmanager
-    def device_context(device):
-        log.append(("enter", device))
-        try:
-            yield
-        finally:
-            log.append(("leave", device))
-
-    monkeypatch.setattr(torch, "empty", allocation("empty", torch.empty))
-    monkeypatch.setattr(torch, "zeros", allocation("zeros", torch.zeros))
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: log.append(("current stream", device)) or stream)
-    monkeypatch.setattr(torch.cuda, "Event", Event)
-    monkeypatch.setattr(entry, "device_context", device_context)
-    k = make_entry(dev)
-    pair = k.outputs(3)
-    assert log == [("enter", dev), ("empty", (3, WIDTH // 2)), ("zeros", (128, BLOCKS)), ("current stream", dev), ("record", stream), ("leave", dev)]
-    event, on, spans = k._init[3]
-    assert isinstance(event, Event) and on is stream and spans == _spans(pair)
-    assert bool((pair["scales"].view(U8) == 0).all()) and pair["scales"].dtype == E4M3 and pair["codes"].dtype == U8
-    log.clear()
-    assert k.outputs(3) is pair and not log, "the pair of a row count is allocated and recorded once"
-    capturing[0] = True
-    k.outputs(4)
-    assert [what for what, _ in log] == ["enter", "empty", "zeros", "leave"] and 4 in k.buffers and set(k._init) == {3}
+    for name in ("order_behind", "record", "span"):
+        monkeypatch.setattr(init_order, name, entered(f"init_order.{name}"))
+    # the entry's ranges come from the function its overlap check calls on every call, not from ``init_order.span``
+    monkeypatch.setattr(k, "_launch_writes", entered("the range arithmetic of the ordering"))
+    s.calls.clear()
+    calls()
+    assert s.calls == [("launch", 100), ("launch", 100)], "without a record of the device: the launch alone"
 
 
 def test_declines_an_unserved_compute_capability_by_name():
@@ -2044,6 +1922,7 @@ def _warm_entry_and_reference(dev, arm, rows, seed):
     return k, x, scale, want
 
 
+@pytest.mark.usefixtures("settled_records")
 @pytest.mark.parametrize("arm, arm_id", list(zip(LAUNCH_ARMS, LAUNCH_ARM_IDS)), ids=LAUNCH_ARM_IDS)
 def test_warm_launch_waits_for_an_initialization_pending_on_another_stream(arm, arm_id):
     """``compile(rows)`` on a side stream behind a delay, the call on the original stream: the launch is ordered behind the
@@ -2061,6 +1940,7 @@ def test_warm_launch_waits_for_an_initialization_pending_on_another_stream(arm, 
     _assert_same(dict(codes=codes, scales=scales), want, f"{arm_id}: entry-owned outputs initialized on another stream")
 
 
+@pytest.mark.usefixtures("settled_records")
 def test_warm_launch_on_a_side_stream_waits_for_an_initialization_pending_on_the_original_stream():
     """The roles of the streams exchanged: ``compile(rows)`` on the original stream behind a delay, the call on a side stream."""
     dev = _device_or_skip()
@@ -2076,6 +1956,7 @@ def test_warm_launch_on_a_side_stream_waits_for_an_initialization_pending_on_the
     _assert_same(dict(codes=codes, scales=scales), want, "entry-owned outputs initialized on the original stream, written on a side stream")
 
 
+@pytest.mark.usefixtures("settled_records")
 def test_captured_call_waits_on_the_host_for_a_pending_initialization_and_for_nothing_else():
     """The documented setup of a capture -- ``compile(rows)`` first -- on a side stream behind a delay, then a RAW capture
     (``torch.cuda.graph`` synchronizes the device when it is entered, which hides the schedule) and a replay at once.  A capturing
@@ -2111,6 +1992,7 @@ def test_captured_call_waits_on_the_host_for_a_pending_initialization_and_for_no
         graph.reset()
 
 
+@pytest.mark.usefixtures("settled_records")
 def test_warm_call_does_nothing_for_an_initialization_that_is_complete(monkeypatch):
     """Once a call has seen the initialization complete, the warm path is what it was: three calls on the original stream and
     three on the stream that initialized the pair allocate no device memory, raise nothing under
@@ -2130,7 +2012,7 @@ def test_warm_call_does_nothing_for_an_initialization_that_is_complete(monkeypat
     torch.cuda.synchronize()
     mine = _outs(rows, dev)
     touched = []
-    monkeypatch.setattr(k, "_order_behind_pending", lambda *a, **kw: touched.append("the ordering step"))
+    monkeypatch.setattr(init_order, "order_behind", lambda *a, **kw: touched.append("the ordering step"))
     for name in ("query", "synchronize", "wait"):
         monkeypatch.setattr(torch.cuda.Event, name, lambda *a, _name=name, **kw: touched.append(f"Event.{_name}"))
     for name in ("wait_event", "wait_stream", "synchronize"):
@@ -2153,6 +2035,7 @@ def test_warm_call_does_nothing_for_an_initialization_that_is_complete(monkeypat
     _assert_same(dict(codes=codes, scales=scales), want, "the warm calls' bytes")
 
 
+@pytest.mark.usefixtures("settled_records")
 def test_row_counts_initialized_on_two_streams_are_ordered_one_by_one():
     """Two row counts, each pair initialized on its own parked stream; the second stream is parked for longer.  The first row
     count is launched while both are pending and again after ITS initialization completed; the second row count is launched
@@ -2176,6 +2059,7 @@ def test_row_counts_initialized_on_two_streams_are_ordered_one_by_one():
     _assert_same(dict(zip(("codes", "scales"), got_second)), want_second, f"rows {second}, initialized on the second stream")
 
 
+@pytest.mark.usefixtures("settled_records")
 @pytest.mark.parametrize("codes_reach_the_call", ("by default", "passed back"))
 def test_entry_owned_codes_on_a_recycled_block_wait_for_what_its_stream_still_owes_it(codes_reach_the_call):
     """The entry-owned ``codes`` are not initialized, but their block can be a recycled one: a tensor filled and freed on the
@@ -2208,6 +2092,7 @@ def test_entry_owned_codes_on_a_recycled_block_wait_for_what_its_stream_still_ow
     _assert_same(dict(codes=codes, scales=scales), want, f"entry-owned codes on a recycled block, {codes_reach_the_call}")
 
 
+@pytest.mark.usefixtures("settled_records")
 @pytest.mark.parametrize("how", ("the pair", "its scales alone", "a view of its scales"))
 def test_outputs_taken_by_the_caller_and_passed_back_wait_for_their_pending_initialization(how):
     """``outputs(rows)`` taken on a side stream behind a delay and PASSED BACK to a call on the original stream as explicit
@@ -2233,6 +2118,7 @@ def test_outputs_taken_by_the_caller_and_passed_back_wait_for_their_pending_init
     _assert_same(dict(codes=codes, scales=scales), want, f"{how}, passed back while the initialization was pending")
 
 
+@pytest.mark.usefixtures("settled_records")
 def test_slices_of_another_row_counts_pair_wait_for_that_pairs_pending_initialization():
     """The pair of ANOTHER row count, taken on a parked side stream and passed to a call of fewer rows as slices that start
     INSIDE it (its code rows from row 100 on, its second scale band): the launch is ordered behind the initialization of the
@@ -2250,6 +2136,7 @@ def test_slices_of_another_row_counts_pair_wait_for_that_pairs_pending_initializ
     assert bool((pair["scales"][:128].view(U8) == 0).all()), "the scale band the call does not write is not zero"
 
 
+@pytest.mark.usefixtures("settled_records")
 def test_two_streams_with_disjoint_entry_owned_outputs_each_wait_for_the_pending_initialization():
     """``compile(rows)`` on a parked side stream, then -- both while it is pending -- a call on stream A with the entry's CODES
     and caller-owned scales and a call on stream B with caller-owned codes and the entry's SCALES.  The two launches share no
@@ -2276,6 +2163,7 @@ def test_two_streams_with_disjoint_entry_owned_outputs_each_wait_for_the_pending
     _assert_same(dict(codes=codes_b, scales=scales_b), want_b, "stream B: caller-owned codes, the entry's scales")
 
 
+@pytest.mark.usefixtures("settled_records")
 def test_documented_capture_flow_with_entry_owned_outputs_replays_bitwise_with_eager():
     """The documented flow of a capture with ENTRY-OWNED outputs: ``compile(rows)`` for every row count -- one on the current
     stream, one on a side stream behind a delay -- then ``with torch.cuda.graph(...)`` and the calls without outputs.  A pair
@@ -2305,6 +2193,37 @@ def test_documented_capture_flow_with_entry_owned_outputs_replays_bitwise_with_e
                 _assert_same(dict(codes=codes, scales=scales), want, f"{label}: the entry-owned outputs of {rows} rows")
     finally:
         graph.reset()
+
+
+@pytest.mark.usefixtures("settled_records")
+@pytest.mark.parametrize("who_writes", ("another entry writes this entry's pending pair", "this entry writes another entry's pending set"))
+def test_launches_across_entries_wait_for_the_pending_initialization_of_what_they_write(who_writes):
+    """The records are the DEVICE's, not an entry's.  A pair is taken with ``outputs`` on a side stream parked behind a delay
+    and written, from the original stream, by a WARM launch of ANOTHER entry: the NVFP4 form of ``cudnn.AddNormQuantDecode``
+    writes this entry's pair, and this entry writes that one's ``codes`` / ``scales``.  Either launch is ordered behind the
+    pair's zero-fill although the host does not wait; unordered, the fill erases the block scales the kernel wrote."""
+    from cudnn.norm.frost.add_norm_quant_decode import AddNormQuantDecode
+
+    dev = _device_or_skip()
+    rows = 7
+    k, x, scale, want = _warm_entry_and_reference(dev, (None, None), rows, seed=141)
+    norm = AddNormQuantDecode(dev, WIDTH, 1e-6, add=False, bf16=False, quant="nvfp4")
+    weight = torch.ones(WIDTH, dtype=BF16, device=dev)
+    ready = _outs(rows, dev)
+    norm(x, None, weight, scale, codes=ready["codes"], scales=ready["scales"])  # the other entry warm, and its bytes in ready outputs
+    torch.cuda.synchronize()
+    theirs = {name: t.clone() for name, t in ready.items()}
+    taken = {}
+    if who_writes.startswith("another entry"):
+        pending = park(pooled(dev, lambda: _outs(rows, dev)), lambda: taken.update(k.outputs(rows)))
+        norm(x, None, weight, scale, codes=taken["codes"], scales=taken["scales"])
+        want = theirs
+    else:
+        pending = park(pooled(dev, lambda: _outs(rows, dev)), lambda: taken.update(norm.outputs(rows)))
+        k(x, scale, codes=taken["codes"], scales=taken["scales"])
+    assert not pending.query(), "the call did not overlap the pending initialization (or it waited on the host)"
+    torch.cuda.synchronize()
+    _assert_same(dict(codes=taken["codes"], scales=taken["scales"]), want, who_writes)
 
 
 def test_warm_entry_rejects_a_bad_binding_before_the_compiled_kernel_is_looked_up():

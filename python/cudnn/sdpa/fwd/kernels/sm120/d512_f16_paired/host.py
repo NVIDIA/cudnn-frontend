@@ -5,6 +5,8 @@
 
 from .contract import Geometry
 
+PACKED_HN_STATS_OVERRIDE = True
+
 
 def lower(spec, facts, knobs, *, lower_impl, knob_type):
     # The registry supplies common framework services; this implementation

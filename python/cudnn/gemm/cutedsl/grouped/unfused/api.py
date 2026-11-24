@@ -27,7 +27,7 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
-from ..backend_utils import row_major_layout
+from ..backend_utils import execute_with_wrapper_workspace, row_major_layout
 from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
 
@@ -98,6 +98,7 @@ class GroupedGemmSm100(APIBase):
         bias_tensor: Optional[torch.Tensor] = None,
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        _workspace=None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -112,6 +113,7 @@ class GroupedGemmSm100(APIBase):
             bias_tensor=bias_tensor,
             prob_tensor=prob_tensor,
             current_stream=current_stream,
+            _workspace=_workspace,
         )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
@@ -354,7 +356,9 @@ def grouped_gemm_wrapper_sm100(
         op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
         internal_c = c_tensor if c_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
         d_out = d_tensor if d_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
-        op.execute(
+        execute_with_wrapper_workspace(
+            op,
+            framework,
             a_tensor=a_tensor,
             c_tensor=internal_c,
             d_tensor=d_out,
@@ -489,7 +493,9 @@ def grouped_gemm_wrapper_sm100(
 
     _wrapper_memo[_memo_key] = (op, framework, expected_shape, expected_stride, c_dtype, d_dtype, is_dense)
 
-    op.execute(
+    execute_with_wrapper_workspace(
+        op,
+        framework,
         a_tensor=a_tensor,
         c_tensor=internal_c,
         d_tensor=d_tensor,

@@ -180,9 +180,14 @@ Decode classes the rules above trailed (``_sm100_fp8_decode_gap``; study sm100_f
 it is a power of two, and the regimes split there (packed 0.11-0.46 of the backend, unpacked near parity up to 1.26-1.89).
 Paged d64 without a sink (S_q 1-16, full cache or windowed), windowed paged d256 and dense d192 x 128 lead when packed; its
 windowed sink twin leads from 1616 KV tokens in flight. Unpacked, windowed d64 MTP / verify leads up to 72k keys; on cc 10.0 only
-(B300 or GB300 failed), windowed d128 up to S_q 12 and the d192 sink twin from 1059 tokens. Windowed d128 packed lost 1.26-1.35
-on the GB200 / GB300 nightlies' b 1 x 2-unit rows -> TRAIL, as do the other unpacked classes (holdout up to 1.15-1.90).
-cuDNN 9.24 builds no FP8 plan for dense d192 x 128 or paged d256, so there FROST is the only plan either way.
+(B300 or GB300 failed), windowed d128 up to S_q 12 and the d192 sink twin from 1059 tokens. The other unpacked classes trail
+(holdout up to 1.15-1.90). Study sm100_fp8_decode_v3_20261122 adds the paged spec-decode (S_q 2-16) classes: windowed d128 packed
+leads from 1048 KV tokens in flight (below it, a few units over a short window lose on GB200 / GB300 hardware, which B200 and B300
+do not reproduce, so the floor was selected against those nightlies); paged d192 x 128 leads packed; its windowed sink twin leads
+packed from 24 KV units and, on cc 10.0 only, unpacked from 6464 tokens. Study sm103_fp8_d128_win_unpacked_20261122 gives cc 10.3
+its own windowed d128 unpacked rule, from 12 KV units (b * h_kv), fit on B300 and selected against GB300 for the same reason as the
+packed floor. cuDNN 9.24 builds no FP8 plan for dense or paged d192 x
+128 or paged d256, so there FROST is the only plan either way.
 Short prefill (s_q 17-512, s_kv 64-8192, b 1/8; GPU replay and eager back-to-back submission): FROST
 submits in ~16-18 us against the backend's ~13 us, so a single-wave launch with a cache below 1k is
 host-bound and loses eager 1.03-1.37 while winning GPU time; d512 with >= 32 query heads wins both at
@@ -712,6 +717,11 @@ SM100_FP8_D64_WIN_UNPACKED_MAX_KV = 73728  # unpacked windowed d64 MTP / verify:
 SM100_FP8_D128_WIN_UNPACKED_MAX_S_Q = 12  # unpacked windowed d128: S_q 2-8 lead, 16 does not
 SM100_FP8_D192_SINK_PACKED_MIN_TOKENS = 1616  # windowed d192 x 128 + sink: b * h_kv * keys per row
 SM100_FP8_D192_SINK_UNPACKED_MIN_TOKENS = 1059
+# Study sm100_fp8_decode_v3_20261122: below each floor a few KV units over a short window keep the backend
+SM100_FP8_D128_WIN_PACKED_MIN_TOKENS = 1048  # windowed paged d128, packed: b * h_kv * keys per row
+SM100_FP8_D192_PAGED_SINK_PACKED_MIN_UNITS = 24  # windowed paged d192 x 128 + sink, packed: b * h_kv
+SM100_FP8_D192_PAGED_SINK_UNPACKED_MIN_TOKENS = 6464  # the same, unpacked (cc 10.0): b * h_kv * keys per row
+SM103_FP8_D128_WIN_UNPACKED_MIN_UNITS = 12  # cc 10.3 windowed paged d128, unpacked: b * h_kv (study sm103_fp8_d128_win_unpacked_20261122)
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
 SM100_PAGED_D128_PREFIX_MAX_B = 64  # SM100 paged bf16 d128 GQA prefix lead: measured bounds (module docstring)
@@ -1264,9 +1274,10 @@ def _sm100_fp8_decode_leads(facts) -> bool:
 
 
 def _sm100_fp8_decode_gap(caps: Capabilities, facts) -> Optional[str]:
-    """Study sm100_fp8_decode_gaps_20261118 (module docstring, "SM100 per-tensor FP8 row"): LEAD for the decode classes it shipped,
-    None for every other graph (the hand rules below decide those, as before). The kernels pack the GQA group only when it is a power
-    of two; the row's own packing decides the regime, as ``placement_table._decode_pack_group`` does without its S_q <= 4 depth."""
+    """Studies sm100_fp8_decode_gaps_20261118 and sm100_fp8_decode_v3_20261122 (module docstring, "SM100 per-tensor FP8 row"): LEAD
+    for the decode classes they shipped, None for every other graph (the hand rules below decide those, as before). The kernels pack
+    the GQA group only when it is a power of two; the row's own packing decides the regime, as ``placement_table._decode_pack_group``
+    does without its S_q <= 4 depth."""
     if facts.device_cc not in ((10, 0), (10, 3)) or facts.thd or facts.o_block_scale or facts.has_epilogue_gate or not facts.h_kv:
         return None
     if facts.dtype != cudnn.data_type.FP8_E4M3 or facts.dtype_o != cudnn.data_type.FP8_E4M3:
@@ -1289,13 +1300,23 @@ def _sm100_fp8_decode_gap(caps: Capabilities, facts) -> Optional[str]:
     elif facts.s_q == 1:
         return None
     elif shape == (128, 128) and facts.has_paged_kv and window and not facts.has_sink:
-        # packed: the GB200 / GB300 nightly's b 1 x 2-unit rows lost 1.26-1.35, so the class failed its gate; unpacked failed GB300's
-        lead = not packed and facts.device_cc == (10, 0) and facts.s_q <= SM100_FP8_D128_WIN_UNPACKED_MAX_S_Q
-    elif shape == (192, 128) and not facts.has_paged_kv and not window and not facts.has_sink:
-        lead = packed
+        # unpacked: cc 10.0 keeps its S_q bound; cc 10.3 was fit on B300 against GB300, whose few-unit rows lose
+        tokens = facts.b * facts.h_kv * keys
+        if packed:
+            lead = tokens >= SM100_FP8_D128_WIN_PACKED_MIN_TOKENS
+        elif facts.device_cc == (10, 0):
+            lead = facts.s_q <= SM100_FP8_D128_WIN_UNPACKED_MAX_S_Q
+        else:
+            lead = facts.b * facts.h_kv >= SM103_FP8_D128_WIN_UNPACKED_MIN_UNITS
+    elif shape == (192, 128) and not window and not facts.has_sink:
+        lead = packed  # dense or paged; unpacked failed its holdout in both
     elif shape == (192, 128) and not facts.has_paged_kv and window and facts.has_sink:
         tokens = facts.b * facts.h_kv * keys
         lead = tokens >= SM100_FP8_D192_SINK_PACKED_MIN_TOKENS if packed else facts.device_cc == (10, 0) and tokens >= SM100_FP8_D192_SINK_UNPACKED_MIN_TOKENS
+    elif shape == (192, 128) and window and facts.has_sink:  # paged; the unpacked bound failed the B300 holdout
+        tokens = facts.b * facts.h_kv * keys
+        units_lead = facts.b * facts.h_kv >= SM100_FP8_D192_PAGED_SINK_PACKED_MIN_UNITS
+        lead = units_lead if packed else facts.device_cc == (10, 0) and tokens >= SM100_FP8_D192_PAGED_SINK_UNPACKED_MIN_TOKENS
     elif shape == (256, 256) and facts.has_paged_kv and window and not facts.has_sink:
         lead = packed
     else:
