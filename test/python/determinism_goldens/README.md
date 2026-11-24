@@ -67,6 +67,18 @@ recomputed activation and deterministic FP32 dprob replay, batch invariance,
 CUDA graph replay and independent references. Six original backward goldens
 under `da1753675488f6a3` are retained byte for byte from PR #2737.
 
+Original-runtime strict validation (2026-11-23) at `35173f66` reports
+**31 passed, 0 failed, 0 skipped** across both directions: backward contributes
+**18 passes** (12 non-golden cases and all six original golden comparisons),
+and forward contributes 13. Both the source package and freshly built native
+extension resolved inside this snapshot. Runtime `da1753675488f6a3` was
+reproduced on GB300/SM103 with 152 SMs: Torch
+`2.13.0a0+9186a08b2c.nv26.07`, CUDA 13.3, driver API 13030, cuDNN 92400,
+CuTe DSL 4.8.0 with its CUDA 13.4 compiler, tvm-ffi 0.1.12 and pytest 9.1.1.
+The combined command is recorded in the forward section below. All 12 golden
+files remained unchanged. This validates regression against the original
+runtime; the newer-runtime baseline gaps above remain explicit.
+
 Historical evidence: PR #2737 run H (`f0a7d2b8`, GB300/SM103, CuTe DSL 4.8.0
 cu13) reported 18 backward determinism passes, including six strict golden
 checks; run I (`3c5c77fe`, cu12 compiler flavor) reported 12 non-golden passes.
