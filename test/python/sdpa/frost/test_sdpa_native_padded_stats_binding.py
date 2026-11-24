@@ -186,9 +186,9 @@ def _gpu_arch():
     from frost_test_utils import _dsl_installed
 
     cc = torch.cuda.get_device_capability()
-    if not _dsl_installed() or cc not in ((10, 0), (10, 3), (10, 7), (12, 0)):
+    if not _dsl_installed() or cc not in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
         pytest.skip("requires an existing Blackwell/Rubin THD row and CuTe DSL")
-    return "sm107" if cc == (10, 7) else "sm120" if cc == (12, 0) else "sm100"
+    return "sm107" if cc == (10, 7) else "sm120" if cc[0] == 12 else "sm100"
 
 
 def _case(*, fp8=False, layout="bsh", arch=None):
