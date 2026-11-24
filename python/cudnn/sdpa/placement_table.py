@@ -1186,6 +1186,14 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "verify", "paged", "window", True, "gqa", True): Entry("always", None, "sm80_decode_gaps_20261117"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", False): Entry("always", None, "sm80_decode_gaps_20261117"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "mtp", "paged", "window", False, "gqa", True): Entry("always", None, "sm80_decode_gaps_20261117"),
+    # study sm80_dense_d256_q1_v3_pcie_20261121: dense d256 single-row decode under the d256 split rule. Off the tile a small base grid
+    # (b x h_kv) over a short cache keeps the backend, so that floor needs both the work and the grid.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", False): Entry(
+        "ge", 23.095, "sm80_dense_d256_q1_v3_pcie_20261121"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", True): Entry(
+        "ge", 23.756, "sm80_dense_d256_q1_v3_pcie_20261121", "cost", ("ge", 2.161, "tiles")
+    ),
     # study sm80_paged_d256_q1_v3_pcie_20261118 (A100 80GB PCIe, after the 82nd commit's split): paged d256 single-row decode on the tile
     # leads from cost 2^24.511 (was 2^31.5). Fit in v2 (80 cells), confirmed once on 24 fresh cells: 19 changed at 0.802, worst 1.012;
     # the nightly's qwen rows move at 0.874. Off the tile the gaps study's entry stays (v1 / v2 fits failed there at a 1k-key cache).
