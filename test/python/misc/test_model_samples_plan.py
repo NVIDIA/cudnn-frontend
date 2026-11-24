@@ -2314,6 +2314,105 @@ def test_a_paged_cache_hands_out_its_rows_of_the_two_tables_as_views():
             DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", tokens, page=PAGE, max_model_len=wrong)
 
 
+def test_the_cursor_holds_the_rows_of_one_position_at_fixed_addresses():
+    """``DecodeState.step_cursor()``: what a recorded decode step reads at fixed addresses.  At every position of a state,
+    at 1 and at 4 sequences and across a page boundary, the rows of the cursor are the rows ``at`` and ``attended`` hand
+    out by the host position, in the same dtypes and shapes, each at the alignment a kernel's operand needs -- reached
+    by ``set`` and by ``advance`` alike -- and they stay where they were allocated.  The accessors hand out the
+    table's rows while the cursor is off, the cursor's while it is on, and refuse a position the cursor does not stand
+    at.  ``holds`` is the arithmetic of the tables written out from host integers: it fails on each row alone.  A state
+    builds its cursor where it is asked, once; one of several tokens per sequence and one without tables have none."""
+    from model_samples.state import DecodeState
+
+    capacity = 130
+    for sequences in (1, 4):
+        state = DecodeState(("full_attention",), sequences, capacity, KV_SHAPES, "cpu", page=PAGE, max_model_len=2051)
+        cache, table = state.layers[0], state.table
+        assert table.cursor is None, "no cursor until a state is asked for one"
+        cursor = state.step_cursor()
+        assert state.step_cursor() is cursor is table.cursor and not cursor.on and cursor.position == 0 and cursor.launches() == 3
+        assert (tuple(cursor.ids.shape), cursor.ids.dtype) == ((sequences,), torch.int32) and not cursor.ids.any()
+        addresses = [t.data_ptr() for t in (cursor.ids, cursor.positions, cursor.slots, cursor.lengths)]
+        assert cursor.positions.data_ptr() % 8 == cursor.slots.data_ptr() % 8 == 0 and cursor.lengths.data_ptr() % 16 == 0
+        for stepped in (False, True):  # the rows of a position set from the tables, and reached by one add per row from position 0
+            cursor.set(0)
+            for position in range(capacity):
+                if stepped and position:
+                    cursor.advance()
+                elif not stepped:
+                    cursor.set(position)
+                where = f"{sequences} sequences, position {position}, {'advanced' if stepped else 'set'}"
+                _, positions, slots = cache.at(position)  # the cursor is off: the rows of the tables, by the host position
+                blocks, lengths = cache.attended(position)
+                assert positions.data_ptr() == table.positions[position].data_ptr() and lengths.data_ptr() == table.lengths[position].data_ptr(), where
+                assert cursor.position == position and cursor.holds(), where
+                assert _same(cursor.positions, positions) and _same(cursor.slots, slots) and _same(cursor.lengths[:sequences], lengths), where
+                assert _same(cursor.lengths, table.lengths[position]), where
+                if position in (0, 63, 64, capacity - 1):  # switched on: the accessors hand out the cursor's rows, the page table as before
+                    cursor.on = True
+                    cos_sin, at, slot = cache.at(position)
+                    again, length = cache.attended(position)
+                    cursor.on = False
+                    assert cos_sin is table.cos_sin and again.data_ptr() == blocks.data_ptr(), where
+                    assert [t.data_ptr() for t in (at, slot, length)] == addresses[1:], where
+                    assert (tuple(at.shape), tuple(slot.shape), tuple(length.shape)) == ((3, sequences), (sequences,), (sequences,)), where
+            assert [t.data_ptr() for t in (cursor.ids, cursor.positions, cursor.slots, cursor.lengths)] == addresses, "the rows never move"
+        # a window of a cache (a check runs some sequences alone) reads its own columns of the cursor
+        if sequences > 1:
+            cursor.set(64)
+            cursor.on = True
+            _, at, slot = cache.rows(1, 3).at(64)
+            cursor.on = False
+            assert at.tolist() == [[64, 64]] * 3 and slot.tolist() == [1 * state.pages * PAGE + 64, 2 * state.pages * PAGE + 64]
+        # switched on, the cursor is read where it stands and nowhere else
+        cursor.set(5)
+        cursor.on = True
+        for call in (cache.at, cache.attended):
+            with pytest.raises(ValueError, match="position 5") as refused:
+                call(6)
+            assert "6" in str(refused.value)
+        with pytest.raises(IndexError):  # a position no step starts at stays the accessor's own refusal
+            cache.at(capacity)
+        cursor.on = False
+        assert cache.at(6)[1].data_ptr() == table.positions[6].data_ptr(), "off again: the table's rows at any position"
+        # ``replayed`` moves the host's account alone: the rows are then one position behind it, and ``holds`` says so
+        cursor.replayed()
+        assert cursor.position == 6 and not cursor.holds()
+        cursor.set(6)
+        for row, wrong in ((cursor.positions, 7), (cursor.slots, 5), (cursor.lengths, 6)):
+            kept = row.clone()
+            row.view(-1)[-1] = wrong  # one element of one row
+            assert not cursor.holds(), "each row is held on its own"
+            row.copy_(kept)
+            assert cursor.holds()
+        for outside in (-1, capacity):
+            with pytest.raises(IndexError, match="not one a step starts at"):
+                cursor.set(outside)
+        assert cursor.position == 6 and cursor.holds(), "a refused position moves nothing"
+        # the last position of the state: one add more stands behind the tables, and the arithmetic still holds
+        cursor.set(capacity - 1)
+        cursor.advance()
+        assert cursor.position == capacity and cursor.holds()
+        # ``clear`` is the state's: the cursor is its holder's to set, and says where it stands
+        state.position = 9
+        state.clear()
+        assert state.position == 0 and cursor.position == capacity
+    # a state without a table of lengths: two rows, two adds
+    plain_tables = DecodeState(("full_attention",), 2, 70, KV_SHAPES, "cpu", page=PAGE)
+    short = plain_tables.step_cursor()
+    assert short.lengths is None and short.launches() == 2
+    short.set(63)
+    short.advance()
+    assert short.holds() and short.slots.tolist() == [64, plain_tables.pages * PAGE + 64]
+    # no cursor for steps of several tokens per sequence, and none without the tables of a pool
+    with pytest.raises(ValueError, match="one token per sequence"):
+        DecodeState(("full_attention",), 2, 70, KV_SHAPES, "cpu", 4, page=PAGE).step_cursor()
+    with pytest.raises(ValueError, match="paged attention cache"):
+        DecodeState(("full_attention",), 2, 70, KV_SHAPES, "cpu").step_cursor()
+    with pytest.raises(ValueError, match="paged attention cache"):  # a paged layout asked for, and no attention layer to page
+        DecodeState(("linear_attention",), 2, 70, KV_SHAPES, "cpu", page=PAGE).step_cursor()
+
+
 def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_reads_them(monkeypatch):
     """One adapter of the closed list reads the page table and the lengths (``Block.attended_tables``): the library's paged
     decode attention.  A state of a run without such a block holds neither: its tables, its bytes and the memory

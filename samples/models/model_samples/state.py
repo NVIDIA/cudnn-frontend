@@ -48,6 +48,17 @@ step, by reference -- the tensor that step's last norm returned, never a copy --
 (row ``t``: the token that follows row ``t``); and ``draft``, the drafter's own attention cache, which a session with a
 drafter builds with the state.  A family's step sets the first two; a state without a drafter has no third.
 
+**What a recorded decode step reads** (:class:`Cursor`, ``DecodeState.step_cursor()``).  A step that is recorded once as a
+launch sequence and replayed for every token runs no Python between two tokens, so nothing of it may be selected by a
+host integer: a recorded launch keeps the ADDRESS of every operand it was recorded with.  The token a step is fed and the
+rows of the position it stands at -- the position rows, the slot rows and the lengths, which :meth:`PagedKvCache.at` and
+:meth:`PagedKvCache.attended` hand out as rows of the tables -- are therefore held once more at fixed addresses: the ids
+buffer and three rows of the cursor, set from the tables (``Cursor.set``) and moved on by one position in place
+(``Cursor.advance``: an in-place add per row, the last launches of such a step).  The cursor is built where it is asked
+for and is off until its holder switches it on for the one pass in which a step is recorded: only then do the two
+accessors hand out its rows.  Every step launched from Python reads the rows of the tables by the host position, as it
+does on a state without a cursor.
+
 ``snapshot`` / ``restore`` exist for the replay and batch-invariance checks of ``tie_out``; a sample has no other use for them.
 """
 
@@ -142,6 +153,10 @@ class PageTable:
     single: Optional["PageTable"] = None  # beside a table of several tokens per sequence: the table of one, for the decode steps of a prompt
     blocks: Optional[torch.Tensor] = None  # the page table; one tensor for both tokens counts of a state
     lengths: Optional[torch.Tensor] = None  # the positions a sequence holds after a step of ``tokens`` tokens
+    #: the rows of ONE position of this table at fixed addresses, for a step that is recorded and replayed
+    #: (``DecodeState.step_cursor()``); ``None`` until a state is asked for it.  The caches that read this table hand out
+    #: its rows while it is switched on, and the table's own rows otherwise
+    cursor: Optional["Cursor"] = None
 
     @staticmethod
     def rotary(capacity: int, rotary_dim: int, theta: float, device) -> torch.Tensor:
@@ -205,6 +220,82 @@ class PageTable:
         if self.blocks is not None:
             held += [self.blocks, self.lengths, *(() if self.single is None else (self.single.lengths,))]
         return sum(t.numel() * t.element_size() for t in held)
+
+
+@dataclass
+class Cursor:
+    """What a recorded decode step reads at FIXED addresses: the ids it is fed and the rows of the position it stands at.
+
+    ``ids`` ``[sequences]`` int32: the ids the step's lookup reads; the step's own last copy writes the ids it chose into
+    it, so the next replay feeds on them.  ``positions`` ``[3, rows]`` int64, ``slots`` ``[rows]`` int64 and ``lengths``
+    ``[sequences rounded up to four]`` int32 (``None`` on a state without that table): the rows ``PagedKvCache.at`` and
+    ``.attended`` hand out for one position, as copies of the table's rows in allocations of their own -- the same
+    dtypes, shapes and alignment, so a kernel reads them as it reads a row of the table.  ``position`` is the host's
+    own account of where the three rows stand; a holder compares it with the state's position in front of every replay
+    and sets the rows where the two differ (a step launched from Python moves the state and never the cursor).
+
+    ``on`` says that the caches of the table hand out these rows in the place of the table's: set by the holder for the
+    one pass in which a step is recorded, and for nothing else."""
+
+    table: PageTable
+    ids: torch.Tensor
+    positions: torch.Tensor
+    slots: torch.Tensor
+    lengths: Optional[torch.Tensor]
+    position: int = 0
+    on: bool = False
+
+    @classmethod
+    def build(cls, table: PageTable, device) -> "Cursor":
+        """The cursor of ``table`` at position 0: the rows of the step that starts there, cloned.  ``ValueError`` for a table
+        of several tokens per sequence (a recorded step feeds one) and for a table no step starts on."""
+        if table.tokens != 1:
+            raise ValueError(f"a recorded step feeds one token per sequence; this table is for steps of {table.tokens}")
+        if not int(table.positions.shape[0]):
+            raise ValueError("a recorded step starts at a position of its state; this table holds none")
+        ids = torch.zeros(table.sequences, dtype=torch.int32, device=device)
+        lengths = None if table.lengths is None else table.lengths[0].clone()
+        return cls(table, ids, table.positions[0].clone(), table.slots[0].clone(), lengths)
+
+    def set(self, position: int) -> None:
+        """Stand at ``position``: its rows of the tables copied into the cursor's rows (a copy per row), and the host's
+        account with them.  ``IndexError`` for a position no step starts at."""
+        steps = int(self.table.positions.shape[0])
+        if not 0 <= position < steps:
+            raise IndexError(f"position {position} is not one a step starts at: the tables hold {steps} such positions, from 0")
+        self.positions.copy_(self.table.positions[position])
+        self.slots.copy_(self.table.slots[position])
+        if self.lengths is not None:
+            self.lengths.copy_(self.table.lengths[position])
+        self.position = position
+
+    def advance(self) -> None:
+        """One position on, in place: an add per row -- the launches that end a recorded step (``launches``) -- and the
+        host's account with them.  A holder that records the adds puts the account back, and moves it once per replay
+        (``replayed``)."""
+        self.positions.add_(1)
+        self.slots.add_(1)
+        if self.lengths is not None:
+            self.lengths.add_(1)
+        self.position += 1
+
+    def replayed(self) -> None:
+        """A replay of a recorded step has run the adds of ``advance``: the host's account follows."""
+        self.position += 1
+
+    def launches(self) -> int:
+        """The launches of ``advance``: one per row the cursor holds."""
+        return 2 + (self.lengths is not None)
+
+    def holds(self) -> bool:
+        """Whether the rows on the device are those of ``position``, by the arithmetic of the tables written out here
+        from host integers (never from a row of the table: a table one row late agrees with itself): every position
+        row holds ``position``, row ``i`` of the slots ``i x pages x page + position``, every length ``position + 1``.
+        A host read: for a check behind a request, never inside a step."""
+        table, at = self.table, self.position
+        slots = [sequence * table.pages * table.page + at for sequence in range(table.sequences)]
+        held = self.positions.tolist() == [[at] * table.sequences] * 3 and self.slots.tolist() == slots
+        return held and (self.lengths is None or self.lengths.tolist() == [at + 1] * int(self.lengths.shape[0]))
 
 
 @dataclass
@@ -318,7 +409,23 @@ class PagedKvCache:
         the last row, and a negative one, which would index the tables from their end."""
         self._starts(position)
         first, last = self.first * self.tokens, (self.first + self.sequences) * self.tokens
+        cursor = self._recording(position)
+        if cursor is not None:  # a step that is being recorded: the rows at fixed addresses, which its own last launches move on
+            return self.table.cos_sin, cursor.positions[:, first:last], cursor.slots[first:last]
         return self.table.cos_sin, self.table.positions[position][:, first:last], self.table.slots[position][first:last]
+
+    def _recording(self, position: int) -> Optional[Cursor]:
+        """The table's cursor while it is switched on -- the pass in which a step is recorded -- else ``None``.  The
+        cursor stands where the pass is made: a ``ValueError`` where the step asks for another position than the one
+        its rows hold, which a replay would then read in its place."""
+        cursor = self.table.cursor
+        if cursor is None or not cursor.on:
+            return None
+        if cursor.position != position:
+            raise ValueError(
+                f"a step is recorded where its cursor stands: the cursor holds the rows of position {cursor.position}, the step asks for {position}"
+            )
+        return cursor
 
     def _starts(self, position: int) -> None:
         """``IndexError`` for a position no step of this object's tokens starts at."""
@@ -342,6 +449,9 @@ class PagedKvCache:
                 "this attention cache has no page table and no lengths: its state was given no maximum length (DecodeState(max_model_len=)), "
                 "which a session hands the state where a block of its plans reads them"
             )
+        cursor = self._recording(position)
+        if cursor is not None:  # as in ``at``: the lengths at a fixed address
+            return self.table.blocks[self.first : self.first + self.sequences], cursor.lengths[: self.sequences]
         return self.table.blocks[self.first : self.first + self.sequences], self.table.lengths[position, : self.sequences]
 
 
@@ -514,6 +624,19 @@ class DecodeState:
         self.greedy: Optional[torch.Tensor] = None
         #: the drafter's own attention cache (``KvCache``), built by a session that has a drafter; it has no position
         self.draft: Optional[KvCache] = None
+
+    def step_cursor(self) -> Cursor:
+        """The cursor of this state (:class:`Cursor`): built at the first call, at position 0, and the same object from
+        then on -- what is recorded on a state reads the addresses of that state's cursor.  ``ValueError`` on a state
+        whose steps feed several tokens per sequence, and on one without the tables of a paged attention cache: the
+        rows a cursor holds are rows of those tables."""
+        if self.tokens != 1:
+            raise ValueError(f"a recorded step feeds one token per sequence; a step of this state feeds {self.tokens}")
+        if self.table is None:
+            raise ValueError("a recorded step reads the position rows of a paged attention cache; this state has no such tables (DecodeState(page=))")
+        if self.table.cursor is None:
+            self.table.cursor = Cursor.build(self.table, self.device)
+        return self.table.cursor
 
     @property
     def accepted(self) -> int:
