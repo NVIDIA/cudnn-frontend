@@ -704,6 +704,26 @@ def test_sm80_paged_window_decode_follows_the_pcie_study(s_kv):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
+def test_sm80_paged_d192x192_window_decode_follows_its_study(s_kv):
+    """sm80_paged_d192x192_swa_pcie_20261124 (A100 80GB PCIe, padded Q, no sink): windowed d192 x 192 single-row decode leads up to
+    2^4.792 parallel tiles on the tile and 2^7.161 query rows off it, so step5_swa (64/4, 512-key window) at b 1 leads and wide
+    batches keep the backend. Windowed d192 x 192 prefill has no entry: its off-tile side failed the study's holdout."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def f(**over):
+        base = dict(b=1, h_q=64, h_kv=4, s_q=1, s_kv=s_kv, d_qk=192, d_v=192, causal=True, bottom_right=True, window_left=511)
+        base.update(device_cc=(8, 0), page_size=16, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, f()).study == "sm80_paged_d192x192_swa_pcie_20261124"
+    assert pt.lookup(row, f()) is True
+    assert pt.lookup(row, f(b=128)) is False
+    assert pt.matched_entry(row, f(s_q=2048, s_kv=2048 + s_kv % 2, thd=True, max_total_seq_len_q=2048)) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_sm80_prefill_gaps_follow_their_study(s_kv):
     """Study sm80_prefill_gaps_20261117 (A100): paged THD-Q prefill (gpt-oss d64 with a sink, causal and windowed; dsv4 d512) and dense
     dsv4 d512 lead past a floor; small chunks keep the backend. Paged d128 has no entry; paged d192 x 128 and d256 were retired after
