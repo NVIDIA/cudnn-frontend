@@ -58,6 +58,10 @@ THE CONTRACT.
 
 ``test/python/sdpa/frost/test_tile_dsl_consume_then_arrive.py`` pins the generated chain of every form and runs it on a ring
 whose unsafe twin fails; ``test/python/warm_stress.py`` is the run-time detector for a kernel that adopts it.
+
+THE OFFSET ALONE.  :func:`consumed_zero` returns ``off`` itself for an order that is not an mbarrier release: a value that
+has to be read before an address, an index or a stored word is formed (``tile_dsl.handover``: the loads behind an acquire
+load of a counter in global memory).  The same contract holds for ``consumed`` and ``zero``.
 """
 
 import cutlass
@@ -74,6 +78,7 @@ from .scheduler import _read_tile_id_lane_geometry
 
 __all__ = [
     "ReleaseZero",
+    "consumed_zero",
     "consume_then_arrive",
     "consume_then_arrive_on_peer",
     "consume_then_read_tile_id_arrive",
@@ -198,14 +203,27 @@ def _check_pred(pred, who: str):
         raise TypeError(f"{who}: `pred` is the compile-time constant {pred.value!r}; omit it for an arrive on every calling lane")
 
 
-def _release_address(mb, consumed, zero, who: str):
-    """The barrier address plus ``(sum of every consumed word) & release_zero`` elements: the plain address at run time."""
+def _masked_fold(consumed, zero, who: str):
+    """``(wrapping 32-bit sum of every consumed word) & release_zero``: 0 at run time, computed from every consumed register."""
     _check_zero(zero, who)
     fold = None
     for value in _consumed_values(consumed, who):
         for word in _value_words(value, who):
             fold = word if fold is None else fold + word
-    offset = fold & zero.word
+    return fold & zero.word
+
+
+def consumed_zero(consumed, zero):
+    """An ``Int32`` that is 0 for every data value at run time and that the generated code computes from every register of
+    ``consumed``: ``(wrapping sum of every consumed word) & release_zero``.  Add it to an address or an index, or to a word
+    that is stored, when that address, index or word must not be formed before ``consumed`` was read -- the anchor of the
+    ``consume_then_*`` forms without their arrive.  ``consumed`` and ``zero`` follow the module's contract."""
+    return _masked_fold(consumed, zero, "consumed_zero")
+
+
+def _release_address(mb, consumed, zero, who: str):
+    """The barrier address plus ``(sum of every consumed word) & release_zero`` elements: the plain address at run time."""
+    offset = _masked_fold(consumed, zero, who)
     base = mb.smem_ptr if isinstance(mb, MBarrier) else mb
     if hasattr(base, "subview"):
         return base.subview(offset)
