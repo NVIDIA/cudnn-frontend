@@ -28,7 +28,9 @@ from .dsrelu.api import (
 
 from .glu.api import (
     GroupedGemmGluSm100,
+    GroupedGemmGluSm90,
     grouped_gemm_glu_wrapper_sm100,
+    grouped_gemm_glu_wrapper_sm90,
 )
 
 from .glu_hadamard.api import (
@@ -43,7 +45,9 @@ from .glu_hadamard_quant.api import (
 
 from .dglu.api import (
     GroupedGemmDgluSm100,
+    GroupedGemmDgluSm90,
     grouped_gemm_dglu_wrapper_sm100,
+    grouped_gemm_dglu_wrapper_sm90,
 )
 
 from .wgrad.api import (
@@ -76,12 +80,16 @@ __all__ = [
     "grouped_gemm_dsrelu_wrapper_sm100",
     "GroupedGemmGluSm100",
     "grouped_gemm_glu_wrapper_sm100",
+    "GroupedGemmGluSm90",
+    "grouped_gemm_glu_wrapper_sm90",
     "GroupedGemmGluHadamardSm100",
     "grouped_gemm_glu_hadamard_wrapper_sm100",
     "GroupedGemmGluHadamardQuantSm100",
     "grouped_gemm_glu_hadamard_quant_wrapper_sm100",
     "GroupedGemmDgluSm100",
     "grouped_gemm_dglu_wrapper_sm100",
+    "GroupedGemmDgluSm90",
+    "grouped_gemm_dglu_wrapper_sm90",
     "GroupedGemmWgradSm100",
     "get_grouped_gemm_wgrad_workspace_size_sm100",
     "grouped_gemm_wgrad_wrapper_sm100",

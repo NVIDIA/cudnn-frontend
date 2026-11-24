@@ -16,6 +16,7 @@ import cudnn
 from cudnn.tensor_adapter import has_wgmma
 from determinism_utils import assert_bitwise, snapshot
 from gemm.cutedsl.test_grouped_gemm_bf16_utils import make_grouped_gemm_bf16_problem
+from gemm.cutedsl.test_grouped_gemm_dglu_bf16_utils import make_grouped_gemm_dglu_bf16_problem
 from gemm.cutedsl.test_grouped_gemm_glu_bf16_utils import make_grouped_gemm_glu_bf16_problem
 from gemm.cutedsl.test_grouped_gemm_sm90 import override_schedule
 from gemm.cutedsl.test_grouped_gemm_wgrad_bf16_utils import make_grouped_gemm_wgrad_bf16_problem
@@ -34,8 +35,12 @@ def _make(op, discrete, seed):
         problem["a"].mul_(0.5 * seed)
         problem["b"].mul_(0.5 * seed)
         return problem
-    make = make_grouped_gemm_glu_bf16_problem if op == "glu" else make_grouped_gemm_bf16_problem
-    problem = make(m=EXPERTS * ROWS, n=N, k=K, experts=EXPERTS, discrete=discrete, alpha_values=ALPHA)
+    if op == "dglu":
+        problem = make_grouped_gemm_dglu_bf16_problem(m=EXPERTS * ROWS, n=N, k=K, experts=EXPERTS, discrete=discrete, alpha_values=ALPHA, beta_values=ALPHA)
+        problem["c"] = problem["c"].squeeze(-1)
+    else:
+        make = make_grouped_gemm_glu_bf16_problem if op == "glu" else make_grouped_gemm_bf16_problem
+        problem = make(m=EXPERTS * ROWS, n=N, k=K, experts=EXPERTS, discrete=discrete, alpha_values=ALPHA)
     problem["a"] = problem["a"].squeeze(-1).mul_(0.5 * seed)
     # In place, so the discrete b_ptrs see it too.
     problem["b_storage"].mul_(0.5 * seed)
@@ -43,7 +48,7 @@ def _make(op, discrete, seed):
     return problem
 
 
-def _launch(op, problem, sched, arch="sm100"):
+def _launch(op, problem, sched, arch="sm100", generate_c=True):
     """One ``*_{arch}`` wrapper call on the current stream; returns its outputs (fresh buffers)."""
     if op == "wgrad":
         output = torch.empty_like(problem["output"])
@@ -60,6 +65,22 @@ def _launch(op, problem, sched, arch="sm100"):
             wgrad_dtype=torch.bfloat16,
         )
         return {"wgrad": output}
+    if op == "dglu":
+        result = getattr(cudnn, f"grouped_gemm_dglu_wrapper_{arch}")(
+            a_tensor=problem["a"],
+            c_tensor=problem["c"],
+            sfa_tensor=None,
+            padded_offsets=problem["offsets"],
+            alpha_tensor=problem["alpha"],
+            beta_tensor=problem["beta"],
+            prob_tensor=problem["prob"],
+            dprob_tensor=torch.zeros_like(problem["prob"]),
+            b_tensor=problem["b_storage"],
+            d_dtype=torch.bfloat16,
+            use_dynamic_sched=sched == "dynamic",
+        )
+        # dprob is an atomic sum across N tiles, so only D is compared bitwise.
+        return {"d": result["d_row_tensor"]}
     kwargs = dict(
         a_tensor=problem["a"],
         padded_offsets=problem["offsets"],
@@ -67,7 +88,7 @@ def _launch(op, problem, sched, arch="sm100"):
         prob_tensor=problem["prob"],
         c_dtype=torch.bfloat16,
         d_dtype=torch.bfloat16,
-        generate_c=True,
+        generate_c=generate_c,
         use_dynamic_sched=sched == "dynamic",
     )
     if problem["b_ptrs"] is not None:
@@ -78,10 +99,10 @@ def _launch(op, problem, sched, arch="sm100"):
     else:
         kwargs.update(b_tensor=problem["b_storage"], b_major="k")
     if op == "glu":
-        result = cudnn.grouped_gemm_glu_wrapper_sm100(sfa_tensor=None, **kwargs)
+        result = getattr(cudnn, f"grouped_gemm_glu_wrapper_{arch}")(sfa_tensor=None, **kwargs)
     else:
         result = getattr(cudnn, f"grouped_gemm_wrapper_{arch}")(**kwargs)
-    return {"c": result["c_tensor"], "d": result["d_tensor"]}
+    return {"c": result["c_tensor"], "d": result["d_tensor"]} if generate_c else {"d": result["d_tensor"]}
 
 
 CASES = [
@@ -104,23 +125,24 @@ def test_sm100_bf16_overlapping_streams(op, discrete, sched):
     _assert_overlap_matches_serial(op, discrete, sched)
 
 
-def _assert_overlap_matches_serial(op, discrete, sched, arch="sm100"):
+def _assert_overlap_matches_serial(op, discrete, sched, arch="sm100", generate_c=True):
     pair = [_make(op, discrete, seed) for seed in (1, 2)]
-    expected = [snapshot(_launch(op, problem, sched, arch)) for problem in pair]
+    expected = [snapshot(_launch(op, problem, sched, arch, generate_c)) for problem in pair]
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     for iteration in range(ITERATIONS):
         torch.cuda.synchronize()
         results = []
         for stream, problem in zip(streams, pair):
             with torch.cuda.stream(stream):
-                results.append(_launch(op, problem, sched, arch))
+                results.append(_launch(op, problem, sched, arch, generate_c))
         torch.cuda.synchronize()
         for index, (result, reference) in enumerate(zip(results, expected)):
             assert_bitwise(snapshot(result), reference, f"iteration {iteration} call {index}")
 
 
-# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad; the forced cases cover each schedule.
-SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad") for schedule in (None, "cooperative", "pingpong")]
+# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad / GLU with C; the forced cases cover each schedule. dGLU
+# has one schedule.
+SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad", "glu") for schedule in (None, "cooperative", "pingpong")] + [("dglu", None)]
 
 
 @pytest.mark.parametrize("op,schedule", SM90_CASES, ids=[f"{op}-{schedule or 'heuristic'}" for op, schedule in SM90_CASES])
@@ -128,4 +150,5 @@ def test_sm90_bf16_overlapping_streams(op, schedule):
     if not torch.cuda.is_available() or not has_wgmma(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM90 is required")
     with override_schedule(schedule):
-        _assert_overlap_matches_serial(op, False, "dynamic", "sm90")
+        # The forced pingpong GLU runs without the saved C; the heuristic case covers pingpong with C.
+        _assert_overlap_matches_serial(op, False, "dynamic", "sm90", generate_c=not (op == "glu" and schedule == "pingpong"))

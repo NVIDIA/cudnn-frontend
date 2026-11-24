@@ -52,11 +52,13 @@ cudnn.GraphContext.compute_data_type
 cudnn.GraphContext.intermediate_data_type
 cudnn.GraphContext.io_data_type
 cudnn.GroupedGemmDgluSm100
+cudnn.GroupedGemmDgluSm90
 cudnn.GroupedGemmDsreluSm100
 cudnn.GroupedGemmDswigluSm100
 cudnn.GroupedGemmGluHadamardQuantSm100
 cudnn.GroupedGemmGluHadamardSm100
 cudnn.GroupedGemmGluSm100
+cudnn.GroupedGemmGluSm90
 cudnn.GroupedGemmQuantSm100
 cudnn.GroupedGemmSm100
 cudnn.GroupedGemmSm90
@@ -849,6 +851,13 @@ cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm100.execute
 cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm100.scratch_workspace_bytes
 cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm100.supports_gate_then_up_precisions
 cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm100.supports_glu_layouts
+cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm90
+cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm90.check_support
+cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm90.compile
+cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm90.execute
+cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm90.scratch_workspace_bytes
+cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm90.supports_gate_then_up_precisions
+cudnn.gemm.cutedsl.grouped.GroupedGemmDgluSm90.supports_glu_layouts
 cudnn.gemm.cutedsl.grouped.GroupedGemmDsreluSm100
 cudnn.gemm.cutedsl.grouped.GroupedGemmDsreluSm100.check_support
 cudnn.gemm.cutedsl.grouped.GroupedGemmDsreluSm100.compile
@@ -886,6 +895,13 @@ cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm100.execute
 cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm100.preferred_gate_then_up_mma_tiler
 cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm100.supports_gate_then_up_precisions
 cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm100.supports_glu_layouts
+cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm90
+cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm90.check_support
+cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm90.compile
+cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm90.execute
+cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm90.preferred_gate_then_up_mma_tiler
+cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm90.supports_gate_then_up_precisions
+cudnn.gemm.cutedsl.grouped.GroupedGemmGluSm90.supports_glu_layouts
 cudnn.gemm.cutedsl.grouped.GroupedGemmQuantSm100
 cudnn.gemm.cutedsl.grouped.GroupedGemmQuantSm100.check_support
 cudnn.gemm.cutedsl.grouped.GroupedGemmQuantSm100.compile
@@ -921,6 +937,7 @@ cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.set_m
 cudnn.gemm.cutedsl.grouped.get_grouped_gemm_wgrad_workspace_size_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dglu_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dglu_wrapper_sm100
+cudnn.gemm.cutedsl.grouped.grouped_gemm_dglu_wrapper_sm90
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dsrelu_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dsrelu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dswiglu_wrapper_sm100
@@ -930,6 +947,7 @@ cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_hadamard_quant_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_hadamard_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_wrapper_sm100
+cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_wrapper_sm90
 cudnn.gemm.cutedsl.grouped.grouped_gemm_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_quant_jax_forward
 cudnn.gemm.cutedsl.grouped.grouped_gemm_quant_wrapper_sm100
@@ -1012,6 +1030,7 @@ cudnn.graph_cache
 cudnn.grouped_gemm
 cudnn.grouped_gemm_dglu_jax_sm100
 cudnn.grouped_gemm_dglu_wrapper_sm100
+cudnn.grouped_gemm_dglu_wrapper_sm90
 cudnn.grouped_gemm_dsrelu_jax_sm100
 cudnn.grouped_gemm_dsrelu_wrapper_sm100
 cudnn.grouped_gemm_dswiglu_wrapper_sm100
@@ -1021,6 +1040,7 @@ cudnn.grouped_gemm_glu_hadamard_quant_wrapper_sm100
 cudnn.grouped_gemm_glu_hadamard_wrapper_sm100
 cudnn.grouped_gemm_glu_jax_sm100
 cudnn.grouped_gemm_glu_wrapper_sm100
+cudnn.grouped_gemm_glu_wrapper_sm90
 cudnn.grouped_gemm_jax_sm100
 cudnn.grouped_gemm_quant_jax_forward
 cudnn.grouped_gemm_quant_wrapper_sm100

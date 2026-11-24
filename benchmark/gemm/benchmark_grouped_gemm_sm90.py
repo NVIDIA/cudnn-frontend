@@ -16,6 +16,10 @@ execution uses fixed output buffers and a preallocated workspace; graph timing
 is device time for an actual captured bundle, while eager timing includes host
 dispatch and synchronization. Routing and FC2 forward are excluded.
 Forward measures the FC1 GEMM without GLU (N=2F, K=H).
+Glu measures FC1 forward + SwiGLU, writing C.
+Dglu measures FC2 dgrad + dSwiGLU + dprob, including its buffer reset, without
+dbias; its kernel has one (cooperative) schedule and ignores the override.
+Glu and dglu use --glu-layout (interleaved_32 by default, or gate_then_up).
 Dgrad measures the FC2 dgrad (N=F, K=H), reading the forward weights N-major.
 Schedule checks are exact.
 """
@@ -38,6 +42,8 @@ SCHEDULES = ("cooperative", "pingpong")
 #: direction -> its public wrapper, its class API and the schedules its kernel runs.
 DIRECTIONS = dict(
     forward=("grouped_gemm_wrapper_sm90", "GroupedGemmSm90", SCHEDULES),
+    glu=("grouped_gemm_glu_wrapper_sm90", "GroupedGemmGluSm90", SCHEDULES),
+    dglu=("grouped_gemm_dglu_wrapper_sm90", "GroupedGemmDgluSm90", ("cooperative",)),
     dgrad=("grouped_gemm_wrapper_sm90", "GroupedGemmSm90", SCHEDULES),
 )
 
@@ -48,7 +54,7 @@ def problem(args, direction, schedule):
     valid_m = math.ceil(args.context * args.microbatch * args.ep * 8 / 256)
     m = math.ceil(valid_m / 256) * 256
     h, f = 7168, 2048
-    n, k = (2 * f, h) if direction == "forward" else (f, h)
+    n, k = (2 * f, h) if direction in ("forward", "glu") else (f, h)
     rows = groups * m
     # Pingpong runs only its 128x192 tile on a (2, 1) cluster.
     tile_n = 192 if schedule == "pingpong" else 256
@@ -72,6 +78,28 @@ def problem(args, direction, schedule):
             b_major="k",
             # Without generate_c the kernel does not write C, but the class API takes a sample.
             c_tensor=torch.empty(rows, n, device="cuda", dtype=torch.bfloat16),
+        )
+    if direction == "glu":
+        kwargs.update(
+            b_tensor=torch.randn(groups, n, k, device="cuda", dtype=torch.bfloat16) * 0.125,
+            b_major="k",
+            sfa_tensor=None,
+            c_dtype=torch.bfloat16,
+            generate_c=True,
+            act_func="swiglu",
+            glu_layout=args.glu_layout,
+        )
+    if direction == "dglu":
+        kwargs.update(
+            b_tensor=torch.randn(groups, k, n, device="cuda", dtype=torch.bfloat16) * 0.125,
+            b_major="n",
+            sfa_tensor=None,
+            # The forward's saved C (gate | up, 2N wide, in --glu-layout order).
+            c_tensor=torch.randn(rows, 2 * n, device="cuda", dtype=torch.bfloat16) * 0.125,
+            beta_tensor=torch.ones(groups, device="cuda"),
+            dprob_tensor=torch.zeros(rows, device="cuda", dtype=torch.float32),
+            act_func="dswiglu",
+            glu_layout=args.glu_layout,
         )
     if direction == "dgrad":
         kwargs.update(
@@ -113,11 +141,15 @@ def prepare(kwargs, direction, schedule):
     for name, parameter in inspect.signature(execute).parameters.items():
         if name not in arguments and parameter.default is inspect.Parameter.empty:
             arguments[name] = None
+    if "workspace" in inspect.signature(execute).parameters:
+        arguments["workspace"] = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     if "_workspace" in inspect.signature(execute).parameters:
         # The kernel scratch the wrapper allocates per call.
         arguments["_workspace"] = torch.empty(implementation._scratch_nbytes, device="cuda", dtype=torch.uint8)
 
     def run():
+        if kwargs.get("dprob_tensor") is not None:
+            kwargs["dprob_tensor"].zero_()
         execute(**arguments)
 
     run()
@@ -139,8 +171,16 @@ def check(actual, expected):
 
 
 def output_hashes(values):
-    """Cross-process controls; copying/hashing is outside timing."""
-    return {name: hashlib.sha256(value.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest() for name, value in values.items()}
+    """Cross-process controls; copying/hashing is outside timing.
+
+    dprob uses an existing atomic reduction. Its bytes are not a deterministic
+    regression contract.
+    """
+    return {
+        name: hashlib.sha256(value.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+        for name, value in values.items()
+        if name != "dprob_tensor"
+    }
 
 
 def distribution(samples):
@@ -205,10 +245,13 @@ def main():
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--bundle", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=8)
+    parser.add_argument("--glu-layout", choices=("interleaved_32", "gate_then_up"), default="interleaved_32")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     if args.ep < 1 or 256 % args.ep or min(args.context, args.microbatch, args.warmup, args.bundle, args.repeats) < 1:
         parser.error("EP must divide 256; context, microbatch and timing counts must be positive")
+    if args.direction == "dglu" and args.schedule == "pingpong":
+        parser.error("dglu has one (cooperative) schedule")
     runtime = dict(
         gpu=torch.cuda.get_device_name(),
         capability=torch.cuda.get_device_capability(),

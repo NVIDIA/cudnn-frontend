@@ -279,6 +279,8 @@ class MoEGroupedGemmBf16KernelSm90:
         # act_func fuses a GLU (interleaved 32-column gate/up blocks): D has half the accumulator's N columns.
         self.act_func = act_func
         self.fused_glu = act_func is not None
+        # glu_layout="gate_then_up" (set by the GLU kernel): B and C hold the gate branch in columns [0, N/2), up in [N/2, N).
+        self.gate_then_up = False
 
     # ------------------------------------------------------------------
     # _setup_attributes
@@ -524,13 +526,25 @@ class MoEGroupedGemmBf16KernelSm90:
         )
 
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
-        tma_atom_b, tma_tensor_b = cpasync.make_tiled_tma_atom(
-            utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, cute.make_layout(1)),
-            b,
-            b_smem_layout,
-            (self.mma_tiler[1], self.mma_tiler[2]),
-            num_multicast=self.num_mcast_ctas_b,
-        )
+        if cutlass.const_expr(self.gate_then_up):
+            # Two TMA boxes per stage, the tile's gate rows (n0 + [0, N_tile/2)) and up rows (N/2 + the same) into the
+            # stage's first and second halves: the accumulator holds the tile's gate columns, then its up columns.
+            b_half_tile = (self.mma_tiler[0], self.mma_tiler[1] // 2, self.mma_tiler[2])
+            tma_atom_b, tma_tensor_b = cpasync.make_tiled_tma_atom(
+                utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, cute.make_layout(1)),
+                b,
+                cute.slice_(sm90_utils.make_smem_layout_b(self.b_layout, b_half_tile, self.b_dtype, 1), (None, None, 0)),
+                (b_half_tile[1], b_half_tile[2]),
+                num_multicast=self.num_mcast_ctas_b,
+            )
+        else:
+            tma_atom_b, tma_tensor_b = cpasync.make_tiled_tma_atom(
+                utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, cute.make_layout(1)),
+                b,
+                b_smem_layout,
+                (self.mma_tiler[1], self.mma_tiler[2]),
+                num_multicast=self.num_mcast_ctas_b,
+            )
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
@@ -551,8 +565,10 @@ class MoEGroupedGemmBf16KernelSm90:
             self.epi_tile,
         )
         cluster_n = self.cluster_shape_mn[1]
-        tma_tensor_b = _widen_for_cluster(tma_tensor_b, 0, self.mma_tiler[1], cluster_n)
-        tma_tensor_c = _widen_for_cluster(tma_tensor_c, 1, self.mma_tiler[1], cluster_n)
+        if cutlass.const_expr(not self.gate_then_up):
+            # gate_then_up addresses B and C by explicit coordinates (in-mode, no wrap) and reads N/2 from B's extent.
+            tma_tensor_b = _widen_for_cluster(tma_tensor_b, 0, self.mma_tiler[1], cluster_n)
+            tma_tensor_c = _widen_for_cluster(tma_tensor_c, 1, self.mma_tiler[1], cluster_n)
         tma_tensor_d = _widen_for_cluster(tma_tensor_d, 1, self.mma_tiler_d[1], cluster_n)
 
         # ---- Helper kernel: dynamic scheduler counter reset ----
@@ -673,6 +689,21 @@ class MoEGroupedGemmBf16KernelSm90:
             c_pipeline.producer_commit()
             c_pipeline.producer_acquire()
         epilog_barrier.arrive_and_wait()
+
+    def _c_coord(self, c_subtile_layout, c_blocks, subtile_idx, subtile_shape, branch):
+        """The C epilogue tile of a fused GLU's D subtile ``subtile_idx`` = (m, j) and ``branch`` (0 gate, 1 up).
+
+        interleaved_32: the tile's C subtile 2 s + branch. gate_then_up: from the tile's gate origin, row block m and
+        32-column block j, or N/64 + j for up; a gate block past N/2 (a partial N tile) moves out of bounds, so the TMA
+        store drops it instead of writing over the up branch.
+        """
+        if cutlass.const_expr(not self.gate_then_up):
+            return c_subtile_layout.get_hier_coord(2 * subtile_idx + branch)
+        gate_blocks_in_n, branch_blocks = c_blocks
+        m_sub, j = subtile_idx // subtile_shape[1], subtile_idx % subtile_shape[1]
+        if cutlass.const_expr(branch == 0):
+            return (m_sub, j + branch_blocks * cutlass.Int32(j >= gate_blocks_in_n), 0)
+        return (m_sub, j + branch_blocks, 0)
 
     def _epi_buffer(self, subtile, num_stage, buffer_base):
         """SMEM buffer of an epilogue subtile; pingpong warp groups own disjoint buffer ranges."""
@@ -866,7 +897,8 @@ class MoEGroupedGemmBf16KernelSm90:
                 real_a, _ = ext.get_gmem_tensor("a", mA_mkl, padded_offsets, work_tile_info)
                 real_b, _ = ext.get_gmem_tensor("b", mB_nkl, padded_offsets, work_tile_info)
                 gA_mkl = cute.local_tile(real_a, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None))
-                gB_nkl = cute.local_tile(real_b, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None))
+                if cutlass.const_expr(not self.gate_then_up):
+                    gB_nkl = cute.local_tile(real_b, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None))
 
                 # SM90 SMEM tensors are rank 3, so tma_partition groups 2 modes, not 3.
                 a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
@@ -878,16 +910,36 @@ class MoEGroupedGemmBf16KernelSm90:
                     cute.group_modes(gA_mkl, 0, 2),
                 )
                 b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
-                tBsB, tBgB = cpasync.tma_partition(
-                    tma_atom_b,
-                    block_in_cluster_coord_vmnk[1],
-                    b_cta_layout,
-                    cute.group_modes(sB, 0, 2),
-                    cute.group_modes(gB_nkl, 0, 2),
-                )
+                if cutlass.const_expr(self.gate_then_up):
+                    # Branch p's half tile: rows p * N/2 + tile_n * N_tile/2 of B into rows p * N_tile/2 of the stage.
+                    b_half_tiler = (self.mma_tiler[1] // 2, self.mma_tiler[2])
+                    sB_halves = cute.local_tile(sB, b_half_tiler, (None, None, None))
+                    n_half = cute.size(real_b, mode=[0]) // 2
+                    tBsB_br = []
+                    tBgB_br = []
+                    for branch in cutlass.range_constexpr(2):
+                        real_b_branch = real_b if branch == 0 else cute.domain_offset((n_half, 0, 0), real_b)
+                        tBsB_p, tBgB_p = cpasync.tma_partition(
+                            tma_atom_b,
+                            block_in_cluster_coord_vmnk[1],
+                            b_cta_layout,
+                            cute.group_modes(sB_halves[(None, None, branch, 0, None)], 0, 2),
+                            cute.group_modes(cute.local_tile(real_b_branch, b_half_tiler, (None, None, None)), 0, 2),
+                        )
+                        tBsB_br.append(tBsB_p)
+                        tBgB_br.append(tBgB_p[(None, work_tile_info.tile_n_idx, None, 0)])
+                else:
+                    tBsB, tBgB = cpasync.tma_partition(
+                        tma_atom_b,
+                        block_in_cluster_coord_vmnk[1],
+                        b_cta_layout,
+                        cute.group_modes(sB, 0, 2),
+                        cute.group_modes(gB_nkl, 0, 2),
+                    )
 
                 tAgA_slice = tAgA[(None, work_tile_info.tile_m_idx, None, 0)]
-                tBgB_slice = tBgB[(None, work_tile_info.tile_n_idx, None, 0)]
+                if cutlass.const_expr(not self.gate_then_up):
+                    tBgB_slice = tBgB[(None, work_tile_info.tile_n_idx, None, 0)]
 
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
@@ -896,13 +948,25 @@ class MoEGroupedGemmBf16KernelSm90:
 
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
-                    tBgB_k = tBgB_slice[(None, ab_producer_state.count)]
+                    if cutlass.const_expr(not self.gate_then_up):
+                        tBgB_k = tBgB_slice[(None, ab_producer_state.count)]
                     tAsA_pipe = tAsA[(None, ab_producer_state.index)]
-                    tBsB_pipe = tBsB[(None, ab_producer_state.index)]
+                    if cutlass.const_expr(not self.gate_then_up):
+                        tBsB_pipe = tBsB[(None, ab_producer_state.index)]
                     tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
                     ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
                     cute.copy(tma_atom_a, tAgA_k, tAsA_pipe, tma_bar_ptr=tma_bar, mcast_mask=a_full_mcast_mask)
-                    cute.copy(tma_atom_b, tBgB_k, tBsB_pipe, tma_bar_ptr=tma_bar, mcast_mask=b_full_mcast_mask)
+                    if cutlass.const_expr(self.gate_then_up):
+                        for branch in cutlass.range_constexpr(2):
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB_br[branch][(None, ab_producer_state.count)],
+                                tBsB_br[branch][(None, ab_producer_state.index)],
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=b_full_mcast_mask,
+                            )
+                    else:
+                        cute.copy(tma_atom_b, tBgB_k, tBsB_pipe, tma_bar_ptr=tma_bar, mcast_mask=b_full_mcast_mask)
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
@@ -1075,9 +1139,20 @@ class MoEGroupedGemmBf16KernelSm90:
                     gD_epi,
                 )
                 if cutlass.const_expr(self.generate_c):
-                    gC_mnl_loop = cute.local_tile(real_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
-                    gC_tile = gC_mnl_loop[(None, None, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx, 0)]
-                    gC_epi = cute.zipped_divide(gC_tile, epi_tile)
+                    if cutlass.const_expr(self.gate_then_up):
+                        # C (gate | up) from the tile's gate origin in epilogue tiles, addressed by _c_coord; c_blocks is
+                        # (the tile's gate blocks inside N/2, N/2 in 32-column blocks).
+                        c_branch_blocks = cute.size(real_c, mode=[1]) // (2 * epi_tile[1])
+                        c_first_block = epi_work_tile_info.tile_n_idx * (self.mma_tiler_d[1] // epi_tile[1])
+                        c_origin = (epi_work_tile_info.tile_m_idx * self.mma_tiler[0], c_first_block * epi_tile[1], 0)
+                        gC_epi = cute.zipped_divide(cute.domain_offset(c_origin, real_c), epi_tile)
+                        c_blocks = (c_branch_blocks - c_first_block, c_branch_blocks)
+                        c_subtile_layout = None
+                    else:
+                        c_blocks = None
+                        gC_mnl_loop = cute.local_tile(real_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
+                        gC_tile = gC_mnl_loop[(None, None, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx, 0)]
+                        gC_epi = cute.zipped_divide(gC_tile, epi_tile)
                     bSG_sC, bSG_gC = cpasync.tma_partition(
                         tma_atom_c,
                         0,
@@ -1085,8 +1160,9 @@ class MoEGroupedGemmBf16KernelSm90:
                         cute.group_modes(sC, 0, 2),
                         gC_epi,
                     )
-                    c_subtile_shape = gC_epi.shape[1]
-                    c_subtile_layout = cute.make_layout(c_subtile_shape, stride=(c_subtile_shape[1], 1))
+                    if cutlass.const_expr(not self.gate_then_up):
+                        c_subtile_shape = gC_epi.shape[1]
+                        c_subtile_layout = cute.make_layout(c_subtile_shape, stride=(c_subtile_shape[1], 1))
 
                 subtile_cnt = cute.size(gD_epi, mode=[1])
                 subtile_shape = gD_epi.shape[1]
@@ -1104,12 +1180,18 @@ class MoEGroupedGemmBf16KernelSm90:
                         # D subtile s reads accumulator subtiles 2s (gate) and 2s+1 (up): same rows, 32 columns apart.
                         acc_gate = 2 * subtile_idx * size_tRS_rD
                         acc_up = acc_gate + size_tRS_rD
+                        if cutlass.const_expr(self.gate_then_up):
+                            # The accumulator holds the tile's gate columns, then its up columns: subtile (m, j) pairs
+                            # accumulator subtiles (m, j) and (m, j + N_tile/64).
+                            acc_gate = (subtile_idx + subtile_idx // subtile_shape[1] * subtile_shape[1]) * size_tRS_rD
+                            acc_up = acc_gate + subtile_shape[1] * size_tRS_rD
                         if cutlass.const_expr(self.generate_c and self.pingpong):
                             # Pingpong's 192-register accumulator: C (gate, then up) is stored first, straight from it, and the
                             # alpha reload past those stores' barriers keeps the activation below them (0 spills).
                             for half in cutlass.range_constexpr(2):
+                                acc_half = acc_up if half == 1 else acc_gate
                                 for i in cutlass.range_constexpr(size_tRS_rD):
-                                    tRS_rC[i] = tRS_rAcc[acc_gate + half * size_tRS_rD + i] * alpha_val
+                                    tRS_rC[i] = tRS_rAcc[acc_half + i] * alpha_val
                                 self.store_c(
                                     tiled_copy_r2s_c,
                                     tma_atom_c,
@@ -1121,7 +1203,7 @@ class MoEGroupedGemmBf16KernelSm90:
                                     bSG_sC,
                                     c_pipeline,
                                     self._epi_buffer(2 * num_prev_subtiles + half, self.num_c_stage, c_buffer_base),
-                                    c_subtile_layout.get_hier_coord(2 * subtile_idx + half),
+                                    self._c_coord(c_subtile_layout, c_blocks, subtile_idx, subtile_shape, half),
                                     epilog_barrier,
                                     epi_store_warp,
                                 )
@@ -1166,7 +1248,7 @@ class MoEGroupedGemmBf16KernelSm90:
                             bSG_sC,
                             c_pipeline,
                             self._epi_buffer(2 * num_prev_subtiles, self.num_c_stage, c_buffer_base),
-                            c_subtile_layout.get_hier_coord(2 * subtile_idx),
+                            self._c_coord(c_subtile_layout, c_blocks, subtile_idx, subtile_shape, 0),
                             epilog_barrier,
                             epi_store_warp,
                         )
@@ -1181,7 +1263,7 @@ class MoEGroupedGemmBf16KernelSm90:
                             bSG_sC,
                             c_pipeline,
                             self._epi_buffer(2 * num_prev_subtiles + 1, self.num_c_stage, c_buffer_base),
-                            c_subtile_layout.get_hier_coord(2 * subtile_idx + 1),
+                            self._c_coord(c_subtile_layout, c_blocks, subtile_idx, subtile_shape, 1),
                             epilog_barrier,
                             epi_store_warp,
                         )

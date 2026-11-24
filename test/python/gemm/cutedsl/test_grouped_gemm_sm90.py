@@ -316,24 +316,34 @@ def test_sm90_pingpong_rejects(kwargs, match):
 
 
 @pytest.mark.parametrize(
-    "n,k,tile,cluster,expected",
+    "n,k,tile,cluster,glu_c,expected",
     [
-        (2048, 1024, None, None, (True, (128, 192))),
-        (2048, 1024, (128, 192), (2, 1), (True, (128, 192))),
-        (2048, 3072, None, None, (True, (128, 192))),
-        (2048, 3136, None, None, (False, (128, 256))),
-        (4096, 4096, None, None, (False, (128, 256))),
-        (1024, 1024, None, None, (False, (128, 256))),
-        (2048, 1024, (128, 256), None, (False, (128, 256))),
-        (2048, 1024, (128, 160), None, (False, (128, 160))),
-        (2048, 1024, None, (1, 2), (False, (128, 256))),
-        (2048, 1024, (128, 192), (1, 2), (False, (128, 192))),
+        (2048, 1024, None, None, False, (True, (128, 192))),
+        (2048, 1024, (128, 192), (2, 1), False, (True, (128, 192))),
+        (2048, 2048, None, None, True, (True, (128, 192))),
+        (2048, 3072, None, None, False, (True, (128, 192))),
+        (2048, 3072, None, None, True, (True, (128, 192))),
+        (2048, 3136, None, None, False, (False, (128, 256))),
+        (2048, 4096, None, None, True, (False, (128, 256))),
+        (1024, 1024, None, None, True, (False, (128, 256))),
+        (2048, 1024, (128, 256), None, True, (False, (128, 256))),
+        (4096, 4096, None, None, False, (False, (128, 256))),
+        (1024, 1024, None, None, False, (False, (128, 256))),
+        (2048, 1024, (128, 256), None, False, (False, (128, 256))),
+        (2048, 1024, (128, 160), None, False, (False, (128, 160))),
+        (2048, 1024, None, (1, 2), False, (False, (128, 256))),
+        (2048, 1024, (128, 192), (1, 2), False, (False, (128, 192))),
     ],
     ids=[
         "N2048-K1024",
         "explicit-128x192-c21",
+        "glu-c-N2048-K2048",
         "N2048-K3072",
+        "glu-c-N2048-K3072",
         "N2048-K3136",
+        "glu-c-N2048-K4096",
+        "glu-c-N1024-K1024",
+        "glu-c-explicit-128x256",
         "N4096-K4096",
         "N1024-K1024",
         "explicit-128x256",
@@ -342,18 +352,19 @@ def test_sm90_pingpong_rejects(kwargs, match):
         "128x192-c12",
     ],
 )
-def test_sm90_schedule_heuristic(n, k, tile, cluster, expected):
-    # Pingpong for K <= 3072 and N >= 2048 on 128x192 tiles and (2, 1) clusters.
+def test_sm90_schedule_heuristic(n, k, tile, cluster, glu_c, expected):
+    # Pingpong for K <= 3072 and N >= 2048 (a GLU's N is 2I, with or without C) on 128x192 tiles and (2, 1) clusters.
+    from cudnn.gemm.cutedsl.grouped.glu._bf16_api import GroupedGemmGluBf16API
     from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import GroupedGemmBf16API
 
     m, dev = 256, "cuda"
     a = torch.zeros((m, k), dtype=torch.bfloat16, device=dev)
     b = torch.zeros((1, n, k), dtype=torch.bfloat16, device=dev)
     c = torch.zeros((m, n), dtype=torch.bfloat16, device=dev)
-    d = torch.zeros((m, n), dtype=torch.bfloat16, device=dev)
+    d = torch.zeros((m, n // 2 if glu_c else n), dtype=torch.bfloat16, device=dev)
     common = dict(sample_padded_offsets=torch.full((1,), m, dtype=torch.int32, device=dev), sample_alpha=torch.ones(1, device=dev))
-    common.update(sample_b=b, sample_prob=torch.ones((m,), device=dev), mma_tiler_mn=tile, cluster_shape_mn=cluster)
-    api = GroupedGemmBf16API(a, c, d, arch="sm90", **common)
+    common.update(sample_b=b, sample_prob=torch.ones((m,), device=dev), mma_tiler_mn=tile, cluster_shape_mn=cluster, generate_c=glu_c)
+    api = (GroupedGemmGluBf16API if glu_c else GroupedGemmBf16API)(a, c, d, arch="sm90", **common)
     assert (api._pingpong, api.mma_tiler_mn) == expected
 
 

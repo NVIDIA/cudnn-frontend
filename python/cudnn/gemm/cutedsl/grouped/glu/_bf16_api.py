@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Private BF16 API for the SM100 grouped GEMM GLU kernel."""
+"""Private BF16 API for the SM100 (and SM90) grouped GEMM GLU kernel."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -38,6 +39,8 @@ from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake
 from ..moe_utils import MoEWeightMode
 from ..glu_layout import validate_glu_layout
 from .moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
+from .moe_grouped_gemm_glu_sm90 import MoEGroupedGemmGluBf16KernelSm90
+from ..unfused.moe_grouped_gemm_sm90 import check_pingpong_tile, default_mma_tiler, use_pingpong
 
 
 def _output_dtypes():
@@ -61,7 +64,7 @@ class GroupedGemmGluBf16API(APIBase):
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
@@ -70,6 +73,7 @@ class GroupedGemmGluBf16API(APIBase):
         b_major: str = "k",
         use_dynamic_sched: bool = False,
         glu_layout: str = "interleaved_32",
+        arch: str = "sm100",
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -122,18 +126,25 @@ class GroupedGemmGluBf16API(APIBase):
         self.b_shape = tuple(b_shape) if b_shape is not None else None
         self.b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else self.b_desc.dtype
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
-        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        # arch="sm90" (GroupedGemmGluSm90) runs the Hopper kernel: tile M <= 128, a (2, 1) cluster by default and the
+        # dynamic scheduler always.
+        self._is_sm90 = arch == "sm90"
+        # The SM90 schedule comes from the GEMM's (N, K) and the tile: N is the pre-activation 2I (B is (2I, K, experts)).
+        dense_b = self.b_desc is not None and self.b_desc.ndim == 3
+        self._pingpong = self._is_sm90 and dense_b and use_pingpong(*self.b_desc.shape[:2], mma_tiler_mn, cluster_shape_mn)
+        self.mma_tiler_mn = tuple(mma_tiler_mn or (default_mma_tiler(self._pingpong) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
-        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
+        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.generate_c = generate_c
         self.glu_layout = validate_glu_layout(glu_layout)
         self.act_func = act_func
         self.b_major = b_major
-        self.use_dynamic_sched = use_dynamic_sched
+        # SM90's only scheduler is the dynamic one (the gmem atomic-counter claim), so it is the default there.
+        self.use_dynamic_sched = True if self._is_sm90 else use_dynamic_sched
         self._has_bias = self.bias_desc is not None
-        self._kernel = MoEGroupedGemmGluBiasBf16Kernel
+        self._kernel = MoEGroupedGemmGluBf16KernelSm90 if self._is_sm90 else MoEGroupedGemmGluBiasBf16Kernel
         self._workspace: Optional[torch.Tensor] = None
         self._scratch_nbytes = 0
         self._live_b_ptrs = None
@@ -183,6 +194,10 @@ class GroupedGemmGluBf16API(APIBase):
             launch_stream = as_torch_stream(int(current_stream), b_ptrs.device)
             self._launch_stream_cache[key] = launch_stream
         b_ptrs.record_stream(launch_stream)
+
+    def _schedule_kwargs(self) -> dict:
+        """The SM90 kernel's schedule flag; empty for the cooperative default and the SM100 kernels."""
+        return {"pingpong": True} if self._pingpong else {}
 
     def check_support(self) -> bool:
         if self.a_desc.ndim != 3:
@@ -261,7 +276,16 @@ class GroupedGemmGluBf16API(APIBase):
 
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
-        if self.m_aligned != MoEGroupedGemmGluBiasBf16Kernel.FIX_PAD_SIZE:
+        check_pingpong_tile(self._pingpong, self.mma_tiler_mn, self.cluster_shape_mn)
+        if self._is_sm90:
+            if self.weight_mode != MoEWeightMode.DENSE:
+                raise NotImplementedError("SM90 grouped GEMM GLU supports dense weights (sample_b) only, not discrete b_ptrs")
+            if self._has_bias:
+                raise NotImplementedError("SM90 grouped GEMM GLU does not support bias")
+            for desc, name in ((self.c_desc, "sample_c"), (self.d_desc, "sample_d")):
+                if _convert_to_cutlass_data_type(desc.dtype) not in (cutlass.BFloat16, cutlass.Float16):
+                    raise NotImplementedError(f"SM90 grouped GEMM GLU {name} must be BF16 or FP16, got {desc.dtype}")
+        if self.m_aligned != self._kernel.FIX_PAD_SIZE:
             raise ValueError(f"m_aligned must be 256, got {self.m_aligned}")
         if self.act_func not in ("swiglu", "geglu"):
             raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {self.act_func}")
@@ -288,6 +312,7 @@ class GroupedGemmGluBf16API(APIBase):
             self.b_major,
             "n",
             self.m_aligned,
+            **self._schedule_kwargs(),
         ):
             raise ValueError("Unsupported BF16 grouped GEMM GLU tile, cluster, alignment, " "or layout configuration")
 
@@ -295,10 +320,16 @@ class GroupedGemmGluBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
-        if not has_tcgen05(major):
+        if self._is_sm90:
+            if not has_wgmma(major):
+                raise RuntimeError(f"GroupedGemmGluSm90 requires SM90 (WGMMA), found SM{compute_capability}")
+        elif not has_tcgen05(major):
             raise RuntimeError(f"GroupedGemmGluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
-        if self.glu_layout == "gate_then_up":
+        if self.glu_layout == "gate_then_up" and self._is_sm90:
+            # SM90 loads each tile's gate and up weight rows as two TMA boxes: any SM90 tile and schedule, both activations.
+            self._not_implemented_error_if(n % 256 != 0, "gate_then_up GLU requires each gate/up branch N divisible by 128; padding is not implicit")
+        elif self.glu_layout == "gate_then_up":
             self._not_implemented_error_if(compute_capability not in (100, 103), "gate_then_up GLU requires SM100/103")
             self._not_implemented_error_if(n % 256 != 0 or self.mma_tiler_mn[1] != 256, "gate_then_up GLU requires N divisible by 256 and tile_N=256")
             self._not_implemented_error_if(self.b_major != "k" or self.act_func != "swiglu", "gate_then_up GLU requires K-major weights and swiglu")
@@ -327,6 +358,7 @@ class GroupedGemmGluBf16API(APIBase):
             enable_bias=self._has_bias,
             generate_c=self.generate_c,
             glu_layout=self.glu_layout,
+            **self._schedule_kwargs(),
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
