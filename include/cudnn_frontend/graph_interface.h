@@ -3139,6 +3139,9 @@ class Graph : public ICudnn, public INode {
 
     Graph &
     select_numeric_notes(std::vector<NumericalNote_t> const &notes) {
+        if (std::find(notes.begin(), notes.end(), NumericalNote_t::RL) != notes.end()) {
+            throw std::invalid_argument("The RL numerical note requires a frontend Python graph engine.");
+        }
         auto status = plans.filter_numeric_notes(notes, true);
         if (status.is_bad()) {
             CUDNN_FE_LOG(status.get_message() << std::endl);

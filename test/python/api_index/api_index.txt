@@ -1554,6 +1554,7 @@ cudnn.numerical_note.FFT
 cudnn.numerical_note.FULL_PRECISION_MATH
 cudnn.numerical_note.NONDETERMINISTIC
 cudnn.numerical_note.REDUCED_PRECISION_REDUCTION
+cudnn.numerical_note.RL
 cudnn.numerical_note.STRICT_NAN_PROP
 cudnn.numerical_note.TENSOR_CORE
 cudnn.numerical_note.WINOGRAD

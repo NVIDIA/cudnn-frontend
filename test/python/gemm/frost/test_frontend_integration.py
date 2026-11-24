@@ -121,7 +121,7 @@ def test_engine_is_in_the_manifest():
     (row,) = [r for r in MANIFEST if r.name == _FROST]
     assert is_python_engine(row.engine_id)
     assert row.module == "cudnn.gemm.frost.engine" and row.factory == "FrostGemmEngines"
-    assert list(row.slots) == [_FROST], "the manifest assigns this engine its id"
+    assert row.slots[_FROST].slot == 0
 
 
 @_GPU

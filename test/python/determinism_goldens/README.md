@@ -4,6 +4,35 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### BF16 RL matmul (2026-11-23)
+
+On 2026-11-24, all 27 cases in the [RL test suite](../rl/README.md) passed on
+SM100, including 6 plan-selection cases and 14 FlashInfer integration cases.
+On SM100 (68 SMs), the [RL matmul tests](../rl/test_rl_matmul_determinism.py) compared output
+bytes across repeated launches, row counts, row permutations and duplicates,
+and compact B layouts. It covered K16 tail padding and fixed split-K with a
+column bias. The two [RL baseline files](../rl/goldens/aa6120c0182e69f6) also match an
+independent FP64 reference rounded to BF16 on inputs with exact dyadic values.
+The backward compatibility case uses the RL forward output to form `dY`. On
+SM100, native cuDNN matmul plans computed `dX` and `dW` (`eng0_k24=0`) and
+a native ADD reduction computed `dBias` (`eng3_k2=0`). All three gradients
+passed their FP64 reference checks, including with FROST engines enabled.
+
+Run from `test/python` with the SM100 device selected:
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+    python -m pytest -n0 -m L0 -q rl/test_rl_matmul_determinism.py
+```
+
+The seven cases passed on the RL changes based on `2b98a25d`, with cuDNN
+9.29.0, CuTe DSL 4.8.1, PyTorch 2.15.0+cu132 and TVM-FFI 0.1.15.post2.
+The 2048 × 2048 × 2048 pipeline case ran in 256 blocks with four blocks per
+cluster and three refills per stage. All 3,000 warm launches and 3,000
+shared-memory-poisoned launches matched the independent reference bitwise.
+The unsafe control produced a mismatch in all 200 launches. SM103 and SM107
+remain unverified.
+
 ### MoeEp.training_wgrad: replay, expert invariance and warm stress (2026-11-23)
 
 `MoeEp.training_wgrad` runs the vendored Rubin WGrad kernel. Each output tile is reduced by one CTA over its expert's

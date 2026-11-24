@@ -111,7 +111,12 @@ class FrostGemmEngine(BaseEngine):
 def FrostGemmEngines(ids):
     """The gemm engines the manifest asked for, with the ids it assigned."""
     out = []
-    for cls in (FrostGemmEngine,):
+    classes = [FrostGemmEngine]
+    if "rl_gemm" in ids:
+        from ..rl.engine import RlGemmEngine
+
+        classes.append(RlGemmEngine)
+    for cls in classes:
         if cls.name in ids:
             engine = cls()
             engine.engine_id = ids[cls.name]

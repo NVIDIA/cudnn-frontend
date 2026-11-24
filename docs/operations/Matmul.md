@@ -37,3 +37,41 @@ set_compute_data_type(DataType_t value)
     - B
     - name
     - compute_data_type
+
+### Batch-invariant BF16 forward for reinforcement learning
+
+The Python graph API offers the `rl_gemm` engine on SM100, SM103 and SM107.
+Request it with the `RL` numerical note on both the rollout and training forward graphs.
+
+```python
+g = cudnn.pygraph(
+    io_data_type=cudnn.data_type.BFLOAT16,
+    intermediate_data_type=cudnn.data_type.FLOAT,
+    compute_data_type=cudnn.data_type.FLOAT,
+)
+a = g.tensor(dim=[1, m, k], stride=[m * k, k, 1], data_type=cudnn.data_type.BFLOAT16)
+b = g.tensor(dim=[1, k, n], stride=[n * k, 1, k], data_type=cudnn.data_type.BFLOAT16)
+y = g.matmul(A=a, B=b)
+y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+g.select_numeric_notes([cudnn.numerical_note.RL])
+g.build()
+```
+
+On the same architecture and software stack, a row with identical inputs, weights
+and bias follows the same K16 FP32 accumulation order at any batch size or row
+position. The weight shape fixes the number and order of K chunks. To include
+a BF16 column bias, keep the matmul intermediate in FP32 and use `g.add` with
+FP32 compute before the BF16 output conversion.
+
+The engine accepts rank-2 matrices or rank-3 matrices with a singleton batch
+dimension, positive M, and positive K and N divisible by eight. A has row-major
+layout with a leading dimension divisible by eight. B is compact row-major or
+column-major. Output is contiguous row-major and the operand pointers require
+16-byte alignment. Build a graph for each distinct shape. Allocate
+`g.get_workspace_size()` bytes of scratch for execution, with separate scratch
+for concurrent launches. Requesting the note on an unsupported graph raises
+`cudnnGraphNotSupportedError`. For a linear layer `Y = X @ W.T + bias`, training
+can use native cuDNN matmul plans to compute `dX = dY @ W` and `dW = dY.T @ X`,
+and an FP32 sum over the rows of `dY` for the bias gradient. The backward graphs
+use the saved input and weight and do not require the RL note.
+See the [determinism support matrix](https://docs.nvidia.com/cudnn/operations/determinism).
