@@ -40,7 +40,9 @@ def _check_own_family(tmpl) -> None:
 
 
 def _as_custream(stream):
-    return _cuda.CUstream(stream or 0)
+    from cudnn.engines.base import require_stream
+
+    return _cuda.CUstream(require_stream(stream, "frost_gemm"))
 
 
 from ..dtypes import (

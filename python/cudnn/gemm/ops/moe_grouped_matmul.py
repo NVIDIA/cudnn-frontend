@@ -18,12 +18,14 @@ Graph caching ensures cuDNN graphs are built once per unique configuration
 and reused across calls.
 """
 
+import atexit
 import logging
 from typing import Optional, Dict
 from enum import IntEnum
 
 import torch
 import cudnn
+from cudnn._handle import ThreadHandlePool
 
 _logger = logging.getLogger(__name__)
 
@@ -31,7 +33,7 @@ _logger = logging.getLogger(__name__)
 # Module-level state
 # ---------------------------------------------------------------------------
 
-_cudnn_handles = {}
+_handles = ThreadHandlePool()  # graphs in _graph_cache keep the handle they were built with
 _graph_cache: Dict[tuple, tuple] = {}
 
 # Dtype mapping (module-level constant)
@@ -83,12 +85,27 @@ class _UIDs(IntEnum):
 
 
 def _get_handle(device: torch.device):
-    """Return a lazily-initialised cuDNN handle with the current CUDA stream."""
-    if device not in _cudnn_handles:
-        _cudnn_handles[device] = cudnn.create_handle()
-    stream = torch.cuda.current_stream(device).cuda_stream
-    cudnn.set_stream(handle=_cudnn_handles[device], stream=stream)
-    return _cudnn_handles[device]
+    """Return this thread's cuDNN handle for ``device`` on the current stream."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+
+    def create():
+        with torch.cuda.device(index):
+            return cudnn.create_handle()
+
+    handle = _handles.get(index, create)
+    cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(index).cuda_stream)
+    return handle
+
+
+def _destroy_handles() -> None:
+    for handle in _handles.clear():
+        try:
+            cudnn.destroy_handle(handle)
+        except Exception:  # noqa: BLE001 -- CUDA may already be torn down at exit
+            pass
+
+
+atexit.register(_destroy_handles)
 
 
 def _torch_dtype_to_cudnn(dtype: torch.dtype):

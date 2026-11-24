@@ -8,7 +8,6 @@ from __future__ import annotations
 import cudnn
 from cudnn.engines.base import BaseEngine
 from cudnn.frost import buffers
-from cudnn.frost.device import build_device
 
 from ..graph_analyzer import analyze
 
@@ -90,7 +89,4 @@ class GdnCakeDetEngine(BaseEngine):
         from ..frost.engine import FrostLaPlan
         from .gdn_plan import GdnCakePlan
 
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            return FrostLaPlan(GdnCakePlan(graph._facts_for(analyze), next(iter(graph.nodes))))
+        return FrostLaPlan(GdnCakePlan(graph._facts_for(analyze), next(iter(graph.nodes))))

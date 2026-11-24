@@ -21,7 +21,10 @@ copy of that weight only where another block of the run's plans reads one.  An a
 layout of its own also says how the layout is made (``stored_layout(merged)``, its entry's own load-time helper): the
 loader then keeps the weight in that layout and in no other stored form.  An adapter to an entry of a step that feeds
 several tokens per sequence takes the step's slot table where the decode step's adapter takes slot ids
-(``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).
+(``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).  An adapter whose
+entry reads or writes the attention cache as a pool of pages says so (``cache_page``): the session then builds its state
+in that layout, and the adapter takes the pool's two halves and the rows of the state's tables from the cache it is handed
+(``state.PagedKvCache.at``), never from the position.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from ..census import Kernel
 ENTRY_NAMES: Dict[str, str] = {
     "fe.gdn_decode_fused": "cudnn.GdnDecodeFused",
     "fe.gdn_verify_fused": "cudnn.GdnVerifyFused",
+    "fe.attention_prepare_decode": "cudnn.AttentionPrepareDecode",
     "fe.attention_gate_quant_decode": "cudnn.AttentionGateQuantDecode",
     "fe.add_norm_quant_decode": "cudnn.AddNormQuantDecode",
     "fe.fp8_projection_decode": "cudnn.Fp8ProjectionDecode",
@@ -214,6 +218,7 @@ def factories() -> Dict[str, Callable]:
     return {
         "fe.gdn_decode_fused": fe.GdnDecodeFusedBlock,
         "fe.gdn_verify_fused": fe.GdnVerifyFusedBlock,
+        "fe.attention_prepare_decode": fe.AttentionPrepareDecodeBlock,
         "fe.attention_gate_quant_decode": fe.AttentionGateQuantDecodeBlock,
         "fe.add_norm_quant_decode": fe.AddNormQuantDecodeBlock,
         "fe.fp8_projection_decode": fe.Fp8ProjectionDecodeBlock,

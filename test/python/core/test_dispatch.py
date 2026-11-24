@@ -424,7 +424,7 @@ def test_indexed_execution_keeps_each_callers_plan(monkeypatch):
     first_entered, second_entered, first_finished = (threading.Event() for _ in range(3))
     local = threading.local()
 
-    def stream(handle):
+    def stream(handle, device=None):
         if local.first:
             first_entered.set()
             assert second_entered.wait(10)

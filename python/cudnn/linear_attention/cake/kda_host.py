@@ -30,6 +30,7 @@ from array import array
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
+from cudnn.engines.base import require_stream
 from cudnn.frost.device import compute_capability, current_device, device_context, multiprocessor_count, shared_memory_per_block_optin
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 
@@ -396,7 +397,7 @@ class CompiledCakeKda(_CakeKda):
         self.index_state_checkpoints = pos["state_checkpoints"]
 
     def run(self, views, workspace, stream) -> None:
-        stream = int(stream) if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
         with device_context(self.device):
             self._prepare(stream, views, self.names)
             q, k, v, g, beta = (views[i] for i in (self.index_q, self.index_k, self.index_v, self.index_g, self.index_beta))
@@ -492,7 +493,7 @@ class CompiledCakeKdaBwd(_CakeKda):
         self.index_d_dt_bias = pos["d_dt_bias"]
 
     def run(self, views, workspace, stream) -> None:
-        stream = int(stream) if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
         with device_context(self.device):
             self._prepare(stream, views, self.names)
             q, k, v, g, beta = (views[i] for i in (self.index_q, self.index_k, self.index_v, self.index_g, self.index_beta))
