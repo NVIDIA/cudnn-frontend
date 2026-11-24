@@ -1491,6 +1491,14 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "q1", "paged", "window", False, "gqa", True): Entry(
         "le", 10.661, "sm80_paged_window_decode_pcie_20261118", "rows"
     ),
+    # study sm80_paged_d192x192_swa_pcie_20261124 (A100 80GB PCIe 300 W): padded-Q paged d192 x 192 window single-row decode without a
+    # sink leads up to 2^4.792 parallel tiles on the tile and 2^7.161 query rows off it. Windowed d192 x 192 prefill has no entry.
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa", False): Entry(
+        "le", 4.792, "sm80_paged_d192x192_swa_pcie_20261124", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 192), "q1", "paged", "window", False, "gqa", True): Entry(
+        "le", 7.161, "sm80_paged_d192x192_swa_pcie_20261124", "rows"
+    ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "mtp", "paged", "window", False, "gqa", True): Entry("ge", 0.5, "sm80_gen_gaps_20261117", "tiles"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", False): Entry("ge", 22.292, "sm80_gen_gaps_20261117"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "verify", "paged", "window", False, "gqa", True): Entry(
