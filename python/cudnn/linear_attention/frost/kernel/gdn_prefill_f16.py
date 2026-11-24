@@ -588,10 +588,12 @@ def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, n
     itself (every row of the levelled table comes by the ticket), and the warp holds a row that continues a cut tile
     back (``level_hold``) between its own read of the ticket and the arrive that releases the consumers; the wait's zero
     goes into the row the warp returns AND into the slot, which the elected lane writes once more in front of that
-    arrive -- one published row, formed from the acquire load, for the load warp and for the consumers.  The arrive is
-    delayed, never skipped; a ticket at or past ``total_tiles`` names no row and reads no order entry.  A test build
-    without the order (``LEVEL_UNORDERED``): the elected lane arrives right behind its store of the slot and the warp
-    reads the slot behind that arrive -- no load of the slot is live across the arrive that hands it to the consumers."""
+    arrive -- one published row, formed from the acquire load, for the load warp and for the consumers.  Every lane of
+    the warp has loaded the slot by then, so the warp synchronises in front of that second store as it does behind the
+    first: no lane's load of the slot is left unordered against a store to it.  The arrive is delayed, never skipped; a
+    ticket at or past ``total_tiles`` names no row and reads no order entry.  A test build without the order
+    (``LEVEL_UNORDERED``): the elected lane arrives right behind its store of the slot and the warp reads the slot behind
+    that arrive -- no load of the slot is live across the arrive that hands it to the consumers."""
     bars.mb_scheduler_done[scheduler_state.idx].wait(scheduler_state.phase)
     if elect_one:
         fetched = cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu"))
@@ -605,6 +607,8 @@ def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, n
         if next_tile < total_tiles:
             hold = level_hold(cfg, next_tile, mLevelOrder, mScheduler)
         next_tile = next_tile + hold
+        # The lanes' loads of the slot above, the elected lane's second store below: the warp synchronises between them.
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         if elect_one:
             sScheduler[scheduler_state.idx] = next_tile
             bars.mb_scheduler_ready[scheduler_state.idx].arrive()
