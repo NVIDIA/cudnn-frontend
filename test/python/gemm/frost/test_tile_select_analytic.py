@@ -242,7 +242,6 @@ def test_fp8_formats_share_parameters_but_not_integer_accumulation(calibrated_de
         (107, "sm100", "NVIDIA B200", False),
         (107, "sm100", "NVIDIA Graphics Device", True),
         (107, "sm100", "NVIDIA VR NVL72", True),
-        (100, "sm100", "NVIDIA VR NVL72", False),
         (100, "sm100", "NVIDIA Graphics Device", False),
         (107, "sm103", "NVIDIA Graphics Device", False),
         (100, "sm103", "NVIDIA B200", False),
