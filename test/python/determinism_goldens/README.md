@@ -1025,6 +1025,7 @@ pytest core/test_determinism_utils.py
 | --- | --- | --- | --- |
 | `conv/cutedsl/test_conv3d_postops_determinism.py` | Conv3D raw, norm/SiLU, prepared norm/SiLU, residual/spatial pad, C12 causal input, standalone norm/SiLU preparation | Output, cache, residual, padding and exposed workspace bytes | Unsupported (inference only) |
 | `gemm/cutedsl/test_grouped_gemm_wgrad_empty.py` | `grouped_gemm_wgrad_wrapper_sm100`, cold-empty compilation | — | exact-zero overwrite and unchanged accumulated dW bytes; nonempty reuse, mixed empty experts and CUDA Graph replay |
+| `gemm/cutedsl/test_grouped_gemm_dglu_activation.py` | `grouped_gemm_dglu_wrapper_sm100` and `GroupedGemmDgluSm100`, `activation_tensor` with `dgeglu` and `dswiglu` | — | activation and D_row: replay under concurrent work, expert reorder, duplicate and neighbor isolation; dSwiGLU activation byte-equal to the BF16 GLU forward D; dprob numerical only |
 | `gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py` | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | saved C, D in both directions, both scale planes | — |
 | `gemm/cutedsl/test_grouped_gemm_dglu_gate_then_up.py` | `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | — | D in both directions, both scale planes, dprob; dbias numerical reference |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_layout.py` | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | C, D, pre/post-RHT amax | — |
@@ -2791,6 +2792,47 @@ CUDNN_TEST_TIMEOUT=1800 CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -q -s \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_forward.py \
   -k "prepared_plan or sm90_compressed or api_is_split_from_top_k"
 ```
+
+### Grouped dGLU recomputed activation for dSwiGLU — SM100, 2026-11-23 UTC
+
+`test_grouped_gemm_dglu_activation.py` now runs every existing recomputed
+activation case for both `dgeglu` and `dswiglu`. New L0 cases check the
+following:
+
+- The dSwiGLU activation is byte-equal to the BF16 GLU forward `D` when the
+  saved C holds the forward's FP32 pre-activation. One power-of-two entry per
+  A row and power-of-two alpha and beta make that exact. The check covers
+  both `vector_f32` modes, both `glu_layout` values, dense and discrete
+  weights, an empty expert and capacity past the final offset.
+- The activation and `D_row` replay byte for byte under concurrent work. The
+  shape is 128 tiles, enough to cross the persistent schedule.
+- Those outputs are unchanged by expert reorder, duplication and a changed
+  neighbor expert, and the inputs are not mutated.
+- JAX inputs are rejected for the class, the dense wrapper and the discrete
+  wrapper.
+
+Each case keeps an independent Torch reference. dprob accumulates with float
+atomics across N tiles, so it is checked numerically and not byte-compared.
+No golden files were added. The forward byte equality is a cross-kernel
+reference that does not depend on the runtime.
+
+Run from `test/python` with the modified checkout imported:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_dglu_activation.py -m L0 -q -rs
+```
+
+Measured on NVIDIA GB200 SM100 (148 SMs), driver 595.71.05, Torch
+`2.14.1+cu130`, CuTe DSL 4.8.0 with its CUDA 13.4 compiler, TVM FFI 0.1.16
+and JAX 0.9.1 (CPU, for the host-only rejections). The frontend 1.34.0
+source was imported over a stubbed compiled extension. All 66 cases ran:
+64 passed and 2 failed. The two failures are both
+`test_dglu_activation_caller_workspace_and_first_capture` cases. A
+`DeviceView` workspace needs the compiled extension's DLPack export, which
+the stub does not provide, and the same two cases fail identically on the
+unmodified source. A mutated kernel that multiplies `up * prob` before the
+SiLU product fails the forward byte-equality cases. SM103 and SM107 remain
+unverified; SM90 is unsupported.
 
 ### Canonical grouped GLU branch storage — SM100, 2026-11-10 UTC
 
