@@ -1658,6 +1658,7 @@ class FlashAttentionDSABackwardSm100H16:
 
             # Gemm dKV4 = Q^T[512:575] @ dS. Its TMEM region previously
             # held S/dP and is free after compute_mma_dS consumer_wait.
+            mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
             dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1669,7 +1670,7 @@ class FlashAttentionDSABackwardSm100H16:
                 )
                 dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-            # Commit dKV4 on pipeline (no acquire needed) to notify consumer
+            # Publish dKV4 to the reduce warps
             mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
             mma_reduce_dKV_producer_state.advance()
 
