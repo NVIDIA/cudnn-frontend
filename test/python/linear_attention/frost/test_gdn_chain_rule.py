@@ -33,7 +33,7 @@ from cudnn.linear_attention.frost.common.piece_chain import (
 from cudnn.linear_attention.frost.common.tail import choose_tail
 from determinism_utils import assert_bitwise, snapshot
 from linear_attention import test_la as la
-from linear_attention.determinism import check_reference, pack, sequences
+from linear_attention.determinism import check_reference, pack, sequences, split
 from test_gdn_value_width_split import CHUNK, KEY_HEADS, SM_COUNTS, SUB_TOKENS, VALUE_HEADS, WIDTH, build_plan, one_row, plan_scheme
 
 SLOTS = range(CHAIN_MIN_PIECES, CHAIN_MAX_PIECES + 1)
@@ -373,16 +373,20 @@ def test_batch_invariant_bytes_do_not_follow_the_batch_across_the_chain_rule(fro
 @pytest.mark.L0
 def test_batch_without_the_chain_group_writes_the_bytes_it_writes_with_it(frost_engine, monkeypatch):
     """A dense batch above the tokens from which the shared rule carries the chain group, at a size at which this GPU's
-    forward does not: output and final state match the fp64 recurrence and are bit for bit those of the same call with the
-    group carried, whose five launches find no work."""
+    forward does not: output and final state are bit for bit those of the same call with the group carried, whose five
+    launches find no work, and the first and the last sequence match the fp64 recurrence (the recurrence of the whole batch
+    on the host outlasts a test's time budget)."""
     num_sm, tokens = la.sm_count(), CHAIN_MIN_MEAN_TOKENS // 2
     heads = dict(heads=KEY_HEADS, value_heads=VALUE_HEADS)
     count = next((n for n in range(2, 16 * CHAIN_MIN_PIECES) if piece_chain.ragged_pieces(heads_out=VALUE_HEADS, num_sm=num_sm, total_tokens=n * tokens)), None)
     if count is None or group_scheme(num_sm, [tokens] * count, **heads):
         pytest.skip(f"a batch of {tokens}-token sequences carries the chain group at every size on {num_sm} SMs")
-    inputs = pack(sequences("gdn", (tokens,) * count, heads=KEY_HEADS, value_heads=VALUE_HEADS, key_dim=WIDTH, value_dim=WIDTH))
+    samples = sequences("gdn", (tokens,) * count, heads=KEY_HEADS, value_heads=VALUE_HEADS, key_dim=WIDTH, value_dim=WIDTH)
+    inputs = pack(samples)
     without = run_forward(inputs, in_place=True)
-    check_reference("gdn", inputs, without, False)
+    pieces = split("gdn", without, samples)
+    for index in (0, count - 1):
+        check_reference("gdn", pack(samples[index : index + 1]), pieces[index], False)
     la.clear_caches()
     monkeypatch.setattr(piece_chain, "CHAIN_GROUP_TILE_TOKENS", 0)
     assert group_scheme(num_sm, [tokens] * count, **heads)
