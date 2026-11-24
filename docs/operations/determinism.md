@@ -124,6 +124,8 @@ arbitrary user callbacks.
 | `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Replay only (H32); H64 unverified | Supported | Supported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Replay only (H32); H64 unverified | Replay only | Replay only |
+| `cudnn.ops.dsa.indexer_backward_jax(clip_log=False)` | bprop | BF16 Q/K/weights; FP32 dK | Unverified | Small-case replay verified; general replay and batch invariance unverified | Unverified |
+| `indexer_backward_jax` (packed THD) | bprop | BF16 Q/K/weights and dQ/dWeights; FP32 dK | Unsupported | Small-case dQ/dWeights byte replay verified; general replay/batch invariance unverified; atomic dK has no bitwise guarantee | Unsupported |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
 | `block_sparse_attention_forward` (blk64, `sparse_block_size=64`) | fprop | BF16 | Supported | Supported (cc 10.3 verified; cc 10.0 unverified) | Unverified |
 | `block_sparse_attention_forward` (blk64, `sparse_block_size=64`) | fprop | FP16 | Supported | Unsupported (the SM100/SM103 blk64 forward serves BF16 only) | Unverified |

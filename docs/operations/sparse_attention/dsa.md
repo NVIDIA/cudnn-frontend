@@ -110,10 +110,24 @@ are separate calls; the caller owns the VJP. Each has a PyTorch counterpart in
 | --- | --- | --- |
 | `indexer_forward_jax` | `indexer_forward` (`DSA.indexer_forward_wrapper`) | BF16 `q (B, S_q, 64, 128)`, `k (B, S_k, 1, 128)`, `weights (B, S_q, 64)`; `ratio=4`; `S_k` a multiple of 4. Packed THD: `q (T_q, 64, 128)`, `k (T_k, 1, 128)`, `weights (T_q, 64)` with int32 `cu_seqlens_q` / `cu_seqlens_k` and static `max_seqlen_q` / `max_seqlen_k`; scores are `(T_q, ceil4(max_seqlen_k))`, indexed by sequence-local key position. Returns FP32 ratio-causal scores, plus the row LSE with `return_lse=True` |
 | `top_k_forward_jax` | `top_k_forward` (`DSA.indexer_top_k_wrapper`) | `scores (n_rows, num_cols)` FP32/FP16/BF16, int32 `seq_lens (n_rows,)`; `top_k <= 2048`. Returns unsorted int32 column ids, `-1`-padded |
-| `indexer_backward_jax` | `indexer_backward` (`DSA.indexer_backward_wrapper`) | Top-k KL indexer loss backward; `topk=512` only. `d_k` is FP32 |
+| `indexer_backward_jax` | `indexer_backward` (`DSA.indexer_backward_wrapper`) | Top-k KL indexer loss backward; `topk=512` only. BSHD or packed THD with the same prefix/max-length kwargs as `indexer_forward_jax`; THD selected arrays are `(T_q, 512)` with segment-local IDs. Returns `(d_q, d_weights, d_k)` in BF16/BF16/FP32; THD `d_k` is `(T_k, 128)`. Raw averaging uses physical Q capacity (`B*S_q` or `T_q`). `clip_log=False` preserves stable KL gradients and caller teacher mass; default `True` retains clipped logs |
 | `dense_indexer_backward_jax` | `dense_indexer_backward` (`DSA.dense_indexer_backward_wrapper`) | Dense KL indexer loss backward from `indexer_forward_jax(..., return_lse=True)`. `d_k` is FP32 |
 | `sparse_attention_forward_jax` | `sparse_attention_forward` (`DSA.sparse_attention_forward_wrapper`) | BF16 `q (T_q, 64, 512)`, `kv (T_kv, 512)`; int32 global indices `(T_q, K)` with `K` a multiple of 64 |
 | `sparse_attention_backward_jax` | `sparse_attention_backward` (`DSA.sparse_attention_backward_wrapper`) | Gradients of `q`, `kv` and the FP32 attention sinks |
+
+For THD sparse indexer backward, prefixes must start at zero, be nondecreasing,
+end within physical token capacity, and have segment lengths covered by the
+positive static maxima. Empty segments and repeated terminal prefixes are
+supported. Invalid IDs (negative or outside their segment's K length) are
+ignored, with teacher/student slots zeroed before score-gradient reduction.
+Q/K/weight capacity beyond terminal prefixes and all-invalid rows receive zero
+gradients, including poisoned unused storage. Active operands must be finite;
+selected IDs must be unique per row. Causal selection remains caller-owned.
+The wrapper uses sparse device prefix lookup plus one packed native backward
+pipeline; it does not pad sequences to a dense batch. Multiply `grad_loss` by
+`T_q` to cancel raw averaging for a summed THD loss. FP32 dK atomics have no
+bitwise determinism guarantee in this JAX entry point.
+
 
 ### DSA Namespace
 

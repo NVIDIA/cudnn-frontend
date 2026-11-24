@@ -136,15 +136,19 @@ def test_dense_indexer_backward_jax_matches_reference():
     assert_close_gradients(got, (expected[0], expected[2], expected[1][:, :, 0]))
 
 
-def test_indexer_backward_jax_matches_reference_and_keeps_inputs():
-    batch, seqlen_q, seqlen_k, topk, sm_scale = 1, 128, 1024, 512, 128**-0.5
+@pytest.mark.parametrize("batch,clip_log,seqlen_q", [(1, True, 128), (1, False, 32), (2, False, 32)])
+def test_indexer_backward_jax_matches_reference_and_keeps_inputs(batch, clip_log, seqlen_q):
+    seqlen_k, topk = 1024, 512
+    sm_scale = 128**-0.5 if clip_log else 0.17
     key = jax.random.key(8)
     q = jax.random.normal(key, (batch, seqlen_q, 64, 128), jnp.bfloat16)
     k = jax.random.normal(jax.random.fold_in(key, 1), (batch, seqlen_k, 1, 128), jnp.bfloat16)
     weights = jax.random.normal(jax.random.fold_in(key, 2), (batch, seqlen_q, 64), jnp.bfloat16)
-    indices = jax.vmap(lambda r: jax.random.permutation(r, seqlen_k)[:topk])(jax.random.split(jax.random.fold_in(key, 3), seqlen_q))
-    valid = jnp.arange(topk)[None, None] < jnp.arange(1, seqlen_q + 1)[None, :, None] * 4
-    indices = jnp.where(valid, indices[None], -1).astype(jnp.int32)
+    indices = jax.vmap(lambda r: jax.random.permutation(r, seqlen_k)[:topk])(jax.random.split(jax.random.fold_in(key, 3), batch * seqlen_q)).reshape(
+        batch, seqlen_q, topk
+    )
+    valid = jnp.arange(topk)[None, None] < jnp.arange(seqlen_q)[None, :, None] * 4
+    indices = jnp.where(valid, indices, -1).astype(jnp.int32)
     grad_loss = jnp.array([0.5], jnp.float32)
 
     def selected_scores(x, y, w):
@@ -155,14 +159,141 @@ def test_indexer_backward_jax_matches_reference_and_keeps_inputs():
     scores, vjp = jax.vjp(selected_scores, q, k, weights)
     index_score = jnp.where(valid, jax.nn.softmax(jnp.where(valid, scores, -jnp.inf), axis=-1), 0.0)
     attn_score = jnp.where(valid, jax.nn.softmax(jax.random.normal(jax.random.fold_in(key, 4), scores.shape), axis=-1), 0.0)
-    attn_score = attn_score / attn_score.sum(-1, keepdims=True)
+    attn_score = attn_score / jnp.maximum(attn_score.sum(-1, keepdims=True), 1e-8) * 0.7
     attn_score_before = np.asarray(attn_score)
 
-    got = dsa.indexer_backward_jax(q, k, weights, attn_score, index_score, indices, grad_loss, sm_scale=sm_scale)
+    got = jax.jit(lambda *xs: dsa.indexer_backward_jax(*xs, sm_scale=sm_scale, clip_log=clip_log))(q, k, weights, attn_score, index_score, indices, grad_loss)
 
     np.testing.assert_array_equal(np.asarray(attn_score), attn_score_before)
-    expected = vjp(kl_score_gradient(attn_score, index_score, valid, grad_loss[0] / (batch * seqlen_q)))
+    if clip_log:
+        score_grad = kl_score_gradient(attn_score, index_score, valid, grad_loss[0] / (batch * seqlen_q))
+    else:
+        score_grad = (index_score * attn_score.sum(-1, keepdims=True) - attn_score) * grad_loss[0] / (batch * seqlen_q)
+    expected = vjp(score_grad)
     assert_close_gradients(got, (expected[0], expected[2], expected[1][:, :, 0]))
+
+
+@pytest.mark.parametrize(
+    "q_lengths,k_lengths",
+    [((3, 0, 5, 2, 0), (2, 3, 4, 0, 0)), ((17, 0, 33, 2), (5, 0, 9, 0)), ((0, 0), (0, 0))],
+)
+@pytest.mark.parametrize("clip_log", [False, True])
+def test_indexer_backward_jax_thd_matches_independent_kl(q_lengths, k_lengths, clip_log):
+    # The oracle computes selected logits directly in JAX; no native indexer forward is involved.
+    cu_q_np = np.cumsum((0,) + q_lengths, dtype=np.int32)
+    cu_k_np = np.cumsum((0,) + k_lengths, dtype=np.int32)
+    tq, tk, scale, upstream = int(cu_q_np[-1]) + 3, int(cu_k_np[-1]) + 2, 0.13, 0.7
+    cu_q, cu_k = jnp.asarray(cu_q_np), jnp.asarray(cu_k_np)
+    key = jax.random.key(21)
+    q = jax.random.normal(key, (tq, 64, 128), jnp.bfloat16).at[cu_q_np[-1] :].set(jnp.nan)
+    k = jax.random.normal(jax.random.fold_in(key, 1), (tk, 1, 128), jnp.bfloat16).at[cu_k_np[-1] :].set(jnp.nan)
+    weights = (jax.random.normal(jax.random.fold_in(key, 2), (tq, 64), jnp.bfloat16) * 0.125).at[cu_q_np[-1] :].set(jnp.nan)
+    ids_np = np.full((tq, 512), -1, np.int32)
+    for b, (nq, nk) in enumerate(zip(q_lengths, k_lengths)):
+        for row in range(int(cu_q_np[b]), int(cu_q_np[b + 1])):
+            # First row stays all-invalid; final slot is positive but outside this segment.
+            if row != cu_q_np[b]:
+                ids_np[row, :nk] = np.arange(nk, dtype=np.int32)[::-1]
+            ids_np[row, -1] = nk
+    # Capacity rows carry apparently valid IDs and poisoned probabilities; prefixes must override them.
+    ids_np[cu_q_np[-1] :, 0] = 0
+    ids = jnp.asarray(ids_np)
+    target_raw = jax.random.uniform(jax.random.fold_in(key, 3), (tq, 512)) + 0.1
+    target = jnp.full((tq, 512), jnp.nan, jnp.float32)
+    predict = jnp.full((tq, 512), jnp.nan, jnp.float32)
+
+    def local_logits(x, y, w, b):
+        qs, qe, ks, ke = int(cu_q_np[b]), int(cu_q_np[b + 1]), int(cu_k_np[b]), int(cu_k_np[b + 1])
+        local_ids = ids[qs:qe]
+        valid = (local_ids >= 0) & (local_ids < ke - ks)
+        active = jnp.any(valid, -1)
+        x = jnp.where(active[:, None, None], x[qs:qe], 0).astype(jnp.float32)
+        w = jnp.where(active[:, None], w[qs:qe], 0).astype(jnp.float32)
+        gathered = y[ks:ke, 0][jnp.clip(local_ids, 0, ke - ks - 1)].astype(jnp.float32)
+        logits = jnp.einsum("qht,qh->qt", jax.nn.relu(jnp.einsum("qhd,qtd->qht", x, gathered)), w * scale)
+        finite_logits = jnp.where(active[:, None], jnp.where(valid, logits, -jnp.inf), 0)
+        return finite_logits, valid, active
+
+    for b, (nq, nk) in enumerate(zip(q_lengths, k_lengths)):
+        if nq == 0 or nk == 0:
+            continue
+        qs, qe = int(cu_q_np[b]), int(cu_q_np[b + 1])
+        logits, valid, active = local_logits(q, k, weights, b)
+        mass = jnp.where(jnp.arange(nq) % 2, 0.37, 1.4)[:, None]
+        t = jnp.where(valid, target_raw[qs:qe], 0)
+        t = t / jnp.maximum(t.sum(-1, keepdims=True), 1e-8) * mass
+        target = target.at[qs:qe].set(jnp.where(valid, t, jnp.nan))
+        predict = predict.at[qs:qe].set(jnp.where(valid & active[:, None], jax.nn.softmax(logits), jnp.nan))
+
+    def reference_loss(x, y, w):
+        result = jnp.zeros((), jnp.float32)
+        for b, (nq, nk) in enumerate(zip(q_lengths, k_lengths)):
+            if nq == 0 or nk == 0:
+                continue
+            qs, qe = int(cu_q_np[b]), int(cu_q_np[b + 1])
+            logits, valid, _ = local_logits(x, y, w, b)
+            t = jnp.where(valid, target[qs:qe], 0)
+            if clip_log:
+                # Matches the default clipped-log objective, independently differentiated.
+                p = jnp.where(valid, jax.nn.softmax(logits), 1.0)
+                term = -jnp.maximum(t, math.exp(-100)) * jnp.log(jnp.maximum(p, math.exp(-100)))
+            else:
+                term = -t * jnp.where(valid, jax.nn.log_softmax(logits), 0.0)
+            result += jnp.where(valid, term, 0).sum()
+        return result * (upstream / tq)
+
+    inputs = (q, k, weights, target, predict, ids, cu_q, cu_k)
+    before = [np.asarray(x).copy() for x in inputs]
+    backward = jax.jit(
+        lambda x, y, w, t, p, i, cq, ck: dsa.indexer_backward_jax(
+            x,
+            y,
+            w,
+            t,
+            p,
+            i,
+            jnp.asarray(upstream, jnp.float32),
+            sm_scale=scale,
+            clip_log=clip_log,
+            cu_seqlens_q=cq,
+            cu_seqlens_k=ck,
+            max_seqlen_q=max(max(q_lengths), 1),
+            max_seqlen_k=max(max(k_lengths), 1),
+        )
+    )
+    got = backward(*inputs)
+    dq_ref, dk_ref, dw_ref = jax.grad(reference_loss, argnums=(0, 1, 2))(q, k, weights)
+    expected = (dq_ref, dw_ref, dk_ref[:, 0])
+    assert [x.shape for x in got] == [q.shape, weights.shape, (tk, 128)]
+    assert [x.dtype for x in got] == [jnp.bfloat16, jnp.bfloat16, jnp.float32]
+    for actual, ref in zip(got, expected):
+        a, r = np.asarray(actual, np.float32), np.asarray(ref, np.float32)
+        assert np.isfinite(a).all()
+        if np.any(r):
+            assert_close_gradients((actual,), (ref,))
+        else:
+            np.testing.assert_array_equal(a, np.zeros_like(a))
+    for actual, original in zip(inputs, before):
+        # BF16 NaNs are deliberately retained; byte equality also checks their payloads.
+        np.testing.assert_array_equal(np.asarray(actual).view(np.uint8), original.view(np.uint8))
+    np.testing.assert_array_equal(np.asarray(got[0][cu_q_np[-1] :]), 0)
+    np.testing.assert_array_equal(np.asarray(got[1][cu_q_np[-1] :]), 0)
+    np.testing.assert_array_equal(np.asarray(got[2][cu_k_np[-1] :]), 0)
+    for b, (nq, nk) in enumerate(zip(q_lengths, k_lengths)):
+        if nq:
+            row = int(cu_q_np[b])
+            np.testing.assert_array_equal(np.asarray(got[0][row]), 0)
+            np.testing.assert_array_equal(np.asarray(got[1][row]), 0)
+        if nq and not nk:
+            np.testing.assert_array_equal(np.asarray(got[0][cu_q_np[b] : cu_q_np[b + 1]]), 0)
+        if not nq and nk:
+            np.testing.assert_array_equal(np.asarray(got[2][cu_k_np[b] : cu_k_np[b + 1]]), 0)
+
+    # dQ/dW have no cross-CTA reduction. FP32 dK uses atomics and has no bitwise replay guarantee.
+    replay = backward(*(jnp.array(x, copy=True) for x in inputs))
+    for first, second in zip(got[:2], replay[:2]):
+        np.testing.assert_array_equal(np.asarray(first).view(np.uint8), np.asarray(second).view(np.uint8))
+    np.testing.assert_allclose(np.asarray(replay[2]), np.asarray(got[2]), rtol=1e-5, atol=1e-6)
 
 
 def test_sparse_attention_jax_forward_and_backward():
@@ -194,3 +325,33 @@ def test_sparse_attention_jax_forward_and_backward():
     np.testing.assert_allclose(np.asarray(gradients[0], np.float32), np.asarray(reference_gradients[0], np.float32), atol=4e-2, rtol=2e-2)
     np.testing.assert_allclose(np.asarray(gradients[1], np.float32), np.asarray(reference_gradients[1], np.float32), atol=3e-3, rtol=2e-2)
     np.testing.assert_allclose(np.asarray(gradients[2]), np.asarray(reference_gradients[2]), atol=2e-5, rtol=2e-2)
+
+
+def test_indexer_backward_jax_unclipped_underflow_and_replay():
+    q = jnp.ones((1, 1, 64, 128), jnp.bfloat16)
+    k = jnp.broadcast_to(jnp.arange(1, 5, dtype=jnp.bfloat16)[None, :, None, None], (1, 4, 1, 128))
+    weights = jnp.ones((1, 1, 64), jnp.bfloat16)
+    ids = jnp.full((1, 1, 512), -1, jnp.int32).at[..., :2].set(jnp.array([0, 1], jnp.int32))
+    teacher = jnp.zeros((1, 1, 512), jnp.float32).at[..., :2].set(0.35)
+    # Stable softmax([-200, 0]) underflows the first probability but not its KL gradient.
+    probabilities = jnp.zeros_like(teacher).at[..., 1].set(1.0)
+    upstream = jnp.array([1.7], jnp.float32)
+    original = [np.asarray(x).copy() for x in (q, k, weights, teacher, probabilities, ids, upstream)]
+    native = jax.jit(lambda clip, *xs: dsa.indexer_backward_jax(*xs, sm_scale=0.25, clip_log=clip), static_argnums=0)
+    clipped = native(True, q, k, weights, teacher, probabilities, ids, upstream)
+    default = dsa.indexer_backward_jax(q, k, weights, teacher, probabilities, ids, upstream, sm_scale=0.25)
+    raw = native(False, q, k, weights, teacher, probabilities, ids, upstream)
+    replay = native(False, q, k, weights, teacher, probabilities, ids, upstream)
+    for x, y in zip(clipped, default):
+        np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
+    for x, y in zip(raw, replay):
+        np.testing.assert_array_equal(np.asarray(x).view(np.uint8), np.asarray(y).view(np.uint8))
+    score_grad = probabilities * teacher.sum(-1, keepdims=True) - teacher
+    _, vjp = jax.vjp(lambda x, y, w: indexer_scores(x, y[:, :, 0], w, 0.25), q, k, weights)
+    full_grad = jnp.zeros((1, 1, 4), jnp.float32).at[..., :2].set(score_grad[..., :2] * upstream[0])
+    expected = vjp(full_grad)
+    assert_close_gradients(raw, (expected[0], expected[2], expected[1][:, :, 0]))
+    assert float(jnp.max(jnp.abs(raw[0].astype(jnp.float32)))) > 0
+    assert float(jnp.max(jnp.abs(clipped[0].astype(jnp.float32)))) == 0
+    for before, after in zip(original, (q, k, weights, teacher, probabilities, ids, upstream)):
+        np.testing.assert_array_equal(before, np.asarray(after))
