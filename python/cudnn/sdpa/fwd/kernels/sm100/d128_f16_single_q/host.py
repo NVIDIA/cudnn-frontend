@@ -6,6 +6,8 @@
 from .contract import Geometry, small_geometry
 from ..half_flavor_contract import padded_shape
 
+PACKED_HN_STATS_OVERRIDE = True
+
 
 def lower(spec, facts, knobs, *, lower_impl, knob_type):
     knobs = knobs or knob_type()

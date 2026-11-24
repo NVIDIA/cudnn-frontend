@@ -281,6 +281,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         tiled_copy: cute.TiledCopy,
         enable_persistent_dynamic_scheduling: cutlass.Constexpr[bool] = False,
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
+        starts=None,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
         smem = SmemAllocator()
@@ -378,6 +379,9 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             if not cutlass.const_expr(self.merge_blocks):
                 seq_len = seqlen[bidx // self.next_n]
                 row_end = seq_len - self.next_n + (bidx % self.next_n) + 1
+                if cutlass.const_expr(starts is not None):
+                    row_start = starts[bidx]
+                    row_end = max(row_start, row_end)
                 length = row_end - row_start
 
             if cutlass.const_expr(self.enable_multi_cta):
@@ -558,6 +562,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         stream: cuda.CUstream,
         enable_persistent_dynamic_scheduling: cutlass.Constexpr[bool] = False,
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
+        starts=None,
     ):
         """Host function for the indexer topk kernel"""
         # now we don't support it.
@@ -565,6 +570,8 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             self.enable_multi_cta and enable_persistent_dynamic_scheduling
         ), "enable_multi_cta and enable_persistent_dynamic_scheduling cannot both be True"
 
+        if cutlass.const_expr(starts is not None):
+            assert not (self.enable_multi_cta or self.merge_blocks or enable_persistent_dynamic_scheduling)
         num_rows = input_values.shape[0]
         # each cta processes one row of input.
         if cutlass.const_expr(self.enable_dynamic_multi_cta):
@@ -592,6 +599,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             tiled_copy,
             enable_persistent_dynamic_scheduling,
             min_blocks_per_mp,
+            starts,
         ).launch(
             grid=blocks,
             block=(tiled_copy.size, 1, 1),
@@ -686,6 +694,7 @@ def compile_topk_kernel(
     tie_break=0,
     deterministic=False,
     deterministic_ordering="auto",
+    has_starts=False,
 ):
     """The compiled kernel for this plan-time key, from the module cache.
 
@@ -725,6 +734,7 @@ def compile_topk_kernel(
         tie_break,
         deterministic,
         deterministic_ordering,
+        has_starts,
     )
     if key not in _compile_cache:
         n_rows = cute.sym_int()
@@ -742,6 +752,7 @@ def compile_topk_kernel(
             (n_batch,),
             stride_order=(0,),
         )
+        starts_fake = cute.runtime.make_fake_compact_tensor(cute.Int32, (n_rows,), stride_order=(0,)) if has_starts else None
         output_indices_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
             (n_rows, top_k),
@@ -783,6 +794,7 @@ def compile_topk_kernel(
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
+            starts=starts_fake,
             # Qualify standalone Top-K on SM120 / SM121 without enabling unrelated
             # DSA kernels through the shared architecture/support map.
             options=compile_options(gpu_arch=_SM120_FAMILY_ARCH.get(tuple(torch.cuda.get_device_capability()))),
@@ -799,6 +811,7 @@ def launch_topk_kernel(
     out_values,
     buffer,
     next_n,
+    starts=None,
 ):
     """Launch on the TVM-FFI environment stream (torch's current stream).
 
@@ -819,6 +832,7 @@ def launch_topk_kernel(
             seq_lens,
             out_indices,
             out_values,
+            starts,
         )
         return
 
@@ -847,6 +861,7 @@ def launch_topk_kernel(
             seq_lens[batch_lo:batch_hi],
             out_indices[row_lo:row_hi],
             out_values[row_lo:row_hi] if out_values is not None else None,
+            starts[row_lo:row_hi] if starts is not None else None,
         )
 
 

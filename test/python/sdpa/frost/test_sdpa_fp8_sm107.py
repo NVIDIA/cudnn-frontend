@@ -97,6 +97,10 @@ class TestSparseDecodeForwardRegressions:
     test_sparse_dense_reference = staticmethod(_sparse.test_identity_vs_the_dense_kernel_below_the_bound)
     test_decode_qwen_token_tile = staticmethod(_decode.test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units)
     test_decode_independent_pool_layouts = staticmethod(_decode.test_paged_decode_independent_pool_layouts)
+    test_decode_wide_output_replay = staticmethod(_decode.test_decode_64_column_tile_wide_output_replays)
+    test_wide_tile_no_spill = staticmethod(_decode.test_sm107_decode_wide_tile_renderings_carry_no_spill)
+    test_column_groups = staticmethod(_decode.test_decode_kernel_four_column_groups)
+    test_source_twin = staticmethod(_decode.test_sm107_decode_body_matches_the_sm100_body)
 
 
 @requires_rubin

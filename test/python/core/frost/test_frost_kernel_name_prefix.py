@@ -18,6 +18,7 @@ _KERNEL_ROOTS = (
     _REPO_ROOT / "python" / "cudnn" / "engram",
     _REPO_ROOT / "python" / "cudnn" / "rope",
     _REPO_ROOT / "python" / "cudnn" / "row_quantize",
+    _REPO_ROOT / "python" / "cudnn" / "row_argmax",
 )
 
 
