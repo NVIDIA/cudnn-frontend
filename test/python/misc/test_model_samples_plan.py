@@ -2467,6 +2467,422 @@ def test_a_plan_says_whether_its_step_can_be_recorded():
     assert plan.recordable() == ""
 
 
+class _StandInGraph:
+    """What stands in for ``loop.LaunchGraph`` on the host: a launch sequence without a GPU.  ``record(body)`` runs the pass
+    and then takes back everything it did to the session's state and cursor -- a recorded pass launches and nothing
+    runs -- and ``replay()`` runs the same pass again with the cursor handed out, writes what it returns into the
+    tensors the first pass returned (a replay writes where the recorded pass allocated) and takes the host's side of
+    it back, which a replay never moves.  So a replay computes the step from the ids buffer and the cursor's rows, at
+    fixed addresses, as a recorded sequence does.  ``session`` is set by the test; ``refuse`` makes the next pass raise
+    behind its last launch; ``stated`` is what ``nodes()`` answers; every graph that was built is in ``built``."""
+
+    session = None
+    refuse = None
+    stated = None
+    built: list = []
+
+    @staticmethod
+    def serves(device) -> bool:
+        return True
+
+    def __init__(self, device):
+        self.device, self.body, self.out, self.replays, self.released = device, None, None, 0, False
+        type(self).built.append(self)
+
+    def record(self, body):
+        session = type(self).session
+        state, cursor = session.state, session.state.table.cursor
+        snap, rows = state.snapshot(), [t.clone() for t in (cursor.ids, cursor.positions, cursor.slots, cursor.lengths)]
+        try:
+            out = body()
+            if type(self).refuse is not None:
+                raise type(self).refuse
+        finally:  # the device's side alone: what the pass did on the host is the session's to put back
+            host = (state.position, state.hidden, state.greedy, state.verify_steps)
+            state.restore(snap)
+            state.position, state.hidden, state.greedy, state.verify_steps = host
+            for t, kept in zip((cursor.ids, cursor.positions, cursor.slots, cursor.lengths), rows):
+                t.copy_(kept)
+        self.body, self.out = body, tuple(torch.zeros_like(t) for t in out)  # what a recorded pass returns holds nothing yet
+        return self.out
+
+    def replay(self):
+        assert not self.released, "a released sequence is not replayed"
+        self.replays += 1  # the launch is issued, whatever the pass then does
+        session = type(self).session
+        state, cursor = session.state, session.state.table.cursor
+        position, hidden, greedy, calls = state.position, state.hidden, state.greedy, session._calls
+        cursor.on = True
+        try:
+            out = self.body()
+        finally:
+            cursor.on = False
+            state.position, state.hidden, state.greedy, session._calls, cursor.position = position, hidden, greedy, calls, position
+        for kept, new in zip(self.out, out):
+            kept.copy_(new)
+
+    def reset(self):
+        self.released = True
+
+    def nodes(self):
+        return type(self).stated
+
+
+@contextlib.contextmanager
+def _recording(monkeypatch, sequences=1, capacity=80, capture=True, **more):
+    """Inside: a session of the tiny model on the CPU whose step is recorded and replayed through ``_StandInGraph``: the
+    reference stack with every block said to be held by a recorded sequence, and an attention preparation that asks
+    for a paged cache with its tables and READS them the way an adapter to a kernel does -- the rows ``at`` and
+    ``attended`` hand out, held there against the position the step is at.  Yields ``(session, graph class)``; the
+    session is planned and loaded."""
+    import model_samples
+    from model_samples import loop, providers
+
+    class Graph(_StandInGraph):
+        built = []
+
+    monkeypatch.setattr(loop, "LaunchGraph", Graph)
+    monkeypatch.setattr(providers.BlockBase, "captures", True)
+    model = _paged_model()
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    session = model_samples.Session(model, text, sequences=sequences, stack="reference", device="cpu", capacity=capacity, capture=capture, **more)
+    Graph.session = session
+    with _a_block_asks_for_a_page(tables=True) as stand_in:
+        chain = stand_in.__call__
+
+        def reads_the_rows(self, qkv, cache, position, params):
+            _, positions, slots = cache.at(position)
+            _, lengths = cache.attended(position)
+            rows = [(i, t) for i in range(cache.sequences) for t in range(cache.tokens)]  # a step's rows stand sequence by sequence
+            assert positions.tolist() == [[position + t for _, t in rows]] * 3, f"the position rows at {position}: {positions.tolist()}"
+            assert slots.tolist() == [i * cache.pages * PAGE + position + t for i, t in rows], f"the slots at {position}: {slots.tolist()}"
+            assert lengths.tolist() == [position + cache.tokens] * cache.sequences, f"the lengths at {position}: {lengths.tolist()}"
+            return chain(self, qkv, cache, position, params)
+
+        stand_in.__call__ = reads_the_rows
+        session.plan_table()
+        session.load()
+        yield session, Graph
+
+
+def _prompts(session, length, seed=2):
+    generator = torch.Generator().manual_seed(seed)
+    return [torch.randint(0, session.model.geometry.vocab, (length,), generator=generator) for _ in range(session.sequences)]
+
+
+@pytest.mark.parametrize("sequences", [1, 3])
+def test_a_recorded_request_is_the_request_launched_from_python(monkeypatch, sequences):
+    """A session that records its step (``Session(capture=True)``) against the same session launched from Python, on the
+    host through a stand-in sequence: a prompt of 60 tokens and 12 steps, across positions 63 / 64.  The ids of every
+    read, the record -- the ids handed to every step, the ids chosen, the logits -- and what the state stands on are
+    equal byte for byte.  The step is recorded once, by the load (a stage of its own, behind the warm-up), on the state
+    the first request runs on; a request behind a reset in place replays the same sequence; a fresh state has none
+    until its first replay records one, and the sequence of the state that went is released.  Each replay is one launch
+    of the sequence and counts the step's block calls."""
+    with _recording(monkeypatch, sequences, capture=False) as (eager, _):
+        prompts = _prompts(eager, 60)
+        want = _decoded(eager, prompts, 12)
+        assert eager.recorded is None and eager.python_reason and "capture" not in eager.stages.seconds
+        want_inputs, want_outputs = eager.record.inputs[:72].clone(), eager.record.outputs[:72].clone()
+        calls = eager._report.calls_per_step
+    with _recording(monkeypatch, sequences) as (session, graphs):
+        assert session.python_reason == "" and list(session.stages.seconds)[-2:] == ["warm-up", "capture"]
+        (graph,), recorded = graphs.built, session.recorded
+        assert recorded.graph is graph and recorded.state is session.state and recorded.cursor is session.state.table.cursor
+        assert (recorded.calls, recorded.replays, graph.replays, recorded.launches) == (calls, 0, 0, None)
+        assert session.state.position == 0 and session._calls == 0 and not any(bool(t.any()) for layer in session.state.layers for t in layer.tensors())
+        got = _decoded(session, prompts, 12)
+        assert got[0] == want[0] and _same(got[1], want[1])
+        assert all(_same(a, b) for mine, theirs in zip(got[2], want[2]) for a, b in zip(mine, theirs)), "what the state stands on"
+        assert _same(session.record.inputs[:72], want_inputs) and _same(session.record.outputs[:72], want_outputs) and session.record.count == 72
+        assert (graph.replays, recorded.replays, session._calls, len(graphs.built)) == (72, 72, 72 * calls, 1)
+        assert session.state.position == 72 == recorded.cursor.position and recorded.cursor.holds()
+        assert session.state.greedy is recorded.next_ids and session.state.hidden is recorded.hidden, "what a step leaves on the state"
+        # a reset in place: the same state, the same sequence, the same request
+        session.reset(fresh=False)
+        again = _decoded(session, prompts, 12)
+        assert again[0] == want[0] and _same(again[1], want[1]) and len(graphs.built) == 1 and graph.replays == 144
+        # a fresh state: the sequence of the old one is released with it, and nothing is recorded until the first replay
+        session.reset(fresh=True)
+        assert session.recorded is None and graph.released and len(graphs.built) == 1
+        fresh = _decoded(session, prompts, 12)
+        assert fresh[0] == want[0] and _same(fresh[1], want[1]) and len(graphs.built) == 2
+        assert session.recorded.graph is graphs.built[1] and session.recorded.state is session.state and graphs.built[1].replays == 72
+        # ``record_step`` brings the first replay of a state forward, and is asked once per state
+        session.reset(fresh=True)
+        assert session.record_step() == "" and len(graphs.built) == 3 and session.record_step() == "" and len(graphs.built) == 3
+        session.close()
+        assert session.recorded is None and graphs.built[2].released
+
+
+def test_a_replay_past_the_capacity_is_refused_and_launches_nothing(monkeypatch):
+    """The capacity test stands in front of every replay: a recorded sequence runs no Python, so the test a step launched
+    from Python makes is made by the session.  The step past the capacity is the ``ValueError`` of a session launched
+    from Python, in a prompt and behind one; nothing is replayed, recorded or moved by it."""
+    with _recording(monkeypatch, capacity=20) as (session, graphs):
+        (graph,) = graphs.built
+        ids = session.prefill(_prompts(session, 12))
+        for _ in range(8):
+            ids = session.step(ids)
+        assert session.state.position == 20 and graph.replays == 20
+        before = (session.record.count, session._calls, [t.clone() for t in (session.recorded.cursor.ids, session.recorded.cursor.positions)])
+        for refused in (lambda: session.step(ids), lambda: session.prefill(_prompts(session, 1))):
+            with pytest.raises(ValueError, match="built for 20 positions per sequence"):
+                refused()
+            assert (session.state.position, graph.replays, session.record.count, session._calls) == (20, 20, *before[:2])
+            assert all(_same(t, kept) for t, kept in zip((session.recorded.cursor.ids, session.recorded.cursor.positions), before[2]))
+        session.reset(fresh=False)
+        with pytest.raises(ValueError, match="built for 20 positions per sequence"):  # a prompt that passes it stops at the capacity
+            session.prefill(_prompts(session, 21))
+        assert session.state.position == 20 and graph.replays == 40
+
+
+def test_a_replayed_step_feeds_what_it_is_handed(monkeypatch):
+    """``Session.step(ids)`` feeds ``ids``.  A recorded sequence feeds on its own buffer, which its last launch but three
+    writes with the ids it chose: handed the tensor the last replay returned the session copies nothing, and handed
+    anything else -- other ids, a clone, the same tensor behind a prompt token -- it copies that into the buffer first.
+    The record holds the ids that were handed over, and the step computed on them."""
+    with _recording(monkeypatch, sequences=2) as (session, graphs):
+        ids = session.prefill(_prompts(session, 5))
+        recorded, buffer = session.recorded, session.recorded.cursor.ids
+        assert ids is recorded.next_ids and recorded.chosen and _same(buffer, ids), "the step's own copy: the buffer holds what it chose"
+        writes = []
+        copy = type(buffer).copy_
+
+        def counted(self, source, *more):
+            if self is buffer:
+                writes.append(source)
+            return copy(self, source, *more)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", counted)
+        chosen = ids.clone()
+        ids = session.step(ids)  # the tensor the last replay returned: nothing is copied by the session (the one write is the step's own)
+        assert len(writes) == 1 and writes[0] is not chosen and _same(session.record.inputs[5], chosen)
+        other = torch.tensor([7, 9], dtype=torch.int32)
+        del writes[:]
+        session.step(other)  # other ids: copied in, fed, recorded
+        assert writes[0] is other and len(writes) == 2 and _same(session.record.inputs[6], other)
+        monkeypatch.undo()
+        # the same request launched from Python on those ids gives the step the replay gave
+        logits = session.record.logits[:7].clone()
+    with _recording(monkeypatch, sequences=2, capture=False) as (eager, _):
+        ids = eager.prefill(_prompts(eager, 5))
+        eager.step(eager.step(ids) * 0 + torch.tensor([7, 9], dtype=torch.int32))
+        assert _same(eager.record.logits[:7], logits)
+    with _recording(monkeypatch, sequences=2) as (session, graphs):
+        ids = session.prefill(_prompts(session, 5))
+        recorded = session.recorded
+        recorded.cursor.ids.fill_(3)  # something else wrote the buffer behind the replay: ``chosen`` no longer stands
+        recorded.chosen = False
+        kept = ids.clone()
+        session.step(ids)
+        assert _same(session.record.inputs[5], kept), "the tensor the last replay returned is copied in where the buffer may not hold it"
+        want = session.record.logits[5].clone()
+        session.reset(fresh=False)
+        ids = session.prefill(_prompts(session, 5))
+        session.step(ids.clone())  # a clone of it: copied in, the same step
+        assert _same(session.record.logits[5], want)
+
+
+def test_the_cursor_follows_the_states_position_in_front_of_every_replay(monkeypatch):
+    """One host integer says where the cursor's rows stand, and every replay holds it against the state's position: where
+    the two differ the rows are set from the tables first.  So replays behind steps launched from Python, behind a
+    restored snapshot and behind a reset in place read the rows of the position they run at -- the stand-in's
+    preparation holds them there -- and the request is the request launched from Python."""
+    with _recording(monkeypatch, sequences=2, capture=False) as (eager, _):
+        prompts = _prompts(eager, 60)
+        want = _decoded(eager, prompts, 12)
+    with _recording(monkeypatch, sequences=2) as (session, graphs):
+        (graph,), cursor = graphs.built, session.recorded.cursor
+        ids = session.prefill(prompts)
+        chosen = [session.read(ids)]
+        for index in range(12):
+            if 3 <= index < 8:  # five steps launched from Python in the middle of the request: the state moves, the cursor does not
+                ids = session._advance(ids.clone())
+                assert cursor.position == 63 and session.state.position == 61 + index
+            else:
+                ids = session.step(ids)
+                assert cursor.position == session.state.position and cursor.holds()
+            chosen.append(session.read(ids))
+        assert chosen == want[0] and _same(session.record.logits[:72], want[1]) and graph.replays == 67
+        # a snapshot restored: the state stands where it stood, and the next replay reads the rows of that position
+        snap, position, start = session.state.snapshot(), session.state.position, ids.clone()
+
+        def three_steps():
+            fed = start
+            for _ in range(3):
+                fed = session.step(fed)
+            return session.read(fed), session.record.logits[session.record.count - 1].clone()
+
+        tail = three_steps()
+        session.state.restore(snap)
+        assert session.state.position == position and cursor.position == position + 3
+        again = three_steps()
+        assert again[0] == tail[0] and _same(again[1], tail[1]) and cursor.position == position + 3 and cursor.holds()
+        # a reset in place: position 0 again
+        session.reset(fresh=False)
+        assert cursor.position == position + 3 and session.state.position == 0
+        again = _decoded(session, prompts, 12)
+        assert again[0] == want[0] and cursor.position == 72
+
+
+def test_a_recorded_step_is_replayed_on_its_own_state_alone(monkeypatch):
+    """A recorded sequence writes the memory of the state it was recorded on, and remembers that state: a replay on another
+    is a ``ValueError`` that launches nothing.  A session whose state was exchanged without a reset -- the traced pass
+    does that -- records the step again for the state it then has, at that state's first replay, and releases the
+    sequence of the other."""
+    with _recording(monkeypatch) as (session, graphs):
+        (graph,), recorded, own = graphs.built, session.recorded, session.state
+        other = session._fresh_state()
+        with pytest.raises(ValueError, match="the state it was recorded on"):
+            recorded.replay(other)
+        assert graph.replays == 0 and recorded.replays == 0
+        ids = session.prefill(_prompts(session, 4))
+        session.state = other  # exchanged, as ``Session.trace`` does, and stepped on
+        session.step(ids)
+        assert graph.released and len(graphs.built) == 2 and session.recorded.state is other and session.recorded is not recorded
+        assert (graph.replays, graphs.built[1].replays, other.position, own.position) == (4, 1, 1, 4)
+        assert session.recorded.cursor is other.table.cursor and other.table.cursor is not own.table.cursor
+
+
+def test_a_declined_capture_leaves_the_session_as_it_was(monkeypatch):
+    """The net under the plan's data: a pass that the installation refuses.  The session is as it was -- the host position,
+    the count of block calls, what a step left on the state, every byte of the state -- no sequence is kept, the reason
+    carries the first sentence of what was raised and no more, and every step from then on is launched from Python and
+    computes the request.  The refusal is not asked again."""
+    with _recording(monkeypatch, capture=False) as (eager, _):
+        prompts = _prompts(eager, 6)
+        want = _decoded(eager, prompts, 4)
+    with _recording(monkeypatch) as (session, graphs):
+        session.reset(fresh=True)
+        graphs.refuse = RuntimeError(
+            "Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned. More words\nand a path /a/b"
+        )
+        session._calls, hidden = 5, torch.ones(1)
+        session.state.hidden = hidden
+        before = [t.clone() for layer in session.state.layers for t in layer.tensors()]
+        reason = session.record_step()
+        assert (
+            reason
+            == session.python_reason
+            == (
+                "the capture of the step was declined on this installation "
+                "(Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned)"
+            )
+        )
+        assert session.recorded is None and graphs.built[-1].released and len(graphs.built) == 2
+        assert (session.state.position, session._calls, session.state.greedy) == (0, 5, None) and session.state.hidden is hidden
+        assert all(_same(t, kept) for t, kept in zip((t for layer in session.state.layers for t in layer.tensors()), before))
+        assert not session.state.table.cursor.on and session.state.table.cursor.position == 0
+        session.reset(fresh=True)
+        got = _decoded(session, prompts, 4)
+        assert got[0] == want[0] and _same(got[1], want[1]) and len(graphs.built) == 2 and session.record_step() == reason
+    for error in (NotImplementedError("no such kernel"), ValueError("an operand of another shape. And more")):
+        with _recording(monkeypatch) as (session, graphs):
+            session.reset(fresh=True)
+            graphs.refuse = error
+            assert session.record_step().endswith(f"({str(error).split('. ')[0]})")
+    with _recording(monkeypatch) as (session, graphs):  # anything else is not a refusal of the installation: it is raised
+        session.reset(fresh=True)
+        graphs.refuse = KeyError("a block's own defect")
+        with pytest.raises(KeyError):
+            session.record_step()
+        assert session.state.position == 0 and not session.state.table.cursor.on and session.python_reason == ""
+
+
+def test_only_the_plain_decode_step_of_a_plan_that_says_so_is_recorded(monkeypatch):
+    """Whether a session records its step is decided before the load, from what the session is and from its plan's data:
+    a session that was not asked launches from Python; one that was asked does where its step is not the plain decode
+    step -- several tokens per sequence, a prompt in front of verify steps, the reference session of a run's checks,
+    a device no sequence is recorded on -- or where a block of its plan says a recorded sequence cannot hold it.  Each
+    says why in one sentence and steps as it did before."""
+    import model_samples
+    from model_samples import loop
+    from model_samples.weights import OnDemand
+
+    with _recording(monkeypatch, capture=False) as (session, graphs):
+        assert session.python_reason == loop.NOT_ASKED == session.record_step() and session.recordable() == ""
+        session.step(session.prefill(_prompts(session, 3)))
+        assert not graphs.built and session.recorded is None
+        model, text = session.model, session.text
+        common = dict(stack="reference", device="cpu", capacity=40, capture=True)
+        for kind, more in (("tokens", {"tokens": 3}), ("draft_tokens", {"draft_tokens": 2})):
+            other = model_samples.Session(model, text, **common, **more)
+            other.load()
+            assert other.recordable() == other.python_reason == loop.NOT_PLAIN[kind] and other.recorded is None and "capture" not in other.stages.seconds
+        reference = model_samples.Session(model, text, share=session, on_demand=OnDemand(), **common)
+        assert reference.recordable() == loop.NOT_PLAIN["on_demand"]
+        graphs.serves = staticmethod(lambda device: False)
+        elsewhere = model_samples.Session(model, text, **common)
+        assert elsewhere.recordable() == loop.NOT_PLAIN["device"]
+        assert not graphs.built
+    # the plan's data: with the reference chains as they are, the first block that cannot be held is named
+    with _recording(monkeypatch) as (session, graphs):
+        monkeypatch.undo()
+        plain = model_samples.Session(session.model, session.text, stack="reference", device="cuda:0", capacity=40, capture=True)
+        assert plain.recordable() == "add_norm_quantize is on a fallback row of this stack (reference chain), which a recorded launch sequence cannot hold"
+    assert set(loop.NOT_PLAIN) == {"tokens", "draft_tokens", "drafter", "on_demand", "device"}
+
+
+def test_what_a_recorded_sequence_holds_is_held_against_the_plan(monkeypatch):
+    """``census.recorded_launches``: the nodes of a recorded sequence, as the CUDA runtime states them, against the block
+    calls of the step.  Every exact kernel that is not PyTorch's own is there as often as the plan launches it; what is
+    left beside them is the lookup, the token choice, the copy of the chosen ids and the position updates.  A kernel
+    that is missing, one that is there twice and a sequence with nothing left for the token choice each fail with
+    their sentence -- and a session that records such a sequence keeps none: a ``ValueError``, the sequence released."""
+    from model_samples import census
+
+    def site(block, kernel_id, origin, launches=1, relation="exact"):
+        return census.Site(block, 0, (census.Kernel(kernel_id, origin, relation, launches if relation == "exact" else None),))
+
+    sites = [
+        site("embedding", "embedding_gather", "PyTorch"),
+        site("add_norm_quantize", "add_norm_quant", "cuDNN FE"),
+        site("linear_attention.step", "gdn_decode_fused", "cuDNN FE"),
+        site("add_norm_quantize", "add_norm_quant", "cuDNN FE"),
+        site("mlp.down", "fi_mm_fp4", "FlashInfer"),
+        site("token_choice", "pytorch", "PyTorch", relation="host"),
+    ]
+    norm, step, multiply = (
+        "cudnn_kernel_frost_add_rms_norm_quant_h64",
+        "cudnn_kernel_frost_gdn_decode_fused_Cfg",
+        "kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100X",
+    )
+    own = "_ZN2at6native29vectorized_elementwise_kernelILi2E"  # a kernel of PyTorch's, as a node names it
+    nodes = [("kernel", own), ("kernel", norm), ("kernel", step), ("kernel", norm), ("kernel", multiply), ("fill", ""), ("kernel", own), ("kernel", own)]
+    tail = [("copy", ""), ("kernel", own), ("kernel", own), ("kernel", own)]
+    counts, sentences = census.recorded_launches(nodes + tail, sites, copies=1, updates=3)
+    assert sentences == [] and counts == {"launches": 12, "held": 4, "lookup": 1, "token_choice": 3, "copies": 1, "updates": 3}
+    missing = [node for node in nodes if node[1] != step] + tail
+    assert census.recorded_launches(missing, sites)[1] == ["the recorded sequence holds 0 launches of gdn_decode_fused, the plan 1"]
+    twice = nodes + [("kernel", norm)] + tail
+    assert census.recorded_launches(twice, sites)[1] == ["the recorded sequence holds 3 launches of add_norm_quant, the plan 2"]
+    assert census.recorded_launches(missing + [("kernel", norm)], sites)[1] == [
+        "the recorded sequence holds 3 launches of add_norm_quant, the plan 2",
+        "the recorded sequence holds 0 launches of gdn_decode_fused, the plan 1",
+    ]
+    bare = nodes[:5] + tail  # the blocks and the step's own tail, and no launch of the token choice
+    assert census.recorded_launches(bare, sites)[1] == [
+        "the recorded sequence holds 9 launches and the plan's blocks, the copy of the chosen ids and the position updates are 9: none is left for the token choice"
+    ]
+    assert census.recorded_launches(nodes[:5] + [("kernel", own), ("copy", ""), ("kernel", own), ("kernel", own)], sites, updates=2)[0]["token_choice"] == 1
+    # through a session: what the installation states is held when the step is recorded
+    with _recording(monkeypatch) as (session, graphs):
+        monkeypatch.setattr(census, "expected", lambda plan, model, rows=None: sites)
+        session.reset(fresh=True)
+        graphs.stated = nodes + tail
+        assert session.record_step() == "" and session.recorded.launches == counts
+        session.reset(fresh=True)
+        graphs.stated = missing
+        with pytest.raises(ValueError) as wrong:
+            session.record_step()
+        assert (
+            str(wrong.value)
+            == "the recorded step does not hold the launches of the plan: the recorded sequence holds 0 launches of gdn_decode_fused, the plan 1"
+        )
+        assert session.recorded is None and graphs.built[-1].released and session.python_reason == ""
+
+
 def test_a_state_holds_the_two_tables_only_where_a_block_of_its_sessions_plans_reads_them(monkeypatch):
     """One adapter of the closed list reads the page table and the lengths (``Block.attended_tables``): the library's paged
     decode attention.  A state of a run without such a block holds neither: its tables, its bytes and the memory

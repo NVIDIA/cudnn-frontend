@@ -398,6 +398,48 @@ def expected(plan, model, rows: Optional[int] = None) -> List[Site]:
     return sites
 
 
+def recorded_launches(nodes: Sequence[Tuple[str, str]], sites: Sequence[Site], copies: int = 1, updates: int = 3) -> Tuple[dict, List[str]]:
+    """What a recorded launch sequence holds, held against the plan: ``nodes`` are ``(kind, kernel name)`` of every node of
+    the sequence as the CUDA runtime states it (kind ``"kernel"``, ``"copy"``, ``"fill"``), ``sites`` the block calls of the
+    step it records (:func:`expected`), ``copies`` and ``updates`` the launches the recorded step makes behind its blocks:
+    the copy of the chosen ids and the adds that move the position on.
+
+    Held, kernel by kernel: every exact kernel of the plan that is not PyTorch's own -- the entries' and a library's,
+    whose names a node carries as the patterns of :data:`FAMILIES` read them -- is in the sequence as often as the
+    plan launches it in a step.  A block that left the sequence, or is in it twice, fails by its kernel's id.  PyTorch's
+    own kernels are stated by a node under names these patterns do not read, so they are counted together: the plan's
+    exact ones (the lookup), the token choice -- whose launches no row states --, and the copies and updates; what is
+    left of them for the token choice must be at least one launch.
+
+    Returns ``(counts, sentences)``: ``launches`` (all nodes), ``held`` (the launches held kernel by kernel), ``lookup``,
+    ``token_choice``, ``copies``, ``updates``; and one sentence per kernel that is not there as planned -- none where the
+    sequence holds the plan's launches."""
+    planned: Dict[str, int] = {}
+    own = 0  # the plan's exact launches of PyTorch's own kernels
+    for site in sites:
+        for kernel in site.kernels:
+            if kernel.relation != "exact":
+                continue
+            if kernel.origin == "PyTorch":
+                own += kernel.launches
+            else:
+                planned[kernel.id] = planned.get(kernel.id, 0) + kernel.launches
+    found = Counter(canonical(Launch(name, "kernel", 0.0, 0.0)) for kind, name in nodes if kind == "kernel")
+    sentences = [
+        f"the recorded sequence holds {found.get(kernel_id, 0)} launch{'es' if found.get(kernel_id, 0) != 1 else ''} of {kernel_id}, the plan {count}"
+        for kernel_id, count in planned.items()
+        if found.get(kernel_id, 0) != count
+    ]
+    held = sum(planned.values())
+    chosen = len(nodes) - held - own - copies - updates
+    if not sentences and chosen < 1:
+        sentences.append(
+            f"the recorded sequence holds {len(nodes)} launches and the plan's blocks, the copy of the chosen ids and the position updates are "
+            f"{held + own + copies + updates}: none is left for the token choice"
+        )
+    return {"launches": len(nodes), "held": held, "lookup": own, "token_choice": chosen, "copies": copies, "updates": updates}, sentences
+
+
 def passes(plan, drafter, count: int) -> List[Site]:
     """The block calls of the ``count`` draft passes of a step of speculative decoding, in the order a step makes them: the
     wiring of one pass (:func:`expected` on the drafter's plan) once per pass, with the pass's number, from 0, in the place

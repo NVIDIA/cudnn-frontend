@@ -87,6 +87,13 @@ the chain's function on the device, and the kernels the chains launch on the poo
 family serves the GPU and on compute capability 8.0, and is skipped by name on any other class; a host case holds that
 condition on stated compute capabilities.
 
+The recorded-step cells run no script either: a small program in a fresh interpreter builds two sessions of the stack
+``native`` on one load -- one launched from Python, one that records its decode step once and replays it
+(``Session(capture=True)``) -- and holds a replayed request to the same request launched from Python: the ids, the
+logits byte for byte, the end-state digest, at 1 and at 4 sequences; then that a planted difference is found at its
+step, that a replay past the capacity launches nothing, and that a declined recording leaves PyTorch's current stream
+where it was.  They run where the library is installed, as the ``native`` cell does.
+
 Every line of a run is read from standard error, which is not the sample's alone: a library may print there first, and
 behind the run's last line.  A cell that reads the header of a run finds it by the script's tag (``_header``), and
 one that reads the line in front of the verdict counts from the verdict (``_in_front_of_the_verdict``); host cases
@@ -552,6 +559,172 @@ def test_the_native_stack_with_an_empty_kernel_binary_directory_is_a_skip_that_n
     assert code == 0 and verdict.startswith("[00] SKIP ") and sentence in verdict, out[-6000:]
     assert written == "" and "\n[00] stage " not in out and "\nchecks" not in out, "nothing was loaded and nothing checked"
     assert str(tmp_path) not in out and list(empty.iterdir()) == [], "no path on either stream, and nothing written into the directory"
+
+
+RECORDED_PROGRAM = """
+import faulthandler, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import perf, tie_out
+from model_samples.qwen_dense import QwenDense
+
+SEQUENCES, PROMPT, STEPS, PLANTED = {sequences}, 26, 70, 31  # positions 0 to 95: across the first page boundary of the attention cache
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+failed = []
+
+
+def hold(name, held, text):
+    say(f"  {{name:<10}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+model = QwenDense.reduced()
+text = model_samples.TextIO.synthetic(model.geometry.vocab)
+common = dict(sequences=SEQUENCES, stack="native", device="cuda:0", capacity=PROMPT + STEPS)  # the request fills the state: no position is left
+eager = model_samples.Session(model, text, **common)
+session = model_samples.Session(model, text, share=eager, capture=True, **common)
+try:
+    for note in dict.fromkeys(eager.resolve().announcements()):
+        say(f"[recorded] planning: {{note}}")
+    say(eager.plan_table([session]))
+except NotImplementedError as error:
+    say(f"[recorded] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[recorded] {{model_samples.check_environment().header()}}")
+if session.recordable():  # a class on which a block of the stack is on a fallback row: its step is not recorded there
+    say(f"[recorded] SKIP the step of the stack native is not recorded on this GPU: {{session.recordable()}}")
+    raise SystemExit(0)
+eager.load()
+session.load()
+generator = torch.Generator().manual_seed(0)
+prompts = [torch.randint(0, model.geometry.vocab, (PROMPT,), generator=generator, dtype=torch.int32) for _ in range(SEQUENCES)]
+
+
+def request(of, between=None, steps=STEPS):
+    # a prompt, its first new token and ``steps`` steps, each ended by its host read: (the reads, ids fed, ids chosen, logits, end state)
+    of.reset(fresh=False)
+    ids = of.prefill(prompts)
+    reads = [of.read(ids)]
+    for index in range(steps):
+        if between is not None:
+            between(index)
+        ids = of.step(ids)
+        reads.append(of.read(ids))
+    torch.cuda.synchronize()
+    count = of.record.count
+    return reads, of.record.inputs[:count].clone(), of.record.outputs[:count].clone(), of.record.logits[:count].clone(), perf.state_digest(of.state)
+
+
+def equal(a, b):
+    return a[0] == b[0] and all(tie_out.bytes_equal(x, y) for x, y in zip(a[1:4], b[1:4])) and a[4] == b[4]
+
+
+recorded = session.recorded
+hold("recorded", session.python_reason == "" and recorded is not None and "capture" in session.stages.seconds, f"the step was recorded by the load ({{session.python_reason or 'a stage of its own'}})")
+say(f"[recorded] the sequence holds, as this installation states it: {{recorded.launches}}; its own pool {{recorded.pool_bytes}} bytes")
+zero = perf.state_digest(session.state)
+session.reset(fresh=True)
+before = perf.state_digest(session.state)
+session.record_step()
+torch.cuda.synchronize()
+recorded = session.recorded
+hold("nothing", before == zero == perf.state_digest(session.state) and recorded.replays == 0, "recording the step launched nothing: the state holds the bytes it held")
+want = request(eager)
+again = request(eager)
+hold("python", equal(want, again), f"the request launched from Python twice: the ids of {{len(want[0])}} reads, {{want[3].shape[0]}} steps of ids and logits, the end state")
+got = [request(session) for _ in range(3)]
+steps = want[3].shape[0]
+hold("replayed", all(equal(want, each) for each in got) and recorded.replays == 3 * steps, f"three replayed requests against it, {{steps}} steps each: the ids of every read, the ids fed and chosen, the logits byte for byte, the end-state digest")
+cursor = recorded.cursor
+hold("tail", cursor.holds() and cursor.position == session.state.position == steps and got[-1][0][-1] == cursor.ids.tolist(), f"behind a request the ids buffer holds the last chosen ids and the position rows stand at position {{cursor.position}}")
+
+
+def planted(index):
+    if index == PLANTED - PROMPT:  # in front of the step at position PLANTED: the length the attention reads, one too small from there on
+        cursor.lengths.sub_(1)
+
+
+wrong = request(session, planted)
+differs = [step for step in range(steps) if not tie_out.bytes_equal(wrong[3][step], want[3][step])]
+hold("planted", differs[:1] == [PLANTED] and wrong[0][: PLANTED - PROMPT + 1] == want[0][: PLANTED - PROMPT + 1], f"a length one too small from position {{PLANTED}} on: the logits differ first at step {{differs[:1]}}, {{len(differs)}} steps differ")
+hold("restored", equal(want, request(session)), "the next request, its cursor set from the tables at its first replay, is the request again")
+# past the capacity: the step is refused and nothing is launched
+ids, replays, position = recorded.next_ids, recorded.replays, session.state.position
+try:
+    session.step(ids)
+    refused = ""
+except ValueError as error:
+    refused = str(error)
+hold("capacity", "positions per sequence" in refused and (recorded.replays, session.state.position) == (replays, position), f"a replay past the capacity is refused and launches nothing ({{refused[:60]}})")
+# a pass the installation declines: a block that reads the host inside the step
+kind = type(session.plan["token_choice"])
+call = kind.__call__
+
+
+def reads_the_host(self, logits):
+    out = call(self, logits)
+    out.tolist()
+    return out
+
+
+session.reset(fresh=True)
+stream = torch.cuda.current_stream()
+kind.__call__ = reads_the_host
+try:
+    reason = session.record_step()
+finally:
+    kind.__call__ = call
+say(f"[recorded] {{reason}}")
+declined = reason.startswith("the capture of the step was declined on this installation (") and session.recorded is None
+hold("declined", declined and torch.cuda.current_stream() == stream, "a pass with a host read inside is declined, no sequence is kept and PyTorch's current stream is the one it was")
+hold("from python", equal(want, request(session)) and session.recorded is None, "the session then launches from Python and computes the request")
+session.close()
+say("[recorded] FAIL" if failed else "[recorded] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sequences", [1, 4])
+def test_a_recorded_request_equals_the_same_request_from_python(sequences):
+    """One decode step of the stack ``native`` recorded as a launch sequence and replayed for a request, against the same
+    request launched from Python (``Session(capture=True)`` beside a session without it, on one load): the reduced seeded
+    model, a prompt of 26 tokens and 70 steps behind it, across the first page boundary of the attention cache, in a
+    state of exactly those 96 positions.  A small program in a fresh interpreter holds, at 1 and at 4 sequences:
+
+    * recording the step launches nothing: the state holds the bytes it held;
+    * three replayed requests give the ids of every host read, the ids fed to and chosen by every step, the logits of
+      every step byte for byte and the end-state digest of the request launched from Python;
+    * behind a request the ids buffer holds the last chosen ids and the position rows stand at the last position;
+    * a planted difference -- the length the attention reads, one too small from one position on -- moves the logits
+      first at that step; the next request is the request again;
+    * a replay past the capacity is refused and launches nothing;
+    * a pass with a host read inside it is declined: no sequence is kept, PyTorch's current stream is the one it was,
+      and the session computes the request from Python.
+
+    The stack calls a library: skipped where that is absent, by the program's own line where the plan declines the GPU
+    or a block of the stack is on a fallback row.  A skipped cell is uncovered, not passing."""
+    _needs_the_library()
+    key = f"model sample qwen_dense: a recorded decode step against the step launched from Python, {sequences} sequence(s), stack native"
+    out = _program(RECORDED_PROGRAM, "[recorded]", key, "run of a recorded step", unobserved="RAN (never printed: ", sequences=sequences)
+    lines = out.splitlines()
+    for name in ("recorded", "nothing", "python", "replayed", "tail", "planted", "restored", "capacity", "declined", "from python"):
+        (line,) = [line for line in lines if line.startswith(f"  {name} ")]
+        assert line.endswith("    PASS"), line
+    assert "the logits differ first at step [31]" in out and "three replayed requests against it, 96 steps each" in out
+    stated = next(line for line in lines if line.startswith("[recorded] the sequence holds, as this installation states it: "))
+    frost_routing.measured(key + ": the recorded sequence", stated[len("[recorded] ") :])
 
 
 CORE_PROGRAM = """
