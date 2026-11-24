@@ -677,8 +677,9 @@ def test_sm90_bias_mode_a_keeps_an_unsplit_unpacked_plan(change, bias_dtype):
         ({"s_q": 1024, "s_kv": 4096, "h_q": 32, "h_kv": 8, "causal": True}, True),
         ({"s_q": 64, "s_kv": 4096}, False),
         ({"s_q": 1}, False),
+        (_SHORT_Q_GQA, False),
     ],
-    ids=["prefill", "gqa-causal", "below-lead-floor", "decode"],
+    ids=["prefill", "gqa-causal", "below-lead-floor", "decode", "short-q-gqa-long-kv"],
 )
 def test_sm90_io_bias_default_discovery_leads_with_d128(change, leads):
     """Automatic planning for an exact (128, 128) bias graph in the Q/K/V dtype leads with engine 20541's 128 x 128 plan
