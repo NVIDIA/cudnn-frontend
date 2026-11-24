@@ -1330,7 +1330,7 @@ def level_border_cut(b, q, rem, chunks):
 def level_planned_chunks(b_t: cutlass.Constexpr[int], n_rows, n_batch):
     """Chunks per chain a levelled plan was admitted for: the batch's ``n_rows`` token rows shared out to its ``n_batch``
     sequences.  The prologue lays the levelled table out for this count and takes the table only for a batch whose
-    every sequence has it (:func:`level_vote`): cumulative lengths that stop short of the rows are another shape."""
+    every sequence has it (:func:`level_vote`), a last chunk that is not full counted as one: another count is another shape."""
     return cute.ceil_div(n_rows // (n_batch if n_batch > cutlass.Int32(0) else cutlass.Int32(1)), b_t)
 
 
@@ -1452,7 +1452,7 @@ def level_order_body(
     device sees.  The CTA's last warp checks the batch (:func:`level_vote`) while the threads that own rows write them,
     wherever the chunk count alone allows the table (:func:`level_chunks_fit`: the rows then lie inside ``[0, n_tiles)``
     for any batch).  Behind one CTA-wide barrier every thread reads the verdict: a batch that takes the table is done;
-    for any other -- lengths that differ or stop short of the token rows, a chain of fewer than two chunks, a pool row
+    for any other -- a sequence of another chunk count, a chain of fewer than two chunks, a pool row
     named twice -- the CTA writes the uncut table over rows ``[0, n_tiles)`` through :func:`order_body`, with the order
     entry 0 for each row and the item count.  Caller owns ``sKey`` / ``sIdx`` / ``sSpread`` (:func:`order_body`'s) and
     ``sVerdict``; every thread of the calling CTA must reach the barriers inside.
