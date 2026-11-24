@@ -453,7 +453,7 @@ def wgrad_op():
     _require_training_wgrad()
     capacity = 512
     top_k = 2
-    op = MoeEp(
+    with MoeEp(
         _training_config(
             num_experts=_EXPERTS,
             hidden_size=_HIDDEN,
@@ -463,12 +463,9 @@ def wgrad_op():
             physical_recv_pool_rows=_round_up(capacity * top_k + 128 * _EXPERTS, 128),
             combine_format="bf16",
         ).public_config
-    )
-    try:
+    ) as op:
         requirements = op.prepare_training(device=device)
         yield op, requirements, device
-    finally:
-        op.close()
 
 
 def _reference(operands):
@@ -759,7 +756,7 @@ def wgrad_op_large():
     _require_training_wgrad()
     capacity = 8192
     top_k = 2
-    op = MoeEp(
+    with MoeEp(
         _training_config(
             num_experts=_LARGE_EXPERTS,
             hidden_size=_LARGE_HIDDEN,
@@ -769,12 +766,9 @@ def wgrad_op_large():
             physical_recv_pool_rows=_round_up(capacity * top_k + 128 * _LARGE_EXPERTS, 128),
             combine_format="bf16",
         ).public_config
-    )
-    try:
+    ) as op:
         requirements = op.prepare_training(device=device)
         yield op, requirements, device
-    finally:
-        op.close()
 
 
 def _operand_bytes(operands):
