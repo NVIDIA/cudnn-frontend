@@ -68,6 +68,10 @@ class CostProfile:
     scalar_scale_epilogue_ok: bool = False
 
 
+# TODO: temporary. The Rubin profiles were fitted on parts reporting the pre-production name; production parts report a new one.
+# Profiles should key on stable hardware properties instead of the device name, and the Rubin numbers need re-fitting on production parts.
+DEVICE_NAME_ALIASES = {"NVIDIA VR NVL72": "NVIDIA Graphics Device"}
+
 _SM100_EXTRA_GEOMETRIES = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
     "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
@@ -262,7 +266,7 @@ def profile_for(chain: FusionChain, baseline: TileConfig, device: DeviceProperti
         chain.has_block_scale,
     )
     profile = _PROFILES.get(key)
-    if profile is None or profile.device_name != device.name or not _eligible_graph(chain, profile):
+    if profile is None or profile.device_name != DEVICE_NAME_ALIASES.get(device.name, device.name) or not _eligible_graph(chain, profile):
         return None
     if not (profile.mn_bounds[0] <= mm.M <= profile.mn_bounds[1] and profile.mn_bounds[0] <= mm.N <= profile.mn_bounds[1]):
         return None
@@ -332,7 +336,7 @@ def _calibrated(device: DeviceProperties) -> bool:
     where this is False: today the only CC 12.x name in ``_PROFILES`` is the RTX PRO 6000 Blackwell Server Edition, so every other CC 12.x
     part -- the measured GeForce RTX 5090, the Workstation / Max-Q editions, the 84-SM parts, CC 12.1 -- takes them, measured or not.  A
     future profile for such a name retires both rules for that part on every dtype (intended: a fitted cost model outranks a rule)."""
-    return any(key[0] == device.arch and profile.device_name == device.name for key, profile in _PROFILES.items())
+    return any(key[0] == device.arch and profile.device_name == DEVICE_NAME_ALIASES.get(device.name, device.name) for key, profile in _PROFILES.items())
 
 
 def _one_wave_split_k(chain: FusionChain, config: TileConfig, device: DeviceProperties, weight_tiles: int) -> int:
