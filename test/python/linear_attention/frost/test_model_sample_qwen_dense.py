@@ -446,7 +446,12 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     # row launches once per call, so the two add up to the 20 block calls of a step of the two-layer model that are no host path
     assert kernels["exact_launches_per_step"] == sum(kernels["by_provider"].values()) and kernels["fallback_rows"]
     assert kernels["exact_launches_per_step"] + kernels["fallback_calls"] == 20
-    assert kernels["by_provider"] == ({"PyTorch": 1, "cuDNN Frontend": 1} if stack == "fe-cublas" else {"cuDNN Frontend": 13, "PyTorch": 1})
+    if stack == "fe-cublas":
+        assert kernels["by_provider"] == {"PyTorch": 1, "cuDNN Frontend": 1}
+    elif tuple(torch.cuda.get_device_capability()) == (10, 0):
+        assert kernels["by_provider"] == {"cuDNN Frontend": 13, "PyTorch": 1}
+    else:  # a row of an entry claims its GPU classes: off compute capability 10.0 fewer of the 13 are exact rows
+        assert kernels["by_provider"]["PyTorch"] == 1 and 1 <= kernels["by_provider"]["cuDNN Frontend"] < 13 and len(kernels["by_provider"]) == 2
     at = next(index for index, line in enumerate(screen) if line.startswith("kernels     "))
     assert screen[at] == f"kernels     {kernels['exact_launches_per_step']} launches per step on exact rows: " + ", ".join(
         f"{provider} {count}" for provider, count in kernels["by_provider"].items()
