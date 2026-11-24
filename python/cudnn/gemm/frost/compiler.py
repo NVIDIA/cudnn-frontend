@@ -9,25 +9,27 @@ import functools
 import hashlib
 import importlib
 import importlib.util
-import itertools
 import logging
 import os
 import re
+import secrets
 import sys
 import tempfile
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar
+from typing import Any, Callable, ClassVar, Generic, NamedTuple, Protocol, TypeVar
 
 from cudnn._device import ensure_current_context
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
 
+from . import launch_cache
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
 from .fusion_ir import Axis, FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
-from .recipe import AX_MN, FROM_M, FROM_N, REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
+from .recipe import _TORCH_SCALE_DTYPE, AX_MN, FROM_M, FROM_N, REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
 
 
 class _RuntimeConfig(Protocol):
@@ -514,7 +516,10 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> N
             raise ValueError(f"MoE reduction output cannot write an element twice (shape {shape} stride {strides})")
         fills.append((tensor.data_ptr(), plan, word))
 
+    record = launch_cache.active_record()
     for ptr, plan, word in fills:
+        if record is not None:
+            record.fills.append((ptr, plan, "word", word))
         buffers.apply_fill_plan(ptr, plan, word, stream)
 
 
@@ -542,7 +547,58 @@ def _tma_alignment_reject(
     return None
 
 
-def _general_moe_scale_reject(chain, a_bufs, b_bufs, sfa, sfb, K: int) -> str | None:
+class _GeneralMoeFacts(NamedTuple):
+    """What every call of a general grouped plan is checked against, settled once from its chain (``_general_moe_facts``)."""
+
+    roles: tuple  # what the A and B operands are: ("token", "weight"), or ("weight", "token") for a weight-by-token plan
+    operand_dtypes: tuple  # the torch dtype of the A and B buffers (a general plan's data dtypes are scale dtypes too)
+    weight_unit: int  # the axis of a kernel-order [E, N, K] weight that the kernel loads contiguously: 2 (K) or 1 (N)
+    # Per scaled side: (side, the (rows, K) block of its [L, rows, K] operand, one scale matrix for every matrix of the
+    # operand, the scale's torch dtype, the side is the weight).
+    scales: tuple
+    weight_scale: "tuple | None"  # the weight scale's ((N block, K block), one matrix for every expert); None if unscaled
+
+
+_NOT_SETTLED = object()
+
+
+def _general_moe_facts(compiled) -> "_GeneralMoeFacts | None":
+    """The facts of a general grouped plan, or ``None`` for any other plan; settled on the first call and kept on the plan."""
+    facts = getattr(compiled, "_general_moe_facts", _NOT_SETTLED)
+    if facts is not _NOT_SETTLED:
+        return facts
+    chain, facts = compiled.chain, None
+    general = getattr(compiled._compiler, "_is_general_block_scale", None)
+    if general is not None and chain.has_block_scale and general(chain):
+        bs, mm = chain.block_scale, chain.matmul
+        swapped = isinstance(chain.moe, MoeSwapAbSpec)
+        scales = []
+        for side, scaled, block, declared, dtype, weight in (
+            ("A", bs.a_scaled, bs.a_scale_block, bs.sfa_dim, bs.sf_dtype_a, swapped),
+            ("B", bs.b_scaled, bs.b_scale_block, bs.sfb_dim, bs.sf_dtype_b, not swapped),
+        ):
+            if scaled:
+                # A's block is (batch, M, K) and B's (batch, K, N). The count is the same test as the constant the
+                # kernel is rendered with (sm100/compiler.py).
+                rows_k = (block[1], block[2]) if side == "A" else (block[2], block[1])
+                scales.append((side, rows_k, declared is not None and int(declared[0]) == 1, _TORCH_SCALE_DTYPE[dtype], weight))
+        major = mm.a_major if swapped else mm.b_major
+        facts = _GeneralMoeFacts(
+            roles=("weight", "token") if swapped else ("token", "weight"),
+            operand_dtypes=(_TORCH_SCALE_DTYPE.get(mm.a_dtype), _TORCH_SCALE_DTYPE.get(mm.b_dtype)),
+            weight_unit=2 if major == "k" else 1,
+            scales=tuple(scales),
+            weight_scale=next(((block, one) for _side, block, one, _dtype, weight in scales if weight), None),
+        )
+    try:
+        compiled._general_moe_facts = facts
+    except AttributeError:
+        # A slot-only launcher settles them on every call.
+        pass
+    return facts
+
+
+def _general_moe_scale_reject(facts: _GeneralMoeFacts, a_bufs, b_bufs, sfa, sfb, K: int) -> str | None:
     """Why a grouped call's linear scale tensors do not cover its operands, or ``None``.
 
     The call binds A as ``[L, M, K]`` and B as ``[L, N, K]``; each scale is its operand's shape in blocks,
@@ -550,25 +606,46 @@ def _general_moe_scale_reject(chain, a_bufs, b_bufs, sfa, sfb, K: int) -> str | 
     graph declared, which the kernel is compiled for (``sfa_batch_broadcast`` / ``sfb_batch_broadcast``): 1 when one
     scale matrix serves every matrix of the operand (the kernel reads matrix 0), else L, one per matrix (the kernel
     reads the tile's). The other count is refused: the kernel would read past a single matrix, or ignore all but the
-    first of L."""
-    bs = chain.block_scale
-    sides = (
-        ("A", a_bufs, sfa if bs.a_scaled else [], bs.a_scale_block and (bs.a_scale_block[1], bs.a_scale_block[2]), bs.sfa_dim),
-        ("B", b_bufs, sfb if bs.b_scaled else [], bs.b_scale_block and (bs.b_scale_block[2], bs.b_scale_block[1]), bs.sfb_dim),
-    )
-    for side, operands, scales, block, declared in sides:
-        # The same test as the constant the kernel is rendered with (sm100/compiler.py).
-        broadcast = declared is not None and int(declared[0]) == 1
+    first of L.
+
+    A weight scale arrives here in the kernel's order (``_general_moe_weight_scale_view``); the graph orders it
+    ``[B, K blocks, N blocks]``, which the message names too. A scale of the right shape must also pass the rest of a
+    dense plan's ``LinearScaleRule``: the declared dtype, which the promotion warps widen it as (a uint8 buffer bound
+    for an int8 scale would be read as signed), and its elements' alignment, as they load one element at a time."""
+    for side, (block_rows, block_k), one, dtype, weight in facts.scales:
+        operands, scales = (a_bufs, sfa) if side == "A" else (b_bufs, sfb)
         for i, (operand, scale) in enumerate(zip(operands, scales)):
-            expected = (1 if broadcast else int(operand.shape[0]), -(-int(operand.shape[1]) // block[0]), -(-K // block[1]))
-            shape = tuple(int(d) for d in scale.shape)
+            expected = (1 if one else int(operand.shape[0]), -(-int(operand.shape[1]) // block_rows), -(-K // block_k))
+            shape = tuple(scale.shape)
             if shape != expected:
-                compiled = "one scale matrix shared by every matrix of the operand" if broadcast else "one scale matrix per matrix of the operand"
+                compiled = "one scale matrix shared by every matrix of the operand" if one else "one scale matrix per matrix of the operand"
+                graph = f" ([{expected[0]}, {expected[2]}, {expected[1]}] in the graph's order: matrices, K blocks, N blocks)" if weight else ""
                 return (
-                    f"{side} scale[{i}] must have shape [{expected[0]}, {expected[1]}, {expected[2]}] "
-                    f"for a {tuple(int(d) for d in operand.shape)} operand with {block[0]} x {block[1]} blocks; got {shape}. "
+                    f"{side} scale[{i}] must have shape [{expected[0]}, {expected[1]}, {expected[2]}]{graph} "
+                    f"for a {tuple(int(d) for d in operand.shape)} operand with {block_rows} x {block_k} blocks; got {tuple(int(d) for d in shape)}. "
                     f"The plan is compiled for {compiled}, as the graph declared the scale tensor"
                 )
+            got = buffers.dtype_name(scale)
+            if got != dtype:
+                return f"{side} scale[{i}]: expected dtype {dtype}, got {got}"
+            if int(scale.data_ptr()) % scale.element_size():
+                return f"{side} scale[{i}]: pointer 0x{int(scale.data_ptr()):x} is not aligned to its {scale.element_size()}-byte elements"
+    return None
+
+
+def _general_moe_operand_reject(facts: _GeneralMoeFacts, a_bufs, b_bufs) -> str | None:
+    """Why a grouped call's token or weight buffer is not of the dtype the graph declares, or ``None``.
+
+    The kernel's argument check refuses a buffer of another dtype, except a uint8 one for an int8 operand, whose
+    bytes the MMA would read as signed. A graph.execute pack has already described a buffer of the declared extents
+    and element width as the declared tensor (as a backend engine reads it), so this refuses a direct plan call's."""
+    for role, bufs, want in zip(facts.roles, (a_bufs, b_bufs), facts.operand_dtypes):
+        if want is None:
+            continue
+        for i, buf in enumerate(bufs):
+            got = buffers.dtype_name(buf)
+            if got != want:
+                return f"MoE {role} operand[{i}] must be {want}, the dtype the graph declares; got {got}"
     return None
 
 
@@ -678,6 +755,90 @@ def _kernel_order(buf, t, memo: "dict | None" = None):
     return buf
 
 
+def _same_storage(buf, declared) -> bool:
+    """``buf`` has the declared storage geometry ``(dims, strides)``: the same extents, and the same stride on every
+    axis of more than one element (where a stride addresses something)."""
+    if declared is None or not declared[0]:
+        return False
+    shape = tuple(buf.shape)
+    if shape != declared[0]:
+        return False
+    stride = tuple(buf.stride())
+    return stride == declared[1] or all(extent == 1 or s == want for extent, s, want in zip(shape, stride, declared[1]))
+
+
+def _general_moe_weight_view(buf, t, memo: dict, k: int, unit: int):
+    """A general grouped plan's weight, ``[E, K, N]`` in the graph, viewed in the kernel's ``[E, N, K]`` order.
+
+    The declared view is read in the graph's order. Another buffer is read in the order its shape fits: K on axis 1
+    (the graph's) or on axis 2 (the kernel's). One that fits both (N == K) is read in the order that puts its unit
+    stride on the axis the plan loads contiguously (``unit`` of the kernel's order: K, or N for an MN-major weight),
+    which only one of the two orders can do. What fits neither is left as it is, for the shape and layout checks to
+    name."""
+    if len(buf.shape) != 3:
+        return buf
+    if _same_storage(buf, _declared_storage(t, memo)):
+        return buf.permute(0, 2, 1)
+    graph, kernel = buf.shape[1] == k, buf.shape[2] == k
+    if graph and kernel:
+        # Axis 1 of the kernel's order is axis 2 of the graph's, and the other way round.
+        graph, kernel = buf.stride(3 - unit) == 1, buf.stride(unit) == 1
+    return buf.permute(0, 2, 1) if graph and not kernel else buf
+
+
+def _general_moe_weight_scale_view(buf, t, memo: dict, graph_shape: tuple, index: int):
+    """A general grouped plan's weight scale, ``[B, K blocks, N blocks]`` in the graph, viewed in the kernel's
+    ``[B, N blocks, K blocks]`` order.
+
+    The promotion warps read a scale through its own strides, so a buffer of either order serves. The declared view is
+    read in the graph's order, and any other buffer in the one order its shape fits. A buffer whose shape fits both (as
+    many N blocks as K blocks) is refused unless it is the declared view: strides cannot tell the two orders apart (a
+    contiguous graph-order matrix and a contiguous kernel-order one are described alike), and reading one as the other
+    scales every block off the diagonal with its transposed neighbour's scale. What fits neither is left as it is, for
+    ``_general_moe_scale_reject`` to name."""
+    if len(buf.shape) != 3:
+        return buf
+    declared = _declared_storage(t, memo)
+    if _same_storage(buf, declared):
+        return buf.permute(0, 2, 1)
+    shape = tuple(buf.shape)
+    graph = shape == graph_shape
+    if graph and shape == (graph_shape[0], graph_shape[2], graph_shape[1]):
+        strides = "" if declared is None else f" (strides {tuple(declared[1])})"
+        raise ValueError(
+            f"MoE weight scale[{index}] of shape {tuple(int(d) for d in shape)}, strides {tuple(int(s) for s in buf.stride())}: its shape "
+            "fits both the graph's order [matrices, K blocks, N blocks] and the kernel's [matrices, N blocks, K blocks], as this "
+            f"weight has as many N blocks as K blocks, and strides cannot tell the two apart. Bind the declared view{strides}, or "
+            "declare the strides of the buffer this call binds"
+        )
+    return buf.permute(0, 2, 1) if graph else buf
+
+
+def _general_moe_weight_scales(facts: _GeneralMoeFacts, weights, scales, tensors, memo: dict, k: int) -> list:
+    """Each bound weight scale of a general grouped plan in the kernel's order (``_general_moe_weight_scale_view``),
+    against this call's extents and the count of scale matrices the graph declared."""
+    if facts.weight_scale is None or not weights or len(weights[0].shape) != 3:
+        return scales
+    (block_n, block_k), one = facts.weight_scale
+    graph_shape = (1 if one else int(weights[0].shape[0]), -(-k // block_k), -(-int(weights[0].shape[1]) // block_n))
+    return [_general_moe_weight_scale_view(s, t, memo, graph_shape, i) for i, (s, t) in enumerate(zip(scales, tensors))]
+
+
+def _general_moe_weight_layout_reject(facts: _GeneralMoeFacts, weights) -> str | None:
+    """Why a general grouped plan's weight, in the kernel's ``[E, N, K]`` order, is not contiguous along the axis the
+    kernel loads contiguously (K, or N for an MN-major weight), or ``None``: the kernel takes every other stride from
+    the call and assumes that one. It checks every weight of a gated pair; the multi-GEMM launch checks the first."""
+    unit = facts.weight_unit
+    for i, weight in enumerate(weights):
+        if len(weight.shape) == 3 and weight.shape[unit] > 1 and weight.stride(unit) != 1:
+            name = "K" if unit == 2 else "N"
+            return (
+                f"MoE weight operand[{i}] must be contiguous along {name}, the axis the plan loads contiguously; got shape "
+                f"{tuple(int(d) for d in weight.shape)}, strides {tuple(int(s) for s in weight.stride())} in the kernel's [E, N, K] order"
+            )
+    return None
+
+
 def _check_moe_combine_n(compiled, n: int) -> None:
     """Enforce the compiled N divisibility contract before output memset."""
     chain = compiled.chain
@@ -774,9 +935,24 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             raise ValueError(f"MoE {mode.upper()} token operands must share shape [1, rows, K]")
         return indices[0], indices[1] if mode in ("scatter", "combine") else None
 
+    # A general plan reads a weight scale in the order the bound buffer's shape fits, and refuses one whose shape fits
+    # both orders unless it is the declared view (_general_moe_weight_scale_view); it reads its weight likewise
+    # (_general_moe_weight_view). Other plans view only the declared storage in the kernel's order (_kernel_order).
+    facts = _general_moe_facts(compiled)
+    general = facts is not None
+
+    def token_k(tokens):
+        """The call's K, read off its first token buffer (-1, matching no extent, when that is not rank 3)."""
+        return int(tokens[0].shape[2]) if tokens and len(tokens[0].shape) == 3 else -1
+
     if isinstance(compiled.chain.moe, MoeSwapAbSpec):
-        a_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.a_operands]
-        b_bufs = [pull(t, "token") for t in b.b_operands]
+        if general:
+            b_bufs = [pull(t, "token") for t in b.b_operands]
+            k = token_k(b_bufs)
+            a_bufs = [_general_moe_weight_view(pull(t, "weight"), t, memo, k, facts.weight_unit) for t in b.a_operands]
+        else:
+            a_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.a_operands]
+            b_bufs = [pull(t, "token") for t in b.b_operands]
         out_bufs = [
             (
                 pull(t, "output")
@@ -787,10 +963,15 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         ]
         aux_bufs = [_swap_mn_view(pull(t, "aux")) for t in b.aux]
         fto = pull(b.first_token_offset, "first_token_offset")
-        sfa = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfa_operands]
+        sfa = [(pull(t, "weight SF") if general else _kernel_order(pull(t, "weight SF"), t, memo)) for t in b.sfa_operands]
         sfb = [pull(t, "token SF") for t in b.sfb_operands]
         mm = compiled.chain.matmul
         _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
+        if general:
+            reason = _general_moe_weight_layout_reject(facts, a_bufs)
+            if reason is not None:
+                raise ValueError(reason)
+            sfa = _general_moe_weight_scales(facts, a_bufs, sfa, b.sfa_operands, memo, k)
         token_index, token_ks = routing_indices(b_bufs)
         m = a_bufs[0].shape[1]
         n = token_index.shape[0] if token_index is not None else b_bufs[0].shape[1]
@@ -803,13 +984,22 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, (m, n, k)
 
     a_bufs = [pull(t, "token") for t in b.a_operands]
-    b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
+    if general:
+        k = token_k(a_bufs)
+        b_bufs = [_general_moe_weight_view(pull(t, "weight"), t, memo, k, facts.weight_unit) for t in b.b_operands]
+    else:
+        b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
     fto = pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "token SF") for t in b.sfa_operands]
-    sfb = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfb_operands]
+    sfb = [(pull(t, "weight SF") if general else _kernel_order(pull(t, "weight SF"), t, memo)) for t in b.sfb_operands]
     _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
+    if general:
+        reason = _general_moe_weight_layout_reject(facts, b_bufs)
+        if reason is not None:
+            raise ValueError(reason)
+        sfb = _general_moe_weight_scales(facts, b_bufs, sfb, b.sfb_operands, memo, k)
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     token_index, token_ks = routing_indices(a_bufs)
     S = token_index.shape[0] if token_index is not None else a_bufs[0].shape[1]
@@ -957,17 +1147,47 @@ class _CompiledRuntime:
                 raise ValueError(reason)
 
 
-_SCHED_EPOCHS = itertools.count(1)
+# Launch epochs carry bit 30 above 30 random bits: [2**30, 2**31).
+_SCHED_EPOCH_RANDOM_BITS = 30
+_SCHED_EPOCH_LOCK = threading.Lock()
+_sched_epoch_last = 0
 
 
 def _next_sched_epoch() -> int:
-    """A launch epoch no earlier launch of this process used: a positive 31-bit value, never 0.
+    """A launch epoch: a random value in [2**30, 2**31), never the value drawn just before it.
 
     A grouped kernel that takes one (``sched_epoch``) keeps its scheduler counter as ``epoch << 32 | tiles claimed``
     and starts the count over when the word it finds carries another epoch, so the counter in the (scratch)
-    workspace needs no clearing between launches. A CUDA graph replays a launch with the epoch drawn at capture, so
-    the cluster that draws a launch's last claim also returns the word to zero, no launch's epoch (``_sched_close``)."""
-    return next(_SCHED_EPOCHS) % 0x7FFFFFFF + 1
+    workspace needs no clearing between launches. The word may hold whatever another use of the workspace left there:
+    another plan's tensor map, whose first word is a device address, or small integers. An epoch equal to its upper
+    half would take up that count instead of starting its own, and claim no tile. No such upper half has bit 30 set
+    (a device address is below 2**57, its upper half below 2**25), and another leftover word matches a random epoch
+    with probability 2**-30, where a sequence of epochs would reach a fixed value in time. A draw differs from the one
+    before it, so a launch never continues the count its predecessor left on the word.
+
+    A CUDA graph replays a launch with the epoch drawn at capture, so the cluster that draws a launch's last claim
+    also returns the word to zero, no launch's epoch (``_sched_close``)."""
+    global _sched_epoch_last
+    with _SCHED_EPOCH_LOCK:
+        while True:
+            epoch = (1 << _SCHED_EPOCH_RANDOM_BITS) | secrets.randbits(_SCHED_EPOCH_RANDOM_BITS)
+            if epoch != _sched_epoch_last:
+                _sched_epoch_last = epoch
+                return epoch
+
+
+def _int8_input_slots(chain: FusionChain, recipe) -> tuple:
+    """The operand slots of a dense plan's int8 A and B operands, which every call must bind as int8 buffers. A chain
+    without an int8 operand reads nothing of ``recipe``."""
+    mm = chain.matmul
+    if "int8" not in (mm.a_dtype, mm.b_dtype):
+        return ()
+    return tuple(op.index for j, op in enumerate(recipe.inputs) if (mm.a_dtype if j < recipe.b_at else mm.b_dtype) == "int8")
+
+
+def _swap_ab_frame_note(m: int, n: int) -> str:
+    """The note a swap-AB plan's refusal at kernel-frame extents ``(m, n)`` carries."""
+    return f"[in the kernel frame of this swap-AB plan, which runs the graph transposed: its M = {m} and N = {n} are the graph's N and M, and its row / col quant axes the graph's col / row]"
 
 
 def _k_pad_launchable_for(plan, m: int, n: int) -> Callable:
@@ -999,6 +1219,18 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     # The kernel starts its scheduler counter from a launch epoch (the last element of the problem tuple) instead
     # of a counter-clearing kernel ahead of the launch.
     sched_epoch: bool = False
+    # The most routed groups a launch may have, 0 for no bound: a kernel whose scheduler copies the routing offsets
+    # into shared memory has room for the plan's num_groups + 1 of them.
+    sched_groups_max: int = 0
+    # A COMBINE plan's fill of its output as a programmatic launch ahead of the kernel, handed to the family's
+    # _initialize_combine_output; None zeroes the output with a memset. A family sets it only for kernels whose every
+    # role waits for its programmatic predecessor before it touches global memory.
+    combine_zero: "Callable | None" = None
+    # A family opts in when every check of its variant-pack call reads only the plan and the signature of the bound
+    # buffers (launch_cache): a call then replays the launch an earlier call with its signature recorded. sm120's does
+    # not: its COMBINE check (_check_moe_combine_operands) also reads the workspace's device.
+    _replay_calls: ClassVar[bool] = False
+    _launch_cache: Any = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def workspace_bytes(self) -> int:
@@ -1013,7 +1245,11 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             raise ValueError(
                 f"{type(self).__name__} requires a {n_slots * backend._MOE_DESC_SLOT_BYTES}-byte workspace but execute() received none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
             )
-        return backend._moe_carve_workspace(caller, n_slots, type(self).__name__)
+        carve = backend._moe_carve_workspace(caller, n_slots, type(self).__name__)
+        record = launch_cache.active_record()
+        if record is not None:
+            record.carves.append((n_slots, carve))
+        return carve
 
     def __call__(self, variant_pack, workspace=None, stream=None):
         """Validate the target device and dispatch a grouped GEMM call."""
@@ -1024,14 +1260,69 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         # The launch and the output fills before it are driver calls on this thread. An autograd backward runs on
         # a worker whose context stack can still be empty, so bind the context first.
         ensure_current_context(stream, self.device)
+        if self._replay_calls and self.binding is not None:
+            return self._call_replayed(variant_pack, workspace, stream)
         return self._call_variant_pack(variant_pack, workspace, stream)
+
+    def _check_sched_groups(self, num_groups: int) -> None:
+        """Refuse a call that routes more groups than the kernel's copy of the routing offsets holds. The launch paths
+        call it before they write anything (the output fills of COMBINE and reductions included)."""
+        if self.sched_groups_max and num_groups > self.sched_groups_max:
+            raise ValueError(
+                f"this grouped plan was built for at most {self.sched_groups_max} routed groups (first_token_offset of "
+                f"{self.sched_groups_max + 1} entries); the call routes {num_groups}. Build the plan from a graph "
+                "that declares the call's first_token_offset extent."
+            )
+
+    def _call_replayed(self, variant_pack, workspace, stream):
+        """``_call_variant_pack``, replayed when earlier calls had the same buffer signature (launch_cache).
+
+        A signature's first call takes the full path; its second takes it recorded, and what the record gives is kept
+        for the calls after it."""
+        cache = self._launch_cache
+        if cache is None or cache.binding is not self.binding:
+            cache = self._launch_cache = launch_cache.LaunchCache(self.binding, launch_cache.fill_count(self.chain))
+        slots = cache.slots(variant_pack, self._compiler.resolve_variant_pack)
+        if slots is None:
+            return self._call_variant_pack(variant_pack, workspace, stream)
+        try:
+            key = launch_cache.signature(slots)
+            entry = cache.entries.get(key)
+        except Exception:  # noqa: BLE001 -- a buffer whose facts cannot be read or hashed: the full path names it
+            return self._call_variant_pack(variant_pack, workspace, stream)
+        if entry is not None:
+            if entry is launch_cache.UNCACHEABLE:
+                return self._call_variant_pack(variant_pack, workspace, stream)
+            return self._launch_entry(entry, slots, workspace, stream)
+        if cache.first_sighting(key):
+            return self._call_variant_pack(variant_pack, workspace, stream)
+        with launch_cache.recording() as record:
+            result = self._call_variant_pack(variant_pack, workspace, stream)
+        cache.learn(key, record, slots)
+        return result
+
+    def _launch_entry(self, entry, slots, workspace, stream):
+        """The call ``entry`` recorded, on this call's buffers: the workspace carve, the argument views, the output
+        fills, then the launch with its own epoch -- the order of the full path's driver work. The routed-group bound
+        (``_check_sched_groups``) reads first_token_offset's extent, a signature fact: an entry exists only for a
+        signature whose calls passed it."""
+        args = launch_cache.arguments(entry, slots, self._make_workspace(entry.workspace_slots, workspace))
+        launch_cache.fill(entry, slots, stream, self.combine_zero, self._compiler._as_custream)
+        if entry.problem is None:
+            return None
+        return self._enqueue(self._launchable_k_pad if entry.k_pad else self._launchable, entry.problem, args, stream)
+
+    def _enqueue(self, launchable, problem, args, stream):
+        """Launch ``launchable`` on ``stream``, with a launch epoch appended to ``problem`` where the kernel takes one."""
+        if self.sched_epoch:
+            problem = (*problem, _next_sched_epoch())
+        return launchable(problem, *args, stream=self._compiler._as_custream(stream))
 
     def _launch_moe(self, problem, offsets, workspace, operands, outputs, aux, stream, token_index, token_ks, top_k_scores):
         """Assemble and launch the grouped GEMM arguments."""
-        if self.sched_epoch:
-            problem = (*problem, _next_sched_epoch())
-        return _k_pad_launchable_for(self, int(problem[0]), int(problem[1]))(
-            problem,
+        self._check_sched_groups(int(problem[4]))  # problem = (S, N, K, num_experts, num_groups, ...)
+        launchable = _k_pad_launchable_for(self, int(problem[0]), int(problem[1]))
+        args = (
             offsets,
             workspace,
             *((top_k_scores,) if top_k_scores is not None else ()),
@@ -1039,8 +1330,11 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             *((token_index,) if token_index is not None else ()),
             *operands,
             *_moe_launch_tail(outputs, aux, tma_slots=self.tma_slots),
-            stream=self._compiler._as_custream(stream),
         )
+        record = launch_cache.active_record()
+        if record is not None:
+            record.launches.append((tuple(problem), launchable is not self._launchable, args))
+        return self._enqueue(launchable, problem, args, stream)
 
 
 @dataclass
@@ -1220,6 +1514,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         check_grid = self._check_launch_grid if self._validate_launch_grid else None
         zero_extent = backend._zero_extent_problem if self._check_zero_extents else None
         aux_layouts = tuple(((x.index, backend._aux_layout_check(x.ref, swap_ab)) for x in r.aux)) if self._validate_aux_layout else ()
+        # The kernel's argument check takes a uint8 buffer for an int8 operand, whose bytes the MMA would read as signed
+        # (a graph.execute pack describes such a buffer as the declared int8 tensor before it gets here).
+        int8_inputs = _int8_input_slots(self.chain, r)
+        dtype_name = backend.buffers.dtype_name
         gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
@@ -1230,6 +1528,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             ensure_current_context(stream, device)
             original_operands = operands
             operands = r.operand_views(operands)
+            for idx in int8_inputs:
+                if dtype_name(operands[idx]) != "int8":
+                    gave_up["operand dtype"] += 1
+                    return refuse(original_operands, graph_order)
             vs = [operands[i] for i in in_slots]
             for j, perm, dsh, dst, force_graph_order in renorm:
                 v = vs[j]
@@ -1384,6 +1686,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         recipe = self.recipe
         backend._check_plan_device(recipe.device)
         operands = recipe.operand_views(operands)
+        for idx in _int8_input_slots(self.chain, recipe):
+            got = buffers.dtype_name(operands[idx])
+            if got != "int8":
+                raise ValueError(f"{recipe.roles[idx]} must be int8, the dtype the graph declares; got {got}: the int8 MMA reads its bytes as signed")
         mnk, axes = recipe.problem(operands, graph_order)
         backend.check_shapes(recipe, operands, mnk, axes)
         backend.check_alignment(recipe, operands, axes)
@@ -1421,9 +1727,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             except ValueError as exc:
                 if not self.config.swap_ab:
                     raise
-                raise ValueError(
-                    f"{exc} [in the kernel frame of this swap-AB plan, which runs the graph transposed: its M = {m} and N = {n} are the graph's N and M, and its row / col quant axes the graph's col / row]"
-                ) from exc
+                raise ValueError(f"{exc} {_swap_ab_frame_note(m, n)}") from exc
         self._check_quant_scale_blobs([operands[o.index] for o in recipe.outputs])
         if self._validate_aux_layout:
             backend._check_aux_layout(recipe, operands, int(mnk[0]), int(mnk[1]), self.config.swap_ab)
@@ -1462,6 +1766,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         self._check_quant_scale_blobs(outputs)
         num_experts = int(weight.shape[0])
         num_groups = backend._moe_num_groups(first_token_offset, num_experts)
+        self._check_sched_groups(num_groups)
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]
@@ -1485,7 +1790,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             )
         empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, None, token.shape[1])
         backend._initialize_reduction_outputs(self.chain, outputs, stream)
-        backend._initialize_combine_output(self.chain, outputs, stream)
+        backend._initialize_combine_output(self.chain, outputs, stream, self.combine_zero)
         if empty:
             return None
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b), cs, (), stream, token_index, token_ks, top_k_scores)
@@ -1587,6 +1892,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         self._check_quant_scale_blobs(outs)
         num_experts = int(b_slots[0].shape[0])
         num_groups = backend._moe_num_groups(first_token_offset, num_experts)
+        self._check_sched_groups(num_groups)
         a_stride_perms = [t.permute(1, 2, 0) for t in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for t in b_slots]
         c_perms = [ci.permute(1, 2, 0) for ci in outs]
@@ -1616,7 +1922,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             backend._check_moe_combine_operands(chain, a_slots, b_slots, first_token_offset, [], [], (token_index, token_ks, top_k_scores), outs, K, workspace)
         empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, None, a_slots[0].shape[1])
         backend._initialize_reduction_outputs(chain, outs, stream)
-        backend._initialize_combine_output(chain, outs, stream)
+        backend._initialize_combine_output(chain, outs, stream, self.combine_zero)
         if empty:
             return None
         return self._launch_moe(problem_size, first_token_offset, workspace, (*a_wrapped, *b_wrapped), cs, aux, stream, token_index, token_ks, top_k_scores)
@@ -1661,6 +1967,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 )
         num_experts = int(weight.shape[0])
         num_groups = backend._moe_num_groups(first_token_offset, num_experts)
+        self._check_sched_groups(num_groups)
         scale_blob_reason = backend._grouped_row_quant_scale_blob_reject(self.chain, outputs, S, N, num_groups)
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
@@ -1694,7 +2001,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             )
         empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, self.chain.block_scale.block_size, token.shape[1])
         backend._initialize_reduction_outputs(self.chain, outputs, stream)
-        backend._initialize_combine_output(self.chain, outputs, stream)
+        backend._initialize_combine_output(self.chain, outputs, stream, self.combine_zero)
         if empty:
             return None
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b, *sf_args), cs, (), stream, token_index, token_ks, top_k_scores)
@@ -1703,6 +2010,13 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         """Bind block-scaled grouped GEMM inputs and select the launch path."""
         backend = self._compiler
         a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, snk = backend._resolve_moe_variant_pack(self, variant_pack)
+        _facts = _general_moe_facts(self)
+        _general = _facts is not None
+        if _general:
+            # The kernel's argument check would take a uint8 buffer for an int8 operand.
+            _r_op = _general_moe_operand_reject(_facts, a_bufs, b_bufs)
+            if _r_op is not None:
+                raise ValueError(_r_op)
         _out_reqs = backend._output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
         _aux_reqs = backend._aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
         a_role, b_role = ("weight", "token") if isinstance(self.chain.moe, backend.MoeSwapAbSpec) else ("token", "weight")
@@ -1724,17 +2038,17 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             + [(b_role, x, 32 if _padded_b else 16, "ptr") for x in b_bufs]
             + [(f"output[{i}]", x, _out_reqs[i], "full") for i, x in enumerate(out_bufs)]
             + [(f"aux {self.chain.aux_tensors[i].name!r}", x, _aux_reqs[self.chain.aux_tensors[i].name], "full") for i, x in enumerate(aux_bufs)]
-            + [(f"{a_role} SF", x, 16, "ptr") for x in sfa or []]
-            + [(f"{b_role} SF", x, 16, "ptr") for x in sfb or []]
+            # A scale blob is a TMA source; a linear scale's element alignment is _general_moe_scale_reject's.
+            + ([] if _general else [(f"{a_role} SF", x, 16, "ptr") for x in sfa or []])
+            + ([] if _general else [(f"{b_role} SF", x, 16, "ptr") for x in sfb or []])
         )
         _r = backend._alignment_reject(_named)
         if _r is not None:
             raise ValueError(_r)
-        # Linear scales are read through their strides by the promotion warps: what has to hold is their shape.
-        _general = getattr(backend, "_is_general_block_scale", None)
-        _general = bool(_general is not None and _general(self.chain))
+        # Linear scales are read through their strides by the promotion warps, one element at a time: what has to hold
+        # is their shape, dtype and element alignment.
         if _general:
-            _r_sf = _general_moe_scale_reject(self.chain, a_bufs, b_bufs, sfa or [], sfb or [], int(snk[2]))
+            _r_sf = _general_moe_scale_reject(_facts, a_bufs, b_bufs, sfa or [], sfb or [], int(snk[2]))
             if _r_sf is not None:
                 raise ValueError(_r_sf)
         elif sfa or sfb:
@@ -1783,18 +2097,20 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 top_k_scores=top_k_scores,
             )
         out = out_bufs if len(out_bufs) > 1 else out_bufs[0]
-        fake_a = self.chain.block_scale.fake_dequant_a
-        fake_b = self.chain.block_scale.fake_dequant_b
+        # An operand that reads no scale tensor binds none: a raw FP8 operand the analyzer gave its peer's scale
+        # metadata (fake_dequant), and a raw bf16 / fp16 / int8 one of a one-sided general graph, which has neither.
+        a_scaled = self.chain.block_scale.a_scaled
+        b_scaled = self.chain.block_scale.b_scaled
         if self.chain.is_multi_gemm or self.chain.ops:
-            pairs = [((a_bufs[ai], None if fake_a else sfa[ai]), (b_bufs[bi], None if fake_b else sfb[bi])) for ai, bi in self.chain.gemm_operands]
+            pairs = [((a_bufs[ai], sfa[ai] if a_scaled else None), (b_bufs[bi], sfb[bi] if b_scaled else None)) for ai, bi in self.chain.gemm_operands]
             return self._call_multi_gemm(
                 pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream, token_index=token_index, token_ks=token_ks, top_k_scores=top_k_scores
             )
         return self._launch_single(
             a_bufs[0],
             b_bufs[0],
-            None if fake_a else sfa[0],
-            None if fake_b else sfb[0],
+            sfa[0] if a_scaled else None,
+            sfb[0] if b_scaled else None,
             fto,
             out,
             snk,
@@ -1852,6 +2168,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 )
         num_experts = int(b_slots[0][0].shape[0])
         num_groups = backend._moe_num_groups(first_token_offset, num_experts)
+        self._check_sched_groups(num_groups)
         scale_blob_reason = backend._grouped_row_quant_scale_blob_reject(chain, outs, S, N, num_groups)
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
@@ -1899,7 +2216,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             backend._check_moe_combine_operands(chain, tokens, weights, first_token_offset, *sfs, (token_index, token_ks, top_k_scores), outs, K, workspace)
         empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, chain.block_scale.block_size, a0.shape[1])
         backend._initialize_reduction_outputs(chain, outs, stream)
-        backend._initialize_combine_output(chain, outs, stream)
+        backend._initialize_combine_output(chain, outs, stream, self.combine_zero)
         if empty:
             return None
         return self._launch_moe(
@@ -1976,6 +2293,7 @@ _SHARED_EXPORTS = {
     "_moe_carve_workspace": _moe_carve_workspace,
     "_moe_launch_tail": _moe_launch_tail,
     "_k_pad_launchable_for": _k_pad_launchable_for,
+    "_swap_ab_frame_note": _swap_ab_frame_note,
 }
 
 _impl = importlib.import_module(f"{__package__}.{active_family()}.compiler")

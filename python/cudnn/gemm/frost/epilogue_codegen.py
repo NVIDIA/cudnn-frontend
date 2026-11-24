@@ -376,8 +376,11 @@ def _emit_op(
     third_in_chain: str | None = None,
     vsize: int = 32,
     fragment_coordinates: _FragmentCoordinates | None = None,
+    silu_tanh: bool = False,
 ) -> tuple[list[str], str]:
-    """Emit lines computing this op, given the previous-step var name."""
+    """Emit lines computing this op, given the previous-step var name.
+
+    ``silu_tanh`` evaluates SiLU (``swish`` without a beta, or with beta 1) through tanh.approx: see the ``swish`` branch."""
     new = f"_op_{idx}"
 
     if op.op == "identity":
@@ -537,6 +540,14 @@ def _emit_op(
 
     if op.op == "swish":
         beta = dict(op.attrs).get("swish_beta")
+        if silu_tanh and beta in (None, 1.0):
+            # SiLU as x * (1/2 + tanh(x / 2) / 2): fastmath lowers the tanh to tanh.approx.f32, one MUFU op per value where
+            # the form below takes two (ex2.approx and rcp.approx). Measured on SM100 over fp32 x in [-128, 128], its error
+            # is at most 4.0e-6 |x| (the form below: 1.7e-7 |x|). Relative, it is under 4.4e-6 for x >= -1 and grows as
+            # sigmoid(x) goes to 0 below that (1e-4 at x = -6, 1.4e-2 at x = -12); tanh.approx is exactly -1 from x = -16
+            # down, where the result is -0.
+            h = _fl(prev, 0.5)
+            return [f"{new} = {prev} * ({h} + {h} * cute.math.tanh({prev} * {h}, fastmath=True))"], new
         if beta is not None:
             return [
                 f"_swb{idx} = {prev} * {_fl(prev, beta)}",
@@ -1217,8 +1228,8 @@ class _AuxCodegen:
         raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
 
 
-def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=None, fragment_coordinates=None):
-    """Generate per-GEMM rounding and the shared pointwise DAG."""
+def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=None, fragment_coordinates=None, silu_tanh=False):
+    """Generate per-GEMM rounding and the shared pointwise DAG. ``silu_tanh``: see :func:`_emit_op`."""
     scatter = chain.has_moe and chain.moe.mode == "scatter"
     if fragment_coordinates is None and any(op.op == "gen_index" for op in chain.ops):
         fragment_coordinates = _FragmentCoordinates.row_vector(vsize)
@@ -1269,7 +1280,9 @@ def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=
         if third_in_chain is not None:
             cast_lines, third_in_chain = _compute_cast(third_in_chain, op.compute_dtype, f"{i}_c", source_dtype=_parent_dtype(op.parent_idx_c))
             body_lines.extend(cast_lines)
-        lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vsize, fragment_coordinates=fragment_coordinates)
+        lines, cur = _emit_op(
+            op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vsize, fragment_coordinates=fragment_coordinates, silu_tanh=silu_tanh
+        )
         if scatter and op.op == "gen_index":
             token_axis = 2 if isinstance(chain.moe, MoeSwapAbSpec) else 1
             if dict(op.attrs).get("axis") == token_axis:

@@ -109,11 +109,13 @@ def _sm103_make_circular_mma_desc(current_desc_circular, phase_k16, next_addr_bi
 
 
 def _a_collector_op(g):
-    if cutlass.const_expr(num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
+    # g is one of the mma_num_gemms GEMMs the MMA issues per K step. num_gemms counts the GEMMs the epilogue drains
+    # together: the same number, except for a general block-scale gated pair (two passes of one GEMM each).
+    if cutlass.const_expr(mma_num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
         return None
     if cutlass.const_expr(g == 0):
         return nvvm.Tcgen05MMACollectorOp.FILL
-    if cutlass.const_expr(g == num_gemms - 1):
+    if cutlass.const_expr(g == mma_num_gemms - 1):
         return nvvm.Tcgen05MMACollectorOp.LASTUSE
     return nvvm.Tcgen05MMACollectorOp.USE
 

@@ -25,14 +25,15 @@ from cudnn.gemm.frost.tile_helpers import (
     moe_combine_add,
     moe_combine_add_vector,
     moe_combine_stage,
-    moe_combine_bulk,
+    moe_combine_bulk as _moe_combine_bulk,
+    MoeCombineStaging,
     tma_scatter4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
     fence_tensormap_acquire as _fence_tensormap_acquire,
     fence_tensormap_release as _fence_tensormap_release,
+    l2_cache_policy as _l2_cache_policy,
     moe_swizzle_tile as _moe_swizzle_tile,
-    replace_tensormap_global_address as _replace_tensormap_global_address,
     replace_tensormap_global_dim_0 as _replace_tensormap_global_dim_0,
     replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
     replace_tensormap_global_dim_2 as _replace_tensormap_global_dim_2,
@@ -52,16 +53,19 @@ from cuda.bindings import driver as _cuda
 
 # @@INJECT_TILE_CONSTANTS@@
 
+# Workspace tensor-map slots per thread block: one per token operand, which stays unused (the token loads read through
+# the host's map of the whole token tensor), and one per TMA-store output.
 moe_desc_slots = num_a_operands + n_tma_outputs
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
-# The scheduler warp of cluster rank 0 publishes each claimed tile into every
-# cluster CTA's broadcast slot through mapa and arrives on that CTA's barrier,
-# a cluster-scope release by a thread of another CTA. The waits on the
-# broadcast ring poll that barrier at cluster scope with relaxed ordering and
-# then acquire through a fence restricted to shared::cluster memory. That
-# orders the slot read (and the producer's reuse of the slot) after the peer's
-# access just like an acquire-ordered cluster-scope wait, without the L1
-# invalidation such a wait costs on every poll.
+# In a cluster of several thread blocks, the scheduler warp of cluster rank 0
+# publishes each claimed tile into every cluster CTA's broadcast slot through
+# mapa and arrives on that CTA's barrier, a cluster-scope release by a thread
+# of another CTA. The waits on the broadcast ring poll that barrier at cluster
+# scope with relaxed ordering and then acquire through a fence restricted to
+# shared::cluster memory. That orders the slot read (and the producer's reuse
+# of the slot) after the peer's access just like an acquire-ordered
+# cluster-scope wait, without the L1 invalidation such a wait costs on every
+# poll. A thread block that is its own cluster claims its tiles directly.
 _SCHED_BCAST_CLUSTER = cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1
 _SCHED_BCAST_SCOPE = nvvm.MBarrierScope.CLUSTER if _SCHED_BCAST_CLUSTER else None
 _SCHED_BCAST_ORDER = nvvm.MemOrder.RELAXED if _SCHED_BCAST_CLUSTER else None
@@ -98,7 +102,8 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
 
 
 def _a_collector_op(g):
-    # The MMA issues mma_num_gemms (one) GEMM per K step; num_gemms counts the GEMMs the epilogue drains together.
+    # g is one of the mma_num_gemms GEMMs the MMA issues per K step. num_gemms counts the GEMMs the epilogue drains
+    # together: the same number, except for a general block-scale gated pair (two passes of one GEMM each).
     if cutlass.const_expr(mma_num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
         return None
     if cutlass.const_expr(g == 0):
@@ -145,6 +150,41 @@ def _load_sfb(ptr, stride_k, stride_n, stride_l, l_idx, col, k_idx, n, k):
     return (ptr + blk_k * stride_k + blk_n * stride_n + l_idx * stride_l).load()
 
 
+# The scale loads of every window take the strength-reduced address of _load_sf: a scale line (row or column) computed
+# once per tile plus an Int32 K block. The weight-scale grid, reloaded once per 32 // runs windows, keeps the Int64
+# index of _load_sfb: ptxas branches around that long reload but predicates the short form into every window, which
+# measured 1.2% slower on the dsv3 FC1 at 4096 tokens (SM100).
+#
+# A promotion window spans _promo_window_k K elements, and a scale K block _sf*_block_windows windows (promotion_k is
+# the gcd of the scale K blocks).
+_promo_window_k = insts_per_window * mma_inst_k_elems
+_sfa_block_windows = sfa_block_k // _promo_window_k if sfa_present else 1
+_sfb_block_windows = sfb_block_k // _promo_window_k if sfb_present else 1
+
+
+def _sfa_line(ptr, stride_m, stride_l, l_idx, row, m):
+    """Where A's scales of ``row`` start (its first K block). A row past the extent addresses the last row block, so
+    the loads need no bounds branch; the promotion discards what was read for such a row."""
+    return ptr + (cutlass.min(cutlass.Int64(row), m - 1) // sfa_block_m) * stride_m + l_idx * stride_l
+
+
+def _sfb_line(ptr, stride_n, stride_l, l_idx, col, n):
+    """Where B's scales of ``col`` start, bounded like :func:`_sfa_line`."""
+    return ptr + (cutlass.min(cutlass.Int64(col), n - 1) // sfb_block_n) * stride_n + l_idx * stride_l
+
+
+def _load_sf(line, stride_k, window, block_windows, last_block):
+    """The raw scale of promotion window ``window`` (K index ``window * _promo_window_k``) on a scale line of
+    :func:`_sfa_line` / :func:`_sfb_line`: K block ``window // block_windows``, or the last block, ``last_block``, for
+    a window past K, whose value the promotion discards. For the K >= 1 of every launch that is K block
+    ``min(window * _promo_window_k, k - 1) // block_k``, computed in Int32. Neither ``window`` nor ``last_block`` (clamped
+    at 0) is negative, so the block widens unsigned."""
+    blk = window
+    if cutlass.const_expr(block_windows > 1):
+        blk = window // block_windows
+    return (line + cutlass.Uint64(cutlass.min(blk, last_block)) * stride_k).load()
+
+
 # A scale that is the same for every lane of a warp is loaded once and shuffled to the warp. Each lane loads one
 # value of a (column run, window) grid, so one global load covers 32 // runs windows of this thread's column runs
 # (or 32 runs of one window when it has more than 32 of them).
@@ -165,7 +205,9 @@ _promo_tbl_runs = 32 * _sfb_loads
 # The scheduler counter is one 64-bit word in the workspace: the launch epoch above the count of tiles claimed.
 # A workspace is scratch memory, so the word a launch finds is the last launch's, another plan's or unset: any word
 # whose epoch is not this launch's is replaced by this epoch with a count of zero, by whichever cluster gets there
-# first. No kernel has to clear the counter ahead of the launch.
+# first. No kernel has to clear the counter ahead of the launch. The host draws the epoch at random in [2**30, 2**31)
+# (compiler._next_sched_epoch): the word may hold another plan's tensor map, whose first word is a device address, or
+# small integers, and no address's upper half or small integer equals an epoch.
 #
 # A launch also runs again with the epoch it was given: a CUDA graph replays its launches with the arguments they
 # were captured with. So the launch's last claim returns the word to zero, an epoch no launch has. Each cluster
@@ -203,6 +245,42 @@ def _sched_close(counter_ptr, epoch, claimed, launch_tiles):
     if claimed == claims - 1:
         left = (cutlass.Int64(epoch) << 32) | cutlass.Int64(claims)
         nvvm.atomicrmw("cas", counter_ptr, left, b=cutlass.Int64(0), mem_order="relaxed", syncscope="gpu")
+
+
+_FTO_BYTES = offset_cutlass_dtype.width // 8
+
+
+def _sched_offset(fto_smem, first_token_arr, i):
+    """``first_token_offset[i]`` for the scheduler warp: from its shared-memory copy when the plan stages one."""
+    if cutlass.const_expr(sched_fto_entries > 0):
+        return cutlass.Int32((fto_smem.subview(i)).load())
+    return cutlass.Int32(first_token_arr[i])
+
+
+@cute.jit
+def moe_combine_bulk(
+    staging,
+    output,
+    token_index,
+    token_ks,
+    scores,
+    row,
+    group_end,
+    col,
+    columns,
+    output_row_stride,
+    top_k: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+):
+    """The shared drain's bulk reduction (tile_helpers.moe_combine_bulk), evict_last in L2 when the launch's output
+    (tokens x N) takes more than combine_evict_last_bytes: its rows then stay in L2 between the reductions of a token's
+    routed rows. A smaller output stays resident without the hint, and evict_last lines left after the kernel slowed
+    the kernel that ran next."""
+    if cutlass.Int64(scores.shape[0]) * columns * (dtype.width // 8) > combine_evict_last_bytes:
+        _moe_combine_bulk(staging, output, token_index, token_ks, scores, row, group_end, col, columns, output_row_stride, top_k, width, dtype, True)
+    else:
+        _moe_combine_bulk(staging, output, token_index, token_ks, scores, row, group_end, col, columns, output_row_stride, top_k, width, dtype)
 
 
 @cute.kernel
@@ -245,7 +323,8 @@ def _kernel(
     # the share of the accumulator columns.
     promo_warp_id_start = 8
     num_promo_warps = 4 * num_promo_groups
-    prod_reg_count = 24
+    # The control warpgroup's share of the register pool (compiler._GENERAL_BS_GROUPED_CTL_REGS).
+    prod_reg_count = ctl_reg_count
 
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -364,15 +443,10 @@ def _kernel(
     sched_bcast_slot = cutlass.Array(cutlass.Int32, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=16)
     sched_bcast_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
     sched_bcast_empty_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
-    tma_a_desc_smem_list = [
-        cutlass.Array(
-            cutlass.Int64,
-            TENSOR_MAP_QWORDS,
-            space=cutlass.AddressSpace.smem,
-            alignment=128,
-        )
-        for _ in range(num_a_operands)
-    ]
+    sched_fto_smem = None
+    if cutlass.const_expr(sched_fto_entries > 0):
+        # The scheduler's copy of first_token_offset (the plan's num_groups + 1 entries; compiler._sched_fto_entries).
+        sched_fto_smem = cutlass.Array(offset_cutlass_dtype, sched_fto_entries, space=cutlass.AddressSpace.smem, alignment=16)
 
     # @@TMA_STORE_ONLY:BEGIN@@
     epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
@@ -391,11 +465,17 @@ def _kernel(
     # @@TMA_STORE_ONLY:END@@
 
     if cutlass.const_expr(moe_combine_bulk_enabled):
-        combine_staging = cutlass.Array(
-            cd_dtype,
-            epi_stage_rows * epi_cols_per_mma_m,
-            space=cutlass.AddressSpace.smem,
-            alignment=1024,
+        # One row per epilogue thread, padded against bank conflicts; the drain addresses it by unpadded offsets.
+        combine_row_pad = moe_combine_staging_pad_bytes * 8 // cd_dtype.width
+        combine_staging = MoeCombineStaging(
+            cutlass.Array(
+                cd_dtype,
+                epi_stage_rows * (epi_cols_per_mma_m + combine_row_pad),
+                space=cutlass.AddressSpace.smem,
+                alignment=1024,
+            ),
+            epi_cols_per_mma_m,
+            combine_row_pad,
         )
 
     sA_elems = sA_packed_elems
@@ -518,13 +598,41 @@ def _kernel(
     num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
     first_token_arr = cutlass.make_array_view(first_token_offset)
 
-    if warp_idx == scheduler_warp_id:
+    # setmaxnreg is a warpgroup instruction: every warp of a warpgroup executes the same one (PTX ISA, setmaxnreg).
+    # The control warpgroup (warps 4..7: MMA, TMA, scheduler, unused) lowers its count here, before its warps branch
+    # to their roles.
+    if warp_idx >= 4 and warp_idx < 8:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+
+    if warp_idx == scheduler_warp_id:
+        # The routing offsets this warp reads and the workspace word it counts tiles in may be a programmatic
+        # predecessor's outputs: it waits for the predecessor like the other roles.
+        if cutlass.const_expr(USE_PDL):
+            nvvm.griddepcontrol("wait")
         full_warp_mask = 0xFFFFFFFF
         shfl_idx_clamp = 0x1F
         shfl_up_clamp = 0
         lane = cute.arch.lane_idx()
-        gemm_s = cutlass.Int32(first_token_arr[num_groups])
+        if cutlass.const_expr(sched_fto_entries > 0):
+            # The group searches below read the routing offsets from the thread block's copy in shared memory. The
+            # warp copies them once, with every copy in flight at the same time, while rank 0 opens the counter.
+            fto_base = first_token_offset.iterator.toint()
+            for fto_chunk in range(cute.ceil_div(num_groups + 1, 32)):
+                fto_i = fto_chunk * 32 + lane
+                if fto_i <= num_groups:
+                    nvvm.cp_async_shared_global(
+                        sched_fto_smem.data_ptr(fto_i),
+                        cutlass.inttoptr(fto_base + cutlass.Int64(fto_i) * _FTO_BYTES, 1, offset_cutlass_dtype),
+                        _FTO_BYTES,
+                        nvvm.LoadCacheModifier.CA,
+                    )
+            nvvm.cp_async_commit_group()
+            if cta_rank_in_cluster == 0:
+                if lane == 0:
+                    _sched_open(sched_counter_ptr, sched_epoch)
+            nvvm.cp_async_wait_group(0)
+            nvvm.bar_warp_sync(0xFFFFFFFF)
+        gemm_s = _sched_offset(sched_fto_smem, first_token_arr, num_groups)
         sched_stage = cutlass.Int32(0)
         sched_empty_phase = cutlass.Int32(1)
         bcast_stage = cutlass.Int32(0)
@@ -541,7 +649,7 @@ def _kernel(
         is_tile_valid = cutlass.Int32(1)
         cached_next_end = cutlass.Int32(0)
         if lane < num_groups:
-            cached_next_end = cutlass.Int32(first_token_arr[lane + 1])
+            cached_next_end = _sched_offset(sched_fto_smem, first_token_arr, lane + 1)
         else:
             cached_next_end = gemm_s
         tile_lower_bound = nvvm.shfl_sync(full_warp_mask, cached_next_end, 1, shfl_up_clamp, nvvm.Shfl.UP)
@@ -549,15 +657,34 @@ def _kernel(
         if lane != 0:
             cached_next_begin = tile_lower_bound
 
-        if cta_rank_in_cluster == 0:
-            if lane == 0:
-                _sched_open(sched_counter_ptr, sched_epoch)
+        if cutlass.const_expr(sched_fto_entries == 0):
+            if cta_rank_in_cluster == 0:
+                if lane == 0:
+                    _sched_open(sched_counter_ptr, sched_epoch)
 
         while is_tile_valid != 0:
-            if cta_rank_in_cluster == 0:
+            if cutlass.const_expr(cluster_size > 1):
+                if cta_rank_in_cluster == 0:
+                    while not nvvm.mbarrier_try_wait_parity(
+                        sched_bcast_empty_mbar_ptr.subview(bcast_stage),
+                        bcast_empty_phase,
+                        time_limit=10_000_000,
+                        scope=_SCHED_BCAST_SCOPE,
+                        order=_SCHED_BCAST_ORDER,
+                    ):
+                        pass
+                    if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
+                        nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
+                    claimed = cutlass.Int32(0)
+                    if lane == 0:
+                        claimed = _sched_claim(sched_counter_ptr)
+                    claimed = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
+                    if lane < cluster_size:
+                        (nvvm.mapa(sched_bcast_slot.subview(bcast_stage), lane)).store(claimed)
+                        nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_full_mbar_ptr.subview(bcast_stage), lane))
                 while not nvvm.mbarrier_try_wait_parity(
-                    sched_bcast_empty_mbar_ptr.subview(bcast_stage),
-                    bcast_empty_phase,
+                    sched_bcast_full_mbar_ptr.subview(bcast_stage),
+                    bcast_full_phase,
                     time_limit=10_000_000,
                     scope=_SCHED_BCAST_SCOPE,
                     order=_SCHED_BCAST_ORDER,
@@ -565,36 +692,24 @@ def _kernel(
                     pass
                 if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
                     nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
+                linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
+                nvvm.bar_warp_sync(0xFFFFFFFF)
+                # The index read from the mailbox reaches the address of its release on rank 0's barrier (python/cudnn/AGENTS.md Rule 11),
+                # after which rank 0 may write the mailbox again.
+                consume_then_arrive_on_peer(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0, linear_idx, rz, pred=lane == 0)
+                last_bcast_stage = bcast_stage
+                last_bcast_empty_done_phase = bcast_empty_phase ^ 1
+                bcast_stage += 1
+                if bcast_stage == SCHED_BCAST_STAGES:
+                    bcast_stage = cutlass.Int32(0)
+                    bcast_full_phase = bcast_full_phase ^ 1
+                    bcast_empty_phase = bcast_empty_phase ^ 1
+            else:
+                # A thread block that is its own cluster claims directly: no mailbox to publish through or acknowledge.
                 claimed = cutlass.Int32(0)
                 if lane == 0:
                     claimed = _sched_claim(sched_counter_ptr)
-                claimed = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
-                if lane < cluster_size:
-                    (nvvm.mapa(sched_bcast_slot.subview(bcast_stage), lane)).store(claimed)
-                    nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_full_mbar_ptr.subview(bcast_stage), lane))
-            while not nvvm.mbarrier_try_wait_parity(
-                sched_bcast_full_mbar_ptr.subview(bcast_stage),
-                bcast_full_phase,
-                time_limit=10_000_000,
-                scope=_SCHED_BCAST_SCOPE,
-                order=_SCHED_BCAST_ORDER,
-            ):
-                pass
-            if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
-                nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
-            linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
-            nvvm.bar_warp_sync(0xFFFFFFFF)
-            # The index read from the mailbox reaches the address of its release on rank 0's barrier (python/cudnn/AGENTS.md Rule 11),
-            # after which rank 0 may write the mailbox again.
-            consume_then_arrive_on_peer(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0, linear_idx, rz, pred=lane == 0)
-            if cutlass.const_expr(cluster_size > 1):
-                last_bcast_stage = bcast_stage
-                last_bcast_empty_done_phase = bcast_empty_phase ^ 1
-            bcast_stage += 1
-            if bcast_stage == SCHED_BCAST_STAGES:
-                bcast_stage = cutlass.Int32(0)
-                bcast_full_phase = bcast_full_phase ^ 1
-                bcast_empty_phase = bcast_empty_phase ^ 1
+                linear_idx = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
 
             group_begin = cached_next_begin
             group_end = cached_next_end
@@ -614,7 +729,7 @@ def _kernel(
                     )
                     next_end_group = group_idx + 32 + 1
                     if next_end_group <= num_groups:
-                        cached_next_end = cutlass.Int32(first_token_arr[next_end_group])
+                        cached_next_end = _sched_offset(sched_fto_smem, first_token_arr, next_end_group)
                     else:
                         cached_next_end = gemm_s
                     tile_lower_bound = nvvm.shfl_sync(
@@ -698,7 +813,7 @@ def _kernel(
                         )
                         group_end_idx = group_idx + lane + 1
                         if group_end_idx <= num_groups:
-                            cached_next_end = cutlass.Int32(first_token_arr[group_end_idx])
+                            cached_next_end = _sched_offset(sched_fto_smem, first_token_arr, group_end_idx)
                         else:
                             cached_next_end = gemm_s
                         tile_lower_bound = nvvm.shfl_sync(
@@ -811,7 +926,6 @@ def _kernel(
                     nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
 
     if warp_idx == tma_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
@@ -822,26 +936,22 @@ def _kernel(
         if cutlass.const_expr(cta_group == 2):
             logical_cta_tile_n = cgrp_tile_mnk[1] // cluster_n
 
-        lane = tidx % 32
-        block_linear = bidx + bidy * gridx
-        cta_desc_base_list = [a_tma_workspace.iterator.raw_ptr() + (block_linear * moe_desc_slots + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_a_operands)]
-        a_desc_tma_ptr_list = [
-            cute.make_ptr(
-                cutlass.Int64,
-                cta_desc_base_list[_ai].toint(),
-                mem_space=cute.AddressSpace.generic,
-            )
-            for _ai in range(num_a_operands)
-        ]
-        previous_group_begin = cutlass.Int32(-1)
-        if cutlass.const_expr(moe_aligned_offsets or moe_combine_fixed_descriptors):
-            a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
-        else:
-            a_desc_load_list = a_desc_tma_ptr_list
-        if elect_one and cutlass.const_expr(not moe_aligned_offsets and (not moe_combine_fixed_descriptors)):
-            for _ai in cutlass.range_constexpr(num_a_operands):
-                _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
-        nvvm.bar_warp_sync(0xFFFFFFFF)
+        # The token rows load through the host's map of the whole token tensor, at the group's first row plus the
+        # tile's: no per-group copy of the map to rewrite. A box that runs past the group's last row reads the next
+        # group's rows, or zeros past the end of the tensor. No output drain stores a row past the group's end (each
+        # bounds its rows by group_end); with a token scale, the promotion also scales such a row by zero, and without
+        # one (an unscaled token operand) the row's accumulator holds its product with this group's weights.
+        a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
+        if cutlass.const_expr(moe_combine):
+            # A COMBINE's reductions read and write its output rows in L2, and the weight tiles stream past them: a tile
+            # that a single M tile of its group reads is not read again and loads evict_first. Every group's weight tiles
+            # do while the output fits in combine_first_every_group_bytes, and none while the weights the launch can read
+            # fit in combine_first_min_weight_bytes (compiler._combine_l2_policy_bytes).
+            b_policy_first = _l2_cache_policy("evict_first")
+            b_policy_normal = _l2_cache_policy("evict_normal")
+            b_weight_bytes = cutlass.min(cutlass.min(M, cutlass.Int64(num_experts)), cutlass.Int64(num_groups)) * N * k * ab_max_data_bits // 8
+            b_first_streams = b_weight_bytes > combine_first_min_weight_bytes
+            b_first_every_group = cutlass.Int64(top_k_scores.shape[0]) * N * (cd_dtype.width // 8) <= combine_first_every_group_bytes
 
         while is_valid != 0:
             while not nvvm.mbarrier_try_wait_parity(
@@ -876,27 +986,12 @@ def _kernel(
                 else:
                     coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
                     coord_n_pair = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n
-                if cutlass.const_expr(moe_combine_fixed_descriptors):
-                    coord_m_desc = group_begin + coord_m_group
-                elif cutlass.const_expr(moe_aligned_offsets):
-                    coord_m_desc = group_begin + coord_m_group
-                else:
-                    coord_m_desc = coord_m_group
-
-                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets and (not moe_combine_fixed_descriptors)):
-                    previous_group_begin = group_begin
-                    for _ai in cutlass.range_constexpr(num_a_operands):
-                        _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
-                    for _ai in cutlass.range_constexpr(num_a_operands):
-                        if elect_one:
-                            row_base = mA_list[_ai].iterator.raw_ptr().toint() + ((group_begin * a_stride_m_list[_ai] * a_dtype.width) >> 3)
-                            _replace_tensormap_global_address(tma_a_desc_smem_list[_ai], row_base)
-                            _replace_tensormap_global_dim_1(tma_a_desc_smem_list[_ai], group_end - group_begin)
-                        nvvm.bar_warp_sync(0xFFFFFFFF)
-                        if lane < TENSOR_MAP_QWORDS:
-                            (cta_desc_base_list[_ai] + lane).store((tma_a_desc_smem_list[_ai].subview(lane)).load())
-                        nvvm.bar_warp_sync(0xFFFFFFFF)
-                        _fence_tensormap_release()
+                coord_m_desc = group_begin + coord_m_group
+                b_l2_policy = None
+                if cutlass.const_expr(moe_combine):
+                    b_l2_policy = b_policy_normal
+                    if b_first_streams & (b_first_every_group | (group_end - group_begin <= cgrp_tile_mnk[0])):
+                        b_l2_policy = b_policy_first
 
                 for k_tile_idx in range(num_k_tiles):
                     stage = ab_iter % ab_stages
@@ -968,6 +1063,7 @@ def _kernel(
                                             ab_full_mbar_ptr.subview(stage),
                                             [],
                                             multicast_mask=tma_mcast_mask_b,
+                                            l2_cache_hint=b_l2_policy,
                                             group=_CTA_GROUP,
                                         )
                             else:
@@ -979,6 +1075,7 @@ def _kernel(
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
                                         multicast_mask=tma_mcast_mask_b,
+                                        l2_cache_hint=b_l2_policy,
                                         group=_CTA_GROUP,
                                     )
                     ab_iter += 1
@@ -1012,7 +1109,6 @@ def _kernel(
         else:
             ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if warp_idx == mma_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         _tcgen05_alloc(
             tmem_ptr_i32,
             cutlass.Int32(num_tmem_alloc_cols),
@@ -1493,6 +1589,11 @@ def _kernel(
                 if (is_valid != 0) & (glu_gemm != 0):
                     if (tile_iter % acc_stages == 0) & (tile_iter != 0):
                         acc_full_phase_bit = acc_full_phase_bit ^ 1
+                    # Its acc_full phase still completes: wait on it, so that no phase of the barrier goes unobserved
+                    # (compute-sanitizer synccheck reports that as a missing wait). The second pass's stage completes
+                    # after it, so the drain starts no later.
+                    while not nvvm.mbarrier_try_wait_parity(acc_full_mbar_ptr.subview(tile_iter % acc_stages), acc_full_phase_bit, time_limit=10_000_000):
+                        pass
                     tile_iter += 1
                     epi_drain = cutlass.Int32(0)
             if epi_drain != 0:
@@ -1515,12 +1616,16 @@ def _kernel(
                                 (d_desc_base_list[_di] + lane).store((_scratch.subview(lane)).load())
                             nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
+                        # The stores below fetch the rewritten map, not a copy of the old one.
+                        for _di in cutlass.range_constexpr(n_tma_outputs):
+                            _fence_tensormap_acquire(d_desc_ptr_list[_di])
                 # @@TMA_STORE_ONLY:END@@
                 # @@WIDE_QUANT_ONLY:BEGIN@@
                 # A quantize block as wide as the tile (wide_quant) cannot be scaled as its values leave the accumulator: the block's
                 # maximum comes first. Two sweeps of the tile take the place of the shared drain below: the first evaluates the
                 # epilogue values, takes the maxima and writes the values back over the (first) accumulator; the second quantizes
-                # them by their block's scale and stores them. The stage is released after the second sweep's loads.
+                # them by their block's scale and stores them. The stage is released after the second sweep's loads, and a gated
+                # pair's other stage (the tile's first pass), which only the first sweep reads, after the first sweep's stores.
                 coord_n_c = tile_n * cgrp_tile_mnk[1] + n_rank * (cta_tile_mnk[1] * cta_group)
                 acc_stage = tile_iter % acc_stages
                 if acc_stage == 0 and tile_iter != 0:
@@ -1553,6 +1658,14 @@ def _kernel(
                         # @@INJECT_WQ_VALUES@@
                         nvvm.tcgen05_st(shape, cutlass.inttoptr(tmem_col_addr_gemms[0] + wq_col, 6, cutlass.Float32), wq_src)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(glu_pair):
+                    # The tile's first pass (the second paired GEMM, one stage back) has been read for the last time, and every
+                    # value loaded from it reached a store above, finished now (python/cudnn/AGENTS.md Rule 11, tensor memory):
+                    # its stage goes back to the MMA warp, so that the next tile's first pass runs under the second sweep.
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                    if elect_one:
+                        nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage - 1))
                 if cutlass.const_expr(wide_quant_lanes):
                     # A block across the lanes: every epilogue warp's column maxima are in wq_colmax before any warp reads them.
                     nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
@@ -1565,8 +1678,7 @@ def _kernel(
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:
-                            for _g in cutlass.range_constexpr(glu_passes):
-                                nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage - _g))
+                            nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
                     col = coord_n_c + subtile_col_offset
                     for j in cutlass.range_constexpr(subtile_w // vsize):
                         col_j = col + j * vsize
@@ -1725,6 +1837,13 @@ def _kernel(
             if elect_one:
                 nvvm.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
+        # @@TMA_STORE_ONLY:BEGIN@@
+        # The last bulk stores still read the staging ring after they are issued: warp 0 waits for those reads, so
+        # the thread block does not exit (and hand its shared memory to the next one) before they are done.
+        if warp_idx == 0:
+            nvvm.cp_async_bulk_wait_group(0, read=True)
+        # @@TMA_STORE_ONLY:END@@
+
     if warp_idx >= promo_warp_id_start:
         nvvm.setmaxregister(promo_reg_count, nvvm.SetMaxRegisterAction.INCREASE)
         nvvm.barrier_cta_sync(barrier_id=TMEM_ALLOC_BARRIER_ID, thread_count=tmem_alloc_bar_count)
@@ -1788,6 +1907,13 @@ def _kernel(
             promo_is_writer = (warp_idx % 4) == 3 - promo_group
             promo_tbl_full = promo_tbl_full_mbar_ptr.subview(promo_group * partial_stages)
             promo_tbl = promo_scale_tbl.subview(promo_group * partial_stages * _promo_tbl_runs)
+        # The windows that start inside K (window * _promo_window_k < k; a later one is the zero-filled tail of the last
+        # K tile), and the last K block of each scale, which a load for a window past K reads.
+        live_windows = cutlass.Int32((k + (_promo_window_k - 1)) // _promo_window_k)
+        if cutlass.const_expr(sfa_present):
+            sfa_last_block = cutlass.Int32(cutlass.max((k - 1) // sfa_block_k, 0))
+        if cutlass.const_expr(sfb_present):
+            sfb_last_block = cutlass.Int32(cutlass.max((k - 1) // sfb_block_k, 0))
 
         tile_iter = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
@@ -1847,24 +1973,31 @@ def _kernel(
                 if cutlass.const_expr(promo_in_registers):
                     for c in cutlass.range_constexpr(promo_cols):
                         promo_sum[c] = cutlass.Float32(0.0)
+                # A load of _load_sf addresses a scale line (row or column, computed here once per tile) plus a K block
+                # computed from the window index in Int32.
                 if cutlass.const_expr(sfa_present and not _sfa_uniform):
                     # The first window's per-lane A scales.
+                    sfa_lines = []
                     for mi in cutlass.range_constexpr(promo_mi_count):
                         row = coord_m_tile + (promo_mi0 + mi) * epi_rows_per_mma_m + promo_lane
-                        sfa_next[mi] = _load_sfa(sfa_ptr, sfa_stride_m, sfa_stride_k, sfa_stride_l, 0, row, 0, M, k)
+                        sfa_lines.append(_sfa_line(sfa_ptr, sfa_stride_m, sfa_stride_l, 0, row, M))
+                        sfa_next[mi] = _load_sf(sfa_lines[mi], sfa_stride_k, 0, _sfa_block_windows, sfa_last_block)
                 if cutlass.const_expr(sfb_present):
                     # The first grid period's loads (the first window's, for the table).
                     if cutlass.const_expr(promo_scale_table):
-                        prime_k = cutlass.Int64(0)
+                        prime_window = 0
                     else:
-                        prime_k = cutlass.Int64(promo_warp_lane // _sfb_shfl_cols) * (insts_per_window * mma_inst_k_elems)
+                        prime_window = promo_warp_lane // _sfb_shfl_cols
                     if cutlass.const_expr(_sfa_folded):
                         prime_row = coord_m_tile
-                        sfa_ahead[0] = _load_sfa(sfa_ptr, sfa_stride_m, sfa_stride_k, sfa_stride_l, 0, prime_row, prime_k, M, k)
+                        sfa_fold_line = _sfa_line(sfa_ptr, sfa_stride_m, sfa_stride_l, 0, prime_row, M)
+                        sfa_ahead[0] = _load_sf(sfa_fold_line, sfa_stride_k, prime_window, _sfa_block_windows, sfa_last_block)
+                    sfb_lines = []
                     for load in cutlass.range_constexpr(_sfb_loads):
                         prime_run = load * 32 + promo_lane_run
                         prime_col = coord_n_c + promo_n0 + prime_run * sfb_group_cols
-                        sfb_ahead[load] = _load_sfb(sfb_ptr, sfb_stride_k, sfb_stride_n, sfb_stride_l, sfb_l, prime_col, prime_k, N, k)
+                        sfb_lines.append(_sfb_line(sfb_ptr, sfb_stride_n, sfb_stride_l, sfb_l, prime_col, N))
+                        sfb_ahead[load] = _load_sf(sfb_lines[load], sfb_stride_k, prime_window, _sfb_block_windows, sfb_last_block)
                 for window in range(last_window + 1):
                     partial_slot = partial_iter % partial_stages
                     if partial_slot == 0 and partial_iter != 0:
@@ -1873,7 +2006,7 @@ def _kernel(
                     # past K (the zero-filled tail of the last K tile) holds an exact zero partial: scale it by zero
                     # instead of by a scale block that does not exist.
                     window_k = cutlass.Int64(window) * (insts_per_window * mma_inst_k_elems)
-                    window_live = window_k < k
+                    window_live = window < live_windows
 
                     row_scales = []
                     if cutlass.const_expr(_sfa_folded):
@@ -1894,13 +2027,12 @@ def _kernel(
                             row_scales.append(nvvm.shfl_sync(0xFFFFFFFF, sfa_grid[0], (window % _sfa_windows) * promo_mi_count + mi, 0x1F, nvvm.Shfl.IDX))
                     else:
                         # Take this window's per-lane A scales, loaded during the previous one, and issue the next window's loads.
-                        next_k = window_k + insts_per_window * mma_inst_k_elems
                         for mi in cutlass.range_constexpr(promo_mi_count):
                             row_scale = cutlass.Float32(1.0)
                             if cutlass.const_expr(sfa_present):
                                 row = coord_m_tile + (promo_mi0 + mi) * epi_rows_per_mma_m + promo_lane
                                 raw = sfa_next[mi]
-                                sfa_next[mi] = _load_sfa(sfa_ptr, sfa_stride_m, sfa_stride_k, sfa_stride_l, 0, row, next_k, M, k)
+                                sfa_next[mi] = _load_sf(sfa_lines[mi], sfa_stride_k, window + 1, _sfa_block_windows, sfa_last_block)
                                 row_scale = cutlass.Float32(0.0)
                                 if (row < group_end) & window_live:
                                     row_scale = raw.to(cutlass.Float32)
@@ -1957,13 +2089,12 @@ def _kernel(
                         # writes the window's scales (loaded during the previous window) and issues the next window's loads; the
                         # others wait for the table.
                         if promo_is_writer:
-                            tbl_next_k = window_k + insts_per_window * mma_inst_k_elems
                             if cutlass.const_expr(_sfa_folded):
                                 tbl_frow = coord_m_tile
                                 tbl_fa_scale = cutlass.Float32(0.0)
                                 if (tbl_frow < group_end) & window_live:
                                     tbl_fa_scale = sfa_ahead[0].to(cutlass.Float32)
-                                sfa_ahead[0] = _load_sfa(sfa_ptr, sfa_stride_m, sfa_stride_k, sfa_stride_l, 0, tbl_frow, tbl_next_k, M, k)
+                                sfa_ahead[0] = _load_sf(sfa_fold_line, sfa_stride_k, window + 1, _sfa_block_windows, sfa_last_block)
                             for load in cutlass.range_constexpr(_sfb_loads):
                                 tbl_run = load * 32 + promo_warp_lane
                                 tbl_col = coord_n_c + promo_n0 + tbl_run * sfb_group_cols
@@ -1973,7 +2104,7 @@ def _kernel(
                                 if cutlass.const_expr(_sfa_folded):
                                     tbl_b_scale = tbl_b_scale * tbl_fa_scale
                                 (promo_tbl.subview(partial_slot * _promo_tbl_runs + tbl_run)).store(tbl_b_scale)
-                                sfb_ahead[load] = _load_sfb(sfb_ptr, sfb_stride_k, sfb_stride_n, sfb_stride_l, sfb_l, tbl_col, tbl_next_k, N, k)
+                                sfb_ahead[load] = _load_sf(sfb_lines[load], sfb_stride_k, window + 1, _sfb_block_windows, sfb_last_block)
                             # Every lane's stores precede the elected release.
                             nvvm.bar_warp_sync(0xFFFFFFFF)
                             if elect_one:
@@ -2088,8 +2219,12 @@ def _kernel(
                     nvvm.mbarrier_arrive(acc_full_mbar_ptr.subview(acc_stage))
                 tile_iter += 1
 
-    if warp_idx == unused_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+    if cutlass.const_expr(cta_group == 2):
+        # A pair's follower releases the leader's partial accumulators with relaxed remote arrives that nothing else
+        # orders before the leader exits: every thread arrives here (release) after its last remote operation and waits
+        # (acquire) for the cluster's others.
+        nvvm.barrier_cluster_arrive()
+        nvvm.barrier_cluster_wait()
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

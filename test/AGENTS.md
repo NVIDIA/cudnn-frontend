@@ -620,6 +620,20 @@ GREEN baseline. For RED/GREEN checks, copy only the new test changes into an
 isolated baseline worktree and collect there; verify the concrete operation
 module's `__file__` after conftest setup, not only `cudnn.__file__`.
 
+The FROST compiled cache identifies an overlaid tree:
+`compiled_cache._cudnn_source_digest` hashes every directory on
+`cudnn.__path__` (`_cudnn_source_roots`), so the `gemm/frost/conftest.py`
+overlay, which puts the checkout's `python/cudnn` ahead of the installed
+package, is an environment of its own. Before that the digest covered only
+the directory of `cudnn.__file__`, the installed package under an overlay,
+and an entry is keyed by the generated template source alone: a RED/GREEN or
+A/B check of an edit to a module the templates import but do not inline (for
+example `gemm/frost/tile_helpers.py`) reloaded the kernel compiled from the
+other tree state out of a shared `CUDNN_FRONTEND_COMPILED_CACHE` and passed
+falsely. On a tree without the fix, give each tree state its own cache
+directory. Detector:
+`core/frost/test_compiled_cache.py::test_source_digest_covers_every_directory_of_the_package`.
+
 Read repository documentation relative to the test checkout, not `cudnn.__file__`.
 CI can load a wheel's package initializer while conftests overlay source modules;
 the wheel may omit Markdown files. The GEMM descriptor-order checks in
@@ -1665,3 +1679,65 @@ RED control; assert rejection before either FE scratch initialization or output
 writes. Exact capacity, larger carriers of a different element width, and raw
 integer pointers with unknown capacity are positive controls. See
 `core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+### FROST grouped GEMM launch replay and layer timing
+
+An SM100 grouped GEMM plan replays the launch of a call whose bound buffers
+repeat an earlier call's signature (`gemm/frost/launch_cache.py`; the
+contract is in [python/cudnn/AGENTS.md](../python/cudnn/AGENTS.md)): from the
+third call of a signature on, only the recorded views, output fills and
+launch run. A test or harness that monkeypatches a launch-path function
+(`_initialize_combine_output`, a `_check_*`, a launcher) sees it called on the
+first two calls of a signature only, and an A/B that swaps such a function
+measures the recorded path: an A/B of two `_initialize_combine_output`
+variants timed the same recorded fill twice once the plan replayed. The plan
+attributes `_launchable` and `combine_zero` are read per call, so patching
+those does reach replays. Turn replay off with
+`monkeypatch.setattr(type(plan._compiled), "_replay_calls", False, raising=False)`
+(deleting the attribute instead falls back to the base class's False and
+loses the class's own value), or compare separate source trees; count
+full-path calls by wrapping `type(plan._compiled)._call_variant_pack`
+(`_full_path_calls` in `gemm/frost/test_moe_launch_cache.py`).
+
+Time MoE kernel choices inside the layer (FC1, then FC2), not alone:
+
+- Rank a COMBINE (FC2) config in the layer. At 1-2 tokens the 16-wide
+  swapped tile was the fastest COMBINE alone but up to 2-3.5% slower in the
+  layer, and a loop of one COMBINE back to back measures L2 reuse that a
+  model never has, so its L2 policies are judged in the layer too.
+- FC1 alone, launched back to back at one token, is bimodal per batch: the
+  launches overlap through programmatic dependent launch, and a batch can
+  lock into a pattern 5-7% faster or slower. A single-change attribution
+  there (a scheduler wait at -4 to -5%) did not carry over to the layer,
+  where the same revert moved 0.15% or less; the layer's round-to-round
+  spread was 0.1-0.4%.
+
+No stress test confirms the proxy fence of a deferred `cp.async` handoff.
+With `st.shared` token copies and a plain release arrive, a swapped 16-wide
+GATHER kernel at K = 2048 failed 616 of 680 launches without
+`fence.proxy.async` when the arrive followed the stores at once, and 47 of
+680 behind `cp.async.wait_group 0`; once the arrive trailed the stores by one
+stage, or went through the relay warp, it failed 0 of 680 with or without the
+fence. The PTX pin `test_general_gather_relay_fences_each_copied_stage_for_the_mma`
+is the guard.
+
+Two compute-sanitizer reports on the general grouped kernels are not kernel
+faults; check a new report of either kind against these before chasing it:
+
+- memcheck reports "Invalid __global__ atomic of size 2 bytes ... misaligned"
+  on the 2-CTA swapped COMBINE tiles (256x16, 256x32, 128x128 2x1) with a
+  BF16 or FP16 output, and aborts the kernel. The 16-bit add lowers to a
+  32-bit CAS loop on an address aligned by construction, the reported
+  addresses carry the CAS swap value in their low 32 bits, and an in-kernel
+  trap on a misaligned address ahead of the add never fires (the report goes
+  away with it). Runs without the tool are correct; FP32 outputs and the
+  1-CTA swapped tiles are clean. The 128x128 2x1 tile reported it before the
+  2026-11 fixes too. Not yet rechecked with a newer compute-sanitizer.
+- racecheck reports "invalid __shared__ write ... in a block that might have
+  already exited" for the scheduler warp's mailbox writes on 1-CTA clusters
+  of two or more CTAs. A peer reads every claim rank 0 writes, the closing one
+  included, behind its full barrier before it exits, and rank 0 waits for the
+  last stage's empty barrier before it exits, so no write reaches an exited
+  block; racecheck does not follow that cross-CTA mbarrier order. The 2-CTA
+  plans' closing cluster barrier (needed there for the pair's remote
+  partial-accumulator arrives) is why their report is absent.

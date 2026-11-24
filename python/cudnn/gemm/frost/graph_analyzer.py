@@ -1120,9 +1120,15 @@ def _block_scale_combo(cap):
     )
 
 
-def _block_scale_spec(a0, b0, meta):
-    """Construct the shared block-scale operand specification."""
+def _block_scale_spec(a0, b0, meta, a_caps=(), b_caps=()):
+    """Construct the shared block-scale operand specification.
+
+    ``a0`` / ``b0`` are GEMM 0's operands; ``a_caps`` / ``b_caps`` every distinct A / B operand in slot order, whose
+    scale tensors' dims the spec records (``sfa_dims`` / ``sfb_dims``)."""
     from .fusion_ir import BlockScaleSpec
+
+    def _scale_dims(caps):
+        return tuple(meta[cap["sf_id"]].dim if cap["sf_id"] is not None else None for cap in caps)
 
     return BlockScaleSpec(
         a_dtype=a0["data_dtype"],
@@ -1143,6 +1149,8 @@ def _block_scale_spec(a0, b0, meta):
         dequant_out_b=b0["deq_out"],
         fake_dequant_a=a0["fake_dequant"],
         fake_dequant_b=b0["fake_dequant"],
+        sfa_dims=_scale_dims(a_caps),
+        sfb_dims=_scale_dims(b_caps),
     )
 
 
@@ -1416,7 +1424,7 @@ def _build_multi_moe_chain(
         for cap in b_caps.values():
             if _block_scale_combo(cap) != _block_scale_combo(b0):
                 raise ValueError("all weight operands of a block-scale multi-MoE must share the same SF combo")
-        block_scale_spec = _block_scale_spec(a0, b0, meta)
+        block_scale_spec = _block_scale_spec(a0, b0, meta, [a_caps[i] for i in a_ids], [b_caps[i] for i in b_ids])
     mm_compute = moe_ops[0].compute_dtype if moe_ops[0].compute_dtype is not None else compute_dtype
     gemm_out_dtypes = tuple(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype, meta) for mm in moe_ops)
     if combine:
@@ -2265,7 +2273,7 @@ def _build_multi_gemm_chain(
         for cap in b_caps.values():
             if _block_scale_combo(cap) != _block_scale_combo(b0):
                 raise ValueError("all B operands of a block-scale multi-GEMM must share the same SF combo")
-        block_scale_spec = _block_scale_spec(a0, b0, meta)
+        block_scale_spec = _block_scale_spec(a0, b0, meta, [a_caps[i] for i in a_ids], [b_caps[i] for i in b_ids])
     mm_compute = matmuls[0].compute_dtype if matmuls[0].compute_dtype is not None else compute_dtype
     gemm_out_dtypes = tuple(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype, meta) for mm in matmuls)
     matmul_out_dim = (batch, M, N)

@@ -17,13 +17,16 @@ import cudnn.gemm.frost  # noqa: F401  (installs recorder)
 import pytest
 import torch
 
-from gemm_test_utils import Plan, ceil_div, requires_int8_mma, requires_sm100
+import warm_stress
+from gemm_test_utils import Plan, ceil_div, keep_kernel_ptx, kernel_ptx, requires_int8_mma, requires_sm100, requires_sm100_tree
 from cudnn.gemm.frost import compiler as C
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding
 from cudnn.gemm.frost.kernel_registry import GraphType, classify_graph_type, general_block_scale_reject, select_template
 from cudnn.gemm.frost.tile_config import by_name
 
-pytestmark = pytest.mark.L0
+# Every test here concerns the sm100 tree's general templates and compiler (several call names only that compiler has):
+# a process that runs another family's tree skips them.
+pytestmark = [pytest.mark.L0, requires_sm100_tree]
 
 _CUDNN = {
     "fp8_e4m3": cudnn.data_type.FP8_E4M3,
@@ -265,6 +268,8 @@ _NUMERIC_CASES = {
     "mx_like_e8m0_1x32": dict(block_a=(1, 32), block_b=(32, 1), sfa="fp8_e8m0", sfb="fp8_e8m0"),
     "window_inside_k_tile": dict(block_a=(1, 64)),
     "window_spans_k_tiles": dict(K=1024, block_a=(1, 256), block_b=(256, 128)),
+    # An A scale block spans two promotion windows, and K=640 ends inside the last one.
+    "k_block_of_two_windows": dict(K=640, block_a=(1, 256)),
     "per_tensor": dict(block_a=(256, 512), block_b=(512, 256)),
     "per_row_and_column": dict(block_a=(1, 512), block_b=(512, 1)),
     "n_block_not_a_chunk_multiple": dict(N=240, block_b=(128, 48)),
@@ -398,9 +403,10 @@ def test_general_block_scale_geometries(config, shape):
 
 
 @requires_sm100
-@pytest.mark.parametrize("split_k,K,block_a,block_b", [(2, 1024, (1, 128), (128, 128)), (3, 1280, (1, 256), (256, 128))])
+@pytest.mark.parametrize("split_k,K,block_a,block_b", [(2, 1024, (1, 128), (128, 128)), (3, 1280, (1, 256), (256, 128)), (3, 1280, (1, 256), (128, 128))])
 def test_general_block_scale_split_k(split_k, K, block_a, block_b):
-    """A split may cut a promotion window: each slice scales its own part of the block."""
+    """A split may cut a promotion window, or start inside an A scale block of two windows: each slice scales its own
+    part of the block."""
     _run(256, 256, K, split_k=split_k, block_a=block_a, block_b=block_b)
 
 
@@ -437,6 +443,66 @@ def test_general_block_scale_rows_do_not_depend_on_their_neighbors():
         outs[name] = out
     assert not torch.isnan(outs["all"]).any()
     assert torch.equal(outs["all"][:, 128:256].view(torch.int16), outs["middle"].view(torch.int16))
+
+
+# Warm launches through the CLC response slot
+#
+# A thread block takes its next tile from a cluster launch control (CLC) query: the response lands in a shared-memory
+# slot (one per thread block) that the scheduler, TMA, MMA, epilogue and promotion warps each read and then release to
+# the cluster's leader for the next query, the async-proxy fence behind each read ordering it before that release
+# (python/cudnn/AGENTS.md Rule 11). A launch of several tiles per thread block rewrites the slot several times.
+
+
+def _stress_case(config):
+    """A launch of 8 tiles per SM with an integer-valued reference of every output byte: small-integer operands and
+    power-of-two scales make every product and partial sum exact in fp32 in any order, and the bf16 output that sum
+    rounded once. A CLC launch's grid is its tiles; the thread blocks that run are the ones resident at once (one per
+    SM), each taking the tiles of the ones it cancels."""
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    M, N, K = 2 * 128 * sm_count, 512, 256
+    g = _graph(M, N, K)
+    _, binding = analyze_with_binding(g)
+    plan = Plan(g, config=by_name(config))
+    assert select_template(plan.chain, plan._compiled.config).file == _TEMPLATE and not plan.workspace_bytes
+    gen = torch.Generator(device="cuda").manual_seed(13)
+    a = torch.randint(-3, 4, (1, M, K), device="cuda", generator=gen).float()
+    b = torch.randint(-3, 4, (1, N, K), device="cuda", generator=gen).float()
+    sa = torch.exp2(torch.randint(-1, 2, (1, M, K // 128), device="cuda", generator=gen).float())
+    sb_nk = torch.exp2(torch.randint(-1, 2, (1, N // 128, K // 128), device="cuda", generator=gen).float())
+    out = torch.empty(1, M, N, device="cuda", dtype=torch.bfloat16)
+    pack = {
+        binding.a_operands[0]: a.to(torch.float8_e4m3fn),
+        binding.b_operands[0]: b.to(torch.float8_e4m3fn),
+        binding.sfa_operands[0]: sa,
+        binding.sfb_operands[0]: sb_nk.transpose(1, 2),
+        binding.outputs[0]: out,
+    }
+    reference = ((a.double() * _expand(sa, (1, 128), (M, K))) @ (b.double() * _expand(sb_nk, (128, 128), (N, K))).transpose(1, 2)).float().to(torch.bfloat16)
+    tiles = (M // 128) * (N // 128)
+    return warm_stress.StressCase(
+        name=f"general dense block scale {config}",
+        launch=lambda: plan(pack),
+        outputs={"out": out},
+        thread_blocks=sm_count,
+        refills_per_launch=tiles // sm_count - 1,
+        reference={"out": reference},
+    )
+
+
+@requires_sm100
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("config", [_TILE_128, "CONFIG_sm100_128x128x128_128x128x32_cluster1x4_1ctamma"], ids=["cluster1x1", "cluster1x4"])
+def test_general_block_scale_warm_launches_keep_writing_the_reference_bytes(config):
+    """Warm launches, back to back and behind a launch that overwrites every SM's shared memory, write the bytes of an
+    independent reference: the run-time detector of a CLC response read after its slot went back to the next query,
+    with one thread block and with clusters of four (the response multicast to each, released to the leader). A rate
+    bound at one thread block per SM, which the report flags (see the grouped cells in
+    test_general_moe_grouped_block_scale_matmul_fwd.py)."""
+    warm_stress.build_launchers(torch.device("cuda"))
+    stress = _stress_case(config)
+    assert stress.refills_per_launch >= 4, "the shape rewrites every thread block's CLC response slot inside one launch"
+    warm_stress.assert_warm_stress(stress, validation=warm_stress.stress_validation(torch.device("cuda")))
 
 
 @requires_sm100
@@ -489,3 +555,19 @@ def test_general_block_scale_public_plan():
     torch.cuda.synchronize()
     ref = (a.double() * _expand(sa, (1, 128), (M, K))) @ (b.double() * _expand(sb_nk, (128, 128), (N, K))).transpose(1, 2)
     torch.testing.assert_close(out.double(), ref.to(torch.bfloat16).double(), rtol=1e-2, atol=1e-2 * ref.abs().mean().item())
+
+
+@requires_sm100
+@pytest.mark.parametrize("config,paired", [("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma", True), (_TILE_128, False)], ids=["2cta", "1cta"])
+def test_general_block_scale_pairs_end_on_a_cluster_barrier(config, paired, monkeypatch, tmp_path):
+    """A pair's follower releases the leader's partial accumulators with relaxed remote arrives, which nothing else
+    orders before the leader thread block exits and its shared memory goes to the next one. A paired kernel ends on
+    barrier.cluster.arrive (release) and barrier.cluster.wait (acquire), which every thread reaches after its role; a
+    1-CTA kernel without a cluster K reduction has no such barrier."""
+    keep_kernel_ptx(monkeypatch, C, tmp_path)
+    plan = Plan(_graph(512, 256, 512), config=by_name(config))
+    ptx = kernel_ptx(plan)
+    body = ptx[ptx.index(".entry") :]
+    lines = [line.strip() for line in body[: body.index("\n}\n")].splitlines() if line.strip() and not line.strip().startswith("//")]
+    end = len(lines) - 1 - lines[::-1].index("ret;")
+    assert (lines[end - 2 : end] == ["barrier.cluster.arrive;", "barrier.cluster.wait;"]) is paired, lines[end - 3 : end + 1]

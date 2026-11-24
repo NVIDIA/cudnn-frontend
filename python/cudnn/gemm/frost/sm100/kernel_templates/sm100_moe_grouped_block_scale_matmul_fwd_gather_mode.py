@@ -30,6 +30,7 @@ from cudnn.gemm.frost.tile_helpers import (
     moe_combine_add_vector,
     moe_combine_stage,
     moe_combine_bulk,
+    MoeCombineStaging,
     tma_scatter4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
@@ -195,11 +196,13 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
 
 
 def _a_collector_op(g):
-    if cutlass.const_expr(num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
+    # g is one of the mma_num_gemms GEMMs the MMA issues per K step. num_gemms counts the GEMMs the epilogue drains
+    # together: the same number, except for a general block-scale gated pair (two passes of one GEMM each).
+    if cutlass.const_expr(mma_num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
         return None
     if cutlass.const_expr(g == 0):
         return nvvm.Tcgen05MMACollectorOp.FILL
-    if cutlass.const_expr(g == num_gemms - 1):
+    if cutlass.const_expr(g == mma_num_gemms - 1):
         return nvvm.Tcgen05MMACollectorOp.LASTUSE
     return nvvm.Tcgen05MMACollectorOp.USE
 
@@ -420,11 +423,17 @@ def _kernel(
     # @@TMA_STORE_ONLY:END@@
 
     if cutlass.const_expr(moe_combine_bulk_enabled):
-        combine_staging = cutlass.Array(
-            cd_dtype,
-            epi_stage_rows * epi_cols_per_mma_m,
-            space=cutlass.AddressSpace.smem,
-            alignment=1024,
+        # One row per epilogue thread, padded against bank conflicts; the drain addresses it by unpadded offsets.
+        combine_row_pad = moe_combine_staging_pad_bytes * 8 // cd_dtype.width
+        combine_staging = MoeCombineStaging(
+            cutlass.Array(
+                cd_dtype,
+                epi_stage_rows * (epi_cols_per_mma_m + combine_row_pad),
+                space=cutlass.AddressSpace.smem,
+                alignment=1024,
+            ),
+            epi_cols_per_mma_m,
+            combine_row_pad,
         )
 
     sA_elems = sA_packed_elems

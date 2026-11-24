@@ -3272,7 +3272,9 @@ def test_the_collector_helpers_are_one_text_across_every_template():
 def _load_collector_helpers(path, consts):
     """Exec a template's collector helpers alone, with the injected constants
     supplied and the DSL stubbed. The helpers are pure compile-time predicates,
-    so they run outside a kernel trace."""
+    so they run outside a kernel trace. The A helper chains the GEMMs one K step
+    issues, ``mma_num_gemms``, which every renderer emits next to ``num_gemms``
+    (equal to it but in a general block-scale gated pair, whose MMA issues one)."""
     import ast
     import types
 
@@ -3302,18 +3304,24 @@ def test_the_a_and_b_collectors_can_never_both_be_live():
             continue
         both += 1
         for mma_size_m in (1, 2, 4):
-            for num_gemms in (1, 2, 3):
+            for mma_num_gemms in (1, 2, 3):
                 for num_a_operands in (1, 2):
                     for b_ok in (True, False):
                         fns = _load_collector_helpers(
                             path,
-                            dict(mma_size_m=mma_size_m, num_gemms=num_gemms, num_a_operands=num_a_operands, b_collector_ok=b_ok),
+                            dict(
+                                mma_size_m=mma_size_m,
+                                num_gemms=mma_num_gemms,
+                                mma_num_gemms=mma_num_gemms,
+                                num_a_operands=num_a_operands,
+                                b_collector_ok=b_ok,
+                            ),
                         )
-                        live_a = any(fns["_a_collector_op"](g) is not None for g in range(num_gemms))
+                        live_a = any(fns["_a_collector_op"](g) is not None for g in range(mma_num_gemms))
                         live_b = any(fns["_b_collector_op"](mi) is not None for mi in range(mma_size_m))
                         assert not (
                             live_a and live_b
-                        ), f"{path.name}: both collectors live at mma_size_m={mma_size_m} num_gemms={num_gemms} num_a={num_a_operands} b_ok={b_ok}"
+                        ), f"{path.name}: both collectors live at mma_size_m={mma_size_m} mma_num_gemms={mma_num_gemms} num_a={num_a_operands} b_ok={b_ok}"
     assert both, "no template defines both collector helpers -- the check silently covered nothing"
 
 
@@ -3324,9 +3332,9 @@ def test_every_a_collector_chain_starts_with_fill_and_ends_with_lastuse():
     entry and silently multiply in the wrong operand."""
     seen = 0
     for path in template_files():
-        for name, n_key in (("_a_collector_op", "num_gemms"), ("_b_collector_op", "mma_size_m")):
+        for name, n_key in (("_a_collector_op", "mma_num_gemms"), ("_b_collector_op", "mma_size_m")):
             for n in (1, 2, 3):
-                consts = dict(mma_size_m=1, num_gemms=1, num_a_operands=1, b_collector_ok=True)
+                consts = dict(mma_size_m=1, num_gemms=1, mma_num_gemms=1, num_a_operands=1, b_collector_ok=True)
                 consts[n_key] = n
                 fns = _load_collector_helpers(path, consts)
                 if name not in fns:

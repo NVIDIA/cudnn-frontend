@@ -58,7 +58,7 @@ from ..dtypes import (
     dense_output_layout,
     tensor_alignment,
 )
-from .epilogue_codegen import EpilogueSnippets, generate, k_pad_axes, tma_out_ready_marker, tma_out_value
+from .epilogue_codegen import EpilogueSnippets, generate, k_pad_axes, swap_combine_lanes_applies, tma_out_ready_marker, tma_out_value
 from ..fusion_ir import (
     ZERO_PRESERVING_OPS,
     FusionChain,
@@ -88,6 +88,7 @@ from ..graph_analyzer import (
 )
 from ..arch_family import current_arch
 from ..tile_config import DEFAULT_CONFIG, TileConfig, _sm_count
+from .. import launch_cache
 
 from ..compiler import (
     _fallback_cache_dir,
@@ -143,6 +144,7 @@ from ..compiler import (
     _register_legacy_device_view_adapter,
     _moe_carve_workspace,
     _moe_launch_tail,
+    _swap_ab_frame_note,
 )
 
 _TVM_FFI_OK = importlib.util.find_spec("tvm_ffi") is not None
@@ -543,6 +545,35 @@ def _l2_swizzle_budget_bytes() -> int:
     return l2_swizzle_budget_bytes()
 
 
+# A grouped COMBINE adds every routed row into its token's output row: a read-modify-write in L2 that the weight stream
+# evicts.  The general templates keep the output rows resident by two L2 policies, chosen per launch by its sizes:
+#   * the weight tiles load evict_first -- every group's while the output (tokens x N x output bytes) fits in L2, else
+#     only those of a group one M (token) tile covers, which read theirs once -- unless the weights the launch can read
+#     (experts it can route to x N x K) fit in L2 as well, where nothing needs their room.  Against evict_normal the
+#     layer (GATHER FC1 then COMBINE FC2, 5 models, 128x128 1x1) took 0.95-0.98x at 512 tokens, 0.93-0.99x at 2048 and
+#     0.95-1.00x at 4096; the swapped 128x16 tile 0.994-0.996x at 8 tokens, 0.98-0.99x at 64 and 0.97-0.98x at 128.  Groups
+#     of several M tiles re-read their weight tiles: evict_first on those took the layer to 0.97-0.99x at 2048-4096 tokens
+#     while the output fits (N = 2048 to 4096) and to 1.01-1.03x past it (N = 4096 and 7168 at 4096 tokens).  At 1 token
+#     (8-13 MB of weights) evict_first took the 128x16 layer to 1.003-1.007x and a back-to-back COMBINE to 1.09-1.27x;
+#   * the bulk reductions run evict_last while the output takes more than half the L2: 0.96-0.98x the layer at 4096
+#     tokens for N = 2048, 0.997-0.998x for N = 4096 to 7168, at 2048 tokens 0.98x (N = 4096, 32 MB).  At 512 tokens
+#     (4-14 MB) the evict_last lines left after the kernel slowed the next one: 1.00-1.01x.
+# Measured on a 68-SM SM100 part (33 MB L2), fp32 output.
+_COMBINE_L2_POLICY_CONSTANTS = ("combine_first_every_group_bytes", "combine_first_min_weight_bytes", "combine_evict_last_bytes")
+
+
+def _combine_l2_policy_bytes(chain: FusionChain) -> tuple[int, int, int]:
+    """``(every_group_output_bytes, min_weight_bytes, evict_last_output_bytes)`` of a general grouped COMBINE: the output
+    size up to which every group's weight tiles load evict_first, the weight size past which a launch's weight tiles load
+    evict_first at all, and the output size past which its reductions run evict_last (see above)."""
+    if not (chain.has_moe and chain.moe.mode == "combine"):
+        return 0, 1 << 62, 1 << 62
+    from cudnn.frost.device import l2_cache_bytes, resolve_device
+
+    l2 = int(l2_cache_bytes(resolve_device(None)))
+    return l2, l2, l2 // 2
+
+
 def _async_moe_gather_smem_bytes(cfg: TileConfig, chain: FusionChain, ab_stages: int, acc_stages: int, use_tma: bool) -> int:
     """Mirror the plain async-GATHER templates' per-CTA allocation order."""
     size = 0
@@ -726,6 +757,8 @@ def _render_tile_constants(
     lines.append(f"tile_swizzle_n = {1 if fallback_cluster is not None else 0}")
     lines.append(f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}")
     lines.append(f"num_gemms = {chain.num_gemms}")
+    # The GEMMs one K step issues, which the A collector chains: all of them here (see the general renderer).
+    lines.append(f"mma_num_gemms = {chain.num_gemms}")
     lines.append(f"num_a_operands = {chain.num_a_operands}")
     lines.append(f"num_b_operands = {chain.num_b_operands}")
     lines.append(f"gemm_a_idx = {tuple(a for a, _ in chain.gemm_operands)}")
@@ -1426,6 +1459,8 @@ def _render_block_scale_tile_constants(
         f"acc_stage_stride = {acc_stage_stride}",
         f"acc_overlap_subtiles = {acc_overlap_subtiles}",
         f"num_gemms = {num_gemms}",
+        # The GEMMs one K step issues, which the A collector chains: all of them here (see the general renderer).
+        f"mma_num_gemms = {num_gemms}",
         f"num_a_operands = {na}",
         f"num_b_operands = {nb}",
         f"num_sfa_operands = {real_na}",
@@ -1613,16 +1648,29 @@ _GENERAL_BS_MOE_MAX_AB_STAGES = 8
 _GENERAL_BS_MOE_LONG_K_TILES = 32
 # Partial accumulators beyond this many only add TMEM the MMA never gets far enough ahead to use.
 _GENERAL_BS_MAX_PARTIAL_STAGES = 4
-# Registers a thread raises itself to (setmaxnreg): with the producer warps lowered to their 24, the CTA's
-# threads have 64K registers between them.
+# Registers a thread raises itself to (setmaxnreg). The 16-warp templates run 512 threads on a 128-register entry
+# pool, 64K registers in all: the epilogue warpgroup takes 168, each promotion warpgroup 152 and the control warpgroup
+# (MMA, TMA, scheduler) lowers itself to the rest or less. The dense template's keeps 24; the grouped templates'
+# takes the whole rest, 40, where at 24 their scheduler warp spilled its claim loop to the stack. A warpgroup that
+# asks for more than the pool holds waits in setmaxnreg.inc forever, so a change to one count changes this sum.
+_GENERAL_BS_REG_POOL = 65536
 _GENERAL_BS_PROMO_REGS = 152
 _GENERAL_BS_EPI_REGS = 168
+_GENERAL_BS_DENSE_CTL_REGS = 24
+_GENERAL_BS_GROUPED_CTL_REGS = _GENERAL_BS_REG_POOL // (4 * 32) - _GENERAL_BS_EPI_REGS - 2 * _GENERAL_BS_PROMO_REGS
+# The grouped scheduler warp copies the routing offsets (num_groups + 1 of them) into shared memory once per thread
+# block and searches them there, instead of a dependent global load per 32 groups. A plan whose offsets take more
+# than this many bytes searches them in global memory, and so does one whose A/B stages leave no room for the copy or
+# that the copy would move to a larger shared-memory carveout (_smem_carveout_crossed).
+_GENERAL_BS_SCHED_FTO_SMEM_MAX_BYTES = 8192
 # The async GATHER pipelines run 640 threads on a 96-register entry pool. The control warpgroup lowers itself to
 # 48 per thread (the sources' 64 left the promotion warps of a 2-CTA plan spilling to the stack) and the token-copy
 # warps keep 96 or more: the epilogue and promotion warps share the rest.
 _GENERAL_BS_GATHER_CTL_REGS = 48
 _GENERAL_BS_GATHER_POOL = 640 * 96 - 4 * 32 * _GENERAL_BS_GATHER_CTL_REGS
 _GENERAL_BS_GATHER_EPI_REGS = 112
+# Columns per drain chunk of a gated pair's lanes quantize under that epilogue budget (_epi_n_for_chain).
+_GENERAL_BS_GATHER_GLU_EPI_N = 32
 
 
 def _is_general_block_scale(chain: FusionChain) -> bool:
@@ -1630,6 +1678,70 @@ def _is_general_block_scale(chain: FusionChain) -> bool:
     from ..kernel_registry import GENERAL_BLOCK_SCALE_GRAPH_TYPES, classify_graph_type
 
     return classify_graph_type(chain) in GENERAL_BLOCK_SCALE_GRAPH_TYPES
+
+
+def _glu_silu_tanh(chain: FusionChain) -> bool:
+    """Whether the epilogue evaluates SiLU as x * (1/2 + tanh.approx(x / 2) / 2), one MUFU op per value, instead of
+    x * rcp.approx(1 + ex2.approx(-x log2 e)), two (``epilogue_codegen._emit_op`` has the error of each): a gated pair of
+    the general templates only (kernel_registry.general_glu_pair). Its drain runs while the MMA warp waits for the
+    pair's main accumulator stages, so its MUFU work is on the pair's critical path. Every other template, and a
+    general template's single GEMM, keep the two-op form and its numerics.
+
+    Measured on a 68-SM SM100 part, same-session A/B of a GATHER FC1 into FP8 block-128: 0.964 / 0.962 / 0.982 / 0.986 /
+    0.991 of the two-op form's time at 4096 tokens on 128x128 1x2 tiles (qwen3_30b, qwen35_35b, qwen3_235b,
+    qwen3_coder_480b, dsv3), 0.994-1.001 at 64 and 512 tokens. 0.003-0.005% of the FP8 codes changed and the scales by
+    at most 7e-6 (relative); the error against an fp32 reference did not change in its first five digits. A bf16 output
+    changes more of its codes, 8-14% on the gated test shapes: 0.07-0.13% of the values above 1% of the output's RMS,
+    and a quarter to a third of the values below it, where a gate below -1 makes the relative error large (a gate of
+    -16 or less gives 0). Its error against an fp32 reference did not change either."""
+    from ..kernel_registry import general_glu_pair
+
+    return _is_general_block_scale(chain) and general_glu_pair(chain)
+
+
+def _swap_combine_lanes(chain: FusionChain, cfg: TileConfig) -> bool:
+    """Whether a swapped COMBINE drains with lane-parallel route loads (epilogue_codegen._SWAP_COMBINE_LANES_ROWS; the
+    general swapped template loads the routes).  The general templates' drain has no acc overlap, so its column offsets
+    are trace-time values.  A graph that declares at most one routed row per expert drains about one column per tile:
+    there the lane loads replace the column's own loads one for one, and with them the layer took 1.00-1.01x the time at
+    1-8 tokens (5 models).  On tiles of more columns they took the swapped COMBINE to 0.60-0.78x the time at 512 tokens
+    (128x16, 128x32 and the 256x32 pair; 2 models)."""
+    if not (_is_general_block_scale(chain) and isinstance(chain.moe, MoeSwapAbSpec)):
+        return False
+    rows_per_expert = -(-chain.matmul.N // max(chain.moe.num_groups, 1))  # the swapped chain's N is the routed rows
+    return (
+        cfg.swap_ab
+        and rows_per_expert > 1
+        and not _use_swap_bulk_combine(chain, cfg)
+        and not cfg.workspace_split_k
+        and swap_combine_lanes_applies(chain, _tma_slots_for(chain, cfg))
+    )
+
+
+def _sched_fto_entries(chain: FusionChain) -> int:
+    """The routing offsets a general grouped template's scheduler may copy into shared memory: the plan's
+    num_groups + 1, or 0 when they take more than ``_GENERAL_BS_SCHED_FTO_SMEM_MAX_BYTES`` and it searches them in global
+    memory. The plan (``_general_block_scale_plan``) takes the copy only where shared memory has room for it."""
+    if chain.moe is None:
+        return 0
+    entries = chain.moe.num_groups + 1
+    return entries if entries * DTYPE_BYTES[chain.moe.offset_dtype] <= _GENERAL_BS_SCHED_FTO_SMEM_MAX_BYTES else 0
+
+
+# The shared-memory carveouts of an SM100 SM (KB): a kernel runs with the smallest one that holds its thread block's
+# shared memory and the 1 KB the system reserves per block, and the rest of the SM's 256 KB is its L1. A GATHER kernel
+# whose 2 KB of routing offsets moved it from the 196 KB carveout to 228 KB ran 5% slower (qwen3_next_80b FC1, 4096
+# tokens, 128x128 tiles in 1x2 clusters); with the copy in its COMBINE FC2 alone, the FC2 in the larger carveout behind
+# that FC1 in the smaller, the layer ran 2.3% slower.
+_SM100_SMEM_CARVEOUTS_KB = (0, 8, 16, 32, 64, 100, 132, 164, 196, 228)
+
+
+def _smem_carveout_crossed(footprint: int, extra: int, fixed_reserve: int) -> bool:
+    """Whether ``extra`` more bytes may move a kernel to a larger carveout. ``footprint`` is the plan's shared memory
+    with ``fixed_reserve`` for the header, of which the kernel may use as little as its 1 KB reserved array: the kernel's
+    own count lies in ``[footprint - fixed_reserve + 1024, footprint]``."""
+    low = footprint - fixed_reserve + 1024
+    return any(low <= kb * 1024 - 1024 < footprint + extra for kb in _SM100_SMEM_CARVEOUTS_KB)
 
 
 def _general_block_scale_plan(chain: FusionChain, cfg: TileConfig) -> dict:
@@ -1647,6 +1759,10 @@ def _general_block_scale_plan(chain: FusionChain, cfg: TileConfig) -> dict:
         raise NotImplementedError("general block scale reads its scale tensors in graph order; swapAB plans are not supported")
     if cfg.mma_tile_k_bytes != 32:
         raise NotImplementedError(f"general block scale issues 32-byte K instructions; config {cfg.name!r} has mma_tile_k_bytes={cfg.mma_tile_k_bytes}")
+    # Every warpgroup of a general template moves its registers (setmaxnreg) whatever the drain, which the qualified
+    # swap-bulk COMBINE of the weight-by-token templates does not allow (it keeps the launch's count).
+    if _use_swap_bulk_combine(chain, cfg):
+        raise NotImplementedError(f"general block scale has no qualified swap-bulk COMBINE drain; config {cfg.name!r} selects it")
     # One 128-B swizzled SMEM row per K tile, as in the block-scale template.
     if cfg.cta_tile_k_bytes != 128:
         raise NotImplementedError(f"general block scale needs cta_tile_k_bytes == 128; config {cfg.name!r} has {cfg.cta_tile_k_bytes}")
@@ -1712,15 +1828,23 @@ def _general_block_scale_plan(chain: FusionChain, cfg: TileConfig) -> dict:
     # A thread's tile columns start at a multiple of promo_n_cols, so runs of gcd(block_n, promo_n_cols) share a B scale.
     b_block = bs.b_scale_block
     sfb_group_cols = math.gcd(b_block[2], promo_n_cols) if b_block is not None else promo_n_cols
+    # Under swap B is the token operand. A tile's columns start at its group's first routed row, which is a multiple
+    # of first_token_offset's alignment_value only, and under GATHER each column is gathered from any token row. So a
+    # token scale block of several rows is shared by runs no longer than that alignment, or (GATHER) by no two columns:
+    # a longer run would take the scale of its first column for rows of the next block.
+    if b_block is not None and b_block[2] > 1 and isinstance(chain.moe, MoeSwapAbSpec):
+        sfb_group_cols = 1 if tmpl.async_gather else math.gcd(sfb_group_cols, chain.moe.offset_multiple)
     sfb_groups = promo_n_cols // sfb_group_cols
 
     # Registers. The dense and the plain grouped templates run 16 warps; the async GATHER ones their source's 20,
     # whose token-copy warps size themselves by the token rows a lane caches (16-byte chunks).
     promo_regs, epi_regs, copy_regs = _GENERAL_BS_PROMO_REGS, _GENERAL_BS_EPI_REGS, 0
+    ctl_regs = _GENERAL_BS_DENSE_CTL_REGS if chain.moe is None else _GENERAL_BS_GROUPED_CTL_REGS
     if tmpl.async_gather:
         swapped = isinstance(chain.moe, MoeSwapAbSpec)
         token_rows = (cta_n // cta_group) if swapped else cta_m
         copy_regs = (128 if swapped else 112) if token_rows * cfg.cta_tile_k_bytes // (128 * 16) > 8 else 96
+        ctl_regs = _GENERAL_BS_GATHER_CTL_REGS
         epi_regs = _GENERAL_BS_GATHER_EPI_REGS
         promo_regs = (_GENERAL_BS_GATHER_POOL - 4 * 32 * copy_regs - 4 * 32 * epi_regs) // (8 * 32) // 8 * 8
     # A promotion thread holds its running sum, the columns of the TMEM load in flight (narrower when the wide load
@@ -1765,6 +1889,13 @@ def _general_block_scale_plan(chain: FusionChain, cfg: TileConfig) -> dict:
                 f"a wide block quantize needs a tile of exactly one block along the quantized axis: config {cfg.name!r} has {tile_block} "
                 f"{'rows' if wq_lanes else 'columns'} per tile for block_size={wq.block_size}"
             )
+        # Both sweeps take a drain chunk (epi_n columns, then halves for the tail) as whole store vectors: a chunk
+        # narrower than a vector would compile to a sweep that skips its columns.
+        epi_n, vsize = _epi_n_for_chain(cfg, chain), _epi_chunk_elems(chain, cfg, _use_tma_store_epi(chain, cfg))
+        if epi_n % vsize or epi_cols_per_mma_m % vsize:
+            raise NotImplementedError(
+                f"a wide block quantize drains whole {vsize}-value vectors; config {cfg.name!r} drains {epi_cols_per_mma_m} columns in chunks of {epi_n}"
+            )
 
     # SMEM: the A/B rings of the block-scale template, without scale-factor rings.
     use_tma_store_epi = _use_tma_store_epi(chain, cfg)
@@ -1798,6 +1929,16 @@ def _general_block_scale_plan(chain: FusionChain, cfg: TileConfig) -> dict:
     if stages < 1:
         raise NotImplementedError(f"general block scale {cfg.name!r}: no AB stage fits in SMEM including buffer alignment padding")
     budget_stages = stages
+    # The scheduler's copy of the routing offsets takes shared memory the A/B stages leave, unless it would move the
+    # kernel to a larger carveout (_smem_carveout_crossed).
+    sched_fto_entries = _sched_fto_entries(chain)
+    if sched_fto_entries:
+        fto_bytes = align_up(sched_fto_entries * DTYPE_BYTES[chain.moe.offset_dtype], 128)
+        footprint = fixed_reserve + ring_bytes + ab_reserved
+        if ring_bytes + ab_reserved + fto_bytes > budget or _smem_carveout_crossed(footprint, fto_bytes, fixed_reserve):
+            sched_fto_entries = 0
+        else:
+            fixed_reserve += fto_bytes
 
     def _roots(n):
         return _block_scale_smem_desc_roots(header_bytes=fixed_reserve, rings=[("A[0]", ring_stage_bytes[0] * n), ("B[0]", ring_stage_bytes[1] * n)])
@@ -1849,7 +1990,9 @@ def _general_block_scale_plan(chain: FusionChain, cfg: TileConfig) -> dict:
         promo_chunk_cols=promo_chunk_cols,
         promo_regs=promo_regs,
         epi_regs=epi_regs,
+        ctl_regs=ctl_regs,
         gather_copy_regs=copy_regs,
+        sched_fto_entries=sched_fto_entries,
         ab_stages=stages,
         budget_stages=budget_stages,
         desc_roots=roots,
@@ -1941,6 +2084,8 @@ def _render_general_block_scale_tile_constants(cfg: TileConfig, chain: FusionCha
         f"wide_quant_lanes = {plan['wide_quant_lanes']}",
         f"tile_swizzle_n = {1 if fallback_cluster is not None else 0}",
         f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
+        *(f"{name} = {value}" for name, value in zip(_COMBINE_L2_POLICY_CONSTANTS, _combine_l2_policy_bytes(chain))),
+        f"swap_combine_lanes = {_swap_combine_lanes(chain, cfg)}",
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b}",
         f"a_mcast_slices = {a_mcast_slices}",
@@ -2030,6 +2175,7 @@ def _render_general_block_scale_tile_constants(cfg: TileConfig, chain: FusionCha
         f"promo_chunks = {plan['promo_n_cols'] // chunk}",
         f"promo_reg_count = {promo_regs}",
         f"epi_reg_count = {epi_regs}",
+        *([] if tmpl.async_gather else [f"ctl_reg_count = {plan['ctl_regs']}"]),
         f"sfa_present = {a_block is not None}",
         f"sfb_present = {b_block is not None}",
     ]
@@ -2055,6 +2201,7 @@ def _render_general_block_scale_tile_constants(cfg: TileConfig, chain: FusionCha
     if chain.has_moe:
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        lines.append(f"sched_fto_entries = {plan['sched_fto_entries']}")
     lines.extend(gather_lines)
     lines.extend(_mixed_cga_constants(cfg, fallback_cluster))
     lines.extend(_quant_device_imports(chain))
@@ -2292,6 +2439,7 @@ def _render_block_scale_template(
     tile_constants += f"\nmoe_gather = {chain.has_moe and chain.moe.mode == 'gather'}\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
     tile_constants += f"\nmoe_combine = {chain.has_moe and chain.moe.mode == 'combine'}"
     tile_constants += f"\nmoe_combine_bulk_enabled = {_use_bulk_combine(chain, config)}"
+    tile_constants += f"\nmoe_combine_staging_pad_bytes = {_COMBINE_STAGING_PAD_BYTES}"
     tile_constants += f"\nmoe_combine_fixed_descriptors = {_use_fixed_combine_descriptors(chain, config)}"
     tile_constants += f"\nmoe_combine_swap_bulk_enabled = {_use_swap_bulk_combine(chain, config)}"
     if plumb.tap_constants:
@@ -2557,8 +2705,11 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     return t.reshape(shape)
 
 
-def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None:
-    """Zero COMBINE's final output on the launch stream after runtime checks."""
+def _initialize_combine_output(chain: FusionChain, outputs, stream=None, zero_kernel=None) -> None:
+    """Zero COMBINE's final output on the launch stream after runtime checks.
+
+    ``zero_kernel`` is the plan's programmatic fill (``combine_zero.CombineZero``, built for the general grouped
+    templates only): it zeroes an output that is one region it takes, and a memset zeroes any other."""
     if chain.moe.mode != "combine":
         return
     output = outputs[0]  # COMBINE accepts exactly one final output.
@@ -2569,7 +2720,41 @@ def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None
     plan = buffers.strided_fill_plan(shape, strides)
     if plan is None:
         raise ValueError("MoE COMBINE output must have non-overlapping positive strides")
-    buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
+    elem_bytes = DTYPE_BYTES[chain.outputs[0].dtype]
+    # A replayed call (launch_cache) issues the fill recorded here: the fill kernel's region and the memset's are
+    # functions of the output's shape, strides and address residue, which its signature holds.
+    record = launch_cache.active_record()
+    if zero_kernel is not None and len(plan) == 1:
+        offset, pitch, width, height = plan[0]
+        base = output.data_ptr() + offset * elem_bytes
+        if zero_kernel.takes(base, pitch * elem_bytes, width * elem_bytes, height):
+            if record is not None:
+                record.fills.append((output.data_ptr(), plan, "kernel", elem_bytes))
+            zero_kernel(base, pitch * elem_bytes, width * elem_bytes, height, _as_custream(stream))
+            return
+    if record is not None:
+        record.fills.append((output.data_ptr(), plan, "zero", elem_bytes))
+    buffers.apply_zero_fill_plan(output.data_ptr(), plan, elem_bytes, stream)
+
+
+def _combine_zero_kernel(chain: FusionChain) -> "Callable | None":
+    """The programmatic fill a general grouped COMBINE plan zeroes its output with (``combine_zero``), or None for the
+    memset: every other plan's, and one whose fill cannot be built here."""
+    if not (chain.has_moe and chain.moe.mode == "combine" and _is_general_block_scale(chain)):
+        return None
+    from cudnn.frost.compiled_cache import CompileRefused
+    from cudnn.frost.device import multiprocessor_count
+
+    from . import combine_zero
+
+    try:
+        return combine_zero.build(_frost_compile_options(), multiprocessor_count(_plan_device()))
+    except CompileRefused:
+        # A build that may not compile (compiled_cache.refuse_compiles) and has no compiled fill zeroes with the memset.
+        return None
+    except Exception as exc:  # noqa: BLE001 -- the memset zeroes the output just as well, only later
+        _LOG.warning("cudnn.frost gemm: the COMBINE output fill kernel could not be built (%s); the plan zeroes its output with a memset", exc)
+        return None
 
 
 class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
@@ -2577,6 +2762,12 @@ class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
 
     _compiler = sys.modules[__name__]
     _validate_whole_scale_blocks = True
+
+    @property
+    def _validate_runtime_quant(self) -> bool:
+        """A wide quantize runs at its compiled extents only (``_check_runtime_quant``); the other quantize
+        epilogues of this family are not checked per call."""
+        return wide_quant(self.chain) is not None
 
 
 def _mma_a_dtype(chain: FusionChain) -> str:
@@ -2774,6 +2965,23 @@ def _epi_n(cfg, out_dt: str) -> int:
     return min(_EPI_ROW_BYTES_MAX * 8 // DTYPE_BITS[out_dt], cap, _pow2_floor(cols, cap=cols))
 
 
+# A tcgen05.ld of 128 fp32 columns per lane needs more than 128 registers (ptxas asks for 146), and ptxas holds every
+# instruction of a kernel of more than 384 threads (one thread block per SM) to 65536 / threads registers, whatever
+# setmaxnreg grants its warp.
+_WIDE_LDTM_MAX_THREADS = 384
+
+
+def _template_threads(chain: FusionChain, cfg) -> int:
+    """Threads per CTA of the template that renders ``(chain, cfg)``; the config's count when no template does."""
+    from ..kernel_registry import select_template
+
+    try:
+        warps = select_template(chain, cfg).warps_per_cta
+    except ValueError:
+        warps = None
+    return 32 * (warps or cfg.warps_per_cta)
+
+
 def _epi_n_for_chain(cfg, chain: FusionChain) -> int:
     """Chain-aware drain width."""
     from ..kernel_registry import _use_async_gather
@@ -2796,15 +3004,26 @@ def _epi_n_for_chain(cfg, chain: FusionChain) -> int:
         return 128
     if _use_bulk_combine(chain, cfg):
         cols = _epi_tile_cols(cfg)
-        return min(256 // DTYPE_BYTES[chain.output_dtype], cols & -cols)
+        width = min(256 // DTYPE_BYTES[chain.output_dtype], cols & -cols)
+        if _template_threads(chain, cfg) > _WIDE_LDTM_MAX_THREADS:
+            # 256 bytes of a 16-bit output are 128 columns, one TMEM load too wide for a template of more threads (the
+            # general one runs 512).
+            width = min(width, _EPI_N_MAX)
+        return width
     if not any(q.axis == 1 for q in chain.quants):
         return _epi_n(cfg, _epi_store_dtype(chain, cfg))
     cols = _epi_tile_cols(cfg)
-    return min(
+    width = min(
         _EPI_ROW_BYTES_MAX * 8 // DTYPE_BITS[chain.output_dtype],
         _EPI_N_MAX,
         _pow2_floor(cols, cap=cols),
     )
+    if _use_async_gather(chain, cfg) and _is_general_block_scale(chain) and chain.is_multi_gemm:
+        # A gated pair's quantize sweep holds a chunk of both GEMMs before the SwiGLU: 2 x 64 fp32 values per lane
+        # spill under the async GATHER epilogue's register budget (STACK 8016 B on a 128-column swapped tile; 216 B at
+        # 32 columns), so the chunk stays at 32 columns.
+        width = min(width, _GENERAL_BS_GATHER_GLU_EPI_N)
+    return width
 
 
 def _epi_swizzle_lines(cfg, out_dt: str, chain: FusionChain | None = None) -> list[str]:
@@ -2852,13 +3071,22 @@ def _use_bulk_combine(chain: FusionChain, cfg: TileConfig) -> bool:
     )
 
 
+# The bulk COMBINE drain stages one tile row per epilogue thread, stored in 16-byte vectors and read back by a bulk
+# reduction.  Rows of a multiple of 128 bytes all start in the same bank, so the eight rows one 16-byte store phase
+# covers conflict eight ways; padding each row by 16 bytes starts consecutive rows four banks apart.  With the general
+# templates' L2 policies (_combine_l2_policy_bytes) the padding took the fp32 COMBINE (128x128 1x1) to 0.73-0.95x the
+# time of unpadded rows at 4096 tokens (the layer 0.86-0.98x) and 0.78-0.99x at 512 (5 models, a 68-SM SM100 part).
+# The templates lay the rows out with tile_helpers.MoeCombineStaging.
+_COMBINE_STAGING_PAD_BYTES = 16
+
+
 def _combine_smem_bytes(chain: FusionChain, cfg: TileConfig) -> int:
     """Reserve the weighted staging tile and its alignment padding."""
     if _use_swap_bulk_combine(chain, cfg):
         return 128 * cfg.cta_tile_m * DTYPE_BYTES[chain.output_dtype] + 16
     if not _use_bulk_combine(chain, cfg):
         return 0
-    return _EPI_STAGE_ROWS * _epi_tile_cols(cfg) * DTYPE_BYTES[chain.output_dtype] + 16
+    return _EPI_STAGE_ROWS * (_epi_tile_cols(cfg) * DTYPE_BYTES[chain.output_dtype] + _COMBINE_STAGING_PAD_BYTES) + 16
 
 
 def _use_swap_bulk_combine(chain: FusionChain, cfg: TileConfig) -> bool:
@@ -3067,6 +3295,35 @@ def _check_wide_quant_supported(chain: FusionChain, config: TileConfig) -> None:
     )
     if quant.scale_dim is not None and tuple(quant.scale_dim) != expected:
         raise NotImplementedError(f"block_scale_quantize requires scale_dim={expected}; got {quant.scale_dim}")
+
+
+def _check_runtime_quant(chain: FusionChain, cfg: TileConfig, m: int, n: int) -> None:
+    """Refuse a call of a wide-quantize plan (:func:`~..fusion_ir.wide_quant`) at a kernel-frame (m, n) other than
+    the compiled (M, N).
+
+    The scale output's shape is the graph's [B, M, N / 128] whatever the call's extents, while the epilogue indexes
+    it by the call's N and strides: another N writes scales past that tensor (or row r's blocks over row r + 1's)
+    and leaves the scale of a partial last block unwritten. An empty call writes nothing: it is left to the launch
+    path, which skips it (``_zero_extent_problem``). The launchers check this before any output is written (the dense
+    one through :func:`_runtime_quant_reason`); the weight-by-token one, a swap-AB plan's, then re-runs the
+    compile-time quant gates at the call's extents for the other quantize kinds."""
+    quant = wide_quant(chain)
+    if quant is None or not (m and n) or (int(m), int(n)) == (chain.matmul.M, chain.matmul.N):
+        return
+    raise ValueError(
+        f"cudnn.frost gemm: this plan quantizes its output to FP8 with one fp32 scale per {quant.block_size} output "
+        f"columns, and its scale tensor keeps the graph's extents: it runs only at the kernel-frame (M, N) = "
+        f"({chain.matmul.M}, {chain.matmul.N}) it was built for, not ({m}, {n}) -- build a plan for this shape"
+    )
+
+
+def _runtime_quant_reason(chain: FusionChain, cfg: TileConfig, m: int, n: int) -> "str | None":
+    """:func:`_check_runtime_quant`'s refusal, as a reason, or None."""
+    try:
+        _check_runtime_quant(chain, cfg, m, n)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def _check_block_quant_supported(
@@ -3297,7 +3554,7 @@ def _graph_shapes_fixed(graph) -> bool:
     return not any(options.get(key, False) for key in ("is_dynamic_shape_enabled", "is_override_shape_enabled"))
 
 
-def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None, shapes_fixed: bool = False) -> TileConfig:
     if knobs is not None:
         try:
             config = knobs.to_config()
@@ -3309,6 +3566,14 @@ def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=
     from ..kernel_registry import preferred_strategy
     from ..tile_config import select_config
 
+    if _is_general_block_scale(chain):
+        # At most 128 accumulator columns; the CTA group, the cluster and the dense split-K by planning's general block-scale rules.
+        from ..planning import current_device_properties, general_block_scale_baseline
+
+        # Whether the chain may split K at all (two slices without a cluster K reduction: the reasons are the chain's).
+        split_k = not (chain.has_moe or dynamic_shapes) and _splitk_reject_reason(chain, replace(DEFAULT_CONFIG, split_k_slices=2)) is None
+        baseline = general_block_scale_baseline(chain, current_device_properties(), split_k=split_k, shapes_fixed=shapes_fixed and not dynamic_shapes)
+        return preferred_strategy(chain, baseline)
     tile_m = chain.matmul.M
     if chain.moe is not None:
         tile_m = (chain.matmul.M + chain.moe.num_groups - 1) // chain.moe.num_groups
@@ -3336,7 +3601,7 @@ def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=
 
 def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None, shapes_fixed: bool = False) -> TileConfig:
     """Choose one strategy, or replay the exact supplied knobs."""
-    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs)
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs, shapes_fixed=shapes_fixed)
     if knobs is not None or dynamic_shapes:
         return config
     from ..planning import select_strategy
@@ -3346,7 +3611,7 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None,
 
 def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False, shapes_fixed: bool = False) -> list[TileConfig]:
     """Choose a bounded list with the single-plan recommendation first."""
-    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes)
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, shapes_fixed=shapes_fixed)
     if dynamic_shapes:
         return [config]
     from ..planning import select_strategies
@@ -3550,13 +3815,18 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
 
 
 def probe_cutedsl() -> None:
-    """The cutedsl floor gate shared by check_support and the family heuristics."""
+    """The cutedsl gate shared by check_support and the family heuristics: the version floor, then the target of the
+    GPU the plan is built for (Rule 7: the floor admits a 4.7.x DSL, whose Arch has no sm_107a, on a cc 10.7 part)."""
     installed, version = buffers.cutedsl_state()
     if not installed:
         raise NotImplementedError("frost_gemm requires the cutedsl extra (nvidia-cutlass-dsl)")
     if buffers.cutedsl_too_old(version):
         want = ".".join(str(v) for v in buffers.CUTEDSL_MIN_VERSION)
         raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
+    arch = _current_arch()
+    reason = buffers.cutedsl_arch_requirement_error(None if arch is None else divmod(arch, 10))
+    if reason is not None:
+        raise NotImplementedError(f"frost_gemm cannot compile for this GPU: {reason}")
 
 
 # Epilogue ops the shared emitter computes in Int32 (relu and leaky_relu convert
@@ -3714,10 +3984,35 @@ def _check_block_scale_supported(chain: FusionChain, template_pipeline: str) -> 
 # One 128-byte TMA tensormap slot per CTA per distinct A operand.
 
 
+def _zero_extent_problem(m: int, n: int, k: int, block_size: "int | None" = None, source_rows: "int | None" = None) -> bool:
+    """True when a grouped call has nothing to compute; raise when it has work the kernel cannot encode.
+
+    The template hosts encode their TMA descriptors from the call's extents, and ``cuTensorMapEncodeTiled``
+    rejects a zero dimension, which the DSL turns into a process abort rather than an exception: no zero extent may
+    reach a launch. With M or N zero (an expert-parallel rank that received no rows) the reduction seeds and the
+    COMBINE zero-fill are the whole result: the caller writes them and skips the launch. K = 0 and a GATHER from a
+    token buffer without rows still have outputs to write, so they are refused before anything is written.
+
+    ``block_size`` is no floor on K here, unlike sm120's: a linear-scale (general) chain addresses a partial last
+    scale block, and the other block-scale chains of this family refuse a K that ends inside one on every call
+    (``_validate_whole_scale_blocks``)."""
+    if not (m and n):
+        return True
+    if k == 0:
+        raise ValueError("cudnn.frost gemm: K=0 is a zero K extent, which the kernel's TMA descriptors cannot encode; a call with nonzero M and N needs K >= 1")
+    if source_rows == 0:
+        raise ValueError("cudnn.frost gemm: MoE token_index routes rows into a token buffer that has none; GATHER reads every routed row from that buffer")
+    return False
+
+
 class CompiledMoeGemm(_CompiledMoeGemm[TileConfig, GemmBinding]):
     """Execute a compiled grouped GEMM."""
 
     _compiler = sys.modules[__name__]
+    _check_zero_extents = True
+    # Every check of this family's grouped call reads the plan and the bound buffers' signatures (launch_cache). The
+    # tvm-ffi launch takes the views themselves; the legacy one wraps them, which a launch entry does not record.
+    _replay_calls = _TVM_FFI_OK
 
 
 def _launch_moe_swap_ab(
@@ -3728,14 +4023,27 @@ def _launch_moe_swap_ab(
     e = int(weights[0].shape[0])
     offsets = _offset_vector(offsets)
     g = _moe_num_groups(offsets, e)
-    if chain.quants and (m, n) != (chain.matmul.M, chain.matmul.N):
+    # An empty call writes no quantized output: it reaches the skip below (_zero_extent_problem) unchecked.
+    if chain.quants and m and n and (m, n) != (chain.matmul.M, chain.matmul.N):
+        # A wide quantize runs at its compiled extents only; the other quantize kinds re-run their gates at the call's.
+        try:
+            _check_runtime_quant(chain, cfg, m, n)
+        except ValueError as exc:
+            raise ValueError(f"{exc} {_swap_ab_frame_note(m, n)}") from exc
         runtime_chain = replace(chain, matmul=replace(chain.matmul, M=m, N=n))
         try:
             _check_block_quant_supported(runtime_chain, _epi_vec_bytes(chain, cfg), cfg)
         except NotImplementedError as exc:
             raise ValueError(str(exc)) from exc
-    if n % math.gcd(_epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype], chain.moe.offset_multiple, chain.matmul.N):
-        raise ValueError("MoE weight-by-token runtime S violates the compiled STG chunk alignment")
+    vec_elems = _epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype]
+    chunk = math.gcd(vec_elems, chain.moe.offset_multiple, chain.matmul.N)
+    if n % chunk:
+        raise ValueError(
+            f"MoE weight-by-token runtime S violates the compiled STG chunk alignment: the token count {n} must be a multiple "
+            f"of {chunk}, the greatest common divisor of the graph's token count ({chain.matmul.N}), the epilogue vector "
+            f"({vec_elems} elements) and the alignment_value of first_token_offset ({chain.moe.offset_multiple}): declare an "
+            "alignment_value that divides every token count the plan runs"
+        )
     for quant in chain.quants:
         if (m if quant.axis == 1 else n) % quant.block_size:
             raise ValueError("MoE weight-by-token quantization axis must contain whole runtime blocks")
@@ -3779,10 +4087,14 @@ def _launch_moe_swap_ab(
     c = [_wrap_raw_tensor(buf) if spec.is_reduction or spec.is_quant_scale else wrap(buf, _LEADING_DIM_C) for spec, buf in zip(chain.outputs, c)]
     sf = [wrap(buf.permute(1, 2, 0), _LEADING_DIM_AUX) for buf in weight_sf + token_sf]
     aux = [wrap(_reshape_aux_to_fake(buf, ref), _LEADING_DIM_AUX) for ref, buf in zip(chain.aux_tensors, aux)]
+    compiled._check_sched_groups(g)
     slots = compiled._grid_ctas * compiled._desc_slots_per_cta
     workspace = compiled._make_workspace(slots + _MOE_SCHED_COUNTER_SLOTS, workspace)
+    empty = _zero_extent_problem(m, n, k, None, tokens[0].shape[1])
     _initialize_reduction_outputs(chain, outputs, stream)
-    _initialize_combine_output(chain, outputs, stream)
+    _initialize_combine_output(chain, outputs, stream, compiled.combine_zero)
+    if empty:
+        return None
     return compiled._launch_moe(problem, offsets, workspace, (*a, *b, *sf), c, aux, stream, token_index, token_ks, top_k_scores)
 
 
@@ -3851,6 +4163,8 @@ def _compile_fused_gemm(chain: FusionChain, config: TileConfig, *, binding=None)
         packed_lanes=_epi_packed_lanes(config),
         workspace_split_k=config.workspace_split_k,
     )
+    if _glu_silu_tanh(chain):
+        generate_kwargs["silu_tanh"] = True
     snippets = generate(chain, **generate_kwargs)
     render = _render_block_scale_template if chain.has_block_scale else _render_template
     src = render(chain, snippets, config)
@@ -3894,6 +4208,14 @@ class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm[TileConfig, GemmBindi
 
     _compiler = sys.modules[__name__]
     _validate_whole_scale_blocks = True
+    _check_zero_extents = True
+    _replay_calls = _TVM_FFI_OK  # as CompiledMoeGemm's
+
+    @property
+    def _validate_runtime_quant(self) -> bool:
+        """A wide quantize runs at its compiled extents only (``_check_runtime_quant``); the other quantize
+        epilogues of this family are not checked per call."""
+        return wide_quant(self.chain) is not None
 
 
 def _jit_moe_block_scale(
@@ -3919,6 +4241,10 @@ def _jit_moe_block_scale(
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
+    if _swap_combine_lanes(chain, config):
+        generate_kwargs["swap_combine_lanes"] = True
+    if _glu_silu_tanh(chain):
+        generate_kwargs["silu_tanh"] = True
     snippets = generate(chain, **generate_kwargs)
     src = _render_block_scale_template(chain, snippets, config)
     mod = _import_kernel(src)
@@ -3927,6 +4253,11 @@ def _jit_moe_block_scale(
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
     grid_ctas = _grid_num_clusters(config) * cluster_m * cluster_n
     token_operands = chain.num_b_operands if isinstance(chain.moe, MoeSwapAbSpec) else chain.num_a_operands
+    sched_groups_max = 0
+    if _is_general_block_scale(chain):
+        # The rendering's copy of the routing offsets holds the graph's num_groups + 1 (sched_fto_entries).
+        fto_entries = _general_block_scale_plan(chain, replace(config, warps_per_cta=_tmpl.warps_per_cta))["sched_fto_entries"]
+        sched_groups_max = max(fto_entries - 1, 0)
     return CompiledMoeBlockScaleGemm(
         chain=chain,
         config=config,
@@ -3950,6 +4281,11 @@ def _jit_moe_block_scale(
         + len([m for m in store_modes if m == "tma"]),
         store_modes=store_modes,
         use_tma_store=use_tma,
-        # The general grouped templates open their scheduler counter themselves (_sched_open).
+        # The general grouped templates open their scheduler counter themselves (_sched_open), and the plan may give
+        # their scheduler a copy of the routing offsets in shared memory, sized for the graph's groups.
         sched_epoch=_is_general_block_scale(chain),
+        sched_groups_max=sched_groups_max,
+        # Every role of a general grouped template waits for its programmatic predecessor before it touches global
+        # memory: a COMBINE call zeroes its output with a programmatic launch ahead of the kernel, not a memset.
+        combine_zero=_combine_zero_kernel(chain),
     )

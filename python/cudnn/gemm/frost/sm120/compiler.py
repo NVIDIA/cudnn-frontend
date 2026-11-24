@@ -1305,8 +1305,13 @@ def _check_aux_layout(recipe, operands, m: int, n: int, swap_ab: bool) -> None:
         )
 
 
-def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None:
-    """Zero COMBINE's final output on the launch stream after runtime checks: the kernel only ever adds into it."""
+def _initialize_combine_output(chain: FusionChain, outputs, stream=None, zero_kernel=None) -> None:
+    """Zero COMBINE's final output on the launch stream after runtime checks: the kernel only ever adds into it.
+
+    No plan of this family builds a programmatic fill (the plan's ``combine_zero``, the sm100 general grouped
+    templates'): ``zero_kernel`` is always None here, and the output is zeroed with a memset."""
+    if zero_kernel is not None:
+        raise NotImplementedError("cudnn.frost gemm: the sm120 tree zeroes a COMBINE output with a memset only")
     if chain.moe.mode != "combine":
         return
     output = outputs[0]  # COMBINE accepts exactly one final output.
@@ -2754,13 +2759,19 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
 
 
 def probe_cutedsl() -> None:
-    """The cutedsl floor gate shared by check_support and the family heuristics."""
+    """The cutedsl gate shared by check_support and the family heuristics: the version floor, then the target of the
+    GPU the plan is built for (Rule 7: the floor admits a 4.7.x DSL, whose Arch has no sm_107a, on a cc 10.7 part,
+    which this tree compiles for when CUDNN_FRONTEND_GEMM_ARCH_FAMILY pins it there)."""
     installed, version = buffers.cutedsl_state()
     if not installed:
         raise NotImplementedError("frost_gemm requires the cutedsl extra (nvidia-cutlass-dsl)")
     if buffers.cutedsl_too_old(version):
         want = ".".join(str(v) for v in buffers.CUTEDSL_MIN_VERSION)
         raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
+    arch = _current_arch()
+    reason = buffers.cutedsl_arch_requirement_error(None if arch is None else divmod(arch, 10))
+    if reason is not None:
+        raise NotImplementedError(f"frost_gemm cannot compile for this GPU: {reason}")
 
 
 def probe_chain(chain: FusionChain, config: TileConfig) -> None:

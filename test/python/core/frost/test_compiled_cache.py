@@ -45,6 +45,28 @@ def test_manifest_names_every_dependency_and_is_deterministic():
     assert cc.environment_manifest() == m  # same process, same answer
 
 
+def test_source_digest_covers_every_directory_of_the_package(tmp_path, monkeypatch):
+    """A checkout overlaid ahead of an installed package on ``cudnn.__path__`` (the FROST test conftest, the benchmark
+    harnesses) is what the kernels are traced from, while ``cudnn.__file__`` still names the installed package: the
+    source digest covers every directory on the path, so an edit to a module of either moves the environment, and a
+    package of one directory keeps that directory's digest."""
+    overlay = tmp_path / "cudnn"
+    overlay.mkdir()
+    (overlay / "helper.py").write_text("X = 1\n")
+    installed = [str(pathlib.Path(p).resolve()) for p in cudnn.__path__]
+    monkeypatch.setattr(cudnn, "__path__", [str(overlay), *installed])
+    monkeypatch.setattr(cc, "_SOURCE_DIGESTS", {})
+    assert cc._cudnn_source_roots() == (str(overlay.resolve()), *dict.fromkeys(installed))
+    first = cc._cudnn_source_digest()
+    assert cc.environment_manifest()["cudnn_source"] == first
+    (overlay / "helper.py").write_text("X = 2\n")
+    monkeypatch.setattr(cc, "_SOURCE_DIGESTS", {})
+    assert cc._cudnn_source_digest() != first
+    monkeypatch.setattr(cudnn, "__path__", installed[:1])
+    monkeypatch.setattr(cc, "_SOURCE_DIGESTS", {})
+    assert cc._cudnn_source_digest() == cc.source_tree_digest(pathlib.Path(installed[0])) != first
+
+
 def test_entry_location_is_the_content_hash_of_manifest_and_key(tmp_path):
     m = {"schema": cc._SCHEMA, "cudnn_frontend": "1.30.0", "cutlass_dsl": "4.7.1"}
     a = cc._entry_dir(tmp_path, m, "k1")
@@ -250,7 +272,14 @@ def test_the_manifest_carries_the_source_tree_not_a_commit(tmp_path):
     assert cc.source_tree_digest(tmp_path) != before
     import cudnn
 
-    assert cc.environment_manifest()["cudnn_source"] == cc.source_tree_digest(pathlib.Path(cudnn.__file__).resolve().parent)
+    # The installed package's directory, behind a checkout overlaid ahead of it where there is one
+    # (test_source_digest_covers_every_directory_of_the_package).
+    roots = cc._cudnn_source_roots()
+    assert str(pathlib.Path(cudnn.__file__).resolve().parent) in roots
+    if len(roots) == 1:
+        assert cc.environment_manifest()["cudnn_source"] == cc.source_tree_digest(pathlib.Path(roots[0]))
+    else:
+        assert cc.environment_manifest()["cudnn_source"] == cc._cudnn_source_digest() != cc.source_tree_digest(pathlib.Path(roots[-1]))
 
 
 def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(tmp_path, monkeypatch):

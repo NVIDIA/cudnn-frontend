@@ -14,6 +14,7 @@ and batch-invariance byte comparisons."""
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import re
 
@@ -23,14 +24,17 @@ import pytest
 import torch
 
 import warm_stress
-from gemm_test_utils import Plan, keep_kernel_ptx, kernel_ptx, requires_sm100
+from gemm_test_utils import Plan, keep_kernel_ptx, kernel_ptx, requires_sm100, requires_sm100_tree
 from cudnn.gemm.frost import compiler as C
-from cudnn.gemm.frost.fusion_ir import BlockQuantizeSpec, wide_quant
+from cudnn.gemm.frost import epilogue_codegen as EC
+from cudnn.gemm.frost.fusion_ir import BlockQuantizeSpec, FusionOp, wide_quant
 from cudnn.gemm.frost.graph_analyzer import analyze
-from cudnn.gemm.frost.kernel_registry import general_glu_pair, general_glu_pair_reject, select_template, swap_ab_graph
+from cudnn.gemm.frost.kernel_registry import general_glu_pair, general_glu_pair_reject, select_template, swap_ab_graph, template_path
 from cudnn.gemm.frost.tile_config import by_name
 
-pytestmark = pytest.mark.L0
+# Every test here concerns the sm100 tree's general templates and compiler (several call names only that compiler has):
+# a process that runs another family's tree skips them.
+pytestmark = [pytest.mark.L0, requires_sm100_tree]
 
 DT = cudnn.data_type
 _BLOCK = 128
@@ -319,6 +323,26 @@ def test_an_fp32_scale_is_rejected_outside_the_general_templates():
         C.probe_supported(g, by_name(_TILE_128))
 
 
+def test_the_routing_offsets_copy_keeps_the_kernel_in_its_carveout():
+    """The scheduler's shared-memory copy of the routing offsets takes only room the A/B stages leave, and not where it
+    may move the kernel to a larger shared-memory carveout: a GATHER FC1 of 512 experts (K = 2048, N = 512) in 128x128
+    tiles fills six 32 KB stages to just under the 196 KB carveout (198704 bytes measured) and goes without the copy,
+    in 128x16 weight-by-token tiles it takes the copy."""
+    g, _ = _graph("gather", 512, 4096, 512, 2048, rows=4096, fp8=True)
+    chain = analyze(g)
+    plan = C._general_block_scale_plan(chain, by_name(_config(128, "1x2")))
+    assert (plan["ab_stages"], plan["sched_fto_entries"]) == (6, 0)
+    swap_cfg = dataclasses.replace(by_name(_config(16)), swap_ab=True)
+    assert C._general_block_scale_plan(swap_ab_graph(chain), swap_cfg)["sched_fto_entries"] == 513
+    # The plan's shared memory with a 4 KB header reserve: the kernel's own lies up to 3 KB below it. The 196 KB carveout
+    # holds 199680 bytes of a thread block's (the system reserves 1 KB of it).
+    assert C._smem_carveout_crossed(200704, 2176, 4096)  # the case above
+    assert C._smem_carveout_crossed(201000, 128, 4096)  # the kernel may still be under the edge, and pass it
+    assert not C._smem_carveout_crossed(199000, 128, 4096)  # under the edge even at the plan's count
+    assert not C._smem_carveout_crossed(225280, 2176, 4096)  # in the 228 KB carveout either way
+    assert not C._smem_carveout_crossed(150000, 2048, 4096)
+
+
 # End-to-end numerics (GPU)
 
 
@@ -513,10 +537,11 @@ def test_a_gated_pair_refuses_one_scale_matrix_for_either_weight(swap):
 
 _GATED_RELEASES = {
     # the loader and the promotion warps read 7 words, the epilogue 8; "table" is the partial's release behind the
-    # promotion scale table (at least one register)
-    "fwd": (dict(kind="moe"), [1, 1, 7, 7, 8]),
-    "swap_fp8": (dict(kind="moe", fp8=True, swap=True, config=_config(32)), [1, 1, 7, 7, 8, "table"]),
-    "gather_fp8": (dict(kind="gather", S=300, rows=512, fp8=True), [1, 4, 7, 7, 8]),
+    # promotion scale table (at least one register). GATHER adds its relay warp (1) and token-copy warps (4). These
+    # thread blocks are their own clusters: no mailbox acknowledgement.
+    "fwd": (dict(kind="moe"), [1, 7, 7, 8]),
+    "swap_fp8": (dict(kind="moe", fp8=True, swap=True, config=_config(32)), [1, 7, 7, 8, "table"]),
+    "gather_fp8": (dict(kind="gather", S=300, rows=512, fp8=True), [1, 1, 4, 7, 7, 8]),
 }
 
 
@@ -670,3 +695,486 @@ def test_gated_fp8_graph_replays_write_the_eager_bytes(kind):
     finally:
         torch.cuda.synchronize()
         graph.reset()
+
+
+# A wide quantize runs at the extents it was built for
+#
+# The scale output of a wide quantize has the graph's shape, [1, rows, N / 128] (a constant rule), while the epilogue
+# stores scale block col // 128 of a row for the call's N, through the call's strides: at a larger N it wrote scales past
+# that tensor (a row's last block over the next row's first), and at an N inside a block it left that block's scale
+# unwritten. A call at other extents is refused before anything is written; a call without rows has nothing to write.
+
+
+def _wide_quant_pack(t, kind, E, S, rows, N, K, gemms):
+    """Operands for a call at runtime ``N`` with the graph-shaped scale view: (pack, codes, the scale view's backing).
+
+    The weights are bound in the kernel's order, [lead, N, K]; so are the grouped weight scales, [E, N / 128, K / 128],
+    while the dense one is the graph's [1, K / 128, N / 128] view of them."""
+    dev = "cuda"
+    gen = torch.Generator(device=dev).manual_seed(3)
+    lead = 1 if kind == "dense" else E
+    kb, nb = K // _BLOCK, -(-N // _BLOCK)
+    pack = {
+        t["tok"]: (torch.randn(1, S, K, device=dev, generator=gen) * 0.5).to(torch.float8_e4m3fn),
+        t["sfa"]: torch.rand(1, S, kb, device=dev, generator=gen) + 0.5,
+    }
+    for i in range(gemms):
+        pack[t["w"][i]] = (torch.randn(lead, N, K, device=dev, generator=gen) * 0.5).to(torch.float8_e4m3fn)
+        sb = torch.rand(lead, nb, kb, device=dev, generator=gen) + 0.5
+        pack[t["sfb"][i]] = sb.transpose(1, 2) if kind == "dense" else sb
+    if kind != "dense":
+        pack[t["fto"]] = (torch.arange(E + 1, dtype=torch.int32, device=dev) * (rows // E)).view(-1, 1, 1)
+    if kind == "gather":
+        pack[t["idx"]] = torch.randint(0, S, (1, rows, 1), device=dev, generator=gen, dtype=torch.int32)
+    codes = torch.full((1, rows, N), 0x7F, device=dev, dtype=torch.uint8)
+    # The graph's [1, rows, 2] scale view in front of a guard: a scale stored past the view lands in the guard.
+    backing = torch.full((rows * 2 + 4096,), float("nan"), device=dev)
+    pack[t["q"]], pack[t["qs"]] = codes.view(torch.float8_e4m3fn), backing[: rows * 2].view(1, rows, 2)
+    return pack, codes, backing
+
+
+@requires_sm100
+@pytest.mark.parametrize("N", [384, 320, 128], ids=["wider", "partial_block", "narrower"])
+@pytest.mark.parametrize("kind,gemms", [("dense", 1), ("moe", 1), ("gather", 2)], ids=["dense", "moe", "gated_gather"])
+def test_a_wide_quantize_refuses_a_call_at_another_n(kind, gemms, N):
+    """Built for N = 256, called at another N with the graph-shaped scale view: refused, and neither a code nor a scale
+    (in the view or past it) is written."""
+    E, S, N0, K = 4, 256, 256, 512
+    rows = 256
+    S_tok = 192 if kind == "gather" else S
+    g, t = _graph(kind, E, S_tok, N0, K, rows=rows if kind == "gather" else None, gemms=gemms, fp8=True)
+    plan = Plan(g, config=by_name(_TILE_128))
+    assert select_template(plan.chain, plan._compiled.config).file == _TEMPLATES[(kind, False)]
+    pack, codes, backing = _wide_quant_pack(t, kind, E, S_tok, rows, N, K, gemms)
+    with pytest.raises(ValueError, match=rf"runs only at the kernel-frame \(M, N\) = \({rows}, {N0}\) it was built for, not \({rows}, {N}\)"):
+        plan(pack)
+    torch.cuda.synchronize()
+    assert bool((codes == 0x7F).all()) and bool(torch.isnan(backing).all())
+    # The control: at the built extents the same buffers are written, the guard is not.
+    pack, codes, backing = _wide_quant_pack(t, kind, E, S_tok, rows, N0, K, gemms)
+    plan(pack)
+    torch.cuda.synchronize()
+    assert not bool((codes == 0x7F).any()) and bool(torch.isfinite(backing[: rows * 2]).all()) and bool(torch.isnan(backing[rows * 2 :]).all())
+
+
+@requires_sm100
+@pytest.mark.parametrize("kind,gemms", [("moe", 1), ("gather", 2)], ids=["moe", "gated_gather"])
+def test_a_swapped_wide_quantize_refuses_a_call_at_another_token_count(kind, gemms):
+    """A weight-by-token plan built for 256 routed rows, called with 128 and the graph-shaped scale tensor: refused with
+    the call's extents in the kernel frame, whose M and N are the graph's N and routed rows, and neither a code nor a
+    scale is written."""
+    E, S, N, K = 4, 256, 256, 512
+    rows, half = 256, 128
+    S_tok = 192 if kind == "gather" else S
+    g, t = _graph(kind, E, S_tok, N, K, rows=rows if kind == "gather" else None, gemms=gemms, fp8=True)
+    plan = Plan(g, config=by_name(_config(32)), swap_ab=True)
+    assert select_template(plan.chain, plan._compiled.config).file == _TEMPLATES[(kind, True)]
+    pack, codes, _ = _wide_quant_pack(t, kind, E, S_tok if kind == "gather" else half, half, N, K, gemms)
+    backing = torch.full((rows * 2 + 4096,), float("nan"), device="cuda")
+    pack[t["qs"]] = backing[: rows * 2].view(1, rows, 2)
+    with pytest.raises(
+        ValueError, match=rf"runs only at the kernel-frame \(M, N\) = \({N}, {rows}\) it was built for, not \({N}, {half}\).*kernel frame of this swap-AB plan"
+    ):
+        plan(pack)
+    torch.cuda.synchronize()
+    assert bool((codes == 0x7F).all()) and bool(torch.isnan(backing).all())
+    # The control: at the built extents the same buffers are written, the guard is not.
+    pack, codes, backing = _wide_quant_pack(t, kind, E, S_tok, rows, N, K, gemms)
+    plan(pack)
+    torch.cuda.synchronize()
+    assert not bool((codes == 0x7F).any()) and bool(torch.isfinite(backing[: rows * 2]).all()) and bool(torch.isnan(backing[rows * 2 :]).all())
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap", [False, True], ids=["fwd", "swap"])
+@pytest.mark.parametrize("gemms", [1, 2], ids=["one_gemm", "gated"])
+def test_a_wide_quantize_call_without_rows_writes_nothing(gemms, swap, monkeypatch):
+    """An expert-parallel rank with no routed rows calls the plan with zero token rows (zero-row views of live
+    buffers) and the graph-shaped scale tensor: the call returns before the launch, and nothing is written."""
+    E, S0, N, K = 4, 256, 256, 512
+    g, t = _graph("moe", E, S0, N, K, gemms=gemms, fp8=True)
+    plan = Plan(g, config=by_name(_config(32) if swap else _TILE_128), swap_ab=swap)
+    assert select_template(plan.chain, plan._compiled.config).file == _TEMPLATES[("moe", swap)]
+
+    def no_launch(*args, **kwargs):
+        pytest.fail("a call without rows reached the launch")
+
+    monkeypatch.setattr(type(plan._compiled), "_launch_moe", no_launch)
+    dev = "cuda"
+    codes = torch.full((1, 8, N), 0x7F, device=dev, dtype=torch.uint8)
+    scales = torch.full((1, S0, N // _BLOCK), float("nan"), device=dev)
+    pack = {
+        t["tok"]: torch.zeros(1, 8, K, device=dev).to(torch.float8_e4m3fn)[:, :0],
+        t["sfa"]: torch.ones(1, 0, K // _BLOCK, device=dev),
+        t["fto"]: torch.zeros(E + 1, 1, 1, dtype=torch.int32, device=dev),
+        t["q"]: codes.view(torch.float8_e4m3fn)[:, :0],
+        t["qs"]: scales,
+    }
+    for i in range(gemms):
+        pack[t["w"][i]] = torch.ones(E, N, K, device=dev).to(torch.float8_e4m3fn).transpose(1, 2)
+        pack[t["sfb"][i]] = torch.ones(E, N // _BLOCK, K // _BLOCK, device=dev).transpose(1, 2)
+    assert plan(pack) is None
+    torch.cuda.synchronize()
+    assert bool((codes == 0x7F).all()) and bool(torch.isnan(scales).all())
+
+
+# Register moves and the pair's first-pass stage (source, no GPU)
+#
+# setmaxnreg is a warpgroup instruction: the PTX ISA leaves it undefined unless every warp of the warpgroup executes the
+# same one. An mbarrier phase that completes while no thread waits on it is what compute-sanitizer synccheck reports as
+# a missing wait (and it ends the launch): the epilogue waits on every acc_full phase the promotion warps complete.
+
+
+def _setmaxnreg_sites(source):
+    """(action, count, the run-time ``if`` tests above it) of every ``nvvm.setmaxregister`` call of a template."""
+    sites = []
+
+    def visit(node, tests):
+        if isinstance(node, ast.If):
+            test = ast.unparse(node.test)
+            inner = tests if test.startswith("cutlass.const_expr(") else [*tests, test]
+            for child in [*node.body, *node.orelse]:
+                visit(child, inner)
+            return
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "nvvm.setmaxregister":
+            sites.append((ast.unparse(node.args[1]).rsplit(".", 1)[-1], ast.unparse(node.args[0]), tests))
+        for child in ast.iter_child_nodes(node):
+            visit(child, tests)
+
+    visit(ast.parse(source), [])
+    return sites
+
+
+@pytest.mark.parametrize("kind,swap", list(_TEMPLATES))
+def test_every_warpgroup_of_a_general_template_moves_its_registers_at_one_instruction(kind, swap):
+    """No setmaxregister sits in a branch that one warp takes (``warp_idx == <role>``). The control warpgroup (warps
+    4..7, four warps of four roles) lowers its count at one entry before they branch; every other call is taken by
+    whole warpgroups."""
+    sites = _setmaxnreg_sites(template_path(_TEMPLATES[(kind, swap)]).read_text())
+    assert sites
+    for action, count, tests in sites:
+        assert not any(re.search(r"\bwarp_idx ==", test) for test in tests), f"setmaxregister({count}, {action}) under {tests}"
+    control = [site for site in sites if site[2] == ["warp_idx >= 4 and warp_idx < 8"]]
+    assert len(control) == 1 and control[0][0] == "DECREASE"
+
+
+@pytest.mark.parametrize("kind,swap", list(_TEMPLATES))
+def test_a_gated_pair_waits_on_the_stage_of_its_first_pass(kind, swap):
+    """The epilogue drains a tile's two passes together, behind the second pass's acc_full. The first pass completes a
+    phase of its own stage's acc_full too: where the epilogue skips the first pass, it waits on that phase. Otherwise
+    compute-sanitizer synccheck reports every gated launch of more than one tile per thread block as a missing wait
+    (about 500 reports on a 2048 x 2048 x 256 dense pair) and ends it. The source pin stands in for that tool run."""
+    source = template_path(_TEMPLATES[(kind, swap)]).read_text()
+    begin = source.index("# The tile's first pass (the second paired GEMM) stays in its accumulator stage")
+    skip = source[begin : source.index("if epi_drain", begin)]
+    assert "mbarrier_try_wait_parity(acc_full_mbar_ptr.subview(tile_iter % acc_stages), acc_full_phase_bit" in skip
+
+
+# The drain width of a gathered pair's lanes quantize (no GPU)
+
+
+@pytest.mark.parametrize("n", [64, 128])
+def test_a_gathered_gated_pair_drains_its_lanes_quantize_32_columns_at_a_time(n):
+    """A gated pair's quantize sweep holds a drain chunk of both GEMMs before the SwiGLU. Under the async GATHER
+    templates' 112-register epilogue a chunk of 64 columns (2 x 64 fp32 values per lane) spilled 8 KB a thread on a
+    128-column swapped tile, so the chunk is 32 columns there. A single GEMM, and the sorted template's 168-register
+    epilogue, keep 64."""
+
+    def epi_n(kind, gemms):
+        chain = swap_ab_graph(analyze(_graph(kind, 6, 300 if kind == "gather" else 512, 256, 512, rows=512, gemms=gemms, fp8=True)[0]))
+        cfg = dataclasses.replace(by_name(_config(n)), swap_ab=True)
+        C._general_block_scale_plan(chain, cfg)
+        return C._epi_n_for_chain(cfg, chain)
+
+    assert epi_n("gather", 2) == 32
+    assert epi_n("gather", 1) == 64
+    assert epi_n("moe", 2) == 64
+
+
+def test_a_wide_quantize_refuses_a_drain_chunk_narrower_than_its_store_vector(monkeypatch):
+    """Both sweeps take a drain chunk as whole store vectors (32 values here): a 16-column chunk would compile to sweeps
+    that skip their columns, so the plan is refused."""
+    chain = analyze(_graph("moe", 6, 512, 256, 512, fp8=True)[0])
+    cfg = by_name(_TILE_128)
+    assert C._general_block_scale_plan(chain, cfg)["wide_quant"]
+    monkeypatch.setattr(C, "_epi_n_for_chain", lambda cfg, chain: 16)
+    with pytest.raises(NotImplementedError, match="drains whole 32-value vectors"):
+        C._general_block_scale_plan(chain, cfg)
+
+
+# A wide quantize's block maximum skips NaN element by element in either orientation, a nonzero scale is at least the
+# smallest normal fp32 (2**-126), whose reciprocal the kernel's flush-to-zero approximation keeps, and a block of zeros
+# stores scale 0 and codes 0.
+
+_MIN_NORMAL = 2.0**-126
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap", [False, True], ids=["fwd", "swap"])
+def test_a_wide_quantize_skips_a_nan_and_floors_a_tiny_scale(swap):
+    """One GEMM, FP8 block-128 output, three experts of 128 routed rows each over exact operands (small integers and
+    powers of two: every output value is exact in fp32):
+
+    - expert 0: an e4m3 NaN in output column 5 of the weight, beside column 6 whose weights are 4 times the others'. The
+      block's scale is its largest finite magnitude times RN(1/448), and the NaN's code is NaN. The non-swapped drain
+      took each 32-value vector's maximum NaN-propagating and folded the vectors NaN-skipping: columns 0..31, column 6
+      among them, dropped out of the scale, and column 6 saturated.
+    - expert 1: the values are about 1e-36, so amax / 448 is subnormal: the scale is 2**-126, and the codes are the
+      values times 2**126. The flush-to-zero reciprocal of a subnormal scale is infinite, which made the codes the
+      values times FLT_MAX.
+    - expert 2: the token rows are zero: scale 0, codes 0."""
+    E, R, N, K = 3, 128, 256, 256
+    S = E * R
+    g, t = _graph("moe", E, S, N, K, gemms=1, fp8=True)
+    plan = Plan(g, config=by_name(_config(32) if swap else _TILE_128), swap_ab=swap)
+    assert select_template(plan.chain, plan._compiled.config).file == _TEMPLATES[("moe", swap)]
+    dev = "cuda"
+    gen = torch.Generator(device=dev).manual_seed(7)
+    kb, nb = K // _BLOCK, N // _BLOCK
+    tok = torch.randint(-1, 2, (1, S, K), device=dev, generator=gen).float()
+    tok[0, :R, 3] = 1.0  # every row of expert 0 multiplies the NaN
+    tok[0, 2 * R :] = 0.0
+    w = torch.randint(-1, 2, (E, N, K), device=dev, generator=gen).float()
+    w[0, 6] *= 4.0
+    sa = torch.ones(1, S, kb, device=dev)
+    sa[0, R : 2 * R] = 2.0**-64
+    sb = torch.ones(E, nb, kb, device=dev)
+    sb[1] = 2.0**-61
+    w8 = w.to(torch.float8_e4m3fn)
+    w8.view(torch.uint8)[0, 5, 3] = 0x7F  # an e4m3 NaN
+    w_ref = w.double()
+    w_ref[0, 5, 3] = float("nan")
+    tok_ref = tok[0].double() * sa[0].double().repeat_interleave(_BLOCK, 1)
+    w_ref = w_ref * sb.double().repeat_interleave(_BLOCK, 1).repeat_interleave(_BLOCK, 2)
+    ref = torch.cat([tok_ref[e * R : (e + 1) * R] @ w_ref[e].T for e in range(E)])
+    q = torch.full((1, S, N), 0x55, device=dev, dtype=torch.uint8)
+    qs = torch.full((1, S, nb), float("nan"), device=dev)
+    pack = {
+        t["tok"]: tok.to(torch.float8_e4m3fn),
+        t["sfa"]: sa,
+        t["w"][0]: w8.transpose(1, 2),
+        t["sfb"][0]: sb.transpose(1, 2),
+        t["fto"]: (torch.arange(E + 1, dtype=torch.int32, device=dev) * R).view(-1, 1, 1),
+        t["q"]: q.view(torch.float8_e4m3fn),
+        t["qs"]: qs,
+    }
+    plan(pack)
+    torch.cuda.synchronize()
+
+    nan = torch.isnan(ref)
+    amax = torch.nan_to_num(ref.abs(), nan=0.0).view(S, nb, _BLOCK).amax(dim=2).float()
+    want = amax * torch.tensor(1.0 / _FP8_MAX, dtype=torch.float32, device=dev)
+    want = torch.where(amax > 0, want.clamp_min(_MIN_NORMAL), want)
+    scale = qs[0]
+    for e, what in enumerate(("a block with a NaN", "a block of about 1e-36", "a block of zeros")):
+        rows = slice(e * R, (e + 1) * R)
+        assert torch.equal(
+            scale[rows].view(torch.int32), want[rows].view(torch.int32)
+        ), f"{what}: scale {scale[rows].flatten()[:4].tolist()}, want {want[rows].flatten()[:4].tolist()}"
+    codes = q[0].view(torch.float8_e4m3fn).float()
+    assert bool(nan[:R, 5].all()) and int(nan.sum()) == R
+    assert bool(torch.isnan(codes[nan]).all()), "a NaN's code is not NaN"
+    assert bool((q[0, 2 * R :] == 0).all()), "a block of zeros stored a nonzero code"
+    finite = ~nan
+    finite[2 * R :] = False
+    per_elem = scale.repeat_interleave(_BLOCK, dim=1)[finite]
+    got = codes[finite]
+    want_codes = (ref.float()[finite] / per_elem).to(torch.float8_e4m3fn).float()
+    diff = (got - want_codes).abs()
+    assert bool((diff <= _e4m3_step(torch.maximum(got.abs(), want_codes.abs()))).all()), f"a code is {float(diff.max())} away from the reference's"
+    assert float((diff == 0).float().mean()) > 0.995
+
+
+# The pair's drain: the first pass's stage back after the first sweep, and SiLU in one MUFU op
+#
+# A pair's first pass waits in its main accumulator stage for the second, and the MMA warp starts the next tile's first
+# pass into that stage once the epilogue releases it. Of a wide quantize's two sweeps, the first is the last read of
+# that stage: the second sweep reloads only the stage the first wrote its values back to. The drain's SiLU runs while
+# the MMA warp waits: x * (1/2 + tanh.approx(x / 2) / 2) takes one MUFU op per value where x * rcp(1 + ex2(-x log2 e))
+# takes two (ex2.approx, rcp.approx). Only these pairs evaluate it so; every other SiLU keeps the two-op form.
+
+
+def _wide_quant_region(kind, swap):
+    source = template_path(_TEMPLATES[(kind, swap)]).read_text()
+    begin = source.index("# @@WIDE_QUANT_ONLY:BEGIN@@")
+    return source[begin : source.index("# @@WIDE_QUANT_ONLY:END@@", begin)]
+
+
+_ACC_RELEASE = re.compile(r"nvvm\.mbarrier_arrive\(acc_empty_mbar_ptr\.subview\(([^)]*)\)\)")
+
+
+@pytest.mark.parametrize("kind,swap", list(_TEMPLATES))
+def test_a_gated_wide_quantize_releases_the_first_pass_stage_after_the_first_sweep(kind, swap):
+    """(source, no GPU) A pair arrives on its first pass's stage (the second paired GEMM's, one stage back) once the first
+    sweep, its last reader, is done with it: behind the sweep's tcgen05.st of the values computed from every word it
+    loaded and the wait for those stores, a wait for the loads and a fence (python/cudnn/AGENTS.md Rule 11, tensor
+    memory: the first read of the loaded registers precedes the release), and before the second sweep. The second sweep
+    arrives on the other stage only. When both arrived after the second sweep's loads, the MMA warp waited for the whole
+    drain before each tile's first pass."""
+    region = _wide_quant_region(kind, swap)
+    first, second = region.split("# @@INJECT_WQ_SCALE@@")
+    store_wait = "nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)"
+    steps = [
+        "_cv = nvvm.tcgen05_ld(",
+        "# @@INJECT_WQ_VALUES@@",
+        "nvvm.tcgen05_st(shape, cutlass.inttoptr(tmem_col_addr_gemms[0] + wq_col, 6, cutlass.Float32), wq_src)",
+        store_wait,
+        "if cutlass.const_expr(glu_pair):",
+        "nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)",
+        "nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)",
+        "nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage - 1))",
+    ]
+    missing = [step for step in steps if step not in first]
+    assert not missing, f"the first sweep has no {missing}"
+    order = [first.index(step) for step in steps]
+    assert order == sorted(order), "the first sweep releases the first pass's stage out of order"
+    assert not _ACC_RELEASE.findall(first[: first.index(store_wait)]), "a release inside the first sweep's loads"
+    assert _ACC_RELEASE.findall(first) == ["acc_stage - 1"]
+    released = _ACC_RELEASE.findall(second)
+    assert released == ["acc_stage"], f"the second sweep releases {released}"
+
+
+def _silu_graph(gemms=2, S=512, N=256, K=128, out=DT.FLOAT, beta=None):
+    """``swish(tokens @ w0) * (tokens @ w1)`` (``gemms=2``) or ``swish(tokens @ w0)``, dense, FP8 block-128 operands."""
+    g = cudnn.pygraph(io_data_type=DT.BFLOAT16, intermediate_data_type=DT.FLOAT, compute_data_type=DT.FLOAT)
+    kb, nb = K // _BLOCK, N // _BLOCK
+    t = {"w": [], "sfb": []}
+    t["tok"] = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=DT.FP8_E4M3)
+    t["sfa"] = g.tensor(name="SFA", dim=[1, S, kb], stride=[S * kb, kb, 1], data_type=DT.FLOAT)
+    tok_d = g.block_scale_dequantize(input=t["tok"], descale=t["sfa"], block_size=[1, _BLOCK])
+    c = []
+    for i in range(gemms):
+        t["w"].append(g.tensor(name=f"w{i}", dim=[1, K, N], stride=[K * N, 1, K], data_type=DT.FP8_E4M3))
+        t["sfb"].append(g.tensor(name=f"SFB{i}", dim=[1, kb, nb], stride=[kb * nb, 1, kb], data_type=DT.FLOAT))
+        c.append(g.matmul(A=tok_d, B=g.block_scale_dequantize(input=t["w"][i], descale=t["sfb"][i], block_size=[_BLOCK, _BLOCK]), name=f"mm{i}"))
+    y = g.swish(input=c[0], name="silu") if beta is None else g.swish(input=c[0], swish_beta=beta, name="silu")
+    if gemms == 2:
+        y = g.mul(a=y, b=c[1], name="mul")
+    y.set_output(True).set_data_type(out)
+    t["out"] = y
+    return g, t
+
+
+def _mxfp8_pair_graph(M=256, N=256, K=512):
+    """``swish(A @ B0) * (A @ B1)`` over MXFP8 (E8M0 scales per 32 values): a pair of the source block-scale templates."""
+    g = cudnn.pygraph(io_data_type=DT.BFLOAT16, intermediate_data_type=DT.FLOAT, compute_data_type=DT.FLOAT)
+    rk = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
+    a = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=DT.FP8_E4M3)
+    sfa = g.tensor(name="SFA", dim=[1, M, K // 32], stride=[M * K // 32, K // 32, 1], data_type=DT.FP8_E8M0, **rk)
+    a_d = g.block_scale_dequantize(input=a, descale=sfa, block_size=[1, 32])
+    c = []
+    for i in range(2):
+        b = g.tensor(name=f"B{i}", dim=[1, K, N], stride=[K * N, 1, K], data_type=DT.FP8_E4M3)
+        sfb = g.tensor(name=f"SFB{i}", dim=[1, K // 32, N], stride=[K // 32 * N, 1, K // 32], data_type=DT.FP8_E8M0, **rk)
+        c.append(g.matmul(A=a_d, B=g.block_scale_dequantize(input=b, descale=sfb, block_size=[32, 1]), name=f"mm{i}"))
+    g.mul(a=g.swish(input=c[0]), b=c[1]).set_output(True).set_data_type(DT.BFLOAT16)
+    return g
+
+
+def _plain_pair_graph(M=256, N=256, K=512):
+    """``swish(A @ B0) * (A @ B1)`` in bf16: a pair of the plain templates."""
+    g = cudnn.pygraph(io_data_type=DT.BFLOAT16, intermediate_data_type=DT.FLOAT, compute_data_type=DT.FLOAT)
+    a = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=DT.BFLOAT16)
+    c = [g.matmul(A=a, B=g.tensor(name=f"B{i}", dim=[1, K, N], stride=[K * N, 1, K], data_type=DT.BFLOAT16), name=f"mm{i}") for i in range(2)]
+    g.mul(a=g.swish(input=c[0]), b=c[1]).set_output(True).set_data_type(DT.BFLOAT16)
+    return g
+
+
+def test_only_a_general_gated_pair_evaluates_silu_through_tanh_approx():
+    """(no GPU) The five templates' pairs, bf16 or FP8 out, take the one-op SiLU; a general template's single GEMM with
+    a SiLU, a pair of the source block-scale templates (MXFP8) and a plain bf16 pair keep the two-op form, and so does
+    a swish whose beta is not 1."""
+    for kind, swap in _TEMPLATES:
+        for fp8 in (False, True):
+            chain = analyze(_graph(kind, 6, 300 if kind == "gather" else 512, 256, 512, rows=512, fp8=fp8)[0])
+            assert C._glu_silu_tanh(swap_ab_graph(chain) if swap else chain), (kind, swap, fp8)
+    assert C._glu_silu_tanh(analyze(_silu_graph()[0]))
+    single = analyze(_silu_graph(gemms=1)[0])
+    assert C._is_general_block_scale(single) and not C._glu_silu_tanh(single)
+    assert not C._glu_silu_tanh(analyze(_mxfp8_pair_graph()))
+    assert not C._glu_silu_tanh(analyze(_plain_pair_graph()))
+
+    def swish(silu_tanh, beta=None):
+        op = FusionOp(op="swish", attrs=() if beta is None else (("swish_beta", beta),))
+        return "\n".join(EC._emit_op(op, "x", 0, {}, silu_tanh=silu_tanh)[0])
+
+    one_op = "x * (cutlass.full_like(x, cutlass.Float32(0.5)) + cutlass.full_like(x, cutlass.Float32(0.5)) * cute.math.tanh(x * cutlass.full_like(x, cutlass.Float32(0.5)), fastmath=True))"
+    assert swish(True) == f"_op_0 = {one_op}" and swish(True, beta=1.0) == f"_op_0 = {one_op}"
+    for form in (swish(False), swish(False, beta=1.0), swish(True, beta=2.0)):
+        assert "cute.math.tanh" not in form and "cute.math.exp2(" in form and "cute.math.rcp(" in form
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "case",
+    ["dense_bf16", "gather_fp8", "gather_swap_fp8", "dense_one_gemm"],
+)
+def test_a_gated_pair_takes_one_tanh_approx_per_silu(case, monkeypatch, tmp_path):
+    """In the generated PTX: a pair's SiLU is tanh.approx.f32 (one MUFU op) and the kernel takes no ex2.approx (which
+    the two-op form needs); a general template's single GEMM with a SiLU keeps ex2.approx and takes no tanh.approx."""
+    keep_kernel_ptx(monkeypatch, C, tmp_path)
+    if case == "dense_one_gemm":
+        plan = Plan(_silu_graph(gemms=1, out=DT.BFLOAT16)[0], config=by_name(_TILE_128))
+        counts = {op: kernel_ptx(plan).count(op) for op in ("tanh.approx.f32", "ex2.approx")}
+        assert counts["tanh.approx.f32"] == 0 and counts["ex2.approx"] > 0, counts
+        return
+    if case == "dense_bf16":
+        plan = Plan(_graph("dense", 6, 512, 256, 512)[0], config=by_name(_TILE_128))
+    else:
+        swap = case == "gather_swap_fp8"
+        plan, _ = _gated_plan(kind="gather", S=300, rows=512, fp8=True, swap=swap, config=_config(32) if swap else _TILE_128)
+    counts = {op: kernel_ptx(plan).count(op) for op in ("tanh.approx.f32", "ex2.approx")}
+    assert counts["tanh.approx.f32"] > 0 and counts["ex2.approx"] == 0, counts
+
+
+@requires_sm100
+def test_a_gated_pair_silu_stays_within_a_tanh_approx_of_the_exact_one():
+    """A pair's SiLU against x * sigmoid(x) in fp64, over exact gate values with the up GEMM 1: one-hot token rows times
+    e4m3 weights and a power-of-two scale (x in [-28, 28], every value an e4m3 one over 16), output in fp32. The bound,
+    2^-12 |x|, is the error of x * (1/2 + tanh(x / 2) / 2) through a tanh within a relative 2^-11 of its value; this part
+    measured at most 3.4e-6 |x| on these inputs, the two-op form 8.2e-8 |x|."""
+    S, N, K = 512, 256, 128
+    g, t = _silu_graph(S=S, N=N, K=K)
+    plan = Plan(g, config=by_name(_TILE_128))
+    dev = "cuda"
+    gen = torch.Generator(device=dev).manual_seed(11)
+    tok = torch.zeros(1, S, K, device=dev)
+    tok[0, torch.arange(S), torch.arange(S) % K] = 1.0
+    w0 = ((torch.rand(1, N, K, device=dev, generator=gen) * 2 - 1) * 448).to(torch.float8_e4m3fn)
+    out = torch.full((1, S, N), float("nan"), device=dev)
+    plan(
+        {
+            t["tok"]: tok.to(torch.float8_e4m3fn),
+            t["sfa"]: torch.ones(1, S, 1, device=dev),
+            t["w"][0]: w0.transpose(1, 2),
+            t["w"][1]: torch.ones(1, N, K, device=dev).to(torch.float8_e4m3fn).transpose(1, 2),
+            # the graph's [1, K / 128, N / 128] view of [1, N / 128, K / 128] scales, as _run binds them
+            t["sfb"][0]: torch.full((1, N // _BLOCK, 1), 1.0 / 16, device=dev).transpose(1, 2),
+            t["sfb"][1]: torch.ones(1, N // _BLOCK, 1, device=dev).transpose(1, 2),
+            t["out"]: out,
+        }
+    )
+    torch.cuda.synchronize()
+    x = (w0[0].double().T / 16)[torch.arange(S) % K]  # [S, N]: row r takes weight column r % K
+    want = x * torch.sigmoid(x)
+    got = out[0].double()
+    assert bool(torch.isfinite(got).all())
+    assert x.min() < -16 and x.max() > 16 and x.unique().numel() > 100
+    bound = 2.0**-12 * x.abs() + 2.0**-22 * want.abs()
+    assert bool(((got - want).abs() <= bound).all()), f"error up to {float(((got - want).abs() / x.abs().clamp_min(1e-30)).max()):.3e} |x|"
+
+
+@requires_sm100
+def test_a_gated_fp8_pair_of_several_tiles_per_thread_block_writes_the_bytes_of_every_cluster():
+    """The production FC1's shape of work, GATHER into FP8 block-128 on 128x128 tiles, with several tiles per thread
+    block: each thread block's next tile runs its first pass in the stage the drain gave back after its first sweep.
+    Clusters of one, two and four tiles along the weight's columns schedule the tiles differently and write the same
+    codes and scales; each passes the fp32 reference (``_run``). One K block makes a pass shorter than a drain: with the
+    stage given back before the first sweep had read it, the next pass's store reached it under the sweep and the
+    output was not finite (with K = 512 it came too late to show)."""
+    kw = dict(kind="gather", E=6, S=2048, rows=8192, N=512, K=128, fp8=True)
+    one = _run(config=_TILE_128, **kw)
+    for cluster in ("1x2", "1x4"):
+        many = _run(config=_config(128, cluster), **kw)
+        assert torch.equal(many.data.view(torch.uint8), one.data.view(torch.uint8)), cluster
+        assert torch.equal(many.scale[0, : one.used].view(torch.int32), one.scale[0, : one.used].view(torch.int32)), cluster

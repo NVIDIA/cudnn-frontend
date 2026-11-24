@@ -955,6 +955,18 @@ anything releases that stage, and prove the order in the compiled kernel.**
   for a slot overwritten by the same thread block's next MMA chain. A slot
   rewritten by another thread block, by `tcgen05.st` or after a deallocation
   was not measured. Do not read this rule as an exemption for tensor memory.
+  A release between `tcgen05.wait::ld` and the first read of the loaded
+  registers does not conform: the general block-scale templates' gated
+  wide-quantize drain released its first-pass stage there, and the
+  disassembly put the arrive ahead of the reads of the last load. Behind a
+  `tcgen05.st` of results computed from every loaded word and that store's
+  `tcgen05.wait::st` it conforms; that drain releases there now
+  (`test_a_gated_wide_quantize_releases_the_first_pass_stage_after_the_first_sweep`).
+  `consume_then_arrive` over the loaded words conforms as well, but in that
+  kernel ptxas interleaved its fold with the surrounding arithmetic and it
+  released no earlier than the store-based form. The conforming placement
+  cost 0.6-1.5% of that FC1 at 4096 tokens on 1x1 tiles (measured
+  2026-11-23).
 - **Scope.** The rule applies to new and changed release sites. Existing
   sites move onto the helper in follow-up changes; until a site has moved,
   its release arrive, fence or named barrier stays.
@@ -1223,6 +1235,21 @@ reference; `sdpa/frost/test_sdpa_thd_tensormap_acquire.py` and
 surrounding descriptor replacement, data visibility, and pipeline synchronization
 have different contracts and remain required.
 
+**A device-side `tensormap.replace` keeps the map's size class.** The encoder
+sets qword 1 bit 21 of a `CUtensorMap` when the map's strided span is at
+least 128 KiB, and replacing the address or an extent leaves the bit as it
+was. A map rebased onto a sub-range of a larger tensor then lets a box that
+crosses its last row read up to 128 KiB from the new address (measured): past
+the end of the tensor for the last groups, a sticky illegal-address fault
+where unmapped memory follows. The general grouped GEMM templates load token
+rows through the host's map of the whole tensor at absolute rows and rewrite
+only their output maps; the older `sm100_moe_grouped_*` templates still
+rebase their token maps per group. A rewrite also needs its order: drain the
+readers of the old map, write, release, then acquire before the first use.
+Detector: a token tensor that ends at reserved, unmapped address space
+(`_before_unmapped_memory` in
+`gemm/frost/test_general_moe_grouped_block_scale_matmul_fwd.py`).
+
 **Every TMA scatter4 source needs 128-byte SMEM address alignment.** An aligned
 ring base does not align each four-row issue: a 16-byte staging row advances
 only 64 bytes, so every second issue faults. Select STG for such staging pitches
@@ -1349,6 +1376,82 @@ Both compiler families use `recipe.check_split_k_shape` in the launch guard
 and `explain()`: every split must have a K tile, and workspace reduction must
 retain its compiled N chunk. Check before seeds, workspace writes or launch;
 reject without changing the selected reduction mode.
+
+**An SM100 grouped GEMM plan replays its calls by buffer signature
+(`gemm/frost/launch_cache.py`).** The first call of a signature takes the
+full path (`_CompiledMoeBase._call_variant_pack`); the second takes it while
+`launch_cache.recording()` records the workspace carve, the output fills and
+the launch; later calls run only those, on their own buffers. A signature is,
+per bound buffer, its type, shape, strides, dtype, device and address modulo
+256, plus which bound buffers share an address. The sm100 family replays
+under tvm-ffi only (the legacy launch wraps its views, which an entry does
+not record).
+
+- A new check on a grouped launch path reads only the plan and those facts
+  (the routed-group bound, `_check_sched_groups`, reads `first_token_offset`'s
+  extent, a signature fact), or it also runs per call in `_launch_entry`, as
+  the workspace check does. A family whose checks read anything else keeps
+  `_replay_calls = False`; sm120 does, since its COMBINE check reads the
+  workspace's device.
+- A new output fill, workspace carve or second launch goes through the
+  recording hooks (`launch_cache.active_record()` in
+  `_initialize_reduction_outputs`, `_initialize_combine_output`,
+  `_make_workspace` and `_launch_moe`) and is counted in
+  `launch_cache.fill_count`; a fill of a new kind needs its own kind in
+  `launch_cache.fill` (the COMBINE fill records `"kernel"` for the plan's
+  `combine_zero` and `"zero"` for the memset). A record that an entry cannot
+  describe stores the signature as not replayable: still correct, but back to
+  about 130 us of host time per call.
+- Detectors: `gemm/frost/test_moe_launch_cache.py`, among them
+  `test_replayed_call_writes_what_the_full_path_writes`,
+  `test_replayed_plan_refuses_what_the_full_path_refuses` and
+  `test_replayed_general_combine_zeroes_its_output_with_the_fill_kernel`. A
+  test that patches a launch-path function: [test/AGENTS.md](../../test/AGENTS.md).
+
+**SM100 runs a kernel in the smallest shared-memory carveout that holds it.**
+The carveouts are 0, 8, 16, 32, 64, 100, 132, 164, 196 and 228 KB
+(`_SM100_SMEM_CARVEOUTS_KB` in `gemm/frost/sm100/compiler.py`): a thread
+block's shared memory plus the 1 KB the system reserves per block selects
+one, and the rest of the SM's 256 KB is L1. Shared memory added to a kernel
+just under a step moves it to the next carveout: a 2 KB routing-offset table
+moved a GATHER FC1 (128x128 tiles in 1x2 clusters, 4096 tokens) from 196 to
+228 KB and cost 5%, and with the table in its COMBINE FC2 alone, the FC2 in
+the larger carveout behind the FC1 in the smaller cost the layer 2.3%. The
+general grouped plan takes its scheduler's copy of `first_token_offset` only
+where `_smem_carveout_crossed` finds no step crossed. Before adding shared
+memory near a step, read the kernel's per-block shared memory from a
+`torch.profiler` trace.
+
+**ptxas if-converts a short block under a once-every-N-windows condition.**
+Its predicated instructions then issue in every window. In the general
+block-scale promotion loops, the weight-scale grid reload of the plain and
+GATHER templates and the warp-uniform A-scale grid of the swapped ones keep
+the long Int64 index of `_load_sfb` / `_load_sfa`, which ptxas branches
+around: strength-reducing that reload measured 1.2% slower on a DeepSeek-V3
+FC1 at 4096 tokens. After touching such a block, check `cuobjdump -sass` for
+a `@P BRA` over it. The per-window scale loads take the other form
+(`_load_sf`): a scale line computed once per tile plus a non-negative Int32 K
+block, widened with `cutlass.Uint64`. Signed DSL `//` and `%` lower to
+`arith.floordivsi` / `arith.remsi` with a sign fix-up, about ten SASS
+instructions for a 64-bit divide by 128.
+
+**A change to the general grouped templates' token loads, scheduler or relay
+reopens their selection calibration.** General block-scale chains are planned
+by `planning.general_block_scale_baseline` and `_general_moe_swap_pick`
+(`_select_general_block_scale` orders the shortlist), not by `select_config`;
+`gemm/frost/test_general_block_scale_selection.py` pins the picks. Their
+thresholds measure template details: the 1x1 against 1x2 choice of the sorted
+templates follows how fast a 1x1 token box loads (the token tensor's size, K),
+and the swap widths follow the scheduler and the claim path. The template
+fixes of the 2026-11-20 review moved a GATHER 1x2 / 1x1 ratio of 0.984 to
+1.002-1.005, and NONE 1x2 at a short K from 0.995 to up to 1.20x. After such a
+change, re-run the selection sweep (FC1 and COMBINE inside the layer, single
+NONE and GATHER, dense; the model shapes at 1-4096 tokens, same session
+against the previous picks; [test/AGENTS.md](../../test/AGENTS.md) has the
+timing traps) and update that test. The grouped templates launch
+`max_active_clusters` clusters with no fallback cluster, so a default cluster
+must keep every SM busy (`planning._clusters_cover_sms`); the dense
+template's fallback clusters make that moot there.
 
 ## The public function contract
 

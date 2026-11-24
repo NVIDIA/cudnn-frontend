@@ -737,6 +737,11 @@ class BlockScaleSpec:
     fake_dequant_a: bool = False
     fake_dequant_b: bool = False
     padded_e2m1: bool = False
+    # The declared dims of every distinct A / B operand's scale tensor, in operand-slot order (None for an operand
+    # without one). ``sfa_dim`` / ``sfb_dim`` are the first of them; a kernel that renders one count of scale matrices
+    # for every operand of a side reads the others here.
+    sfa_dims: tuple = ()
+    sfb_dims: tuple = ()
 
     def __post_init__(self) -> None:
         if self.sf_dtype_a is None and self.sf_dtype_b is None:
@@ -1271,6 +1276,8 @@ def swap_ab(chain: FusionChain) -> FusionChain:
             dequant_out_b=block_scale.dequant_out_a,
             fake_dequant_a=block_scale.fake_dequant_b,
             fake_dequant_b=block_scale.fake_dequant_a,
+            sfa_dims=tuple(_mn(d) for d in block_scale.sfb_dims),
+            sfb_dims=tuple(_mn(d) for d in block_scale.sfa_dims),
         )
 
     return dataclasses.replace(

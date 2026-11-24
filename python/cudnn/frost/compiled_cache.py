@@ -18,9 +18,11 @@ Layout, and the rules that keep a stale artifact from ever being reused:
     <root>/v2/<env_hash>/<entry_hash>/entry.json the key and calling convention it was stored under (commit marker)
 
 - ``env_hash`` is the content hash of :func:`environment_manifest`: frontend
-  version and a digest of the whole ``cudnn`` package's source (the shared
-  helpers a kernel imports are not in its own key; an edited checkout must
-  not hit a wheel's entries), cutlass-dsl and tvm-ffi versions, the CUDA
+  version and a digest of the whole ``cudnn`` package's source, every
+  directory on ``cudnn.__path__`` (the shared helpers a kernel imports are
+  not in its own key; an edited checkout must not hit a wheel's entries, nor
+  a checkout overlaid ahead of an installed package hit the package's),
+  cutlass-dsl and tvm-ffi versions, the CUDA
   driver, and the device's name,
   compute capability, SM count and L2 size (FROST bakes the last two into
   kernels). Any change lands in a different directory; nothing is ever
@@ -225,7 +227,8 @@ def _dist_version(name: str) -> str:
         return "unknown"
 
 
-_SOURCE_DIGEST: Optional[str] = None
+# The source digest of each ``cudnn.__path__`` this process has seen, by its resolved directories.
+_SOURCE_DIGESTS: Dict[Tuple[str, ...], str] = {}
 
 
 def source_tree_digest(root: Path) -> str:
@@ -249,16 +252,48 @@ def source_tree_digest(root: Path) -> str:
     return h.hexdigest()[:16]
 
 
-def _cudnn_source_digest() -> str:
-    global _SOURCE_DIGEST
-    if _SOURCE_DIGEST is None:
-        try:
-            import cudnn
+def _cudnn_source_roots() -> Tuple[str, ...]:
+    """Every directory the ``cudnn`` package imports its modules from, resolved, in search order (``cudnn.__path__``).
 
-            _SOURCE_DIGEST = source_tree_digest(Path(cudnn.__file__).resolve().parent)
+    A checkout can be overlaid on an installed package by putting its ``python/cudnn`` first on ``cudnn.__path__`` (the
+    FROST test conftest and the benchmark harnesses do): ``cudnn.__file__`` still names the installed ``__init__``,
+    while the kernels are traced from the checkout's modules."""
+    import cudnn
+
+    roots: list = []
+    for entry in list(getattr(cudnn, "__path__", None) or [Path(cudnn.__file__).parent]):
+        root = str(Path(entry).resolve())
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def _cudnn_source_digest() -> str:
+    """The digest of every ``.py`` the package can import: :func:`source_tree_digest` of each directory on
+    ``cudnn.__path__``, combined in search order (a package with one directory keeps that directory's digest).
+    Computed once per process for each ``__path__`` seen, so an overlay added later is a new environment."""
+    try:
+        roots = _cudnn_source_roots()
+    except Exception:  # noqa: BLE001 -- a package that cannot be read shares nothing
+        return "unknown"
+    with _LOCK:
+        digest = _SOURCE_DIGESTS.get(roots)
+    if digest is None:
+        try:
+            digests = [source_tree_digest(Path(root)) for root in roots]
+            if len(digests) == 1:
+                digest = digests[0]
+            else:
+                h = hashlib.sha256()
+                for part in digests:
+                    h.update(part.encode("utf-8"))
+                    h.update(b"\0")
+                digest = h.hexdigest()[:16]
         except Exception:  # noqa: BLE001 -- a package that cannot be read shares nothing
-            _SOURCE_DIGEST = "unknown"
-    return _SOURCE_DIGEST
+            digest = "unknown"
+        with _LOCK:
+            _SOURCE_DIGESTS[roots] = digest
+    return digest
 
 
 def environment_manifest(device: Optional[int] = None) -> Dict[str, str]:

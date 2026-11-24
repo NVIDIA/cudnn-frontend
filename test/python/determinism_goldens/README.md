@@ -4,6 +4,97 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### General linear-scale GEMM kernels: review fixes — SM100, 2026-11-24
+
+The five general block-scale templates of the record below changed in three
+rounds of fixes after a review on 2026-11-20, on the change that follows
+source `866108a9`. Forward only, and still no golden: the byte checks compare
+launches with each other, with an exact integer reference, or with cold
+launches.
+
+What changed numerically, and why:
+
+- **Gated pair SiLU.** A gated pair (dense, and grouped NONE and GATHER in
+  both orientations) evaluates SiLU as `x * (1/2 + tanh.approx(x/2) / 2)`, one
+  MUFU operation per value instead of `ex2.approx` and `rcp.approx`: its
+  drain runs while the MMA waits for the pair's accumulator stages, and a
+  GATHER FC1 into FP8 block-128 took 0.962-0.991 of its previous time at 4096
+  tokens. Against the previous form, 0.003-0.005% of the FP8 codes changed
+  and the scales by at most `7e-6` relative; a BF16 output changed 8-14% of
+  its codes on the gated test shapes. The independent check,
+  `test_a_gated_pair_silu_stays_within_a_tanh_approx_of_the_exact_one`,
+  compares the pair's FP32 output with `x * sigmoid(x)` computed in fp64 over
+  exact gate values in [-28, 28]: the error stays within `2^-12 * |x|`
+  (measured at most `3.4e-6 * |x|`; the previous form `8.2e-8 * |x|`). A
+  single GEMM keeps the previous form.
+- **FP8 block-128 quantize.** A block's maximum ignores NaN values element by
+  element, and a nonzero scale is raised to `2^-126`, so `rcp.approx.ftz`
+  never meets a subnormal. Bytes change only for token-by-weight blocks that
+  hold a NaN (their finite values are scaled by the finite maximum), for
+  weight-by-token blocks of NaN only (scale 0 instead of NaN), and for blocks
+  whose maximum is below `448 * 2^-126`.
+- **Weight-by-token token scales of several rows.** A run of token columns
+  took the scale of its first column for the rows of the next scale block
+  where a group started inside a block (relative error 0.3-1.3). Runs now
+  stay within the `alignment_value` of `first_token_offset`, and are single
+  columns under GATHER. One scale per token row, as in DeepSeek FP8, was not
+  affected.
+
+The fix rounds compared the other changes against the previous source and
+found the bytes of ordinary data unchanged (retained, not rerun here): the
+scheduler (random launch epochs, direct claims in one-block clusters, the
+routing offsets in shared memory, the scheduler's wait for its programmatic
+predecessor), token loads through the whole-tensor map, the promotion's
+Int32 scale addressing, the gated first-pass release after the first sweep,
+the COMBINE output fill kernel and launch replay by buffer signature. COMBINE
+outputs differ only in the order of their FP32 atomic adds.
+
+Byte checks run for this record, beside the table of the 2026-11-19 record:
+
+| Suite (`gemm/frost/`) | Byte checks |
+|---|---|
+| `test_general_block_scale_matmul.py` | replay (`test_general_block_scale_repeats_bitwise`); row isolation; warm stress of the launch-control slot on 1x1 and 1x4 clusters (7 refills per launch, against an exact reference) |
+| `test_general_moe_grouped_block_scale_matmul_fwd.py` | replay and row isolation; warm stress, five cells; CUDA graph replays (`test_general_grouped_graph_replays_write_every_tile`); launches behind a programmatic predecessor that writes the routing late, eager and replayed; a counter word left by another plan; unrouted token rows holding NaN codes reach no output; the COMBINE output fill behind a late writer (integer data and power-of-two scales, exact in any atomic order) |
+| `test_general_block_scale_gated_fp8.py` | replay and row isolation of the pair; warm stress of the swapped gated FP8 plan, NONE and GATHER, against cold launches; CUDA graph replays; clusters of two and four tiles along the lanes; a GATHER pair into FP8 block-128 on 128x128 tiles with several tiles per thread block, clusters 1x1, 1x2 and 1x4, each against the FP32 reference (`test_a_gated_fp8_pair_of_several_tiles_per_thread_block_writes_the_bytes_of_every_cluster`); the fp64 SiLU check |
+| `test_moe_launch_cache.py` | a replayed call writes the bytes of the full path (COMBINE: its sums to rounding), eager and captured in a CUDA graph |
+
+Each of the nine warm-stress cells read **0 mismatches in 3000 warm and 3000
+poisoned launches**; the helper's control failed 200 of 200 launches on this
+GPU. The cells run one thread block per SM, below the control's three, so a
+zero bounds the rate for the tested shape only, and the gated FP8 cells
+compare with cold launches, not with an independent reference.
+
+Run on an SM100 GPU of compute capability 10.0 with 68 SMs, driver
+610.57.04, PyTorch 2.14.1+cu130, cuDNN backend 92400 and CuTe DSL 4.8.0
+compiling with CUDA 13.4, with empty kernel and compiled caches, under a
+shared GPU lock (other processes could use the GPU at the same time). The
+`gemm/frost` conftest overlays `python/cudnn` of the checkout; the run
+confirmed that the test processes imported the GEMM compiler, the launch
+cache and the compiled cache from the checkout. Results, one process per
+suite: `test_general_block_scale_gated_fp8.py` **140 passed**;
+`test_general_moe_grouped_block_scale_matmul_fwd.py` **251 passed**;
+`test_general_block_scale_matmul.py` **63 passed**; `test_moe_launch_cache.py`
+**48 passed**; no failures and no skips. SM103 and SM107 were not available
+and are unverified.
+
+```bash
+cd test/python
+for suite in test_general_block_scale_gated_fp8 test_general_moe_grouped_block_scale_matmul_fwd test_general_block_scale_matmul test_moe_launch_cache; do
+    python -m pytest "gemm/frost/$suite.py" -m L0 -q -rs
+done
+```
+
+Retained from the default-plan work of the fix rounds (benchmark harness, not
+a suite): the fused FC1's FP8 codes and scales and single NONE / GATHER BF16
+outputs were byte-identical across every timed tile (16-, 32- and 64-wide
+weight-by-token tiles; 128x128 in 1x1, 1x2 and 1x4 clusters), and COMBINE
+FP32 outputs differed only by the order of their atomic adds.
+
+Not covered, as before: a group reordered, duplicated or removed; row
+isolation under GATHER; SCATTER, and COMBINE repeatability for general
+inputs; batch invariance across the default plan's switch points (the routed
+rows per group, and M for the dense kernel).
+
 ### General linear-scale GEMM kernels — SM100, 2026-11-19
 
 The FROST general block-scale kernels apply linear scale tensors to the

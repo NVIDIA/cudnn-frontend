@@ -134,7 +134,13 @@ A weight scale tensor holds one matrix per expert, `[E, K/128, N/128]` for
 the blocks above, or one that every expert shares, `[1, K/128, N/128]` (GATHER
 takes one per expert). The plan is built for the count the graph declares, and
 a call binds a scale tensor of that count: the other count is refused at the
-call, before anything is written.
+call, before anything is written. A call binds the declared view, or any
+buffer whose shape settles the axis order: `[E|1, K/128, N/128]` is read in
+the graph's order through its own strides, `[E|1, N/128, K/128]` in the
+kernel's order (for example a checkpoint's scale tensor bound without a
+transpose). When the weight has as many N blocks as K blocks, strides cannot
+tell the two orders apart, and only the declared view (its shape and strides)
+is accepted.
 
 Two fusions let FC1 produce FC2's input in one kernel, under NONE and GATHER
 (and for the dense `matmul`):
@@ -145,16 +151,42 @@ Two fusions let FC1 produce FC2's input in one kernel, under NONE and GATHER
   twice, once per weight, and the epilogue reads both results together. The
   weights are K-major. The tile config is a 1-CTA MMA tile of at most 128
   accumulator columns (two accumulator stages); split-K is not supported.
+  The two weights' scale tensors declare the same shape (both one matrix per
+  expert, or both shared); a pair whose scale shapes differ is refused when
+  the plan is built.
+  The pair's SiLU (`swish` without `swish_beta`, or with 1) is evaluated as
+  `x * (1/2 + tanh(x/2) / 2)` through the approximate `tanh.approx.f32`, one
+  MUFU operation per value. On SM100 it is within `4.0e-6 * |x|` of
+  `x * sigmoid(x)`: under `4.4e-6` relative for `x >= -1`, more where
+  `sigmoid(x)` approaches 0 (`1e-4` at `x = -6`, `1.4e-2` at `x = -12`), and
+  `-0` for `x <= -16`. Every other FROST GEMM epilogue, a single GEMM of these
+  kernels included, keeps `x / (1 + 2^(-x * log2(e)))` (with `swish_beta`,
+  `beta * x` in the exponent) through approximate `exp2` and reciprocal
+  (within `1.7e-7 * |x|` for SiLU). Against that form, a fused
+  FC1 into FP8 block-128 changes 0.003-0.005% of its codes and its scales by
+  at most `7e-6` relative; a BF16 output changes 8-14% of its codes on the
+  gated test shapes, but only 0.07-0.13% of the values above 1% of the
+  output's RMS. The error against an FP32 reference does not change.
 - **FP8 block-128 output.** `block_scale_quantize(block_size=128)` whose scale
   output is `FLOAT`: E4M3 data `[1,R,N]` and one FP32 scale per 128
-  output columns of a row, `[1,R,N/128]`, with
-  `scale = max(abs(block)) / 448` and
-  `data = round(value / scale)`. `block_size=[1,128]` is accepted as the same
-  block. A block of zeros stores scale 0 and data 0. `N` is a multiple of 128
-  and the scale tensor is 4-byte aligned, unreordered. It must be the graph's
-  only output, without auxiliary epilogue inputs. Token-by-weight tiles are
-  128 columns wide; weight-by-token (`SWAP_AB=1`) tiles take any token width.
-  Rows past the final offset are not written, in the data or in the scales.
+  output columns of a row, `[1,R,N/128]`. With `amax` the block's largest
+  magnitude, NaN values ignored (0 when the block holds nothing else), the
+  stored scale is `RN(amax * RN(1/448))`, raised to `2^-126` (the smallest
+  normal FP32) when `amax > 0`, and a value `x` is stored as
+  `cvt.rn.satfinite.e4m3(RN(x * min(rcp.approx.ftz(scale), FLT_MAX)))`. Above
+  that floor the scale is the correctly rounded `amax / 448` or a neighbouring
+  FP32 value. A block of zeros stores scale 0 and data 0; a NaN value stores a
+  NaN code and leaves its block's scale unchanged; a block whose `amax` is
+  below `448 * 2^-126` (about `5.3e-36`) stores codes below 448, because of
+  the floor. `block_size=[1,128]` is accepted as the same block. `N` is a
+  multiple of 128 and the scale tensor is 4-byte aligned, unreordered. It must
+  be the graph's only output, without auxiliary epilogue inputs.
+  Token-by-weight tiles are 128 columns wide; weight-by-token (`SWAP_AB=1`)
+  tiles take any token width. Rows past the final offset are not written, in
+  the data or in the scales. The scale output keeps the graph's shape, so a
+  plan with this output runs only at the extents it was built for (R and N; M
+  and N for the dense `matmul`): a call at other extents is refused before
+  anything is written.
 
 ```python
 gate = graph.moe_grouped_matmul(token, gate_weight, first_token_offset, token_index=token_index, mode=cudnn.moe_grouped_matmul_mode.GATHER)
@@ -170,6 +202,102 @@ results over the FP8 operands and their FP32 scales. The two weights may be
 views of one `[E, 2N, K]` buffer: declare each with the buffer's expert
 stride. The quantized data and its scales are exactly the token operand and
 `[1,128]` scale of a following FC2 graph.
+
+The general block-scale grouped kernels follow these rules for the routing,
+the launch and the token scales:
+
+- **`alignment_value` of `first_token_offset` is a promise, not a checked
+  input.** Declared with `graph.tensor(..., alignment_value=a)` or
+  `set_alignment_value(a)`, it promises that every offset is a multiple of
+  `a`. It sizes the weight-by-token epilogue's vector stores along the tokens
+  and the runs of token columns that share a token scale (below), and when
+  `a` is a multiple of 128 and of the cluster's token tile, the TMA-store
+  epilogue writes every group through one output map. Offsets that break the
+  promise let a tile write rows of the neighbouring group and rows past the
+  final offset, and can stop the launch with a CUDA error. A weight-by-token
+  plan runs token counts that are multiples of the greatest common divisor of
+  the graph's token count, its epilogue vector and `a`: declare an `a` that
+  divides every token count the plan runs.
+- **Routed groups.** A plan is built for the group count its graph declares
+  (`first_token_offset` `[G+1,1,1]`). A call that routes fewer groups runs; a
+  call that routes more can be refused, before anything is written, so
+  declare the largest group count the plan serves. Token rows after the final
+  offset may hold anything: the kernels may read them, but nothing they hold
+  reaches an output.
+- **Empty calls.** A call without routed rows launches no GEMM (a COMBINE
+  output is still zeroed). A call with K = 0, or a GATHER from a token buffer
+  without rows, is refused before anything is written. K need not be a
+  multiple of the scale block: the kernels read a partial last block.
+- **Programmatic dependent launch.** The grouped kernels launch as
+  programmatic dependents. Every role, the tile scheduler included, waits for
+  the kernel ahead of it (`griddepcontrol.wait`) before it touches global
+  memory, so a routing kernel may release its dependents before it writes the
+  offsets. The kernels release their own dependents before their epilogue
+  finishes: a kernel launched behind the call with programmatic stream
+  serialization waits (`griddepcontrol.wait` or
+  `cudaGridDependencySynchronize()`) before it reads the outputs.
+- **Token scales under `SWAP_AB=1`.** A weight-by-token tile takes the tokens
+  as its columns, from its group's first routed row. A token scale block of
+  several rows (`[r,128]` with r > 1) is shared by a run of columns no longer
+  than the greatest common divisor of r, a promotion thread's columns and
+  `alignment_value`, and by no two columns under GATHER, whose columns are
+  any token rows. An `alignment_value` that is a multiple of r keeps the runs
+  long. One scale per token row (`[1,128]`, as in DeepSeek FP8) is read per
+  column either way.
+
+**Default tiles.** Without knobs, the engine plans a grouped graph of fixed
+extents from r, the routed rows per group (`ceil(R / G)`), and K in bytes per
+token row:
+
+| Graph | Weight-by-token tile (`SWAP_AB=1`) |
+|---|---|
+| Gated pair, NONE or GATHER | 128x16 up to r = 16 (only at r = 1 from K = 4096 bytes), 128x32 up to r = 32, 128x64 up to r = 56 |
+| One GEMM, NONE or GATHER | 128x16 up to r = 8 (only at r = 1 from K = 2560 bytes), 128x32 up to r = 16 |
+| COMBINE | 128x16 at r = 1, or up to r = 4 with K of at most 768 bytes; past that, with K of at most 768 bytes and r * K of at most 8192 bytes, the 256x16 CTA pair (2x1 cluster) |
+
+Past those rows, and for SCATTER, the plan is token-by-weight: 128x128 1-CTA
+tiles in 1x2 clusters (one token tile multicast to two weight tiles) for
+SCATTER, and for NONE from r = 128 with K of at least 1536 bytes, when the
+weight's N tiles pair up and two-CTA clusters cover every SM; in 1x1 clusters
+otherwise, and always for GATHER and COMBINE. A graph with override or
+dynamic shapes is never swapped: GATHER takes 1x1, the other modes 1x2 under
+the same conditions. Where the engine declines the default plan, it falls
+back to 128x128 1x1. `create_execution_plans` also lists the other
+weight-by-token widths, the 256x16 and 256x32 CTA pairs and 128x128 tiles in
+1x1, 1x2 and 1x4 clusters for autotuning. These rules were measured on one
+68-SM SM100 part.
+
+A dense `matmul` of linear-scale operands takes 1-CTA tiles of 128 rows and
+128 columns, in the widest of the 1x4, 1x2 and 1x1 clusters that divides its N
+tiles. With fixed extents of at most 256 rows whose tiles fill at most half
+the SMs, a K of at most 1024 bytes per row takes 64-column tiles (not with an
+FP8 block-128 output or an N-major weight), and from K = 2048 bytes, where the
+graph can split K, K splits into the largest power of two of at most 8 slices
+that keeps the CTAs within one wave and at least two 128-byte K tiles per
+slice: two slices only from K = 3072 bytes (6144 when the unsplit grid fills
+more than 2/5 of the SMs), and four or eight slices that stop at two K tiles
+per slice become 64-column tiles at half the slices. Past 256 rows at the
+extents the graph declares, one GEMM of K-major operands with batch 1 and no
+output quantize takes the 2x1 CTA pair (a 256x128 tile over two CTAs) from
+512 rows, with a K of at least 2048 bytes, at least 16 N tiles, an even count
+of 128-row tiles and more tiles than SMs; failing that, from a K of 1536
+bytes, the 1x2 cluster when its N tiles pair up. An FP8 block-128 output, a
+gated pair, an N-major weight and a batched graph keep the 1-CTA plan. The
+unsplit 128-column plans (1-CTA in any cluster, or a CTA pair) write the same
+bytes; a split-K plan adds its slices in another order. A graph with override or
+dynamic shapes takes the plan that does not depend on M: 1-CTA 128-column
+tiles, no split and no workspace.
+
+**Host overhead of eager calls.** On SM100, a grouped `frost_gemm` plan runs
+its full call-time validation the first two times a buffer signature occurs:
+the bound buffers' types, shapes, strides, dtypes, devices, address alignment
+(modulo 256 bytes) and which of them share an address. Later calls with that
+signature, through `graph.execute` or the plan, replay the checked launch,
+its output fills included: about 32-35 us of host time per launch instead of
+124-141 us (FP8 block-128 FC1 and FC2 at one token, 68-SM SM100 part). The
+workspace, the stream, the current device and the launch epoch are still
+checked or drawn per call, and CUDA graph capture is unaffected. A call whose
+buffers differ in any of those facts is validated in full.
 
 ### FROST SCATTER support
 
@@ -308,10 +436,24 @@ These warmed CUDA Graph measurements include output zeroing and compare fixed
 configurations, rather than end-to-end serving performance.
 Output zeroing uses `cudaMemsetAsync` for contiguous storage and
 `cudaMemset2DAsync` for padded row/column-major storage, preserving padding.
-The execute-time stream orders output memset, the existing scheduler-counter
-initialization kernel, and grouped GEMM. Routing metadata and scores may change
-on graph replay, and runtime token/output extents remain independent of routed
-capacity.
+On SM100, a COMBINE plan of the general block-scale grouped kernels (linear
+scale tensors, see "FROST linear-scale operands" above) zeroes its output with
+a small FROST kernel instead, when the output is whole 16-byte vectors from a
+16-byte aligned start: a contiguous output whose size is a multiple of 16
+bytes, or padded rows whose width and pitch are multiples of 16 bytes. Other
+layouts keep the memset. The kernel is launched with programmatic stream
+serialization: it lets the grouped GEMM launch at once and waits for the
+preceding stream work before its first store, which saved up to about 2.5 us
+per MoE layer at 1-512 tokens on a 68-SM SM100 part. A kernel launched behind
+the call with programmatic stream serialization must wait
+(`griddepcontrol.wait` or `cudaGridDependencySynchronize()`) before it reads
+the output, as it must behind the grouped GEMM itself, which releases its
+dependents before its epilogue finishes.
+The execute-time stream orders the output zeroing, the scheduler-counter
+initialization kernel of the templates that have one (the general block-scale
+grouped kernels have none), and the grouped GEMM. Routing metadata and scores
+may change on graph replay, and runtime token/output extents remain
+independent of routed capacity.
 
 ## MoE Grouped Matmul Forward
 

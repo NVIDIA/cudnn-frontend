@@ -701,14 +701,19 @@ The rules, borrowed from FlashInfer's autotune cache v2 so that a stale
 artifact can never be reused by accident:
 
 - **Identity is the whole manifest, hashed.** Frontend version AND a digest
-  of every `.py` in the `cudnn` package (a kernel is compiled from the shared
-  helpers it imports as much as from its template, and the version does not
-  move in a checkout someone is editing — an uncommitted edit lands in another
-  directory; a wheel hashes the same every process), cutlass-dsl and tvm-ffi
-  versions, the CUDA driver, and the device's name, compute capability, SM
-  count and L2 size (FROST bakes the last two into kernels) name the directory
-  `<root>/v2/<env_hash>/`. Any change lands elsewhere; an unreadable field is
-  hashed as `"unknown"`, never skipped.
+  of every `.py` the `cudnn` package can import (each directory on
+  `cudnn.__path__`, combined in search order; a package of one directory keeps
+  that directory's digest), cutlass-dsl and tvm-ffi versions, the CUDA driver,
+  and the device's name, compute capability, SM count and L2 size (FROST bakes
+  the last two into kernels) name the directory `<root>/v2/<env_hash>/`. A
+  kernel is compiled from the shared helpers it imports as much as from its
+  template, and the version does not move in a checkout someone is editing:
+  an uncommitted edit lands in another directory, a wheel hashes the same
+  every process, and a checkout overlaid ahead of an installed package (the
+  FROST test conftest, harnesses that insert a source tree into
+  `cudnn.__path__`) is an environment of its own that never reloads kernels
+  traced from the other copy's helpers. Any change lands elsewhere; an
+  unreadable field is hashed as `"unknown"`, never skipped.
 - **An entry is reused only under its own embedded key.** `entry.json`
   carries the full key, symbol and signature and is compared on load; the
   object is written first and the record after it (the commit marker), both

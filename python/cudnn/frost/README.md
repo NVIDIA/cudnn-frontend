@@ -267,7 +267,11 @@ CompiledPlan.execute(graph, uid_to_data, ctx)          (the hot path)
   the pack; `pack.operands(indices)` turns positions into `OperandBuffer`s --
   one caller buffer described (pointer, shape, stride, dtype), non-owning, and
   itself a DLPack producer. An engine resolves positions once at first execute
-  and asks for buffers per call.
+  and asks for buffers per call. `frost_gemm`'s SM100 grouped plans also
+  replay a checked launch: a call whose bound buffers repeat an earlier call's
+  signature (type, shape, strides, dtype, device, address modulo 256,
+  aliasing) runs only the recorded views, output fills and launch
+  (`gemm/frost/launch_cache.py`).
 
 `python/cudnn/gemm/frost/engine.py` is the worked example, deliberately thin:
 `check_support` delegates to `probe_supported` and
@@ -1118,10 +1122,78 @@ takes a general one.
   - Under swapAB the weight scale is uniform over a thread's rows as well (a
     128-row MMA block lies in one scale block), so the loader multiplies it
     into the grid slot or table entry and a column costs no multiply.
+  - Under swapAB a tile's token columns start at its group's first routed
+    row, which is a multiple of `first_token_offset`'s `alignment_value` only,
+    and under GATHER each column is any token row. A token scale block of
+    several rows is therefore shared by a run of
+    `gcd(block rows, columns per thread, alignment_value)` columns, and by no
+    two columns under GATHER (`sfb_group_cols`). A longer run gave the rows
+    of the next block the scale of its first column where a group started
+    inside a block (relative error 0.3-1.3; one scale per token row, as in
+    DeepSeek FP8, was never affected):
+    `test_a_swapped_token_scale_of_several_rows_is_shared_only_within_the_offset_alignment`
+    and the `token_blocks_of_*` numerics cases.
   A scale that differs per lane (the token scale of a row, unswapped) is
   loaded by its lane, one window ahead.
+- **Scheduler.** The scheduler warp of cluster rank 0 claims tiles from one
+  64-bit word of the caller's workspace, the launch epoch above the count. The
+  host draws the epoch at random in [2^30, 2^31), never the previous draw
+  (`compiler._next_sched_epoch`): the word may hold another plan's tensor map,
+  whose first word is a device address with an upper half below 2^25, or
+  small integers, and a sequential epoch once took up such a count and claimed
+  nothing (`test_general_grouped_counter_takes_no_count_another_use_left`). A
+  word of another epoch starts the count over (`_sched_open`), and the
+  cluster that draws a launch's last claim returns the word to zero
+  (`_sched_close`). A thread block that is its own cluster claims directly; a
+  cluster of several hands rank 0's claims to its members through the
+  broadcast mailbox (table below). The warp copies `first_token_offset` into
+  shared memory once per thread block (`sched_fto_entries`, the graph's G + 1
+  entries) and searches the copy, when the offsets take at most 8 KB, fit in
+  what the A/B stages leave and do not move the kernel to a larger
+  shared-memory carveout (`_smem_carveout_crossed`); otherwise it searches
+  global memory. A plan with the copy refuses a call that routes more groups
+  than it holds (`_CompiledMoeBase._check_sched_groups`) before any output
+  fill. Like every role that touches global memory, the scheduler warp waits
+  for its programmatic predecessor (`griddepcontrol.wait`) first: a routing
+  kernel may release its dependents before it writes the offsets
+  (`test_general_grouped_routing_is_read_behind_a_programmatic_predecessor`).
+- **Token rows.** The fwd and fwd_swap_ab templates load token rows through
+  the host's map of the whole token tensor, at the group's first row plus the
+  tile's; only
+  the TMA-store output maps are rewritten per group, and the workspace slot of
+  each token map stays unused. A box past the group's last row reads the next
+  group's rows, the rows after the last offset, or zero fill past the tensor.
+  Every drain, reduction and quantize store therefore bounds its rows
+  (swapped: columns) by `group_end`: a token scale zeroes such a row in the
+  promotion, but an unscaled token operand leaves its product with this
+  group's weights (`test_general_grouped_unrouted_token_rows_reach_no_output`;
+  `test_general_grouped_token_loads_stop_at_the_end_of_the_token_tensor`
+  places the token tensor in front of unmapped memory). The GATHER templates
+  copy their token rows through `token_index` with `cp.async`.
+- **COMBINE output fill.** A COMBINE call zeroes its output with
+  `sm100/combine_zero.py` (the plan's `combine_zero`) instead of a memset when
+  the output is one region of whole 16-byte vectors, 16-byte aligned at every
+  row (`CombineZero.takes`). The fill is a programmatic launch of at most 8
+  thread blocks per SM whose blocks release their dependents at entry and wait
+  (`griddepcontrol.wait`) before their first store, so the grouped GEMM's
+  thread blocks can be resident while it waits. This is correct only because
+  every role of these templates waits for its programmatic predecessor before
+  it touches global memory: a role that reads the routing, the scales or the
+  workspace, or writes the output, ahead of its wait races with the fill
+  (`test_general_grouped_combine_output_is_zeroed_behind_a_programmatic_predecessor`).
+  A plan that cannot build the fill, the other grouped templates and the
+  sm120 tree keep the memset.
 - **Register budget.** `sm100/compiler.py::_general_block_scale_plan` sizes
-  the promotion warps from what the CTA has left. The GATHER pool is 640
+  the promotion warps from what the CTA has left. The plain templates run 512
+  threads on the 128-register entry pool: the epilogue warpgroup takes 168,
+  each promotion warpgroup 152, and the control warpgroup (MMA, TMA,
+  scheduler) exactly the rest in the grouped templates, 40
+  (`_GENERAL_BS_GROUPED_CTL_REGS`; at 24 the scheduler warp spilled its claim
+  loop), and 24 in the dense one. A warpgroup that asks for more than the pool
+  holds waits in `setmaxnreg.inc` forever, so raising one count means lowering
+  another (`test_general_grouped_plan_fills_the_register_pool`). Each warpgroup moves
+  its count with one `setmaxnreg` that its four warps execute, outside the
+  role branches. The GATHER pool is 640
   threads at the 96-register entry count. The control warpgroup lowers itself
   to 48 (`gather_ctl_reg_count`; at the sources' 64 the promotion warps of a
   2-CTA plan spilled to the stack), the token-copy warps keep their source's
@@ -1139,7 +1211,9 @@ takes a general one.
   that takes an expert's routed rows in one pass over its weights: 16 or 32
   columns for a few rows per expert, 80 or 96 for 65 to 96, and the unswapped
   128x128 tile for a few hundred. A 2-CTA unswapped plan needs more than 128
-  rows per expert to pay for its second CTA.
+  rows per expert to pay for its second CTA. The engine's default picks are
+  listed under "Default tiles" in `docs/operations/MoeGroupedMatmul.md`;
+  `gemm/frost/planning.py` holds the rules with their measurements.
 - **Modes and fusions.** NONE and GATHER select the templates above; SCATTER
   and COMBINE, a ReLU epilogue, fp32 output and N-major weights run through
   the plain and swapped templates unchanged from their sources. A gated pair
@@ -1153,7 +1227,7 @@ takes a general one.
   | Buffer | Written by | Read by | Released by |
   |---|---|---|---|
   | `sched_storage` (a slot of the two-slot scheduler ring) | the scheduler warp, once every consumer credited the slot | the loader, the MMA warp, the epilogue and promotion warps; under GATHER also the relay and token-copy warps | `consume_then_arrive` on `sched_empty`, elected lane, over every word the warp read |
-  | `sched_bcast_slot` (the claimed tile index, one mailbox per thread block) | the scheduler warp of cluster rank 0, through `mapa` | every thread block's scheduler warp | plain and swapped: `consume_then_arrive_on_peer` on rank 0's `sched_bcast_empty` (`release.cta`, the read-then-credit form of `barrier.mbar_arrive_on_peer`; a default `mbarrier_arrive` on the `mapa` address is a cluster-scope release, which cost a COMBINE kernel with a short K up to a fifth of its time). GATHER (a cluster of several thread blocks): a reduction on rank 0's `bcast_ack_count`, which the helper has no form for, behind a store of the index every lane read (into the first word of the retained token-descriptor storage, which nothing reads) |
+  | `sched_bcast_slot` (the claimed tile index, one mailbox per thread block of a cluster of several; a thread block that is its own cluster claims directly and has none) | the scheduler warp of cluster rank 0, through `mapa` | every thread block's scheduler warp | plain and swapped: `consume_then_arrive_on_peer` on rank 0's `sched_bcast_empty` (`release.cta`, the read-then-credit form of `barrier.mbar_arrive_on_peer`; a default `mbarrier_arrive` on the `mapa` address is a cluster-scope release, which cost a COMBINE kernel with a short K up to a fifth of its time). GATHER (a cluster of several thread blocks): a reduction on rank 0's `bcast_ack_count`, which the helper has no form for, behind a store of the index every lane read (into the first word of the retained token-descriptor storage, which nothing reads) |
   | `promo_scale_tbl` (`promo_scale_table`) | one warp of the promotion warpgroup, once the stage's next window is full | the warpgroup's four warps, as they fold | `consume_then_arrive` (2-CTA: `..._on_peer`) on `partial_empty` over the window's table words: every promotion warp's release is what lets the next window fill. Measured on gated FP8 FC1 kernels with 32-column swapped tiles: under 0.5% of the kernel for most shapes, up to 4% for two of them |
   | `wq_colmax` (a quantize block across the lanes, swapped templates) | each epilogue warp, its own columns | all four epilogue warps, behind the epilogue's thread-block barrier | the next drain's barrier, which has no address to compute: every maximum a lane loads reaches a global store of its drain (the scale, or the data it scales) in front of that barrier, and the two buffers alternate so a warp's next write goes to the other one |
 
@@ -1163,6 +1237,12 @@ takes a general one.
   `fence.proxy.async.shared::cta` between that read and its release. Tensor
   memory (the partial a promotion thread folds, the accumulator the epilogue
   drains) is released behind `tcgen05.wait::ld`, as in the source templates.
+  Under a wide quantize, a gated pair's first-pass stage, which the first
+  sweep reads for the last time, is released behind that sweep's
+  `tcgen05.st` of the values computed from every word it loaded and the
+  `tcgen05.wait::st` of those stores, so each loaded register is read in
+  front of the release (all five templates;
+  `test_a_gated_wide_quantize_releases_the_first_pass_stage_after_the_first_sweep`).
   `test_general_grouped_templates_release_every_word_they_read` holds the
   source to this table, `..._release_addresses_depend_on_the_words_read` the
   generated PTX, and the warm-stress cells run a shape that rewrites every

@@ -139,7 +139,7 @@ arbitrary user callbacks.
 | `pygraph.matmul` over `block_scale_dequantize` operands with linear scale tensors (FROST general block-scale kernel; plain, gated pair, FP8 block-128 output) | fprop | FP8 E4M3 operands, FP32 scales in 1x128 / 128x128 blocks; BF16 output, or FP8 E4M3 output with one FP32 scale per 128 columns | Unsupported for this kernel | Unverified (SM100 repeatability tested; batch invariance and SM103 unverified) | Unverified |
 | `pygraph.moe_grouped_matmul`, NONE, over linear-scale operands (FROST general grouped kernels, token-by-weight and `SWAP_AB=1`; plain, gated pair, FP8 block-128 output) | fprop | FP8 E4M3 operands, FP32 scales in 1x128 / 128x128 blocks; BF16 output, or FP8 E4M3 output with one FP32 scale per 128 columns | Unsupported for these kernels | Unverified (SM100 repeatability and isolated-row cases tested; general batch invariance and SM103 unverified) | Unverified |
 | `pygraph.moe_grouped_matmul`, GATHER, over linear-scale operands (FROST general grouped kernels, both orientations; plain, gated pair, FP8 block-128 output) | fprop | FP8 E4M3 operands, FP32 scales in 1x128 / 128x128 blocks; BF16 output, or FP8 E4M3 output with one FP32 scale per 128 columns | Unsupported for these kernels | Unverified (SM100 repeatability tested; batch invariance and SM103 unverified) | Unverified |
-| `pygraph.moe_grouped_matmul`, SCATTER and COMBINE, over linear-scale operands (FROST general grouped kernels) | fprop | FP8 E4M3 operands, FP32 scales; BF16 (SCATTER) or FP32 (COMBINE) output | Unsupported for these kernels | Unverified; COMBINE adds a token's routed rows with atomic adds, in no fixed order | Unverified |
+| `pygraph.moe_grouped_matmul`, SCATTER and COMBINE, over linear-scale operands (FROST general grouped kernels) | fprop | FP8 E4M3 operands, FP32 scales; BF16 (SCATTER) or FP32, BF16 or FP16 (COMBINE) output | Unsupported for these kernels | Unverified; COMBINE adds a token's routed rows with atomic adds, in no fixed order | Unverified |
 
 The general block-scale GEMM rows cover the FROST kernels that apply linear
 scale tensors to the accumulator, for example FP8 E4M3 data with one FP32
@@ -157,6 +157,22 @@ inside one launch kept writing the reference bytes; these kernels run one
 thread block per SM, so that result bounds a failure rate for the tested
 shape and is not a qualification. See the
 [coverage record](../../test/python/determinism_goldens/README.md#general-linear-scale-gemm-kernels--sm100-2026-11-19).
+
+Since that record, a gated pair evaluates its SiLU with one MUFU operation
+(`tanh.approx`), which changes the values of a fused FC1's outputs; MoE
+Grouped Matmul ("FROST linear-scale operands") gives the error. Some FP8
+block-128 blocks that hold a NaN, blocks whose largest magnitude is below
+`448 * 2^-126`, and weight-by-token plans with token scale blocks of several
+rows also write other values than before. The replay, row-isolation, warm
+stress, CUDA graph replay and cross-cluster byte checks passed again on
+SM100, and a GATHER gated pair into FP8 block-128 with several tiles per
+thread block writes the same codes and scales on clusters of one, two and
+four tiles. The engine's default plan for these graphs depends on the routed
+rows per group, and for the dense kernel on M (its split-K slice count and
+tile width, which change the FP32 summation order): batch invariance across
+those switch points stays unverified. A COMBINE with a BF16 or FP16 output
+adds each weighted contribution atomically in the output precision. See the
+[2026-11-24 record](../../test/python/determinism_goldens/README.md#general-linear-scale-gemm-kernels-review-fixes--sm100-2026-11-24).
 
 Exact D256 FP16/BF16 on SM100/SM103 has separate lookahead and swap-AB
 engine entries. The public engine/knob record fixes the main body and Q tile;

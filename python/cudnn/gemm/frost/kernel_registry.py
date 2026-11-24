@@ -272,6 +272,19 @@ def general_glu_pair_reject(chain: FusionChain) -> str | None:
         return "general block scale pairs two GEMMs over K-major weights only"
     if chain.has_moe and chain.moe.mode not in ("none", "gather"):
         return f"general block scale pairs two GEMMs under MoE NONE or GATHER; the graph uses {chain.moe.mode.upper()}"
+    bs = chain.block_scale
+    weight_dims = () if bs is None else (bs.sfa_dims if swapped else bs.sfb_dims)
+    if len(set(weight_dims)) > 1:
+        # The kernel renders one count of weight scale matrices (sfb_batch_broadcast, sfa_batch_broadcast when swapped)
+        # and the launch checks every bound weight scale against it, so no call could bind a second weight scale of
+        # another shape as declared. Named in the graph's order, [matrices, K blocks, N blocks].
+        graph_order = [None if d is None else list(d) if not swapped else [*d[:-2], d[-1], d[-2]] for d in weight_dims]
+        matrix = "expert" if chain.has_moe else "batch"
+        return (
+            "general block scale reads both weights' scales with one compiled count of scale matrices, so a gated pair's two "
+            f"weight scale tensors must declare one shape (one scale matrix shared by every {matrix} for both, or one per {matrix} "
+            f"for both); the graph declares {' and '.join(str(d) for d in graph_order)}"
+        )
     return None
 
 

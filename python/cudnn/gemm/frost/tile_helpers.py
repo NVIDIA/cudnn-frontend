@@ -203,6 +203,13 @@ def copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
         dst_i64_ptr.subview(i).store((src_words + i).load())
 
 
+def l2_cache_policy(evict: str):
+    """A run-time ``createpolicy`` L2 eviction policy (fraction 1.0) for the ``.L2::cache_hint`` of a TMA load or bulk
+    copy: ``evict`` is ``"evict_first"``, ``"evict_normal"`` or ``"evict_last"``.  Created at run time as swiglu_decode
+    creates its policies: a constant policy made ptxas emit an invalid encoding on some toolchains."""
+    return nvvm.inline_ptx(f"createpolicy.fractional.L2::{evict}.b64 $0, 1.0;", write_only_types=[cutlass.Int64])
+
+
 @cute.jit
 def moe_gather_row(token_index, row, group_end, source_rows):
     src = cutlass.Int32(source_rows)
@@ -231,6 +238,46 @@ def moe_combine_add(ptr, value, dtype: cutlass.Constexpr):
             "l,h,~{memory}",
             has_side_effects=True,
         )
+
+
+@cute.jit
+def moe_combine_add_if(ptr, value, dtype: cutlass.Constexpr, pred):
+    """``moe_combine_add`` predicated on ``pred``: the reduction is issued under a predicate, not branched around, so a
+    warp that drains a column takes no branch per lane.  ``ptr`` need not address memory where ``pred`` is false."""
+    if cutlass.const_expr(dtype == cutlass.Float32):
+        operand, constraint, instruction = value.ir_value(), "f", "red.global.add.f32"
+    else:
+        operand, constraint = value.to(dtype).bitcast(cutlass.Int16).ir_value(), "h"
+        instruction = "red.global.add.noftz.bf16" if cutlass.const_expr(dtype == cutlass.BFloat16) else "red.global.add.noftz.f16"
+    llvm.inline_asm(
+        None,
+        [ptr.toint().ir_value(), operand, cutlass.Int32(pred).ir_value()],
+        "{ .reg .pred %combine_p; setp.ne.s32 %combine_p, $2, 0; @%combine_p " + instruction + " [$0], $1; }",
+        "l," + constraint + ",r,~{memory}",
+        has_side_effects=True,
+    )
+
+
+@cute.jit
+def moe_combine_lane_routes(token_index, token_ks, scores, col0, group_end, lane, columns: cutlass.Constexpr, top_k: cutlass.Constexpr):
+    """The routes of a swapped COMBINE tile of ``columns`` routed rows from ``col0``, one column per lane and 32-column
+    batch: lane l of batch b holds the token of column col0 + 32 b + l (-1 past the group or the tile, or for an invalid
+    route) and its score."""
+    tokens = []
+    weights = []
+    for b in cutlass.range_constexpr((columns + 31) // 32):
+        route = col0 + b * 32 + lane
+        token = cutlass.Int32(-1)
+        weight = cutlass.Float32(0.0)
+        if (route < group_end) & (b * 32 + lane < columns):
+            routed = cutlass.Int32(token_index[route])
+            slot = cutlass.Int32(token_ks[route])
+            if (routed >= 0) & (routed < scores.shape[0]) & (slot >= 0) & (slot < top_k):
+                token = routed
+                weight = cutlass.Float32(scores[routed, slot])
+        tokens.append(token)
+        weights.append(weight)
+    return tokens, weights
 
 
 @cute.jit
@@ -264,6 +311,30 @@ def moe_combine_add_vector(ptr, values, dtype: cutlass.Constexpr, count: cutlass
         else:
             moe_combine_add_vector(ptr, values[: count // 2], dtype, count // 2)
             moe_combine_add_vector(ptr + count // 2, values[count // 2 :], dtype, count // 2)
+
+
+class MoeCombineStaging:
+    """The bulk COMBINE staging buffer: rows of ``row_elems`` elements laid out ``row_elems + pad_elems`` apart.
+    ``data_ptr`` takes the offset the shared drain computes for unpadded rows (``row * row_elems + col``, ``col <
+    row_elems``) and returns that element's address in the padded buffer."""
+
+    def __init__(self, array, row_elems: int, pad_elems: int):
+        self.array = array
+        self.row_elems = row_elems
+        self.pad_elems = pad_elems
+
+    def data_ptr(self, offset):
+        return self.array.data_ptr(offset + offset // self.row_elems * self.pad_elems)
+
+    # The DSL carries the buffer through dynamic control flow as the array's values.
+    def __extract_mlir_values__(self):
+        return self.array.__extract_mlir_values__()
+
+    def __extract_mlir_attributes__(self):
+        return self.array.__extract_mlir_attributes__()
+
+    def __new_from_mlir_values__(self, values):
+        return MoeCombineStaging(self.array.__new_from_mlir_values__(values), self.row_elems, self.pad_elems)
 
 
 @cute.jit
@@ -321,8 +392,10 @@ def moe_combine_bulk(
     top_k: cutlass.Constexpr,
     width: cutlass.Constexpr,
     dtype: cutlass.Constexpr,
+    evict_last: cutlass.Constexpr = False,
 ):
-    """Reduce a complete staged feature tile, then release this thread's row."""
+    """Reduce a complete staged feature tile, then release this thread's row.  ``evict_last`` gives the reduction an
+    L2 evict_last policy."""
     if row < group_end:
         token = token_index[row]
         slot = token_ks[row]
@@ -331,18 +404,28 @@ def moe_combine_bulk(
             if (destination.toint() % 16 == 0) & (col + width <= columns):
                 cute.arch.fence_view_async_shared()
                 if cutlass.const_expr(dtype == cutlass.Float32):
-                    instruction = "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;"
+                    op = "add.f32"
                 elif cutlass.const_expr(dtype == cutlass.BFloat16):
-                    instruction = "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16 [$0], [$1], $2;"
+                    op = "add.noftz.bf16"
                 else:
-                    instruction = "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16 [$0], [$1], $2;"
-                llvm.inline_asm(
-                    None,
-                    [destination.toint().ir_value(), cutlass.Int32(staging.toint()).ir_value(), cutlass.Int32(width * dtype.width // 8).ir_value()],
-                    instruction,
-                    "l,r,r,~{memory}",
-                    has_side_effects=True,
-                )
+                    op = "add.noftz.f16"
+                operands = [destination.toint().ir_value(), cutlass.Int32(staging.toint()).ir_value(), cutlass.Int32(width * dtype.width // 8).ir_value()]
+                if cutlass.const_expr(evict_last):
+                    llvm.inline_asm(
+                        None,
+                        operands + [l2_cache_policy("evict_last").ir_value()],
+                        f"cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.{op} [$0], [$1], $2, $3;",
+                        "l,r,r,l,~{memory}",
+                        has_side_effects=True,
+                    )
+                else:
+                    llvm.inline_asm(
+                        None,
+                        operands,
+                        f"cp.reduce.async.bulk.global.shared::cta.bulk_group.{op} [$0], [$1], $2;",
+                        "l,r,r,~{memory}",
+                        has_side_effects=True,
+                    )
                 nvvm.cp_async_bulk_commit_group()
                 nvvm.cp_async_bulk_wait_group(0, read=True)
 

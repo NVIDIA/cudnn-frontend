@@ -94,6 +94,51 @@ def _emit_moe_combine_store(tap_idx, i, src, spec, chain, vsize):
     return lines
 
 
+# A swapped COMBINE drains a tile column (one routed token) per step: every lane (one weight row each) adds its value to
+# that token's output row.  With the column's token and score loaded per column, each step waited on three dependent
+# loads.  Under ``swap_combine_lanes`` the template loads the tile's routes before its accumulator wait, lane l the token
+# and score of tile column l (and l + 32, ... for a wider tile: tile_helpers.moe_combine_lane_routes, into
+# ``combine_lane_tokens`` / ``combine_lane_weights``), and each column step takes its column's from that lane by shuffle
+# and issues its reduction under a predicate.  The drain's per-column ``col_j < group_end`` test stays: it is
+# warp-uniform and skips the empty columns of a narrow group.  A shuffle needs every lane, so the lanes of weight rows
+# past M drain row M - 1 with their reductions predicated off, in place of the drain's ``row < M`` test.  Needs a drain
+# whose column offsets are trace-time values (no acc overlap).
+_SWAP_COMBINE_LANES_ROWS = [
+    "_combine_row_ok = row < M",
+    "row = cutlass.min(row, M - 1)",
+]
+
+
+def swap_combine_lanes_applies(chain: FusionChain, tma_slots: "frozenset[int]" = frozenset(), workspace_split_k: bool = False) -> bool:
+    """Whether ``chain``'s epilogue can drain under ``swap_combine_lanes``: a swapped COMBINE whose only output is the
+    combined one (the prelude moves ``row`` and the drain's other users of it would read the moved row)."""
+    return (
+        isinstance(chain.moe, MoeSwapAbSpec)
+        and chain.moe.mode == "combine"
+        and len(chain.outputs) == 1
+        and len(chain.output_specs) == 1
+        and not chain.aux_tensors
+        and not chain.reductions
+        and not chain.quants
+        and not tma_slots
+        and not workspace_split_k
+    )
+
+
+def _emit_moe_combine_lanes_store(tap_idx, i, src, spec, vsize):
+    """The column steps of a swapped COMBINE under ``swap_combine_lanes`` (see ``_SWAP_COMBINE_LANES_ROWS``)."""
+    lines = []
+    for e in range(vsize):
+        lines += [
+            f"_combine_c = subtile_col_offset + j * {vsize} + {e}",
+            "_combine_token = cute.arch.shuffle_sync(combine_lane_tokens[_combine_c // 32], cutlass.Int32(_combine_c % 32))",
+            "_combine_weight = cute.arch.shuffle_sync(combine_lane_weights[_combine_c // 32], cutlass.Int32(_combine_c % 32))",
+            f"moe_combine_add_if(gC_tap_{tap_idx}_ptr + cutlass.Int64(row) * out_stride_m_{i} + cutlass.Int64(_combine_token) * out_stride_n_{i}, "
+            f"{src}[{e}] * _combine_weight, {DTYPE_TO_CUTLASS[spec.dtype]}, _combine_row_ok & (_combine_token >= 0))",
+        ]
+    return lines
+
+
 def _emit_reduction_atomic(
     tap_idx: int,
     red_idx: int,
@@ -538,6 +583,8 @@ def _emit_block_quant(
 
 
 _F32_MAX = "cutlass.Float32(3.402823466e38)"
+# 2**-126, the smallest normal fp32: the floor of a nonzero wide-quantize scale.
+_F32_MIN_NORMAL = "cutlass.Float32(1.1754943508222875e-38)"
 
 
 def _emit_wide_quant(
@@ -566,8 +613,16 @@ def _emit_wide_quant(
     column over the warp and leaves each warp's maxima in ``wq_colmax`` (this drain's buffer ``wq_buf`` of two); after
     the template's barrier, ``store`` combines the four, and warp 0 stores the scales. Every maximum a lane loads
     reaches a global store of that drain (the scale, or the data it scales) before the lane arrives at the next
-    drain's barrier, behind which the buffer is rewritten. Either way the scale is ``amax / max(output dtype)`` as a
-    linear fp32, and a block of zeros stores scale 0 and data 0 (the reciprocal is clamped to the largest float)."""
+    drain's barrier, behind which the buffer is rewritten.
+
+    Either way, with ``qmax`` the largest magnitude of the output dtype (448 for e4m3):
+
+    - ``amax`` is the block's largest magnitude with NaNs ignored, element by element (0 when it has no other value);
+    - the stored scale is ``RN(amax * RN(1 / qmax))``, raised to 2**-126 (the smallest normal fp32) when ``amax > 0``,
+      so that the reciprocal below never meets a subnormal (``rcp.approx.ftz`` flushes one to 0);
+    - a value ``x`` is stored as ``cvt.rn.satfinite(RN(x * min(rcp.approx.ftz(scale), FLT_MAX)))``.
+
+    A block of zeros stores scale 0 and data 0 (the reciprocal is clamped to the largest float); a NaN stays NaN."""
     swapped = isinstance(chain.moe, MoeSwapAbSpec)
     bs = quant.block_size
     out_max = _quant_output_max(spec.dtype)
@@ -579,10 +634,14 @@ def _emit_wide_quant(
     if quant.axis != 1:
         values += [
             f"_wq_abs = cute.math.absf(cute.TensorSSA(wq_src.ir_value(), ({vsize}, 1), cutlass.Float32))",
-            "wq_amax = cute.math.max(wq_amax, _wq_abs[None, 0].reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0))",
+            # A maxnum reduction skips a NaN element by itself, as the lanes' redux.sync below does. (ReductionOp.MAX is
+            # maximumf: a NaN would become the vector's maximum, and the running maxnum fold would drop the whole vector.)
+            'wq_amax = cute.math.max(wq_amax, _wq_abs[None, 0].to_vector().reduce("max"))',
         ]
         scale += [
             f"_wq_sf = wq_amax * cute.arch.rcp_approx({out_max})",
+            "if wq_amax > cutlass.Float32(0.0):",
+            f"    _wq_sf = cute.math.max(_wq_sf, {_F32_MIN_NORMAL})",
             f"wq_inv = cute.math.min(cute.arch.rcp_approx(_wq_sf), {_F32_MAX})",
             # The tile's columns are one block of the row; a cluster's tile past N stores nothing.
             f"if ({row_pred}) & (coord_n_c + {bs} <= N):",
@@ -597,9 +656,15 @@ def _emit_wide_quant(
         for c in range(vsize):
             values += [f'_wq_a{c} = cute.arch.warp_redux_sync(wq_src[{c}], "fmax", abs=True)', f"if lane == {c}:", f"    _wq_mine = _wq_a{c}"]
         values += [f"if lane < {vsize}:", "    (wq_colmax.subview(wq_buf + warp_idx * epi_cols_per_mma_m + wq_col + lane)).store(_wq_mine)"]
-        store += ["_wq_m = cutlass.Float32(0.0)", f"if lane < {vsize}:", "    _wq_m = (wq_colmax.subview(wq_buf + wq_col + lane)).load()"]
-        store += [f"    _wq_m = cute.math.max(_wq_m, (wq_colmax.subview(wq_buf + {w} * epi_cols_per_mma_m + wq_col + lane)).load())" for w in range(1, 4)]
-        store += [f"_wq_sfm = _wq_m * cute.arch.rcp_approx({out_max})", f"_wq_inv = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
+        # Every warp's maximum is folded into 0 with maxnum: a warp whose lanes of the column were all NaN adds nothing.
+        store += ["_wq_m = cutlass.Float32(0.0)", f"if lane < {vsize}:"]
+        store += [f"    _wq_m = cute.math.max(_wq_m, (wq_colmax.subview(wq_buf + {w} * epi_cols_per_mma_m + wq_col + lane)).load())" for w in range(4)]
+        store += [
+            f"_wq_sfm = _wq_m * cute.arch.rcp_approx({out_max})",
+            "if _wq_m > cutlass.Float32(0.0):",
+            f"    _wq_sfm = cute.math.max(_wq_sfm, {_F32_MIN_NORMAL})",
+            f"_wq_inv = cute.make_rmem_tensor({vsize}, cutlass.Float32)",
+        ]
         store += [f"_wq_inv[{c}] = cute.math.min(cute.arch.rcp_approx(cute.arch.shuffle_sync(_wq_sfm, cutlass.Int32({c}))), {_F32_MAX})" for c in range(vsize)]
         store.append(f"_wq_out = cute.make_rmem_tensor({vsize}, cutlass.Float32)")
         for e in range(0, vsize, 2):
@@ -676,17 +741,27 @@ def generate(
     packed_lanes: bool = False,
     workspace_split_k: bool = False,
     k_padding: bool = False,
+    swap_combine_lanes: bool = False,
+    silu_tanh: bool = False,
 ) -> EpilogueSnippets:
     """Produce the two hook-site snippets, the extra kernel param list, and all per-tap plumbing.
 
     ``k_padding`` appends the F8_128x4 K-padding stores (:func:`_emit_block_quant_k_pad`). A plan compiles the body
     without them, which is develop's epilogue, and -- when any quantized output can end a scale row inside a quad
-    (:func:`k_pad_axes`) -- once more with them; the launch picks the second only for extents that do."""
+    (:func:`k_pad_axes`) -- once more with them; the launch picks the second only for extents that do.
+
+    ``swap_combine_lanes`` drains a swapped COMBINE whose only output is the combined one with lane-parallel route loads
+    (see ``_SWAP_COMBINE_LANES_ROWS``).
+
+    ``silu_tanh`` evaluates SiLU with one MUFU op per value (``epilogue_codegen._emit_op``): the general templates' gated
+    pairs (``compiler._glu_silu_tanh``)."""
     vsize = vec_bytes_epi // output_elem_bytes
     scatter = chain.has_moe and chain.moe.mode == "scatter"
     row_bound = "group_end" if chain.has_moe and not isinstance(chain.moe, MoeSwapAbSpec) else "M"
     col_bound = "group_end" if isinstance(chain.moe, MoeSwapAbSpec) else "N"
-    aux_lines: list[str] = []
+    if swap_combine_lanes and not swap_combine_lanes_applies(chain, tma_slots, workspace_split_k):
+        raise ValueError("swap_combine_lanes drains a swapped COMBINE with one output and no aux tensor, reduction or quantize")
+    aux_lines: list[str] = list(_SWAP_COMBINE_LANES_ROWS) if swap_combine_lanes else []
     aux_row = f"cute.math.min(cutlass.Int32(row), cutlass.Int32({row_bound}) - 1)"
     for aux in chain.aux_tensors:
         aux_lines.append(f"{_aux_ptr_var(aux.name)} = {aux.name}.iterator.raw_ptr()")
@@ -710,7 +785,7 @@ def generate(
     body_lines: list[str] = tma_vec_bindings + _aux_pre
 
     # Per-op result var name lookup (handles `identity` pass-throughs).
-    pointwise_lines, _parent_value = _emit_pointwise_dag(chain, vsize=vsize, bounded=bounded, aux_load_expr=_aux_load_expr)
+    pointwise_lines, _parent_value = _emit_pointwise_dag(chain, vsize=vsize, bounded=bounded, aux_load_expr=_aux_load_expr, silu_tanh=silu_tanh)
     body_lines.extend(pointwise_lines)
 
     specs = chain.output_specs
@@ -791,7 +866,10 @@ def generate(
             continue
         tap_idx = _tap_of[si]
         if chain.has_moe and chain.moe.mode == "combine":
-            body_lines.extend(_emit_moe_combine_store(tap_idx, si, src, spec, chain, vsize))
+            if swap_combine_lanes:
+                body_lines.extend(_emit_moe_combine_lanes_store(tap_idx, si, src, spec, vsize))
+            else:
+                body_lines.extend(_emit_moe_combine_store(tap_idx, si, src, spec, chain, vsize))
             continue
         if chain.has_moe and chain.moe.mode == "scatter":
             body_lines.extend(_emit_moe_scatter_store(tap_idx, si, src, spec, chain, vsize, store_row_pred, col_bound))
