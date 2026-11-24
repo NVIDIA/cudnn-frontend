@@ -74,7 +74,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -169,8 +169,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 )
 
         self.acc_dtype = acc_dtype
-        self.mma_tiler_mn = mma_tiler_mn
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256
+        self.mma_tiler_mn = tuple(mma_tiler_mn or (256, 256))
+        self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1))
         self.accumulate_on_output = accumulate_on_output
         self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmWgradKernel

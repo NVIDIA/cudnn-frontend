@@ -1,9 +1,9 @@
 # Grouped GEMM + WGrad (Unified)
 
 `GroupedGemmWgradSm100` and `grouped_gemm_wgrad_wrapper_sm100` are experimental
-SM100+ APIs for grouped MoE weight gradients. The same public surface dispatches
-BF16 inputs to the BF16 kernel and preserves the legacy FP4/FP8 block-scaled
-backend.
+SM100+ APIs for grouped MoE weight gradients, with SM90 twins for a BF16 subset
+(see [SM90 (Hopper)](#sm90-hopper)). The same public surface dispatches BF16 inputs
+to the BF16 kernel and preserves the legacy FP4/FP8 block-scaled backend.
 
 The CuTe DSL dependencies both APIs need ship with the package:
 
@@ -274,8 +274,37 @@ static contract creates a different cached operator or fails validation.
 BF16 wrapper calls allocate their tensor maps per call, so same-signature
 wrapper calls may overlap on different streams.
 
+## SM90 (Hopper)
+
+`GroupedGemmWgradSm90` and `grouped_gemm_wgrad_wrapper_sm90` take exactly the
+arguments of `GroupedGemmWgradSm100` and `grouped_gemm_wgrad_wrapper_sm100` and
+return the same outputs, so a caller switches by name only. They run a Hopper BF16
+kernel (WGMMA and TMA, accumulator in registers) and require an SM90 GPU; the
+`_sm100` names require SM100+ and do not run on SM90. The kernel claims output
+tiles from a global atomic counter on persistent clusters, as SM90 has no cluster
+launch control. It covers the BF16 contract above with these limits:
+
+- Dense `wgrad_tensor` output only; `output_mode="discrete"` raises `NotImplementedError`.
+- SM90 uses the dynamic scheduler (atomic counter) by default; the static
+  scheduler is not available.
+- `input_order="tensor2d"` only; `"tensor_ragged"` raises `NotImplementedError`.
+- `accumulate_on_output=True` raises `NotImplementedError`.
+- Block-scaled (FP8/FP4) inputs raise `NotImplementedError`.
+- Torch tensors only (no JAX entry).
+- The SM90 kernel picks its warp-group schedule from the problem shape, and
+  `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 192)`
+  for output `N >= 2048`, else `(128, 256)`. SM100 uses `(256, 256)`. The
+  `N >= 2048` schedule runs only on a `(128, 192)` tile with a `(2, 1)` cluster
+  (given or defaulted); any other tile or cluster runs the default schedule.
+  An explicit SM90 tile has M in `{64, 128}` and N a multiple of 32 up to 256.
+  `cluster_shape_mn=None` selects `(2, 1)`; an
+  explicit cluster has power-of-two sides and at most 8 CTAs.
+
+Each output tile is computed by one CTA over the expert's whole token range
+(no split-K), so the result does not depend on the claim order.
+
 The APIs reject unsupported dtypes or layouts, malformed/unaligned offsets or
 pointers, mixed devices, forbidden BF16 scale controls, unsupported tiling, use
-before `compile()`, unavailable CUDA, and devices below SM100. Support and
+before `compile()`, unavailable CUDA, and devices other than SM100+ (SM90 for the `_sm90` names). Support and
 validation errors are reported as `ValueError` or `RuntimeError`; callers should
 not rely on this experimental API remaining source-compatible across releases.

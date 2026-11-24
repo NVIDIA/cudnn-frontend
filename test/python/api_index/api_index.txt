@@ -63,6 +63,7 @@ cudnn.GroupedGemmSm90
 cudnn.GroupedGemmSreluSm100
 cudnn.GroupedGemmSwigluSm100
 cudnn.GroupedGemmWgradSm100
+cudnn.GroupedGemmWgradSm90
 cudnn.Handle
 cudnn.Handle.device
 cudnn.KPageLayout
@@ -912,6 +913,10 @@ cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100
 cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100.check_support
 cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100.compile
 cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100.execute
+cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm90
+cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm90.check_support
+cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm90.compile
+cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm90.execute
 cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm
 cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.allocate_outputs
 cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.check_call
@@ -938,6 +943,7 @@ cudnn.gemm.cutedsl.grouped.grouped_gemm_srelu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_swiglu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wgrad_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wgrad_wrapper_sm100
+cudnn.gemm.cutedsl.grouped.grouped_gemm_wgrad_wrapper_sm90
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wrapper_sm90
 cudnn.gemm.cutedsl.grouped.prepare_grouped_gemm
@@ -1029,6 +1035,7 @@ cudnn.grouped_gemm_srelu_wrapper_sm100
 cudnn.grouped_gemm_swiglu_wrapper_sm100
 cudnn.grouped_gemm_wgrad_jax_sm100
 cudnn.grouped_gemm_wgrad_wrapper_sm100
+cudnn.grouped_gemm_wgrad_wrapper_sm90
 cudnn.grouped_gemm_wrapper_sm100
 cudnn.grouped_gemm_wrapper_sm90
 cudnn.heur_mode

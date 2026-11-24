@@ -47,14 +47,16 @@ def _launch(op, problem, sched, arch="sm100"):
     """One ``*_{arch}`` wrapper call on the current stream; returns its outputs (fresh buffers)."""
     if op == "wgrad":
         output = torch.empty_like(problem["output"])
-        ptrs = torch.tensor([expert.data_ptr() for expert in output], dtype=torch.int64, device="cuda")
-        cudnn.grouped_gemm_wgrad_wrapper_sm100(
+        discrete = problem["discrete"]
+        ptrs = torch.tensor([expert.data_ptr() for expert in output], dtype=torch.int64, device="cuda") if discrete else None
+        getattr(cudnn, f"grouped_gemm_wgrad_wrapper_{arch}")(
             a_tensor=problem["a"],
             b_tensor=problem["b"],
             sfa_tensor=None,
             sfb_tensor=None,
             offsets_tensor=problem["offsets"],
-            output_mode="discrete",
+            output_mode="discrete" if discrete else "dense",
+            wgrad_tensor=None if discrete else output,
             wgrad_ptrs=ptrs,
             acc_dtype=torch.float32,
             wgrad_dtype=torch.bfloat16,
@@ -119,8 +121,9 @@ def _assert_overlap_matches_serial(op, discrete, sched, arch="sm100"):
             assert_bitwise(snapshot(result), reference, f"iteration {iteration} call {index}")
 
 
-# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad; the forced cases cover each schedule.
-SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad") for schedule in (None, "cooperative", "pingpong")]
+# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad and cooperative for wgrad (output N=1024); the forced
+# cases cover each schedule. SM90 wgrad writes a dense output.
+SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad", "wgrad") for schedule in (None, "cooperative", "pingpong")]
 
 
 @pytest.mark.parametrize("op,schedule", SM90_CASES, ids=[f"{op}-{schedule or 'heuristic'}" for op, schedule in SM90_CASES])

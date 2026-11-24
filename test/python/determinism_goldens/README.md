@@ -10,6 +10,10 @@ Forward and dgrad have no golden record. Replay, batch invariance and warm stres
 directions and both warp-group schedules; `test_sm90_pingpong_matches_cooperative` checks that
 pingpong (128x192 tile, (2, 1) cluster) gives the cooperative bytes for forward and dgrad.
 
+Wgrad has no golden record either. Warm stress at the same setup: 0 wrong of 3000 warm + 3000
+poisoned wgrad launches. The tile-info case `test_sm90_wgrad_warm_stress` (K = 64, 256 tokens per
+expert) covers wgrad's Rule 11 release sites.
+
 Runtime: NVIDIA H100 80GB HBM3 (SM90, 132 SMs, x86-64 host), PyTorch 2.14.0+cu130,
 CUDA 13.0, driver API 13020, cuDNN 92400, CuTe DSL 4.8.0, tvm-ffi 0.1.16,
 compute-sanitizer 2026.1.1.0; source built from the commit under test.

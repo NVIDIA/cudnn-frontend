@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Private descriptor-first BF16 API for SM100 grouped GEMM wgrad."""
+"""Private descriptor-first BF16 API for SM90 and SM100 grouped GEMM wgrad."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from cudnn.tensor_adapter import (
     framework_dtype,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -38,6 +39,8 @@ from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug
 from ..canonical import validate_once
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
+from ..unfused.moe_grouped_gemm_sm90 import pingpong_config_error
+from .moe_grouped_gemm_wgrad_sm90 import MoEGroupedGemmWgradBF16KernelSm90, use_pingpong_wgrad
 
 
 def _output_dtypes():
@@ -62,12 +65,13 @@ class GroupedGemmWgradBf16API(APIBase):
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
+        arch: str = "sm100",
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -103,9 +107,14 @@ class GroupedGemmWgradBf16API(APIBase):
             )
 
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
-        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        # arch="sm90" (GroupedGemmWgradSm90) runs the Hopper kernel: tile M <= 128 and a (2, 1) cluster by default.
+        self._is_sm90 = arch == "sm90"
+        # The SM90 schedule comes from the output N (wgrad_shape is (M, N)) and the tile.
+        self.pingpong = self._is_sm90 and len(self.wgrad_shape) == 2 and use_pingpong_wgrad(self.wgrad_shape[1], mma_tiler_mn, cluster_shape_mn)
+        default_tile = ((128, 192) if self.pingpong else (128, 256)) if self._is_sm90 else (256, 256)
+        self.mma_tiler_mn = tuple(mma_tiler_mn or default_tile)
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
-        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
+        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.accumulate_on_output = accumulate_on_output
         self.sf_vec_size = sf_vec_size
         self.sf_fp8_dtype_override = sf_fp8_dtype_override
@@ -115,7 +124,7 @@ class GroupedGemmWgradBf16API(APIBase):
             sample_global_scale_a,
             sample_global_scale_b,
         )
-        self._kernel = MoEGroupedGemmWgradBF16Kernel
+        self._kernel = MoEGroupedGemmWgradBF16KernelSm90 if self._is_sm90 else MoEGroupedGemmWgradBF16Kernel
         self._workspace: Optional[torch.Tensor] = None
         self._scratch_nbytes = 0
         self._compile_wgrad_ptrs: Optional[torch.Tensor] = None
@@ -242,9 +251,17 @@ class GroupedGemmWgradBf16API(APIBase):
             if pointer % alignment:
                 raise ValueError(f"{name} data pointer must be {alignment}-byte aligned")
 
+        if self._is_sm90 and self.accumulate_on_output:
+            raise NotImplementedError("accumulate_on_output is not supported on SM90")
+        if self._is_sm90 and (self.weight_mode != MoEWeightMode.DENSE or self.input_order != WGradInputOrder.Tensor2D):
+            raise NotImplementedError("SM90 wgrad supports dense output and the Tensor2D input order only")
+
         # Per-expert token counts are device data (Rule 3); can_implement gets a split with the right total.
         groups = [tokens_sum] + [0] * (self.expert_cnt - 1)
 
+        pingpong_error = pingpong_config_error(self.mma_tiler_mn, self.cluster_shape_mn) if self.pingpong else None
+        if pingpong_error is not None:
+            raise ValueError(f"SM90 wgrad: {pingpong_error}")
         if not self._kernel.can_implement(
             cutlass.BFloat16,
             _convert_to_cutlass_data_type(self.wgrad_dtype),
@@ -260,13 +277,17 @@ class GroupedGemmWgradBf16API(APIBase):
             self.b_major,
             self.weight_mode,
             self.input_order,
+            **(dict(pingpong=self.pingpong) if self._is_sm90 else {}),
         ):
-            raise ValueError("Unsupported BF16 grouped GEMM wgrad configuration: check mma_tiler, cluster, and alignment")
+            raise ValueError("Unsupported BF16 grouped GEMM wgrad configuration: check mma_tiler, cluster, the SM90 schedule, and alignment")
         if not cuda_is_available():
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         capability = major * 10 + minor
-        if not has_tcgen05(major):
+        if self._is_sm90:
+            if not has_wgmma(major):
+                raise RuntimeError(f"GroupedGemmWgradSm90 requires SM90 (WGMMA), found SM{capability}")
+        elif not has_tcgen05(major):
             raise RuntimeError(f"GroupedGemmWgradSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
         self._is_supported = True
         return True
@@ -306,6 +327,7 @@ class GroupedGemmWgradBf16API(APIBase):
             expert_cnt=self.expert_cnt,
             weight_mode=self.weight_mode,
             input_order=self.input_order,
+            **(dict(pingpong=self.pingpong) if self._is_sm90 else {}),
         )
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
@@ -314,7 +336,8 @@ class GroupedGemmWgradBf16API(APIBase):
         # Internal scratch in the caller's framework allocator; kernels write through its
         # raw pointer and it is never surfaced as a framework array.
         self._workspace = allocate_byte_workspace(self._framework, kernel.get_workspace_bytes(), self.a_desc.device)
-        # Bytes the wrapper allocates per call on the launch stream: overlapping calls must not share the TMA descriptors.
+        # Bytes the wrapper allocates per call on the launch stream: overlapping calls must not share the SM90 tile counter
+        # or the SM100 discrete/ragged TMA descriptors.
         self._scratch_nbytes = kernel.get_workspace_bytes()
         self._validate_data_alignment(self._workspace, "workspace", 128)
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
