@@ -64,7 +64,7 @@ def block_prefix_sum_kernel(
     barrier_id=1,
     need_total_sum=False,
 ):
-    """Block prefix sum kernel in CuTe DSL"""
+    """Scan one tile. Callers reusing warp_sums must rendezvous after the final reads."""
     # Thread and warp id
     warp_id = tidx // 32
     lane_id = tidx % 32
@@ -154,3 +154,4 @@ def block_prefix_sum(
             )
             output[i] = val + previous_sum
             previous_sum = previous_sum + total_sum
+            cute.arch.barrier(barrier_id=0, number_of_threads=num_threads_per_block)

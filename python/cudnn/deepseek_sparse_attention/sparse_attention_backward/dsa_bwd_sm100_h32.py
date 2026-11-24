@@ -751,6 +751,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         topk: Int32,
         mma_reduce_dKV_pipeline,
         token_idx: Int32,
+        ack_mask: Int32,
     ):
         """Consume three reducer generations for each M64 tile."""
         tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4 = tdKVtdKV

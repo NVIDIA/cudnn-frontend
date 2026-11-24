@@ -167,6 +167,27 @@ def wait_poll(mb, phase, tight_iters: cutlass.Constexpr[int] = POLL_TIGHT_ITERS,
     nvvm.inline_ptx(poll_ptx(tight_iters, sleep_ns), read_only_args=[mb, cutlass.Int32(phase)])
 
 
+def sleep_ptx(units: int) -> str:
+    """The inline-PTX body of :func:`timer_sleep` -- plain Python so a host test can pin the rendering: ``units`` plain TIMER
+    sleeps of one microsecond each, counted in a PTX register (a loop neither compiler can fold)."""
+    units = int(units)
+    if units < 1:
+        raise ValueError(f"timer_sleep: units must be >= 1, got {units}")
+    return "{\n\t.reg .pred P1;\n\t.reg .u32 n;\n\tmov.u32 n, 0;\n\tLAB_SLEEP:\n\tnanosleep.u32 1000;\n\tadd.u32 n, n, 1;\n\t" + (
+        f"setp.lt.u32 P1, n, {units};\n\t@P1 bra LAB_SLEEP;\n\t}}"
+    )
+
+
+@cute.jit
+def timer_sleep(units: cutlass.Constexpr[int]):
+    """Every calling lane sleeps about ``units`` microseconds: ``units`` x ``nanosleep.u32 1000`` (SASS NANOSLEEP, the plain timer
+    form; each sleep lasts between 0 and twice its argument and at most 1 ms, so the total is approximate).  A DELAY FOR
+    STRESS PROBES ONLY -- a role held back in a producer's gap shows whether an order rests on a barrier or on timing: a
+    bounded wait only slows down, an unordered hand-over returns wrong bytes or hangs.  It orders nothing and no served
+    path may call it.  Block-scoped labels: the fixed names are legal at every instantiation."""
+    inline_ptx(sleep_ptx(units), write_only_types=[], read_only_args=[])
+
+
 @cute.jit
 def arrive(mb):
     nvvm.mbarrier_arrive(mb)
