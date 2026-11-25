@@ -1125,7 +1125,7 @@ def _distributed_ds3_numerics_worker(
         assertion_error = None
         try:
             _check_ds3_profiles(outputs, resolved, expected)
-        except BaseException as error:
+        except Exception as error:
             assertion_error = error
         dist.barrier(group=ep_group)
         if assertion_error is not None:
