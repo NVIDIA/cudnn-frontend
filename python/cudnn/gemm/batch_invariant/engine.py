@@ -13,7 +13,7 @@ from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirem
 from cudnn.frost.workspace import Workspace, check_workspace_device
 from cudnn.graph_types import NodeType, Tensor, storage_geometry, storage_slot_bytes
 
-from ._graph import ScaledMatmul, is_scaled, match_scaled
+from ._scaled_graph import ScaledMatmul, is_scaled, match_scaled
 
 
 @dataclass(frozen=True)

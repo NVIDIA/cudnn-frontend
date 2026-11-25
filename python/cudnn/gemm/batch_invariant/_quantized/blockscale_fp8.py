@@ -934,3 +934,5 @@ class BlockScaleFp8Gemm:
         cute.arch.sync_threads()
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

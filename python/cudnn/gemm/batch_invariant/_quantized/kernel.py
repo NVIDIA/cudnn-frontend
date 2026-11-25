@@ -353,6 +353,8 @@ class BlockGemm:
         tmem.relinquish_alloc_permit()
         tmem.free(tmem.retrieve_ptr(ACC_DTYPE))
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
 
 class ScaledBlockGemm(BlockGemm):
     """``C = cvt(mul.rn(sum_k A B, mul.rn(a_scale, b_scale)))``: the fp8 classes' body; the scales are 1-element fp32

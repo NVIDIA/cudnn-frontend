@@ -46,3 +46,6 @@ def _fold(chunks: cutlass.Constexpr, partials, out, scale_a, scale_b, bias, rows
                 if cutlass.const_expr(bias is not None):
                     acc = cute.math.add(acc, bias[col].to(Float32), rounding=RoundingMode.NEAREST_EVEN)
                 out[row, col, 0] = acc.to(out.element_type)
+
+
+_fold.set_name_prefix("cudnn", remove_cutlass_symbol=True)

@@ -1539,6 +1539,8 @@ class BlockScaledGemm:
             cute.arch.cluster_arrive()  # no CTA leaves while a peer may still address its smem
             cute.arch.cluster_wait()
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
 
 class ScaledBlockScaledGemm(BlockScaledGemm):
     """``C = cvt(mul.rn(sum_k MMA(A, SFA, B, SFB), alpha))``: the 4-bit classes' body (``mm_fp4``); ``alpha`` is the caller's
