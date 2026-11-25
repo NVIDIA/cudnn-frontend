@@ -1338,8 +1338,8 @@ def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, determini
 
 @pytest.mark.L0
 @pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
-@pytest.mark.parametrize("tie_break", [0, 1, 2])
-def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, tie_break):
+@pytest.mark.parametrize("tie_break,deterministic", [(0, True), (1, True), (2, True), (0, False)], ids=["0", "1", "2", "arbitrary"])
+def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, tie_break, deterministic):
     """Check FP32 cutoff keys at the FP16 rounding boundaries used by coarse filtering."""
     dsa = _import_dsa()
     width, k, rows = 32773, 2048, 156
@@ -1362,7 +1362,9 @@ def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, tie_break):
     scores.masked_fill_((columns < starts[:, None]) | (columns >= ends[:, None]), torch.inf)
 
     def run(data=scores, lower=starts, upper=ends):
-        result = dsa.indexer_top_k_wrapper(data, upper, k, starts=lower if has_starts else None, tie_break=tie_break, deterministic=True)
+        result = dsa.indexer_top_k_wrapper(
+            data, upper, k, starts=lower if has_starts else None, tie_break=tie_break, deterministic=deterministic, return_val=deterministic
+        )
         return {"indices": result["indices"], "values": result["values"]}
 
     expected_indices = []
@@ -1375,6 +1377,17 @@ def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, tie_break):
         expected_indices.append(indices.int())
         expected_values.append(pattern[indices])
     expected = {"indices": torch.stack(expected_indices)[order], "values": torch.stack(expected_values)[order]}
+    if not deterministic:
+        actual = run()
+        assert actual["values"] is None
+        indices = actual["indices"]
+        assert ((indices >= starts[:, None]) & (indices < ends[:, None])).all()
+        sorted_indices = indices.sort(dim=1).values
+        assert (sorted_indices[:, 1:] != sorted_indices[:, :-1]).all()
+        picked = scores.gather(1, indices.long())
+        assert_bitwise({"values": picked.sort(dim=1).values}, {"values": expected["values"].sort(dim=1).values}, "FP32 interval oracle")
+        return
+
     actual = assert_replays(run)
     assert_bitwise(actual, expected, "FP32 interval oracle")
     for rows_to_check in ([0], [7, 2, 1, 7, 6, 10]):

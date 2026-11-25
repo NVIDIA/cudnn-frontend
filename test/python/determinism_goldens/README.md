@@ -4921,6 +4921,16 @@ errors per GPU with the native PyTorch allocator and
 `-n0 -o addopts= -m L0 -k "deterministic_random_exact or starts_bf16_mixed_interval_widths or ignores_vector_padding"`.
 The updated kernel remains unverified on cc 10.0, cc 10.7 and SM12x.
 
+The nondeterministic FP32 K=2048 indices-only path with `tie_break=0`
+now skips the first exact radix digit when the coarse bin determines it.
+Two added L0 cases check the selected score multiset against an independent
+sort and require distinct in-bounds source indices with and without
+`starts`. The same L0/L1 command and software stack reported 252 passed,
+9 SM120/121 skips and 6 deselected on both H200 and B300. All seven golden
+comparisons matched on each GPU. Compute Sanitizer memcheck reported 20
+passed and zero errors per GPU using the native PyTorch allocator and
+`-n0 -o addopts= -m L0 -k "(coarse_bin_refinement and arbitrary) or spilled_candidate_planes"`.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.

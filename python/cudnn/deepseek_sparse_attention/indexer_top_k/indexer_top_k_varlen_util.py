@@ -1069,7 +1069,15 @@ class IndexerTopKKernelVarlen:
 
             first_round = cutlass.Int32(0)
             fp32_prefix = cutlass.Uint32(0)
-            if cutlass.const_expr(self.deterministic and self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048):
+            if cutlass.const_expr(
+                self.dtype == cutlass.Float32
+                and self.enable_gmem_store
+                and self.top_k == 2048
+                and (
+                    self.deterministic
+                    or (self.tie_break == 0 and not self.return_val and self.max_num_cols >= 32768 and not self.enable_multi_cta and not self.merge_blocks)
+                )
+            ):
                 if length >= 16384:
                     positive = threshold_bin < 128
                     half_magnitude = (threshold_bin ^ 0x7F) & 0x7F if positive else threshold_bin & 0x7F
@@ -1079,9 +1087,10 @@ class IndexerTopKKernelVarlen:
                     # Only even exponents change the FP32 high byte at that boundary.
                     if half_exp > 0 and half_exp < 31 and ((half_magnitude & 3) != 0 or (half_exp & 1) != 0):
                         first_round = 1
-                        # Rebase the exponent from FP16 to FP32 and apply the ordered-key transform.
-                        high_byte = (half_exp + (127 - 15)) >> 1
-                        fp32_prefix = cutlass.Uint32(high_byte ^ 0x7F if positive else high_byte | 0x80) << 24
+                        if cutlass.const_expr(self.deterministic):
+                            # Rebase the exponent from FP16 to FP32 and apply the ordered-key transform.
+                            high_byte = (half_exp + (127 - 15)) >> 1
+                            fp32_prefix = cutlass.Uint32(high_byte ^ 0x7F if positive else high_byte | 0x80) << 24
             first_shift = self.first_refine_shift - first_round * 8
 
             refine_required = topk_remaining > 0
