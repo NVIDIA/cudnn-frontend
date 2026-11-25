@@ -223,7 +223,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         s_counter,
         s_threshold_bin_id,
         s_num_input,
-        g_num_input,
         s_indices,
         s_input_idx,
         s_last_remain,
@@ -256,7 +255,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             s_counter,
             s_threshold_bin_id,
             s_num_input,
-            g_num_input,
             s_indices,
             s_input_idx,
             s_last_remain,
@@ -307,14 +305,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             layout=cute.make_ordered_layout((2,), order=(0)),
             byte_alignment=128,
         )
-        if cutlass.const_expr(self.enable_gmem_store):
-            g_num_input = smem.allocate_tensor(
-                element_type=cutlass.Int32,
-                layout=cute.make_ordered_layout((2), order=(0)),
-                byte_alignment=128,
-            )
-        else:
-            g_num_input = None
         s_indices = smem.allocate_tensor(
             element_type=self.index_type,
             layout=cute.make_ordered_layout((self.indexer_topk_max_k,), order=(0)),
@@ -348,10 +338,10 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                 layout=cute.make_ordered_layout((1,), order=(0,)),
                 byte_alignment=8,
             )
-            if cutlass.const_expr(self.use_deterministic_bitmap):
+            if cutlass.const_expr(self.bitmap_capacity > 0):
                 s_index_bits = smem.allocate_tensor(
                     element_type=cute.Uint32,
-                    layout=cute.make_ordered_layout(((self.max_num_cols + 31) // 32,), order=(0,)),
+                    layout=cute.make_ordered_layout(((self.bitmap_capacity + 31) // 32,), order=(0,)),
                     byte_alignment=128,
                 )
             else:
@@ -439,7 +429,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     s_counter,
                     s_threshold_bin_id,
                     s_num_input,
-                    g_num_input,
                     s_indices,
                     s_input_idx,
                     s_last_remain,
@@ -492,7 +481,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     s_counter,
                     s_threshold_bin_id,
                     s_num_input,
-                    g_num_input,
                     s_indices,
                     s_input_idx,
                     s_last_remain,
@@ -538,7 +526,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                         s_counter,
                         s_threshold_bin_id,
                         s_num_input,
-                        g_num_input,
                         s_indices,
                         s_input_idx,
                         s_last_remain,
@@ -718,6 +705,10 @@ def compile_topk_kernel(
         deterministic_ordering = "bitmap" if bucketed_num_cols <= bitmap_limit else "bitonic"
     elif deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 3):
         deterministic_ordering = "bitmap" if _sm103_deterministic_bitmap(bucketed_num_cols, top_k, large_occupancy) else "bitonic"
+        # Offset rows can be far narrower than their score matrix. Cap bitmap
+        # storage by interval length and retain bitonic ordering for wider rows.
+        if has_starts and dtype == cutlass.BFloat16 and top_k == 512 and large_occupancy and bucketed_num_cols == 131072:
+            deterministic_ordering = "interval_bitmap"
     deterministic_ordering = resolve_deterministic_ordering(bucketed_num_cols, deterministic, deterministic_ordering)
     assert not load_balance
 

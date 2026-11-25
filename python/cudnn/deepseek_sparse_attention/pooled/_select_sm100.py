@@ -93,9 +93,6 @@ class PooledSelectKernel(IndexerTopKKernelVarlenDecode):
         counter = alloc(smem, Int32, 1)
         threshold = alloc(smem, Int32, 1)
         num_input = alloc(smem, Int32, 2)
-        global_num_input = None
-        if cutlass.const_expr(self.enable_gmem_store):
-            global_num_input = alloc(smem, Int32, 2)
         indices = alloc(smem, self.index_type, self.indexer_topk_max_k)
         input_indices = smem.allocate_tensor(
             self.index_type,
@@ -123,7 +120,6 @@ class PooledSelectKernel(IndexerTopKKernelVarlenDecode):
                 counter,
                 threshold,
                 num_input,
-                global_num_input,
                 indices,
                 input_indices,
                 last_remain,

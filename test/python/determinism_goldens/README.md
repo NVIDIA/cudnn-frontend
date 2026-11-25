@@ -4795,6 +4795,42 @@ at K=512 passed for all three dtypes and both tie directions. Memcheck reported
 driver API errors during compilation, so the SM100 sanitizer result is inconclusive.
 SM107 and SM12x interval coverage remains unverified.
 
+The interval and radix-spill optimizations on baseline `0e6176e1` were checked
+with CUDA 13.0 PyTorch 2.12.1, cuDNN backend 9.19.0, and CuTe DSL 4.8.0
+(CUDA 13.4 compiler) on NVIDIA L20X reporting cc 9.0 and B300 reporting cc 10.3.
+The wide FP32 interval test checks bitwise replay, reordered and duplicated
+rows across the occupancy boundary, and isolation from changed neighbor rows.
+The BF16 mixed-interval test covers both sides of the bitmap capacity. The
+refill stress observed zero differing outputs in 128 warm and 128 poisoned
+launches on each GPU. The unsafe control failed 200 of 200 launches on each GPU.
+The three golden cases per GPU pin both indices and values for cutoff ties
+and empty or short intervals in FP32, FP16, and BF16. The updated kernel
+revision is unverified on cc 10.0, cc 10.7, and SM12x.
+
+```sh
+cd test/python
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -s -q -rs -m "L0 or L1" \
+  deepseek_sparse_attention/cutedsl/test_DSA_indexer_top_k.py
+```
+
+- SM90 and SM103 each reported 182 passed, 9 skipped, and 6 deselected. The
+  skipped cases target SM120/121.
+- The SM103 pooled DSA selector regression reported 17 passed and 95 deselected
+  with `-m "L0 or L1" -k "pooled_select_public or indexer_paged_scores_topk_and_expansion or pooled_indexer_large_pools_and_pages"`.
+
+The cutoff-key optimization reuses the exact radix digits for directed tie
+selection. Six L0 cases check that FP32, FP16 and BF16 retain the sign of
+zero at a negative-zero cutoff, with both source-column tie directions
+and a nonzero interval start. On the same B300 software stack, the command
+above reported 188 passed, 9 SM120/121 skips and 6 deselected, with all three
+existing golden files unchanged. The refill stress again observed zero
+differences in 128 warm and 128 poisoned launches. The B300 pooled selector
+regression again reported 17 passed and 95 deselected. The SM90 benchmarks
+passed their sampled interval oracle checks, but the SSH session closed
+before the full pytest summary. Full SM90 qualification of this change is
+unverified.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.

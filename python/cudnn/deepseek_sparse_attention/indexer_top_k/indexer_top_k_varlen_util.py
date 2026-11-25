@@ -29,12 +29,13 @@ top-k varlen utils. could be used by prefill and decode phase.
 
 
 DETERMINISTIC_BITMAP_MAX_NUM_COLS = 262144
+INTERVAL_BITMAP_MAX_LENGTH = 32768
 
 
 def resolve_deterministic_ordering(max_num_cols: int, deterministic: bool, ordering: str) -> str:
     """Resolve the internal canonical-ordering strategy for one specialization."""
-    if ordering not in ("auto", "bitmap", "bitonic"):
-        raise ValueError("deterministic_ordering must be 'auto', 'bitmap', or 'bitonic'")
+    if ordering not in ("auto", "bitmap", "bitonic", "interval_bitmap"):
+        raise ValueError("deterministic_ordering must be 'auto', 'bitmap', 'bitonic', or 'interval_bitmap'")
     if not deterministic:
         if ordering != "auto":
             raise ValueError("deterministic_ordering requires deterministic=True")
@@ -112,7 +113,7 @@ class IndexerTopKKernelVarlen:
         # UINT16 is sufficient through column 65535. Bitonic ordering also
         # needs one out-of-range sentinel, so only its exact 65536-column
         # boundary must widen to UINT32; bitmap ordering has no sentinel.
-        needs_uint32_sentinel = self.deterministic and self.deterministic_ordering == "bitonic" and self.per_row_max_num_cols == 65536
+        needs_uint32_sentinel = self.deterministic and self.deterministic_ordering != "bitmap" and self.per_row_max_num_cols == 65536
         if cutlass.const_expr(self.per_row_max_num_cols <= 65536 and not needs_uint32_sentinel):
             self.index_type = cutlass.Uint16
             self.index_sentinel = 0xFFFF
@@ -169,7 +170,11 @@ class IndexerTopKKernelVarlen:
             self.num_refine_rounds = 1
 
         self.deterministic_sort_size = 1 << (self.top_k - 1).bit_length()
-        self.use_deterministic_bitmap = self.deterministic_ordering == "bitmap"
+        self.bitmap_capacity = 0
+        if self.deterministic_ordering == "bitmap":
+            self.bitmap_capacity = self.max_num_cols
+        elif self.deterministic_ordering == "interval_bitmap":
+            self.bitmap_capacity = INTERVAL_BITMAP_MAX_LENGTH
 
     @cute.jit
     def cta_sync(self, s_cta_mbarrier, sync_phase):
@@ -277,6 +282,7 @@ class IndexerTopKKernelVarlen:
         row_start,
         length,
         remaining,
+        pivot_key,
         s_indices,
         scan_scratch,
         s_cta_mbarrier,
@@ -284,11 +290,6 @@ class IndexerTopKKernelVarlen:
     ):
         """Select cutoff ties in source-column order without sorting output slots."""
         tidx, _, _ = cute.arch.thread_idx()
-        # The radix pass already found the exact cutoff and filled these slots.
-        # Read its key before any thread replaces one of the provisional winners.
-        pivot_index = cutlass.Int32(cutlass.Uint32(s_indices[self.top_k - 1]))
-        pivot_key = self.to_ordered(score[pivot_index])
-        self.cta_sync(s_cta_mbarrier, sync_phase)
         selected = cutlass.Int32(0)
         tile_start = cutlass.Int32(0)
         # Four adjacent items per thread amortize the block scan and barriers
@@ -354,80 +355,95 @@ class IndexerTopKKernelVarlen:
         slot order.  Sort the selected local indices before the output copy,
         providing a stronger canonical ordering than set repeatability alone.
         """
+        if cutlass.const_expr(self.deterministic_ordering == "bitmap"):
+            self._sort_selected_bitmap(row_start, length, s_indices, scan_scratch, s_cta_mbarrier, sync_phase, s_index_bits)
+        elif cutlass.const_expr(self.deterministic_ordering == "interval_bitmap"):
+            if length <= self.bitmap_capacity:
+                self._sort_selected_bitmap(row_start, length, s_indices, scan_scratch, s_cta_mbarrier, sync_phase, s_index_bits)
+            else:
+                self._sort_selected_bitonic(length, s_indices, s_cta_mbarrier, sync_phase)
+        else:
+            self._sort_selected_bitonic(length, s_indices, s_cta_mbarrier, sync_phase)
+
+    @cute.jit
+    def _sort_selected_bitmap(self, row_start, length, s_indices, scan_scratch, s_cta_mbarrier, sync_phase, s_index_bits):
         tidx, _, _ = cute.arch.thread_idx()
         valid_k = min(cutlass.Int32(self.top_k), length)
-        if cutlass.const_expr(self.use_deterministic_bitmap):
-            num_words = (length + cutlass.Int32(31)) // cutlass.Int32(32)
-            for word in range(tidx, num_words, self.num_threads_per_cta):
-                s_index_bits[word] = cutlass.Uint32(0)
-            self.cta_sync(s_cta_mbarrier, sync_phase)
+        num_words = (length + cutlass.Int32(31)) // cutlass.Int32(32)
+        for word in range(tidx, num_words, self.num_threads_per_cta):
+            s_index_bits[word] = cutlass.Uint32(0)
+        self.cta_sync(s_cta_mbarrier, sync_phase)
 
-            for i in range(tidx, valid_k, self.num_threads_per_cta):
-                index = cutlass.Uint32(s_indices[i]) - cutlass.Uint32(row_start)
-                word = cutlass.Int32(index >> cutlass.Uint32(5))
-                bit = cutlass.Uint32(1) << (index & cutlass.Uint32(31))
-                cute.arch.atomic_or(
-                    (s_index_bits.iterator + word).llvm_ptr,
-                    bit,
-                    sem="relaxed",
-                    scope="cta",
-                )
-            self.cta_sync(s_cta_mbarrier, sync_phase)
+        for i in range(tidx, valid_k, self.num_threads_per_cta):
+            index = cutlass.Uint32(s_indices[i]) - cutlass.Uint32(row_start)
+            word = cutlass.Int32(index >> cutlass.Uint32(5))
+            bit = cutlass.Uint32(1) << (index & cutlass.Uint32(31))
+            cute.arch.atomic_or(
+                (s_index_bits.iterator + word).llvm_ptr,
+                bit,
+                sem="relaxed",
+                scope="cta",
+            )
+        self.cta_sync(s_cta_mbarrier, sync_phase)
 
-            output_base = cutlass.Int32(0)
-            word_base = cutlass.Int32(0)
-            while word_base < num_words:
-                word = word_base + tidx
-                bits = cutlass.Uint32(0)
-                if word < num_words:
-                    bits = s_index_bits[word]
-                count = cutlass.Int32(cute.arch.popc(bits))
-                prefix, total = self.deterministic_block_prefix_sum(
-                    count,
-                    scan_scratch,
-                    s_cta_mbarrier,
-                    sync_phase,
-                )
-                slot = output_base + prefix - count
-                for bit_idx in cutlass.range_constexpr(32):
-                    if bits & (cutlass.Uint32(1) << bit_idx):
-                        s_indices[slot] = self.index_type(row_start + word * cutlass.Int32(32) + bit_idx)
-                        slot += 1
-                output_base += total
-                word_base += self.num_threads_per_cta
-            self.cta_sync(s_cta_mbarrier, sync_phase)
-        else:
-            sentinel = self.index_type(self.index_sentinel)
+        output_base = cutlass.Int32(0)
+        word_base = cutlass.Int32(0)
+        while word_base < num_words:
+            word = word_base + tidx
+            bits = cutlass.Uint32(0)
+            if word < num_words:
+                bits = s_index_bits[word]
+            count = cutlass.Int32(cute.arch.popc(bits))
+            prefix, total = self.deterministic_block_prefix_sum(
+                count,
+                scan_scratch,
+                s_cta_mbarrier,
+                sync_phase,
+            )
+            slot = output_base + prefix - count
+            for bit_idx in cutlass.range_constexpr(32):
+                if bits & (cutlass.Uint32(1) << bit_idx):
+                    s_indices[slot] = self.index_type(row_start + word * cutlass.Int32(32) + bit_idx)
+                    slot += 1
+            output_base += total
+            word_base += self.num_threads_per_cta
+        self.cta_sync(s_cta_mbarrier, sync_phase)
 
-            # s_indices is provisioned for INDEXER_TOPK_MAX_K (2048), so every
-            # power-of-two padding slot needed by the in-place bitonic sort exists.
-            i = tidx
-            while i < self.deterministic_sort_size:
-                if i >= valid_k:
-                    s_indices[i] = sentinel
-                i += self.num_threads_per_cta
-            self.cta_sync(s_cta_mbarrier, sync_phase)
+    @cute.jit
+    def _sort_selected_bitonic(self, length, s_indices, s_cta_mbarrier, sync_phase):
+        tidx, _, _ = cute.arch.thread_idx()
+        valid_k = min(cutlass.Int32(self.top_k), length)
+        sentinel = self.index_type(self.index_sentinel)
 
-            width = cutlass.Int32(2)
-            while width <= self.deterministic_sort_size:
-                distance = width // cutlass.Int32(2)
-                while distance > 0:
-                    i = tidx
-                    while i < self.deterministic_sort_size:
-                        peer = i ^ distance
-                        if peer > i:
-                            lhs = s_indices[i]
-                            rhs = s_indices[peer]
-                            ascending = (i // width) % cutlass.Int32(2) == 0
-                            descending = (i // width) % cutlass.Int32(2) == 1
-                            swap = (ascending and lhs > rhs) or (descending and lhs < rhs)
-                            if swap:
-                                s_indices[i] = rhs
-                                s_indices[peer] = lhs
-                        i += self.num_threads_per_cta
-                    self.cta_sync(s_cta_mbarrier, sync_phase)
-                    distance = distance // cutlass.Int32(2)
-                width = width * cutlass.Int32(2)
+        # s_indices is provisioned for INDEXER_TOPK_MAX_K (2048), so every
+        # power-of-two padding slot needed by the in-place bitonic sort exists.
+        i = tidx
+        while i < self.deterministic_sort_size:
+            if i >= valid_k:
+                s_indices[i] = sentinel
+            i += self.num_threads_per_cta
+        self.cta_sync(s_cta_mbarrier, sync_phase)
+
+        width = cutlass.Int32(2)
+        while width <= self.deterministic_sort_size:
+            distance = width // cutlass.Int32(2)
+            while distance > 0:
+                i = tidx
+                while i < self.deterministic_sort_size:
+                    peer = i ^ distance
+                    if peer > i:
+                        lhs = s_indices[i]
+                        rhs = s_indices[peer]
+                        ascending = (i // width) % cutlass.Int32(2) == 0
+                        descending = (i // width) % cutlass.Int32(2) == 1
+                        swap = (ascending and lhs > rhs) or (descending and lhs < rhs)
+                        if swap:
+                            s_indices[i] = rhs
+                            s_indices[peer] = lhs
+                    i += self.num_threads_per_cta
+                self.cta_sync(s_cta_mbarrier, sync_phase)
+                distance = distance // cutlass.Int32(2)
+            width = width * cutlass.Int32(2)
 
     @cute.jit
     def prefix_sum_and_find_threshold_coarse(
@@ -441,7 +457,6 @@ class IndexerTopKKernelVarlen:
         s_counter,
         s_last_remain,
         topk_remaining,
-        g_num_input,
         s_cta_mbarrier,
         sync_phase,
         s_num_input_idx=0,
@@ -461,8 +476,6 @@ class IndexerTopKKernelVarlen:
                 if previous <= topk_remaining and s_histogram[tidx] > topk_remaining:
                     s_threshold_bin_id[0] = tidx
                     s_num_input[s_num_input_idx] = 0
-                    if cutlass.const_expr(self.enable_gmem_store):
-                        g_num_input[s_num_input_idx] = 0
                     # TODO: the difference between 1 and 2.
                     s_counter[0] = 0
             # sync among all threads in a cta.
@@ -496,8 +509,6 @@ class IndexerTopKKernelVarlen:
             if previous <= topk_remaining and s_histogram[tidx] > topk_remaining:
                 s_threshold_bin_id[0] = tidx
                 s_num_input[s_num_input_idx] = 0
-                if cutlass.const_expr(self.enable_gmem_store):
-                    g_num_input[s_num_input_idx] = 0
                 # the difference between coarse and fine-grained.
                 s_counter[0] = 0
                 run_loop = False
@@ -514,8 +525,6 @@ class IndexerTopKKernelVarlen:
                         if previous <= topk_remaining and s_histogram[i] > topk_remaining:
                             s_threshold_bin_id[0] = i
                             s_num_input[s_num_input_idx] = 0
-                            if cutlass.const_expr(self.enable_gmem_store):
-                                g_num_input[s_num_input_idx] = 0
                             # the difference between coarse and fine-grained.
                             s_counter[0] = 0
                             run_next_loop = False
@@ -534,7 +543,6 @@ class IndexerTopKKernelVarlen:
         s_counter,
         s_last_remain,
         topk_remaining,
-        g_num_input,
         s_cta_mbarrier,
         sync_phase,
         s_num_input_idx=0,
@@ -554,8 +562,6 @@ class IndexerTopKKernelVarlen:
                 if previous <= topk_remaining and s_histogram[tidx] > topk_remaining:
                     s_threshold_bin_id[0] = tidx
                     s_num_input[s_num_input_idx] = 0
-                    if cutlass.const_expr(self.enable_gmem_store):
-                        g_num_input[s_num_input_idx] = 0
                     # the first difference between coarse and fine-grained.
                     s_last_remain[0] = topk_remaining - previous
             self.cta_sync(s_cta_mbarrier, sync_phase)
@@ -588,8 +594,6 @@ class IndexerTopKKernelVarlen:
             if previous <= topk_remaining and s_histogram[tidx] > topk_remaining:
                 s_threshold_bin_id[0] = tidx
                 s_num_input[s_num_input_idx] = 0
-                if cutlass.const_expr(self.enable_gmem_store):
-                    g_num_input[s_num_input_idx] = 0
                 # the difference between coarse and fine-grained.
                 s_last_remain[0] = topk_remaining - previous
                 run_loop = False
@@ -605,8 +609,6 @@ class IndexerTopKKernelVarlen:
                         if previous <= topk_remaining and s_histogram[i] > topk_remaining:
                             s_threshold_bin_id[0] = i
                             s_num_input[s_num_input_idx] = 0
-                            if cutlass.const_expr(self.enable_gmem_store):
-                                g_num_input[s_num_input_idx] = 0
                             # the difference between coarse and fine-grained.
                             s_last_remain[0] = topk_remaining - previous
                             run_next_loop = False
@@ -632,7 +634,6 @@ class IndexerTopKKernelVarlen:
         s_counter,
         s_threshold_bin_id,
         s_num_input,
-        g_num_input,
         s_indices,
         s_input_idx,
         s_last_remain,
@@ -658,70 +659,6 @@ class IndexerTopKKernelVarlen:
             dst = output_indices[bidx, None]
             if cutlass.const_expr(self.return_val):
                 dst_values = output_values[bidx, None]
-        # Note, for multi-cta version, each ctas must have its own extra_buffer.
-        if cutlass.const_expr(self.enable_gmem_store):
-            if cutlass.const_expr(self.enable_multi_cta):
-                _, grid_dim_y, _ = cute.arch.grid_dim()
-                bidx_val, bidy_val, _ = cute.arch.block_idx()
-                buffer_row_id = cutlass.Int64(bidx_val) * cutlass.Int64(grid_dim_y) + cutlass.Int64(bidy_val)
-            else:
-                buffer_row_id = cutlass.Int64(bidx)
-            buffer = self._slice_row_64bit(extra_buffer, buffer_row_id)
-
-        # for initial scalar load part.
-        row_ptr = score.iterator + row_start
-        row_addr_u64 = row_ptr.toint()
-
-        # 256/8 = 32bytes
-        align_bytes = self.num_copy_bits // 8
-        # fp32: 4bytes
-        elem_bytes = self.dtype.width // 8
-
-        misalign = row_addr_u64 % align_bytes
-        fix_bytes = cutlass.Int64(0)
-        if misalign != 0:
-            fix_bytes = align_bytes - misalign
-
-        prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
-        # A row shorter than the bytes up to the next aligned address is all prologue.
-        if prologue_elems > length:
-            prologue_elems = length
-
-        remaining = length - prologue_elems
-        aligned_size = (remaining // self.vec_size) * self.vec_size
-        left_size = remaining - aligned_size
-
-        vec_start = row_start + prologue_elems
-        left_start = vec_start + aligned_size
-
-        shape = input.shape
-
-        idX = cute.make_identity_tensor((shape[0], aligned_size))
-        input_ptr = input.iterator + vec_start
-        input_addr_u64 = input_ptr.toint()
-        input_ptr_aligned = cute.make_ptr(self.dtype, input_addr_u64, input.memspace, assumed_align=align_bytes)
-
-        input_tensor = cute.make_tensor(
-            input_ptr_aligned,
-            cute.make_layout((shape[0], aligned_size), stride=input.stride),
-        )
-
-        # slice for CTAs
-        gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, None)) for mT in (input_tensor, idX)]
-        # Note, we use gX_aligned here to avoid the alignment issue when the input is not aligned.
-        gX_aligned_ptr = cute.make_ptr(self.dtype, gX.iterator.toint(), gX.memspace, assumed_align=align_bytes)
-        gX_aligned = cute.make_tensor(gX_aligned_ptr, cute.make_layout(gX.shape, stride=gX.stride))
-
-        self.num_sub_tiles = gX.shape[2]
-
-        thr_copy = tiled_copy.get_slice(tidx)
-
-        tXgX = thr_copy.partition_S(gX_aligned)
-        tXcX = thr_copy.partition_S(cX)[(0, None), None, None, None]
-        tXrX = cute.make_fragment_like(tXgX[None, None, None, 0])
-
-        tXcX_tile = thr_copy.partition_S(cX)
-
         # Trivial case: length <= top_k
         if length <= self.top_k:
             for i in range(tidx, self.top_k, self.num_threads_per_cta):
@@ -739,6 +676,70 @@ class IndexerTopKKernelVarlen:
                     if cutlass.const_expr(self.return_val):
                         dst_values[i] = dst_values.element_type(dst_values.element_type.inf * dst_values.element_type(-1.0))
         else:
+            # Note, for multi-cta version, each ctas must have its own extra_buffer.
+            if cutlass.const_expr(self.enable_gmem_store):
+                if cutlass.const_expr(self.enable_multi_cta):
+                    _, grid_dim_y, _ = cute.arch.grid_dim()
+                    bidx_val, bidy_val, _ = cute.arch.block_idx()
+                    buffer_row_id = cutlass.Int64(bidx_val) * cutlass.Int64(grid_dim_y) + cutlass.Int64(bidy_val)
+                else:
+                    buffer_row_id = cutlass.Int64(bidx)
+                buffer = self._slice_row_64bit(extra_buffer, buffer_row_id)
+
+            # Vector alignment depends on both the physical row stride and start.
+            row_ptr = score.iterator + row_start
+            row_addr_u64 = row_ptr.toint()
+
+            # 256/8 = 32bytes
+            align_bytes = self.num_copy_bits // 8
+            # fp32: 4bytes
+            elem_bytes = self.dtype.width // 8
+
+            misalign = row_addr_u64 % align_bytes
+            fix_bytes = cutlass.Int64(0)
+            if misalign != 0:
+                fix_bytes = align_bytes - misalign
+
+            prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
+            # A row shorter than the bytes up to the next aligned address is all prologue.
+            if prologue_elems > length:
+                prologue_elems = length
+
+            remaining = length - prologue_elems
+            aligned_size = (remaining // self.vec_size) * self.vec_size
+            # The unaligned prefix and suffix make one scalar traversal.
+            edge_count = length - aligned_size
+
+            vec_start = row_start + prologue_elems
+
+            shape = input.shape
+
+            idX = cute.make_identity_tensor((shape[0], aligned_size))
+            input_ptr = input.iterator + vec_start
+            input_addr_u64 = input_ptr.toint()
+            input_ptr_aligned = cute.make_ptr(self.dtype, input_addr_u64, input.memspace, assumed_align=align_bytes)
+
+            input_tensor = cute.make_tensor(
+                input_ptr_aligned,
+                cute.make_layout((shape[0], aligned_size), stride=input.stride),
+            )
+
+            # slice for CTAs
+            gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, None)) for mT in (input_tensor, idX)]
+            # Note, we use gX_aligned here to avoid the alignment issue when the input is not aligned.
+            gX_aligned_ptr = cute.make_ptr(self.dtype, gX.iterator.toint(), gX.memspace, assumed_align=align_bytes)
+            gX_aligned = cute.make_tensor(gX_aligned_ptr, cute.make_layout(gX.shape, stride=gX.stride))
+
+            num_sub_tiles = gX.shape[2]
+
+            thr_copy = tiled_copy.get_slice(tidx)
+
+            tXgX = thr_copy.partition_S(gX_aligned)
+            tXcX = thr_copy.partition_S(cX)[(0, None), None, None, None]
+            tXrX = cute.make_fragment_like(tXgX[None, None, None, 0])
+
+            tXcX_tile = thr_copy.partition_S(cX)
+
             if cutlass.const_expr(self.deterministic):
                 if tidx == 0:
                     cute.arch.mbarrier_init(s_cta_mbarrier.iterator, self.num_threads_per_cta)
@@ -759,7 +760,7 @@ class IndexerTopKKernelVarlen:
             # 1.1 Build histogram with vectorized loads
             vec_size = self.vec_size
 
-            for tile_idx in range(self.num_sub_tiles):
+            for tile_idx in range(num_sub_tiles):
                 tXpX_tile = self.predicate_tile(
                     tXcX_tile[None, None, None, tile_idx],
                     cutlass.Int32(aligned_size),
@@ -789,19 +790,11 @@ class IndexerTopKKernelVarlen:
                             val_one,
                         )
 
-            # for initial scalar load part.
-            for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+            # Visit the prologue and tail together.
+            for j in range(tidx, edge_count, self.num_threads_per_cta):
                 col_idx = cutlass.Int32(row_start + j)
-                raw = score[col_idx]
-                bin_val = self.to_coarse_key(raw)
-                atomicAdd(
-                    s_histogram.iterator + cutlass.Int32(bin_val),
-                    val_one,
-                )
-
-            # for left part (left_size)
-            for j in range(tidx, left_size, self.num_threads_per_cta):
-                col_idx = cutlass.Int32(left_start + j)
+                if j >= prologue_elems:
+                    col_idx += aligned_size
                 raw = score[col_idx]
                 bin_val = self.to_coarse_key(raw)
                 atomicAdd(
@@ -822,7 +815,6 @@ class IndexerTopKKernelVarlen:
                 s_counter,
                 s_last_remain,
                 topk_remaining,
-                g_num_input,
                 s_cta_mbarrier,
                 sync_phase,
                 s_num_input_idx=0,
@@ -835,7 +827,7 @@ class IndexerTopKKernelVarlen:
             # 1.4 Collect indices
             if topk_remaining == 0:
                 # Collect indices where bin > threshold
-                for tile_idx in range(self.num_sub_tiles):
+                for tile_idx in range(num_sub_tiles):
                     tXpX_tile = self.predicate_tile(
                         tXcX_tile[None, None, None, tile_idx],
                         cutlass.Int32(aligned_size),
@@ -861,19 +853,11 @@ class IndexerTopKKernelVarlen:
                                 idx = self.index_type(relative_idx + vec_start)
                                 s_indices[pos] = idx
 
-                # for initial scalar load part.
-                for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+                # Include both edges in the same pass.
+                for j in range(tidx, edge_count, self.num_threads_per_cta):
                     col_idx = cutlass.Int32(row_start + j)
-                    raw = score[col_idx]
-                    bin_val = self.to_coarse_key(raw)
-                    if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
-                        idx = self.index_type(col_idx)
-                        s_indices[pos] = idx
-
-                # for left part (left_size)
-                for j in range(tidx, left_size, self.num_threads_per_cta):
-                    col_idx = cutlass.Int32(left_start + j)
+                    if j >= prologue_elems:
+                        col_idx += aligned_size
                     raw = score[col_idx]
                     bin_val = self.to_coarse_key(raw)
                     if bin_val < threshold_bin:
@@ -890,8 +874,10 @@ class IndexerTopKKernelVarlen:
                     s_histogram[tidx] = 0
                 self.cta_sync(s_cta_mbarrier, sync_phase)
 
-                # Filter and build refinement histogram
-                for tile_idx in range(self.num_sub_tiles):
+                # The candidate counter reserves one slot across both buffers.
+                # Global scratch stores only the suffix beyond shared capacity.
+                # Filter and build the refinement histogram.
+                for tile_idx in range(num_sub_tiles):
                     tXpX_tile = self.predicate_tile(
                         tXcX_tile[None, None, None, tile_idx],
                         cutlass.Int32(aligned_size),
@@ -925,11 +911,7 @@ class IndexerTopKKernelVarlen:
                                     if pos < self.indexer_topk_smem_input_size:
                                         s_input_idx[0, pos] = idx
                                     else:
-                                        buffer_pos = atomicAdd(
-                                            g_num_input.iterator,
-                                            val_one,
-                                        )
-                                        buffer[0, buffer_pos] = cutlass.Int32(cutlass.Uint32(idx))
+                                        buffer[0, pos - self.indexer_topk_smem_input_size] = cutlass.Int32(cutlass.Uint32(idx))
                                     ordered = self.to_ordered(raw_input)
                                     sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                                     # atomicAdd(s_histogram[sub_bin], 1)
@@ -948,9 +930,11 @@ class IndexerTopKKernelVarlen:
                                         val_one,
                                     )
 
-                # for initial scalar load part.
-                for j in range(tidx, prologue_elems, self.num_threads_per_cta):
+                # Include both edges in the same pass.
+                for j in range(tidx, edge_count, self.num_threads_per_cta):
                     col_idx = cutlass.Int32(row_start + j)
+                    if j >= prologue_elems:
+                        col_idx += aligned_size
                     raw = score[col_idx]
                     bin_val = self.to_coarse_key(raw)
                     if bin_val < threshold_bin:
@@ -967,11 +951,7 @@ class IndexerTopKKernelVarlen:
                             if pos < self.indexer_topk_smem_input_size:
                                 s_input_idx[0, pos] = self.index_type(col_idx)
                             else:
-                                buffer_pos = atomicAdd(
-                                    g_num_input.iterator,
-                                    val_one,
-                                )
-                                buffer[0, buffer_pos] = cutlass.Int32(col_idx)
+                                buffer[0, pos - self.indexer_topk_smem_input_size] = cutlass.Int32(col_idx)
                             ordered = self.to_ordered(raw)
                             sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                             atomicAdd(
@@ -995,54 +975,14 @@ class IndexerTopKKernelVarlen:
                                     val_one,
                                 )
 
-                # for left part
-                for j in range(tidx, left_size, self.num_threads_per_cta):
-                    col_idx = cutlass.Int32(left_start + j)
-                    raw = score[col_idx]
-                    bin_val = self.to_coarse_key(raw)
-                    if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
-                        idx = self.index_type(col_idx)
-                        s_indices[pos] = idx
-                    elif bin_val == threshold_bin:
-                        pos = atomicAdd(
-                            s_num_input.iterator,
-                            val_one,
-                        )
-                        # TODO: add gmem buffer here.
-                        if cutlass.const_expr(self.enable_gmem_store):
-                            if pos < self.indexer_topk_smem_input_size:
-                                s_input_idx[0, pos] = self.index_type(col_idx)
-                            else:
-                                buffer_pos = atomicAdd(
-                                    g_num_input.iterator,
-                                    val_one,
-                                )
-                                buffer[0, buffer_pos] = cutlass.Int32(col_idx)
-                            ordered = self.to_ordered(raw)
-                            sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                            atomicAdd(
-                                s_histogram.iterator + cutlass.Int32(sub_bin),
-                                val_one,
-                            )
-                        else:
-                            # TODO: how to handle the type of sub_bin and ordered?
-                            if cutlass.const_expr(self.dtype == cutlass.Float32):
-                                ordered = cutlass.Uint32(0)
-                                sub_bin = cutlass.Uint32(0)
-                            else:
-                                ordered = cutlass.Uint16(0)
-                                sub_bin = cutlass.Int32(0)
-                            if pos < self.indexer_topk_smem_input_size:
-                                s_input_idx[0, pos] = self.index_type(col_idx)
-                                ordered = self.to_ordered(raw)
-                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                    val_one,
-                                )
                 fence_acq_rel_cta()
                 self.cta_sync(s_cta_mbarrier, sync_phase)
+
+                # Assemble the exact cutoff from the selected radix digits.
+                if cutlass.const_expr(self.deterministic or self.tie_break != 0):
+                    pivot_key = cutlass.Uint32(0)
+                    if cutlass.const_expr(self.dtype != cutlass.Float32):
+                        pivot_key = cutlass.Uint32(threshold_bin) << 8
 
                 # Phase 2: Refinement rounds
                 run_next_round = True
@@ -1060,20 +1000,27 @@ class IndexerTopKKernelVarlen:
                             s_counter,
                             s_last_remain,
                             topk_remaining,
-                            g_num_input,
                             s_cta_mbarrier,
                             sync_phase,
                             s_num_input_idx=r_idx ^ 1,
                         )
-                        num_input = min(s_num_input[r_idx], self.indexer_topk_smem_input_size)
-                        if cutlass.const_expr(self.enable_gmem_store):
-                            cur_g_num_input = g_num_input[r_idx]
-
                         threshold = s_threshold_bin_id[0]
+                        strict_count = cutlass.Int32(0)
                         if threshold > 0:
-                            topk_remaining -= s_histogram[threshold - 1]
+                            strict_count = s_histogram[threshold - 1]
+                        topk_remaining -= strict_count
+
                         offset = self.first_refine_shift - round * 8
                         is_last_round = round == self.num_refine_rounds - 1
+                        candidate_count = s_num_input[r_idx]
+                        if cutlass.const_expr(self.deterministic or self.tie_break != 0):
+                            pivot_key |= cutlass.Uint32(threshold) << offset
+                            # When the last bin has no strictly better candidates,
+                            # the column-ordered tie scan supplies all remaining ids.
+                            if is_last_round and strict_count == 0:
+                                candidate_count = cutlass.Int32(0)
+                        num_input = min(candidate_count, self.indexer_topk_smem_input_size)
+                        spill_count = candidate_count - num_input
 
                         if topk_remaining == 0:
                             for i in range(tidx, num_input, self.num_threads_per_cta):
@@ -1086,7 +1033,7 @@ class IndexerTopKKernelVarlen:
                             if cutlass.const_expr(self.enable_gmem_store):
                                 for i in range(
                                     tidx,
-                                    cur_g_num_input,
+                                    spill_count,
                                     self.num_threads_per_cta,
                                 ):
                                     idx = buffer[r_idx, i]
@@ -1098,11 +1045,12 @@ class IndexerTopKKernelVarlen:
                             # break
                             run_next_round = False
                         else:
-                            # Reset histogram
-                            self.cta_sync(s_cta_mbarrier, sync_phase)
-                            if tidx < self.radix + 1:
-                                s_histogram[tidx] = 0
-                            self.cta_sync(s_cta_mbarrier, sync_phase)
+                            # Only a subsequent radix digit needs an empty histogram.
+                            if not is_last_round:
+                                self.cta_sync(s_cta_mbarrier, sync_phase)
+                                if tidx < self.radix + 1:
+                                    s_histogram[tidx] = 0
+                                self.cta_sync(s_cta_mbarrier, sync_phase)
 
                             for i in range(tidx, num_input, self.num_threads_per_cta):
                                 idx = s_input_idx[r_idx, i]
@@ -1115,12 +1063,13 @@ class IndexerTopKKernelVarlen:
                                     s_indices[pos] = idx
                                 elif bin_val == threshold:
                                     if is_last_round:
-                                        cur_pos = atomicAdd(
-                                            s_last_remain.iterator,
-                                            val_one_negative,
-                                        )
-                                        if cur_pos > 0:
-                                            s_indices[self.top_k - cur_pos] = idx
+                                        if cutlass.const_expr(not self.deterministic and self.tie_break == 0):
+                                            cur_pos = atomicAdd(
+                                                s_last_remain.iterator,
+                                                val_one_negative,
+                                            )
+                                            if cur_pos > 0:
+                                                s_indices[self.top_k - cur_pos] = idx
                                     else:
                                         # pos = atomicAdd(s_num_input[r_idx ^ 1], 1)
                                         cur_pos = atomicAdd(
@@ -1133,11 +1082,7 @@ class IndexerTopKKernelVarlen:
                                             if cur_pos < self.indexer_topk_smem_input_size:
                                                 s_input_idx[r_idx ^ 1, cur_pos] = idx
                                             else:
-                                                buffer_pos = atomicAdd(
-                                                    g_num_input.iterator + (r_idx ^ 1),
-                                                    val_one,
-                                                )
-                                                buffer[r_idx ^ 1, buffer_pos] = idx_int32
+                                                buffer[r_idx ^ 1, cur_pos - self.indexer_topk_smem_input_size] = idx_int32
                                             bin32 = self.to_ordered(raw_input)
                                             sub_bin = (bin32 >> (offset - 8)) & 0xFF
                                             # atomicAdd(s_histogram[sub_bin], 1)
@@ -1163,11 +1108,12 @@ class IndexerTopKKernelVarlen:
                                                     val_one,
                                                 )
 
-                            self.cta_sync(s_cta_mbarrier, sync_phase)
+                            # Both loops read the current candidate plane and
+                            # reserve distinct slots through the same atomics.
                             if cutlass.const_expr(self.enable_gmem_store):
                                 for i in range(
                                     tidx,
-                                    cur_g_num_input,
+                                    spill_count,
                                     self.num_threads_per_cta,
                                 ):
                                     # int32
@@ -1182,44 +1128,30 @@ class IndexerTopKKernelVarlen:
                                         s_indices[pos] = self.index_type(idx)
                                     elif bin_val == threshold:
                                         if is_last_round:
-                                            cur_pos = atomicAdd(
-                                                s_last_remain.iterator,
-                                                val_one_negative,
-                                            )
-                                            if cur_pos > 0:
-                                                s_indices[self.top_k - cur_pos] = self.index_type(idx)
+                                            if cutlass.const_expr(not self.deterministic and self.tie_break == 0):
+                                                cur_pos = atomicAdd(
+                                                    s_last_remain.iterator,
+                                                    val_one_negative,
+                                                )
+                                                if cur_pos > 0:
+                                                    s_indices[self.top_k - cur_pos] = self.index_type(idx)
                                         else:
                                             # pos = atomicAdd(s_num_input[r_idx ^ 1], 1)
                                             cur_pos = atomicAdd(
                                                 s_num_input.iterator + (r_idx ^ 1),
                                                 val_one,
                                             )
-                                            if cutlass.const_expr(self.enable_gmem_store):
-                                                if cur_pos < self.indexer_topk_smem_input_size:
-                                                    s_input_idx[r_idx ^ 1, cur_pos] = self.index_type(idx)
-                                                else:
-                                                    buffer_pos = atomicAdd(
-                                                        g_num_input.iterator + (r_idx ^ 1),
-                                                        val_one,
-                                                    )
-                                                    buffer[r_idx ^ 1, buffer_pos] = idx
-                                                bin32 = self.to_ordered(raw_input)
-                                                sub_bin = (bin32 >> (offset - 8)) & 0xFF
-                                                # atomicAdd(s_histogram[sub_bin], 1)
-                                                atomicAdd(
-                                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                                    val_one,
-                                                )
+                                            if cur_pos < self.indexer_topk_smem_input_size:
+                                                s_input_idx[r_idx ^ 1, cur_pos] = self.index_type(idx)
                                             else:
-                                                if cur_pos < self.indexer_topk_smem_input_size:
-                                                    s_input_idx[r_idx ^ 1, cur_pos] = idx
-                                                    bin32 = self.to_ordered(raw_input)
-                                                    sub_bin = (bin32 >> (offset - 8)) & 0xFF
-                                                    # atomicAdd(s_histogram[sub_bin], 1)
-                                                    atomicAdd(
-                                                        s_histogram.iterator + cutlass.Int32(sub_bin),
-                                                        val_one,
-                                                    )
+                                                buffer[r_idx ^ 1, cur_pos - self.indexer_topk_smem_input_size] = idx
+                                            bin32 = self.to_ordered(raw_input)
+                                            sub_bin = (bin32 >> (offset - 8)) & 0xFF
+                                            # atomicAdd(s_histogram[sub_bin], 1)
+                                            atomicAdd(
+                                                s_histogram.iterator + cutlass.Int32(sub_bin),
+                                                val_one,
+                                            )
                             fence_acq_rel_cta()
                             self.cta_sync(s_cta_mbarrier, sync_phase)
                             if cutlass.const_expr(self.deterministic or self.tie_break != 0):
@@ -1231,6 +1163,7 @@ class IndexerTopKKernelVarlen:
                                         row_start,
                                         length,
                                         topk_remaining,
+                                        self.ordered_type(pivot_key),
                                         s_indices,
                                         s_histogram,
                                         s_cta_mbarrier,
