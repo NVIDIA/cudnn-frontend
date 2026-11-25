@@ -124,6 +124,42 @@ the default tuning's output bytes over repeated calls. These checks do not
 cover replay under concurrent work, batch invariance, warm stress or goldens,
 and no golden files are recorded.
 
+### Dense GEMM + GLU (`cudnn.ops.gemm_glu_forward`) — SM100, 2026-11-21
+
+`gemm/cutedsl/test_gemm_glu_determinism.py` is the first determinism suite for
+the dense GEMM + GLU fusion. It covers `act_func="swiglu"` and `"geglu"`
+(non-default `linear_offset`, `geglu_alpha` and clamps) on four numerical
+paths: standard BF16 and FP8 E4M3, block-scaled MXFP8 (E4M3/E8M0) and NVFP4
+(E2M1/E4M3), each with one- and two-CTA tiles. Outputs compared are AB12, C
+and, for FP4 inputs, FP32 amax. The fusion is forward-only.
+
+- Replay: eight launches with fresh output buffers and concurrent GPU work on
+  M = N = K = 512, L = 3; an independent FP32 reference; unchanged input bytes.
+- Batch invariance over the L axis: each sequence alone, packed, reordered,
+  duplicated and beside a changed neighbor. Sequences are quantized once and
+  keep their payload and scale bytes. amax is one reduction over the whole
+  launch and is excluded from the per-sequence comparison; replay covers it.
+- Goldens: eight M = N = K = 256, L = 2 cases (two activations, four paths),
+  recorded after replay and the reference passed.
+
+The kernels read A/B stages only through `tcgen05` MMA and scale copies, so no
+warm-stress case was added; `test_gemm_glu_retained_outputs_replay` keeps the
+TMA-store stage coverage.
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest gemm/cutedsl/test_gemm_glu_determinism.py -m L0 -q -rs
+```
+
+Measured on an SM100 part reporting `NVIDIA Graphics Device` (148 SMs), driver
+580.159.03 (API 13000), Torch 2.15.0+cu134, CUDA 13.4, cuDNN 93000, CuTe DSL
+4.8.1 with its CUDA 13.4 compiler, TVM FFI 0.1.16, on `7ea29fe4f` plus this
+change: **40 passed, 0 skipped** (16 replay, 16 batch invariance, 8 golden;
+runtime key `60a5ec93deccba7a`). SM103 and SM107 are unverified. SwiGLU bytes
+were additionally compared against the pre-change kernel on 28 configurations
+(standard BF16/FP32/FP8, MXFP8, MXFP4, NVFP4; both tiles): all identical.
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution
@@ -1119,6 +1155,7 @@ pytest core/test_determinism_utils.py
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_layout.py` | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | C, D, pre/post-RHT amax | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D/RHT payloads and scales, including standard GEMM-blocked column scales | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py` | `GroupedGemmGluHadamardQuantSm100` and its wrapper, natural tensor ranks with either GLU branch order | C, D/RHT payloads and scales; legacy-rank equality, replay, batch invariance and graph replay | — |
+| `gemm/cutedsl/test_gemm_glu_determinism.py` | `cudnn.ops.gemm_glu_forward`, `swiglu` and `geglu`, standard and block-scaled | AB12, C, FP4-input amax (replay only) | Unsupported (forward-only fusion) |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` | `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel with `deterministic=True` | — | dprob and D_row: replay under concurrent work (both activations, dense/discrete, static/dynamic scheduler, ragged and empty experts), expert reorder, duplicate and neighbor isolation in both GLU orders; launch-stream ordering; D_row equal to the atomic path |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |

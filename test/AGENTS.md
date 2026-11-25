@@ -323,7 +323,7 @@ Keep `--dump-kernel-launches` out of the pass/fail sanitizer run: some builds co
 - Paged ring-loader checks use more K/V stages per split than ring slots. A raw-copy barrier phase invariant keeps exact chunk-count guards (`TestMixedFp8Kv.test_d512_admission`). The predecoded THD scheduler returns slot credit after all lanes' reads (CGA1 and CGA2).
 - Sparse score-recompute support tests mock both `device_capability()` and `torch.cuda.get_device_capability()`; test non-power-of-two TMEM slot counts and the usable 227 KiB SMEM bound (`test_DSA_sparse_score_recompute.py`, `test_DSA_sparse_attention_score_recompute_uses_launchable_smem_budget`).
 - Large-head backward keeps contraction width separate from output-column tile (`test_sdpa_bwd_d512_fp8.py`); unequal-width dK/dV reductions keep masked vectors in their interval (`test_sdpa_bwd_thd_d192_sm100.py`).
-- TMA store stages are counted in committed groups (`test_gemm_swiglu_retained_outputs_replay`). Bulk MoE COMBINE: `gemm/frost/test_moe_combine_bulk.py`; run `test_two_cta_atomic_fallback` under compute-sanitizer on SM100 before widening normal 2-CTA bulk.
+- TMA store stages are counted in committed groups (`test_gemm_glu_retained_outputs_replay`). Bulk MoE COMBINE: `gemm/frost/test_moe_combine_bulk.py`; run `test_two_cta_atomic_fallback` under compute-sanitizer on SM100 before widening normal 2-CTA bulk.
 - Shared auxiliary kernels need direct boundary tests and caller checks (THD fold inputs FP32 or half; test the full output allocation).
 
 ### Devices, streams and contexts

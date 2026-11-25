@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-JAX tests for the type-erased GemmSwigluSm100 API and the gemm_swiglu_jax_sm100
+JAX tests for the type-erased gemm_glu_forward and the gemm_glu_forward_jax
 XLA custom-call entry point. Same JAX contract as gemm_amax (see
 test_gemm_amax_jax.py): k-major (mn, k, 1) A/B, n-major outputs, L == 1, SF tensors
 in the physical C-contiguous atom shape.
@@ -48,16 +48,23 @@ def test_swiglu_block_ref_large_gates(dtype):
     np.testing.assert_allclose(actual, np.broadcast_to(expected[:, None], actual.shape), rtol=1e-6, atol=1e-43)
 
 
+def geglu_block_ref(ab12_ref, n, linear_offset=1.0, geglu_alpha=1.702, glu_clamp_max=7.0, glu_clamp_min=-7.0):
+    cols = np.arange(n).reshape(n // 32, 32)
+    up = np.clip(ab12_ref[:, cols[0::2].reshape(-1)], glu_clamp_min, glu_clamp_max)
+    gate = np.minimum(ab12_ref[:, cols[1::2].reshape(-1)], glu_clamp_max)
+    return (up + linear_offset) * gate / (1 + np.exp(-geglu_alpha * gate))
+
+
 def make_ab_bf16(mn, k, rng):
     values = (rng.integers(-4, 5, size=(mn, k, 1)) * 0.25).astype(ml_dtypes.bfloat16)
     return values, values.astype(np.float32)[:, :, 0]
 
 
 @pytest.mark.L0
-def test_gemm_swiglu_jax_wrapper_bf16():
+def test_gemm_glu_jax_wrapper_bf16():
     """Eager wrapper, non-quantized kernel, bf16 inputs."""
     skip_unless_sm100()
-    from cudnn import gemm_swiglu_wrapper_sm100
+    from cudnn.ops import gemm_glu_forward
 
     m, n, k = 256, 256, 256
     alpha = 1.0
@@ -71,7 +78,7 @@ def test_gemm_swiglu_jax_wrapper_bf16():
     c_ref = swiglu_block_ref(ab12_ref, n)
 
     for _ in range(2):  # exercise the compile cache path
-        ab12, c, sfc, amax = gemm_swiglu_wrapper_sm100(
+        ab12, c, sfc, amax = gemm_glu_forward(
             a_tensor=a_dev,
             b_tensor=b_dev,
             alpha=alpha,
@@ -86,10 +93,10 @@ def test_gemm_swiglu_jax_wrapper_bf16():
 
 
 @pytest.mark.L0
-def test_gemm_swiglu_jax_wrapper_quant_fp8():
+def test_gemm_glu_jax_wrapper_quant_fp8():
     """Eager wrapper, blockscaled quantized kernel, MXFP8 inputs."""
     skip_unless_sm100()
-    from cudnn import gemm_swiglu_wrapper_sm100
+    from cudnn.ops import gemm_glu_forward
 
     m, n, k = 256, 256, 256
     sf_vec_size = 32
@@ -104,7 +111,7 @@ def test_gemm_swiglu_jax_wrapper_quant_fp8():
     ab12_ref = (a_ref * sfa_expanded) @ (b_ref * sfb_expanded).T
     c_ref = swiglu_block_ref(ab12_ref, n)
 
-    ab12, c, sfc, amax = gemm_swiglu_wrapper_sm100(
+    ab12, c, sfc, amax = gemm_glu_forward(
         a_tensor=a_dev,
         b_tensor=b_dev,
         c_major="n",
@@ -121,14 +128,14 @@ def test_gemm_swiglu_jax_wrapper_quant_fp8():
 
 
 @pytest.mark.L0
-def test_gemm_swiglu_jax_jit_sm100():
+def test_gemm_glu_jax_jit_sm100():
     """XLA custom-call entry point: jitted, repeated (donation safety), and alpha attr."""
     import cutlass.jax
 
     if not cutlass.jax.is_available():
         pytest.skip("CuTeDSL JAX extensions unavailable")
     skip_unless_sm100()
-    from cudnn import gemm_swiglu_jax_sm100
+    from cudnn.ops import gemm_glu_forward_jax
 
     m, n, k = 256, 256, 256
     alpha = 2.0
@@ -140,7 +147,7 @@ def test_gemm_swiglu_jax_jit_sm100():
     ab12_ref = alpha * (a_ref @ b_ref.T)
     c_ref = swiglu_block_ref(ab12_ref, n)
 
-    jitted = jax.jit(lambda a, b: gemm_swiglu_jax_sm100(a, b, alpha=alpha, ab12_dtype=jnp.float32, c_dtype=jnp.bfloat16))
+    jitted = jax.jit(lambda a, b: gemm_glu_forward_jax(a, b, alpha=alpha, ab12_dtype=jnp.float32, c_dtype=jnp.bfloat16))
     for _ in range(2):
         ab12, c = jitted(a_dev, b_dev)
         jax.block_until_ready((ab12, c))  # XLA-stream ordered; no manual device sync needed
@@ -156,7 +163,7 @@ def test_gemm_swiglu_jax_jit_sm100():
     a2, b2, sfa, sfb = (jax.device_put(x) for x in (a2_np, b2_np, sfa_np, sfb_np))
 
     quant = jax.jit(
-        lambda a, b, sfa, sfb: gemm_swiglu_jax_sm100(
+        lambda a, b, sfa, sfb: gemm_glu_forward_jax(
             a, b, ab12_dtype=jnp.bfloat16, c_dtype=jnp.bfloat16, sfa_tensor=sfa, sfb_tensor=sfb, sf_vec_size=sf_vec_size
         )
     )
@@ -168,9 +175,62 @@ def test_gemm_swiglu_jax_jit_sm100():
 
 
 @pytest.mark.L0
-def test_gemm_swiglu_jax_wrapper_errors():
+def test_gemm_glu_jax_geglu():
+    """GeGLU through the jitted XLA custom call (both kernels) and the eager function."""
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable")
     skip_unless_sm100()
-    from cudnn import gemm_swiglu_wrapper_sm100
+    from cudnn.ops import gemm_glu_forward, gemm_glu_forward_jax
+
+    m, n, k = 256, 256, 256
+    alpha = 0.125
+    rng = np.random.default_rng(4)
+    a_np, a_ref = make_ab_bf16(m, k, rng)
+    b_np, b_ref = make_ab_bf16(n, k, rng)
+    a_dev, b_dev = jax.device_put(a_np), jax.device_put(b_np)
+    ab12_ref = alpha * (a_ref @ b_ref.T)
+
+    for glu in (dict(), dict(linear_offset=0.25, geglu_alpha=1.0, glu_clamp_max=1.5, glu_clamp_min=-1.0)):
+        c_ref = geglu_block_ref(ab12_ref, n, **glu)
+        jitted = jax.jit(lambda a, b: gemm_glu_forward_jax(a, b, alpha=alpha, ab12_dtype=jnp.float32, c_dtype=jnp.bfloat16, act_func="geglu", **glu))
+        for _ in range(2):
+            ab12, c = jitted(a_dev, b_dev)
+            jax.block_until_ready((ab12, c))
+            np.testing.assert_allclose(np.asarray(ab12)[:, :, 0], ab12_ref, atol=0.02, rtol=0.02)
+            np.testing.assert_allclose(np.asarray(c).astype(np.float32)[:, :, 0], c_ref, atol=0.05, rtol=0.05)
+        ab12, c, sfc, amax = gemm_glu_forward(a_dev, b_dev, alpha=alpha, ab12_dtype=jnp.float32, c_dtype=jnp.bfloat16, act_func="geglu", **glu)
+        device_sync()
+        assert sfc is None and amax is None
+        np.testing.assert_allclose(np.asarray(c).astype(np.float32)[:, :, 0], c_ref, atol=0.05, rtol=0.05)
+
+    sf_vec_size = 32
+    alpha = 1 / 64
+    a2_np, a2_ref = make_ab_fp8(m, k, ml_dtypes.float8_e4m3fn, rng)
+    b2_np, b2_ref = make_ab_fp8(n, k, ml_dtypes.float8_e4m3fn, rng)
+    sfa_np, sfa_expanded = make_sf_physical(m, k, sf_vec_size, ml_dtypes.float8_e8m0fnu, rng)
+    sfb_np, sfb_expanded = make_sf_physical(n, k, sf_vec_size, ml_dtypes.float8_e8m0fnu, rng)
+    a2, b2, sfa, sfb = (jax.device_put(x) for x in (a2_np, b2_np, sfa_np, sfb_np))
+    quant = jax.jit(
+        lambda a, b, sfa, sfb: gemm_glu_forward_jax(
+            a, b, alpha=alpha, ab12_dtype=jnp.bfloat16, c_dtype=jnp.bfloat16, sfa_tensor=sfa, sfb_tensor=sfb, sf_vec_size=sf_vec_size, act_func="geglu"
+        )
+    )
+    ab12q, cq = quant(a2, b2, sfa, sfb)
+    jax.block_until_ready((ab12q, cq))
+    ab12q_ref = alpha * ((a2_ref * sfa_expanded) @ (b2_ref * sfb_expanded).T)
+    np.testing.assert_allclose(np.asarray(ab12q).astype(np.float32)[:, :, 0], ab12q_ref, atol=0.5, rtol=0.05)
+    np.testing.assert_allclose(np.asarray(cq).astype(np.float32)[:, :, 0], geglu_block_ref(ab12q_ref, n), atol=1.0, rtol=0.05)
+
+    with pytest.raises(NotImplementedError, match="situglu"):
+        gemm_glu_forward_jax(a_dev, b_dev, act_func="situglu")
+
+
+@pytest.mark.L0
+def test_gemm_glu_jax_wrapper_errors():
+    skip_unless_sm100()
+    from cudnn.ops import gemm_glu_forward
 
     m, n, k = 256, 256, 256
     rng = np.random.default_rng(3)
@@ -179,12 +239,12 @@ def test_gemm_swiglu_jax_wrapper_errors():
     a_dev, b_dev = jax.device_put(a_np), jax.device_put(b_np)
 
     with pytest.raises(ValueError, match="row-major"):
-        gemm_swiglu_wrapper_sm100(a_dev, b_dev, c_major="m")
+        gemm_glu_forward(a_dev, b_dev, c_major="m")
 
     a_batched = jax.device_put(np.repeat(a_np, 2, axis=2))
     b_batched = jax.device_put(np.repeat(b_np, 2, axis=2))
     with pytest.raises(ValueError, match="batch dim L == 1"):
-        gemm_swiglu_wrapper_sm100(a_batched, b_batched)
+        gemm_glu_forward(a_batched, b_batched)
 
     with pytest.raises(ValueError, match="Unsupported tensor framework"):
-        gemm_swiglu_wrapper_sm100(a_np, b_np)
+        gemm_glu_forward(a_np, b_np)

@@ -1,13 +1,15 @@
-# GEMM + SwiGLU (SM100)
+# GEMM + GLU (SM100)
 
 **This is an experimental API and subject to change.**
 
 ## Overview
 
-**GEMM + SwiGLU fusion**: A persistent, batched dense GEMM fused with a SwiGLU epilogue on NVIDIA Blackwell GPUs (SM100+), implemented with CUTLASS/CUTE. It produces both the full GEMM output `AB12` and a SwiGLU-projected tensor `C` in a single pass.
+**GEMM + GLU fusion**: A persistent, batched dense GEMM fused with a gated-linear-unit epilogue (`act_func="swiglu"` or `"geglu"`) on NVIDIA Blackwell GPUs (SM100+), implemented with CUTLASS/CUTE. It produces both the full GEMM output `AB12` and a GLU-projected tensor `C` in a single pass.
+
+Entry points: `cudnn.ops.gemm_glu_forward` (PyTorch tensors, and JAX arrays eagerly) and `cudnn.ops.gemm_glu_forward_jax` (`jax.jit`-compatible). The fusion is forward-only.
 
 This API supports two modes:
-1. **Standard mode**: High-precision GEMM with SwiGLU epilogue
+1. **Standard mode**: High-precision GEMM with GLU epilogue
 2. **Quantized mode** (block-scaled): Low-precision GEMM using block scaling supporting FP4 and FP8 data types
 
 ### Shapes
@@ -17,7 +19,7 @@ This API supports two modes:
   - `B`: shape `(N, K, L)`
 - Outputs:
   - `AB12`: shape `(M, N, L)` – full GEMM result
-  - `C`: shape `(M, N/2, L)` – SwiGLU-projected result
+  - `C`: shape `(M, N/2, L)` – GLU-projected result
 
     `L` is the batch dimension.
 
@@ -29,7 +31,7 @@ $$
 AB12[m, n, l] = \alpha \sum_{k} A[m, k, l] \, B[n, k, l]
 $$
 
-- SwiGLU epilogue (performed by pairing 32-column blocks along `N`):
+- GLU epilogue (performed by pairing 32-column blocks along `N`):
 
   Let block size `G = 32`. For each pair of consecutive 32-wide column blocks in `AB12`:
   - Input block:  `X_b = AB12[:, 2*b*G : 2*b*G + G, :]`
@@ -40,10 +42,21 @@ C[:, \, bG:(b+1)G, \, :] = X_b \cdot \operatorname{swish}(G_b), \quad
 \operatorname{swish}(x) = x \cdot \sigma(x)
 $$
 
+  The equation above is `act_func="swiglu"` (default). With `act_func="geglu"`:
+
+$$
+C[:, \, bG:(b+1)G, \, :] = \left(\operatorname{clamp}(X_b, c_{min}, c_{max}) + o\right) \cdot \hat{G}_b \cdot \sigma(a \, \hat{G}_b), \quad
+\hat{G}_b = \min(G_b, c_{max})
+$$
+
+  where `o = linear_offset`, `a = geglu_alpha`, `c_max = glu_clamp_max` and `c_min = glu_clamp_min` (the gate has no lower clamp). These match the grouped `grouped_gemm_glu` GeGLU.
+
 Notes:
-- The `alpha` scaling is applied before the SwiGLU; both `X_b` and `G_b` are from the scaled GEMM results.
-- `AB12` stores the entire scaled GEMM output (both input and gate blocks), while `C` stores the fused SwiGLU-projected result with half the columns.
-- **N divisibility requirement**: `N` must be divisible by 64 (two consecutive 32-column blocks) to ensure proper pairing for the SwiGLU operation.
+- The `alpha` scaling is applied before the GLU; both `X_b` and `G_b` are from the scaled GEMM results.
+- `AB12` stores the entire scaled GEMM output (both input and gate blocks, never clamped), while `C` stores the fused GLU-projected result with half the columns.
+- **N divisibility requirement**: `N` must be divisible by 64 (two consecutive 32-column blocks) to ensure proper pairing for the GLU operation.
+- `act_func="situglu"` is not supported by the dense kernels and raises `NotImplementedError`; it exists only in the block-scaled grouped GEMM GLU.
+- `act_func="swiglu"` output is bit-identical to the former SwiGLU-only kernel.
 
 ### Diagram
 
@@ -68,21 +81,23 @@ Notes:
 
 The tensor parameters are type-erased: torch tensors and JAX arrays are both accepted (torch is only imported when torch tensors/dtypes are passed, jax only when JAX arrays are passed). Dtype parameters accept torch dtypes, numpy/ml_dtypes dtypes, dtype name strings, or `cutlass` types. The JAX contract matches gemm_amax (see `gemm_amax.md` "Using JAX arrays"): A/B k-major `(M, K, 1)`/`(N, K, 1)`, outputs n-major only, batch `L == 1`, SF tensors accepted in the physical C-contiguous atom shape `(L, MN', K', 32, 4, 4)`; the eager entry points run on the CUDA legacy default stream (synchronize before reading outputs).
 
-For jitted JAX programs, use **`gemm_swiglu_jax_sm100`** — an XLA custom call (built on `cutlass.jax.cutlass_call` / CuTeDSL's native `cutlass.jax` bridge, `jax` dependency group) that runs on XLA's compute stream, returns fresh `(ab12, c)` arrays, and composes with `jax.jit`. Both the standard and the blockscaled MXFP8 quantized kernels are supported. `alpha` is a static (trace-time) parameter.
+For jitted JAX programs, use **`cudnn.ops.gemm_glu_forward_jax`** — an XLA custom call (built on `cutlass.jax.cutlass_call` / CuTeDSL's native `cutlass.jax` bridge, `jax` dependency group) that runs on XLA's compute stream, returns fresh `(ab12, c)` arrays, and composes with `jax.jit`. Both the standard and the blockscaled MXFP8 quantized kernels are supported. `alpha`, `act_func`, `linear_offset`, `geglu_alpha` and the clamps are static (trace-time) parameters.
 
 ```python
-from cudnn import gemm_swiglu_jax_sm100
+from cudnn.ops import gemm_glu_forward_jax
 
 @jax.jit
 def swiglu_mlp(a, b):
-    ab12, c = gemm_swiglu_jax_sm100(a, b, alpha=1.0, ab12_dtype=jnp.float32, c_dtype=jnp.bfloat16)
+    ab12, c = gemm_glu_forward_jax(a, b, alpha=1.0, ab12_dtype=jnp.float32, c_dtype=jnp.bfloat16)
     return c
 ```
 
-### High-level wrapper (Standard Mode)
+### Standard mode
 
 ```python
-result = gemm_swiglu_wrapper_sm100(
+from cudnn.ops import gemm_glu_forward
+
+result = gemm_glu_forward(
     a_tensor,
     b_tensor,
     alpha=1.0,
@@ -93,18 +108,19 @@ result = gemm_swiglu_wrapper_sm100(
     mma_tiler_mn=(128, 128),
     cluster_shape_mn=(1, 1),
     stream=None,
+    act_func="swiglu",
 )
 ab12, c, sfc, amax = result
 # Note: sfc and amax are always None in standard mode
 # Key access: result["ab12_tensor"], result["c_tensor"]
 ```
 
-### High-level wrapper (Quantized Mode)
+### Quantized mode
 
-When scale factor tensors are provided, the wrapper uses the block-scaled quantized kernel.
+When scale factor tensors are provided, the function uses the block-scaled quantized kernel.
 
 ```python
-result = gemm_swiglu_wrapper_sm100(
+result = gemm_glu_forward(
     a_tensor,
     b_tensor,
     alpha=1.0,
@@ -127,69 +143,21 @@ ab12, c, sfc, amax = result
 # Key access: result["ab12_tensor"], result["c_tensor"], result["sfc_tensor"], result["amax_tensor"]
 ```
 
-### Class API (Standard Mode)
+### GeGLU
 
 ```python
-gemm = GemmSwigluSm100(
-    sample_a,
-    sample_b,
-    sample_ab12,
-    sample_c,
-    alpha=1.0,
-    acc_dtype=torch.float32,
-    mma_tiler_mn=(128, 128),
-    cluster_shape_mn=None,
-)
-assert gemm.check_support()
-gemm.compile()
-gemm.execute(
+result = gemm_glu_forward(
     a_tensor,
     b_tensor,
-    ab12_tensor,
-    c_tensor,
-    alpha=1.0,
-    current_stream=None,
+    act_func="geglu",
+    linear_offset=None,  # None -> 1.0 for geglu
+    geglu_alpha=1.702,
+    glu_clamp_max=7.0,
+    glu_clamp_min=-7.0,
 )
 ```
 
-### Class API (Quantized Mode)
-
-```python
-gemm = GemmSwigluSm100(
-    sample_a,
-    sample_b,
-    sample_ab12,
-    sample_c,
-    alpha=1.0,
-    acc_dtype=torch.float32,
-    mma_tiler_mn=(128, 128),
-    cluster_shape_mn=None,
-    # Quantization parameters
-    sample_sfa=sample_sfa,
-    sample_sfb=sample_sfb,
-    sample_amax=sample_amax,          # Required for fp4 inputs with bf16 output
-    sample_sfc=sample_sfc,            # Required when c_dtype is fp8
-    sample_norm_const=sample_norm_const,  # Required when c_dtype is fp8
-    sf_vec_size=16,
-    vector_f32=False,
-    ab12_stages=4,
-)
-assert gemm.check_support()
-gemm.compile()
-gemm.execute(
-    a_tensor,
-    b_tensor,
-    ab12_tensor,
-    c_tensor,
-    sfa_tensor=sfa_tensor,
-    sfb_tensor=sfb_tensor,
-    amax_tensor=amax_tensor,
-    sfc_tensor=sfc_tensor,
-    norm_const_tensor=norm_const_tensor,
-    alpha=1.0,
-    current_stream=None,
-)
-```
+`linear_offset`, `geglu_alpha` and the clamps are runtime parameters: one compiled kernel serves any value. They are ignored for `act_func="swiglu"`.
 
 ---
 
@@ -197,7 +165,7 @@ gemm.execute(
 
 ### Input/Output tensors
 
-- Input tensor **A**: `a_tensor` (wrapper) or `sample_a`, `a_tensor` (class)
+- Input tensor **A**: `a_tensor`
   - Shape: `(M, K, L)`
   - Stride: `(1, M, M·K)` for `m`-major or `(K, 1, M·K)` for `k`-major
     - Quantized mode: Must be `k`-major for FP4 inputs
@@ -205,39 +173,39 @@ gemm.execute(
     - Standard mode: `{float16, bfloat16, float32, float8_e4m3fn, float8_e5m2}`
     - Quantized mode: `{float4_e2m1fn_x2, uint8, float8_e4m3fn, float8_e5m2}`
       - `uint8` is interpreted as packed FP4 (two FP4 values per byte)
-- Input tensor **B**: `b_tensor` (wrapper) or `sample_b`, `b_tensor` (class)
+- Input tensor **B**: `b_tensor`
   - Shape: `(N, K, L)`
   - Stride: `(1, N, N·K)` for `n`-major or `(K, 1, N·K)` for `k`-major
   - Dtype (`ab_dtype`): Must match `A`
-- Output tensor **AB12**: `result["ab12_tensor"]` (wrapper) or `sample_ab12`, `ab12_tensor` (class)
+- Output tensor **AB12**: `result["ab12_tensor"]`
   - Shape: `(M, N, L)`
-  - Stride: `(1, M, M·N)` for `m`-major or `(N, 1, M·N)` for `n`-major. Provided as `c_major` argument for wrapper
+  - Stride: `(1, M, M·N)` for `m`-major or `(N, 1, M·N)` for `n`-major. Provided as the `c_major` argument
     - Quantized mode: Must be `n`-major for FP4 outputs
-  - Dtype (`ab12_dtype`, provided as `ab12_dtype` argument for wrapper):
+  - Dtype (`ab12_dtype`):
     - Standard mode: `{float32, float16, bfloat16}` if `acc_dtype == float32`, `{float16, bfloat16}` if `acc_dtype == float16`
     - Quantized mode: `{float32, float16, bfloat16, float8_e4m3fn, float8_e5m2}`
-- Output tensor **C**: `result["c_tensor"]` (wrapper) or `sample_c`, `c_tensor` (class)
+- Output tensor **C**: `result["c_tensor"]`
   - Shape: `(M, N/2, L)`
   - Stride: `(1, M, M·N/2)` for `m`-major or `(N/2, 1, M·N/2)` for `n`-major. Must match with `AB12`
-  - Dtype (`c_dtype`, provided as `c_dtype` argument for wrapper):
+  - Dtype (`c_dtype`):
     - Standard mode: `{float16, bfloat16}`
     - Quantized mode: `{float32, float16, bfloat16, float8_e4m3fn, float8_e5m2}`
 - **Quantization-specific tensors**
-  - Input tensor **SFA** (A scale factor): `sfa_tensor` (wrapper) or `sample_sfa`, `sfa_tensor` (class)
+  - Input tensor **SFA** (A scale factor): `sfa_tensor`
     - Shape: `(32, 4, ceil(M/128), 4, ceil(ceil(K/sf_vec_size)/4), L)`
     - Dtype: `{float8_e8m0fnu, float8_e4m3fn}`
-  - Input tensor **SFB** (B scale factor): `sfb_tensor` (wrapper) or `sample_sfb`, `sfb_tensor` (class)
+  - Input tensor **SFB** (B scale factor): `sfb_tensor`
     - Shape: `(32, 4, ceil(N/128), 4, ceil(ceil(K/sf_vec_size)/4), L)`
     - Dtype: Must match `SFA`
-  - Output tensor **SFC** (C scale factor, **Optional**): `result["sfc_tensor"]` (wrapper) or `sample_sfc`, `sfc_tensor` (class)
+  - Output tensor **SFC** (C scale factor, **Optional**): `result["sfc_tensor"]`
     - Shape: `(32, 4, ceil(M/128), 4, ceil(ceil((N/2)/sf_vec_size)/4), L)`
     - Dtype: Must match `SFA`
     - **Required when**: `c_dtype ∈ {float8_e4m3fn, float8_e5m2}`
-  - Output tensor **AMAX** (**Optional**): `result["amax_tensor"]` (wrapper) or `sample_amax`, `amax_tensor` (class)
+  - Output tensor **AMAX** (**Optional**): `result["amax_tensor"]`
     - Shape: `(1,)`
     - Dtype: `float32`
     - **Required when**: `ab_dtype` is FP4 and `c_dtype == bfloat16`
-  - Input tensor **Norm Const** (**Optional**): `norm_const_tensor` (wrapper) or `sample_norm_const`, `norm_const_tensor` (class)
+  - Input tensor **Norm Const** (**Optional**): `norm_const_tensor`
     - Shape: `(1,)`
     - Dtype: `float32`
     - **Required when**: `c_dtype ∈ {float8_e4m3fn, float8_e5m2}`
@@ -245,7 +213,7 @@ gemm.execute(
 ### Common parameters
 
 - `alpha: float`
-  - Scalar multiplier applied to the GEMM result before SwiGLU.
+  - Scalar multiplier applied to the GEMM result before the GLU.
   - Default: `1.0`
 - `acc_dtype: torch.dtype`
   - Accumulator dtype.
@@ -260,7 +228,16 @@ gemm.execute(
   - Thread Block cluster shape `(CLUSTER_M, CLUSTER_N)`
   - Constraints: positive powers of 2, `CLUSTER_M*CLUSTER_N ≤ 16`.
   - Default: `(1,1)` if `mma_tiler_mn[0] != 256` else `(2,2)`.
-- CUDA stream (`current_stream` in class API, `stream` in wrapper)
+- `act_func: str`
+  - `"swiglu"` (default) or `"geglu"`. `"situglu"` raises `NotImplementedError`.
+  - `"geglu"` requires `acc_dtype == float32`.
+- `linear_offset: float | None`
+  - GeGLU offset on the input (up) block. `None` selects `1.0` for `"geglu"` and `0.0` for `"swiglu"`. Ignored for `"swiglu"`.
+- `geglu_alpha: float`
+  - GeGLU pre-sigmoid scale. Default: `1.702`. Ignored for `"swiglu"`.
+- `glu_clamp_max: float`, `glu_clamp_min: float`
+  - GeGLU clamps: `glu_clamp_max` bounds the gate and input blocks from above, `glu_clamp_min` bounds the input block from below. Defaults: `7.0`, `-7.0`. Ignored for `"swiglu"`.
+- `stream`: CUDA stream
 - **Quantization-specific parameters**
   - `sf_vec_size: int`
     - Scale factor vector size (number of elements per scale factor)
@@ -269,13 +246,13 @@ gemm.execute(
       - FP8 inputs require `sf_vec_size=32` with `sf_dtype=float8_e8m0fnu`
       - FP4 inputs do not support `sf_vec_size=32` with `sf_dtype=float8_e4m3fn`
   - `vector_f32: bool`
-    - Enable packed f32 operations for improved performance
+    - Enable packed f32 operations for improved performance (the GeGLU activation itself always uses the scalar path)
     - Default: `False`
   - `ab12_stages: int`
     - Number of pipeline stages for AB12 output
     - Default: `4`
 
-### Wrapper-specific parameters: `gemm_swiglu_wrapper_sm100`
+### Function parameters: `gemm_glu_forward`
 
 - `a_tensor`, `b_tensor`: see Input/Output tensors
 - `c_major: str`: see Input/Output tensors. Default: `"n"`
@@ -284,12 +261,12 @@ gemm.execute(
 - `sfa_tensor`, `sfb_tensor`, `norm_const_tensor`: see Quantization-specific tensors
 - `sf_vec_size`, `vector_f32`, `ab12_stages`: see Quantization-specific parameters
 
-### Wrapper return values
+### Return values
 
 Returns a `TupleDict` with fixed keys:
 
 - `ab12_tensor`: Intermediate GEMM output
-- `c_tensor`: SwiGLU output
+- `c_tensor`: GLU output
 - `sfc_tensor`: Output scale factors (or `None` when not applicable)
 - `amax_tensor`: Max-abs output (or `None` when not applicable)
 
@@ -298,18 +275,6 @@ Tuple unpacking order is always:
 
 - **Standard mode**: `sfc_tensor is None` and `amax_tensor is None`
 - **Quantized mode**: `sfc_tensor` and/or `amax_tensor` are populated based on dtype/configuration
-
-### Class-specific parameters
-
-#### `GemmSwigluSm100` (constructor)
-
-- `sample_a`, `sample_b`, `sample_ab12`, `sample_c` – see Input/Output tensors
-- `sample_sfa`, `sample_sfb`, `sample_sfc`, `sample_amax`, `sample_norm_const` – see Scale factor tensors (quantized mode)
-
-#### `GemmSwigluSm100.execute`
-
-- `a_tensor`, `b_tensor`, `ab12_tensor`, `c_tensor` – see Input/Output tensors. Must have same layout as sample tensors provided in constructor.
-- `sfa_tensor`, `sfb_tensor`, `sfc_tensor`, `amax_tensor`, `norm_const_tensor` – see Scale factor tensors (quantized mode)
 
 ---
 
@@ -363,4 +328,4 @@ Additional constraints:
 
 ## Usage examples
 
-For usage examples, see test cases in `test/python/gemm/cutedsl/test_gemm_swiglu.py`
+For usage examples, see test cases in `test/python/gemm/cutedsl/test_gemm_glu.py`

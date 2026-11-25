@@ -14,6 +14,8 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.math as math
 
+from ...grouped.moe_kernel_helpers import fmax, fmin, silu_f32_scaled
+
 # Mathematical constant: log2(e) for converting exp(x) to exp2(x * log2(e))
 LOG2_E = 1.4426950408889634
 
@@ -121,6 +123,7 @@ class PersistentDenseGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        act_func: str = "swiglu",
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -148,6 +151,9 @@ class PersistentDenseGemmKernel:
         :type cluster_shape_mn: Tuple[int, int]
         """
 
+        if act_func not in ("swiglu", "geglu"):
+            raise ValueError(f"Invalid activation function: {act_func}")
+        self.act_func = act_func
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -301,6 +307,10 @@ class PersistentDenseGemmKernel:
         ab12: cute.Tensor,
         c: cute.Tensor,
         alpha: cutlass.Float32,
+        linear_offset: cutlass.Float32,
+        geglu_alpha: cutlass.Float32,
+        glu_clamp_max: cutlass.Float32,
+        glu_clamp_min: cutlass.Float32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x / (1 + math.exp(-x, True)),
@@ -477,6 +487,10 @@ class PersistentDenseGemmKernel:
             self.tile_sched_params,
             epilogue_op,
             alpha,
+            linear_offset,
+            geglu_alpha,
+            glu_clamp_max,
+            glu_clamp_min,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -509,6 +523,10 @@ class PersistentDenseGemmKernel:
         tile_sched_params: PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cutlass.Float32,
+        linear_offset: cutlass.Float32,
+        geglu_alpha: cutlass.Float32,
+        glu_clamp_max: cutlass.Float32,
+        glu_clamp_min: cutlass.Float32,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1046,19 +1064,30 @@ class PersistentDenseGemmKernel:
                     acc_vec1 = tiled_copy_r2s.retile(tTR_rAcc1).load()  # copy input tile 1
                     acc_vec0 = acc_vec0 * alpha
                     acc_vec1 = acc_vec1 * alpha
-                    # Use exp2 with log2(e) conversion since cute.math.exp is not available
-                    # exp(x) = 2^(x * log2(e))
-                    gate_rcp = (1 + cute.math.exp2(-1 * acc_vec1 * LOG2_E, True)).to(self.acc_dtype)
+                    if cutlass.const_expr(self.act_func == "geglu"):
+                        glu_up = cute.make_rmem_tensor(acc_vec0.shape, cutlass.Float32)
+                        glu_gate = cute.make_rmem_tensor(acc_vec1.shape, cutlass.Float32)
+                        glu_up.store(acc_vec0)
+                        glu_gate.store(acc_vec1)
+                        for i in cutlass.range_constexpr(cute.size(glu_up.shape)):
+                            glu_up[i] = (fmax(fmin(glu_up[i], glu_clamp_max), glu_clamp_min) + linear_offset) * silu_f32_scaled(
+                                fmin(glu_gate[i], glu_clamp_max), alpha=geglu_alpha, fastmath=True
+                            )
+                        acc_vec_c = glu_up.load().to(self.c_dtype)
+                    else:
+                        # Use exp2 with log2(e) conversion since cute.math.exp is not available
+                        # exp(x) = 2^(x * log2(e))
+                        gate_rcp = (1 + cute.math.exp2(-1 * acc_vec1 * LOG2_E, True)).to(self.acc_dtype)
 
-                    res = cute.make_rmem_tensor(gate_rcp.shape, cutlass.Float32)
-                    res.store(gate_rcp)
-                    for i in cutlass.range_constexpr(cute.size(res.shape)):
-                        res[i] = cute.arch.rcp_approx(res[i])
+                        res = cute.make_rmem_tensor(gate_rcp.shape, cutlass.Float32)
+                        res.store(gate_rcp)
+                        for i in cutlass.range_constexpr(cute.size(res.shape)):
+                            res[i] = cute.arch.rcp_approx(res[i])
 
-                    gate = res.load()
-                    gate = gate * acc_vec1
+                        gate = res.load()
+                        gate = gate * acc_vec1
 
-                    acc_vec_c = (acc_vec0 * gate).to(self.c_dtype)
+                        acc_vec_c = (acc_vec0 * gate).to(self.c_dtype)
 
                     acc_vec0 = (acc_vec0).to(self.ab12_dtype)
                     acc_vec1 = (acc_vec1).to(self.ab12_dtype)

@@ -24,7 +24,7 @@ modules in `python/cudnn/`:
 - `gemm/cutedsl/dense/amax`
 - `gemm/cutedsl/dense/dsrelu`
 - `gemm/cutedsl/dense/srelu`
-- `gemm/cutedsl/dense/swiglu`
+- `gemm/cutedsl/dense/glu`
 - `gemm/cutedsl/grouped/dglu`
 - `gemm/cutedsl/grouped/dsrelu`
 - `gemm/cutedsl/grouped/dswiglu`
