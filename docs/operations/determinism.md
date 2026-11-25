@@ -74,6 +74,8 @@ arbitrary user callbacks.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
+| `pygraph.matmul` with numerical note `BATCH_INVARIANT`, optional column bias | fprop | BF16 inputs and output, FP32 accumulation | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
+| Scaled `pygraph.matmul` with numerical note `BATCH_INVARIANT` | fprop | Per-tensor E4M3/E5M2, groupwise E4M3, MXFP8, NVFP4, MXFP4, MXFP8 × MXFP4. FP16/BF16 output | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
 | `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
 | `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
@@ -116,8 +118,8 @@ arbitrary user callbacks.
 | `simplified_sparse_attention_forward_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
 | `dense_indexer_kl_forward`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Replay only | Unverified |
 | `dense_indexer_kl_forward`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
-| `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
-| `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
+| `qsa_forward` | fprop | BF16, FP16 | Unverified | Replay only | Replay only |
+| `qsa_backward`, `qsa_indexed_backward` | bprop | BF16, FP16 | Unverified | Replay only | Replay only |
 | `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Unverified | Supported | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
@@ -383,8 +385,9 @@ for replay, batch-invariance, and stress-test results.
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
   rows move. The fused CuTe path also changes scalar loss and saved gradient
-  bytes across runs through atomic reductions. Only indexer Q/K receive
-  gradients; the teacher stays frozen. Tiny single-row goldens do not qualify
+  bytes across runs through atomic reductions, including forward loss replay
+  on SM103. Only indexer Q/K receive gradients; the teacher stays frozen.
+  Tiny single-row goldens do not qualify
   larger reductions. CPU and other GPUs are not qualified for determinism.
 
 - Simplified sparse attention (PyTorch and JAX): no deterministic mode. The SM100 forward

@@ -1576,6 +1576,7 @@ cudnn.norm_forward_phase.TRAINING
 cudnn.norm_forward_phase.name
 cudnn.norm_forward_phase.value
 cudnn.numerical_note
+cudnn.numerical_note.BATCH_INVARIANT
 cudnn.numerical_note.DOWN_CONVERT_INPUTS
 cudnn.numerical_note.FFT
 cudnn.numerical_note.FULL_PRECISION_MATH

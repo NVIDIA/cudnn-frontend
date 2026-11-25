@@ -10,6 +10,7 @@ import torch
 # (query heads, KV heads) geometries the attention kernels serve: the full 24Q/2KV model and its 12Q/1KV (two-way) and
 # 6Q/1KV (four-way, KV head replicated) tensor-parallel shards.
 HEAD_GEOMETRIES = ((6, 1), (12, 1), (24, 2))
+DTYPES = (torch.bfloat16, torch.float16)
 
 
 def check_tensor(name, tensor, shape, dtype, device, alignment=4):
@@ -34,8 +35,8 @@ def check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, b
         raise NotImplementedError("QSA requires T > 0, D = 256, and 6/1, 12/1 or 24/2 query/KV heads")
     if q.numel() > 2**31 - 1:
         raise NotImplementedError("QSA requires T * Hq * D <= INT32_MAX")
-    if q.dtype != torch.bfloat16:
-        raise NotImplementedError("QSA training requires BF16 q, k, v and grad_out")
+    if q.dtype not in DTYPES:
+        raise NotImplementedError("QSA training requires BF16 or FP16 q, k, v and grad_out")
     if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size != 4:
         raise NotImplementedError("QSA supports block_size=4")
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale):
@@ -47,7 +48,7 @@ def check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, b
         raise ValueError("NB must be in [1, INT32_MAX]")
     device = q.device
     for name, tensor, heads in (("q", q, hq), ("k", k, hkv), ("v", v, hkv)):
-        check_tensor(name, tensor, (total, heads, dim), torch.bfloat16, device, 16)
+        check_tensor(name, tensor, (total, heads, dim), q.dtype, device, 16)
     check_tensor("sel_blocks", sel_blocks, (total, blocks), torch.uint8, device, 1)
     for name, tensor in (("lo", lo), ("hi", hi), ("blk_base", blk_base), ("tok_base", tok_base)):
         check_tensor(name, tensor, (total,), torch.int32, device)

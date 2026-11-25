@@ -79,6 +79,8 @@ class EngineSlot:
     # sibling serves it, so withholding the slot leaves the graph with no plan at all rather than with
     # the backend's.  Every other graph still sees the slot only under the opt-in flag.
     unlocked_by: Tuple[str, ...] = ()
+    # A numerical-mode engine is offered only when the caller requests its contract.
+    required_numeric_note: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -152,7 +154,16 @@ class EngineFamily:
         """
         enabled = opt_in_engines_enabled()
         set_attrs = _set_params(graph) if graph is not None else frozenset()
-        return {name: self.engine_id + s.slot for name, s in self.slots.items() if enabled or not s.opt_in or not set_attrs.isdisjoint(s.unlocked_by)}
+        requested = {note.name for kind, note, keep in getattr(graph, "_note_filters", ()) if kind == "numerical" and keep}
+        return {
+            name: self.engine_id + slot.slot
+            for name, slot in self.slots.items()
+            if (
+                slot.required_numeric_note in requested
+                if slot.required_numeric_note
+                else enabled or not slot.opt_in or not set_attrs.isdisjoint(slot.unlocked_by)
+            )
+        }
 
 
 def _set_params(graph) -> frozenset:
@@ -283,7 +294,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "frost_gemm",
         "cudnn.gemm.frost.engine",
         "FrostGemmEngines",
-        slots={"frost_gemm": EngineSlot(0, opt_in=True)},
+        slots={"frost_gemm": EngineSlot(0, opt_in=True), "batch_invariant_gemm": EngineSlot(1, opt_in=True, required_numeric_note="BATCH_INVARIANT")},
         # Facts + heuristics: the plan the engine would build, listed WITH its
         # tile config spelled as public knobs, so a recorded (engine_id, knobs)
         # pins the exact kernel (cudnn.gemm.frost.heuristics). One candidate for

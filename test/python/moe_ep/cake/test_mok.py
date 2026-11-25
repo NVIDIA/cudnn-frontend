@@ -14,7 +14,7 @@ import torch.distributed as dist
 from cudnn._cake import loader
 from cudnn.moe_ep.cake import create_mok_workspace, prepare_mok_training, quantize_mok_weights
 
-pytestmark = pytest.mark.L0
+pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive]
 
 
 @pytest.fixture(scope="module")
