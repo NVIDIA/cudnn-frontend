@@ -222,8 +222,7 @@ class TestQSABackwardEngine:
     @pytest.mark.L0
     @pytest.mark.parametrize("entry, lengths, h_q, h_kv", ENGINE_REPLAYS)
     def test_replay(self, entry, lengths, h_q, h_kv):
-        # the indexed backward needs the CUDA 13 DSL at every head geometry
-        _skip_cu12(1 if entry == "indexed" else h_kv)
+        _skip_cu12(h_kv)
         inputs = _inputs(lengths, h_kv, seed=sum(lengths), h_q=h_q)
         run_entry = lambda: _entry_backward(entry, inputs, lengths, deterministic=True)
         grads = assert_replays(lambda: dict(zip(("dq", "dk", "dv"), run_entry())), repeats=4)
