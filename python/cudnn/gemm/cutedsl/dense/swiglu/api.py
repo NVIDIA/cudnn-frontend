@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from .dense_gemm_persistent_glu import (
+from .dense_gemm_persistent_swiglu import (
     PersistentDenseGemmKernel,
 )
-from .dense_blockscaled_gemm_persistent_glu_interleaved_quant import (
+from .dense_blockscaled_gemm_persistent_swiglu_interleaved_quant import (
     Sm100BlockScaledPersistentDenseGemmKernel,
 )
 from cuda.bindings import driver as cuda
@@ -29,21 +29,8 @@ from cudnn.tensor_adapter import (
 import os
 
 
-def check_act_func(act_func: str) -> None:
-    if act_func == "situglu":
-        raise NotImplementedError("dense GEMM GLU does not support act_func='situglu'; it is implemented for the block-scaled grouped GEMM GLU only")
-    if act_func not in ("swiglu", "geglu"):
-        raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {act_func}")
-
-
-def resolve_linear_offset(act_func: str, linear_offset: Optional[float]) -> float:
-    if linear_offset is None:
-        return 1.0 if act_func == "geglu" else 0.0
-    return linear_offset
-
-
-class GemmGlu(APIBase):
-    """Persistent GEMM + GLU (SwiGLU or GeGLU) plan for SM100; internal to ``gemm_glu_forward``.
+class GemmSwigluSm100(APIBase):
+    """Persistent GEMM + SwiGLU for SM100.
 
     Tensor parameters are type-erased: torch tensors and JAX arrays are both accepted
     (the compiled kernels consume tensors via DLPack). torch is only imported when
@@ -70,7 +57,6 @@ class GemmGlu(APIBase):
         sf_vec_size: int = 16,
         vector_f32: bool = False,
         ab12_stages: int = 4,
-        act_func: str = "swiglu",
     ):
         super().__init__()
 
@@ -98,16 +84,15 @@ class GemmGlu(APIBase):
         self.sf_vec_size = sf_vec_size
         self.vector_f32 = vector_f32
         self.ab12_stages = ab12_stages
-        self.act_func = act_func
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
         # Kernel selection
         if self.sfa_desc is None and self.sfb_desc is None and self.amax_desc is None and self.sfc_desc is None and self.norm_const_desc is None:
-            self._logger.debug("No quantization arguments provided, using regular GEMM GLU kernel")
+            self._logger.debug("No quantization arguments provided, using regular GEMM swiglu kernel")
             self._kernel = PersistentDenseGemmKernel
         else:
-            self._logger.debug("Quantization arguments provided, using quantized GEMM GLU kernel")
+            self._logger.debug("Quantization arguments provided, using quantized GEMM swiglu kernel")
             self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
         self._logger.debug(
@@ -118,7 +103,6 @@ class GemmGlu(APIBase):
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
-        check_act_func(self.act_func)
 
         self._logger.debug("Checking tensor shapes, strides, and dtypes")
         m, k, l = self.a_desc.shape
@@ -202,7 +186,7 @@ class GemmGlu(APIBase):
         elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
             self._value_error_if(
                 self.sfa_desc is None or self.sfb_desc is None,
-                "sfa and sfb must be provided for quantized GEMM GLU kernel",
+                "sfa and sfb must be provided for quantized GEMM swiglu kernel",
             )
 
             self.ab_dtype = self._check_dtype(
@@ -213,12 +197,12 @@ class GemmGlu(APIBase):
                     cutlass.Float8E5M2,
                     cutlass.Float8E4M3FN,
                 ],
-                name="A (for quantized GEMM GLU kernel)",
+                name="A (for quantized GEMM swiglu kernel)",
             )
             self.acc_dtype = self._check_dtype(
                 self.acc_dtype,
                 dtype=cutlass.Float32,
-                name="Accumulator (for quantized GEMM GLU kernel)",
+                name="Accumulator (for quantized GEMM swiglu kernel)",
             )
             self.ab12_dtype = self._check_dtype(
                 self.ab12_desc,
@@ -229,7 +213,7 @@ class GemmGlu(APIBase):
                     cutlass.Float8E4M3FN,
                     cutlass.Float8E5M2,
                 ],
-                name="AB12 (for quantized GEMM GLU kernel)",
+                name="AB12 (for quantized GEMM swiglu kernel)",
             )
             self.c_dtype = self._check_dtype(
                 self.c_desc,
@@ -240,7 +224,7 @@ class GemmGlu(APIBase):
                     cutlass.Float8E4M3FN,
                     cutlass.Float8E5M2,
                 ],
-                name="C (for quantized GEMM GLU kernel)",
+                name="C (for quantized GEMM swiglu kernel)",
             )
 
             self._value_error_if(
@@ -310,11 +294,6 @@ class GemmGlu(APIBase):
             extra_error_msg="A and B must have the same dtype",
         )
 
-        self._not_implemented_error_if(
-            self.act_func == "geglu" and self.acc_dtype is not cutlass.Float32,
-            f"act_func='geglu' requires float32 acc_dtype, got {self.acc_dtype}",
-        )
-
         self._logger.debug("Checking MMA tile shape and cluster shape")
 
         self._value_error_if(
@@ -337,7 +316,7 @@ class GemmGlu(APIBase):
                 if self._is_fp8(self.ab_dtype):
                     self._value_error_if(
                         self._is_fp8(self.c_dtype) or self._is_fp8(self.ab12_dtype) or self.ab12_dtype is cutlass.Float32,
-                        "For MXFP8 inputs for blockscaled quantized GEMM GLU kernel, ab12_dtype and c_dtype cannot be FP8. ab12_dtype also cannot be float32",
+                        "For MXFP8 inputs for blockscaled quantized GEMM swiglu kernel, ab12_dtype and c_dtype cannot be FP8. ab12_dtype also cannot be float32",
                     )
 
         self._value_error_if(
@@ -398,7 +377,7 @@ class GemmGlu(APIBase):
         compute_capability = major * 10 + minor
         if not has_tcgen05(major):
             raise RuntimeError(
-                f"gemm_glu_forward requires SM100+ compute capability with tcgen05 (not cc 12.x), but found SM{compute_capability} on the current device"
+                f"GemmSwiglu requires SM100+ compute capability with tcgen05 (not cc 12.x), but found SM{compute_capability} on the current device"
             )
 
         self._is_supported = True
@@ -410,21 +389,19 @@ class GemmGlu(APIBase):
         self._ensure_support_checked()
 
         if self._kernel is PersistentDenseGemmKernel:
-            gemm_glu = self._kernel(
+            gemm_swiglu = self._kernel(
                 acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
                 use_2cta_instrs=(self.mma_tiler_mn[0] == 256),
                 mma_tiler_mn=self.mma_tiler_mn,
                 cluster_shape_mn=self.cluster_shape_mn,
-                act_func=self.act_func,
             )
         elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-            gemm_glu = self._kernel(
+            gemm_swiglu = self._kernel(
                 sf_vec_size=self.sf_vec_size,
                 mma_tiler_mn=self.mma_tiler_mn,
                 cluster_shape_mn=self.cluster_shape_mn,
                 vector_f32=self.vector_f32,
                 ab12_stages=self.ab12_stages,
-                act_func=self.act_func,
             )
         else:
             raise NotImplementedError(f"Unreachable: invalid kernel type {self._kernel}")
@@ -440,25 +417,21 @@ class GemmGlu(APIBase):
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         if self._kernel is PersistentDenseGemmKernel:
-            self._logger.debug("Compiling gemm_glu")
+            self._logger.debug("Compiling gemm_swiglu")
             return cute.compile(
-                gemm_glu,
+                gemm_swiglu,
                 a=self._make_fake_cute_tensor_from_desc(self.a_desc),
                 b=self._make_fake_cute_tensor_from_desc(self.b_desc),
                 ab12=self._make_fake_cute_tensor_from_desc(self.ab12_desc),
                 c=self._make_fake_cute_tensor_from_desc(self.c_desc),
                 alpha=self.alpha,
-                linear_offset=0.0,
-                geglu_alpha=1.702,
-                glu_clamp_max=7.0,
-                glu_clamp_min=-7.0,
                 max_active_clusters=max_active_clusters,
                 stream=fake_stream,
                 options="--enable-tvm-ffi",
             )
-        self._logger.debug("Compiling gemm_glu_blockscaled_quantized")
+        self._logger.debug("Compiling gemm_swiglu_blockscaled_quantized")
         return cute.compile(
-            gemm_glu,
+            gemm_swiglu,
             a_tensor=self._make_fake_cute_tensor_from_desc(self.a_desc, assumed_align=16),
             b_tensor=self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16),
             sfa_tensor=self._make_fake_cute_tensor_from_desc(self.sfa_desc, assumed_align=16),
@@ -469,10 +442,6 @@ class GemmGlu(APIBase):
             sfc_tensor=self._make_fake_cute_tensor_from_desc(self.sfc_desc, assumed_align=16),
             norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
             alpha=self.alpha,
-            linear_offset=0.0,
-            geglu_alpha=1.702,
-            glu_clamp_max=7.0,
-            glu_clamp_min=-7.0,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             options="--enable-tvm-ffi",
@@ -495,10 +464,6 @@ class GemmGlu(APIBase):
                 ab12_tensor: Any,
                 c_tensor: Any,
                 alpha: float,
-                linear_offset: float,
-                geglu_alpha: float,
-                glu_clamp_max: float,
-                glu_clamp_min: float,
                 stream: cuda.CUstream,
             ) -> None:
                 _compiled_kernel(
@@ -507,10 +472,6 @@ class GemmGlu(APIBase):
                     ab12_tensor,
                     c_tensor,
                     alpha,
-                    linear_offset,
-                    geglu_alpha,
-                    glu_clamp_max,
-                    glu_clamp_min,
                     stream,
                 )
 
@@ -528,10 +489,6 @@ class GemmGlu(APIBase):
                 sfc_tensor: Optional[Any],
                 norm_const_tensor: Optional[Any],
                 alpha: float,
-                linear_offset: float,
-                geglu_alpha: float,
-                glu_clamp_max: float,
-                glu_clamp_min: float,
                 stream: cuda.CUstream,
             ) -> None:
                 amax_tensor = self._unpad_tensor_to_ndim(amax_tensor, 1, "amax")
@@ -547,10 +504,6 @@ class GemmGlu(APIBase):
                     sfc_tensor,
                     norm_const_tensor,
                     alpha,
-                    linear_offset,
-                    geglu_alpha,
-                    glu_clamp_max,
-                    glu_clamp_min,
                     stream,
                 )
 
@@ -571,13 +524,8 @@ class GemmGlu(APIBase):
         norm_const_tensor: Optional[Any] = None,
         alpha: float = 1.0,
         current_stream: Optional[cuda.CUstream] = None,
-        linear_offset: Optional[float] = None,
-        geglu_alpha: float = 1.702,
-        glu_clamp_max: float = 7.0,
-        glu_clamp_min: float = -7.0,
     ) -> None:
         self._logger.debug("Entering execute")
-        linear_offset = resolve_linear_offset(self.act_func, linear_offset)
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
             # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
@@ -585,7 +533,7 @@ class GemmGlu(APIBase):
 
         self._runtime_error_if(
             self._compiled_kernel is None,
-            "GemmGlu kernel not compiled; call compile() first",
+            "GemmSwigluSm100 kernel not compiled; call compile() first",
         )
         self._logger.debug("Executing with compiled kernel")
 
@@ -596,10 +544,6 @@ class GemmGlu(APIBase):
                 ab12_tensor=ab12_tensor,
                 c_tensor=c_tensor,
                 alpha=alpha,
-                linear_offset=linear_offset,
-                geglu_alpha=geglu_alpha,
-                glu_clamp_max=glu_clamp_max,
-                glu_clamp_min=glu_clamp_min,
                 stream=current_stream,
             )
         elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
@@ -614,10 +558,6 @@ class GemmGlu(APIBase):
                 sfc_tensor=sfc_tensor,
                 norm_const_tensor=norm_const_tensor,
                 alpha=alpha,
-                linear_offset=linear_offset,
-                geglu_alpha=geglu_alpha,
-                glu_clamp_max=glu_clamp_max,
-                glu_clamp_min=glu_clamp_min,
                 stream=current_stream,
             )
         else:
@@ -629,10 +569,10 @@ class GemmGlu(APIBase):
 import logging
 
 _logger = logging.getLogger(__name__)
-glu_plan_cache = {}
+_cache_of_GemmSwigluSm100Objects = {}
 
 
-def gemm_glu_forward(
+def gemm_swiglu_wrapper_sm100(
     a_tensor: Any,
     b_tensor: Any,
     alpha: float = 1.0,
@@ -650,39 +590,9 @@ def gemm_glu_forward(
     vector_f32: bool = False,
     ab12_stages: int = 4,
     stream: Optional[cuda.CUstream] = None,
-    act_func: str = "swiglu",
-    linear_offset: Optional[float] = None,
-    geglu_alpha: float = 1.702,
-    glu_clamp_max: float = 7.0,
-    glu_clamp_min: float = -7.0,
 ) -> TupleDict:
-    """Dense GEMM fused with a GLU activation on SM100+.
 
-    Computes ``AB12 = alpha * A @ B^T`` and ``C = act(up, gate)``, where ``up`` and
-    ``gate`` are the alternating 32-column blocks of AB12. A is (M, K, L), B is
-    (N, K, L); torch tensors or JAX arrays. Passing ``sfa_tensor``/``sfb_tensor``
-    selects the block-scaled (MXFP8/NVFP4) kernel.
-
-    Args:
-        act_func: ``"swiglu"`` (``up * gate * sigmoid(gate)``) or ``"geglu"``.
-            ``"situglu"`` is not supported by the dense kernels.
-        linear_offset: GeGLU offset on the up branch. ``None`` picks ``1.0`` for
-            ``"geglu"`` and ``0.0`` for ``"swiglu"``. Ignored for ``"swiglu"``.
-        geglu_alpha: GeGLU pre-sigmoid scale. The activation is
-            ``(clamp(up, glu_clamp_min, glu_clamp_max) + linear_offset)
-            * gate_clamped * sigmoid(geglu_alpha * gate_clamped)`` with
-            ``gate_clamped = min(gate, glu_clamp_max)``. Ignored for ``"swiglu"``.
-        glu_clamp_max: GeGLU upper clamp on gate and up. Ignored for ``"swiglu"``.
-        glu_clamp_min: GeGLU lower clamp on up only. Ignored for ``"swiglu"``.
-
-    ``linear_offset``, ``geglu_alpha`` and the clamps are runtime parameters and
-    not part of the kernel cache key. AB12 always holds the unclamped GEMM output.
-
-    Returns:
-        TupleDict ``(ab12_tensor, c_tensor, sfc_tensor, amax_tensor)``.
-    """
-    check_act_func(act_func)
-    _logger.debug("gemm_glu_forward: Creating empty output tensors ab12 and c")
+    _logger.debug("gemm_swiglu_wrapper_sm100: Creating empty output tensors ab12 and c")
     framework = detect_framework(a_tensor)
     ab12_dtype = _convert_to_cutlass_data_type(ab12_dtype)
     c_dtype = _convert_to_cutlass_data_type(c_dtype)
@@ -712,9 +622,9 @@ def gemm_glu_forward(
             )
 
         if is_quantized:
-            _logger.debug("gemm_glu_forward: Detected sfa_tensor and sfb_tensor, constructing quantized output tensors")
+            _logger.debug("gemm_swiglu_wrapper_sm100: Detected sfa_tensor and sfb_tensor, constructing quantized output tensors")
             if c_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}:
-                _logger.debug("gemm_glu_forward: Detected fp8 c_dtype, constructing sfc_tensor")
+                _logger.debug("gemm_swiglu_wrapper_sm100: Detected fp8 c_dtype, constructing sfc_tensor")
 
                 sf_k = ceil_div(n // 2, sf_vec_size)
                 mma_shape = (
@@ -732,7 +642,7 @@ def gemm_glu_forward(
                     device=a_tensor.device,
                 ).permute(mma_permute_order)
             if ab_cutlass_dtype in {cutlass.Float4E2M1FN, cutlass.Uint8} and c_dtype is cutlass.BFloat16:
-                _logger.debug("gemm_glu_forward: Detected fp4 ab_dtype and bf16 c_dtype, constructing amax_tensor")
+                _logger.debug("gemm_swiglu_wrapper_sm100: Detected fp4 ab_dtype and bf16 c_dtype, constructing amax_tensor")
                 amax_tensor = torch.full((1, 1, 1), -float("inf"), device=a_tensor.device, dtype=torch.float32)
     elif framework == "jax":
         import jax
@@ -764,7 +674,7 @@ def gemm_glu_forward(
         # finished materializing them before the kernel runs.
         jax.block_until_ready(outputs_to_sync)
     else:
-        raise ValueError(f"Unsupported tensor framework '{framework}' for gemm_glu_forward; pass torch tensors or JAX arrays")
+        raise ValueError(f"Unsupported tensor framework '{framework}' for gemm_swiglu_wrapper_sm100; pass torch tensors or JAX arrays")
 
     cache_key = (
         get_shape(a_tensor),
@@ -792,12 +702,11 @@ def gemm_glu_forward(
         sf_vec_size,
         vector_f32,
         ab12_stages,
-        act_func,
     )
-    if cache_key in glu_plan_cache:
-        _logger.debug("gemm_glu_forward: Using previously cached GemmGlu object")
-        gemm_glu = glu_plan_cache[cache_key]
-        gemm_glu.execute(
+    if cache_key in _cache_of_GemmSwigluSm100Objects:
+        _logger.debug("gemm_swiglu_wrapper_sm100: Using previously cached GemmSwigluSm100 object")
+        gemm_swiglu = _cache_of_GemmSwigluSm100Objects[cache_key]
+        gemm_swiglu.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
             ab12_tensor=ab12_tensor,
@@ -809,14 +718,10 @@ def gemm_glu_forward(
             norm_const_tensor=norm_const_tensor,
             alpha=alpha,
             current_stream=stream,
-            linear_offset=linear_offset,
-            geglu_alpha=geglu_alpha,
-            glu_clamp_max=glu_clamp_max,
-            glu_clamp_min=glu_clamp_min,
         )
     else:
-        _logger.debug("gemm_glu_forward: No previously cached GemmGlu object found, creating new GemmGlu object")
-        gemm_glu = GemmGlu(
+        _logger.debug("gemm_swiglu_wrapper_sm100: No previously cached GemmSwigluSm100 object found, creating new GemmSwigluSm100 object")
+        gemm_swiglu = GemmSwigluSm100(
             sample_a=a_tensor,
             sample_b=b_tensor,
             sample_ab12=ab12_tensor,
@@ -833,11 +738,10 @@ def gemm_glu_forward(
             sf_vec_size=sf_vec_size,
             vector_f32=vector_f32,
             ab12_stages=ab12_stages,
-            act_func=act_func,
         )
-        assert gemm_glu.check_support(), "Unsupported testcase"
-        gemm_glu.compile()
-        gemm_glu.execute(
+        assert gemm_swiglu.check_support(), "Unsupported testcase"
+        gemm_swiglu.compile()
+        gemm_swiglu.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
             ab12_tensor=ab12_tensor,
@@ -849,12 +753,8 @@ def gemm_glu_forward(
             norm_const_tensor=norm_const_tensor,
             alpha=alpha,
             current_stream=stream,
-            linear_offset=linear_offset,
-            geglu_alpha=geglu_alpha,
-            glu_clamp_max=glu_clamp_max,
-            glu_clamp_min=glu_clamp_min,
         )
-        glu_plan_cache[cache_key] = gemm_glu
+        _cache_of_GemmSwigluSm100Objects[cache_key] = gemm_swiglu
 
     return TupleDict(
         ab12_tensor=ab12_tensor,

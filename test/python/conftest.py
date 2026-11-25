@@ -685,11 +685,11 @@ def pytest_addoption(parser):
     parser.addoption("--dsa-topk", action="store", default=None, type=int, help="[DSA] Top-K count")
     parser.addoption("--dsa-ratio", action="store", default=None, type=int, help="[DSA] Indexer compression ratio")
 
-    # GEMM GLU command line options for test_gemm_glu.py
-    parser.addoption("--gemm-glu-mnkl", action="store", default=None, type=str, help="[test_gemm_glu.py] M,N,K,L dimensions as comma-separated values (e.g., '256,256,512,1')")
-    parser.addoption("--gemm-glu-mma-tiler", action="store", default=None, type=str, help="[test_gemm_glu.py] MMA tiler (M,N) dimensions as comma-separated values (e.g., '128,128')")
-    parser.addoption("--gemm-glu-cluster-shape", action="store", default=None, type=str, help="[test_gemm_glu.py] Cluster shape (M,N) dimensions as comma-separated values (e.g., '1,1')")
-    parser.addoption("--gemm-glu-alpha", action="store", default=None, type=float, help="[test_gemm_glu.py] Alpha scaling factor")
+    # GEMM SwiGLU command line options for test_gemm_swiglu.py
+    parser.addoption("--gemm-swiglu-mnkl", action="store", default=None, type=str, help="[test_gemm_swiglu.py] M,N,K,L dimensions as comma-separated values (e.g., '256,256,512,1')")
+    parser.addoption("--gemm-swiglu-mma-tiler", action="store", default=None, type=str, help="[test_gemm_swiglu.py] MMA tiler (M,N) dimensions as comma-separated values (e.g., '128,128')")
+    parser.addoption("--gemm-swiglu-cluster-shape", action="store", default=None, type=str, help="[test_gemm_swiglu.py] Cluster shape (M,N) dimensions as comma-separated values (e.g., '1,1')")
+    parser.addoption("--gemm-swiglu-alpha", action="store", default=None, type=float, help="[test_gemm_swiglu.py] Alpha scaling factor")
 
     # GEMM Amax command line options for test_gemm_amax.py
     parser.addoption("--gemm-amax-mnkl", action="store", default=None, type=str, help="[test_gemm_amax.py] M,N,K,L dimensions as comma-separated values (e.g., '512,256,256,1')")

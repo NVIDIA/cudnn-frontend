@@ -21,7 +21,7 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 
 *   **[FROST GEMM engine](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/frost):** JIT-compiled Blackwell GEMM engine reachable through the ordinary `cudnn.pygraph` API — matmul, grouped (MoE) matmul, block-scaled FP4/FP8, and chained pointwise epilogues are fused into one kernel from the graph you already built. Opt in with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`; it is then a candidate for every matmul graph it can serve, ranked against the backend's own plans.
 *   **[GEMM + Amax](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/dense/amax):** Optimized FP8 matrix multiplication with absolute maximum calculation.
-*   **[GEMM + GLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/dense/glu):** High-performance implementation of the SwiGLU / GeGLU activation fused with GEMM.
+*   **[GEMM + SwiGLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/dense/swiglu):** High-performance implementation of the SwiGLU activation fused with GEMM.
 *   **[GEMM + sReLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/dense/srelu):** High-performance implementation of squared-ReLU fused with GEMM.
 *   **[GEMM + dsReLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/dense/dsrelu):** High-performance implementation of dsquared-ReLU fused with GEMM.
 *   **[Grouped GEMM (BF16)](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/grouped/unfused):** Unfused BF16 grouped GEMM with dense and discrete MoE weight layouts.
