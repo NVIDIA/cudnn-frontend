@@ -4831,6 +4831,21 @@ passed their sampled interval oracle checks, but the SSH session closed
 before the full pytest summary. Full SM90 qualification of this change is
 unverified.
 
+In the revision after `ceab650c`, FP32 selection can reuse a spilled
+candidate buffer at K=2048 when an effective row has at least 16,384 columns
+and every candidate survives the current radix digit. Twelve L0 cases
+check a zero-based prefix or a nonzero start, all three tie policies, and
+both deterministic settings. They include retention across consecutive
+digits, retention after filtering onto the other buffer, and rows on
+both sides of the length threshold. The warmed refill test halves the
+candidate set in each of the first three exact radix passes.
+
+The same command above on B300 reported 200 passed, 9 SM120/121 skips
+and 6 deselected. All three golden files matched, and the refill stress
+observed zero differences in 128 warm and 128 poisoned launches. The B300
+pooled selector regression reported 17 passed and 95 deselected. This
+revision was unverified on SM90 because the GPU session was unavailable.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
