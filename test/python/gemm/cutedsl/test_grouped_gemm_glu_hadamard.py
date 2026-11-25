@@ -895,13 +895,13 @@ def _build_srelu_option_case(request, *, c_dtype=torch.bfloat16, d_dtype=torch.b
     return inputs, cfg
 
 
-def _run_srelu_option_case(case, **wrapper_kwargs):
-    """Run the wrapper over an already-built case, so repeated calls share identical inputs."""
+def _launch_srelu_option_case(case, **wrapper_kwargs):
+    """Launch the wrapper over an already-built case without waiting for the kernel."""
     from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
 
     inputs, cfg = case
     wrapper_kwargs.setdefault("act_func", "srelu")
-    outputs = grouped_gemm_glu_hadamard_wrapper_sm100(
+    return grouped_gemm_glu_hadamard_wrapper_sm100(
         a_tensor=inputs["a_tensor"],
         b_tensor=inputs["b_tensor"],
         sfa_tensor=inputs["sfa_tensor"],
@@ -920,6 +920,11 @@ def _run_srelu_option_case(case, **wrapper_kwargs):
         m_aligned=cfg["m_aligned"],
         **wrapper_kwargs,
     )
+
+
+def _run_srelu_option_case(case, **wrapper_kwargs):
+    """Run the wrapper over an already-built case, so repeated calls share identical inputs."""
+    outputs = _launch_srelu_option_case(case, **wrapper_kwargs)
     torch.cuda.synchronize()
     return outputs
 
@@ -1134,6 +1139,46 @@ def test_grouped_gemm_glu_hadamard_srelu_options_replay(request, use_tmem_post_r
         return {name: outputs[name] for name in ("c_tensor", "d_tensor", "amax_tensor", "post_rht_amax_tensor")}
 
     assert_replays(run)
+
+
+TMEM_POST_RHT_AMAX_REPEATS = 64
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("act_func", ["swiglu", "srelu"])
+def test_grouped_gemm_glu_hadamard_tmem_post_rht_amax_matches_smem_repeated(request, act_func):
+    """The TMEM post-RHT amax equals the shared-memory path, bit for bit, on every back-to-back launch.
+
+    In the TMEM path the Hadamard MMA's A operand and accumulator share TMEM columns, and both
+    CTAs of the pair hand them over through mbarriers twice per subtile. A missing or aliased
+    handoff shows up as an MMA on a stale operand or a read of an overwritten accumulator, which
+    changes the amax (or hangs). Prob leaves each expert's amax to a few tokens so that a single
+    misread round is visible, and the launches are queued without host synchronization.
+    """
+    case = _build_srelu_option_case(request)
+    inputs, _ = case
+    prob = inputs["prob_tensor"]
+    spiky = torch.full_like(prob, 1.0 / 64)
+    spiky[::97] = 1.0
+    prob.copy_(spiky)
+
+    smem = _run_srelu_option_case(case, act_func=act_func, use_tmem_post_rht_amax=False)
+    tmem = _run_srelu_option_case(case, act_func=act_func, use_tmem_post_rht_amax=True)
+    for name in ("c_tensor", "d_tensor", "amax_tensor", "post_rht_amax_tensor"):
+        _assert_same_bytes(tmem[name], smem[name], f"{name}: TMEM vs shared-memory post-RHT amax path")
+    _, d, _ = _stored_cd_prob(inputs, tmem)
+    _assert_post_rht_amax(inputs, tmem, d)
+
+    want = smem["post_rht_amax_tensor"].cpu()
+    launches = [
+        _launch_srelu_option_case(case, act_func=act_func, use_tmem_post_rht_amax=True)["post_rht_amax_tensor"] for _ in range(TMEM_POST_RHT_AMAX_REPEATS)
+    ]
+    torch.cuda.synchronize()
+    wrong = [i for i, got in enumerate(launches) if not torch.equal(bitwise_bits(got.cpu()), bitwise_bits(want))]
+    assert (
+        not wrong
+    ), f"{len(wrong)}/{len(launches)} launches returned a different post-RHT amax, first at launch {wrong[0]}: {launches[wrong[0]].reshape(-1).tolist()} != {want.reshape(-1).tolist()}"
 
 
 @pytest.mark.L0
