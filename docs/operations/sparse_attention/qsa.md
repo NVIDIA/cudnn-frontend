@@ -63,7 +63,7 @@ Choose an entry by its input and saved-state contract:
 | Need | Entry point | Contract |
 |---|---|---|
 | Packed training with a block-selection bitmap | `cudnn.ops.qsa_forward`, `qsa_backward` | The bitmap API documented on this page; 24Q/2KV, 12Q/1KV or 6Q/1KV |
-| Packed training with selected token IDs | `cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward` ([docs](/operations/sparse_attention/qsa/qsa_indexed), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md)) | 12Q/1KV or 6Q/1KV on SM100/SM103/SM107; shares the QSA attention kernels |
+| Packed training with selected token IDs | `cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward` ([docs](/operations/sparse_attention/qsa/qsa_indexed), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md)) | 24Q/2KV, 12Q/1KV or 6Q/1KV on SM100/SM103/SM107; shares the QSA attention kernels |
 | Generate selected blocks from indexer Q and compressed K | `cudnn.ops.qsa_select_forward`, `qsa_select_decode_forward` | QSA selector over the shared DSA scorer and top-k; returns local block IDs, not token IDs |
 | Decode selection over a paged compressed-key cache | `cudnn.ops.qsa_select_decode_paged_forward` | BF16 indexer cache; see the paged selector's architecture and layout requirements in its docstring |
 | Integrated projection, compression, selection and attention | `GatedAttentionBlockFwd` with `QsaSpec(index_source="indexer")` ([docs](/operations/Attention/gated_attention_block), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/attention/gated_attention_block.md)) | Use the integrated block's own architecture, layout and inference support matrix |

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Packed 12:1 and 6:1 QSA from four-token groups, without a quadratic bitmap."""
+"""Packed 24:2, 12:1 and 6:1 QSA from four-token groups, without a quadratic bitmap."""
 
 from functools import lru_cache
 import importlib
@@ -12,18 +12,18 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn._torch_stream import stream_context
-from cudnn.QSA._contract import check_tensor
+from cudnn.QSA._contract import HEAD_GEOMETRIES, check_tensor
 
-QUERY_HEADS = (6, 12)  # per single KV head: the four-way and two-way tensor-parallel shards of the 24Q/2KV model
+KV_HEADS = dict(HEAD_GEOMETRIES)  # query heads -> KV heads
 
 
 def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None, cu_seqlens=None):
     if not isinstance(q, torch.Tensor) or not q.is_cuda or q.ndim != 3:
         raise ValueError("q must be a CUDA tensor with shape [T, Hq, 256]")
     total, hq = q.shape[0], q.shape[1]
-    if total < 1 or hq not in QUERY_HEADS or q.shape[2] != 256 or q.numel() > 2**31 - 1:
-        raise NotImplementedError("Indexed QSA requires T > 0, 12Q/1KV or 6Q/1KV, D256 and T * Hq * 256 <= INT32_MAX")
-    for name, tensor, heads in (("q", q, hq), ("k", k, 1), ("v", v, 1)):
+    if total < 1 or hq not in KV_HEADS or q.shape[2] != 256 or q.numel() > 2**31 - 1:
+        raise NotImplementedError("Indexed QSA requires T > 0, 24Q/2KV, 12Q/1KV or 6Q/1KV, D256 and T * Hq * 256 <= INT32_MAX")
+    for name, tensor, heads in (("q", q, hq), ("k", k, KV_HEADS[hq]), ("v", v, KV_HEADS[hq])):
         check_tensor(name, tensor, (total, heads, 256), torch.bfloat16, q.device, 16)
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale):
         raise ValueError("scale must be a finite host scalar")
@@ -48,7 +48,7 @@ class _QsaIndexedPlan(APIBase):
     """Immutable geometry and compiled kernels. Execute uses caller storage only.
 
     The backward runs the dense-prefix and two-pass launch sequence of ``cudnn.QSA._backward`` behind the per-query
-    compaction, for 12 or 6 query heads per KV head, with the documents of a packed buffer described by ``cu_seqlens``
+    compaction, for 12 or 6 query heads per KV head and one or two KV heads, with the documents of a packed buffer described by ``cu_seqlens``
     when the caller has them.
     """
 
@@ -56,6 +56,7 @@ class _QsaIndexedPlan(APIBase):
         with torch.cuda.device(device):
             super().__init__()
         self.total, self.width, self.device, self.direction, self.hq = total, width, device, direction, hq
+        self.hkv = KV_HEADS[hq]
         self.num_seqs = num_seqs
         self.max_seq_len = max_seq_len
         self.deterministic = deterministic
@@ -92,7 +93,9 @@ class _QsaIndexedPlan(APIBase):
                     "Indexed QSA backward requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.7.0' with a CUDA 13 compatible driver"
                 )
             mode = engine.SEQ_CU if self.num_seqs else engine.SEQ_SINGLE
-            self.engine_plan = engine.plan_for(self.total, self.device, 1, mode, max(self.num_seqs, 1), self.hq, self.max_seq_len, self.deterministic)
+            self.engine_plan = engine.plan_for(
+                self.total, self.device, self.hkv, mode, max(self.num_seqs, 1), self.hq // self.hkv, self.max_seq_len, self.deterministic
+            )
             self.workspace_bytes += self.engine_plan.workspace_bytes()
         self._is_supported = True
         return True
@@ -108,10 +111,10 @@ class _QsaIndexedPlan(APIBase):
             self._metadata = _metadata.compile_metadata(self.arch, self.width // 4)
             if self.direction == "fprop":
                 module = "fprop_sm100"
-                if self.arch == 107 and self.total >= 32768 and self.hq == 12:
+                if self.arch == 107 and self.total >= 32768 and self.hq == 12 * self.hkv:
                     module = "fprop_n64_sm107"  # specialised for 12 heads per KV head
                 self.impl = importlib.import_module(f"cudnn.QSA.kernels.{module}")
-                self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, self.hq, 1, self.arch)
+                self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, self.hq, self.hkv, self.arch)
             else:
                 from cudnn.QSA import _backward as engine
 
