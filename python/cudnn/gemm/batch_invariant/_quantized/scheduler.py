@@ -166,8 +166,6 @@ class TileScheduler:
         r = idx
         if cutlass.const_expr(not p.static_l1):
             l, r = divmod(idx, p.fdd_l)
-        sl = Int32(0)
-        f = Int32(0)
         if cutlass.const_expr(p.swizzle == 1):
             f, sl = divmod(r, p.fdd_S)
         else:

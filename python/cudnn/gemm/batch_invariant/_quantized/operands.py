@@ -16,7 +16,8 @@ import cutlass.utils as utils
 
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .arithmetic import MMA_K_BLOCKS, Knobs
+from .._knobs import Knobs
+from .arithmetic import MMA_K_BLOCKS
 
 ACC_DTYPE = cutlass.Float32
 IN_DT = {

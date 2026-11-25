@@ -28,8 +28,9 @@ from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from cudnn.frost.tile_dsl.barrier import named_barrier_sync_unaligned
 
+from .._formats import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC
 from .._knobs import BREUSE_FMTS, Knobs
-from .arithmetic import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC, CuteF32, EpilogueChain, MainloopBlock
+from .arithmetic import CuteF32, EpilogueChain, MainloopBlock
 from .epilogue import apply_chain_pre_cvt, epilogue_loop
 from .operands import (
     ACC_DTYPE,
@@ -94,7 +95,8 @@ class BlockScaledPlan:
     A_TMA_INTERNAL = None
     B_TMA_INTERNAL = None
 
-    def make_tiled_mma(self, cta_group, tile_mn, breuse: bool = False, b_collector=None):
+    @classmethod
+    def make_tiled_mma(cls, cta_group, tile_mn, breuse: bool = False, b_collector=None):
         """The instruction (the A2 surface, ``Knobs.instruction(IN_FMT)``): the sm_100 block-scaled op the library selects
         for the plan's operand / scale formats (``kind::mxf8f6f4`` K = 32 for e4m3 with 32-wide UE8M0 scales). ``breuse`` /
         ``b_collector`` (the B-reuse record: two instructions of half the tile's M per K step through the collector
@@ -102,18 +104,19 @@ class BlockScaledPlan:
         assert not breuse and b_collector is None, "B-reuse needs the sm_107 instruction's collector buffer"
         kmaj = cute.nvgpu.OperandMajorMode.K
         return utils.sm100.make_blockscaled_trivial_tiled_mma(
-            self.A_DT,
-            self.B_DT,
+            cls.A_DT,
+            cls.B_DT,
             kmaj,
             kmaj,
-            self.SF_DT,
-            self.SF_VEC,
+            cls.SF_DT,
+            cls.SF_VEC,
             cta_group,
             tile_mn,
         )
 
-    def epilogue_tile(self):
-        return utils.sm100.compute_epilogue_tile_shape(self.cta_tile_shape_mnk, self.use_2cta_instrs, self.c_layout, self.c_dtype)
+    @staticmethod
+    def epilogue_tile(_tiled_mma, cta_tile_shape_mnk, use_2cta_instrs, c_layout, c_dtype):
+        return utils.sm100.compute_epilogue_tile_shape(cta_tile_shape_mnk, use_2cta_instrs, c_layout, c_dtype)
 
     def sf_tmem_cols(self):
         """TMEM columns of one stage of SFA and of SFB, from the TMEM layouts: a TMEM address is ``row << 16 | col``, so the
@@ -124,7 +127,8 @@ class BlockScaledPlan:
         sfb = cute.cosize(cute.recast_layout(32, self.SF_DT.width, self.tCtSFB_layout)) & 0xFFFF
         return sfa, sfb
 
-    def tmem_alloc_cols(self, need: int) -> int:
+    @staticmethod
+    def tmem_alloc_cols(need: int) -> int:
         return max(32, _pow2ceil(need))
 
     def __init__(self, knobs: Knobs, c_dtype, c_layout, cta_chunks: bool = False):
@@ -155,11 +159,12 @@ class BlockScaledPlan:
         assert not self.breuse or self.IN_FMT in BREUSE_FMTS, (self.IN_FMT, knobs)
         # the instruction variant (A2 surface): kind::mxf8f6f4.block_scale, K = 32 (sm_100 op) or 64 (sm_107 op), SF UE8M0 / 32,
         # cta_group 1/2, tile MxN
-        self.tiled_mma = self.make_tiled_mma(self.cta_group, knobs.mma_tiler_mn, self.breuse)
+        format_cls = type(self)
+        self.tiled_mma = format_cls.make_tiled_mma(self.cta_group, knobs.mma_tiler_mn, self.breuse)
         self.tiled_mma_bkeep = self.tiled_mma_breuse = None
         if self.breuse:
-            self.tiled_mma_bkeep = self.make_tiled_mma(self.cta_group, knobs.mma_tiler_mn, True, tcgen05.CollectorOp.FILL)
-            self.tiled_mma_breuse = self.make_tiled_mma(self.cta_group, knobs.mma_tiler_mn, True, tcgen05.CollectorOp.LASTUSE)
+            self.tiled_mma_bkeep = format_cls.make_tiled_mma(self.cta_group, knobs.mma_tiler_mn, True, tcgen05.CollectorOp.FILL)
+            self.tiled_mma_breuse = format_cls.make_tiled_mma(self.cta_group, knobs.mma_tiler_mn, True, tcgen05.CollectorOp.LASTUSE)
         inst_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
         assert inst_k == self.block.step, (inst_k, self.block.step)
         self.atom_thr_size = cute.size(self.tiled_mma.thr_id.shape)
@@ -178,7 +183,7 @@ class BlockScaledPlan:
         # instruction's per-CTA M: 128 rows, half of a 2-CTA instruction, whatever the tile's M)
         self.sfb_tile_n = -(-tn // SF_ATOM_ROWS) * SF_ATOM_ROWS
         sfb_m = knobs.inst_m // self.atom_thr_size
-        self.tiled_mma_sfb = self.make_tiled_mma(tcgen05.CtaGroup.ONE, (sfb_m, self.sfb_tile_n))
+        self.tiled_mma_sfb = format_cls.make_tiled_mma(tcgen05.CtaGroup.ONE, (sfb_m, self.sfb_tile_n))
         self.mma_tiler_sfb = (sfb_m, self.sfb_tile_n, self.mma_tiler[2])
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*knobs.cluster_shape_mn, 1)),
@@ -194,7 +199,7 @@ class BlockScaledPlan:
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
         self.is_sfb_mcast = self.num_mcast_ctas_sfb > 1
-        self.epi_tile = self.epilogue_tile()
+        self.epi_tile = format_cls.epilogue_tile(self.tiled_mma, self.cta_tile_shape_mnk, self.use_2cta_instrs, c_layout, c_dtype)
         self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
         # the in-cluster split's mailbox: (cluster_k - 1) fp32 tiles (one slot per peer) and one mbarrier per epilogue subtile
         self.subtile_elems = cute.size(self.epi_tile[0]) * cute.size(self.epi_tile[1])
@@ -228,7 +233,7 @@ class BlockScaledPlan:
         self.sum_stage = self.num_acc_stage if n_sum else None
         self.num_tmem_stages = self.num_acc_stage + n_sum
         self.num_acc_tmem_cols = acc_cols * self.num_tmem_stages
-        self.num_tmem_alloc_cols = self.tmem_alloc_cols(self.num_acc_tmem_cols + self.num_sfa_tmem_cols + self.num_sfb_tmem_cols)
+        self.num_tmem_alloc_cols = format_cls.tmem_alloc_cols(self.num_acc_tmem_cols + self.num_sfa_tmem_cols + self.num_sfb_tmem_cols)
         assert self.num_tmem_alloc_cols <= self.TMEM_COLS, (
             knobs,
             self.num_tmem_alloc_cols,
@@ -281,7 +286,8 @@ class BlockScaledPlanSM107(BlockScaledPlan):
     TMEM_ALLOC_ARCH = "sm_107"  # the allocator accepts the non-power-of-two 576 on sm_107 only
     S2T_BROADCAST = True
 
-    def make_tiled_mma(self, cta_group, tile_mn, breuse: bool = False, b_collector=None):
+    @classmethod
+    def make_tiled_mma(cls, cta_group, tile_mn, breuse: bool = False, b_collector=None):
         """The Rubin block-scaled tiled MMA at the instruction shape ``(inst_m, tn, INST_K)``. B-reuse (``breuse``: the tile's
         M is 2 x ``inst_m``, two instructions per K step): the tiled MMA spans the whole tile with ``MMA_M = 2``, permuted so
         that each CTA of the 2-CTA pair owns a contiguous half of the tile's rows (CTA 0 rows 0 .. 255, CTA 1 rows 256 ..
@@ -295,32 +301,34 @@ class BlockScaledPlanSM107(BlockScaledPlan):
             perm = (
                 cute.make_layout((inst_m // 2, 2, 2), stride=(1, inst_m, inst_m // 2)),
                 tile_mn[1],
-                self.INST_K,
+                cls.INST_K,
             )
         return rubin.make_blockscaled_trivial_tiled_mma(
-            self.A_DT,
-            self.B_DT,
+            cls.A_DT,
+            cls.B_DT,
             kmaj,
             kmaj,
-            self.SF_DT,
-            self.SF_VEC,
+            cls.SF_DT,
+            cls.SF_VEC,
             cta_group,
-            (inst_m, tile_mn[1], self.INST_K),
+            (inst_m, tile_mn[1], cls.INST_K),
             a_collector_op=tcgen05.CollectorOp.DISCARD,
             b_collector_op=tcgen05.CollectorOp.DISCARD if b_collector is None else b_collector,
             permutation_mnk=perm,
         )
 
-    def epilogue_tile(self):
+    @staticmethod
+    def epilogue_tile(tiled_mma, cta_tile_shape_mnk, use_2cta_instrs, c_layout, c_dtype):
         return rubin.compute_epilogue_tile_shape(
-            self.tiled_mma.op,
-            self.cta_tile_shape_mnk,
-            self.use_2cta_instrs,
-            self.c_layout,
-            self.c_dtype,
+            tiled_mma.op,
+            cta_tile_shape_mnk,
+            use_2cta_instrs,
+            c_layout,
+            c_dtype,
         )
 
-    def tmem_alloc_cols(self, need: int) -> int:
+    @staticmethod
+    def tmem_alloc_cols(need: int) -> int:
         """Powers of two up to 512; beyond that the whole sm_107 TMEM (576 columns, what NVIDIA's Rubin example allocates)."""
         cols = max(32, _pow2ceil(need))
         return cols if cols <= 512 else TMEM_COLS_SM107
@@ -611,7 +619,7 @@ def blockscaled_produce_ktiles(
     SFA and SFB of a k-tile. Returns the producer (loop-carried)."""
     ab_producer.reset()
     peek_empty = ab_producer.try_acquire()
-    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+    for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
         handle = ab_producer.acquire_and_advance(peek_empty)
         kt = k_tile0 + handle.count
         cute.copy(
@@ -782,9 +790,7 @@ def blockscaled_mma_fold(
     # tn < 64 (the swapped decode records): a single N tile (acceptance: all tokens fit it), so its scale factors are the
     # atom's first rows and the TMEM window needs no shift
     ab_consumer.reset()
-    peek_full = cutlass.Boolean(1)
-    if is_leader_cta:
-        peek_full = ab_consumer.try_wait()
+    peek_full = ab_consumer.try_wait() if is_leader_cta else cutlass.Boolean(1)
     if is_leader_cta:
         acc_pipeline.producer_acquire(acc_state)  # the epilogue has drained this TMEM buffer
     for k_tile in range(k_tile_cnt):  # blocks ascending (the lowering's outer loop)
@@ -897,7 +903,7 @@ def blockscaled_mma_loop(
                 tiled_mma_breuse,
             )
         else:
-            for _c in cutlass.range(0, chunks, 1, unroll=1):  # chunks ascending, each a fold from +0 into the next stage
+            for _ in cutlass.range(0, chunks, 1, unroll=1):  # chunks ascending, each a fold from +0 into the next stage
                 ab_consumer, acc_state = blockscaled_mma_fold(
                     lowering,
                     st,

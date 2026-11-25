@@ -21,7 +21,9 @@ from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 from cudnn.frost.tile_dsl.barrier import named_barrier_sync_unaligned
 from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
-from .arithmetic import BLOCK_K, SCALE_BLOCK_N, CuteF32, EpilogueChain, Knobs, MainloopBlock
+from .._formats import BLOCK_K, SCALE_BLOCK_N
+from .._knobs import Knobs
+from .arithmetic import CuteF32, EpilogueChain, MainloopBlock
 from .epilogue import apply_chain_pre_cvt
 from .mainloop import mma_fold
 from .operands import (
@@ -213,7 +215,7 @@ def blockscale_producer_loop(
                             )
                 scale_pipeline.producer_commit(scale_state)  # arrives when this lane's copies have landed
                 scale_state.advance()
-                for _j in cutlass.range_constexpr(SCALE_GROUP):  # the group's blocks: one operand stage each
+                for _ in cutlass.range_constexpr(SCALE_GROUP):  # the group's blocks: one operand stage each
                     handle = ab_producer.acquire_and_advance(peek_empty)  # operand slot empty; the leader arms the tx barrier
                     cute.copy(
                         tma_atom_a,
@@ -254,7 +256,7 @@ def blockscale_producer_loop(
                             _elem(sSFB, (lane, j, scale_state.index)),
                         )
                 scale_pipeline.producer_commit(scale_state)
-                for _j in cutlass.range(0, k_tail, 1, unroll=1):
+                for _ in cutlass.range(0, k_tail, 1, unroll=1):
                     handle = ab_producer.acquire_and_advance(peek_empty)
                     cute.copy(
                         tma_atom_a,
@@ -275,7 +277,7 @@ def blockscale_producer_loop(
                         peek_empty = ab_producer.try_acquire()
             scale_state.advance(cutlass.Int32(k_tail > 0))  # the tail's stage, when there is one
         else:
-            for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                 handle = ab_producer.acquire_and_advance(peek_empty)  # operand slot empty; the leader arms the tx barrier
                 cute.copy(
                     tma_atom_a,
@@ -446,7 +448,7 @@ def blockscale_epilogue_loop(
         if cutlass.const_expr(native_k):
             k_whole = k_tile_cnt // SCALE_GROUP  # whole groups, then a short last group
             k_tail = k_tile_cnt - k_whole * SCALE_GROUP
-            for _g in cutlass.range(0, k_whole, 1, unroll=1):  # the ring's stages: groups of SCALE_GROUP blocks
+            for _ in cutlass.range(0, k_whole, 1, unroll=1):  # the ring's stages: groups of SCALE_GROUP blocks
                 scale_pipeline.consumer_wait(scale_state)  # the group's scales are in the ring
                 a4 = _vec4(sSFA, (irow, 0, scale_state.index)).load()  # this row's four block scales: one 16-byte read
                 b4 = _vec4(sSFB, (gsel * blk_per_group, 0, scale_state.index)).load()

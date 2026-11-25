@@ -21,9 +21,8 @@ from cutlass.tensor_utils import LayoutEnum
 
 from cudnn.frost.tile_dsl.barrier import named_barrier_sync_unaligned
 
-from .arithmetic import CuteF32
-from .arithmetic import Knobs, MainloopBlock
-from .arithmetic import EpilogueChain
+from .._knobs import Knobs
+from .arithmetic import CuteF32, EpilogueChain, MainloopBlock
 from .epilogue import epilogue_loop
 from .mainloop import mma_loop
 from .operands import (

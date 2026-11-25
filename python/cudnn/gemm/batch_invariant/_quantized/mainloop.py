@@ -89,7 +89,7 @@ def mma_loop(
                 tCtAcc_base,
             )
         else:
-            for _c in cutlass.range(0, chunks, 1, unroll=1):  # chunks ascending, each a fold from +0 into the next stage
+            for _ in cutlass.range(0, chunks, 1, unroll=1):  # chunks ascending, each a fold from +0 into the next stage
                 ab_consumer, acc_state = mma_fold(
                     lowering,
                     k_tile_cnt,

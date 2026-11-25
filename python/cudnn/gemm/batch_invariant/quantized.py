@@ -18,7 +18,7 @@ from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.device import device_context
 
 from ._fixup import reduce_partials
-from ._quantized.arithmetic import ALPHA_GIVEN, BLOCK_SCALED, FP8_FMTS, MX_MIXED_FMTS
+from ._formats import ALPHA_GIVEN, BLOCK_SCALED, FP8_FMTS, MX_MIXED_FMTS
 from ._quantized.blockscale_fp8 import BlockScaleFp8Gemm
 from ._quantized.blockscaled import PLANS, BlockScaledGemm, ScaledBlockScaledGemm
 from ._quantized.blockscaled_mx_mixed import plan_for as mixed_plan_for

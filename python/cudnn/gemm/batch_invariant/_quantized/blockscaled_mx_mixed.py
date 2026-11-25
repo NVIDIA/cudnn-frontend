@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import cutlass
 
-from .arithmetic import SF_VEC, Knobs
+from .._formats import SF_VEC
+from .._knobs import Knobs
 from .blockscaled import E8M0_DTYPE, BlockScaledPlan, BlockScaledPlanSM107
 
 E4M3 = cutlass.Float8E4M3FN

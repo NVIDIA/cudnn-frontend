@@ -14,8 +14,7 @@ import cutlass.cute as cute
 from cutlass import Float32
 from cutlass.cute.math import RoundingMode
 
-from .._formats import ALPHA_GIVEN, BLOCK_K, BLOCK_SCALED, ELEM_BITS_OF, FP8_FMTS, MMA_K_OF, MX_MIXED_FMTS, SCALE_BLOCK_N, SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC
-from .._knobs import Knobs
+from .._formats import ELEM_BITS_OF, MMA_K_OF
 
 MMA_K_BLOCKS = 4
 
