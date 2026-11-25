@@ -1279,8 +1279,8 @@ def test_indexer_top_k_starts_signed_zero_cutoff(dtype, tie_break):
 @pytest.mark.L0
 @pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
 @pytest.mark.parametrize("tie_break", [0, 1, 2])
-@pytest.mark.parametrize("deterministic", [False, True])
-def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, deterministic):
+@pytest.mark.parametrize("deterministic,return_val", [(False, True), (True, True), (False, False)], ids=["values", "deterministic", "indices"])
+def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, deterministic, return_val):
     """Exercise reuse, filtering, and reuse after switching a candidate plane."""
     dsa = _import_dsa()
     width, k, rows = 32773, 2048, 156
@@ -1288,18 +1288,25 @@ def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, determini
     low = columns % 67
     common = (0x3F800000 | low).view(torch.float32)
     two_bins = (0x3F800000 | ((columns % 2) << 16) | low).view(torch.float32)
-    patterns = torch.stack((common, two_bins, common, two_bins, common, two_bins))
+    # Only the small group of ones enters refinement for this full-width row.
+    shared = torch.where(columns < k - 1, 2.0, torch.where(columns < k + 31, 1.0, 0.0))
+    patterns = torch.stack((common, two_bins, common, two_bins, common, two_bins, shared))
     order = torch.arange(rows, device="cuda") % len(patterns)
     scores = patterns[order]
-    starts_list = [3, 139, 7, 21, 5, 17] if has_starts else [0] * len(patterns)
-    ends_list = [width, width - 19, starts_list[2] + 16383, starts_list[3] + 16384, starts_list[4] + 17, starts_list[5]]
+    starts_list = [3, 139, 7, 21, 5, 17, 11] if has_starts else [0] * len(patterns)
+    ends_list = [width, width - 19, starts_list[2] + 16383, starts_list[3] + 16384, starts_list[4] + 17, starts_list[5], width]
     starts = torch.tensor(starts_list, dtype=torch.int32, device="cuda")[order]
     ends = torch.tensor(ends_list, dtype=torch.int32, device="cuda")[order]
     scores.masked_fill_((columns < starts[:, None]) | (columns >= ends[:, None]), torch.inf)
 
     def run():
-        result = dsa.indexer_top_k_wrapper(scores, ends, k, starts=starts if has_starts else None, tie_break=tie_break, deterministic=deterministic)
-        return {"indices": result["indices"], "values": result["values"]}
+        result = dsa.indexer_top_k_wrapper(
+            scores, ends, k, starts=starts if has_starts else None, tie_break=tie_break, deterministic=deterministic, return_val=return_val
+        )
+        if return_val:
+            return {"indices": result["indices"], "values": result["values"]}
+        assert result["values"] is None
+        return {"indices": result["indices"]}
 
     actual = assert_replays(run, allowed_inf={"values": -torch.inf}) if deterministic else run()
     for pattern, (start, end) in enumerate(zip(starts_list, ends_list)):
@@ -1309,20 +1316,22 @@ def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, determini
             candidates = candidates.flip(0)
         ranked = candidates[patterns[pattern, candidates].argsort(descending=True, stable=True)[:count]]
         rows_ids = actual["indices"][pattern :: len(patterns)]
-        rows_values = actual["values"][pattern :: len(patterns)]
         valid_ids = rows_ids[:, :count].long()
         assert ((valid_ids >= start) & (valid_ids < end)).all()
+        picked_values = scores[pattern :: len(patterns)].gather(1, valid_ids)
         sorted_ids = valid_ids.sort(dim=1).values
         assert (sorted_ids[:, 1:] != sorted_ids[:, :-1]).all()
         if deterministic or tie_break:
             expected_ids = ranked.sort().values.expand_as(valid_ids)
             torch.testing.assert_close(valid_ids if deterministic else sorted_ids, expected_ids, atol=0, rtol=0)
         else:
-            expected_values = patterns[pattern, ranked].sort().values.expand_as(rows_values[:, :count])
-            torch.testing.assert_close(rows_values[:, :count].sort(dim=1).values, expected_values, atol=0, rtol=0)
-        torch.testing.assert_close(rows_values[:, :count], scores[pattern :: len(patterns)].gather(1, valid_ids), atol=0, rtol=0)
+            expected_values = patterns[pattern, ranked].sort().values.expand_as(picked_values)
+            torch.testing.assert_close(picked_values.sort(dim=1).values, expected_values, atol=0, rtol=0)
         assert (rows_ids[:, count:] == -1).all()
-        assert rows_values[:, count:].isneginf().all()
+        if return_val:
+            rows_values = actual["values"][pattern :: len(patterns)]
+            torch.testing.assert_close(rows_values[:, :count], picked_values, atol=0, rtol=0)
+            assert rows_values[:, count:].isneginf().all()
 
 
 @pytest.mark.L0

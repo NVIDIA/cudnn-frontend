@@ -1199,7 +1199,12 @@ class IndexerTopKKernelVarlen:
                     self.cta_sync(s_cta_mbarrier, sync_phase)
 
             if refine_required:
-                if cutlass.const_expr(self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048) and length >= 16384:
+                reuse_spilled_planes = length >= 16384
+                if cutlass.const_expr(self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048):
+                    if cutlass.const_expr(not self.deterministic and not self.return_val and self.tie_break != 0):
+                        # The candidate set only shrinks after the coarse pass.
+                        reuse_spilled_planes = reuse_spilled_planes and s_num_input[0] > self.indexer_topk_smem_input_size
+                if cutlass.const_expr(self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048) and reuse_spilled_planes:
                     self._refine_topk_candidates(
                         score,
                         row_start,

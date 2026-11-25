@@ -4898,6 +4898,15 @@ The memcheck invocation used `-n0 -o addopts= -m L0` and recorded its
 golden to a temporary directory for comparison against the checked hashes.
 The current radix path remains unverified on cc 10.0, cc 10.7 and SM12x.
 
+The directed-tie indices-only path checks whether the coarse candidate
+set spilled before entering the reuse path. The L0 spill suite adds six
+indices-only cases and includes a full-width row whose cutoff candidates
+fit in shared memory alongside rows that spill. The independent interval
+reference checks selection in either bounds mode for each tie policy.
+L20X and B300 each reported 249 passed, 9 SM120/121 skips and 6
+deselected with the same L0/L1 command and binding build. Memcheck
+reported zero errors in all 18 spill and shared-candidate cases per GPU.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
