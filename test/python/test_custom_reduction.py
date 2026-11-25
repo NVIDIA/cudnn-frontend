@@ -657,7 +657,6 @@ def test_custom_reduction_docs_argmax_executes(cudnn_handle):
 
     # Values in a small integer range, so most rows hold their maximum more than once.
     x_cpu = ((torch.arange(4 * 64 * 8).view(4, 64, 8) * 37) % 23).to(torch.float32)
-    idx_cpu = torch.arange(64, dtype=torch.int32).view(1, 64, 1).expand(4, 64, 8).contiguous()
     expected = torch.argmax(x_cpu, dim=1, keepdim=True).to(torch.int32)
 
     graph = cudnn.pygraph(
@@ -667,8 +666,9 @@ def test_custom_reduction_docs_argmax_executes(cudnn_handle):
         compute_data_type=cudnn.data_type.FLOAT,
     )
     x = graph.tensor(dim=list(x_cpu.shape), stride=list(x_cpu.stride()), data_type=cudnn.data_type.FLOAT, name="X")
-    idx = graph.tensor(dim=list(idx_cpu.shape), stride=list(idx_cpu.stride()), data_type=cudnn.data_type.INT32, name="IDX")
-    # The argmax example of docs/operations/CustomReduction.md.
+    # The argmax example of docs/operations/CustomReduction.md: the graph makes the index stream along dimension 1.
+    idx = graph.gen_index(x, axis=1, compute_data_type=cudnn.data_type.INT32)
+    idx.set_data_type(cudnn.data_type.INT32)
     value, index = graph.custom_reduction(
         [x, idx],
         reduction_dims=[1],
@@ -677,11 +677,11 @@ def test_custom_reduction_docs_argmax_executes(cudnn_handle):
     index.set_output(True)
     graph.build([cudnn.heur_mode.A])
 
-    x_gpu, idx_gpu = x_cpu.cuda(), idx_cpu.cuda()
+    x_gpu = x_cpu.cuda()
     index_gpu = torch.full(list(expected.shape), -1, dtype=torch.int32, device="cuda")
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     torch.cuda.synchronize()
-    graph.execute({x: x_gpu, idx: idx_gpu, index: index_gpu}, workspace, handle=cudnn_handle)
+    graph.execute({x: x_gpu, index: index_gpu}, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
     assert torch.equal(index_gpu.cpu(), expected)
 
@@ -702,7 +702,6 @@ def test_custom_reduction_plan_serialize_roundtrip(cudnn_handle):
         return argmax["reducer"](child, lhs, rhs)
 
     x_cpu = ((torch.arange(4 * 64 * 8).view(4, 64, 8) * 37) % 23).to(torch.float32)
-    idx_cpu = torch.arange(64, dtype=torch.int32).view(1, 64, 1).expand(4, 64, 8).contiguous()
     expected = torch.argmax(x_cpu, dim=1, keepdim=True).to(torch.int32)
 
     graph = cudnn.pygraph(
@@ -712,7 +711,8 @@ def test_custom_reduction_plan_serialize_roundtrip(cudnn_handle):
         compute_data_type=cudnn.data_type.FLOAT,
     )
     x = graph.tensor(dim=list(x_cpu.shape), stride=list(x_cpu.stride()), data_type=cudnn.data_type.FLOAT, name="X")
-    idx = graph.tensor(dim=list(idx_cpu.shape), stride=list(idx_cpu.stride()), data_type=cudnn.data_type.INT32, name="IDX")
+    idx = graph.gen_index(x, axis=1, compute_data_type=cudnn.data_type.INT32)
+    idx.set_data_type(cudnn.data_type.INT32)
     _, index = graph.custom_reduction(
         [x, idx],
         counted_argmax,
@@ -723,11 +723,11 @@ def test_custom_reduction_plan_serialize_roundtrip(cudnn_handle):
     index.set_output(True)
     graph.build([cudnn.heur_mode.A])
 
-    x_gpu, idx_gpu = x_cpu.cuda(), idx_cpu.cuda()
+    x_gpu = x_cpu.cuda()
     original = torch.full(list(expected.shape), -1, dtype=torch.int32, device="cuda")
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     torch.cuda.synchronize()
-    graph.execute({x: x_gpu, idx: idx_gpu, index: original}, workspace, handle=cudnn_handle)
+    graph.execute({x: x_gpu, index: original}, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
     assert torch.equal(original.cpu(), expected)
 
@@ -742,7 +742,7 @@ def test_custom_reduction_plan_serialize_roundtrip(cudnn_handle):
         restored = torch.full(list(expected.shape), -1, dtype=torch.int32, device="cuda")
         restored_workspace = torch.empty(restored_graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
         torch.cuda.synchronize()
-        restored_graph.execute({x: x_gpu, idx: idx_gpu, index: restored}, restored_workspace, handle=restored_handle)
+        restored_graph.execute({x: x_gpu, index: restored}, restored_workspace, handle=restored_handle)
         torch.cuda.synchronize()
     finally:
         cudnn.destroy_handle(restored_handle)
@@ -1561,23 +1561,24 @@ def _arg_graph(cudnn_handle, torch, x, index_type, kind, rule, output="index"):
         compute_data_type=cudnn.data_type.FLOAT,
     )
     x_t = graph.tensor(dim=list(x.shape), stride=list(x.stride()), data_type=value_type, name="X")
-    idx_t = graph.tensor(dim=list(x.shape), stride=list(x.stride()), data_type=index_type, name="IDX")
+    # The index stream 0 ... N-1 along the reduced dimension, made in the graph.
+    idx_t = graph.gen_index(x_t, axis=1, compute_data_type=index_type)
+    idx_t.set_data_type(index_type)
     value, index = graph.custom_reduction(
         [x_t, idx_t], reduction_dims=[1], name=f"{kind}_{rule}", **getattr(cudnn.reduction_modifiers, kind)(value_type, index_type, rule)
     )
     (index if output == "index" else value).set_output(True)
-    return graph, x_t, idx_t, value, index
+    return graph, x_t, value, index
 
 
 def _run_arg(cudnn_handle, torch, x, kind, rule):
-    graph, x_t, idx_t, _, index = _arg_graph(cudnn_handle, torch, x, cudnn.data_type.INT32, kind, rule)
+    graph, x_t, _, index = _arg_graph(cudnn_handle, torch, x, cudnn.data_type.INT32, kind, rule)
     graph.build([cudnn.heur_mode.A])
-    rows, extent = x.shape
-    iota = torch.arange(extent, dtype=torch.int32, device="cuda").expand(rows, extent).contiguous()
+    rows = x.shape[0]
     out = torch.full((rows, 1), -7, dtype=torch.int32, device="cuda")
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     torch.cuda.synchronize()
-    graph.execute({x_t: x, idx_t: iota, index: out}, workspace, handle=cudnn_handle)
+    graph.execute({x_t: x, index: out}, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
     return out.view(-1).long()
 
@@ -1680,27 +1681,28 @@ def test_reduction_modifiers_forward_the_backend_decision_on_other_stream_types(
     # The frontend builds the body for any stream type, and the backend decides: the build either runs and gives the
     # torch index, or forwards the backend's not-supported status.
     for value_dtype, index_type, index_dtype in (
+        # This row probes an INT64 gen_index as well as an INT64 reduction stream, so a backend that declines either
+        # one gives NOT_SUPPORTED.
         (torch.float32, cudnn.data_type.INT64, torch.int64),
         (torch.float64, cudnn.data_type.INT32, torch.int32),
     ):
         x = torch.randn(4, 64, dtype=value_dtype, device="cuda")
-        graph, x_t, idx_t, _, index = _arg_graph(cudnn_handle, torch, x, index_type, "argmax", "torch")
+        graph, x_t, _, index = _arg_graph(cudnn_handle, torch, x, index_type, "argmax", "torch")
         try:
             graph.build([cudnn.heur_mode.A])
         except cudnn.cudnnGraphNotSupportedError as error:
             assert "CUDNN_STATUS_NOT_SUPPORTED" in str(error)
             continue
-        iota = torch.arange(64, dtype=index_dtype, device="cuda").expand(4, 64).contiguous()
         out = torch.full((4, 1), -1, dtype=index_dtype, device="cuda")
         workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
         torch.cuda.synchronize()
-        graph.execute({x_t: x, idx_t: iota, index: out}, workspace, handle=cudnn_handle)
+        graph.execute({x_t: x, index: out}, workspace, handle=cudnn_handle)
         torch.cuda.synchronize()
         assert torch.equal(out.view(-1).long(), torch.argmax(x, dim=1))
 
     # The value and the index both as graph outputs: the backend decides.
     x = torch.randn(4, 64, dtype=torch.float32, device="cuda")
-    graph, x_t, idx_t, value, index = _arg_graph(cudnn_handle, torch, x, cudnn.data_type.INT32, "argmax", "torch")
+    graph, x_t, value, index = _arg_graph(cudnn_handle, torch, x, cudnn.data_type.INT32, "argmax", "torch")
     value.set_output(True)
     graph.validate()
     try:
@@ -1708,12 +1710,11 @@ def test_reduction_modifiers_forward_the_backend_decision_on_other_stream_types(
     except cudnn.cudnnGraphNotSupportedError as error:
         assert "CUDNN_STATUS_NOT_SUPPORTED" in str(error)
         return
-    iota = torch.arange(64, dtype=torch.int32, device="cuda").expand(4, 64).contiguous()
     out_value = torch.full((4, 1), float("nan"), dtype=torch.float32, device="cuda")
     out_index = torch.full((4, 1), -1, dtype=torch.int32, device="cuda")
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     torch.cuda.synchronize()
-    graph.execute({x_t: x, idx_t: iota, value: out_value, index: out_index}, workspace, handle=cudnn_handle)
+    graph.execute({x_t: x, value: out_value, index: out_index}, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
     assert torch.equal(out_index.view(-1).long(), torch.argmax(x, dim=1))
     assert torch.equal(out_value.view(-1), torch.amax(x, dim=1))
@@ -1732,7 +1733,6 @@ def test_reduction_modifiers_argmax_after_a_pointwise_producer(cudnn_handle):
     mask_cpu = torch.rand(B, V) < 0.3
     p_t_cpu, p_d_cpu = torch.softmax(torch.randn(B, V), dim=1), torch.softmax(torch.randn(B, V), dim=1)
     inv_q_cpu = 1.0 / (torch.rand(B, V) + 0.1)
-    idx_cpu = torch.arange(V, dtype=torch.int32).expand(B, V).contiguous()
 
     def run(producer, expected):
         graph = cudnn.pygraph(
@@ -1749,7 +1749,8 @@ def test_reduction_modifiers_argmax_after_a_pointwise_producer(cudnn_handle):
             return t
 
         y = producer(graph, tensor)
-        idx = tensor("IDX", idx_cpu, cudnn.data_type.INT32)
+        idx = graph.gen_index(y, axis=1, compute_data_type=cudnn.data_type.INT32)
+        idx.set_data_type(cudnn.data_type.INT32)
         _, index = graph.custom_reduction([y, idx], reduction_dims=[1], **cudnn.reduction_modifiers.argmax(cudnn.data_type.FLOAT))
         index.set_output(True)
         graph.build([cudnn.heur_mode.A])
