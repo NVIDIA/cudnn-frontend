@@ -95,22 +95,6 @@ def test_sm90_wgrad_class_api_reuses_compile_across_token_counts():
         assert_grouped_gemm_wgrad_close(problem["output"], grouped_gemm_wgrad_bf16_reference(problem))
 
 
-def test_sm90_wgrad_schedule_follows_rows_per_expert(monkeypatch):
-    # Output N 1024 is not a multiple of 192: the rule picks pingpong at <= 1024 average rows per expert and cooperative
-    # above. The token count is a dynamic dimension of the wrapper's compile cache, so the cache key carries the pick.
-    from cudnn.gemm.cutedsl.grouped.wgrad import api as wgrad_api
-
-    monkeypatch.setattr(wgrad_api, "_cache_of_GroupedGemmWgradSm100Objects", {})
-    monkeypatch.setattr(wgrad_api, "_wgrad_wrapper_memo", {})
-    for group_k_list in ((512, 0, 1024), (2048, 1024, 1024)):
-        problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=group_k_list, m=256, n=1024, a_major="m", b_major="n", initial_value=3.0)
-        actual = run_wrapper(problem)
-        torch.cuda.synchronize()
-        assert_grouped_gemm_wgrad_close(actual, grouped_gemm_wgrad_bf16_reference(problem))
-    ops = list(wgrad_api._cache_of_GroupedGemmWgradSm100Objects.values())
-    assert [(op._implementation.pingpong, op._implementation.mma_tiler_mn) for op in ops] == [(True, (128, 192)), (False, (128, 256))]
-
-
 def one_cluster_margin(cluster):
     """The CUDNNFE_CLUSTER_OVERLAP_MARGIN that leaves one persistent cluster: every CTA then runs all its slot's tiles."""
     return str(cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1]) - 1)

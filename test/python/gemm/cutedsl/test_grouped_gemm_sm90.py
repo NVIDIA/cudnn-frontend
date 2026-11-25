@@ -356,23 +356,14 @@ def test_sm90_schedule_heuristic(n, k, tile, cluster, expected):
     common.update(sample_b=b, sample_prob=torch.ones((m,), device=dev), mma_tiler_mn=tile, cluster_shape_mn=cluster)
     api = GroupedGemmBf16API(a, c, d, arch="sm90", **common)
     assert (api._pingpong, api.mma_tiler_mn) == expected
-    # wgrad (output N, average rows per expert): pingpong for N >= 2048, and for 768 <= N < 2048 when N is a multiple
-    # of 192 or the average rows per expert is at most 1024; cooperative for N >= 4096 at 4096 or more rows per expert;
-    # on 128x192 tiles and (2, 1) clusters only.
-    assert use_pingpong_wgrad(2048, 4096, None, None) and use_pingpong_wgrad(7168, 2048, None, None)
-    assert not use_pingpong_wgrad(4096, 4096, None, None) and not use_pingpong_wgrad(7168, 8192, None, None)
-    assert use_pingpong_wgrad(768, 4096, None, None) and use_pingpong_wgrad(1536, 4096, None, None)
-    assert use_pingpong_wgrad(1024, 1024, None, None) and use_pingpong_wgrad(1024, 640, None, None)
-    assert not use_pingpong_wgrad(1024, 1025, None, None) and not use_pingpong_wgrad(1280, 2048, None, None)
-    assert not use_pingpong_wgrad(512, 256, None, None) and not use_pingpong_wgrad(576, 256, None, None)
-    assert use_pingpong_wgrad(4096, 2048, (128, 192), (2, 1))
-    assert not use_pingpong_wgrad(4096, 2048, (128, 256), None)
-    assert not use_pingpong_wgrad(4096, 2048, (128, 160), None)
-    assert not use_pingpong_wgrad(4096, 2048, None, (1, 2))
+    # wgrad: pingpong for output N >= 2048 on 128x192 tiles and (2, 1) clusters.
+    assert use_pingpong_wgrad(2048, None, None) and not use_pingpong_wgrad(1024, None, None)
+    assert use_pingpong_wgrad(4096, (128, 192), (2, 1))
+    assert not use_pingpong_wgrad(4096, (128, 256), None)
+    assert not use_pingpong_wgrad(4096, (128, 160), None)
+    assert not use_pingpong_wgrad(4096, None, (1, 2))
     with override_schedule("cooperative"):
-        assert not use_pingpong_wgrad(4096, 512, None, None)
-    with override_schedule("pingpong"):
-        assert use_pingpong_wgrad(512, 4096, None, None)
+        assert not use_pingpong_wgrad(4096, None, None)
 
 
 def test_sm90_names_match_sm100_signatures():

@@ -121,8 +121,8 @@ def _assert_overlap_matches_serial(op, discrete, sched, arch="sm100"):
             assert_bitwise(snapshot(result), reference, f"iteration {iteration} call {index}")
 
 
-# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad, and for wgrad (output N=1024, 512 rows per expert); the
-# forced cases cover each schedule. SM90 wgrad writes a dense output.
+# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad and cooperative for wgrad (output N=1024); the forced
+# cases cover each schedule. SM90 wgrad writes a dense output.
 SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad", "wgrad") for schedule in (None, "cooperative", "pingpong")]
 
 

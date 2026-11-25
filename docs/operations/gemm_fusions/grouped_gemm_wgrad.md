@@ -293,14 +293,9 @@ launch control. It covers the BF16 contract above with these limits:
 - Torch tensors only (no JAX entry).
 - The SM90 kernel picks its warp-group schedule from the problem shape, and
   `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 192)`
-  (pingpong) for output `N >= 2048`, and for `768 <= N < 2048` when `N` is a
-  multiple of 192 or the average rows per expert (total tokens / experts) is at
-  most 1024, except for `N >= 4096` with 4096 or more rows per expert; else
-  `(128, 256)` (cooperative). SM100 uses `(256, 256)`. The
-  pingpong schedule runs only on a `(128, 192)` tile with a `(2, 1)` cluster
-  (given or defaulted); any other tile or cluster runs the cooperative schedule.
-  The wrapper picks the schedule per call; a `GroupedGemmWgradSm90` object picks
-  it once, from its sample tensors.
+  for output `N >= 2048`, else `(128, 256)`. SM100 uses `(256, 256)`. The
+  `N >= 2048` schedule runs only on a `(128, 192)` tile with a `(2, 1)` cluster
+  (given or defaulted); any other tile or cluster runs the default schedule.
   An explicit SM90 tile has M in `{64, 128}` and N a multiple of 32 up to 256.
   `cluster_shape_mn=None` selects `(2, 1)`; an
   explicit cluster has power-of-two sides and at most 8 CTAs.
