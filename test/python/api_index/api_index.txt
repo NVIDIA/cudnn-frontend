@@ -1667,6 +1667,8 @@ cudnn.ops.dsa_sparse_workspace_size
 cudnn.ops.fft_causal_conv1d
 cudnn.ops.gated_rmsnorm_backward
 cudnn.ops.gated_rmsnorm_forward
+cudnn.ops.gemm_glu_forward
+cudnn.ops.gemm_glu_forward_jax
 cudnn.ops.gqa_attention_backward
 cudnn.ops.gqa_attention_forward
 cudnn.ops.gqa_attention_workspace_size

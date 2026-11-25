@@ -6,7 +6,7 @@ import json
 import pytest
 import torch
 
-from gemm.cutedsl.test_gemm_swiglu_utils import _swiglu_failure_details, check_ref_gemm_swiglu, run_gemm_swiglu_ref
+from gemm.cutedsl.test_gemm_glu_utils import _swiglu_failure_details, check_ref_gemm_glu, run_gemm_glu_ref
 
 pytestmark = pytest.mark.L0
 
@@ -14,7 +14,7 @@ pytestmark = pytest.mark.L0
 def _case():
     a = torch.arange(1, 13, dtype=torch.float32).view(2, 3, 2) / 10
     b = torch.linspace(-0.5, 0.5, 128 * 3 * 2).view(128, 3, 2)
-    intermediate, expected = run_gemm_swiglu_ref(a, b, 0.7)
+    intermediate, expected = run_gemm_glu_ref(a, b, 0.7)
     return a, b, intermediate, expected
 
 
@@ -35,10 +35,10 @@ def test_failure_details_keep_interleaved_input_gate_columns(column):
 
 def test_failure_diagnostic_is_bounded_and_preserves_assertion(capsys):
     a, b, intermediate, expected = _case()
-    check_ref_gemm_swiglu(a, b, intermediate, expected, alpha=0.7)
+    check_ref_gemm_glu(a, b, intermediate, expected, alpha=0.7)
     assert not capsys.readouterr().out
     with pytest.raises(AssertionError, match="Tensor-likes are not close"):
-        check_ref_gemm_swiglu(a, b, intermediate, expected + 10, alpha=0.7)
+        check_ref_gemm_glu(a, b, intermediate, expected + 10, alpha=0.7)
     output = capsys.readouterr().out
     report = json.loads(output.split("SwiGLU output diagnostic: ", 1)[1])
     assert report["mismatches"] == expected.numel()
@@ -46,7 +46,7 @@ def test_failure_diagnostic_is_bounded_and_preserves_assertion(capsys):
 
 
 def test_diagnostic_error_preserves_original_assertion(monkeypatch, capsys):
-    import gemm.cutedsl.test_gemm_swiglu_utils as helpers
+    import gemm.cutedsl.test_gemm_glu_utils as helpers
 
     a, b, intermediate, expected = _case()
 
@@ -55,7 +55,7 @@ def test_diagnostic_error_preserves_original_assertion(monkeypatch, capsys):
 
     monkeypatch.setattr(helpers, "_swiglu_failure_details", fail_diagnostic)
     with pytest.raises(AssertionError, match="Tensor-likes are not close"):
-        check_ref_gemm_swiglu(a, b, intermediate, expected + 10, alpha=0.7)
+        check_ref_gemm_glu(a, b, intermediate, expected + 10, alpha=0.7)
     assert "diagnostic unavailable: diagnostic probe" in capsys.readouterr().out
 
 
