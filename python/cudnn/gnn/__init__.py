@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from .agg_hg_basis_post import agg_hg_basis_post
 from .agg_simple import agg_simple
 from .graph import CscGraph
 from .mha_gat import mha_gat
@@ -9,6 +10,7 @@ from .mha_simple import mha_simple
 
 __all__ = [
     "CscGraph",
+    "agg_hg_basis_post",
     "agg_simple",
     "mha_gat",
     "mha_gat_v2",
