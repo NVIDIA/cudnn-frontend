@@ -613,6 +613,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                 grid=(num_rows, self.num_ctas_per_row, 1),
                 block=(tiled_copy.size, 1, 1),
                 stream=stream,
+                min_blocks_per_mp=min_blocks_per_mp if cutlass.const_expr(min_blocks_per_mp > 1 and not enable_persistent_dynamic_scheduling) else 0,
             )
 
 
@@ -716,18 +717,19 @@ def compile_topk_kernel(
 
     dtype = _torch_to_cutlass_dtype(torch_dtype)
     bucketed_num_cols = _bucket_num_cols(num_cols)
+    capability = torch.cuda.get_device_capability()
     assert not no_scratch or num_cols <= top_k
 
     large_occupancy = num_rows > 148
-    if torch.cuda.get_device_capability() in _SM120_FAMILY_ARCH:
+    if capability in _SM120_FAMILY_ARCH:
         # SM120 / SM121 cannot hold the large shared-memory radix buffer even for
         # a small row count. Reuse the existing spilling specialization.
         sm120_smem_cols = 16384 if torch_dtype == torch.float32 else 32768
         large_occupancy = large_occupancy or bucketed_num_cols > sm120_smem_cols
-    if deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 0):
+    if deterministic and deterministic_ordering == "auto" and capability == (10, 0):
         bitmap_limit = _sm100_deterministic_bitmap_max_cols(dtype, top_k, large_occupancy)
         deterministic_ordering = "bitmap" if bucketed_num_cols <= bitmap_limit else "bitonic"
-    elif deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 3):
+    elif deterministic and deterministic_ordering == "auto" and capability == (10, 3):
         deterministic_ordering = "bitmap" if _sm103_deterministic_bitmap(bucketed_num_cols, top_k, large_occupancy) else "bitonic"
         # Offset rows can be far narrower than their score matrix. Cap bitmap
         # storage by interval length and retain bitonic ordering for wider rows.
@@ -800,6 +802,20 @@ def compile_topk_kernel(
             deterministic_ordering=deterministic_ordering,
         )
 
+        min_blocks_per_mp = 1
+        if (
+            capability == (9, 0)
+            and large_occupancy
+            and dtype == cutlass.Float32
+            and top_k == 2048
+            and bucketed_num_cols >= 131072
+            and tie_break != 0
+            and not deterministic
+            and not return_val
+        ):
+            # Keep three resident CTAs when directed tie selection increases register pressure.
+            min_blocks_per_mp = 3
+
         # Compile the kernel
         compiled_kernel = cute.compile(
             indexer_topk_func,
@@ -812,11 +828,11 @@ def compile_topk_kernel(
             output_values_fake,
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=min_blocks_per_mp,
             starts=starts_fake,
             # Qualify standalone Top-K on SM120 / SM121 without enabling unrelated
             # DSA kernels through the shared architecture/support map.
-            options=compile_options(gpu_arch=_SM120_FAMILY_ARCH.get(tuple(torch.cuda.get_device_capability()))),
+            options=compile_options(gpu_arch=_SM120_FAMILY_ARCH.get(capability)),
         )
         _compile_cache[key] = compiled_kernel
     return _compile_cache[key]

@@ -4831,7 +4831,7 @@ passed their sampled interval oracle checks, but the SSH session closed
 before the full pytest summary. Full SM90 qualification of this change is
 unverified.
 
-In the revision after `ceab650c`, FP32 selection can reuse a spilled
+In the revision after `f32cc458`, FP32 selection can reuse a spilled
 candidate buffer at K=2048 when an effective row has at least 16,384 columns
 and every candidate survives the current radix digit. Twelve L0 cases
 check a zero-based prefix or a nonzero start, all three tie policies, and
@@ -4847,10 +4847,10 @@ pooled selector regression reported 17 passed and 95 deselected. This
 revision was initially unverified on SM90 because the GPU session was
 unavailable.
 
-The same revision (`82dc9325`) subsequently reported 200 passed, 9 SM120/121
+The same revision (`86828dd5`) subsequently reported 200 passed, 9 SM120/121
 skips and 6 deselected on H20-3e (cc 9.0, 78 SMs) with PyTorch 2.12.1
 cu130, cuDNN 9.19.0, and CuTe DSL 4.8.0 (CUDA 13.4 compiler).
-The three H20 golden input and output hashes agree with both `ceab650c`
+The three H20 golden input and output hashes agree with both `f32cc458`
 on H20 and the previously recorded L20X and B300 results. The refill
 stress observed zero differences in 128 warm and 128 poisoned launches.
 
@@ -4869,7 +4869,7 @@ DSL versions, the L0/L1 command above reported 237 passed,
 regression reported 17 passed. The zero-scratch path is unverified on
 cc 10.0, cc 10.7 and SM12x.
 
-After `ad22d43a`, wide deterministic FP32 K=2048 rows can skip the first
+After `7a2cf7d3`, wide deterministic FP32 K=2048 rows can skip the first
 exact radix digit when the FP16 coarse bin determines all candidates'
 FP32 high byte.
 Six L0 cases cover both interval modes and all tie policies, including
@@ -4880,8 +4880,23 @@ isolation and batch reordering with duplicated rows. The new H20
 golden has the same input and output hashes as the previous kernel.
 On the H20-3e stack above, the L0/L1 command reported 243 passed, 9
 SM120/121 skips and 6 deselected. Refill stress observed zero differences
-in 128 warm and 128 poisoned launches. The current radix path remains
-unverified on cc 10.0, cc 10.3, cc 10.7 and SM12x.
+in 128 warm and 128 poisoned launches.
+
+With the bindings built from `bd250511`, the same L0/L1 command reported
+243 passed, 9 SM120/121 skips and 6 deselected on L20X (cc 9.0, 132 SMs)
+and B300 (cc 10.3, 148 SMs). Both runs used PyTorch 2.12.1 cu130,
+cuDNN 9.19.0 and CuTe DSL 4.8.0 (CUDA 13.4 compiler). Each GPU passed
+the seven golden comparisons and had zero differences in 128 warm and
+128 poisoned refill launches. All seven input and output hashes agree
+across L20X, B300 and H20-3e.
+
+Compute Sanitizer memcheck on L20X and B300 reported zero errors in 19
+cases per GPU with the standard PyTorch allocator and cuDNN 9.20.0.
+The selected cases used
+`-k "coarse_bin_refinement or zero_scratch_cache_boundary or spilled_candidate_planes"`.
+The memcheck invocation used `-n0 -o addopts= -m L0` and recorded its
+golden to a temporary directory for comparison against the checked hashes.
+The current radix path remains unverified on cc 10.0, cc 10.7 and SM12x.
 
 ### DSA BF16 indexer: 46 cases
 
