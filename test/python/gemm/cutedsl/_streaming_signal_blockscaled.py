@@ -33,8 +33,14 @@ POISON = 0xFF
 N = {"quant": 1024, "glu": 1024, "dglu_bf16": 512, "dglu": 512}
 #: Parameter ids: direction, recipe, kernel.
 KIND_IDS = {"quant": "fprop-mxfp8-fc2", "glu": "fprop-mxfp8-glu", "dglu_bf16": "bprop-bf16-dglu", "dglu": "bprop-mxfp8-dglu"}
-# More than 32 experts take the batch opener several lane rounds; an expert of more than 16 M tiles needs several batches.
-ROUTINGS = {"uneven": [700, 0, 256, 1], "many_experts_64": bf16.MANY_EXPERTS_64, "big_expert": bf16.BIG_EXPERT}
+# More than 32 experts take the batch opener several lane rounds; an expert of more than 16 M tiles needs several batches;
+# with many small experts one opening publishes several batches.
+ROUTINGS = {
+    "uneven": [700, 0, 256, 1],
+    "many_experts_64": bf16.MANY_EXPERTS_64,
+    "small_experts_64": bf16.SMALL_EXPERTS_64,
+    "big_expert": bf16.BIG_EXPERT,
+}
 
 
 def is_rubin():

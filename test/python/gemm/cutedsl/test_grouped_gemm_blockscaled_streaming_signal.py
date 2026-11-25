@@ -169,7 +169,8 @@ def test_with_no_rows_exits(kind, variant):
 # ---- The input signal (FC1 GLU, dGLU) ----
 
 # (kind, variant, routing) beside the replay determinism cases (64 experts, a 5000-row expert): the uneven routing (an
-# empty and a one-row expert), the compact SF warp on the stock dynamic scheduler, and the dGLU's entry trigger alone.
+# empty and a one-row expert), the compact SF warp on the stock dynamic scheduler, the dGLU's entry trigger alone, and
+# 64 small experts on the signal scheduler (batch openings that publish several batches).
 MATCH_CASES = [
     ("glu", "signal", "uneven"),
     ("glu", "trigger", "uneven"),
@@ -186,6 +187,11 @@ MATCH_CASES = [
     ("dglu", "trigger", "big_expert"),
     ("dglu", "compact_signal", "big_expert"),
     ("dglu", "compact_trigger", "uneven"),
+    ("glu", "signal", "small_experts_64"),
+    ("glu", "compact_signal", "small_experts_64"),
+    ("dglu_bf16", "signal", "small_experts_64"),
+    ("dglu", "signal", "small_experts_64"),
+    ("dglu", "compact_signal", "small_experts_64"),
 ]
 MATCH_L0 = [
     ("glu", "trigger", "uneven"),
@@ -193,6 +199,9 @@ MATCH_L0 = [
     ("dglu_bf16", "entry", "uneven"),
     ("dglu", "entry", "uneven"),
     ("dglu", "compact_trigger", "uneven"),
+    ("glu", "signal", "small_experts_64"),
+    ("dglu_bf16", "signal", "small_experts_64"),
+    ("dglu", "signal", "small_experts_64"),
 ]
 
 
