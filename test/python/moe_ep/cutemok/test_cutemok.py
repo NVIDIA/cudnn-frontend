@@ -40,7 +40,7 @@ from cudnn.moe_ep.cutemok import (
 from cudnn.moe_ep._cutemok.cutedsl._arch import SUPPORTED_CAPABILITIES
 from cudnn.moe_ep._cutemok.cutedsl._version_gate import CuteDslRequirementError, require_cutedsl
 
-pytestmark = pytest.mark.L0
+pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive]
 
 NAMES = ("CuteMoKConfig", "CuteMoKPlan", "CuteMoKSplitWeight", "cutemok_backward", "cutemok_forward", "cutemok_prepare", "cutemok_quantize_weights")
 GRADIENT_NAMES = ("d_x", "d_router_weights", "d_w_routed_gate", "d_w_routed_up", "d_w_routed_down", "d_w_shared_gate", "d_w_shared_up", "d_w_shared_down")

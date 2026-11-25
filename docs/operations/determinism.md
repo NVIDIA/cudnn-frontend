@@ -381,8 +381,9 @@ for replay, batch-invariance, and stress-test results.
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
   rows move. The fused CuTe path also changes scalar loss and saved gradient
-  bytes across runs through atomic reductions. Only indexer Q/K receive
-  gradients; the teacher stays frozen. Tiny single-row goldens do not qualify
+  bytes across runs through atomic reductions, including forward loss replay
+  on SM103. Only indexer Q/K receive gradients; the teacher stays frozen.
+  Tiny single-row goldens do not qualify
   larger reductions. CPU and other GPUs are not qualified for determinism.
 
 - Simplified sparse attention (PyTorch and JAX): no deterministic mode. The SM100 forward
