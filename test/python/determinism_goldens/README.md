@@ -4931,6 +4931,19 @@ comparisons matched on each GPU. Compute Sanitizer memcheck reported 20
 passed and zero errors per GPU using the native PyTorch allocator and
 `-n0 -o addopts= -m L0 -k "(coarse_bin_refinement and arbitrary) or spilled_candidate_planes"`.
 
+The K=512 follow-up sizes standalone shared index storage to K and skips
+the first exact radix digit for eligible FP32 indices-only rows with
+`tie_break=0`. The K=2048 follow-up uses the aligned load predicate and
+skips a known digit for short FP32 indices-only prefixes with
+`tie_break=1`. Four L0 cases check the score multiset and, for directed
+ties, the exact selected column set with either bounds mode.
+The L0/L1 command above reported 256 passed, 9 SM120/121 skips and
+6 deselected on both H200 and B300 with the same software stack. All
+seven committed golden comparisons matched on each GPU. Compute Sanitizer
+memcheck on the exact-value, cutoff and spill controls reported 30
+passed and zero errors per GPU. The B300 pooled DSA subset reported
+17 passed.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.

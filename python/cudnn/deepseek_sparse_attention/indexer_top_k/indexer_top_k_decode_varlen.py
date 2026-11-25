@@ -305,9 +305,12 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             layout=cute.make_ordered_layout((2,), order=(0)),
             byte_alignment=128,
         )
+        index_slots = self.indexer_topk_max_k
+        if cutlass.const_expr(self.top_k == 512 and not self.enable_multi_cta and not self.merge_blocks):
+            index_slots = self.top_k
         s_indices = smem.allocate_tensor(
             element_type=self.index_type,
-            layout=cute.make_ordered_layout((self.indexer_topk_max_k,), order=(0)),
+            layout=cute.make_ordered_layout((index_slots,), order=(0)),
             byte_alignment=128,
         )
         s_input_idx = smem.allocate_tensor(
@@ -436,6 +439,8 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     s_warp_sums,
                     s_cta_mbarrier,
                     s_index_bits,
+                    standalone=True,
+                    has_starts=cutlass.const_expr(starts is not None),
                 )
         else:
             num_rows = input.shape[0]

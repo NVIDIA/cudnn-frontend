@@ -1338,11 +1338,16 @@ def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, determini
 
 @pytest.mark.L0
 @pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
-@pytest.mark.parametrize("tie_break,deterministic", [(0, True), (1, True), (2, True), (0, False)], ids=["0", "1", "2", "arbitrary"])
-def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, tie_break, deterministic):
+@pytest.mark.parametrize(
+    "k,tie_break,deterministic",
+    [(2048, 0, True), (2048, 1, True), (2048, 2, True), (2048, 0, False), (512, 0, False), (2048, 1, False)],
+    ids=["0", "1", "2", "arbitrary", "arbitrary-k512", "directed-k2048"],
+)
+def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, k, tie_break, deterministic):
     """Check FP32 cutoff keys at the FP16 rounding boundaries used by coarse filtering."""
     dsa = _import_dsa()
-    width, k, rows = 32773, 2048, 156
+    directed = not deterministic and tie_break == 1
+    width, rows = (65539 if directed else 32773), 156
     columns = torch.arange(width, device="cuda", dtype=torch.int32)
     delta = columns * 17 % 127 - 63
     # Below and above 1.0 share the FP32 high byte. Around 2.0 it changes.
@@ -1354,6 +1359,9 @@ def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, tie_break, determi
     pattern_count = len(patterns)
     first = [3, 11, 8, 17, 30, 1, 19, 24, 7, 12, 5] if has_starts else [0] * pattern_count
     last = [width, width, width, width, width, width, width, first[7] + 16383, first[8] + 16384, width, width]
+    if directed:
+        last[0] = first[0] + 4093
+        last[1] = first[1] + 4093
     patterns[-1, first[-1] : first[-1] + k] = 32
     order = torch.arange(rows, device="cuda") % pattern_count
     starts = torch.tensor(first, device="cuda", dtype=torch.int32)[order]
@@ -1386,6 +1394,8 @@ def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, tie_break, determi
         assert (sorted_indices[:, 1:] != sorted_indices[:, :-1]).all()
         picked = scores.gather(1, indices.long())
         assert_bitwise({"values": picked.sort(dim=1).values}, {"values": expected["values"].sort(dim=1).values}, "FP32 interval oracle")
+        if directed:
+            assert_bitwise({"indices": sorted_indices}, {"indices": expected["indices"]}, "cutoff tie source columns")
         return
 
     actual = assert_replays(run)

@@ -415,8 +415,7 @@ class IndexerTopKKernelVarlen:
         valid_k = min(cutlass.Int32(self.top_k), length)
         sentinel = self.index_type(self.index_sentinel)
 
-        # s_indices is provisioned for INDEXER_TOPK_MAX_K (2048), so every
-        # power-of-two padding slot needed by the in-place bitonic sort exists.
+        # The index buffer includes every padding slot needed by bitonic ordering.
         i = tidx
         while i < self.deterministic_sort_size:
             if i >= valid_k:
@@ -886,6 +885,8 @@ class IndexerTopKKernelVarlen:
         s_warp_sums,
         s_cta_mbarrier,
         s_index_bits,
+        standalone: cutlass.Constexpr = False,
+        has_starts: cutlass.Constexpr = False,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
         # # Thread and block indexing
@@ -1004,6 +1005,18 @@ class IndexerTopKKernelVarlen:
 
             # 1.1 Build histogram with vectorized loads
             vec_size = self.vec_size
+            standalone_fp32_indices = (
+                standalone
+                and self.dtype == cutlass.Float32
+                and self.enable_gmem_store
+                and not self.deterministic
+                and not self.return_val
+                and self.max_num_cols >= 32768
+                and not self.enable_multi_cta
+                and not self.merge_blocks
+            )
+            directed_prefix = standalone_fp32_indices and self.top_k == 2048 and self.tie_break == 1 and not has_starts
+            skip_default_k512_digit = standalone_fp32_indices and self.top_k == 512 and self.tie_break == 0
 
             for tile_idx in range(num_sub_tiles):
                 tXpX_tile = self.predicate_tile(
@@ -1016,11 +1029,11 @@ class IndexerTopKKernelVarlen:
                     tXrX,
                     pred=tXpX_tile[None, None, None],
                 )
-                if cutlass.const_expr(not self.deterministic):
+                if cutlass.const_expr(not self.deterministic and not directed_prefix):
                     self._fill_oob(tXrX, tXpX_tile[None, None, None], -tXrX.element_type.inf)
                 cur_tXcX = tXcX[None, None, None, tile_idx]
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
-                    if cutlass.const_expr(self.deterministic):
+                    if cutlass.const_expr(self.deterministic or directed_prefix):
                         # The aligned interior contains only complete vectors.
                         in_bounds = tXpX_tile[i // vec_size, 0, 0]
                     else:
@@ -1070,15 +1083,23 @@ class IndexerTopKKernelVarlen:
             first_round = cutlass.Int32(0)
             fp32_prefix = cutlass.Uint32(0)
             if cutlass.const_expr(
-                self.dtype == cutlass.Float32
-                and self.enable_gmem_store
-                and self.top_k == 2048
-                and (
-                    self.deterministic
-                    or (self.tie_break == 0 and not self.return_val and self.max_num_cols >= 32768 and not self.enable_multi_cta and not self.merge_blocks)
+                skip_default_k512_digit
+                or directed_prefix
+                or (
+                    self.dtype == cutlass.Float32
+                    and self.enable_gmem_store
+                    and self.top_k == 2048
+                    and (
+                        self.deterministic
+                        or (self.tie_break == 0 and not self.return_val and self.max_num_cols >= 32768 and not self.enable_multi_cta and not self.merge_blocks)
+                    )
                 )
             ):
-                if length >= 16384:
+                if cutlass.const_expr(directed_prefix):
+                    try_skip = length < 16384
+                else:
+                    try_skip = length >= 16384
+                if try_skip:
                     positive = threshold_bin < 128
                     half_magnitude = (threshold_bin ^ 0x7F) & 0x7F if positive else threshold_bin & 0x7F
                     half_exp = half_magnitude >> 2
@@ -1087,7 +1108,7 @@ class IndexerTopKKernelVarlen:
                     # Only even exponents change the FP32 high byte at that boundary.
                     if half_exp > 0 and half_exp < 31 and ((half_magnitude & 3) != 0 or (half_exp & 1) != 0):
                         first_round = 1
-                        if cutlass.const_expr(self.deterministic):
+                        if cutlass.const_expr(self.deterministic or directed_prefix):
                             # Rebase the exponent from FP16 to FP32 and apply the ordered-key transform.
                             high_byte = (half_exp + (127 - 15)) >> 1
                             fp32_prefix = cutlass.Uint32(high_byte ^ 0x7F if positive else high_byte | 0x80) << 24
@@ -1124,12 +1145,12 @@ class IndexerTopKKernelVarlen:
                             tXrX,
                             pred=tXpX_tile[None, None, None],
                         )
-                        if cutlass.const_expr(not self.deterministic):
+                        if cutlass.const_expr(not self.deterministic and not directed_prefix):
                             self._fill_oob(tXrX, tXpX_tile[None, None, None], -tXrX.element_type.inf)
                         for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                             cur_tXcX = tXcX[None, None, None, tile_idx]
                             relative_idx = cutlass.Int32(cur_tXcX[i // vec_size][1] + i % vec_size)
-                            if cutlass.const_expr(self.deterministic):
+                            if cutlass.const_expr(self.deterministic or directed_prefix):
                                 in_bounds = tXpX_tile[i // vec_size, 0, 0]
                             else:
                                 in_bounds = relative_idx < aligned_size
@@ -1243,8 +1264,12 @@ class IndexerTopKKernelVarlen:
                         reuse_spilled_planes = reuse_spilled_planes and s_num_input[0] > self.indexer_topk_smem_input_size
                     if reuse_spilled_planes:
                         self._refine_topk_candidates(*refine_args, True, first_round, fp32_prefix)
+                    elif cutlass.const_expr(directed_prefix):
+                        self._refine_topk_candidates(*refine_args, False, first_round, fp32_prefix)
                     else:
                         self._refine_topk_candidates(*refine_args, False, 0, cutlass.Uint32(0))
+                elif cutlass.const_expr(skip_default_k512_digit):
+                    self._refine_topk_candidates(*refine_args, False, first_round, fp32_prefix)
                 else:
                     self._refine_topk_candidates(*refine_args, False, 0, cutlass.Uint32(0))
 
