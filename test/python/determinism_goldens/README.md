@@ -1035,6 +1035,8 @@ pytest core/test_determinism_utils.py
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py` | `GroupedGemmGluHadamardQuantSm100` and its wrapper, natural tensor ranks with either GLU branch order | C, D/RHT payloads and scales; legacy-rank equality, replay, batch invariance and graph replay | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` | `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel with `deterministic=True` | — | dprob and D_row: replay under concurrent work (both activations, dense/discrete, static/dynamic scheduler, ragged and empty experts), expert reorder, duplicate and neighbor isolation in both GLU orders; launch-stream ordering; D_row equal to the atomic path |
+| `gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py` | `MoEGroupedGemmBf16Kernel`, `MoEGroupedGemmGluBiasBf16Kernel` with `streaming_signal_capacity` (host / device layout, PDL) or `streaming_output_notify=N_CHUNK` | BF16 C and D over the experts' rows | Unsupported (forward-only kernels) |
+| `gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal_determinism.py` | `BlockScaledMoEGroupedGemmQuantKernel` (SM100), MXFP8, with `streaming_output_notify=N_CHUNK`; `BlockScaledMoEGroupedGemmGluBiasKernel` (SM100), MXFP8 SwiGLU, with `streaming_signal_capacity` (host / device layout, PDL trigger; stock or compact SFA); the dSwiGLU kernels `MoEGroupedGemmDgluDbiasBf16Kernel` and `BlockScaledMoEGroupedGemmDgluDbiasKernel` (SM100, `deterministic=True`) with `streaming_signal_capacity` (PDL entry trigger; MXFP8: stock or compact SFA) | BF16 D (FC2); BF16 C and D (FC1) over the experts' rows | dGLU: BF16 D and the FP32 dprob slots over the experts' rows: replay, producer release order, batch invariance, claim-slot warm stress |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -2665,6 +2667,118 @@ the strict 48 and the three sanitizer passes. The ordinary candidate-generator
 failure is a separate integration blocker; these explicit-plan results do
 not claim it is fixed. Existing measurements below are retained, not rerun
 as part of this addition.
+
+### Block-scaled grouped GEMM streaming signal — SM100, 2026-11-24
+
+`gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal_determinism.py` holds 37 L0 cases for the streaming signal
+options of the SM100 block-scaled kernels (dense weights, dynamic scheduler, E4M3/E8M0 inputs quantized once and reused
+unchanged): `streaming_output_notify=N_CHUNK` on the MXFP8 quant kernel (FC2, BF16 D, cluster (2, 1) with the 256 x 256
+2-CTA tile and (1, 1) with the 128 x 256 1-CTA tile), and `streaming_signal_capacity` on the MXFP8 SwiGLU kernel (FC1,
+BF16 C and D, host or `device_layout` expert layout with the all-slots-ready PDL trigger; stock SF atoms or
+`compact_sfa_sf_warp`, compact E8M0 rows from which the SF warp builds the atoms) and on the BF16 and MXFP8 dSwiGLU
+kernels (FC1's backward, `deterministic=True`: one FP32 dprob slot per N tile; optional PDL entry trigger). The options
+reorder tiles only, so every case compares raw bytes (FC2 D; FC1 C and D; dGLU D and dprob) with the stock dynamic
+scheduler:
+
+- Replay (4 FC2 + 8 GLU + 5 dGLU): the GLU's signal variants on 64 ragged experts and a 5000-row expert; the dGLUs' on
+  64 ragged experts; FC2 at N=768/chunk 512 (partial last chunk) and N=1024/chunk 256 at both cluster shapes on 64
+  ragged experts, with one cluster beside the consumer (extras stop early) and 1000 (none). Three launches each on fresh
+  NaN-filled buffers beside concurrent work.
+- FC2 chunk-size invariance (1): chunks 256, 512 and 1024 (one chunk) on a 5000-row expert give the same bytes.
+- Producer release order (7): A (dY) and its scales (SF atoms or compact rows), with `device_layout` also the expert
+  layout, hold NaN until a producer stream writes each M tile and releases it, in order, in reverse and in a seeded
+  random order (64 experts).
+- Batch invariance (6): a 700-row target expert alone, with neighbors, behind empty experts, among 1/255/257-row
+  experts, reordered and duplicated: FC2 at both cluster shapes, the GLU under host and device layout, both dGLUs.
+- Claim-slot warm stress (6, Rule 11; the compact cases also cover the SF warp's tile_info slot): 0 wrong of 500 warm
+  and 0 of 500 poisoned launches each.
+
+`test_grouped_gemm_blockscaled_streaming_signal.py` holds the functional cases: every N_CHUNK chunk published with stock
+bytes (chunk shapes, routings, both cluster shapes); an independent float reference (FC2 D within 2e-2 of float32 math
+on the dequantized codes and scales); a concurrent consumer that copies each chunk on publication and must see the final
+D; byte equality on the uneven routing (an empty and a one-row expert), for the compact SF warp on the stock scheduler
+and for the dGLU's entry trigger alone; detectors showing that poisoned A (dY) codes, SF atoms and compact rows each
+reach D; the producer on a 5000-row expert (L1); rejected options. No golden is recorded: the claim is byte equality
+with the stock scheduler on the same runtime.
+
+Red checks on the same runtime: an `N_CHUNK` notifier that counts tiles before their D stores fails 4, 4 and 5 of the 6
+consumer cases in three runs (all 3 L0 cases each time); a scheduler that ignores readiness (every flag reads ready, no
+acquire wait) fails all 9 producer cases; a producer that releases each M tile before writing it fails 8 of them (not
+the BF16 dGLU's).
+
+Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, CuTe DSL 4.8.0, with this change's `python/` tree: both files
+at `-m "L0 or L1"` collected 86 and **86 passed** (49 + 37), 0 skipped. SM103 is unverified; the SM107 (Rubin) kernels
+are not wired. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal_determinism.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal.py -m "L0 or L1" -q -rs
+```
+
+### Grouped GEMM streaming signal options — SM100, 2026-11-20
+
+`gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py` adds 17
+forward cases for the streaming options of the BF16 grouped GEMM kernels
+(plain and GLU, dense weights, 256 x 256 tile, (2, 1) cluster, dynamic
+scheduler). These options change which cluster runs a tile and when, never the
+tile math. So every case compares raw C/D bytes with the stock dynamic scheduler
+and also checks replays or packings:
+
+- Replay (8 cases): `streaming_signal_capacity` alone and with `device_layout`
+  plus PDL triggers, on 64 ragged experts (0 to 1300 rows, several opener lane
+  rounds) and on a 5000-row expert (several batches). Each case runs three
+  launches with fresh NaN-filled C/D/workspace and concurrent work on another
+  stream.
+- Producer release order (2 cases): the GEMM starts while every M tile reads
+  not-ready and A holds NaN. A producer stream then releases the 64-expert
+  problem's tiles in order, in reverse and in a seeded random order. All three
+  orders give identical bytes.
+- Batch invariance (5 cases): one 700-row target expert keeps its A rows, B,
+  alpha and prob. It runs alone, with neighbors, behind empty experts, among
+  1/255/257-row experts, reordered, and duplicated, under host layout, device
+  layout and (plain only) `N_CHUNK` output notify. Each target copy matches the
+  stock scheduler's bytes for the target alone.
+- `N_CHUNK` output notify (2 cases): N=1024/chunk 256 and N=768/chunk 512
+  (partial last chunk). Replays use one cluster beside the consumer (early
+  stop) and 1000 (none); the two settings and the stock scheduler agree.
+
+Levels: 10 cases are L0, which keeps every category at L0 on both kernels, both
+signal layouts, both routings, ragged experts and a partial last chunk. The L0
+cases are 4 replays (each kernel, layout and routing once), both release-order
+cases, 3 batch-invariance cases (plain host layout, GLU device layout, plain
+`N_CHUNK`) and the N=768/chunk 512 `N_CHUNK` replay. The other 7 combinations
+are L1.
+
+The independent float reference stays in
+`test_grouped_gemm_streaming_signal.py` (`plain_reference`). No golden is
+recorded for this suite: the claim is byte equality with the stock scheduler on
+the same runtime. The kernels have no backward.
+
+Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend
+9.24.0, CuTe DSL 4.8.0 (compiling with CUDA 12.9). The run used a PR-built
+cuDNN-FE wheel overlaid with the `6ef34811` grouped-GEMM sources (this
+change's parent), and source-hash and import-path checks confirmed the tested
+files. Each run sharded the cases over four GPUs:
+
+- New suite with the existing `test_grouped_gemm_streaming_signal.py`:
+  **103 passed** (17 + 86), 0 failed, 0 skipped. The 86 include that suite's
+  scheduler warm-stress case: 0 wrong of 500 warm and 0 of 500 poisoned
+  launches. Its unsafe control failed 200 of 200. The tested shape (8 thread
+  blocks, 12 stage refills per launch) is below the control's geometry, so
+  the zero bounds little.
+- Earlier runs on the `b45ad82e` and `63a7ee55` sources also passed with no
+  failures or skips. They ran 101, 17 and 102 cases; the first predates the
+  `N_CHUNK` batch-invariance case.
+- After the L0/L1 split (same sources, test files only): `-m "L0 or L1"` over
+  both files collected 103 cases and **103 passed**; `-m L0` alone, 21 cases of
+  which 10 are this suite's, passed serially on one GPU in 27 s.
+
+SM103, SM107 and CUDA 13 DSL compilation remain unverified. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py -m "L0 or L1" -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_streaming_signal.py -m "L0 or L1" -q -rs
+```
 
 ### GLU + Hadamard + quant column-scale packing — SM100, 2026-11-11
 

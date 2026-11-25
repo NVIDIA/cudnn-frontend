@@ -56,7 +56,9 @@ from ..moe_kernel_helpers import (
     amax_reduction_per_thread,
     epilog_gmem_copy_and_partition,
     get_dtype_rcp_limits,
+    check_dynamic_sched_cluster_shape,
 )
+from ..moe_streaming_output_chunk_tile_scheduler import StreamingOutputNotifyConfig
 
 
 class BlockScaledMoEGroupedGemmQuantKernel:
@@ -77,6 +79,13 @@ class BlockScaledMoEGroupedGemmQuantKernel:
     :param expert_cnt: Number of experts.
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE``.
     :param use_dynamic_sched: Enable dynamic tile scheduling.
+    :param streaming_output_notify: ``StreamingOutputNotifyConfig``; ``N_CHUNK`` publishes each finished chunk of BF16 D
+        columns to a streaming consumer (``MoEStreamingOutputChunkSignalTileScheduler``). Needs ``use_dynamic_sched``,
+        dense weights, BF16 D with no SFD or amax, and cluster (2, 1) with the 2-CTA MMA or (1, 1) with the 1-CTA MMA.
+    :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
+        for that grid before it exits. With ``N_CHUNK`` and its own reset (not ``caller_reset``), that grid is the
+        reset, and every thread waits for it at entry instead, before any signal[] update or dependent launch.
+    :param launch_pdl_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
     """
 
     FIX_PAD_SIZE = 256
@@ -135,6 +144,9 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = False,
         use_single_group_runtime_offsets: bool = False,
+        streaming_output_notify: Optional[StreamingOutputNotifyConfig] = None,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -209,6 +221,19 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         self.epilogue_use_functor = False
 
         self.num_epilog_warps = len(self.epilog_warp_id)
+
+        self.use_pdl = use_pdl
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
+        self.streaming_output_notify = (streaming_output_notify or StreamingOutputNotifyConfig()).bind(
+            (mma_tiler_mn[0] // (2 if use_2cta_instrs else 1), mma_tiler_mn[1]), expert_cnt, False
+        )
+        if self.streaming_output_notify.enabled:
+            if not use_dynamic_sched:
+                raise ValueError("streaming_output_notify requires use_dynamic_sched=True")
+            # signal[] counts D's bulk stores only: SFD and amax are not published per chunk.
+            if generate_sfd or weight_mode != MoEWeightMode.DENSE or use_single_group_runtime_offsets:
+                raise ValueError("streaming_output_notify requires BF16 D without SFD, dense weights and padded_offsets in global memory")
+            check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
 
     # ------------------------------------------------------------------
     # _setup_attributes
@@ -439,7 +464,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
     def get_workspace_bytes(self) -> int:
         desc_workspace_bytes = self.get_desc_workspace_bytes()
         dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
-        return desc_workspace_bytes + dynamic_sched_bytes
+        return desc_workspace_bytes + dynamic_sched_bytes + self.streaming_output_notify.workspace_bytes
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):
@@ -587,6 +612,12 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         arrays of per-expert base addresses; ``n``, ``k``, ``b_stride_size``,
         ``b_major_mode`` describe the uniform per-expert layout.
         """
+        if cutlass.const_expr(self.streaming_output_notify.enabled):
+            # signal[] ends the workspace, and the consumer reads BF16 D columns only.
+            if cutlass.const_expr(scheduler_counter is not None or amax_tensor is not None or sfd_row_tensor is not None):
+                raise ValueError("streaming_output_notify: pass no scheduler_counter, amax or SFD")
+            if cutlass.const_expr(d.element_type != cutlass.BFloat16):
+                raise ValueError(f"streaming_output_notify requires BF16 D, got {d.element_type}")
         if cutlass.const_expr(scheduler_counter is not None):
             workspace_ptr = scheduler_counter.iterator
         a = kernel_facing_mx(a)
@@ -791,6 +822,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 stream=stream,
                 min_blocks_per_mp=1,
             )
+        self.streaming_output_notify.launch_reset(workspace_ptr, self.get_workspace_bytes(), stream)
 
         # ---- Grid computation via MoE scheduler ----
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
@@ -798,6 +830,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             sched_expert_shape = (self.expert_cnt, b_n, b_k)
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
+        self.streaming_output_notify.check_output_cols(sched_expert_shape[1])
 
         sched_params = MoESchedulerParams(
             scenario="2Dx3D",
@@ -904,6 +937,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -1145,6 +1179,12 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
+        # With its own N_CHUNK reset, this kernel is the programmatic dependent of that reset: wait for it before any
+        # count lands on signal[] and before a dependent consumer can poll signal[].
+        if cutlass.const_expr(self.use_pdl and self.streaming_output_notify.enabled and not self.streaming_output_notify.caller_reset):
+            cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.launch_pdl_dependents_at_entry):
+            cute.arch.griddepcontrol_launch_dependents()
 
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -1204,6 +1244,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
             sched_storage=sched_storage,
         )
+        scheduler = self.streaming_output_notify.tile_order(scheduler)
         scheduler.internal_init()
 
         tmem = TmemAllocator(
@@ -1746,6 +1787,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 bias_s2r_tom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.bias_dtype, num_bits_per_copy=128)
                 tTR_rBias = cute.make_rmem_tensor(cute.make_layout(self.epi_tile[1]), self.bias_dtype)
 
+            streaming_output_notifier = self.streaming_output_notify.make_notifier(workspace_ptr, self.get_workspace_bytes(), sched_params.intermediate)
+            streaming_output_notify_state = streaming_output_notifier.make_state()
             num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
                 epi_work_tile_info = MoEWorkTileInfo(
@@ -1842,6 +1885,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
+                if warp_idx == self.epilog_warp_id[0]:
+                    streaming_output_notify_state = streaming_output_notifier.begin_tile(streaming_output_notify_state, epi_work_tile_info, padded_offsets)
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
@@ -1989,6 +2034,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                         d_pipeline.producer_commit()
                         d_pipeline.producer_acquire()
                     self.epilog_sync_barrier.arrive_and_wait()
+                if warp_idx == self.epilog_warp_id[0]:
+                    streaming_output_notify_state = streaming_output_notifier.end_tile(streaming_output_notify_state)
 
                 if cutlass.const_expr(not self.overlapping_accum):
                     with cute.arch.elect_one():
@@ -2014,7 +2061,13 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
+            if warp_idx == self.epilog_warp_id[0]:
+                streaming_output_notifier.finalize(streaming_output_notify_state, padded_offsets)
             d_pipeline.producer_tail()
+
+        # Work after this kernel on the stream must also follow the grid this launch overlapped.
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
