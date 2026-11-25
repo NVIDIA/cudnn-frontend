@@ -423,6 +423,10 @@ class pygraph:
         for kind, note, keep in self._note_filters:
             for i, cfg in enumerate(self._plans):
                 if self._engine_for(cfg) is None:
+                    if keep and kind == "numerical" and note == cudnn.numerical_note.BATCH_INVARIANT:
+                        # Includes the opaque backend delegator, which has no
+                        # native engine config on which C++ could mark a bar.
+                        barred.add(i)
                     continue  # backend entry: the backend already filtered it
                 if (note in self._notes_of(cfg, kind)) != keep:
                     barred.add(i)
@@ -750,10 +754,13 @@ class pygraph:
         compute_data_type: Any = None,
         padding: float = 0.0,
         name: str = "",
+        *,
+        enable_pdl: bool = False,
     ) -> Tensor:
         """Matrix multiplication: C = A @ B.
 
         A and B can be Tensor descriptors or framework tensors (torch, jax, etc.).
+        enable_pdl requests programmatic dependent launch for a batch-invariant mixed MXFP8/MXFP4 GEMM.
         """
         name = self._get_name("matmul", name)
         A = self._ensure_tensor(A, name=f"{name}::A")
@@ -763,6 +770,8 @@ class pygraph:
         node.inputs["A"] = A
         node.inputs["B"] = B
         node.params["padding"] = padding
+        if enable_pdl:
+            node.params["enable_pdl"] = True
 
         C = self._make_output(f"{name}::C")
         node.outputs["C"] = C
@@ -985,6 +994,8 @@ class pygraph:
         usage, and auto-marking it would make its uid required in the variant
         pack.
         """
+        if not self._requires_batch_invariant and any(node.node_type == NodeType.MATMUL and node.params.get("enable_pdl") for node in self._nodes):
+            raise cudnn_graph_not_supported("matmul enable_pdl requires the BATCH_INVARIANT numerical note")
         try:
             for node in self._nodes:
                 node.infer_properties(self._context)
@@ -1107,6 +1118,8 @@ class pygraph:
         backend lowering for a classic query (``_lower_backend_plan``).  ``key()``, ``serialize()`` and a
         direct ``build_operation_graph()`` only lower (C++ lowering, validate, build_operation_graph): no
         plan is created there, and that part of the sequence completes on the guarded domain."""
+        if self._requires_batch_invariant:
+            return "the BATCH_INVARIANT numerical note is served by frontend engines only"
         from .engines import manifest
 
         family = manifest.family_for(self) if self._nodes else None
@@ -1569,6 +1582,12 @@ class pygraph:
 
             public = eng.knobs_to_public(cfg.knobs)
             return f"{eng.name}[{public_knobs_repr(public)}]" if public else eng.name
+        if self._requires_batch_invariant:
+            # A late filter retains the existing indices for diagnostics. Do not
+            # create a native plan solely to obtain the name of a barred entry.
+            if cfg.cpp_index is None:
+                return f"backend engine {cfg.engine_id}"
+            return self._lowered_graph.get_plan_name_at_index(cfg.cpp_index)
         cfg = self._materialize_backend_plan(index)
         if cfg.cpp_index is None:
             # Delegating entry: the backend holds candidates it does not expose
@@ -1628,7 +1647,33 @@ class pygraph:
 
     def select_numeric_notes(self, notes: List[Any]) -> "pygraph":
         """Classic: keep only plans carrying ``notes``."""
+        if cudnn.numerical_note.BATCH_INVARIANT in notes and not self._requires_batch_invariant:
+            if self._is_built and not self._planning_done:
+                raise cudnn_graph_not_supported("a serialized backend plan cannot satisfy the BATCH_INVARIANT numerical note")
+            self._filter_notes("numerical", notes, keep=True)
+            # This note unlocks an engine. A filter is valid both before and
+            # after heuristic discovery; preserve published plan indices when
+            # appending candidates newly eligible under the request.
+            self._candidates = None
+            self._facts.clear()
+            self._backend_entries = None
+            if self._planning_done:
+                from .engines.heuristics import rank
+
+                with self._planning_scope():
+                    engines = [e for e in self._candidate_engines() if cudnn.numerical_note.BATCH_INVARIANT in e.numerical_notes]
+                    if engines:
+                        proposals = rank(self, engines, [], self._backend_heuristics)
+                        self._plans.extend(plan for plan in proposals if plan not in self._plans)
+                barred = self._barred_indices()
+                if self._plan_index in barred and not self._plan_pinned:
+                    self._plan_index = next((i for i in range(len(self._plans)) if i not in barred), self._plan_index)
+            return self
         return self._filter_notes("numerical", notes, keep=True)
+
+    @property
+    def _requires_batch_invariant(self) -> bool:
+        return bool(self._note_filters) and ("numerical", cudnn.numerical_note.BATCH_INVARIANT, True) in self._note_filters
 
     def _filter_notes(self, kind: str, notes: List[Any], *, keep: bool) -> "pygraph":
         """Record a note filter and forward it to the backend.
@@ -1643,7 +1688,7 @@ class pygraph:
         # while that list is empty marks nothing and is silently lost. Anything
         # set earlier is replayed by _create_backend_plans().
         if self._backend_has_plans():
-            getattr(self._lowered_graph, f"{'select' if keep else 'deselect'}_{'behavior' if kind == 'behavior' else 'numeric'}_notes")(list(notes))
+            self._forward_notes(kind, notes, keep)
         if self._is_built and self._planning_done and self._plan_index in self._barred_indices():
             self._is_built = False  # the built plan is no longer allowed to run
         return self
@@ -1657,7 +1702,15 @@ class pygraph:
         """Push every recorded note filter at the backend. Idempotent — the C++
         side ORs into barred_indices — so replaying is safe."""
         for kind, note, keep in self._note_filters:
-            getattr(self._lowered_graph, f"{'select' if keep else 'deselect'}_{'behavior' if kind == 'behavior' else 'numeric'}_notes")([note])
+            self._forward_notes(kind, [note], keep)
+
+    def _forward_notes(self, kind: str, notes: List[Any], keep: bool) -> None:
+        # BATCH_INVARIANT is a frontend-only note. The Python graph filters
+        # backend plans itself, including opaque delegating entries.
+        if kind == "numerical":
+            notes = [note for note in notes if note != cudnn.numerical_note.BATCH_INVARIANT]
+        if notes:
+            getattr(self._lowered_graph, f"{'select' if keep else 'deselect'}_{'behavior' if kind == 'behavior' else 'numeric'}_notes")(list(notes))
 
     def _notes_of(self, cfg: Any, kind: str) -> tuple:
         """The declared notes of a python plan; () for a backend entry, whose
@@ -2153,6 +2206,9 @@ class pygraph:
         get_workspace_size()/execute() refer to i rather than to whatever the
         walk last settled on."""
         if not self._planning_done:
+            if self._requires_batch_invariant:
+                self.create_execution_plans()
+                return self.build_plan_at_index(index)
             return self._lowered_graph.build_plan_at_index(index)
         self._check_plan_index(index)
         self._reject_if_barred(index)
@@ -2240,8 +2296,8 @@ class pygraph:
         return getattr(self._lowered_graph, name)(*args, **kwargs)
 
     def key(self, *args, **kwargs):
-        """Classic cache key. The backend computes it, so the graph must lower —
-        and it does NOT yet distinguish which python engine serves the graph."""
+        """Key for the declared computation. Batch-invariant graphs have a separate key for
+        the same nodes because their arithmetic is part of the request."""
         if self._lowered_graph is None:  # a deserialized graph already has one, and no op tree to rebuild
             node = self._unlowerable_node()
             if node is not None:
@@ -2249,7 +2305,13 @@ class pygraph:
             if not self._is_validated:
                 self.validate()  # lowering freezes the IR; validate() is what infers into it first
             self._lower_backend_graph()
-        return self._lowered_graph.key(*args, **kwargs)
+        key = self._lowered_graph.key(*args, **kwargs)
+        if self._requires_batch_invariant:
+            # Keep the classic uint64 return type and distinguish an otherwise
+            # identical matmul in downstream caches of complete graph objects.
+            pdl = any(node.node_type == NodeType.MATMUL and node.params.get("enable_pdl") for node in self._nodes)
+            return key ^ (1 << 63) ^ (int(pdl) << 62)
+        return key
 
     def create_execution_plan(self, engine_id: int, knobs: Any = None) -> "pygraph":
         """APPEND one plan for an explicit ``(engine_id, knobs)`` to the ranked list.
@@ -2294,6 +2356,9 @@ class pygraph:
     def execute_plan_at_index(self, tensor_dict, workspace=None, index: int = 0, handle=None, *args, tensor_uids=None, **kwargs) -> None:
         """Execute one ranked plan without changing the graph's selected plan."""
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
+            if self._requires_batch_invariant:
+                self.create_execution_plans()
+                return self.execute_plan_at_index(tensor_dict, workspace, index, handle, *args, tensor_uids=tensor_uids, **kwargs)
             h = handle if handle is not None else self._handle
             device = h.device.ordinal if isinstance(h, Handle) else self._default_handle_device if h is None else None
             if device is not None:
@@ -2921,6 +2986,8 @@ class pygraph:
                 raise RuntimeError("serialize(): build the selected plan first (build_plans())")
             blob = _plan_serdes.serialize(self, include_kernels=include_kernels)
             return blob if as_bytes else list(blob)
+        if self._requires_batch_invariant:
+            raise cudnn_graph_not_supported("serialize(): build a batch-invariant plan before serializing this graph")
         if self._lowered_graph is None:
             # Backend-selected or unplanned: the cuDNN graph format — lower on demand.
             node = self._unlowerable_node()
@@ -2954,6 +3021,8 @@ class pygraph:
             _plan_serdes.deserialize(self, data, handle=handle, enforce_precompiled=enforce_precompiled)
             self._sorted_uids = None
             return
+        if self._requires_batch_invariant:
+            raise cudnn_graph_not_supported("a serialized backend plan cannot satisfy the BATCH_INVARIANT numerical note")
         if args and isinstance(args[0], Handle):
             args = (args[0].backend_handle,) + args[1:]
         if isinstance(kwargs.get("handle_"), Handle):

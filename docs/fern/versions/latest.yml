@@ -265,6 +265,12 @@ navigation:
           - page: Engram Saved-State Gate
             path: ../../operations/pointwise/engram_saved_gate.md
             slug: engram_saved_gate
+          - page: FP8 Row Quantization Decode Step (SM100-class)
+            path: ../../operations/pointwise/row_quantize_fp8_decode.md
+            slug: row_quantize_fp8_decode
+          - page: Row Argmax Decode Step (SM100-class)
+            path: ../../operations/pointwise/row_argmax_decode.md
+            slug: row_argmax_decode
       - page: Resampling
         path: ../../operations/Resampling.md
         slug: operations/Resampling
@@ -299,6 +305,9 @@ navigation:
           - page: GAT and GATv2 attention
             path: ../../operations/gnn/mha_gat.md
             slug: mha_gat
+          - page: Simple multi-head attention
+            path: ../../operations/gnn/mha_simple.md
+            slug: mha_simple
       - section: For Agents
         slug: utilities
         contents:

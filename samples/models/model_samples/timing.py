@@ -33,6 +33,13 @@ step.  Per step:
   one.  GPU busy and idle are parts of the traced step, which the profiler stretches, so the line prints the period
   under the profiler first and host-exposed last, with what it is taken against.
 
+A run whose decode step was recorded once and replayed for every token (``Report.replayed``) is one launch and one host
+read per step, and its report says so: the first-token line counts replayed steps, the step line names the replay, and
+the traced pass prints two GPU-busy figures in the place of an idle and a host-exposed time -- of the steps launched
+from Python under the profiler, and of the same steps replayed under it (``Trace.replayed``) -- with the launches of
+each.  Such a report has no note on what bounds a step: the two figures stand beside the period, and nothing is
+asserted.
+
 A session whose step feeds several tokens per sequence (a verify step) reports its step timings and its traced pass, and
 says of three lines that they are not stated: nothing was prefilled through its steps, a step is not one token (how many
 of its tokens a run keeps is the caller's), and the bytes of a step are a family's arithmetic for the decode step.
@@ -138,6 +145,8 @@ class Trace:
     kernels: int
     copies: int
     period: float  # the host-side period under the profiler
+    #: of a pass whose last steps were replays of a recorded step: the same facts over those steps alone
+    replayed: Optional["Trace"] = None
 
 
 def step_facts(records: List[Tuple[str, float, float]]) -> List[Tuple[float, float, int, int]]:
@@ -188,11 +197,15 @@ def _exported(profiler) -> Tuple[list, str]:
     return [], f"the profiler's trace could not be {what} ({why})"
 
 
-def trace_steps(step: Callable[[int], None], count: int, device=None, records: Optional[list] = None) -> Tuple[Optional[Trace], str]:
+def trace_steps(step: Callable[[int], None], count: int, device=None, records: Optional[list] = None, tail: int = 0) -> Tuple[Optional[Trace], str]:
     """Run ``step(i)`` for ``i`` in ``range(count)`` under the PyTorch profiler with kernel activity records only and return
     ``(Trace, "")``, or ``(None, reason)`` where the records cannot be had.  ``step`` ends in the loop's one host read.
     ``device`` is the device the steps run on, where the caller knows it: there are kernel activity records of a CUDA
     device only, and no step is run for another.
+
+    ``tail`` runs that many steps more in the same pass, ``step(count)`` onwards, and keeps their facts apart
+    (``Trace.replayed``): the steps of a caller that launches ``count`` steps from Python and then the same steps as
+    replays of a recorded step.  The medians of the ``Trace`` are over the first ``count`` steps alone.
 
     ``records``, a list, asks for the launch records of the pass: the profiler's trace is exported and every kernel and copy
     record of it (``census.Launch``: name, grid, block, shared memory) is appended in start order -- also where the step facts
@@ -215,7 +228,7 @@ def trace_steps(step: Callable[[int], None], count: int, device=None, records: O
     except RuntimeError as error:  # the profiler could not start its kernel activity records
         return failed(error)
     try:  # an error of a step is the step's, not the profiler's: it is not caught here
-        for i in range(count):
+        for i in range(count + tail):
             start = now()
             step(i)
             periods.append((now() - start) * 1e3)
@@ -242,15 +255,19 @@ def trace_steps(step: Callable[[int], None], count: int, device=None, records: O
     facts = step_facts(activity)
     if not activity:
         return None, "the profiler recorded no kernel activity on this GPU"
-    if len(facts) != count:
-        return None, f"the records show {len(facts)} host reads for {count} steps"
+    if len(facts) != count + tail:
+        return None, f"the records show {len(facts)} host reads for {count + tail} steps"
     median = statistics.median
-    return (
-        Trace(
-            count, median(f[0] for f in facts), median(f[1] for f in facts), int(median(f[2] for f in facts)), int(median(f[3] for f in facts)), median(periods)
-        ),
-        "",
-    )
+
+    def over(some, lasted) -> Trace:
+        return Trace(
+            len(some), median(f[0] for f in some), median(f[1] for f in some), int(median(f[2] for f in some)), int(median(f[3] for f in some)), median(lasted)
+        )
+
+    traced = over(facts[:count], periods[:count])
+    if tail:
+        traced.replayed = over(facts[count:], periods[count:])
+    return traced, ""
 
 
 class Report:
@@ -285,6 +302,10 @@ class Report:
         self.trace_missing = ""  # why there is no traced pass, when one was asked for
         self.bytes: Dict[str, int] = {}  # the model's bytes_per_step, when the family states them
         self.notes: List[str] = []
+        #: whether the steps of the run were replays of a recorded step (one launch and one host read per step), and what
+        #: that sequence holds as the installation states it (``None``: not stated)
+        self.replayed = False
+        self.launches: Optional[int] = None
 
     def text(self) -> str:
         prefix = "reduced model: " if self.reduced else ""
@@ -311,18 +332,36 @@ class Report:
             lines.append(f"first token           not stated: a session of {self.tokens} tokens per sequence prefills nothing (its steps are verify steps)")
         else:
             lines.append(
-                f"first token           {prefix}prefill route: {self.prefill_route}, {self.prompt_tokens} tokens x one step"
+                f"first token           {prefix}prefill route: {self.prefill_route}, {self.prompt_tokens} tokens x one {'replayed ' if self.replayed else ''}step"
                 + (", each but the first behind one pass of the drafter over the position in front of it" if self.drafter else "")
                 + f"; not a time to first token of record ({self.prefill_seconds * 1e3:.1f} ms)"
             )
         s = self.clock.summary()
         if s is not None:
+            made = f"{self.calls_per_step} block calls per step"
+            if self.replayed:  # one launch of the recorded sequence: the block calls of a step are inside it
+                made = (
+                    "one replay" + (f" of {self.launches} launches" if self.launches is not None else " of the recorded step") + " and one host read per step"
+                )
             lines.append(
                 f"steps ({len(self.clock.launch)})            {prefix}period {s['period_median']:.3f} ms median / {s['period_mean']:.3f} mean | "
-                f"in the step {s['in_step_median']:.3f} ms | turnaround {s['turnaround_median']:.3f} ms | {self.calls_per_step} block calls per step"
+                f"in the step {s['in_step_median']:.3f} ms | turnaround {s['turnaround_median']:.3f} ms | {made}"
             )
         share = None  # host-exposed time as a share of the period, when a traced pass measured it
-        if self.trace is not None:
+        if self.trace is not None and self.replayed:
+            # two GPU-busy figures, each with its launches, and nothing set against the period: the steps under the profiler
+            # were launched from Python, the run's own were replays
+            t, r = self.trace, self.trace.replayed
+            lines.append(
+                f"traced pass ({t.steps})      {prefix}the first {t.steps} steps again, launched from Python under the profiler: GPU busy {t.busy:.3f} ms | "
+                f"{t.kernels} kernel launches + {t.copies} copies per step"
+            )
+            if r is not None:
+                lines.append(
+                    f"                      {prefix}{r.steps} of them replayed under the profiler: GPU busy {r.busy:.3f} ms | "
+                    f"{r.kernels} kernel launches + {r.copies} copies per step"
+                )
+        elif self.trace is not None:
             t = self.trace
             period = s["period_median"] if s is not None else t.period
             exposed = period - t.busy
@@ -386,7 +425,8 @@ class Report:
             bound = f"host-exposed {share:.0%} of the period: the launch path from Python bounds this step, not the GPU"
         else:
             bound = f"GPU busy {1 - share:.0%} of the period: the GPU work of this stack bounds this step, not the launch path"
-        lines.append(f"note                  {bound}; no floor and no speed-of-light figure is printed")
+        if not self.replayed:  # of a replayed run nothing is said about what bounds a step: the two GPU-busy figures stand beside the period
+            lines.append(f"note                  {bound}; no floor and no speed-of-light figure is printed")
         lines.extend(self.notes)
         return "\n".join(lines)
 

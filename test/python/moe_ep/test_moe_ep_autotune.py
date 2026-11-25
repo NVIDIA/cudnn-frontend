@@ -108,14 +108,6 @@ def test_autotune_core_contracts(monkeypatch):
         with pytest.raises(ValueError, match=message):
             normalize(baseline, [baseline], **arguments)
 
-    with pytest.raises(ValueError, match="does not sweep reduce_topk_in_kernel"):
-        normalize(
-            baseline,
-            [MoeEpTuningConfig(reduce_topk_in_kernel=True)],
-            warmup_iters=0,
-            timed_iters=1,
-            max_candidates=32,
-        )
     with pytest.raises(ValueError, match="exceeding max_candidates=1"):
         normalize(
             baseline,
@@ -294,14 +286,14 @@ def test_autotune_api_transactions(monkeypatch):
         resolved_config=state.resolved_config,
         backend=active_backend,
     )
-    with pytest.raises(ValueError, match="does not sweep reduce_topk_in_kernel"):
+    with pytest.raises(ValueError, match="candidates must not be empty"):
         op.autotune_inference(
             None,
             None,
             None,
             None,
             None,
-            candidates=[MoeEpTuningConfig(reduce_topk_in_kernel=True)],
+            candidates=[],
             warmup_iters=0,
             timed_iters=1,
         )
@@ -673,6 +665,10 @@ def test_autotune_sm107_inference_training_and_graph():
         MoeEpTuningConfig(token_in_flag_batch=4),
         MoeEpTuningConfig(epi_flag_batch=(2, 1)),
         MoeEpTuningConfig(group_hint=64),
+        # Forward-kernel knobs (inference and training forward only).
+        MoeEpTuningConfig(scheduling="atomic"),
+        MoeEpTuningConfig(scheduling="phase_interleave"),
+        MoeEpTuningConfig(mixed_cga=True),
     ]
 
     inference_args = make_forward_inputs(device)
@@ -692,7 +688,7 @@ def test_autotune_sm107_inference_training_and_graph():
         _print_candidate_timings("inference", result)
         actual = op(*inference_args)
         torch.cuda.synchronize(device)
-        assert result.evaluated_candidates == len(candidates) == 5
+        assert result.evaluated_candidates == len(candidates) == 8
         assert result.winner in candidates
         assert op.inference_tuning == result.winner
         assert op._execution_state.backend is not None
@@ -758,7 +754,10 @@ def test_autotune_sm107_inference_training_and_graph():
             warmup_iters=1,
             timed_iters=2,
         )
-        backward_candidates = [candidate for candidate in candidates if candidate.token_back_mode == "epi_warps"]
+        # Training backward accepts neither dispatch token-back modes nor forward-kernel knobs.
+        backward_candidates = [
+            candidate for candidate in candidates if candidate.token_back_mode == "epi_warps" and candidate.scheduling == "static" and not candidate.mixed_cga
+        ]
         backward_result = op.autotune_training_backward(
             training_args[0],
             grad_output,
@@ -798,7 +797,7 @@ def test_autotune_sm107_inference_training_and_graph():
             out=backward_out,
         )
         torch.cuda.synchronize(device)
-        assert forward_result.evaluated_candidates == len(candidates) == 5
+        assert forward_result.evaluated_candidates == len(candidates) == 8
         assert forward_result.winner in candidates
         assert backward_result.evaluated_candidates == len(backward_candidates)
         assert backward_result.winner in backward_candidates

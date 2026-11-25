@@ -4,9 +4,8 @@
 """The performance mode of a model sample: timed requests of the decode loop, one definition per statistic, a report on the
 screen and a report file.
 
-A **timed request** is what a serving benchmark calls a request: one prompt from a zero state, its first new token, then a
-fixed number of forced decode steps (the end token is ignored).  A run of the mode (``run``) is one process and makes, in
-this order:
+A **timed request** is one prompt from a zero state, its first new token, then a fixed number of forced decode steps (the
+end token is ignored).  A run of the mode (``run``) is one process and makes, in this order:
 
 1. the **checked request**, with the recorder of the checks on, and the reference checks on it (``tie_out.run_checks``):
    replay over the whole request, every provider block against the reference at the **judged positions**
@@ -48,12 +47,22 @@ beside a kernel of its own is the row of its place in the wiring and is named so
 partition the union, so the rows sum to GPU busy.  A step launched from Python says so over its table: a kernel's
 time there is not its time inside a captured sequence.
 
+**A run whose steps are replays** (a session that records its decode step: the stack ``native`` by default).  Its checked
+request, its warm-up request and its timed requests are replays of the recorded step: one launch and one host read
+per token.  The checked request is replayed with the recorder on, and the checks launch every step of it again from
+Python: ids and logits of all its steps byte for byte, the step's own tail behind the request, and the digest of the
+state the recomputation leaves against the replayed request's.  The traced request is launched from Python, as in
+every run -- the kernel check and the per-kernel table need the call log, and the table says so --, and behind it a
+second traced request replays its first steps under the profiler: their launch records are held to the traced
+steps launched from Python (``census.recorded_step``), and their GPU busy is the one the ``step`` line prints
+(``gpu_busy_replayed``).  A replayed step has no launch path from Python between its blocks, so no launch overhead
+and no stretch of tracing is formed for such a run.
+
 **What a run may call itself** (``record_class``).  A run is a ``controlled`` run only when it observed every condition
-itself -- a checkpoint, every block on a claimed target kernel, a captured launch sequence, the three statements of its
-``checks`` lines, no other process on the GPU, the clocks -- and prints ``orientation`` with every reason otherwise.
+itself -- a checkpoint, no block on a fallback row, a captured launch sequence, the three statements of its ``checks``
+lines, no other process on the GPU, the clocks -- and prints ``orientation`` with every reason otherwise.
 The GPU's other processes and its clock are observed through the driver's tool (``observe``) or printed as not observed
-with the reason; no stack of this area is captured, so every run is ``orientation``, on the second line of the screen
-and inside the rate line.  A report holds no speed-up, no baseline and no figure of another GPU class.
+with the reason; a run that is ``orientation`` says so on the second line of the screen and inside the rate line.  A report holds no speed-up, no baseline and no figure of another GPU class.
 """
 
 from __future__ import annotations
@@ -76,7 +85,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import census, observe, tie_out
 from .timing import now, step_facts
 
-SCHEMA = "model-sample-performance/4"
+SCHEMA = "model-sample-performance/6"
+REPLAYED_TRACED = 16  # the steps of the second traced request of a run whose steps are replays
 WIDTH = 110  # of the screen: no line is wider
 ORIENTATION, CONTROLLED = "orientation", "controlled"
 PASS, FAIL, NOT_OBSERVED = census.PASS, census.FAIL, census.NOT_OBSERVED
@@ -101,27 +111,18 @@ OWN_ORIGINS = ("cuDNN FE", "PyTorch")
 #: row is still one kernel
 ONE_KERNEL = ("exact", "library", "read")
 
-#: statistic -> (unit, definition, serving counterpart or None): the sentences the report file carries beside each number
-DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
+#: statistic -> (unit, definition): the sentence the report file carries beside each number
+DEFINITIONS: Dict[str, Tuple[str, str]] = {
     "time_per_output_token": (
         "ms",
         (
             "Per timed request: (time the last token's ids reach the host - time the first new token's ids reach the host) / (new tokens - 1). Of a run: the "
             "median over its timed requests."
         ),
-        (
-            "The same formula as a serving benchmark's time per output token, (end of stream - first text chunk) / (output tokens - 1). Differences: the clock "
-            "is inside the process, the requests repeat one prompt, and a timed request of N steps delivers N + 1 new tokens where a serving request of N "
-            "output tokens delivers N."
-        ),
     ),
     "decode_rate": (
         "tokens/s per sequence",
         "1000 / time per output token in ms. Never a median step turned into a rate. With several sequences the line adds the total.",
-        (
-            "The same as a serving benchmark's tokens per second per user, 1000 / time per output token. It is not output tokens / wall time of the run, which "
-            "contains every time to first token; that figure is in this file as tokens_per_second_wall."
-        ),
     ),
     "token_to_token_interval": (
         "ms",
@@ -129,7 +130,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "The time between the host reads of two consecutive tokens of a timed request, pooled over the run's timed requests; percentiles are nearest-rank. "
             "The intervals span a growing attention cache as well as jitter: the file gives the first and the last timed position."
         ),
-        "None: a percentile of this loop is not a service's tail latency.",
     ),
     "time_to_first_token": (
         "ms",
@@ -138,10 +138,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "ids, the prompt's decode steps (one per prompt token: this sample has no prefill kernel) and the host read. Of a run: the median over its timed "
             "requests. The load is outside it."
         ),
-        (
-            "The same pair of events as a serving benchmark's time to first token without the network; not the same quantity: a serving engine prefills the "
-            "prompt in one pass and adds its queue and its network path."
-        ),
     ),
     "step": (
         "ms",
@@ -149,7 +145,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "The median token-to-token interval over the timed steps at the positions the traced request covers, all timed requests. Equal to the median of the"
             " token-to-token interval when the whole request is traced."
         ),
-        "A serving engine's step is not measured directly: it is its time per output token, times the kept tokens per step with draft tokens.",
     ),
     "gpu_busy": (
         "ms",
@@ -157,7 +152,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "Per traced step: the length of the union of the intervals of every kernel and copy between two host reads, from the profiler's kernel activity "
             "records; the median over the traced steps. An upper bound: tracing lengthens kernels."
         ),
-        "The same method as the kernel-busy sum of a traced serving step.",
     ),
     "host": (
         "ms",
@@ -165,7 +159,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "From a token's ids on the host to the next step's first launch call: the loop's own work (keeping the ids); the median over the timed steps at the"
             " traced positions."
         ),
-        None,
     ),
     "launch_overhead": (
         "ms",
@@ -178,7 +171,14 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "otherwise the line says that launch overhead and host are not resolved by this method. The file holds the remainder as computed, which can be "
             "negative, the count, the median, the extremes and the percentiles of the per-step remainders, and the launch overhead per block call."
         ),
-        None,
+    ),
+    "gpu_busy_replayed": (
+        "ms",
+        (
+            "Of a run whose steps are replays of a recorded step. Per step of a second traced request, whose steps are replays: the length of the union of "
+            "the intervals of every kernel and copy between two host reads, from the profiler's kernel activity records; the median over those steps. An "
+            "upper bound: tracing lengthens kernels."
+        ),
     ),
     "tracing_stretch": (
         "%",
@@ -186,7 +186,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "The median time from a step's first launch to its ids on the host in the traced request, divided by the same in the timed requests at the same "
             "positions, minus 1."
         ),
-        None,
     ),
     "tokens_per_second_wall": (
         "tokens/s per sequence",
@@ -194,16 +193,14 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "Per timed request: new tokens / (time the last token's ids reach the host - time the request is handed to the text path). Of a run: the median "
             "over its timed requests. It holds the time to first token and is not the decode rate; where no decode rate is printed it is null too."
         ),
-        "A serving benchmark's output tokens / wall time of a request, which holds its time to first token.",
     ),
     "launches_per_step": (
         "launches",
         (
-            "From the plan and the kernel census: the launches of a step that are on the target kernel set, by provider and as three numbers -- the target's "
-            "own compiled kernels, cuDNN Frontend entries with byte-equal results, declared stand-ins. Observed by the kernel check on the traced steps, which "
-            "also counts the kernels and copies a step launches beside them."
+            "From the plan: the launches of a step on exact rows -- the rows one named kernel serves, each launch of which the kernel check holds one by one "
+            "-- by provider, and the block calls of a step on fallback rows. Observed by the kernel check on the traced steps, which also counts the kernels "
+            "and copies a step launches beside them."
         ),
-        "The verdict of a kernel census.",
     ),
     "kernel_launches": (
         "launches",
@@ -211,7 +208,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "Of a row of the per-kernel table: the kernel and copy records of a traced step that the kernel check attributes to the row's blocks; the median "
             "per step."
         ),
-        "The kernel census of a traced serving step.",
     ),
     "kernel_time_per_launch": (
         "us",
@@ -221,10 +217,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "the resolution found, and where the profiler hands over whole microseconds the column is not printed. The file also holds the median recorded "
             "duration."
         ),
-        (
-            "The same method as the timeline-exclusive duration of a per-kernel analysis of a traced serving step; comparable only on one GPU class, SM count, "
-            "clock and launch path."
-        ),
     ),
     "kernel_time_per_step": (
         "ms",
@@ -233,7 +225,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "step the added times of all records sum exactly to that step's GPU busy. The medians of the rows need not sum to the median GPU busy, nor their "
             "shares to the whole of it: the file also holds each row's mean, and the means sum to the mean GPU busy."
         ),
-        "The same shares as in a per-kernel analysis of a traced serving step.",
     ),
     "memory": (
         "GiB",
@@ -242,7 +233,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "the emptied pool behind the checks and the end of the timed requests. The file also gives the weights in GB (10^9 bytes), the unit of an ordinary "
             "run's bytes per step line, and the whole process's peak."
         ),
-        None,
     ),
     "startup": (
         "s",
@@ -251,7 +241,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "state, the requests -- has the device synchronised at both ends. The stage of the timed requests spans the requests the statistics are taken "
             "from; no other stage enters a rate or the time to first token."
         ),
-        None,
     ),
 }
 
@@ -268,19 +257,25 @@ class Protocol:
     requests: int = 3
     trace_records: int = 160_000
 
-    def decode_steps(self, prompt_tokens: int) -> int:
+    def decode_steps(self, prompt_tokens: int, replayed: bool = False) -> int:
         """The most decode steps of the stack a run makes: the checked request, its replay by the checks, the timed requests
-        and a traced request of every timed step, and the warm-up request, each behind the prompt's own steps.  The
-        reference's own passes of the checks are not steps of the stack and are not counted."""
-        return (3 + self.requests) * (prompt_tokens + self.steps) + prompt_tokens + self.warmup
+        and a traced request of every timed step, and the warm-up request, each behind the prompt's own steps -- and,
+        for a run whose steps are replays of a recorded step (``replayed``), the second traced request of
+        ``REPLAYED_TRACED`` replayed steps behind its prompt.  The reference's own passes of the checks are not steps
+        of the stack and are not counted."""
+        again = prompt_tokens + min(REPLAYED_TRACED, self.steps) if replayed else 0
+        return (3 + self.requests) * (prompt_tokens + self.steps) + prompt_tokens + self.warmup + again
 
-    def line(self, prompt_tokens: int) -> str:
-        """What a run of the mode will do, said before the load: a rule and counts, never a time."""
+    def line(self, prompt_tokens: int, replayed: bool = False) -> str:
+        """What a run of the mode will do, said before the load: a rule and counts, never a time.  ``replayed``: the run
+        records its decode step and replays it."""
         each = f"{self.requests} timed request{'s' if self.requests != 1 else ''} of {self.steps} decode steps each"
+        again = f" and, replayed under the profiler, one of {min(REPLAYED_TRACED, self.steps)}" if replayed else ""
         return (
-            f"performance mode: at most {self.decode_steps(prompt_tokens):,} decode steps of this stack in all: one checked request and its replay by "
-            f"the checks, one warm-up request of {self.warmup} decode steps behind its first new token, {each}, one traced request of up to "
-            f"{self.steps}; a prompt of {prompt_tokens} tokens is {prompt_tokens} decode steps in front of each; the reference's own passes are not counted"
+            f"performance mode: at most {self.decode_steps(prompt_tokens, replayed):,} decode steps of this stack in all: one checked request and its "
+            f"replay by the checks, one warm-up request of {self.warmup} decode steps behind its first new token, {each}, one traced request of up to "
+            f"{self.steps}{again}; a prompt of {prompt_tokens} tokens is {prompt_tokens} decode steps in front of each; the reference's own passes are "
+            "not counted"
         )
 
 
@@ -434,20 +429,17 @@ def _row_kind(row: census.Row, sites: Sequence[census.Site]) -> Tuple[str, str]:
     return row.relation, ""
 
 
-def _row_label(row: census.Row, relations: Sequence[str], kind: str = "", entry: str = "") -> str:
+def _row_label(row: census.Row, kind: str = "", entry: str = "") -> str:
     """The name of a row of the per-kernel table: its block -- behind the entry that serves it, as the plan names it,
     where that is a library's (``kind`` and ``entry`` of ``_row_kind``); for the blocks of a wiring gap their names,
     with ``(one row)`` where they are several, behind what the row is -- ``beside its kernel:`` for what block calls
-    launch beside kernels of their own, ``not yet:`` where the census of the target kernel set says so of one of its
-    block calls (``relations``: the identities of the row's calls), ``fallback:`` where no identity is stated,
-    ``host path:`` for host blocks alone."""
+    launch beside kernels of their own, ``fallback:`` for blocks on fallback rows, ``host path:`` for host blocks
+    alone."""
     if row.relation == "read":
         return "host read"
     if row.relation == "exact":
-        served = f"{entry}: " if kind == "library" else ""
-        return (served + row.blocks[0] + (" (declared stand-in)" if census.STAND_IN in relations else ""))[:LABEL]
-    prefix = "not yet: " if census.NOT_YET in relations else "fallback: "
-    prefix = "host path: " if row.relation == "host" else ("beside its kernel: " if kind == "beside" else prefix)
+        return ((f"{entry}: " if kind == "library" else "") + row.blocks[0])[:LABEL]
+    prefix = "host path: " if row.relation == "host" else ("beside its kernel: " if kind == "beside" else "fallback: ")
     names = " + ".join(row.blocks) + (" (one row)" if len(row.blocks) > 1 else "")
     if len(prefix + names) > LABEL:
         names = f"{row.blocks[0]} + {len(row.blocks) - 1} more (one row)"
@@ -479,21 +471,18 @@ def kernel_table(traced: Optional[census.Traced], busy: Sequence[float], unobser
             kernels[row].append(launched)
             copied[row].append(copy)
             ms[row].append(adds)
-    stated = traced.claim is not None and traced.claim.known
-    identities = [traced.claim.identities[index - traced.first] if stated and index >= traced.first else None for index in range(len(sites))]
     gpu_busy, median, resolution = statistics.median(busy), statistics.median, time_resolution_us(steps)
     made = []
     for number, row in enumerate(rows):
         blocks = []
         for name in row.blocks:
             calls = [index for index in row.sites if sites[index].block == name]
-            identity = "; ".join(dict.fromkeys(identities[index].text() for index in calls if identities[index] is not None))
-            blocks.append({"block": name, "calls_per_step": len(calls), "entry": sites[calls[0]].entry, "identity": identity or None})
+            blocks.append({"block": name, "calls_per_step": len(calls), "entry": sites[calls[0]].entry})
         exact, (kind, entry) = row.relation == "exact", _row_kind(row, sites)
         shapes = Counter((r.name, r.grid, r.block, r.shared_memory) for r, at in zip(steps[0], traced.result.attributed[0]) if exact and at == number)
         made.append(
             {
-                "label": _row_label(row, [identities[index].relation for index in row.sites if identities[index] is not None], kind, entry),
+                "label": _row_label(row, kind, entry),
                 "relation": kind,
                 "blocks": blocks,
                 "launches_per_step": median([k + c for k, c in zip(kernels[number], copied[number])]),
@@ -514,7 +503,6 @@ def kernel_table(traced: Optional[census.Traced], busy: Sequence[float], unobser
 def record_class(
     reduced: bool,
     fallback_rows: bool,
-    identity: str,
     captured: bool,
     checks: str,
     others: str = "other processes not observed",
@@ -522,15 +510,13 @@ def record_class(
 ) -> Tuple[str, List[str]]:
     """``(class, reasons)`` of a run, the reasons in the order of the conditions.  A run is ``controlled`` only when every
     condition was observed by the run itself; each argument is a condition, or the reason it is not met (``""``: met):
-    ``reduced`` -- no checkpoint; ``fallback_rows`` -- a block of the plan is on a fallback row; ``identity`` -- why the
-    kernels are not a claimed target set on this GPU class; ``captured`` -- the launch sequence is captured, not launched
-    from Python; ``checks`` -- why the three statements of the ``checks`` lines do not all hold; ``others`` -- why the run
-    cannot say it had the GPU alone; ``clocks`` -- every reason for which its clocks are not a controlled run's (one
-    reason, or several)."""
+    ``reduced`` -- no checkpoint; ``fallback_rows`` -- a block of the plan is on a fallback row; ``captured`` -- the launch
+    sequence is captured, not launched from Python; ``checks`` -- why the three statements of the ``checks`` lines do not
+    all hold; ``others`` -- why the run cannot say it had the GPU alone; ``clocks`` -- every reason for which its clocks
+    are not a controlled run's (one reason, or several)."""
     reasons = [
         "reduced model" if reduced else "",
         "fallback rows present" if fallback_rows else "",
-        identity,
         "" if captured else "launched from Python",
         checks,
         others,
@@ -538,14 +524,6 @@ def record_class(
     ]
     reasons = [reason for reason in reasons if reason]
     return (ORIENTATION if reasons else CONTROLLED), reasons
-
-
-def identity_reason(kernels: dict) -> str:
-    """Why the kernels of a run are not a claimed target kernel set on its GPU class (``""``: they are), from the facts of
-    ``kernel_facts``: the stack declares no target, or the census line of the run is not ``EQUAL``."""
-    if not kernels["declared"]:
-        return "no target kernel set declared"
-    return "" if ": EQUAL (" in kernels["census"] else "kernel identity not claimed on this GPU class"
 
 
 def state_digest(state) -> str:
@@ -560,30 +538,29 @@ def state_digest(state) -> str:
     return digest.hexdigest()
 
 
-def kernel_facts(session, status: str) -> dict:
-    """What the ``kernels`` lines say: from the plan and the family's census, the launches of a step that are on the target
-    kernel set, by provider and as three numbers; the block calls on fallback rows; and, from the traced steps, the
-    kernels and copies a step launches beside the target launches (``None`` where they were not observed)."""
-    plan, model, claim = session.plan, session.model, session.claim()
+def planned_launches(plan, model) -> dict:
+    """What a plan states of the launches of one step, call by call of the model's wiring: the launches on exact rows -- the
+    rows one named kernel serves -- in all and by provider, the block calls on fallback rows, and whether a part of the
+    plan is on a fallback row."""
     served = [plan.at(name, site) for (name, _), site in zip(model.wiring(), census.call_sites(model))]
-    facts = {"declared": claim is not None, "stated": bool(claim is not None and claim.known), "fallback_calls": sum(bool(row.fallback) for row, _ in served)}
-    facts["fallback_rows"] = any(row.fallback for _, _, _, row, _ in plan.parts())
-    facts["census"] = None if claim is None else claim.line(status)
-    facts["not_stated"] = "" if claim is None or claim.known else claim.coverage()[0]
-    if facts["stated"]:
-        numbers = claim.numbers()
-        on_target = [identity.relation in (census.TARGET, census.STAND_IN) for identity in claim.identities]
-        providers = Counter(block.provider.replace("cuDNN FE", "cuDNN Frontend") for (_, block), held in zip(served, on_target) if held)
-        stand_ins = sum(identity.relation == census.STAND_IN for identity in claim.identities)
-        facts.update(
-            launches=numbers["launches"],
-            code=numbers["target_code"],
-            port=numbers["target_port"],
-            stand_ins=stand_ins,
-            by_provider=dict(providers.most_common()),
-        )
-        facts["absent"] = len(claim.absent)
-        facts["on_target"] = facts["code"] + facts["port"] + stand_ins
+    by_provider: Counter = Counter()
+    for _, block in served:
+        launches = sum(kernel.launches for kernel in block.kernels if kernel.relation == "exact")
+        if launches:
+            by_provider[block.provider.replace("cuDNN FE", "cuDNN Frontend")] += launches
+    return {
+        "exact_launches_per_step": sum(by_provider.values()),
+        "by_provider": dict(by_provider.most_common()),
+        "fallback_calls": sum(bool(row.fallback) for row, _ in served),
+        "fallback_rows": any(row.fallback for _, _, _, row, _ in plan.parts()),
+    }
+
+
+def kernel_facts(session, status: str) -> dict:
+    """What the ``kernels`` lines say: from the plan, the launches of a step on exact rows, by provider, and the block calls
+    on fallback rows (``planned_launches``); and, from the traced steps, the kernels and copies a step launches in all
+    (``None`` where they were not observed)."""
+    facts = planned_launches(session.plan, session.model)
     result = None if session.traced is None else session.traced.result
     facts["kernels_per_step"] = facts["copies_per_step"] = None
     if result is not None and result.launches and status != NOT_OBSERVED:
@@ -614,6 +591,9 @@ def _packed(label: str, parts: Sequence[str], column: int = 22, joint: str = " |
 def _checks_lines(checks: dict) -> List[str]:
     """The two ``checks`` lines: three statements, each with its verdict, none folded into another."""
     lines = _wrapped("checks", f"blocks against the reference at positions {checks['positions_text']}: {checks['blocks']}", 12)
+    if checks.get("recorded_step"):  # of a run whose steps are replays: the checked request, launched again from Python
+        held = f"the replayed steps are the same steps launched from Python, ids and logits, all {checks['recomputed_steps']}"
+        lines += _wrapped("", f"{held}, and leave the same state: {checks['recorded_step']}", 12)
     second = f"timed requests give the checked request's tokens and state: {checks['timed_requests']}"
     third = f"kernels, traced steps: {checks['kernels']}"
     if 12 + len(second) + 3 + len(third) <= WIDTH:
@@ -639,30 +619,21 @@ def screen(data: dict, unwritten: str = "") -> List[str]:
     else:
         first, *more = record["reasons"]
         lines += _packed("record class", [f"{record['class']}, not a number of record: {first}", *more], joint="; ", hang=";")
-    lines += ["scope       a decode-loop rate, not a served rate: one process, no request queue, no scheduler, no network"]
+    lines += ["scope       the decode loop of one process: no request queue, no scheduler, no network"]
     sequences = f"{model['sequences']} sequence{'s' if model['sequences'] != 1 else ''}"
     lines += _packed("model", [f"{model['name']}, {model['layers']} layers", sequences, model["decoding"]], 12)
     seen = f"other compute processes: {observe.others_text(data['observation'])}"
     lines += _packed("GPU", [f"{gpu['name']}, compute capability {gpu['compute_capability']}, {gpu['sm_count']} SMs", seen], 12)
     lines += _packed("", [f"clocks observed: {observe.clocks_text(data['observation'])}", observe.host_text(data["observation"])], 12)
     calls = f"{kernels['fallback_calls'] or 'no'} block call{'s' if kernels['fallback_calls'] != 1 else ''} on fallback rows"
-    if kernels.get("absent"):  # a launch of the target that no block of the plan stands for
-        calls += f" + {kernels['absent']} launch{'es' if kernels['absent'] != 1 else ''} of the target that {'have' if kernels['absent'] != 1 else 'has'} no block yet"
-    also = "also " if kernels["stated"] else ""
-    beside = f"what a step {also}launches was not observed"
+    exact = kernels["exact_launches_per_step"]
+    beside = "what a step also launches was not observed"
     if kernels["kernels_per_step"] is not None:
-        others, copies = kernels["kernels_per_step"] - (kernels.get("on_target") or 0), kernels["copies_per_step"]
-        beside = f"a step {also}launches {others:,} kernel{'s' if others != 1 else ''} and {copies:,} cop{'ies' if copies != 1 else 'y'}"
-    if kernels["stated"]:
-        providers = ", ".join(f"{provider} {count}" for provider, count in kernels["by_provider"].items()) or "none"
-        lines += _wrapped("kernels", f"{kernels['on_target']} of {kernels['launches']} launches per step are on the target kernel set: {providers}", 12)
-        ports = f"{kernels['port']} cuDNN Frontend entr{'y' if kernels['port'] == 1 else 'ies'} with byte-equal results"
-        lines += [" " * 12 + f"= {kernels['code']} the target's own compiled kernel{'s' if kernels['code'] != 1 else ''} + {ports}"]
-        lines += [" " * 14 + f"+ {kernels['stand_ins']} declared stand-in{'s' if kernels['stand_ins'] != 1 else ''}"]
-        lines += _packed("", [f"not yet: {calls}", beside], 12, "; ")
-    else:
-        lines += _wrapped("kernels", kernels["not_stated"] or "no target kernel set is declared for this stack", 12)
-        lines += _packed("", [calls, beside], 12, "; ")
+        others, copies = kernels["kernels_per_step"] - exact, kernels["copies_per_step"]
+        beside = f"a step also launches {others:,} kernel{'s' if others != 1 else ''} and {copies:,} cop{'ies' if copies != 1 else 'y'}"
+    providers = ", ".join(f"{provider} {count}" for provider, count in kernels["by_provider"].items()) or "none"
+    lines += _wrapped("kernels", f"{exact:,} launch{'es' if exact != 1 else ''} per step on exact rows: {providers}", 12)
+    lines += _packed("", [calls, beside], 12, "; ")
     path = "launch sequence captured" if protocol["launch_path"] == "captured" else "launched from Python, not captured"
     timed = f"timed {protocol['timed_steps']} steps x {protocol['timed_requests']}, end token ignored"
     lines += _packed("protocol", [f"warm-up {protocol['warmup_steps']} steps", timed, path], 12)
@@ -712,6 +683,14 @@ def _step_lines(stats: dict, traced: dict, prefix: str) -> List[str]:
     positions, their median GPU busy -- what the shares of the per-kernel table are taken of -- and by how much tracing
     lengthened a step."""
     value, busy, overhead = f"{prefix}{stats['step']['value']:.3f}  ms", stats["gpu_busy"]["value"], stats["launch_overhead"]
+    again = traced.get("replayed")
+    if again:  # a run whose steps are replays: the step is one launch, and GPU busy is the replayed traced steps'
+        launches = "the recorded step" if again["launches"] is None else f"{again['launches']:,} launches"
+        lines = _wrapped("step", f"{value}: one replay of {launches} and one host read")
+        if again["gpu_busy_ms"] is None:
+            return lines + _wrapped("", f"GPU busy of a replayed step not measured ({again['reason']})")
+        several = f"{again['steps']} traced replayed steps, positions {again['first_position']} to {again['last_position']}"
+        return lines + _wrapped("", f"{prefix}GPU busy {again['gpu_busy_ms']:.3f} ms in {several} (an upper bound: tracing lengthens kernels)")
     one, first, last = traced["steps"] == 1, traced["first_position"], traced["last_position"]
     if busy is None:
         at = f"at the traced position, {first}" if one else f"at the {traced['steps']} traced positions, {first} to {last}"
@@ -797,7 +776,7 @@ def _statistics(
     calls: int = 0,
     unmeasured: str = "no traced step was observed",
 ) -> dict:
-    """The entries of the file's ``statistics`` section, each with its definition and its serving counterpart.  ``covered``:
+    """The entries of the file's ``statistics`` section, each with its definition.  ``covered``:
     the traced positions, the first so many steps of every timed request (0: none was observed, and the step is taken
     over every timed step).  ``busy``: GPU busy of every traced step, in ms, one per traced position -- each is set
     against the step of every timed request at the same position (``step_split``) -- with the traced request
@@ -805,8 +784,8 @@ def _statistics(
     why."""
 
     def entry(key: str, **values) -> dict:
-        unit, definition, counterpart = DEFINITIONS[key]
-        return {"definition": definition, "serving_counterpart": counterpart, "unit": unit, **({"clock": CLOCK} if "events" in values else {}), **values}
+        unit, definition = DEFINITIONS[key]
+        return {"definition": definition, "unit": unit, **({"clock": CLOCK} if "events" in values else {}), **values}
 
     per_token = [request.time_per_output_token_ms() for request in timed]
     first = [request.time_to_first_token_ms() for request in timed]
@@ -920,6 +899,7 @@ def run(
         synchronised behind the zeroing and none of it runs inside the request's time to first token."""
         with stages.stage("zeroing the state"):
             session.reset(fresh=False, recorded=False)
+            session.record_step()  # of a session that replays: where the checks left a fresh state, its step is recorded here, in front of the request
 
     def peaks_now() -> Tuple[int, int]:
         return (torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)) if cuda else (0, 0)
@@ -932,19 +912,33 @@ def run(
     listed = tie_out.positions_text(judged)
     if session.record.inputs.shape[0] < prompt_tokens + protocol.steps:  # the checks replay the request and judge its last positions
         raise ValueError(f"the checked request is {prompt_tokens + protocol.steps} steps and the session records {session.record.inputs.shape[0]}")
+    first_check = "replay" if session.python_reason else "every replayed step launched again from Python"
     say(
         f"{tag} performance mode: the checked request ({prompt_tokens} prompt tokens through the decode step, the first new token, {protocol.steps} forced "
-        f"steps), then the checks against the {session.reference_precision}-accumulated reference: replay, the blocks at positions {listed}, the tokens",
+        f"steps), then the checks against the {session.reference_precision}-accumulated reference: {first_check}, the blocks at positions {listed}, the tokens",
         flush=True,
     )
     with stages.stage("the checked request"):
         checked = request("checked", protocol.steps)
+        session.read_tail()  # of a replayed request: the step's own tail, read before anything replays again
+    replayed = session.replays  # whether the steps of this run are replays of the recorded step
     produced = [[read[sequence] for read in checked.ids] for sequence in range(session.sequences)]
     with stages.stage("the checks before"):
-        before = tie_out.run_checks(session, prompt_tokens=prompt_tokens, max_steps=16, second_reference=real, kernels=tie_out.DEFERRED, positions=judged)
+        before = tie_out.run_checks(
+            session,
+            prompt_tokens=prompt_tokens,
+            max_steps=16,
+            second_reference=real,
+            kernels=tie_out.DEFERRED,
+            positions=judged,
+            digest=state_digest if replayed else None,
+        )
     peaks = peaks_now()
-    if not before.ok:  # as an ordinary run: its lines, and nothing is timed; no file
+    same_state = not replayed or before.end_state == checked.state  # the recomputation from Python leaves the replayed request's state
+    if not (before.ok and same_state):  # as an ordinary run: its lines, and nothing is timed; no file
         say(before.text())
+        if not same_state:
+            say("  recorded step     the state behind the steps launched again from Python is not the state the replayed request left    FAIL")
         return Outcome(False, before.judged, "", produced, peaks=peaks)
     listed = tie_out.positions_text(before.positions)  # from here on: the positions the checks judged, as the checks hand them back
 
@@ -984,16 +978,24 @@ def run(
             session.trace_request(step, more)
             if session.traced.steps is not None:  # one traced request: the records and the call logs of both passes
                 both = (first.call_log + session.traced.call_log, first.steps + session.traced.steps)
-                session.traced = census.Traced(first.sites, *both, rows=session.sequences, claim=first.claim)
+                session.traced = census.Traced(first.sites, *both, rows=session.sequences)
         requests.append(traced)
+    again, replays_trace, replays_missing = None, None, ""
+    if replayed:  # a second traced request: the first traced steps once more, as replays, under the profiler
+        zeroed()
+        with stages.stage("the replayed traced request"):
+            again, step = begin("traced replay")
+            count = min(REPLAYED_TRACED, len(session.traced.steps or []) or REPLAYED_TRACED, protocol.steps)
+            replays_trace, replays_missing = session.trace_replays(step, count)
+            requests.append(again)
     watch.stop()  # the sampler's loops end and their files are read: behind every request
     watched = watch.section([(made.kind, made.t_request, made.t_token[-1] if made.t_token else made.t_first) for made in requests[1:]])
 
     # phase 10: the checks after
     with stages.stage("the checks after"):
         held, missing = PASS, ""  # statement 2, and where it does not hold why no rate is printed: the first thing that differs
-        for number, made in enumerate([*timed, traced], 1):
-            who = f"request {number}" if made.kind == "timed" else "traced request"
+        for number, made in enumerate([*timed, traced, *([again] if again is not None else [])], 1):
+            who = f"request {number}" if made.kind == "timed" else ("traced request" if made.kind == "traced" else "replayed traced request")
             differs = next((index for index, read in enumerate(made.ids) if read != checked.ids[index]), None)
             if differs is not None and held == PASS:
                 held, missing = f"FAIL ({who}, step {differs})", NOT_COMPUTED if made.kind == "timed" else NOT_COMPUTED.replace("timed requests", who)
@@ -1020,7 +1022,7 @@ def run(
     rate_missing = f"not printed: {missing}" if held != PASS else (f"not printed: {NOT_THE_PLAN}" if status == FAIL else "")
     rate_missing = rate_missing or ("not printed for a reduced model" if reduced else "")
     alone, steady = observe.others_reason(watched), observe.clock_reasons(watched)
-    kind, reasons = record_class(reduced, kernels["fallback_rows"], identity_reason(kernels), False, failed, alone, steady)
+    kind, reasons = record_class(reduced, kernels["fallback_rows"], replayed, failed, alone, steady)
     weights = model.copy_bytes(session.uncopied_weights()) + model.stored_bytes(session.stored_weights())
     raw = []
     for made in requests:
@@ -1035,6 +1037,25 @@ def run(
     teardown = {key: os.environ.get(key) for key in ("TEARDOWN_CUPTI", "DISABLE_CUPTI_LAZY_REINIT", "KINETO_LOG_LEVEL")}
     prompt_hash = hashlib.sha256(b"".join(int(i).to_bytes(4, "little") for prompt in prompts for i in prompt.tolist())).hexdigest()
     stats = _statistics(timed, covered, session.sequences, rate_missing, busy, traced, session.report().calls_per_step, unmeasured)
+    # GPU busy of the replayed traced steps, where the run's steps are replays; such a run forms no launch overhead and no stretch
+    again_steps = (session.traced.replayed or []) if replayed and session.traced is not None else []
+    again_facts = [fact for one in again_steps for fact in step_facts([(launch.name, launch.start, launch.end) for launch in one])]
+    again_busy = [fact[0] for fact in again_facts] if again_steps and len(again_facts) == len(again_steps) else []
+    not_replayed = "not formed: the steps of this run are launched from Python"
+    unreplayed = "" if again_busy else (replays_missing or "the launch records could not be cut into the replayed steps")
+    unit, definition = DEFINITIONS["gpu_busy_replayed"]
+    stats["gpu_busy_replayed"] = {
+        "definition": definition,
+        "unit": unit,
+        "value": statistics.median(again_busy) if again_busy else None,
+        "reason": None if again_busy else (f"GPU busy of a replayed step not measured ({unreplayed})" if replayed else not_replayed),
+        **summary(again_busy),
+    }
+    if replayed:
+        no_path = "not formed: a replayed step has no launch path from Python between its blocks"
+        stats["launch_overhead"].update(value=None, reason=no_path, label=None, host_time_per_block_call_us=None)
+        stats["tracing_stretch"].update(value=None, reason="not formed: the traced steps are launched from Python, the timed steps are replays")
+    recorded = session.recorded if replayed else None
     data = {
         "schema": SCHEMA,
         "kind": "run",
@@ -1065,7 +1086,17 @@ def run(
         "kernels": kernels,
         "protocol": {
             "stack": session.stack,
-            "launch_path": "python",
+            "launch_path": "captured" if replayed else "python",
+            "launch_path_reason": None if replayed else session.python_reason,  # why the steps of this run are launched from Python
+            "recorded_step": (
+                None
+                if recorded is None
+                else {
+                    "launches": None if recorded.launches is None else recorded.launches["launches"],
+                    "held": recorded.launches,
+                    "block_launches_planned": recorded.planned,
+                }
+            ),
             "warmup_steps": protocol.warmup,
             "timed_steps": protocol.steps,
             "timed_requests": protocol.requests,
@@ -1091,6 +1122,8 @@ def run(
             "before": list(before.lines),
             "after": {"kernels": [line.strip() for line in kernel_lines], "stored_weights_changed": changed},
             "blocks": PASS if before.judged else "REPORTED (no provider block to judge)",
+            "recorded_step": before.recorded or None,  # of a run whose steps are replays: the checked request launched again from Python
+            "recomputed_steps": before.recomputed or None,
             "timed_requests": held,
             "kernels": third,
             "last_line": f"{tag} {verdict(passed, before.judged, unobserved)}",
@@ -1108,6 +1141,22 @@ def run(
             "per_step": {key: [fact[index] for fact in facts_of] if busy else [] for index, key in enumerate(("gpu_busy_ms", "idle_ms", "kernels", "copies"))},
             "tracing_stretch_percent": stats["tracing_stretch"]["value"],
             "time_resolution_us": time_resolution_us(observed),
+            "replayed": (
+                {
+                    "steps": len(again_steps) or (len(again.t_token) if again is not None else 0),
+                    "first_position": prompt_tokens,
+                    "last_position": prompt_tokens + (len(again_steps) or len(again.t_token)) - 1,
+                    "launches": None if recorded is None or recorded.launches is None else recorded.launches["launches"],
+                    "gpu_busy_ms": stats["gpu_busy_replayed"]["value"],
+                    "reason": unreplayed or None,
+                    "per_step": {
+                        key: [fact[index] for fact in again_facts] if again_busy else []
+                        for index, key in enumerate(("gpu_busy_ms", "idle_ms", "kernels", "copies"))
+                    },
+                }
+                if replayed
+                else None
+            ),
         },
         "per_kernel": kernel_table(session.traced, busy, unmeasured),
         "memory": {

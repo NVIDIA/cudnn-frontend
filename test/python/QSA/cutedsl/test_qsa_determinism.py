@@ -211,6 +211,7 @@ ENGINE_REPLAYS = [
     pytest.param("indexed", (26632,), 12, 1, id="sparse-windows-indexed-q12-kv1"),
     # a sparse sequence packed between dense ones, origins off the 4-token grid
     pytest.param("indexed", (3, 26633, 2051), 12, 1, id="sparse-packed-indexed-q12-kv1"),
+    pytest.param("indexed", (26632,), 24, 2, id="sparse-windows-indexed-q24-kv2"),
 ]
 
 

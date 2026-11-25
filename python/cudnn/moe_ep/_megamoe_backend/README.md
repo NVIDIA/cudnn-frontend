@@ -9,7 +9,21 @@ The private backend provides Rubin SM107 MXFP8 execution for `cudnn.moe_ep`.
 - `hidden_size % 128 == 0`
 - `intermediate_size % 256 == 0`
 - `top_k <= min(32, num_experts)`
-- positive `max_tokens_per_rank`
+- positive `max_tokens_per_rank`, at most 65536 (the vendored routing metadata
+  stores the source token index in 16 bits)
+- expert-parallel group size at most 256 (the same record stores the source
+  rank in 8 bits)
+- forward `fc2_bulk_store` requires `hidden_size % 256 == 0`, and an explicit
+  stage count within the store path's limit (4 for BF16 and 2 for MXFP8 combine
+  under `epi_warps`, 8 under dispatch token-back); the vendored epilogue only
+  checks these at compile time, after workspace allocation
+- exclusive use of the GPU: the persistent kernels size their launch from the
+  device's occupancy and deadlock when fewer clusters are resident
+
+Forward-kernel tuning maps onto these upstream `Sm107MegaMoEMxfp8GluKernel`
+parameters, which a vendor sync must keep compatible: `load_balance_mode`,
+`schedule_mode`, `fc2_use_bulk`, `fc2_tma_stages`, `fallback_cluster_shape_mn`,
+`preferred_cluster_count`, and `fallback_cluster_count`.
 - `apply_topk_in_fc1=True`
 
 Inference accepts BF16/FP16/FP32 or MXFP8 operands. Training accepts
@@ -29,8 +43,8 @@ only:
 - private fixed-capacity transport and routing scratch used only during a call.
 
 It does not own or retain caller weights, output bundles, saved forward state,
-WGrad operands, or weight-staging bundles. No slot is exposed by the public
-API.
+WGrad operands, weight gradients, or weight-staging bundles. No slot is
+exposed by the public API.
 
 ## Native weights
 
@@ -77,7 +91,33 @@ The producing kernels already expose the final grouped-WGrad scale carriers
 when token and scale-factor padding are both 128. Caller E8M0 matrices are
 viewed through the producer's flat or matrix signature, so no scale expansion
 kernel is launched. FC1-B remains gate/up-interleaved, and FC1-A/FC2-A use
-legal transpose views without physical transpose copies.
+legal transpose views without physical transpose copies. Every in-segment
+padding row the producers write has a zero payload and finite scales.
+
+## Training WGrad
+
+`mxfp8/_wgrad_compile.py` runs the vendored Rubin MXFP8 WGrad kernel
+(`BlockScaledMoeWgradKernel`) over those operands in place, one launch per
+GEMM:
+
+- dW1 reads `fc1_a` and `fc1_b`, both token-major with each expert one
+  contiguous block, through the `tensor_ragged` input order (per-expert TMA
+  bounds).
+- dW2 reads `fc2_b`, which is K-major with the global pool pitch `(1, P)`.
+  Only the `tensor2d` input order addresses that layout, and it lets an
+  expert's last K tile run past the segment. The K tile is therefore fixed at
+  the 128-row token padding.
+- Each scale carrier is passed as a zero-copy `(round_up(rows, 128), P / 32)`
+  view of its leading storage.
+- The tile is the largest of 512x256, 256x256, 256x128 and 128x128 that
+  divides M and N, so no TMA box is clipped and the kernel needs no readable
+  tail after any plane.
+
+The plan, its 128-byte-aligned local workspace region and its ABI facts are
+created in `prepare_training()` only when the installed DSL has Rubin TMA
+descriptor overrides (`_cutedsl.rubin_wgrad_cutedsl_error`). Kernels compile
+lazily per output specialization through `aot_compile()` (dynamic token
+extent), and a first compile during capture raises.
 
 ## Overflow and distributed ordering
 

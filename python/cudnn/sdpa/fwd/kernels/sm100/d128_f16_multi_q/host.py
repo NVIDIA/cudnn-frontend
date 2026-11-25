@@ -3,12 +3,10 @@
 
 """Fixed multi-Q entry; shared services resolve its legal width envelope."""
 
+PACKED_HN_STATS_OVERRIDE = True
 
-def lower(spec, facts, knobs, *, lower_impl, knob_type, selected_shape, resolve_geometry=None):
-    if resolve_geometry is None:
-        from cudnn.sdpa.fwd.heuristics import resolve_sm100_half_multi_q_geometry
 
-        resolve_geometry = resolve_sm100_half_multi_q_geometry
+def lower(spec, facts, knobs, *, lower_impl, knob_type, selected_shape, resolve_geometry):
     knobs = knobs or knob_type()
     flavor = selected_shape(spec.capabilities, facts, knobs)
     if flavor is None:

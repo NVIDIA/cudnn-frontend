@@ -20,7 +20,7 @@ the library's incremental decoder, one per sequence, with special tokens left ou
 
 A chat request is read here for what a chat template is given -- messages, tool schemas, template options
 (``chat_request``, ``load_messages``).  What else a request body carries is not the helper layer's to read: a sample that
-accepts the body a serving engine's client sends parses it beside its script.  ``TextIO.generation_defaults`` holds the
+accepts the request body of a chat client parses it beside its script.  ``TextIO.generation_defaults`` holds the
 sampling settings of the checkpoint's ``generation_config.json`` as they stand there; nothing here applies them.
 """
 

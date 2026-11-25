@@ -133,10 +133,11 @@ def test_bitmap_entry_matches_reference(seq_len, grad_scale, h_kv):
     _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (seq_len,))))
 
 
+@pytest.mark.parametrize("h_kv", [1, 2])
 @pytest.mark.parametrize("seq_len, grad_scale", LENGTHS)
-def test_indexed_entry_matches_reference(seq_len, grad_scale):
+def test_indexed_entry_matches_reference(seq_len, grad_scale, h_kv):
     _skip_cu12(1)
-    inputs = _inputs((seq_len,), 1, seed=seq_len, grad_scale=grad_scale)
+    inputs = _inputs((seq_len,), h_kv, seed=seq_len, grad_scale=grad_scale)
     _check(inputs, _indexed_backward(inputs))
 
 
@@ -148,13 +149,14 @@ def test_bitmap_entry_packed_sequences(lengths, h_kv):
     _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], lengths)))
 
 
+@pytest.mark.parametrize("h_kv", [1, 2])
 @pytest.mark.parametrize("described", [True, False])
 @pytest.mark.parametrize("lengths", PACKED)
-def test_indexed_entry_packed_sequences(lengths, described):
+def test_indexed_entry_packed_sequences(lengths, described, h_kv):
     _skip_cu12(1)
     # Without cu_seqlens the documents stay exact: the selection says which keys a query sees, the inverted index
     # keys are block-start tokens, and the dense bitmap masks per token, so blocks off the 4-token grid are fine.
-    inputs = _inputs(lengths, 1, seed=sum(lengths))
+    inputs = _inputs(lengths, h_kv, seed=sum(lengths))
     _check(inputs, _indexed_backward(inputs, inputs["cu_seqlens"] if described else None))
 
 

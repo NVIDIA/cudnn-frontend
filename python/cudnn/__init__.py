@@ -64,6 +64,8 @@ for _optional_symbol in [
     "gnn_mha_gat_backward",
     "gnn_mha_gat_v2_forward",
     "gnn_mha_gat_v2_backward",
+    "gnn_mha_simple_forward",
+    "gnn_mha_simple_backward",
     "fft_causal_conv1d_forward",
     "fft_causal_conv1d_backward",
     "long_fft_causal_conv1d_get_buffer_sizes",
@@ -340,6 +342,8 @@ _EAGER_PUBLIC_NAMES = (
             "gnn_mha_gat_backward",
             "gnn_mha_gat_v2_forward",
             "gnn_mha_gat_v2_backward",
+            "gnn_mha_simple_forward",
+            "gnn_mha_simple_backward",
         )
         if symbol in globals()
     ),
@@ -391,9 +395,12 @@ _MOE_EP_OPTIONAL_IMPORTS = {
     "MoeEpNativeWeightLayout",
     "MoeEpNativeWeightStorageMode",
     "MoeEpTrainingBackwardOutputs",
+    "MoeEpTrainingDiscreteWgradOutputs",
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
+    "MoeEpTrainingWgradOutputs",
     "MoeEpTuningConfig",
+    "MoeEpWgradLayout",
     "MoeFormat",
     "MoeTensor",
     "pack_backward_weights",
@@ -422,6 +429,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "SwigluFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "AttentionPrepareDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "RowQuantizeFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "RowQuantizeFp8Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "RowArgmaxDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -462,6 +471,14 @@ _LAZY_OPTIONAL_IMPORTS = {
     # block scale per sixteen elements in the 128 x 4 scale layout -- in one launch, SM100-class parts): a direct-call entry like the
     # steps above (also `cudnn.row_quantize.frost.RowQuantizeFp4Decode`)
     "RowQuantizeFp4Decode": (".row_quantize.frost.row_quantize_fp4_decode", "RowQuantizeFp4Decode"),
+    # the FP8 row quantization decode step (the dynamic FP8 quantization of bf16 rows, each under its own scale -- E4M3 codes, one fp32
+    # scale per row: the row maximum over 448 with a floor -- in one launch, SM100-class parts): a direct-call entry like the steps
+    # above (also `cudnn.row_quantize.frost.RowQuantizeFp8Decode`)
+    "RowQuantizeFp8Decode": (".row_quantize.frost.row_quantize_fp8_decode", "RowQuantizeFp8Decode"),
+    # the row argmax decode step (per row of a bf16 slab the lowest column of the row maximum, or the entry of an id table at that
+    # column, in one launch, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.row_argmax.frost.RowArgmaxDecode`)
+    "RowArgmaxDecode": (".row_argmax.frost.row_argmax_decode", "RowArgmaxDecode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
@@ -513,12 +530,18 @@ _LAZY_OPTIONAL_IMPORTS = {
         "MoeEpNativeWeightStorageMode",
     ),
     "MoeEpTrainingBackwardOutputs": (".moe_ep", "MoeEpTrainingBackwardOutputs"),
+    "MoeEpTrainingDiscreteWgradOutputs": (
+        ".moe_ep",
+        "MoeEpTrainingDiscreteWgradOutputs",
+    ),
     "MoeEpTrainingForwardOutputs": (".moe_ep", "MoeEpTrainingForwardOutputs"),
     "MoeEpTrainingWgradOperands": (
         ".moe_ep",
         "MoeEpTrainingWgradOperands",
     ),
+    "MoeEpTrainingWgradOutputs": (".moe_ep", "MoeEpTrainingWgradOutputs"),
     "MoeEpTuningConfig": (".moe_ep", "MoeEpTuningConfig"),
+    "MoeEpWgradLayout": (".moe_ep", "MoeEpWgradLayout"),
     "MoeFormat": (".moe_ep", "MoeFormat"),
     "MoeTensor": (".moe_ep", "MoeTensor"),
     "pack_backward_weights": (".moe_ep", "pack_backward_weights"),

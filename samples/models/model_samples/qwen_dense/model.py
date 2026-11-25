@@ -19,6 +19,7 @@ attention.gate_quantize attention output, gate, ``Quant``                8-bit `
 projection.fp8.out     8-bit operand, weight copy, site                  ``[rows, hidden]`` bf16
 mlp.gate_up            4-bit operand, merged gate / up weight, ``Quant``  4-bit ``[rows, 17408]``
 mlp.down               4-bit operand, weight copy                        ``[rows, hidden]`` bf16
+output_head.quantize   final-norm rows, the head's ``Quant``             4-bit ``[rows, hidden]``
 output_head            4-bit operand, weight copy                        logits ``[rows, vocabulary]`` bf16
 token_choice           logits                                            ids ``[rows]`` int32
 ====================== ================================================= ==============================================
@@ -27,9 +28,10 @@ The norm block is called at several sites of a step, and a kernel that serves it
 names the call by what the normed rows feed (``NORM_SITES``; ``sites()`` lists the site of every call of the wiring).  The
 in-projection is called with another weight shape in each kind of layer, and its site says which
 (``IN_PROJECTION_SITES``).  The out-projection has one weight shape, and its site names the layer's kind too
-(``OUT_PROJECTION_SITES``): the target kernel set serves the two kinds with two kernels in a step of several tokens per
+(``OUT_PROJECTION_SITES``): the stack ``native`` serves the two kinds with two kernels in a step of several tokens per
 sequence, so a provider row may serve one of them and hand the other on.  A reference chain and a multiply over a copy
-ignore the site.
+ignore the site.  The last norm of a step is handed no ``Quant`` and returns no quantised operand: the 4-bit operand of
+the output head is formed from its rows by a block of its own, which a kernel serves with a launch of its own.
 
 A step feeds one token per sequence -- the decode step -- or, on a state built for several (``DecodeState(tokens=T)``),
 ``T`` tokens per sequence at once: the verify step of speculative decoding.  Its rows are sequence by sequence (``rows =
@@ -57,7 +59,6 @@ tensor is checked for its storage format and shape before anything is read.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -86,7 +87,7 @@ STORED_WEIGHTS = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp
 #: site name belongs to one block: a provider reads the sites of its row out of ``sites()`` by name
 IN_PROJECTION_SITES = {"linear_attention": "linear_attention.qkvz", "full_attention": "full_attention.qkv"}
 #: the call sites of the out-projection, by the layer's kind.  The weight has one shape in both kinds (hidden x the
-#: mixer's output width, which the two kinds share); what differs is the kernel the target kernel set launches for it in
+#: mixer's output width, which the two kinds share); what differs is the kernel the stack ``native`` launches for it in
 #: a step of several tokens per sequence, so a provider row serves the calls of one kind and hands the other's on
 OUT_PROJECTION_SITES = {"linear_attention": "linear_attention.out", "full_attention": "full_attention.out"}
 #: block -> its call sites by the layer's kind, for the blocks that multiply a weight and are called at a site per kind:
@@ -211,19 +212,8 @@ class QwenDense:
     first_launch_reserve = configs.FIRST_LAUNCH_RESERVE
     logits_band_units = configs.LOGITS_BAND_UNITS
     table_source = "model_samples/qwen_dense/configs.py"
-    target_stacks = configs.TARGET_STACKS  # the stacks a run of which is held against the census of the target kernel set
-    attention_page = configs.ATTENTION_PAGE  # positions per page of the target's attention cache: where a timed run is judged
-    _target = None  # that census, read once per process
-
-    @classmethod
-    def target(cls):
-        """The family's census of the target kernel set of a decode step (``kernel_census.json`` beside ``configs.py``):
-        ``model_samples.census.Target``.  ``ValueError`` when the file is not such a census."""
-        if cls._target is None:
-            from ..census import Target
-
-            cls._target = Target.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel_census.json"))
-        return cls._target
+    checked_stacks = configs.CHECKED_STACKS  # the stacks a run of which always checks its kernels
+    attention_page = configs.ATTENTION_PAGE  # positions per page of the paged attention cache: where a timed run is judged
 
     @classmethod
     def reduced(cls, layers: int = 2, vocab: int = 15520) -> "QwenDense":
@@ -345,6 +335,7 @@ class QwenDense:
             "attention.prepare": (at,),
             "attention.core": (at,),
             "attention.gate_quantize": (at,),
+            "output_head.quantize": (1,),
             "output_head": (1,),
             "token_choice": (1,),
         }
@@ -365,7 +356,7 @@ class QwenDense:
             else:
                 calls += [("attention.prepare", i), ("attention.core", i), ("attention.gate_quantize", i)]
             calls += [("projection.fp8.out", i), ("add_norm_quantize", i), ("mlp.gate_up", i), ("mlp.down", i)]
-        calls += [("add_norm_quantize", len(kinds)), ("output_head", -1), ("token_choice", -1)]
+        calls += [("add_norm_quantize", len(kinds)), ("output_head.quantize", -1), ("output_head", -1), ("token_choice", -1)]
         return tuple(calls)
 
     def sites(self) -> Tuple[str, ...]:
@@ -373,7 +364,7 @@ class QwenDense:
         kind for a layer's input norm, ``"mlp"``, ``"output_head"``), with ``".first"`` behind the first call of a step, which
         has no residual stream to add to; for the in-projection the layer's kind and what its merged weight holds
         (``IN_PROJECTION_SITES``: the weight has another shape in each kind of layer); for the out-projection the layer's
-        kind (``OUT_PROJECTION_SITES``: one weight shape, and two kernels of the target in a step of several tokens per
+        kind (``OUT_PROJECTION_SITES``: one weight shape, and two kernels of ``native`` in a step of several tokens per
         sequence); ``""`` for a block that is called in one form everywhere.  A site name belongs to one block.  ``step``
         hands the same names to the three blocks; a provider row names the form of each, or hands a site on to the next
         row (``ProviderRow.sites``)."""
@@ -488,7 +479,9 @@ class QwenDense:
         whose weights the load keeps on their stored format alone."""
         return sum(2 * s.numel for s in self.tensor_specs() if s.fmt != "scalar") - 2 * self._elements(uncopied)
 
-    def state_bytes(self, sequences: int, capacity: int, tokens: int = 1, page: Optional[int] = None, pages: Optional[int] = None) -> int:
+    def state_bytes(
+        self, sequences: int, capacity: int, tokens: int = 1, page: Optional[int] = None, pages: Optional[int] = None, max_model_len: Optional[int] = None
+    ) -> int:
         """Bytes of the decode state of ``sequences`` sequences: the slot pools of the linear-attention layers (one null slot
         each) and the key/value caches of the attention layers.  At ``tokens`` tokens per sequence a pool holds a
         recurrent state per (sequence, token) and ``tokens + 2`` history columns per sequence.
@@ -497,7 +490,13 @@ class QwenDense:
         ``pages`` pages of every sequence (left out: as many as hold the capacity) -- the capacity rounded up to whole
         pages -- and, once for the state, its tables (``state.PageTable``): two bytes per position and rotary element of
         the cos / sin table, and 32 bytes per row for every position a step of ``tokens`` tokens can start at (three
-        position rows and one slot row of 64-bit integers), and again at one token per sequence for a state of several."""
+        position rows and one slot row of 64-bit integers), and again at one token per sequence for a state of several.
+
+        ``max_model_len``: the state also holds the two tables of a kernel that reads the pool through a page table,
+        built for that maximum length of the run (``state.PageTable.blocks`` / ``lengths``), four bytes an entry: one
+        row of the page table per sequence and one more, each as wide as the pages of the maximum length -- or the
+        sequence's own pages where those are more -- rounded up to four; and per position a step can start at the
+        sequences rounded up to four, again at one token per sequence for a state of several."""
         g = self.geometry
         attention = sum(kind != "linear_attention" for kind in g.layer_kinds)
         state = 0
@@ -512,6 +511,10 @@ class QwenDense:
         if page is not None and attention:
             state += capacity * g.rotary_dim * 2
             state += sum(max(capacity - each + 1, 0) * sequences * each * 32 for each in sorted({tokens, 1}))
+            if max_model_len is not None:
+                own = -(-capacity // page) if pages is None else pages
+                state += (sequences + 1) * (-(-max(own, -(-max_model_len // page)) // 4) * 4) * 4
+                state += sum(max(capacity - each + 1, 0) * (-(-sequences // 4) * 4) * 4 for each in sorted({tokens, 1}))
         return state
 
     def stored_bytes(self, stored: Sequence[str] = ()) -> int:
@@ -531,6 +534,87 @@ class QwenDense:
         weight has its copy."""
         return max((2 * out * inner for block in uncopied for out, inner in self.weight_shapes(block)[1]), default=0)
 
+    def check_row_terms(self, sequences: int, capacity: int, tokens: int = 1, record_steps: Optional[int] = None) -> Dict[str, int]:
+        """What the checks of a run hold that grows with the rows of a step, term by term, in bytes (``check_row_bytes`` says
+        which of them are alive together).  With ``rows`` = ``sequences x tokens`` and ``slots`` = ``rows + 1``:
+
+        * ``"record"``: one record of a session (``loop.Record``): per recorded step and row the id fed, the id chosen and
+          the logits, ``steps x rows x (8 + 2 x vocabulary)`` with ``steps`` = ``record_steps`` (left out: every position);
+        * ``"reference"``: the state of the reference session, every layer again, on plain caches (``state_bytes``);
+        * ``"pool"``: the pool of one linear-attention layer, its recurrent states and its history;
+        * ``"judge"``: what the judge of the fused step forms over that pool at a time (``tie_out.BlockTap._judge``, the band
+          ``gdn_step``): the distance of the live slots in fp32, one byte per element of it, and for the printed rms ratio
+          (``tie_out.rms_ratio``) two fp64 copies of the pool, their difference and its square;
+        * ``"chain"``: the three fp64 pool rows the reference chain of the linear-attention step holds per row of a step;
+        * ``"attention"``: the keys and the values of every position in fp64, which the reference chain of the attention
+          core forms for the rows of a step.
+
+        A term of a kind of layer the model does not have is 0."""
+        g = self.geometry
+        rows = sequences * tokens
+        steps = capacity if record_steps is None else max(1, min(int(record_steps), capacity))
+        linear = "linear_attention" in g.layer_kinds
+        slot = g.la_value_heads * g.la_head_dim**2 * 4 if linear else 0  # one recurrent state, fp32
+        history = (sequences + 1) * (g.la_conv_width - 2 + tokens) * g.qkv_channels * 2 if linear else 0
+        attention = any(kind != "linear_attention" for kind in g.layer_kinds)
+        return {
+            "record": steps * rows * (8 + 2 * g.vocab),
+            "reference": self.state_bytes(sequences, capacity, tokens),
+            "pool": (rows + 1) * slot + history,
+            "judge": rows * slot + rows * slot // 4 + 8 * (rows + 1) * slot,
+            "chain": 6 * rows * slot,
+            "attention": rows * 2 * g.attn_kv_heads * capacity * g.attn_head_dim * 8 if attention else 0,
+        }
+
+    def check_row_bytes(self, sequences: int, capacity: int, tokens: int = 1, record_steps: Optional[int] = None, references: int = 1) -> int:
+        """What the checks of a run (``tie_out.run_checks``) hold at their largest moment beyond the weights and the state of
+        the checked session, in bytes: arithmetic on the widths and on the integers of the session (``check_row_terms``),
+        with no term taken from a run.  The memory sentence adds what this is MORE than at one sequence
+        (``Session.plan_table``): the working memory of ``memory_bytes`` was taken from runs of one sequence and holds
+        their checks, so no sentence of one sequence moves.
+
+        The moment is the judge of the fused linear-attention step inside the checked replay.  Alive there: four records
+        -- the session's own, the first run's, which ``run_checks`` keeps while the session records again, the clones of
+        its checked steps and the reference session's, each counted as a whole record --, the state of the reference
+        session, three saves of the judged layer's pool (``BlockTap``: before the call, after it, and what the twin
+        left) and what the judge forms over it.  Where the fp64 keys and values of the attention chain are more than
+        those saves and the judge together -- a context of a few thousand positions --, they are counted in their place.
+        ``references=2`` is a run that checks a second reference stack (a checkpoint): while that one replays, five
+        records, two reference states and the chain's fp64 rows are alive, and the larger of the two moments is counted.
+
+        Held to the objects by a host test at the judge (the records, the reference's state, the three saves).  The
+        judge's own tensors are alive inside one call and are seen on a GPU alone: the GPU test holds PyTorch's peak
+        of allocated bytes to the weights held, the state and this count, within 5 %, and the family README has the
+        runs.  By the code and measured by no run: the second reference's moment and the attention chain's term.
+
+        NOT counted: the token check, which holds four fp32 tensors of the checked logits at a time and is the larger
+        moment from about 150 checked steps of the two-layer model (from 10 at the published widths); the third
+        reference state alive for a moment when a second reference is reset; the records of the prompt of a session
+        built with ``draft_tokens=``; the comparison of a verify session with its decode session; and what PyTorch's
+        pool keeps beyond the tensors, for which the session adds a share of this count (``loop.CHECK_POOL``)."""
+        term = self.check_row_terms(sequences, capacity, tokens, record_steps)
+        held = 4 * term["record"] + term["reference"] + max(3 * term["pool"] + term["judge"], term["attention"])
+        if references > 1:
+            held = max(held, 5 * term["record"] + 2 * term["reference"] + term["chain"])
+        return held
+
+    def recorded_step_bytes(self, sequences: int) -> int:
+        """What a decode step that is recorded as a launch sequence keeps for itself, in bytes: the tensors of the recorded
+        pass stay in a pool of the sequence's own for as long as it lives, and that pool is whole blocks of PyTorch's
+        allocator -- one block of 2 MiB for the tensors under 1 MiB, and for the logits of a step, the largest of them
+        (2 bytes per id and sequence), a block of 20 MiB from 1 MiB on, or their own size in whole blocks of 2 MiB where
+        that is more.  What a pass frees inside the recording is used again inside it.
+
+        An allowance from runs, not a bound: on compute capability 10.0 PyTorch's reservation grew by 2 MiB at 1 sequence
+        and by 22 MiB at 4 and at 8 sequences of the published model, and by 2 MiB at 1, 4 and 8 sequences of the
+        two-layer model with its reduced vocabulary -- this arithmetic at each of the six.  Its reach ends there: at
+        more sequences the activations of a step pass 1 MiB as well and are not counted, and a run prints what its
+        recordings took beside what its plan counted."""
+        mib = 1 << 20
+        logits = 2 * self.geometry.vocab * sequences
+        large = 0 if logits < mib else max(20 * mib, -(-logits // (2 * mib)) * 2 * mib)
+        return 2 * mib + large
+
     def memory_bytes(
         self,
         sequences: int,
@@ -540,12 +624,13 @@ class QwenDense:
         tokens: int = 1,
         page: Optional[int] = None,
         pages: Optional[int] = None,
+        max_model_len: Optional[int] = None,
     ) -> int:
         """What a run needs on the GPU besides a kernel's own reservation: the weights held -- the bf16 copies (not those
         of the blocks ``uncopied``) and the stored tensors of the blocks ``stored`` (``stored_bytes``) -- the state (at
-        ``tokens`` tokens per sequence, and with attention caches in pages of ``page`` positions where a block of the
-        run asks for them: ``state_bytes``), working memory, and the one copy the checks make on demand at a time
-        (``check_bytes``).
+        ``tokens`` tokens per sequence, with attention caches in pages of ``page`` positions where a block of the
+        run asks for them, and with the page table and the lengths of ``max_model_len`` where a block reads those:
+        ``state_bytes``), working memory, and the one copy the checks make on demand at a time (``check_bytes``).
 
         Working memory is load-time temporaries, activations, the reference's fp64 temporaries during the checks and the
         allocator's slack: 2 GiB, or an eighth of the weights held where that is more, and a quarter of the stored
@@ -569,7 +654,7 @@ class QwenDense:
         kept = self.stored_bytes(stored)
         held = self.copy_bytes(uncopied) + kept
         working = max(2 * GIB, held // 8) + kept // 4
-        return held + self.state_bytes(sequences, capacity, tokens, page, pages) + working + self.check_bytes(uncopied)
+        return held + self.state_bytes(sequences, capacity, tokens, page, pages, max_model_len) + working + self.check_bytes(uncopied)
 
     def bytes_per_step(self, sequences: int, positions: int, stored: Sequence[str] = (), tokens: int = 1) -> Dict[str, int]:
         """What one step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a
@@ -822,7 +907,8 @@ class QwenDense:
             branch = call("projection.fp8.out", i, mixed, layer.out_proj, OUT_PROJECTION_SITES[layer.kind])
             q, _, residual = call("add_norm_quantize", i, branch, residual, layer.post_norm, layer.mlp_quant, "mlp")
             branch = call("mlp.down", i, call("mlp.gate_up", i, q, layer.gate_up, layer.down_quant), layer.down)
-        q, normed, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, weights.head_quant, "output_head")
+        _, normed, _ = call("add_norm_quantize", len(weights.layers), branch, residual, weights.final_norm, None, "output_head")
+        q = call("output_head.quantize", -1, normed, weights.head_quant)
         logits = call("output_head", -1, q, weights.head)
         next_ids = call("token_choice", -1, logits)
         # what a drafter reads of this step, by reference: the final-norm rows and, for each of them, the token that follows it

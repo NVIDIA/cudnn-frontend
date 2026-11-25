@@ -62,6 +62,13 @@ def test_indexed_six_query_heads(supported_gpu, lengths):
     check_case(inputs, indices_for(inputs))
 
 
+@pytest.mark.parametrize("lengths", [(3, 5, 7), (2049,)])
+def test_indexed_two_kv_heads(supported_gpu, lengths):
+    """24Q/2KV: each query head reads the KV head of its twelve-head group, and dK / dV gather per KV head."""
+    inputs = make_inputs(lengths, 24, 2, empty=True, all_selected=True)
+    check_case(inputs, indices_for(inputs))
+
+
 def test_indexed_changed_values_replay(supported_gpu):
     skip_without_cuda13_for_12q1kv(1)
     inputs = make_inputs((3, 65), 12, 1, all_selected=True)

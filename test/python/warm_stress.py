@@ -570,7 +570,7 @@ class ArriveSite:
     count: int | None = None  # arrival count when known from the PTX
 
 
-def release_dependence(ptx_text: str) -> List[ArriveSite]:
+def release_dependence(ptx_text: str, *, named_barrier: Optional[int] = None) -> List[ArriveSite]:
     """Every ``mbarrier.arrive`` (not ``expect_tx``) of a kernel's PTX with what its address is computed from.
 
     A definition-use walk, not an instruction pattern: from the address operand of the arrive backwards through every
@@ -578,6 +578,7 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
     ``dependent`` when the walk meets an ``and`` one of whose operands is computed from a kernel parameter alone
     (``ld.param``) -- the release-zero -- and it reports how many shared-memory or TMEM destination registers the other operand is
     computed from.  The walk does not look through a shared-memory load's own address.
+    With a named barrier ID, trace the participant count of its unaligned arrive instead.
     """
     instructions = []  # (line number, predicate register, opcode, results, sources, parameter symbol, text)
     for number, raw in enumerate(ptx_text.splitlines(), start=1):
@@ -590,7 +591,7 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
             head, _, text = text.partition(" ")
             predicate = head.lstrip("@!")
             text = text.strip()
-        opcode, _, operands = text.partition(" ")
+        opcode, _, operands = text.expandtabs(1).partition(" ")
         operands = operands.strip()
         opcode = opcode.strip()
         results, rest = [], operands
@@ -636,12 +637,17 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
 
     sites = []
     for number, _, opcode, _, _, _, text in instructions:
-        if not opcode.startswith("mbarrier.arrive") or "expect_tx" in opcode:
-            continue
-        match = re.search(r"\[([^\]]+)\]", text)
-        address = _REGISTER.findall(match.group(1)) if match else []
+        if named_barrier is None:
+            if not opcode.startswith("mbarrier.arrive") or "expect_tx" in opcode:
+                continue
+            match = re.search(r"\[([^\]]+)\]", text)
+        else:
+            match = re.fullmatch(rf"(?:bar|barrier)\.arrive\s+{named_barrier},\s*([^;]+);", text)
+            if not match:
+                continue
+        operands = _REGISTER.findall(match.group(1)) if match else []
         site = ArriveSite(number, text, False)
-        if match:
+        if named_barrier is None and match:
             count_operand = text[match.end() :].strip().removesuffix(";").strip().removeprefix(",").strip()
             if not count_operand:
                 site.count = 1
@@ -656,7 +662,7 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
                     site.count = int(count_operand, 0)
                 except ValueError:
                     pass  # Dynamic or otherwise unknown count.
-        for index in sorted(closure(address)):
+        for index in sorted(closure(operands)):
             _, _, and_opcode, _, and_sources, _, _ = instructions[index]
             if not and_opcode.startswith("and.") or len(and_sources) != 2:
                 continue

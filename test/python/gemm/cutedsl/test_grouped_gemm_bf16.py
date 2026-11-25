@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from test_utils import assert_bitwise_runs
 from test_grouped_gemm_bf16_utils import (
     assert_grouped_gemm_close,
     grouped_gemm_bf16_reference,
@@ -51,3 +52,38 @@ def test_grouped_gemm_bf16_wrapper(discrete):
     result = grouped_gemm_wrapper_sm100(**kwargs)
     assert_grouped_gemm_close(result["c_tensor"], expected_c)
     assert_grouped_gemm_close(result["d_tensor"], expected_d)
+
+
+@pytest.mark.L0
+def test_grouped_gemm_bf16_wrapper_one_cta_cluster_dynamic_sched():
+    """Dynamic scheduler with a one-CTA cluster: each CTA claims its own tiles from the counter.
+
+    256 tiles of 128x256 exceed the SM count, so CTAs claim repeatedly; replay must be bitwise stable.
+    """
+    from cudnn import grouped_gemm_wrapper_sm100
+
+    problem = make_grouped_gemm_bf16_problem(m=8192, n=1024, enable_bias=True)
+    expected_c, expected_d = grouped_gemm_bf16_reference(problem)
+
+    def launch():
+        result = grouped_gemm_wrapper_sm100(
+            a_tensor=problem["a"],
+            b_tensor=problem["b"],
+            padded_offsets=problem["offsets"],
+            alpha_tensor=problem["alpha"],
+            bias_tensor=problem["bias"],
+            prob_tensor=problem["prob"],
+            c_dtype=torch.bfloat16,
+            d_dtype=torch.bfloat16,
+            mma_tiler_mn=(128, 256),
+            cluster_shape_mn=(1, 1),
+            generate_c=True,
+            use_dynamic_sched=True,
+        )
+        return result["c_tensor"], result["d_tensor"]
+
+    c_tensor, d_tensor = launch()
+    assert_grouped_gemm_close(c_tensor, expected_c)
+    assert_grouped_gemm_close(d_tensor, expected_d)
+    # Byte comparison needs a unit last stride; the outputs are (m, n, 1) with L outermost.
+    assert_bitwise_runs(lambda: tuple(t[..., 0] for t in launch()), label="bf16 grouped GEMM, cluster (1, 1), dynamic scheduler")

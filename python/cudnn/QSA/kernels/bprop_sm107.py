@@ -42,7 +42,6 @@ from .bprop_sm100 import (
     DP_SMEM,
     DP_ST_W,
     DP_SYNC,
-    DP_SYNC_DQ,
     DP_THREADS,
     DP_TM_A,
     DP_TM_DQ,
@@ -64,8 +63,8 @@ from .bprop_sm100 import (
     _dense_sel,
     _dense_ticket,
     _desc,
-    _dq_done,
-    _dq_turn,
+    _dq_issue,
+    _dq_issuers,
     _kv_done,
     _kv_order,
     _kv_turn,
@@ -671,6 +670,8 @@ def qsa_bwd_dense_pair_sm107_kernel(
         tmem_slot = cutlass.Array(I32, 1, space=cutlass.AddressSpace.smem, alignment=4)
         if cutlass.const_expr(DET):
             kv_order = cutlass.Array(I32, DP_KV_ORDER, space=cutlass.AddressSpace.smem, alignment=16)
+            b_stg = cutlass.Array(cutlass.Int64, _dq_issuers(GH), space=cutlass.AddressSpace.smem, alignment=8)
+            b_stf = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
 
         sbase = smem.data_ptr()
         if cutlass.const_expr(GH < GQ):
@@ -681,6 +682,10 @@ def qsa_bwd_dense_pair_sm107_kernel(
             if prims.elect_sync():
                 if cutlass.const_expr(DET):
                     _kv_order(kv_order.data_ptr(), band, tile, hk, rank, pr, g_lo, t_lo, ntiles, HKV)
+                    for s in cutlass.range_constexpr(_dq_issuers(GH)):
+                        prims.mbarrier_init(b_stg.subview(s), 4)
+                    for s in cutlass.range_constexpr(2):
+                        prims.mbarrier_init(b_stf.subview(s), 1)
                 prims.prefetch_tensormap(tma_kd.get_ptr())
                 prims.prefetch_tensormap(tma_qd.get_ptr())
                 prims.prefetch_tensormap(tma_dod.get_ptr())
@@ -726,6 +731,16 @@ def qsa_bwd_dense_pair_sm107_kernel(
         p_dense_dv_acc = g_dense_dv_acc.iterator.raw_ptr()
         p_k = g_k.iterator.raw_ptr()
         p_v = g_v.iterator.raw_ptr()
+
+        if cutlass.const_expr(DET):
+            par = I32(-1)
+            if warp == 2:
+                par = I32(0)
+            if warp >= DP_THREADS // 32:
+                par = warp - (DP_THREADS // 32 - 1)
+                warp = I32(2)
+            if (par >= 0) & (lane == 0):
+                _dq_issue(tma_dq, p_sync, sbase, b_stg, b_stf, par, rank, hk, pr, tile, nk, g_top, n_lo, n_top, Ut, nparts, ntiles, HKV, GH)
 
         if warp == 0:
             if prims.elect_sync():
@@ -1160,9 +1175,7 @@ def qsa_bwd_dense_pair_sm107_kernel(
             stg0 = sbase + (DP_OFF_ST + qd * DP_ST_W) // 4
             stg1 = sbase + (DP_OFF_DS + qd * DP_ST_W) // 4
             if cutlass.const_expr(DET):
-                dq_slot = rank * 16 + DP_SYNC_DQ + qd
-                nb_seen = I32(-1)
-                np_seen = I32(0)
+                stg1 = stg1 + rank * (DP_CM // 4)
             for k in cutlass.range(nk, unroll=1):
                 g = g_top - 1 - _rot(k, off, nk)
                 _wait(b_dqf, k & 1)
@@ -1175,7 +1188,12 @@ def qsa_bwd_dense_pair_sm107_kernel(
                 if prims.elect_sync():
                     prims.mbarrier_arrive(b_dqe)
                 stg = stg0
-                if rank == 0:
+                if cutlass.const_expr(DET):
+                    if (k & 1) == 1:
+                        stg = stg1
+                    if k >= 2:
+                        _wait(b_stf.subview(k & 1), ((k >> 1) - 1) & 1)
+                elif rank == 0:
                     if (k & 1) == 1:
                         stg = stg1
                     prims.cp_async_bulk_wait_group(1, read=True)
@@ -1190,9 +1208,10 @@ def qsa_bwd_dense_pair_sm107_kernel(
                     (stg + n * 32 + lane).store(prims.mov_b32(val, target_type=I32))
                 prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
                 prims.bar_warp_sync(0xFFFFFFFF)
-                if lane == 0:
-                    if cutlass.const_expr(DET):
-                        nb_seen, np_seen = _dq_turn(p_sync, dq_slot, g, n_lo, n_top, Ut, nparts, tile, hk, pr, nb_seen, np_seen, ntiles, HKV)
+                if cutlass.const_expr(DET):
+                    if prims.elect_sync():
+                        prims.mbarrier_arrive(b_stg.subview(k % _dq_issuers(GH)))
+                elif lane == 0:
                     if cutlass.const_expr(GH == GQ):
                         prims.cp_async_bulk_tensor_reduce(tma_dq.get_ptr(), stg, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GQ, g * DP_G])
                     else:
@@ -1200,9 +1219,8 @@ def qsa_bwd_dense_pair_sm107_kernel(
                             prims.cp_async_bulk_tensor_reduce(
                                 tma_dq.get_ptr(), stg + qq * GQ * 32, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GH, g * DP_G + qq]
                             )
-                prims.cp_async_bulk_commit_group()
-                if cutlass.const_expr(DET):
-                    _dq_done(p_sync, pr, dq_slot, k, lane)
+                if cutlass.const_expr(not DET):
+                    prims.cp_async_bulk_commit_group()
             prims.cp_async_bulk_wait_group(0)
 
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -1303,4 +1321,10 @@ def _dpair_host(
         HKV,
         GH,
         DET,
-    ).launch(grid=(nparts * ntiles * 2 * HKV, 1, 1), block=(DP_THREADS, 1, 1), cluster=(2, 1, 1), stream=stream, use_pdl=(PDL == 1))
+    ).launch(
+        grid=(nparts * ntiles * 2 * HKV, 1, 1),
+        block=(DP_THREADS + 32 * (_dq_issuers(GH) - 1) * DET, 1, 1),
+        cluster=(2, 1, 1),
+        stream=stream,
+        use_pdl=(PDL == 1),
+    )
