@@ -63,7 +63,22 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
             n_chunk_size > 0 and n_chunk_size % stock.cluster_tile_n == 0
         ), f"N chunk {n_chunk_size} must be a positive multiple of N_TILE_SIZE {stock.cluster_tile_n}"
         assert stock.use_dynamic_sched, "the extra clusters stop through the dynamic scheduler's claims"
-        self.__dict__.update(stock.__dict__)
+        # Take over the stock scheduler's state: its params, walk state, dynamic state and broadcast pipeline.
+        super().__init__(
+            stock.params,
+            stock.offs,
+            stock.num_persistent_clusters,
+            stock._current_work_linear_idx,
+            stock.cta_id_in_cluster,
+            stock.current_expert_idx,
+            stock.expert_tile_start,
+            stock.expert_tile_end,
+            dynamic_state=stock._dynamic_state,
+            sched_storage=stock._sched_storage,
+            cluster_pipeline=stock.cluster_pipeline,
+        )
+        missing = stock.__dict__.keys() - self.__dict__.keys()
+        assert not missing, f"stock scheduler state not carried over: {sorted(missing)}"
         self.n_chunk_size = n_chunk_size
         self.clusters_beside_consumer = clusters_beside_consumer
         # The stock ``expert_cnt`` is a kernel argument; this is the same count at trace time.
