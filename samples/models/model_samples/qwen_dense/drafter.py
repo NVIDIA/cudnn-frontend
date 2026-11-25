@@ -249,7 +249,7 @@ class QwenDenseDrafter:
     keys: Dict[str, str] = field(default_factory=dict)  # this family's tensor names -> the checkpoint's own
     name: str = "qwen_dense drafter"
     # what a plan asks of a model (``blocks.plan(drafter.provider_table, drafter.regimes, .., model=drafter)``).  The drafter
-    # names no target stacks: no kernel census holds a draft pass, and a plan of it states no kernel identity
+    # names no checked stacks: whether a run checks its kernels is the model's statement
     provider_table = configs.DRAFTER_PROVIDERS
     regimes = configs.REGIMES
     table_source = "model_samples/qwen_dense/configs.py"

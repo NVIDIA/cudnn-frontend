@@ -18,17 +18,16 @@ from cutlass.cutlass_dsl import dsl_user_op, Int32 as _epi_Int32, Int64
 from cutlass.cute.typing import Float32
 
 from ......helpers.iket_compat import iket
+from ......helpers.tmem_transpose import _TmemTranspose16x32Core
 from ......helpers.flag_batch import GpuReleaseFlagBatchTracker
 from ......helpers.ptx_helpers import (
     red_add_relaxed_sys_f32 as _red_add_relaxed_sys_f32,
-    red_add_relaxed_sys_v2_bf16x2 as _red_add_relaxed_sys_v2_bf16x2,
     stg_e8m0_from_f32,
     stg_e8m0x8_from_f32,
 )
 from ..helpers.utils import swiglu_act, dswiglu_act, quant_sfd_row, quant_sfd_col
 from ......quant_def import CombineFormat
 from .....schedulers.fc12_mapping import BlockPhase
-from ..tmem_transpose import _TmemTranspose16x32Core
 from ..fwd_glu.glu_mxfp8_fc12_epilogue import Fc2OutputDest
 
 Fc1GateUpInterleave = 32
@@ -91,7 +90,6 @@ class DgluMxfp8Epilogue:
         dfc2_subtile_publish: bool = False,
         dfc2_acc_early_release: bool = False,
         use_scaled_cvt: bool = False,
-        fc2_in_kernel_topk_reduce: bool = False,
         combine_format: Optional[CombineFormat] = None,
         combine_hidden: Optional[int] = None,
         act_func: str = "swiglu",
@@ -141,10 +139,6 @@ class DgluMxfp8Epilogue:
         self._num_accumulator_tmem_cols = self._cta_tile_n * self._num_acc_stage
 
         self._token_back_by_dispatch = token_back_by_dispatch
-        # In-kernel top-k reduce
-        self._reduce_topk_in_epilogue = (
-            fc2_in_kernel_topk_reduce and not token_back_by_dispatch
-        )
         _fc1_batch, _fc2_batch = (1, 1) if epi_flag_batch is None else epi_flag_batch
         self._epi_fc1_batch = max(1, min(32, int(_fc1_batch)))
         self._epi_fc2_batch = max(1, min(32, int(_fc2_batch)))
@@ -692,32 +686,33 @@ class DgluMxfp8Epilogue:
 
         is_valid_row = token_row_in_cta < valid_tokens
 
-        r_gate = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
-        r_up = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
-        for j in cutlass.range_constexpr(EN):
-            r_gate[j] = r_gate_bf[j].to(self.acc_dtype)
-            r_up[j] = r_up_bf[j].to(self.acc_dtype)
-        # Zero invalid rows' inputs (their r_acc/r_gate/r_up are padding garbage) so the
-        # warp-wide column amax is not polluted and no NaN propagates into the reduction.
+        # Zero invalid rows' inputs (their r_acc/r_gate_bf/r_up_bf are padding garbage) so
+        # the warp-wide column amax is not polluted and no NaN propagates into the reduction.
         if token_row_in_cta >= valid_tokens:
             for j in cutlass.range_constexpr(EN):
                 r_acc[j] = self.acc_dtype(0.0)
-                r_gate[j] = self.acc_dtype(0.0)
-                r_up[j] = self.acc_dtype(0.0)
+                r_gate_bf[j] = cutlass.BFloat16(0.0)
+                r_up_bf[j] = cutlass.BFloat16(0.0)
 
         # dswiglu backward: acc(grad_h) x (gate, up) -> (d_gate, d_up) ----
         d_gate = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
         d_up = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
         if cutlass.const_expr(self._act_func == "swiglu"):
             subtile_dprob = dswiglu_act(
-                d_gate, d_up, r_acc, r_gate, r_up, beta, prob, self._gate_up_clamp
+                d_gate, d_up, r_acc, r_gate_bf, r_up_bf, beta, prob, self._gate_up_clamp
             )
 
         # dSwiGLU backward has consumed r_acc. Reuse that fragment for the
-        # independent forward recompute now so r_gate/r_up die before the two
-        # dgrad quantization paths instead of remaining live across them.
+        # independent forward recompute now so the pre-activations die before the two
+        # dgrad quantization paths instead of remaining live across them. The recompute
+        # needs the unscaled f32 values, so widen here (only in this configuration).
         if cutlass.const_expr(self._dfc2_recompute):
             if cutlass.const_expr(self._act_func == "swiglu"):
+                r_gate = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
+                r_up = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
+                for j in cutlass.range_constexpr(EN):
+                    r_gate[j] = r_gate_bf[j].to(self.acc_dtype)
+                    r_up[j] = r_up_bf[j].to(self.acc_dtype)
                 swiglu_act(
                     r_acc,
                     r_up,
@@ -1210,10 +1205,6 @@ class DgluMxfp8Epilogue:
                     tensor=token_comm_args.combine_output,
                     metadata=metadata_u32,
                     peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
-                    # Collapse topk -> src_topk=0 so every contribution of a
-                    # source token resolves to the SAME combine row (red-added
-                    # below).  No-op when reduce is off.
-                    reduce_topk_in_kernel=self._reduce_topk_in_epilogue,
                 )
                 dest_row = fc2_output_dest.resolve_token_row(pool_token_global)
             for stg_half in cutlass.range(EpilogueTileN // 16, unroll_full=True):
@@ -1227,35 +1218,17 @@ class DgluMxfp8Epilogue:
                 ):
                     # epi_warps: peer-write grad_x directly to combine_output
                     hidden_off = hidden_col_start + cutlass.Int32(stg_half * 16)
-                    if cutlass.const_expr(self._reduce_topk_in_epilogue):
-                        if is_valid:
-                            reg_u32 = cute.recast_tensor(reg_view, cutlass.Uint32)
-                            for redg_i in cutlass.range_constexpr(16 // 4):
-                                chunk_ptr = cute.make_ptr(
-                                    cutlass.BFloat16,
-                                    dest_row.iterator.toint()
-                                    + (hidden_off + cutlass.Int32(redg_i * 4))
-                                    * cutlass.Int64(2),
-                                    cute.AddressSpace.gmem,
-                                    assumed_align=8,
-                                )
-                                _red_add_relaxed_sys_v2_bf16x2(
-                                    chunk_ptr,
-                                    cutlass.Uint32(reg_u32[2 * redg_i]),
-                                    cutlass.Uint32(reg_u32[2 * redg_i + 1]),
-                                )
-                    else:
-                        dest_ptr = cute.make_ptr(
-                            cutlass.BFloat16,
-                            dest_row.iterator.toint() + hidden_off * cutlass.Int64(2),
-                            cute.AddressSpace.gmem,
-                            assumed_align=32,
+                    dest_ptr = cute.make_ptr(
+                        cutlass.BFloat16,
+                        dest_row.iterator.toint() + hidden_off * cutlass.Int64(2),
+                        cute.AddressSpace.gmem,
+                        assumed_align=32,
+                    )
+                    if is_valid:
+                        cute.copy(
+                            stg_atom, reg_view,
+                            cute.make_tensor(dest_ptr, cute.make_layout(16)),
                         )
-                        if is_valid:
-                            cute.copy(
-                                stg_atom, reg_view,
-                                cute.make_tensor(dest_ptr, cute.make_layout(16)),
-                            )
                 else:
                     # Lean path (token_comm_args is None) OR dispatch-push
                     # (token_back_by_dispatch)
