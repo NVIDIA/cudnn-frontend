@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 import re
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,9 +35,14 @@ def known_byte_failure(request):
     try:
         yield
     except AssertionError as error:
-        if torch.cuda.get_device_capability() != (10, 0) or request.node.name not in _KNOWN_BYTE_FAILURES:
+        capability = torch.cuda.get_device_capability()
+        if capability == (10, 0) and request.node.name in _KNOWN_BYTE_FAILURES:
+            pattern = r"(?:replay \d+|packed slot \d+) (?:loss|(?:saved_)?d[qk]_idx): \d+/\d+ bytes differ"
+        elif capability == (10, 3) and request.node.name == "test_replay[bf16-h32-tail-fprop-cutedsl]":
+            pattern = r"replay \d+ loss: 1/4 bytes differ"
+        else:
             raise
-        if not re.fullmatch(r"(?:replay \d+|packed slot \d+) (?:loss|(?:saved_)?d[qk]_idx): \d+/\d+ bytes differ", str(error)):
+        if not re.fullmatch(pattern, str(error)):
             raise
         pytest.xfail(f"Known Phase 1 reduction-order difference; remove when replay and batch invariance are fixed: {error}")
 
@@ -98,3 +104,25 @@ def test_golden(use_kf, backward):
 
     tensors = dict(zip(("q", "k", "q_idx", "k_idx", "starts", "ends", "valid", "denominator"), (*inputs[0], *inputs[1])))
     assert_golden(f'phase1-cu{CUDA_VERSION.major}.{CUDA_VERSION.minor}-{"cutedsl" if use_kf else "torch"}-{"bprop" if backward else "fprop"}', tensors, actual)
+
+
+@pytest.mark.parametrize(
+    "capability,case,message,expected",
+    [
+        ((10, 3), "test_replay[bf16-h32-tail-fprop-cutedsl]", "replay 2 loss: 1/4 bytes differ", True),
+        ((10, 3), "test_replay[bf16-h32-tail-fprop-cutedsl]", "replay 2 loss: 2/4 bytes differ", False),
+        ((10, 3), "test_replay[bf16-h32-tail-fprop-cutedsl]", "replay 2 saved_dq_idx: 1/4 bytes differ", False),
+        ((10, 3), "test_replay[bf16-h32-tail-fprop-cutedsl]", "loss: non-finite result", False),
+        ((10, 3), "test_replay[bf16-h32-tail-fprop-cutedsl]", "Tensor-likes are not close!", False),
+        ((10, 3), "test_replay[bf16-h32-tail-bprop-cutedsl]", "replay 2 loss: 1/4 bytes differ", False),
+        ((10, 7), "test_replay[bf16-h32-tail-fprop-cutedsl]", "replay 2 loss: 1/4 bytes differ", False),
+        ((10, 0), "test_replay[bf16-h32-tail-fprop-cutedsl]", "replay 2 loss: 1/4 bytes differ", True),
+    ],
+)
+def test_known_byte_failure_scope(monkeypatch, capability, case, message, expected):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    request = SimpleNamespace(node=SimpleNamespace(name=case))
+    error = pytest.xfail.Exception if expected else AssertionError
+    with pytest.raises(error):
+        with known_byte_failure(request):
+            raise AssertionError(message)
