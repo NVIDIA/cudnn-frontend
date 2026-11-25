@@ -11,6 +11,8 @@ the run.  Nothing is chosen at run time and nothing falls back on failure:
 
 * ``NotImplementedError`` from a selection or from ``Block.check_support`` means "not served here": the sample prints
   ``[NN] SKIP <sentence>`` and exits 0;
+* :class:`MissingPackage`, a ``NotImplementedError`` of its own kind, means that a package the stack calls is not
+  installed: nothing takes the place of the stack, so a sample stops there with ``[NN] ERROR`` and exit code 1;
 * ``ValueError`` means the caller violated a contract (an unknown stack, a provider key that is not a declared row).
 
 The stack is explicit (``"fe-cublas"``, ``"native"``, ``"fe-entries"``, ``"reference"``): a row outside the requested stack is
@@ -32,12 +34,23 @@ This module imports nothing beyond the standard library: a plan on stated device
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
 from .census import Kernel
 
 GIB = 1024**3
+
+
+class MissingPackage(NotImplementedError):
+    """A package that a block of the plan calls is not installed (``package``: its distribution's name).  Its sentence names
+    the package and the command that installs it.  It is a ``NotImplementedError``, so whoever plans without running
+    reads it as any decline of the installation; a sample that was asked to run the stack stops on it -- before
+    anything is loaded, with the sentence and a non-zero exit code -- because no other stack takes that stack's place."""
+
+    def __init__(self, sentence: str, package: str):
+        super().__init__(sentence)
+        self.package = package
 
 
 @dataclass(frozen=True)
@@ -160,6 +173,7 @@ class Block(Protocol):
     kernels: Tuple[Kernel, ...]  # the block's census entries: the kernels a call launches, or the families of a fallback row
     per_row: Tuple[int, ...]  # the operands that have one leading row per sequence
     state_args: Tuple[int, ...]  # the operands the call updates in place
+    captures: bool  # whether a recorded launch sequence can hold a call of the block (``Plan.recordable``)
 
     def check_support(self, sequences: int, tokens: int) -> None:
         """Raise the provider's typed decline when it does not serve this run; return otherwise.  Allocates nothing on the
@@ -220,6 +234,8 @@ class BySite:
     stored_weights = False  # asked of the parts: each reads its weight in its own form
     stored_layout = None
     cache_page = None  # asked of the parts too: the session collects the page of the attention cache over every part of its plans
+    attended_tables = False  # ... and whether a part reads the page table and the lengths of that cache
+    captures = False  # asked of the parts too: whether a recorded launch sequence can hold a call is each part's answer
     batch_note = ""
 
     def __init__(self, name: str, parts: Sequence[tuple]):
@@ -340,6 +356,18 @@ class Plan(dict):
                 found += [(scoped(name, site), name, site, row, part) for site, row, part in split]
         return found
 
+    def recordable(self) -> str:
+        """Whether a step of this plan can be recorded once as a launch sequence and replayed for every token: ``""`` where
+        every part of it says it can (``Block.captures``), else why not, in one sentence that names the first part, in
+        table order, that cannot -- with the reason of its row where the row is a fallback.  Decided from the adapters'
+        data alone: before anything is built, loaded or launched."""
+        for label, _, _, row, block in self.parts():
+            if not getattr(block, "captures", False):
+                if row.fallback:
+                    return f"{label} is on a fallback row of this stack ({row.fallback}), which a recorded launch sequence cannot hold"
+                return f"{label} is served by {block.entry}, which a recorded launch sequence cannot hold"
+        return ""
+
     def announcements(self) -> list:
         """What the first use of this plan will do beyond building an entry's kernel, one sentence per kind
         (``Block.first_use_note``; a library that builds kernels of its own with the installed compiler), in table order.  A
@@ -407,17 +435,20 @@ class Plan(dict):
     def reserve_bytes(self) -> int:
         return sum(block.reserve_bytes() for block in self.values())
 
-    def memory(self, need_bytes: int, what: str = "", checks_bytes: int = 0) -> str:
+    def memory(self, need_bytes: int, what: str = "", checks_bytes: int = 0, rows_bytes: int = 0, beyond: str = "") -> str:
         """The memory sentence, in GiB (2^30 bytes); ``what`` names what the need covers when that is more than this plan's
-        run.  ``checks_bytes`` is the part of ``need_bytes`` that is the checks' own -- the bf16 copy their reference
-        makes, one at a time, of a weight the run keeps on its stored format alone: the sentence then states it, in GiB
-        to two places (a copy of one weight is a fraction of one).  Raises ``NotImplementedError`` (a SKIP that names
-        what to do) when the GPU has too little free, and says so when the need exceeds what the GPU has in total:
-        freeing memory cannot help there."""
+        run.  Two parts of ``need_bytes`` are the checks' own, and the sentence states their sum, in GiB to two places,
+        and names each that is not zero bytes: ``checks_bytes``, the bf16 copy their reference makes, one at a time, of
+        a weight the run keeps on its stored format alone (a copy of one weight is a fraction of a GiB), and
+        ``rows_bytes``, what they hold for the sequences ``beyond`` names (``the 84 sequences beyond the first``).
+        Raises ``NotImplementedError`` (a SKIP that names what to do) when the GPU has too little free, and says so
+        when the need exceeds what the GPU has in total: freeing memory cannot help there."""
         need = need_bytes + self.reserve_bytes()
         free, total = self.facts.free_bytes, self.facts.total_bytes
-        if checks_bytes:
-            what += f", {checks_bytes / GIB:.2f} GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)"
+        parts = ["the reference's bf16 copy of one weight at a time, where the run keeps none"] if checks_bytes else []
+        parts += [f"what they hold for {beyond}"] if rows_bytes else []
+        if parts:
+            what += f", {(checks_bytes + rows_bytes) / GIB:.2f} GiB of it for the checks ({', and '.join(parts)})"
         if total and need > total:
             raise NotImplementedError(
                 f"stack {self.stack} needs about {need / GIB:.1f} GiB on this GPU{what}; this GPU has {total / GIB:.1f} GiB in total: "
@@ -446,7 +477,13 @@ def select_row(
     block: str, rows: Sequence[ProviderRow], facts: DeviceFacts, sequences: int, tokens: int, stack: str, key: Optional[str] = None, model=None
 ) -> ProviderRow:
     """The row that serves ``block`` in this run: the first match of the stack's rows, or of the rows with ``key``.  A row
-    that names layer widths matches the ``model`` that has them."""
+    that names layer widths matches the ``model`` that has them.
+
+    A key is by stack only between rows that name the same call.  Where the first match of a key is a row of another
+    stack and the run's own stack has a row that is that row in every field but its stacks and its printed reason,
+    the stack's row is taken: the call is the same, and the reason printed is the one of the stack that runs.  A row
+    of the run's stack that differs in anything else -- the form of the entry, a range -- is another call and is not
+    taken: the first declared row of the key still wins there."""
     if key is not None:
         candidates = [r for r in rows if r.key == key]
         if not candidates:
@@ -457,6 +494,8 @@ def select_row(
             raise NotImplementedError(f"block {block} has no provider row in stack {stack}")
     for row in candidates:
         if row.serves_class(facts.cc) and row.serves_model(model) and row.serves_run(sequences, tokens):
+            if key is not None and stack not in row.stacks:  # the same call on a row of the run's own stack: that row
+                return next((own for own in candidates if stack in own.stacks and replace(own, stack=row.stack, fallback=row.fallback) == row), row)
             return row
     first = candidates[0]
     if tokens > 1:  # a step of several tokens per sequence: a decline is named by the block's rows for such a step, where it has some

@@ -38,6 +38,7 @@ __all__ = [
     "_forward_config",
     "_moe_ep_config",
     "_grad_output",
+    "_join_spawned_with_deadline",
     "_make_forward_case",
     "_naive_reference",
     "_output_as_float",
@@ -48,6 +49,7 @@ __all__ = [
     "_replay_cuda_graph",
     "_require_distributed_sm107",
     "_run_grouped_wgrad_kernel",
+    "_run_isolated",
     "_sm107_device",
     "_stress_backend_reuse",
     "_training_abi_prepared",
@@ -119,16 +121,16 @@ def make_distributed_forward_inputs(
     rank: int,
     world_size: int,
     device: torch.device,
+    hidden: int = 128,
 ):
     """Build rank-local inputs with one local and one remote route per token."""
 
     generator = torch.Generator(device=device).manual_seed(20260811 + rank)
     # Vary local shapes without exceeding the distributed tests'
     # max_tokens_per_rank=8 contract at EP sizes above seven.
-    local_experts, tokens, hidden, intermediate = (
+    local_experts, tokens, intermediate = (
         2,
         rank % 7 + 2,
-        128,
         256,
     )
     activation = quantize_mxfp8(
@@ -210,6 +212,22 @@ def _training_graph_pattern(
             physical_recv_pool_size=128,
             combine_format="bf16",
         )
+    if name == "smoke_h256":
+        # The smallest workload FC2 bulk store accepts (hidden_size % 256 == 0),
+        # valid at any EP size: rank r routes each token to ranks r .. r+top_k-1.
+        top_k = min(8, 2 * world_size)
+        max_tokens_per_rank = 128
+        return _TrainingGraphPattern(
+            name=name,
+            num_experts=2 * world_size,
+            hidden_size=256,
+            intermediate_size=256,
+            top_k=top_k,
+            max_tokens_per_rank=max_tokens_per_rank,
+            # Room for every route on one rank plus per-expert padding: never overflows.
+            physical_recv_pool_size=world_size * max_tokens_per_rank * top_k + 2 * 128,
+            combine_format="bf16",
+        )
     if name == "ds3_ep4_pattern":
         if world_size != 4:
             raise ValueError("ds3_ep4_pattern training graph pattern requires world_size=4, " f"got {world_size}")
@@ -223,7 +241,7 @@ def _training_graph_pattern(
             physical_recv_pool_size=131968,
             combine_format="mxfp8",
         )
-    raise ValueError("training graph pattern must be 'smoke' or 'ds3_ep4_pattern', " f"got {name!r}")
+    raise ValueError("training graph pattern must be 'smoke', 'smoke_h256' or 'ds3_ep4_pattern', " f"got {name!r}")
 
 
 def _constant_mxfp8(
@@ -908,6 +926,44 @@ def _replay_cuda_graph(
             _assert_matches_reference(graph_output, expected)
 
 
+def _terminate_processes(processes) -> None:
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join(timeout=30)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=30)
+
+
+def _run_isolated(target, args=(), *, timeout_seconds: float = 300, what: str) -> None:
+    """Run ``target(*args)`` in a spawned process; a hang fails instead of blocking pytest."""
+
+    import torch.multiprocessing as mp
+
+    process = mp.get_context("spawn").Process(target=target, args=args)
+    process.start()
+    process.join(timeout=timeout_seconds)
+    if process.is_alive():
+        _terminate_processes((process,))
+        pytest.fail(f"{what} did not finish within {timeout_seconds} s")
+    assert process.exitcode == 0, f"{what} failed with exit code {process.exitcode}"
+
+
+def _join_spawned_with_deadline(process_context, *, timeout_seconds: float = 300, what: str) -> None:
+    """Join an ``mp.spawn(join=False)`` context; a hung rank fails instead of blocking pytest."""
+
+    import time
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if process_context.join(timeout=min(1.0, max(0.0, deadline - time.monotonic()))):
+            return
+    _terminate_processes(process_context.processes)
+    pytest.fail(f"{what} did not finish within {timeout_seconds} s")
+
+
 # Backward
 
 
@@ -1168,6 +1224,88 @@ def _run_grouped_wgrad_kernel(
         input_order="tensor2d",
         current_stream=current_stream,
     )["wgrad_tensor"]
+
+
+def _training_wgrad_unavailable_reason() -> str | None:
+    """Why ``MoeEp.training_wgrad`` cannot run with the installed DSL, or None."""
+
+    from cudnn.moe_ep._megamoe_backend.mxfp8._wgrad_compile import wgrad_unavailable_reason
+
+    return wgrad_unavailable_reason()
+
+
+def _require_training_wgrad() -> None:
+    """Skip below the Rubin DSL floor; above it, fail: every supported DSL (public 4.8.0 and later) runs training WGrad."""
+
+    from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import require_rubin_cutedsl
+
+    try:
+        require_rubin_cutedsl()
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    reason = _training_wgrad_unavailable_reason()
+    if reason is not None:
+        pytest.fail(f"MoeEp training WGrad is unavailable on a supported DSL: {reason}")
+
+
+def _allocate_training_wgrad_outputs(expected, dtype=torch.bfloat16):
+    """Dense GEMM-oriented dW destinations."""
+
+    from cudnn.moe_ep import MoeEpTrainingWgradOutputs
+
+    _require_training_wgrad()
+    return MoeEpTrainingWgradOutputs(
+        fc1=torch.empty_like(expected[0], dtype=dtype),
+        fc2=torch.empty_like(expected[1], dtype=dtype),
+    )
+
+
+def _run_training_wgrad(op, operands, outputs):
+    """Run MoeEp WGrad into preallocated outputs."""
+
+    for tensor in (outputs.fc1, outputs.fc2):
+        tensor.fill_(float("nan"))
+    op.training_wgrad(operands, out=outputs)
+    return outputs.fc1, outputs.fc2
+
+
+def _assert_training_wgrads_match(actual, expected, *, grouped=None) -> None:
+    """MoeEp WGrad vs the reference, and byte-equal to FE grouped WGrad when given."""
+
+    _assert_grouped_wgrads_match_reference(
+        actual,
+        expected,
+        reference_name="the independent PyTorch MXFP8 reference (MoeEp.training_wgrad)",
+    )
+    if grouped is not None:
+        for name, mine, theirs in zip(("fc1", "fc2"), actual, grouped):
+            assert torch.equal(mine.view(torch.int16), theirs.view(torch.int16)), f"MoeEp.training_wgrad {name} differs from FE grouped WGrad"
+
+
+def _assert_wgrad_padding_rows_contribute_zero(operands) -> None:
+    """Producer contract: in-segment padding rows have zero payload and finite scales.
+
+    Rows ``[begin + valid, end)`` of every expert segment carry a zero (or
+    negative-zero) E4M3 payload, and none of the segment's E8M0 scale bytes is
+    the NaN encoding 0xFF. The capacity tail after the last offset is not
+    checked: it stays unspecified.
+    """
+
+    ends = [int(value) for value in operands.expert_offsets.detach().cpu().tolist()]
+    valid_counts = [int(value) for value in operands.valid_route_counts.detach().cpu().tolist()]
+    for name in ("fc1_a", "fc1_b", "fc2_a", "fc2_b"):
+        data = getattr(operands, name)
+        prefix = name[:3]
+        scales = getattr(operands, f"{prefix}_sf{name[-1]}").view(torch.uint8).reshape(-1)
+        padded_non_k = _round_up(int(data.shape[1]), 128)
+        begin = 0
+        for expert, (end, valid) in enumerate(zip(ends, valid_counts)):
+            if end > begin:
+                padding = data[begin + valid : end].view(torch.uint8) & 0x7F
+                assert int(padding.count_nonzero().item()) == 0, f"{name} expert {expert} padding rows {begin + valid}:{end} are not zero"
+                part = scales.narrow(0, padded_non_k * begin // 32, padded_non_k * (end - begin) // 32)
+                assert not bool((part == 0xFF).any().item()), f"{name} expert {expert} segment holds NaN scales"
+            begin = end
 
 
 def _dense_wgrads_from_grouped_kernel(
