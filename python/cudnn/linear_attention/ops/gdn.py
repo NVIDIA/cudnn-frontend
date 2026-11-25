@@ -39,12 +39,14 @@ from .common import (
     check_composed_state,
     check_composed_summaries,
     check_context,
+    eager_backward,
     eager_dispatch,
     execute_graph,
     make_execution_resources,
     make_summary_cache_key,
     select_plan,
     summary_backward,
+    summary_dispatch,
     summary_setup_context,
     torch_dtype_to_cudnn,
 )
@@ -1447,8 +1449,9 @@ class EagerGdn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
-        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range
-        return gdn_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else run_gdn_bwd)
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range, and a
+        # trace or mode that started after the forward has to see the op
+        return gdn_backward(ctx, *grads, bwd=run_gdn_bwd if eager_backward(grads) else None)
 
 
 # ---------------------------------------------------------------------------
@@ -2353,7 +2356,9 @@ def gated_delta_net_summary(
     """
     if k.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
-    final_state, transition, context = torch.ops.cudnn.gated_delta_net_summary(
+    final_state, transition, context = summary_dispatch(
+        torch.ops.cudnn.gated_delta_net_summary,
+        run_gdn_summary,
         k,
         v,
         g,
@@ -2423,7 +2428,9 @@ def gated_delta_net_summary_bwd(
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    d_initial_state, transition, context = torch.ops.cudnn.gated_delta_net_summary_bwd(
+    d_initial_state, transition, context = summary_dispatch(
+        torch.ops.cudnn.gated_delta_net_summary_bwd,
+        run_gdn_summary_bwd,
         dO,
         q,
         k,
