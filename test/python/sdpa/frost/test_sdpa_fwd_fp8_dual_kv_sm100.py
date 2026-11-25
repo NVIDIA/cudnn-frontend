@@ -78,6 +78,31 @@ def test_adapter_routes_one_tile_decode_shapes_onto_two_kv_streams(routed, b, h,
     assert api.template_params().dual_kv_stream is expect
 
 
+@pytest.mark.parametrize("output_dtype,dual_kv", [(F8, True), (torch.bfloat16, False)])
+def test_medium_paged_decode_uses_graph_output_dtype(routed, output_dtype, dual_kv):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 paged D128 scheduling policy")
+    q = torch.empty(16, 32, 1, D, device="cuda", dtype=F8)
+    pool = torch.empty(16, 4, 16, D, device="cuda", dtype=F8)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=pool,
+        sample_v=pool,
+        sample_o=torch.empty_like(q, dtype=output_dtype),
+        dtype_o=output_dtype,
+        pertensor_fp8=True,
+        pack_gqa=True,
+        cga=1,
+        split_kv=2,
+        seq_kv_lens_present=True,
+        paged_page_size=16,
+        paged_max_seq_len_kv=32768,
+    )
+    assert api.check_support()
+    # Split partials have their own dtype; the final O descriptor selects the policy.
+    assert api.template_params().dual_kv_stream is dual_kv
+
+
 def test_routing_is_on_by_default_and_the_switch_turns_it_off(monkeypatch):
     """The decode step takes the two-stream specialization out of the box;
     config_sm100.FP8_DUAL_KV_STREAM_ROUTED is the one switch that keeps it off."""

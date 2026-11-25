@@ -174,6 +174,11 @@ def fp8_dual_kv_stream_routed() -> bool:
     return bool(FP8_DUAL_KV_STREAM_ROUTED)
 
 
+def prefer_paged_fp8_dual_kv(batch, kv_length, *, heads, dims, page_size, splits):
+    """Measured two-stream region for packed E4M3 single-token decode on SM100."""
+    return heads == (32, 4) and dims == (128, 128) and page_size == 16 and splits == 2 and 8 <= batch <= 16 and 32768 <= kv_length <= 65536
+
+
 def supports_d64_fp8_swap_ab(shape, *, device_cc, paged, thd, batch_size, s_q, h_q, h_kv, pack_gqa, cga):
     """Legal eight-live-column D64 decode geometry, independent of ranking."""
     group = h_q // h_kv if pack_gqa and h_kv else 1
