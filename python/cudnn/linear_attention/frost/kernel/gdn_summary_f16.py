@@ -903,17 +903,8 @@ def chain_warp_group(
                 # ---- per-row Gate register builds ------------------------------------
                 cumprod_vals = []
                 for k in cutlass.range_constexpr(num_vals):
-                    cumprod_vals.append(sCumprod[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx])
-                last_cumsumlog = sCumsumlog[cfg.b_t - 1, 0, gate_idx]
-                cumsumlog_vals = []
-                for k in cutlass.range_constexpr(num_vals):
-                    cumsumlog_vals.append(sCumsumlog[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx])
-                decay_scale_vals = []
-                for k in cutlass.range_constexpr(0, num_vals, 2):
-                    d0, d1 = fadd2(last_cumsumlog, last_cumsumlog, -cumsumlog_vals[k], -cumsumlog_vals[k + 1])
-                    decay_scale_vals.append(cute.math.exp2(d0, fastmath=True))
-                    decay_scale_vals.append(cute.math.exp2(d1, fastmath=True))
-                bars.mb_gate_done[gate_idx].arrive()
+                    cp = sCumprod[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx]
+                    cumprod_vals.append(cp if cutlass.const_expr(is_h) else -cp)
 
                 # ---- Y = V - k state (packed 16-bit) ---------------------------------
                 if cutlass.const_expr(is_h):
@@ -948,16 +939,24 @@ def chain_warp_group(
                     mb_k_state_acc_ready[0].wait(k_state_ready_index.phase)
                     k_state_ready_index = advance(k_state_ready_index, 1)
 
+                    k_state_vecs = []
                     for half in cutlass.range_constexpr(row_halves):
                         k_state_vec = nvvm.tcgen05_ld(
                             "16x256b",
                             nvvm.make_tmem_ptr(((tmem_row + half * 16) << 16) + tmem_acc_col, cutlass.Float32),
                             num=8,
                         )
+                        k_state_vecs.append(k_state_vec)
+                    for half in cutlass.range_constexpr(row_halves):
+                        k_state_vec = k_state_vecs[half]
                         for j in cutlass.range_constexpr(16):
                             s0, s1 = fmul2(k_state_vec[2 * j], k_state_vec[2 * j + 1], cumprod_vals[2 * j], cumprod_vals[2 * j + 1])
                             k_state_pack = fp32_to_fp16(s0, s1, dtype=cfg.io_dtype)
-                            v_frag[half][j] = sub_f16x2(v_frag[half][j], k_state_pack, cfg.io_dtype)
+                            if cutlass.const_expr(is_h):
+                                v_frag[half][j] = sub_f16x2(v_frag[half][j], k_state_pack, cfg.io_dtype)
+                            else:
+                                # chain M: V = 0, cumprod_vals hold -cumprod
+                                v_frag[half][j] = k_state_pack
                 for half in cutlass.range_constexpr(row_halves):
                     nvvm.tcgen05_st(
                         "16x128b",
@@ -968,6 +967,18 @@ def chain_warp_group(
                 mb_y_input_ready[0].arrive()
                 if cutlass.const_expr(is_h):
                     bars.mb_v_done[v_idx].arrive()
+
+                # ---- gate decay build, hidden under the U MMA ------------------------
+                last_cumsumlog = sCumsumlog[cfg.b_t - 1, 0, gate_idx]
+                cumsumlog_vals = []
+                for k in cutlass.range_constexpr(num_vals):
+                    cumsumlog_vals.append(sCumsumlog[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx])
+                decay_scale_vals = []
+                for k in cutlass.range_constexpr(0, num_vals, 2):
+                    d0, d1 = fadd2(last_cumsumlog, last_cumsumlog, -cumsumlog_vals[k], -cumsumlog_vals[k + 1])
+                    decay_scale_vals.append(cute.math.exp2(d0, fastmath=True))
+                    decay_scale_vals.append(cute.math.exp2(d1, fastmath=True))
+                bars.mb_gate_done[gate_idx].arrive()
 
                 # ---- U epilogue + decayed-U publish ----------------------------------
                 mb_u_acc_ready[0].wait(u_acc_ready_index.phase)

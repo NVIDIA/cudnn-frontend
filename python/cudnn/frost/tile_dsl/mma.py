@@ -10,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 
 from .swizzle import swizzle_xor_128b, swizzle_lin_128b
+from cutlass._mlir.dialects import llvm
 
 
 @cute.jit
@@ -173,6 +174,101 @@ def desc_opaque(value, anchor=None):
         write_only_types=[type(value)],
         read_only_args=args,
     )
+
+
+@cute.jit
+def desc_halves(desc):
+    """(lo, hi) words of a 64-bit SMEM descriptor, opaque to LLVM: K-step advances stay one 32-bit add on lo."""
+    lo, hi = inline_ptx(
+        "mov.b64 {{$w0}, {$w1}}, {$r0};",
+        write_only_types=[cutlass.Int32, cutlass.Int32],
+        read_only_args=[desc],
+    )
+    return lo, hi
+
+
+@cute.jit
+def desc_from_halves(h, k: int, intra: int, subtile: int, sps: int):
+    """64-bit descriptor of K step k from desc_halves h: k // sps whole subtiles + k % sps intra steps."""
+    return inline_ptx(
+        "mov.b64 {$w0}, {{$r0}, {$r1}};",
+        write_only_types=[cutlass.Int64],
+        read_only_args=[h[0] + ((intra * (k % sps) + subtile * (k // sps)) >> 4), h[1]],
+    )
+
+
+@cute.jit
+def mma_halves(desc, a, b, tmem_c, accumulate, unroll: bool, elect_once: bool = False):
+    """One tcgen05 GEMM with the same MMAs, order and operands as mma_ss / mma_ts, from desc_halves operands.
+
+    A K step adds its offset to the low descriptor word only (one 32-bit add) instead of rebuilding a 64-bit
+    descriptor. a = desc_halves of the A SMEM descriptor, or a TMEM pointer; b = desc_halves of the B descriptor.
+    unroll: True issues the K steps unrolled, False as one runtime loop.
+    """
+    if cutlass.const_expr(elect_once):
+        elected = nvvm.elect_sync()
+    if cutlass.const_expr(not unroll):
+        # runtime loop over the K steps: the low descriptor word (or TMEM address) is carried and advanced per step
+        step_b = desc.smem_advance_B_intra >> 4
+        wrap_b = ((desc.smem_subtile_B - desc.sps_B * desc.smem_advance_B_intra) >> 4) if desc.num_k_steps > desc.sps_B else 0
+        lo_b = b[0] + cutlass.Int32(0)
+        if cutlass.const_expr(isinstance(a, tuple)):
+            step_a = desc.smem_advance_A_intra >> 4
+            wrap_a = ((desc.smem_subtile_A - desc.sps_A * desc.smem_advance_A_intra) >> 4) if desc.num_k_steps > desc.sps_A else 0
+            lo_a = a[0] + cutlass.Int32(0)
+        else:
+            step_a = desc.tmem_advance_A
+            wrap_a = 0
+            lo_a = cutlass.Int32(llvm.ptrtoint(cutlass.Int32.mlir_type, a.ir_value()))
+        for k in cutlass.range(desc.num_k_steps, unroll=1):
+            db = inline_ptx(
+                "mov.b64 {$w0}, {{$r0}, {$r1}};",
+                write_only_types=[cutlass.Int64],
+                read_only_args=[lo_b, b[1]],
+            )
+            if cutlass.const_expr(isinstance(a, tuple)):
+                da = inline_ptx(
+                    "mov.b64 {$w0}, {{$r0}, {$r1}};",
+                    write_only_types=[cutlass.Int64],
+                    read_only_args=[lo_a, a[1]],
+                )
+            else:
+                da = nvvm.make_tmem_ptr(lo_a, cutlass.Int8)
+            if cutlass.const_expr(elect_once):
+                issue_mma = elected
+            else:
+                issue_mma = nvvm.elect_sync()
+            if issue_mma:
+                nvvm.tcgen05_mma(desc.kind, nvvm.CTAGroup.CTA_1, tmem_c, da, db, desc.idesc, (k > 0) | cutlass.Boolean(accumulate))
+            lo_b = lo_b + step_b
+            if cutlass.const_expr(wrap_b != 0):
+                if k % desc.sps_B == desc.sps_B - 1:
+                    lo_b = lo_b + wrap_b
+            lo_a = lo_a + step_a
+            if cutlass.const_expr(wrap_a != 0):
+                if k % desc.sps_A == desc.sps_A - 1:
+                    lo_a = lo_a + wrap_a
+        return
+    for k in cutlass.range_constexpr(desc.num_k_steps):
+        db = desc_from_halves(b, k, desc.smem_advance_B_intra, desc.smem_subtile_B, desc.sps_B)
+        if cutlass.const_expr(isinstance(a, tuple)):
+            da = desc_from_halves(a, k, desc.smem_advance_A_intra, desc.smem_subtile_A, desc.sps_A)
+        else:
+            da = a.subview(k * desc.tmem_advance_A)
+        if cutlass.const_expr(elect_once):
+            issue_mma = elected
+        else:
+            issue_mma = nvvm.elect_sync()
+        if issue_mma:
+            nvvm.tcgen05_mma(
+                desc.kind,
+                nvvm.CTAGroup.CTA_1,
+                tmem_c,
+                da,
+                db,
+                desc.idesc,
+                True if cutlass.const_expr(k > 0) else accumulate,
+            )
 
 
 @cute.jit

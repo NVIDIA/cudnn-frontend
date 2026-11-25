@@ -1074,16 +1074,6 @@ def compute1_warp_group(
                 cumprod_vals = []
                 for k in cutlass.range_constexpr(num_vals):
                     cumprod_vals.append(sCumprod[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx])
-                last_cumsumlog = sCumsumlog[cfg.b_t - 1, 0, gate_idx]
-                cumsumlog_vals = []
-                for k in cutlass.range_constexpr(num_vals):
-                    cumsumlog_vals.append(sCumsumlog[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx])
-                decay_scale_vals = []
-                for k in cutlass.range_constexpr(0, num_vals, 2):
-                    d0, d1 = fadd2(last_cumsumlog, last_cumsumlog, -cumsumlog_vals[k], -cumsumlog_vals[k + 1])
-                    decay_scale_vals.append(cute.math.exp2(d0, fastmath=True))
-                    decay_scale_vals.append(cute.math.exp2(d1, fastmath=True))
-                bars.mb_gate_done[gate_idx].arrive()
 
                 # ---- Y = V - k state (packed 16-bit) ---------------------------------
                 if cutlass.const_expr(cfg.v_is_zero):
@@ -1136,6 +1126,18 @@ def compute1_warp_group(
                     )
                 nvvm.tcgen05_wait("store")
                 bars.mb_y_input_ready[0].arrive()
+
+                # ---- gate decay build, hidden under the U MMA ------------------------
+                last_cumsumlog = sCumsumlog[cfg.b_t - 1, 0, gate_idx]
+                cumsumlog_vals = []
+                for k in cutlass.range_constexpr(num_vals):
+                    cumsumlog_vals.append(sCumsumlog[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx])
+                decay_scale_vals = []
+                for k in cutlass.range_constexpr(0, num_vals, 2):
+                    d0, d1 = fadd2(last_cumsumlog, last_cumsumlog, -cumsumlog_vals[k], -cumsumlog_vals[k + 1])
+                    decay_scale_vals.append(cute.math.exp2(d0, fastmath=True))
+                    decay_scale_vals.append(cute.math.exp2(d1, fastmath=True))
+                bars.mb_gate_done[gate_idx].arrive()
 
                 # ---- U epilogue + decayed-U publish ----------------------------------
                 bars.mb_u_acc_ready[0].wait(u_acc_ready_index.phase)

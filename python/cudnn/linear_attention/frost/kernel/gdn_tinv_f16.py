@@ -253,101 +253,114 @@ def gate_warp(
         t0 = 2 * p
         have_m1 = t0 + cutlass.Int32(1) < n_tiles
         wrap1 = head0 + cutlass.Int32(1) == heads_out.divisor
-        r1 = r0 + cutlass.Int32(1) if wrap1 else r0
-        head1 = cutlass.Int32(0) if wrap1 else head0 + cutlass.Int32(1)
+        r1 = r0 + cutlass.Int32(1) if have_m1 and wrap1 else r0
+        head1 = (cutlass.Int32(0) if wrap1 else head0 + cutlass.Int32(1)) if have_m1 else head0
+        lds = []
+        for member in cutlass.range_constexpr(2):
+            r = r0 if cutlass.const_expr(member == 0) else r1
+            head_idx = head0 if cutlass.const_expr(member == 0) else head1
+            chunk_offset = mRows[r, 2] + mRows[r, 0] * cutlass.Int32(cfg.b_t)
+            member_end = mRows[r, 3]
+
+            # ---- safe-gate per-head parameters: a = -exp(A_log) / ln 2, bias -----
+            if cutlass.const_expr(cfg.safe_gate and mA_log is None):
+                a = opaque_f32_zero() - cutlass.Float32(RCP_LN2)
+            else:
+                a = cutlass.Float32(0.0)
+            bias = cutlass.Float32(0.0)
+            if cutlass.const_expr(cfg.safe_gate and mA_log is not None):
+                a = -cute.math.exp2(mA_log[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
+            if cutlass.const_expr(cfg.safe_gate and mDt_bias is not None):
+                bias = mDt_bias[head_idx].to(cutlass.Float32)
+
+            # ---- Gate load: GMEM -> registers (OOB neutral: 1.0 -> log2 = 0.0) ----
+            tok_lo = chunk_offset + lane_idx
+            tok_hi = tok_lo + cutlass.Int32(cfg.threads_per_warp)
+            pos_valid_lo = tok_lo < member_end
+            pos_valid_hi = tok_hi < member_end
+            if cutlass.const_expr(cfg.expand_num > 1):
+                row_lo = tok_lo // cutlass.Int32(cfg.expand_num)
+                row_hi = tok_hi // cutlass.Int32(cfg.expand_num)
+                gate_valid_lo = pos_valid_lo and (tok_lo - row_lo * cutlass.Int32(cfg.expand_num) == 0)
+                gate_valid_hi = pos_valid_hi and (tok_hi - row_hi * cutlass.Int32(cfg.expand_num) == 0)
+                gate_row_end = member_end // cutlass.Int32(cfg.expand_num)
+                raw_lo = mGate[cutlass.min(row_lo, gate_row_end - 1), head_idx]
+                raw_hi = mGate[cutlass.min(row_hi, gate_row_end - 1), head_idx]
+            else:
+                gate_valid_lo = pos_valid_lo
+                gate_valid_hi = pos_valid_hi
+                raw_lo = mGate[cutlass.min(tok_lo, member_end - 1), head_idx]
+                raw_hi = mGate[cutlass.min(tok_hi, member_end - 1), head_idx]
+
+            # ---- Beta load: GMEM -> registers ------------------------------------
+            beta_rows = [cutlass.min(tok_lo, member_end - 1), cutlass.min(tok_hi, member_end - 1)]
+            if cutlass.const_expr(cfg.beta_slots == 1):
+                raws = [mBeta[row, 0, head_idx] for row in beta_rows]
+            else:
+                beta_toks = [row // cutlass.Int32(cfg.beta_slots) for row in beta_rows]
+                raws = [mBeta[tok, row - tok * cutlass.Int32(cfg.beta_slots), head_idx] for row, tok in zip(beta_rows, beta_toks)]
+            lds.append((a, bias, gate_valid_lo, gate_valid_hi, raw_lo, raw_hi, raws, pos_valid_lo, pos_valid_hi))
+
+        outs = []
+        for member in cutlass.range_constexpr(2):
+            a, bias, gate_valid_lo, gate_valid_hi, raw_lo, raw_hi, raws, pos_valid_lo, pos_valid_hi = lds[member]
+            gate_valid = [gate_valid_lo, gate_valid_hi]
+            gate_vals = [raw_lo.to(cutlass.Float32) if gate_valid_lo else oob_neutral, raw_hi.to(cutlass.Float32) if gate_valid_hi else oob_neutral]
+
+            # ---- Gate transform into the log2 domain -----------------------------
+            if cutlass.const_expr(cfg.safe_gate):
+                for col in cutlass.range_constexpr(0, n_cols, 2):
+                    biased_lo, biased_hi = fadd2(gate_vals[col], gate_vals[col + 1], bias, bias)
+                    sp_lo, sp_hi = softplus2(biased_lo, biased_hi)
+                    contrib_lo, contrib_hi = fmul2(sp_lo, sp_hi, a, a)
+                    gate_vals[col] = contrib_lo if gate_valid[col] else cutlass.Float32(0.0)
+                    gate_vals[col + 1] = contrib_hi if gate_valid[col + 1] else cutlass.Float32(0.0)
+            elif cutlass.const_expr(cfg.log_gate):
+                rcp_ln2 = opaque_f32_zero() + cutlass.Float32(RCP_LN2)
+                for col in cutlass.range_constexpr(0, n_cols, 2):
+                    gate_vals[col], gate_vals[col + 1] = fmul2(gate_vals[col], gate_vals[col + 1], rcp_ln2, rcp_ln2)
+            else:
+                floor = cutlass.Float32(1e-10)
+                for col in cutlass.range_constexpr(0, n_cols, 2):
+                    shifted_lo, shifted_hi = fadd2(gate_vals[col], gate_vals[col + 1], floor, floor)
+                    gate_vals[col] = cute.math.log2(shifted_lo, fastmath=True)
+                    gate_vals[col + 1] = cute.math.log2(shifted_hi, fastmath=True)
+
+            # ---- 64-token cumsum: warp scan, then the column carry ---------------
+            for offset in [1, 2, 4, 8, 16]:
+                for col in cutlass.range_constexpr(n_cols):
+                    n = nvvm.shfl_sync(0xFFFFFFFF, gate_vals[col], offset, 0, kind=nvvm.Shfl.UP)
+                    if lane_idx >= offset:
+                        gate_vals[col] = gate_vals[col] + n
+            for col in cutlass.range_constexpr(1, n_cols):
+                last_v = nvvm.shfl_sync(
+                    0xFFFFFFFF,
+                    gate_vals[col - 1],
+                    cfg.threads_per_warp - 1,
+                    cfg.threads_per_warp - 1,
+                    kind=nvvm.Shfl.IDX,
+                )
+                gate_vals[col] += last_v
+            valids = [pos_valid_lo, pos_valid_hi]
+            betas = []
+            for col in cutlass.range_constexpr(n_cols):
+                beta_value = raws[col].to(cutlass.Float32)
+                if cutlass.const_expr(cfg.beta_sigmoid):
+                    beta_value = (sigmoid(beta_value) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(mBeta.element_type).to(cutlass.Float32)
+                betas.append(beta_value if valids[col] else cutlass.Float32(0.0))
+            outs.append((gate_vals, betas))
+
         bars.mb_gate_done[gate_slot].wait(((j // cutlass.Int32(GS)) & cutlass.Int32(1)) ^ cutlass.Int32(1))
         for member in cutlass.range_constexpr(2):
             member_live = cutlass.Boolean(True) if cutlass.const_expr(member == 0) else have_m1
+            gate_vals, betas = outs[member]
             if member_live:
-                r = r0 if cutlass.const_expr(member == 0) else r1
-                head_idx = head0 if cutlass.const_expr(member == 0) else head1
-                chunk_offset = mRows[r, 2] + mRows[r, 0] * cutlass.Int32(cfg.b_t)
-                member_end = mRows[r, 3]
-
-                # ---- safe-gate per-head parameters: a = -exp(A_log) / ln 2, bias -----
-                if cutlass.const_expr(cfg.safe_gate and mA_log is None):
-                    a = opaque_f32_zero() - cutlass.Float32(RCP_LN2)
-                else:
-                    a = cutlass.Float32(0.0)
-                bias = cutlass.Float32(0.0)
-                if cutlass.const_expr(cfg.safe_gate and mA_log is not None):
-                    a = -cute.math.exp2(mA_log[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
-                if cutlass.const_expr(cfg.safe_gate and mDt_bias is not None):
-                    bias = mDt_bias[head_idx].to(cutlass.Float32)
-
-                # ---- Gate load: GMEM -> registers (OOB neutral: 1.0 -> log2 = 0.0) ----
-                tok_lo = chunk_offset + lane_idx
-                tok_hi = tok_lo + cutlass.Int32(cfg.threads_per_warp)
-                pos_valid_lo = tok_lo < member_end
-                pos_valid_hi = tok_hi < member_end
-                if cutlass.const_expr(cfg.expand_num > 1):
-                    row_lo = tok_lo // cutlass.Int32(cfg.expand_num)
-                    row_hi = tok_hi // cutlass.Int32(cfg.expand_num)
-                    gate_valid_lo = pos_valid_lo and (tok_lo - row_lo * cutlass.Int32(cfg.expand_num) == 0)
-                    gate_valid_hi = pos_valid_hi and (tok_hi - row_hi * cutlass.Int32(cfg.expand_num) == 0)
-                    gate_row_end = member_end // cutlass.Int32(cfg.expand_num)
-                    raw_lo = mGate[cutlass.min(row_lo, gate_row_end - 1), head_idx]
-                    raw_hi = mGate[cutlass.min(row_hi, gate_row_end - 1), head_idx]
-                else:
-                    gate_valid_lo = pos_valid_lo
-                    gate_valid_hi = pos_valid_hi
-                    raw_lo = mGate[cutlass.min(tok_lo, member_end - 1), head_idx]
-                    raw_hi = mGate[cutlass.min(tok_hi, member_end - 1), head_idx]
-                gate_valid = [gate_valid_lo, gate_valid_hi]
-                gate_vals = [raw_lo.to(cutlass.Float32) if gate_valid_lo else oob_neutral, raw_hi.to(cutlass.Float32) if gate_valid_hi else oob_neutral]
-
-                # ---- Gate transform into the log2 domain -----------------------------
-                if cutlass.const_expr(cfg.safe_gate):
-                    for col in cutlass.range_constexpr(0, n_cols, 2):
-                        biased_lo, biased_hi = fadd2(gate_vals[col], gate_vals[col + 1], bias, bias)
-                        sp_lo, sp_hi = softplus2(biased_lo, biased_hi)
-                        contrib_lo, contrib_hi = fmul2(sp_lo, sp_hi, a, a)
-                        gate_vals[col] = contrib_lo if gate_valid[col] else cutlass.Float32(0.0)
-                        gate_vals[col + 1] = contrib_hi if gate_valid[col + 1] else cutlass.Float32(0.0)
-                elif cutlass.const_expr(cfg.log_gate):
-                    rcp_ln2 = opaque_f32_zero() + cutlass.Float32(RCP_LN2)
-                    for col in cutlass.range_constexpr(0, n_cols, 2):
-                        gate_vals[col], gate_vals[col + 1] = fmul2(gate_vals[col], gate_vals[col + 1], rcp_ln2, rcp_ln2)
-                else:
-                    floor = cutlass.Float32(1e-10)
-                    for col in cutlass.range_constexpr(0, n_cols, 2):
-                        shifted_lo, shifted_hi = fadd2(gate_vals[col], gate_vals[col + 1], floor, floor)
-                        gate_vals[col] = cute.math.log2(shifted_lo, fastmath=True)
-                        gate_vals[col + 1] = cute.math.log2(shifted_hi, fastmath=True)
-
-                # ---- 64-token cumsum: warp scan, then the column carry ---------------
-                for offset in [1, 2, 4, 8, 16]:
-                    for col in cutlass.range_constexpr(n_cols):
-                        n = nvvm.shfl_sync(0xFFFFFFFF, gate_vals[col], offset, 0, kind=nvvm.Shfl.UP)
-                        if lane_idx >= offset:
-                            gate_vals[col] = gate_vals[col] + n
-                for col in cutlass.range_constexpr(1, n_cols):
-                    last_v = nvvm.shfl_sync(
-                        0xFFFFFFFF,
-                        gate_vals[col - 1],
-                        cfg.threads_per_warp - 1,
-                        cfg.threads_per_warp - 1,
-                        kind=nvvm.Shfl.IDX,
-                    )
-                    gate_vals[col] += last_v
                 for col in cutlass.range_constexpr(n_cols):
                     pos = lane_idx + col * cfg.threads_per_warp
                     sCumsumlog[pos, 0, member, gate_slot] = gate_vals[col]
-
-                # ---- Beta load: GMEM -> registers ------------------------------------
-                beta_rows = [cutlass.min(tok_lo, member_end - 1), cutlass.min(tok_hi, member_end - 1)]
-                if cutlass.const_expr(cfg.beta_slots == 1):
-                    raws = [mBeta[row, 0, head_idx] for row in beta_rows]
-                else:
-                    beta_toks = [row // cutlass.Int32(cfg.beta_slots) for row in beta_rows]
-                    raws = [mBeta[tok, row - tok * cutlass.Int32(cfg.beta_slots), head_idx] for row, tok in zip(beta_rows, beta_toks)]
-                valids = [pos_valid_lo, pos_valid_hi]
                 for col in cutlass.range_constexpr(n_cols):
                     pos = lane_idx + col * cfg.threads_per_warp
-                    beta_value = raws[col].to(cutlass.Float32)
-                    if cutlass.const_expr(cfg.beta_sigmoid):
-                        beta_value = (sigmoid(beta_value) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(mBeta.element_type).to(cutlass.Float32)
-                    sBeta[pos, 0, member, gate_slot] = beta_value if valids[col] else cutlass.Float32(0.0)
+                    sBeta[pos, 0, member, gate_slot] = betas[col]
         bars.mb_gate_ready[gate_slot].arrive()
         head0 = head0 + pair_heads
         r0 = r0 + pair_rows

@@ -197,6 +197,12 @@ class VariantPack:
         ok, offender = self.native.all_dense_layout()
         return ok, (int(offender) if offender else -1)
 
+    def all_tma_layout(self):
+        """``(ok, slot)`` over every filled operand of rank 3 or more: a 16-byte
+        aligned base and 16-byte-multiple outer strides (TMA's descriptor rule)."""
+        ok, offender = self.native.all_tma_layout()
+        return ok, (int(offender) if offender else -1)
+
     @property
     def index_of_uid(self):
         if self._index_of is None:

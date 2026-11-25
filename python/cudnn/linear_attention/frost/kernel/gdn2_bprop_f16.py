@@ -148,7 +148,7 @@ from cudnn.frost.tile_dsl.barrier import (
     Producer,
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
-from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_step, mma_ts_step
+from cudnn.frost.tile_dsl.mma import desc_halves, mma_halves, mma_step
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_32b
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.pointwise import (
@@ -1218,6 +1218,18 @@ def tcgen05_mma_warp(
     assert cfg.smem_state_stages == 1
     sState_trans[0].desc()
     d_state0 = sState[0].desc()
+    x_do_trans0 = desc_halves(d_do_trans0)
+    x_qd_trans0 = desc_halves(d_qd_trans0)
+    x_kd_trans0 = desc_halves(d_kd_trans0)
+    x_ki_trans0 = desc_halves(d_ki_trans0)
+    x_int0 = desc_halves(d_int0)
+    x_kd0 = desc_halves(d_kd0)
+    x_do0 = desc_halves(d_do0)
+    x_ki0 = desc_halves(d_ki0)
+    x_dstate_trans0 = desc_halves(d_dstate_trans0)
+    x_u0 = desc_halves(d_u0)
+    x_dy0 = desc_halves(d_dy0)
+    x_state0 = desc_halves(d_state0)
     dstate0_index = PipelineState.start(phase=0)
 
     gbase = cutlass.Int32(0)
@@ -1251,22 +1263,27 @@ def tcgen05_mma_warp(
             d_int_da = d_int + 2 * intermediate_slot
             d_int_dm = d_int + 3 * intermediate_slot
             d_int_ndm = d_int + 4 * intermediate_slot
-            d_state = desc_opaque(d_state0)
-            d_dstate_trans = desc_opaque(d_dstate_trans0)
-            d_u = desc_opaque(d_u0)
-            d_dy = desc_opaque(d_dy0)
+            x_do_trans = (x_do_trans0[0] + raw_stage_idx * do_seg, x_do_trans0[1])
+            x_qd_trans = (x_qd_trans0[0] + decay_op_off, x_qd_trans0[1])
+            x_kd_trans = (x_kd_trans0[0] + decay_op_off, x_kd_trans0[1])
+            x_ki_trans = (x_ki_trans0[0] + decay_op_off, x_ki_trans0[1])
+            x_int_lo = x_int0[0] + intermediate_stage * intermediate_seg
+            x_int = (x_int_lo, x_int0[1])
+            x_int_tinv = (x_int_lo + intermediate_slot, x_int0[1])
+            x_int_da = (x_int_lo + 2 * intermediate_slot, x_int0[1])
+            x_int_dm = (x_int_lo + 3 * intermediate_slot, x_int0[1])
+            x_int_ndm = (x_int_lo + 4 * intermediate_slot, x_int0[1])
+            x_kd = (x_kd0[0] + decay_op_off, x_kd0[1])
+            x_ki = (x_ki0[0] + decay_op_off, x_ki0[1])
+            x_do = (x_do0[0] + raw_stage_idx * do_seg, x_do0[1])
             chunk_idx = compute_end - cutlass.Int32(1) - rev_idx
 
             # ---- k state = state(S) @ K decay^T --------------------------------------
             bars.mb_k_decay_inv_ready[decay_stage].wait(decay_phase)
             if chunk_idx >= FIRST_STATE_CHUNK:
                 bars.mb_state_ready[state_index.idx].wait(state_index.phase)
-                mma_ss(
-                    bmm_state_k_decay_desc,
-                    d_state,
-                    d_kd0 + decay_op_off,
-                    nvvm.make_tmem_ptr((tmem_base + cfg.tmem_state_k_acc_offset), cutlass.Float32),
-                    accumulate=False,
+                mma_halves(
+                    bmm_state_k_decay_desc, x_state0, x_kd, nvvm.make_tmem_ptr((tmem_base + cfg.tmem_state_k_acc_offset), cutlass.Float32), False, unroll=False
                 )
                 if elect_one:
                     bars.mb_state_k_acc_ready.arrive(cta_group=1)
@@ -1279,40 +1296,26 @@ def tcgen05_mma_warp(
                 a_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dstate_input_offset), cutlass.Int8)
                 b_desc = d_ki0 + decay_op_off
                 c_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_du_acc_offset), cutlass.Float32)
-                for i in cutlass.range_constexpr(bmm_dstate_k_inv_desc.num_subtiles_B):
-                    for k in cutlass.range_constexpr(bmm_dstate_k_inv_desc.sps_B):
-                        mma_ts_step(
-                            bmm_dstate_k_inv_desc,
-                            a_ptr.subview(i * bmm_dstate_k_inv_desc.sps_B * bmm_dstate_k_inv_desc.tmem_advance_A),
-                            b_desc + i * (bmm_dstate_k_inv_desc.smem_subtile_B >> 4),
-                            c_ptr,
-                            k,
-                            cutlass.Boolean(i + k > 0),
-                        )
+                mma_halves(bmm_dstate_k_inv_desc, a_ptr, x_ki, c_ptr, False, unroll=False)
                 dstate_input_index = advance(dstate_input_index, 1)
 
             # ---- dU intra += dO^T(S) @ A ---------------------------------------------
             bars.mb_do_ready[raw_stage_idx].wait((gc // cfg.smem_raw_stages) % 2)
             bars.mb_a_ready[intermediate_stage].wait(intermediate_phase)
-            mma_ss(
-                bmm_do_a_desc,
-                d_do_trans,
-                d_int,
-                nvvm.make_tmem_ptr((tmem_base + cfg.tmem_du_acc_offset), cutlass.Float32),
-                accumulate=has_dstate,
-            )
+            mma_halves(bmm_do_a_desc, x_do_trans, x_int, nvvm.make_tmem_ptr((tmem_base + cfg.tmem_du_acc_offset), cutlass.Float32), has_dstate, unroll=True)
             if elect_one:
                 bars.mb_du_acc_ready.arrive(cta_group=1)
                 bars.mb_a_done[intermediate_stage].arrive(cta_group=1)
 
             # ---- dstate Q-term += dO^T(S) @ Q decay ----------------------------------
             bars.mb_q_decay_ready[decay_stage].wait(decay_phase)
-            mma_ss(
+            mma_halves(
                 bmm_do_q_decay_desc,
-                d_do_trans,
-                d_qd_trans,
+                x_do_trans,
+                x_qd_trans,
                 nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dstate_acc_offset), cutlass.Float32),
-                accumulate=has_dstate,
+                has_dstate,
+                unroll=True,
             )
 
             # ---- U = Y(T) @ T^-1 -----------------------------------------------------
@@ -1322,16 +1325,7 @@ def tcgen05_mma_warp(
             a_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_y_input_offset), cutlass.Int8)
             b_desc = d_int_tinv
             c_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_u_acc_offset), cutlass.Float32)
-            for i in cutlass.range_constexpr(bmm_y_t_inv_desc.num_subtiles_B):
-                for k in cutlass.range_constexpr(bmm_y_t_inv_desc.sps_B):
-                    mma_ts_step(
-                        bmm_y_t_inv_desc,
-                        a_ptr.subview(i * bmm_y_t_inv_desc.sps_B * bmm_y_t_inv_desc.tmem_advance_A),
-                        b_desc + i * (bmm_y_t_inv_desc.smem_subtile_B >> 4),
-                        c_ptr,
-                        k,
-                        cutlass.Boolean(i + k > 0),
-                    )
+            mma_halves(bmm_y_t_inv_desc, a_ptr, x_int_tinv, c_ptr, False, unroll=True)
             if elect_one:
                 bars.mb_u_acc_ready.arrive(cta_group=1)
 
@@ -1341,16 +1335,7 @@ def tcgen05_mma_warp(
             a_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_du_input_offset), cutlass.Int8)
             b_desc = d_int_tinv
             c_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dy_acc_offset), cutlass.Float32)
-            for i in cutlass.range_constexpr(bmm_du_t_inv_trans_desc.num_subtiles_B):
-                for k in cutlass.range_constexpr(bmm_du_t_inv_trans_desc.sps_B):
-                    mma_ts_step(
-                        bmm_du_t_inv_trans_desc,
-                        a_ptr.subview(i * bmm_du_t_inv_trans_desc.sps_B * bmm_du_t_inv_trans_desc.tmem_advance_A),
-                        b_desc + i * (bmm_du_t_inv_trans_desc.smem_subtile_B >> 4),
-                        c_ptr,
-                        k,
-                        cutlass.Boolean(i + k > 0),
-                    )
+            mma_halves(bmm_du_t_inv_trans_desc, a_ptr, x_int_tinv, c_ptr, False, unroll=True)
             if elect_one:
                 bars.mb_dy_acc_ready.arrive(cta_group=1)
                 bars.mb_t_inv_done[intermediate_stage].arrive(cta_group=1)
@@ -1363,16 +1348,7 @@ def tcgen05_mma_warp(
                 a_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_state_input_offset + (gc % 2) * (cfg.d_v // 2)), cutlass.Int8)
                 b_desc = d_do0 + raw_stage_idx * do_seg
                 c_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dq_acc_offset), cutlass.Float32)
-                for i in cutlass.range_constexpr(bmm_state_do_desc.num_subtiles_B):
-                    for k in cutlass.range_constexpr(bmm_state_do_desc.sps_B):
-                        mma_ts_step(
-                            bmm_state_do_desc,
-                            a_ptr.subview(i * bmm_state_do_desc.sps_B * bmm_state_do_desc.tmem_advance_A),
-                            b_desc + i * (bmm_state_do_desc.smem_subtile_B >> 4),
-                            c_ptr,
-                            k,
-                            cutlass.Boolean(i + k > 0),
-                        )
+                mma_halves(bmm_state_do_desc, a_ptr, x_do, c_ptr, False, unroll=False)
             if elect_one:
                 bars.mb_do_mma_done[raw_stage_idx].arrive(cta_group=1)
 
@@ -1382,12 +1358,13 @@ def tcgen05_mma_warp(
             if has_dstate:
                 bars.mb_dstate_smem_ready.wait(dstate_smem_index.phase)
                 dstate_smem_index = advance(dstate_smem_index, 1)
-                mma_ss(
+                mma_halves(
                     bmm_dstate_u_desc,
-                    d_dstate_trans,
-                    d_u,
+                    x_dstate_trans0,
+                    x_u0,
                     nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dk_restore_acc_offset), cutlass.Float32),
-                    accumulate=False,
+                    False,
+                    unroll=False,
                 )
                 if elect_one:
                     bars.mb_dk_restore_part_acc_ready.arrive(cta_group=1)
@@ -1399,46 +1376,19 @@ def tcgen05_mma_warp(
             a_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_neg_dy_input_offset), cutlass.Int8)
             b_desc = d_kd_trans
             c_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dstate_acc_offset), cutlass.Float32)
-            for i in cutlass.range_constexpr(bmm_dy_k_decay_desc.num_subtiles_B):
-                for k in cutlass.range_constexpr(bmm_dy_k_decay_desc.sps_B):
-                    mma_ts_step(
-                        bmm_dy_k_decay_desc,
-                        a_ptr.subview(i * bmm_dy_k_decay_desc.sps_B * bmm_dy_k_decay_desc.tmem_advance_A),
-                        b_desc + i * (bmm_dy_k_decay_desc.smem_subtile_B >> 4),
-                        c_ptr,
-                        k,
-                        cutlass.Boolean(True),
-                    )
+            mma_halves(bmm_dy_k_decay_desc, a_ptr, x_kd_trans, c_ptr, True, unroll=True)
             if elect_one:
                 bars.mb_dstate_acc_ready.arrive(cta_group=1)
 
             # ---- dK inv part = scale.Q decay^T(S) @ dA -------------------------------
             bars.mb_da_ready[intermediate_stage].wait(intermediate_phase)
-            mma_ss(
-                bmm_q_decay_da_desc,
-                d_qd_trans,
-                d_int_da,
-                nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dk_inv_acc_offset), cutlass.Float32),
-                accumulate=False,
+            mma_halves(
+                bmm_q_decay_da_desc, x_qd_trans, x_int_da, nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dk_inv_acc_offset), cutlass.Float32), False, unroll=True
             )
 
             # ---- dQ attn += K inv^T(S) @ dA^T ----------------------------------------
-            if chunk_idx >= FIRST_STATE_CHUNK:
-                mma_ss(
-                    bmm_k_inv_da_desc,
-                    d_ki_trans,
-                    d_int_da,
-                    nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dq_acc_offset), cutlass.Float32),
-                    accumulate=True,
-                )
-            if chunk_idx < FIRST_STATE_CHUNK:
-                mma_ss(
-                    bmm_k_inv_da_desc,
-                    d_ki_trans,
-                    d_int_da,
-                    nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dq_acc_offset), cutlass.Float32),
-                    accumulate=False,
-                )
+            x_acc = chunk_idx >= FIRST_STATE_CHUNK
+            mma_halves(bmm_k_inv_da_desc, x_ki_trans, x_int_da, nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dq_acc_offset), cutlass.Float32), x_acc, unroll=True)
             if elect_one:
                 bars.mb_dq_acc_ready.arrive(cta_group=1)
                 bars.mb_da_done[intermediate_stage].arrive(cta_group=1)
@@ -1447,51 +1397,25 @@ def tcgen05_mma_warp(
             bars.mb_dy_smem_ready.wait(gc % 2)
             if chunk_idx >= FIRST_STATE_CHUNK:
                 a_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_state_input_offset + (gc % 2) * (cfg.d_v // 2)), cutlass.Int8)
-                b_desc = d_dy
                 c_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dk_decay_acc_offset), cutlass.Float32)
-                for i in cutlass.range_constexpr(bmm_state_dy_desc.num_subtiles_B):
-                    for k in cutlass.range_constexpr(bmm_state_dy_desc.sps_B):
-                        mma_ts_step(
-                            bmm_state_dy_desc,
-                            a_ptr.subview(i * bmm_state_dy_desc.sps_B * bmm_state_dy_desc.tmem_advance_A),
-                            b_desc + i * (bmm_state_dy_desc.smem_subtile_B >> 4),
-                            c_ptr,
-                            k,
-                            cutlass.Boolean(i + k > 0),
-                        )
+                mma_halves(bmm_state_dy_desc, a_ptr, x_dy0, c_ptr, False, unroll=False)
             if elect_one:
                 bars.mb_dy_smem_done.arrive(cta_group=1)
                 bars.mb_state_input_done[gc % 2].arrive(cta_group=1)
 
             # ---- dK inv part += K decay^T(S) @ -dM strict ----------------------------
             bars.mb_dm_ready[intermediate_stage].wait(intermediate_phase)
-            mma_ss(
-                bmm_k_decay_dm_desc,
-                d_kd_trans,
-                d_int_ndm,
-                nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dk_inv_acc_offset), cutlass.Float32),
-                accumulate=True,
+            mma_halves(
+                bmm_k_decay_dm_desc, x_kd_trans, x_int_ndm, nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dk_inv_acc_offset), cutlass.Float32), True, unroll=True
             )
             if elect_one:
                 bars.mb_dk_inv_part_acc_ready.arrive(cta_group=1)
 
             # ---- dK decay part += K inv^T(S) @ dM strict^T ---------------------------
-            if chunk_idx >= FIRST_STATE_CHUNK:
-                mma_ss(
-                    bmm_k_inv_dm_desc,
-                    d_ki_trans,
-                    d_int_dm,
-                    nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dk_decay_acc_offset), cutlass.Float32),
-                    accumulate=True,
-                )
-            if chunk_idx < FIRST_STATE_CHUNK:
-                mma_ss(
-                    bmm_k_inv_dm_desc,
-                    d_ki_trans,
-                    d_int_dm,
-                    nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dk_decay_acc_offset), cutlass.Float32),
-                    accumulate=False,
-                )
+            x_acc = chunk_idx >= FIRST_STATE_CHUNK
+            mma_halves(
+                bmm_k_inv_dm_desc, x_ki_trans, x_int_dm, nvvm.make_tmem_ptr((tmem_base + cfg.tmem_dk_decay_acc_offset), cutlass.Float32), x_acc, unroll=True
+            )
             if elect_one:
                 bars.mb_dk_decay_part_acc_ready.arrive(cta_group=1)
                 bars.mb_dm_done[intermediate_stage].arrive(cta_group=1)

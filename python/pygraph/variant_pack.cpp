@@ -1047,6 +1047,25 @@ class VariantPackNative {
     }
 
     bool
+    all_tma_layout(std::string &offender) const {
+        for (size_t i = 0; i < operands_.size(); i++) {
+            const Operand &operand = operands_[i];
+            if (!operand.filled || operand.ndim < 3) continue;
+            const int64_t bytes = (static_cast<int64_t>(operand.dtype.bits) * operand.dtype.lanes) / 8;
+            if (bytes <= 0 || 16 % bytes != 0) continue;
+            bool aligned = reinterpret_cast<uintptr_t>(operand.data) % 16 == 0;
+            for (int d = 0; aligned && !operand.stride.empty() && d < operand.ndim - 1; d++) {
+                if (operand.shape[d] != 1 && operand.stride[d] % (16 / bytes) != 0) aligned = false;
+            }
+            if (!aligned) {
+                offender = std::to_string(i);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool
     operand_contiguous(size_t index) const {
         const Operand &operand = operands_.at(index);
         if (!operand.filled || operand.stride.empty()) return true;
@@ -1791,9 +1810,15 @@ its parts.
                  bool ok = self.all_contiguous(offender);
                  return py::make_tuple(ok, offender);
              })
-        .def("all_dense_layout", [](const VariantPackNative &self) {
+        .def("all_dense_layout",
+             [](const VariantPackNative &self) {
+                 std::string offender;
+                 bool ok = self.all_dense_layout(offender);
+                 return py::make_tuple(ok, offender);
+             })
+        .def("all_tma_layout", [](const VariantPackNative &self) {
             std::string offender;
-            bool ok = self.all_dense_layout(offender);
+            bool ok = self.all_tma_layout(offender);
             return py::make_tuple(ok, offender);
         });
     init_sdpa_thd_binding(m);

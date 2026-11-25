@@ -1931,18 +1931,40 @@ def cg0_pair(
             chunk_col = (lane_idx % 4) * 2 + g * 8 + b
             kk_cumsumlog_cols.append(sCumsumlog[chunk_col, 0, kk_gate_idx])
 
-    decay_t_kk = []
-    for u in cutlass.range_constexpr(2):
-        for k in cutlass.range_constexpr(num_vals):
-            hi_row = ((k // 2) % 2) == 1
-            chunk_row_u0 = row_u0_hi if cutlass.const_expr(hi_row) else row_u0_lo
-            chunk_row_u1 = row_u1_hi if cutlass.const_expr(hi_row) else row_u1_lo
-            chunk_row = chunk_row_u1 if cutlass.const_expr(u == 1) else chunk_row_u0
-            chunk_col = (lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2)
-            is_lower = chunk_row >= chunk_col
-            kk_row_cumsumlog = kk_cumsumlog_rows[u * 2 + (1 if hi_row else 0)]
-            col = (k // 4) * 2 + (k % 2)
-            decay_t_kk.append(cute.math.exp2(kk_row_cumsumlog - kk_cumsumlog_cols[col], fastmath=True) if is_lower else mask_zero)
+    kk_rows = [row_u0_lo, row_u0_hi, row_u1_lo, row_u1_hi]
+    decay_t_kk = [mask_zero] * (2 * num_vals)
+    if half_row_base == 0:
+        decay_t_kk = []
+        for u in cutlass.range_constexpr(2):
+            for k in cutlass.range_constexpr(num_vals):
+                ri = u * 2 + (k // 2) % 2
+                row0 = u * 16 + ((k // 2) % 2) * 8
+                g = k // 4
+                if cutlass.const_expr(8 * g > row0):
+                    decay_t_kk.append(mask_zero)
+                else:
+                    val = cute.math.exp2(kk_cumsumlog_rows[ri] - kk_cumsumlog_cols[g * 2 + k % 2], fastmath=True)
+                    if cutlass.const_expr(8 * g < row0):
+                        decay_t_kk.append(val)
+                    else:
+                        chunk_col = (lane_idx % 4) * 2 + (g * 8 + k % 2)
+                        decay_t_kk.append(val if chunk_col <= kk_rows[ri] else mask_zero)
+    else:
+        decay_t_kk = []
+        for u in cutlass.range_constexpr(2):
+            for k in cutlass.range_constexpr(num_vals):
+                ri = u * 2 + (k // 2) % 2
+                row0 = 32 + u * 16 + ((k // 2) % 2) * 8
+                g = k // 4
+                if cutlass.const_expr(8 * g > row0):
+                    decay_t_kk.append(mask_zero)
+                else:
+                    val = cute.math.exp2(kk_cumsumlog_rows[ri] - kk_cumsumlog_cols[g * 2 + k % 2], fastmath=True)
+                    if cutlass.const_expr(8 * g < row0):
+                        decay_t_kk.append(val)
+                    else:
+                        chunk_col = (lane_idx % 4) * 2 + (g * 8 + k % 2)
+                        decay_t_kk.append(val if chunk_col <= kk_rows[ri] else mask_zero)
     beta0_idx = beta_index.idx
     bars.mb_beta_ready[beta0_idx].wait(beta_index.phase)
     beta_index = advance(beta_index, cfg.smem_beta_stages)

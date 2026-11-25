@@ -2549,3 +2549,6 @@ def run_warmup_summary_backward(
         *tail_scalars,
         *tail_buffers,
     )
+
+
+frost_gdn_regenerate_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)

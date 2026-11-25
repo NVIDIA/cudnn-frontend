@@ -1217,3 +1217,8 @@ def run_cute(mQ, mK, mV, mG, mB, mCu, mIS, mO, mFS, T, H, D, N, device, stream_p
         fn = cute.compile(kda_launch, *args, N, H, prep_nch, nch, nseg, stream)
         _CACHE[key] = fn
     fn(*args, stream)
+
+
+prep_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=False)
+seg_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=False)
+comb_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=False)

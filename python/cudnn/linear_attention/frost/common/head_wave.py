@@ -90,7 +90,7 @@ def head_wave_items(
     write_wave_items(divisor, b_t, phase, heads_out, cu_pieces, main_rows, dest, count)
 
 
-head_wave_items.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+head_wave_items.set_name_prefix("cudnn", remove_cutlass_symbol=False)
 
 
 @cute.kernel
@@ -130,4 +130,4 @@ def state_wave_items(
         )
 
 
-state_wave_items.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+state_wave_items.set_name_prefix("cudnn", remove_cutlass_symbol=False)

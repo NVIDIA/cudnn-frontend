@@ -1648,6 +1648,9 @@ class Gdn2SummaryFrostEngine(BaseEngine):
             raise NotImplementedError(f"Gdn2SummaryFrostEngine: v head dim must be 64 or 128, got {facts.d_v}")
         if facts.gate_channels != facts.d_qk:
             raise NotImplementedError(f"Gdn2SummaryFrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
+        checkpoint = facts.checkpoint_every_n_tokens
+        if checkpoint and checkpoint % 16 != 0:
+            raise NotImplementedError(f"Gdn2SummaryFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         if facts.beta_guard and not facts.use_qk_l2norm:
             raise NotImplementedError("Gdn2SummaryFrostEngine: beta_guard requires use_qk_l2norm (the sensor is defined on the normalized key)")
         if facts.io_dtype is not None:
