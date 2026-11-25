@@ -1131,6 +1131,7 @@ pytest core/test_determinism_utils.py
 | CSA compressor focused cases | `CSA.csa_compressor_forward_wrapper`, `CSA.csa_compressor_backward_wrapper` | BF16 pooled output, including exact-zero capacity rows | BF16 dKV/dScore, FP32 dAPE |
 | `TestDSA` | `sparse_attention_forward_wrapper`, `sparse_attention_backward_wrapper` | output, max logits, LSE, optional indexer LSE | dQ, dKV, dSink |
 | `TestDSADeterministicDKV` | `sparse_attention_backward_wrapper` dKV layouts (`deterministic_dkv_mode`, SM100/SM103) | output, max logits, LSE (H128 D576: reference inputs) | dQ, dKV, dSink |
+| `TestDSAPackedKV` | `sparse_attention_forward_wrapper` with `kv_format` `mxfp8_528` / `nvfp4_288` (SM100 family) | output, max logits, LSE, optional indexer LSE | — (forward only) |
 | `TestDSAIndexerForward` | `indexer_forward_wrapper` | dense scores | — |
 | `TestDSAIndexerBackward` | `indexer_backward_wrapper`, `dense_indexer_backward_wrapper` | — | dIndexerQ, dWeights, dIndexerK, mutated score buffers |
 | `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | — (no backward API for FP8/MXFP8/NVFP4 inputs) |
@@ -4606,10 +4607,11 @@ Head parameters have explicit IDs such as `q24-kv2`. A failure such as
 direction without a separate lookup table. A test stops at its first mismatch;
 later checks in that case are not claimed as passes.
 
-### DSA: 101 cases
+### DSA: 125 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_determinism.py`:
-56 `TestDSA` cases and 45 `TestDSADeterministicDKV` cases.
+56 `TestDSA` cases, 45 `TestDSADeterministicDKV` cases and 24 `TestDSAPackedKV`
+cases.
 Each `TestDSA` case checks all returned forward tensors. Backward uses deterministic
 execution and checks dQ, the shared K/V latent gradient dKV, and dSink.
 The three `(heads, QK dimension, Top-K)` layouts are `(64,512,64)`,
@@ -4640,6 +4642,27 @@ other sequences receive zero dO. The complete dSink vector is then comparable
 to the target alone. Replay/reference cases also cover nonzero dO for every
 sequence. Empty-row sentinels retain their actual float dtype and raw bits;
 NaNs and non-finite outputs/gradients still fail.
+
+### DSA packed KV forward: 24 cases
+
+`TestDSAPackedKV` runs the forward on a packed KV cache, `kv_format`
+`mxfp8_528` or `nvfp4_288`, with BF16 Q at D_qk 512. Each sequence's cache
+rows are quantized once (`block_scaled_kv_reference.quantize_rows`); packing
+concatenates the rows unchanged and shifts valid Top-K indices as in
+`TestDSA`. The numerical reference reads the widened BF16 pool
+(`widen_rows`). The kernel stages each tile's raw rows in shared memory and
+widens them in place, so these cases pin that path; its stage release is
+also covered by the warm stress in
+`test_DSA_sparse_attention_forward_packed_kv.py`.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | both formats × H64 and H96 (two H64 windows), Top-K 64; eight executions, input mutation check, numerical reference | 4 |
+| `test_batch_invariance` | L0 | Same four combinations; each sequence alone, packed, reversed, and duplicated | 4 |
+| `test_selection` | L0 | both formats × ragged lengths, invalid indices, empty rows, Top-K 65 tail, indexer prefix 512; replay, reference, batch checks | 10 |
+| `test_query_boundary` | L0 | both formats × 257 queries (17 + 240); four replays then batch checks | 2 |
+| `test_neighbor_isolation` | L0 | both formats; change the neighbor's Q, cache rows and Top-K selection while keeping the target fixed | 2 |
+| `test_golden` | L0 | both formats; query lengths 3, 2; Top-K 16; three executions, reference, saved hashes (`dsa-mxfp8_528-fprop`, `dsa-nvfp4_288-fprop`) | 2 |
 
 ### DSA deterministic dKV layouts: 45 cases
 
@@ -5085,6 +5108,32 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest QSA/cutedsl/test_qsa_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py -m L0 -q -rs
+```
+
+## SM100 packed KV sparse attention forward validation: 2026-11-19 (UTC)
+
+Change under test: the SM100 H64 sparse attention forward reads packed
+`mxfp8_528` and `nvfp4_288` KV caches (one query per CTA). `TestDSAPackedKV`
+adds 24 forward cases and the goldens `dsa-mxfp8_528-fprop` and
+`dsa-nvfp4_288-fprop` for key `86bcefdfad455cd7`, recorded into an empty
+directory; a second recording matches them byte for byte. FP16/BF16 kernels
+compile to unchanged PTX. Source: this change on the persistent H64 change
+below. Only the DSA suite was rerun.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| SM100 (cc 10.0, `NVIDIA Graphics Device`), 148 SMs | Torch `2.13.0+cu130`, CUDA `13.0`, driver API `13010`, cuDNN `92700`, CuTe DSL `4.7.0a0` (development build), TVM FFI `0.1.13.post3`; key `86bcefdfad455cd7` | **118 passed, 2 failed, 5 skipped** in 204 s: all 24 packed cases passed, including both packed goldens; five temporary skips; the two BF16 goldens failed with `no golden` (no BF16 baseline for this runtime) |
+
+BF16 `dsa-fprop` and `dsa-bprop` goldens recorded at the parent commit into a
+scratch directory pass a strict check on this change. SM103 and SM107 were not
+run: they have no packed goldens yet (a coverage gap, not a pass).
+
+From `test/python`:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0 -q -rs
 ```
 
 ## SM100 H64 persistent sparse attention forward validation: 2026-11-18 (UTC)

@@ -121,6 +121,7 @@ arbitrary user callbacks.
 | `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_backward_wrapper(return_cli_target=True)` teacher output | bprop auxiliary | FP32 target; FP16/BF16 inputs | Unverified (tests added) | Unsupported | Unsupported |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
+| `DSA.sparse_attention_forward_wrapper` (`kv_format`) | fprop | BF16 Q; packed `mxfp8_528` or `nvfp4_288` KV rows, D_qk 512 | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 or FP32 weights | Unverified | Supported | Supported |
@@ -784,8 +785,11 @@ for replay, batch-invariance, and stress-test results.
   isolation, independent reference checks, and changed-metadata CUDA Graph
   replay. It is a forward-only execution surface; there is no corresponding
   prepared backward API. Other architectures are rejected by contract.
-- DSA sparse attention forward/backward accepts FP16/BF16 inputs. FP8/MXFP8
-  inputs are unsupported on all listed GPUs.
+- DSA sparse attention forward/backward accepts FP16/BF16 inputs. On
+  SM100-family GPUs the forward also reads a packed `mxfp8_528` or `nvfp4_288`
+  KV cache (`kv_format`) with BF16 Q at D_qk 512, except H128 with
+  `indexer_topk` of at most 1024. Other packed formats, per-tensor FP8 KV and
+  a second KV pool are unsupported on all listed GPUs.
 - DSA sparse/dense indexer backward requires BF16 Q/K/weights and supports
   BF16 or FP32 dK. FP8/MXFP8 inputs are unsupported on all listed GPUs.
 - Block-sparse attention blk64: no determinism switch. The rows cover

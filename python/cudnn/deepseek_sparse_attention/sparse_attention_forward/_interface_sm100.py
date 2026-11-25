@@ -19,6 +19,8 @@ from cudnn._torch_stream import as_torch_stream
 
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
+from ._kv_formats import KvFormat
+
 _compile_cache: dict = {}
 _ARCH_FLAGS = {
     (10, 0): "sm_100a",
@@ -97,6 +99,9 @@ _HEAD64_KERNEL_HEADS = 64
 _HEAD64_INDEXER_TOPKS = (0, 512, 1024, 2048)
 # indexer_topk values of the dedicated H128 D512 small-top-k kernel.
 _HEAD128_SMALL_TOPK_INDEXER_TOPKS = (0, 512, 1024)
+# Packed KV formats (``_kv_formats``) the H64 kernel reads directly, with BF16 Q
+# on the gather4 path.
+SERVED_KV_FORMATS = ("mxfp8_528", "nvfp4_288")
 
 
 def _kernel_variant(num_heads: int, head_dim: int, indexer_topk: int = 0) -> str:
@@ -107,12 +112,14 @@ def _kernel_variant(num_heads: int, head_dim: int, indexer_topk: int = 0) -> str
     raise ValueError(f"Unsupported SparseAttentionForward variant H={num_heads}, D_qk={head_dim}")
 
 
-def _make_kernel(variant: str, head_dim: int, indexer_topk: int):
+def _make_kernel(variant: str, head_dim: int, indexer_topk: int, kv_format: Optional[KvFormat] = None):
     """Construct one variant behind a narrow adapter for signature changes."""
     if variant == "head64_regular":
         from .dsa_fwd_sm100_head64 import SparseAttentionForwardSm100Head64
 
-        return SparseAttentionForwardSm100Head64(head_dim=head_dim, indexer_topk=indexer_topk)
+        return SparseAttentionForwardSm100Head64(head_dim=head_dim, indexer_topk=indexer_topk, kv_format=kv_format)
+    if kv_format is not None:
+        raise AssertionError(f"kernel variant {variant} reads no packed KV")
     if variant == "head128_small_topk_prefill":
         from .dsa_fwd_sm100_head128_small_topk import SparseAttentionForwardSm100Head128SmallTopKPrefill
 
@@ -134,12 +141,16 @@ def _compile_kernel(
     softmax_scale: float,
     stream,
     device: torch.device,
+    packed_kv: bool = False,
 ):
-    """Compile both variants through their shared flat-tensor call contract."""
+    """Compile both variants through their shared flat-tensor call contract.
+
+    A packed ``kv`` keeps a runtime row pitch (its rows may be padded).
+    """
     return cute.compile(
         kernel_obj,
         to_cute_tensor(q, divisibility=q.shape[-1]),
-        to_cute_tensor(kv, divisibility=kv.shape[-1]),
+        to_cute_tensor(kv) if packed_kv else to_cute_tensor(kv, divisibility=kv.shape[-1]),
         to_cute_tensor(indices, assumed_align=4),
         to_cute_tensor(out, divisibility=out.shape[-1]),
         to_cute_tensor(max_logits, assumed_align=4),
@@ -257,8 +268,13 @@ def _normalize_and_validate(
     topk_length: Optional[torch.Tensor],
     indexer_topk: int,
     consumer: torch.cuda.Stream,
+    kv_format: Optional[KvFormat] = None,
 ):
-    """Validate and normalize with the caller's launch context already active."""
+    """Validate and normalize with the caller's launch context already active.
+
+    A packed ``kv`` (``kv_format`` set) is the caller's ``uint8`` row view and
+    is never copied: a misaligned base or row pitch raises ``ValueError``.
+    """
     if q.ndim != 3:
         raise ValueError(f"Q must be 3-D (total_S_q, H, D_qk), got {tuple(q.shape)}")
     if kv.ndim != 2:
@@ -268,15 +284,35 @@ def _normalize_and_validate(
     total_s_q, num_heads, head_dim = q.shape
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"Q must be float16 or bfloat16, got {q.dtype}")
-    if kv.dtype != q.dtype:
-        raise ValueError(f"Q and KV must have the same dtype, got {q.dtype} and {kv.dtype}")
     if topk_idxs.dtype != torch.int32:
         raise ValueError(f"topk_idxs must be int32, got {topk_idxs.dtype}")
-    if kv.shape[1] != head_dim:
-        raise ValueError(f"KV head dimension ({kv.shape[1]}) must match Q ({head_dim})")
+    if kv_format is None:
+        if kv.dtype != q.dtype:
+            raise ValueError(f"Q and KV must have the same dtype, got {q.dtype} and {kv.dtype}")
+        if kv.shape[1] != head_dim:
+            raise ValueError(f"KV head dimension ({kv.shape[1]}) must match Q ({head_dim})")
+    else:
+        if kv_format.name not in SERVED_KV_FORMATS:
+            raise NotImplementedError(f"kv_format {kv_format.name!r} is not served on SM100; served: {SERVED_KV_FORMATS}")
+        if head_dim != kv_format.head_dim_qk:
+            raise ValueError(f"kv_format {kv_format.name!r} needs D_qk {kv_format.head_dim_qk}, got {head_dim}")
+        if q.dtype != torch.bfloat16:
+            raise NotImplementedError(f"kv_format {kv_format.name!r} is served with bfloat16 Q, got {q.dtype}")
+        if kv.dtype != torch.uint8 or kv.shape[1] != kv_format.record_bytes:
+            raise ValueError(f"kv_format {kv_format.name!r} needs uint8 KV rows of {kv_format.record_bytes} bytes, got {kv.dtype} {tuple(kv.shape)}")
+        if kv.stride(1) != 1 or kv.stride(0) % 16 or kv.stride(0) < kv_format.record_bytes or kv.data_ptr() % 16:
+            raise ValueError(
+                f"packed KV rows need a 16-byte aligned base and a row pitch that is a multiple of 16 and at least "
+                f"{kv_format.record_bytes} bytes, got base 0x{kv.data_ptr():x} and strides {kv.stride()}"
+            )
     if topk_idxs.shape[0] != total_s_q:
         raise ValueError(f"topk_idxs first dimension ({topk_idxs.shape[0]}) must match Q ({total_s_q})")
     variant = _kernel_variant(num_heads, head_dim, indexer_topk)
+    if kv_format is not None and variant != "head64_regular":
+        raise NotImplementedError(
+            f"kv_format {kv_format.name!r} is not served for H={num_heads}, D_qk={head_dim}, indexer_topk={indexer_topk} "
+            "(the dedicated H128 small-top-k kernel reads typed KV only)"
+        )
     valid_indexer = _HEAD64_INDEXER_TOPKS if variant == "head64_regular" else _HEAD128_SMALL_TOPK_INDEXER_TOPKS
     if indexer_topk not in valid_indexer:
         raise ValueError(f"indexer_topk={indexer_topk} is unsupported for H={num_heads}; expected one of {valid_indexer}")
@@ -305,7 +341,8 @@ def _normalize_and_validate(
     # source storage while a copy is still pending.
     _record_stream(inputs, consumer)
     q = _contiguous_aligned(q, 16)
-    kv = _contiguous_aligned(kv, 16)
+    if kv_format is None:
+        kv = _contiguous_aligned(kv, 16)
     topk_idxs = topk_idxs if topk_idxs.is_contiguous() else topk_idxs.contiguous()
     attn_sink = None if attn_sink is None else _contiguous_aligned(attn_sink, 4)
     topk_length = None if topk_length is None else _contiguous_aligned(topk_length, 4)
@@ -336,8 +373,13 @@ def sparse_attention_forward_sm100(
     lse: Optional[torch.Tensor] = None,
     lse_indexer: Optional[torch.Tensor] = None,
     current_stream=None,
+    kv_format: Optional[KvFormat] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Normalize, compile, and launch one SM100 sparse-prefill variant."""
+    """Normalize, compile, and launch one SM100 sparse-prefill variant.
+
+    ``kv_format`` names the layout of a packed ``kv`` (``SERVED_KV_FORMATS``);
+    ``None`` is a typed ``kv`` of Q's dtype.
+    """
     if q.device.type != "cuda":
         raise ValueError(f"Q must live on CUDA, got {q.device}")
     device = q.device
@@ -353,6 +395,7 @@ def sparse_attention_forward_sm100(
             topk_length,
             int(indexer_topk),
             consumer,
+            kv_format,
         )
         total_s_q, num_heads, head_dim = q.shape
         head_dim_v = 512
@@ -413,16 +456,18 @@ def sparse_attention_forward_sm100(
             attn_sink is not None,
             topk_length is not None,
             int(indexer_topk),
+            None if kv_format is None else kv_format.name,
         )
+        packed_kv = kv_format is not None
         compiled = _compile_cache.get(compile_key)
         if compiled is None:
-            kernel_obj = _make_kernel(variant, head_dim, int(indexer_topk))
+            kernel_obj = _make_kernel(variant, head_dim, int(indexer_topk), kv_format)
             # ``to_cute_tensor`` marks a compact shape, which a head window of
             # a wider tensor is not. Shapes and strides stay runtime-dynamic,
             # so the kernel compiled on compact aliases accepts the windows.
             compile_args = tuple(_compact_alias(tensor) for tensor in _head_window_args(tensors, 0, kernel_heads))
             with torch.cuda.nvtx.range("dsa_sparse_attention_forward_compile"):
-                compiled = _compile_kernel(kernel_obj, *compile_args, scale, current_stream, device)
+                compiled = _compile_kernel(kernel_obj, *compile_args, scale, current_stream, device, packed_kv)
             _compile_cache[compile_key] = compiled
 
         with torch.cuda.nvtx.range("dsa_sparse_attention_forward_kernel"):

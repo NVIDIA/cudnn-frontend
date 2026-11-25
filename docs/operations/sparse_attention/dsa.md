@@ -176,7 +176,7 @@ attention sink participates only in the output denominator, not in any stats.
     MQA); or `float8_e4m3fn` with `descale_kv`; or the `torch.uint8` rows
     of a packed cache named by `kv_format`. See *Quantized KV caches*.
   - `topk_idxs`: `(total_S_q, K)` INT32 global token ids; K may be any
-    nonnegative value. SM100 pads a tail internally; SM90 masks it in place.
+    nonnegative value. SM 100 pads a tail internally; SM90 masks it in place.
   - `attn_sink` (optional): `(H,)` FP32
   - `topk_length` (optional): `(total_S_q,)` INT32, clamped to `[0, K]`
   - `softmax_scale` (optional runtime float): defaults to `1 / sqrt(D_qk)`
@@ -204,8 +204,8 @@ attention sink participates only in the output denominator, not in any stats.
 
   | `kv_format` | `D_qk` | Bytes per token | Row layout (byte offsets) | Value of channel `c` | Served |
   |---|---|---|---|---|---|
-  | `mxfp8_528` | 512 | 528 | `[0, 512)` E4M3 codes; `[512, 528)` one UE8M0 scale per 32 channels | `e4m3(code[c]) * 2^(sf[c/32] - 127)` | not yet |
-  | `nvfp4_288` | 512 | 288 | `[0, 256)` E2M1 codes, channel `2i` in the low nibble of byte `i`; `[256, 288)` one E4M3 scale per 16 channels | `e2m1(code[c]) * e4m3(sf[c/16])` | not yet |
+  | `mxfp8_528` | 512 | 528 | `[0, 512)` E4M3 codes; `[512, 528)` one UE8M0 scale per 32 channels | `e4m3(code[c]) * 2^(sf[c/32] - 127)` | SM100 family |
+  | `nvfp4_288` | 512 | 288 | `[0, 256)` E2M1 codes, channel `2i` in the low nibble of byte `i`; `[256, 288)` one E4M3 scale per 16 channels | `e2m1(code[c]) * e4m3(sf[c/16])` | SM100 family |
   | `fp8_bf16rope_656` | 576 | 656 | `[0, 512)` E4M3 codes of channels `[0, 512)`; `[512, 528)` one FP32 scale per 128 of them; `[528, 656)` channels `[512, 576)` as BF16 | `e4m3(code[c]) * sf[c/128]` for `c < 512`, else the BF16 value | not yet |
   | `nvfp4_fp8rope_352` | 576 | 352 | `[0, 256)` E2M1 codes of channels `[0, 512)`, as in `nvfp4_288`; `[256, 320)` channels `[512, 576)` as unscaled E4M3; `[320, 352)` one E4M3 scale per 16 of channels `[0, 512)`, block `b` at byte `320 + 8 * (b % 4) + b // 4` | `e2m1(code[c]) * e4m3(sf[c/16])` for `c < 512`, else the E4M3 value | not yet |
   | `fp8_528` | 512 | 528 | `fp8_bf16rope_656` without its last 64 channels: `[0, 512)` E4M3 codes; `[512, 528)` one FP32 scale per 128 channels | `e4m3(code[c]) * sf[c/128]` | not yet |
@@ -237,8 +237,16 @@ attention sink participates only in the output denominator, not in any stats.
   )
   ```
 
-  Declaring a quantized pool or a second pool raises `NotImplementedError`
-  until a kernel serves it.
+  A served format is read on SM100-family GPUs with BF16 `q`, by every
+  head count of the H64 kernel: H64, H96, and H128 with
+  `indexer_topk = 2048` (the H128 kernel that serves smaller `indexer_topk`
+  reads a pool of `q`'s dtype only). The kernel widens each gathered row
+  exactly to BF16 before the BF16 MMAs, so a packed plan's outputs equal,
+  byte for byte, the plan's outputs on the widened BF16 pool. The rows are
+  read in place, never copied: a base address or row pitch that is not a
+  multiple of 16 bytes raises `ValueError`. Declaring any other quantized
+  pool, a served format with other `q` dtypes or head counts, or a second
+  pool raises `NotImplementedError` until a kernel serves it.
 - **Outputs** — stable `TupleDict` keys:
   - `out`: `(total_S_q, H, 512)`, with the same dtype as `q`
   - `max_logits`: `(total_S_q, H)` FP32
@@ -1605,8 +1613,10 @@ the option is not available with ``deterministic=True``. Supported on SM100-clas
   compressed-logits + Top-K forward serves SM90 for packed THD, ratio 4, D128,
   and 64Q/1KV; SM100+ retains its broader configurations. The standalone
   Indexer Top-K remains SM90+.
-- **Forward scope** — Prefill only; no FP8 cache, decode, or split-KV forward
-  path. SM90 uses one CTA per query and 64-head tile, padding the last head tile
+- **Forward scope** — Prefill only; no decode or split-KV forward path. Of
+  the quantized KV caches, SM100 reads `mxfp8_528` and `nvfp4_288` (one
+  pool); per-tensor FP8, the other packed formats and a second pool are not
+  served. SM90 uses one CTA per query and 64-head tile, padding the last head tile
   internally when H is not a multiple of 64.
 - **Sparse gather path** — SM90 uses predicated 16-byte `cp.async` gathers,
   matching the Hopper C++ kernel. On SM100, the public CuTe facade does not yet

@@ -48,9 +48,11 @@ class SparseAttentionForward(APIBase):
     of these kinds, with its own token ids (``sample_extra_topk_idxs``, and
     optionally ``sample_extra_topk_length``): every query attends to its
     ``topk_idxs`` slots of ``sample_kv`` and its ``extra_topk_idxs`` slots of
-    ``sample_extra_kv`` under one softmax. No architecture serves an FP8 or
-    packed pool or a second pool yet: declaring one raises
-    ``NotImplementedError``.
+    ``sample_extra_kv`` under one softmax. SM100-family GPUs read a packed
+    ``mxfp8_528`` or ``nvfp4_288`` pool with BF16 Q through the H64 kernel
+    (``_interface_sm100.SERVED_KV_FORMATS``), with the outputs the BF16 plan
+    returns on the widened pool; any other FP8 or packed pool, and a second
+    pool, raise ``NotImplementedError``.
     """
 
     def __init__(
@@ -183,10 +185,9 @@ class SparseAttentionForward(APIBase):
             # compiler target (for example an unmapped SM10x).
             _iface_sm100._gpu_arch_flag(ref_device)
         arch = f"SM{capability[0]}{capability[1]}"
-        self._not_implemented_error_if(
-            kv_fmt is not None,
-            f"SparseAttentionForward does not serve kv_format={self.kv_format!r} on {arch}; pass a (total_S_kv, D_qk) pool of Q's dtype",
-        )
+        if kv_fmt is not None:
+            unserved = self._packed_kv_unserved_reason(kv_fmt, major, num_heads, head_dim)
+            self._not_implemented_error_if(unserved is not None, f"SparseAttentionForward does not serve kv_format={self.kv_format!r} on {arch}: {unserved}")
         self._not_implemented_error_if(
             self.kv_desc.dtype == torch.float8_e4m3fn,
             f"SparseAttentionForward does not serve a per-tensor-scaled FP8 KV pool (descale_kv) on {arch}; pass a (total_S_kv, D_qk) pool of Q's dtype",
@@ -204,6 +205,22 @@ class SparseAttentionForward(APIBase):
         self._device_major = major
         self._is_supported = True
         return True
+
+    def _packed_kv_unserved_reason(self, kv_fmt: KvFormat, major: int, num_heads: int, head_dim: int) -> Optional[str]:
+        """Why no kernel reads the packed pool ``kv_fmt`` for this declaration, or ``None`` when one does."""
+        if major != 10:
+            return "packed pools are served on SM100-family GPUs only; pass a (total_S_kv, D_qk) pool of Q's dtype"
+        if kv_fmt.name not in _iface_sm100.SERVED_KV_FORMATS:
+            return f"the served formats are {_iface_sm100.SERVED_KV_FORMATS}; pass a (total_S_kv, D_qk) pool of Q's dtype"
+        if self.q_desc.dtype != torch.bfloat16:
+            return f"a packed pool is served with bfloat16 Q, got {self.q_desc.dtype}"
+        if _iface_sm100._kernel_variant(num_heads, head_dim, self.indexer_topk) != "head64_regular":
+            return f"H={num_heads}, D_qk={head_dim} with indexer_topk={self.indexer_topk} runs a kernel that reads typed KV only"
+        from ._tma_gather4 import TMA_GATHER4_AVAILABLE
+
+        if not TMA_GATHER4_AVAILABLE:
+            return "the installed CuTe DSL does not expose the TMA descriptor address the packed path's gather4 needs"
+        return None
 
     def _check_kv_storage(self, desc, kv_format: Optional[str], descale_desc, *, name: str, format_arg: str, descale_arg: str) -> Optional[KvFormat]:
         """Check a pool's dtype against its format and descale; return its packed format, or ``None`` for a typed pool.
@@ -394,6 +411,7 @@ class SparseAttentionForward(APIBase):
             lse=lse,
             lse_indexer=lse_indexer,
             current_stream=current_stream,
+            kv_format=None if self.kv_format is None else KV_FORMATS[self.kv_format],
         )
 
 
@@ -431,8 +449,8 @@ def sparse_attention_forward_wrapper(
     ``kv_format`` declares a packed cache and ``descale_kv`` the descale of an
     FP8 ``kv``; ``extra_kv``, ``extra_kv_format``, ``extra_topk_idxs``,
     ``extra_topk_length`` and ``descale_extra_kv`` declare a second pool with
-    its own token ids, as on ``SparseAttentionForward``. No architecture
-    serves these yet.
+    its own token ids, as on ``SparseAttentionForward``, which states what
+    is served.
     """
 
     scale = 1.0 / math.sqrt(q.shape[-1]) if softmax_scale is None else float(softmax_scale)
