@@ -532,4 +532,11 @@ class GroupedGemmWgradBf16API(APIBase):
             scratch = (
                 _workspace if is_torch_tensor(_workspace) and get_shape(_workspace) == (nbytes,) else from_dlpack(view, assumed_align=128, enable_tvm_ffi=True)
             )
+        if is_torch_tensor(a_tensor) and get_shape(a_tensor)[1] == 0:
+            # The kernel takes a K-major operand's token stride as a multiple of 256; restride torch's (1, 1) to the
+            # zero-token compact stride. The views hold no elements.
+            if self.a_major == "k":
+                a_tensor = a_tensor.as_strided(get_shape(a_tensor), (0, 1))
+            if self.b_major == "k":
+                b_tensor = b_tensor.as_strided(get_shape(b_tensor), (1, 0))
         self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, current_stream, scratch)

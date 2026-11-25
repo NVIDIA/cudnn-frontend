@@ -1285,6 +1285,7 @@ def test_wgrad_scheduler_advances_before_producer_tail(kernel):
     assert tails == 1
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("a_major,b_major", [("m", "n"), ("k", "n"), ("m", "k"), ("k", "k")])
 def test_grouped_gemm_wgrad_bf16_infers_zero_token_majors(a_major, b_major):
     """Zero tokens (every expert empty): torch's dense K-major operands have stride (1, 1), which must still infer."""
@@ -1301,3 +1302,55 @@ def test_grouped_gemm_wgrad_bf16_infers_zero_token_majors(a_major, b_major):
 
     assert GroupedGemmWgradBf16API._infer_a_major(desc(a)) == a_major
     assert GroupedGemmWgradBf16API._infer_b_major(desc(b)) == b_major
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("a_major,b_major", [("k", "n"), ("m", "k"), ("k", "k")])
+def test_grouped_gemm_wgrad_bf16_zero_token_k_major(monkeypatch, a_major, b_major):
+    """A plan compiled from zero-token stride (1, 1) K-major operands zeroes dW (eager and replayed), then runs T > 0."""
+    from cudnn.gemm.cutedsl.grouped.wgrad import api as wgrad_api
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
+        pytest.skip("Requires SM100+ for grouped GEMM WGrad BF16 kernel.")
+    monkeypatch.setattr(wgrad_api, "_cache_of_GroupedGemmWgradSm100Objects", {})
+    monkeypatch.setattr(wgrad_api, "_wgrad_wrapper_memo", {})
+    m, n = 256, 256
+    empty = dict(dtype=torch.bfloat16, device="cuda")
+    a = torch.empty((m, 0), **empty) if a_major == "k" else torch.empty((0, m), **empty).t()
+    b = torch.empty((n, 0), **empty).t() if b_major == "k" else torch.empty((0, n), **empty)
+    offsets = torch.zeros(3, dtype=torch.int32, device="cuda")
+    output = torch.full((3, m, n), float("nan"), **empty)
+
+    def run(a, b, offsets, output):
+        cudnn.grouped_gemm_wgrad_wrapper_sm100(
+            a_tensor=a,
+            b_tensor=b,
+            sfa_tensor=None,
+            sfb_tensor=None,
+            offsets_tensor=offsets,
+            wgrad_tensor=output,
+            acc_dtype=torch.float32,
+            wgrad_dtype=torch.bfloat16,
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=(1, 1),
+        )
+
+    run(a, b, offsets, output)
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(output.nan_to_num(1.0)) == 0
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run(a, b, offsets, output)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(output.nan_to_num(1.0)) == 0
+    finally:
+        graph.reset()
+
+    monkeypatch.setattr(wgrad_api.GroupedGemmWgradSm100, "compile", lambda self: pytest.fail("T > 0 must reuse the zero-token plan"))
+    problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=(256, 0, 512), m=m, n=n, a_major=a_major, b_major=b_major)
+    run(problem["a"], problem["b"], problem["offsets"], problem["output"])
+    assert_grouped_gemm_wgrad_bf16_close(problem["output"], grouped_gemm_wgrad_bf16_reference(problem))
