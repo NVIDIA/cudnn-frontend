@@ -1374,16 +1374,10 @@ else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dV_bwd.set_output(True).set_dim(dValue.size()).set_stride(dValue.stride()).set_data_type(cudnn.data_type.BFLOAT16)
-                # The gradients are half precision, so the amax_dQ/dK/dV outputs
-                # carry no information a consumer needs; the FROST MXFP8 backward
-                # engine does not produce them and declines a graph that asks.
-                # Leave them virtual under cudnn_oss (dims are still required by
-                # validate()); the native backend path keeps requesting them.
-                mxfp8_amax_requested = args.sdpa_backend != "cudnn_oss"
+                # amax_dQ/dK/dV stay virtual on every leg, as Transformer Engine builds this graph (the gradients
+                # are half precision); validate() still needs their dims.
                 for _amax_t, _amax_gpu in ((amax_dQ_bwd, amax_dQ_gpu), (amax_dK_bwd, amax_dK_gpu), (amax_dV_bwd, amax_dV_gpu)):
                     _amax_t.set_dim(_amax_gpu.size()).set_stride(_amax_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
-                    if mxfp8_amax_requested:
-                        _amax_t.set_output(True)
             else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride())
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride())
@@ -1503,10 +1497,6 @@ else:
                     dK_bwd: dKey,
                     dV_bwd: dValue,
                 }
-                if mxfp8_amax_requested:
-                    variant_pack_bwd[amax_dQ_bwd] = amax_dQ_gpu
-                    variant_pack_bwd[amax_dK_bwd] = amax_dK_gpu
-                    variant_pack_bwd[amax_dV_bwd] = amax_dV_gpu
                 workspace = torch.empty(
                     max(graph_fwd.get_workspace_size(), graph_bwd.get_workspace_size()),
                     device="cuda",
