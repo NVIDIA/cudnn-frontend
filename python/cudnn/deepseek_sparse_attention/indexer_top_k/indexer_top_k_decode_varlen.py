@@ -536,6 +536,31 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     )
                 work_remaining = has_work
 
+    @cute.kernel
+    def _copy_all_columns(self, input_values, seqlen, output_indices, output_values, starts):
+        """Emit the valid interval and pad the rest when every column fits in K."""
+        row, _, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        end = seqlen[row // self.next_n] - self.next_n + row % self.next_n + 1
+        start = starts[row] if cutlass.const_expr(starts is not None) else 0
+        length = end - start
+        # Large batches no longer need chunking for radix workspace indexing.
+        row64 = cutlass.Int64(row)
+        indices = output_indices[row64, None]
+        if cutlass.const_expr(self.return_val):
+            scores = input_values[row64, None]
+            values = output_values[row64, None]
+        for i in range(tidx, self.top_k, self.num_threads_per_cta):
+            if i < length:
+                col = start + i
+                indices[i] = col
+                if cutlass.const_expr(self.return_val):
+                    values[i] = scores[col]
+            else:
+                indices[i] = -1
+                if cutlass.const_expr(self.return_val):
+                    values[i] = self.dtype(-float("inf"))
+
     @cute.jit
     def __call__(
         self,
@@ -560,39 +585,35 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         if cutlass.const_expr(starts is not None):
             assert not (self.enable_multi_cta or self.merge_blocks or enable_persistent_dynamic_scheduling)
         num_rows = input_values.shape[0]
-        # each cta processes one row of input.
-        if cutlass.const_expr(self.enable_dynamic_multi_cta):
-            blocks = (num_rows, self.num_ctas_per_row, 1)
-        elif cutlass.const_expr(not enable_persistent_dynamic_scheduling):
-            blocks = (num_rows, self.num_ctas_per_row, 1)
+        if cutlass.const_expr(extra_buffer is None):
+            self._copy_all_columns(input_values, seqlen, output_indices, output_values, starts).launch(
+                grid=(num_rows, 1, 1),
+                block=(self.num_threads_per_cta, 1, 1),
+                stream=stream,
+            )
         else:
-            blocks = (min(self.num_sms * min_blocks_per_mp, num_rows), self.num_ctas_per_row, 1)
-
-        (
-            copy_atom,
-            tiled_copy,
-            tiler_mn,
-        ) = self._get_tiled_copy()
-        self.indexer_topk_kernel(
-            input_values,
-            indices,
-            extra_buffer,
-            g_global_counter,
-            seqlen,
-            output_indices,
-            output_values,
-            tiler_mn,
-            copy_atom,
-            tiled_copy,
-            enable_persistent_dynamic_scheduling,
-            min_blocks_per_mp,
-            starts,
-        ).launch(
-            grid=blocks,
-            block=(tiled_copy.size, 1, 1),
-            stream=stream,
-        )
-        return
+            if cutlass.const_expr(enable_persistent_dynamic_scheduling and not self.enable_dynamic_multi_cta):
+                num_rows = min(self.num_sms * min_blocks_per_mp, num_rows)
+            copy_atom, tiled_copy, tiler_mn = self._get_tiled_copy()
+            self.indexer_topk_kernel(
+                input_values,
+                indices,
+                extra_buffer,
+                g_global_counter,
+                seqlen,
+                output_indices,
+                output_values,
+                tiler_mn,
+                copy_atom,
+                tiled_copy,
+                enable_persistent_dynamic_scheduling,
+                min_blocks_per_mp,
+                starts,
+            ).launch(
+                grid=(num_rows, self.num_ctas_per_row, 1),
+                block=(tiled_copy.size, 1, 1),
+                stream=stream,
+            )
 
 
 # Standalone Top-K is qualified on the SM120 family without adding 12.x to the
@@ -682,6 +703,8 @@ def compile_topk_kernel(
     deterministic=False,
     deterministic_ordering="auto",
     has_starts=False,
+    *,
+    no_scratch=False,
 ):
     """The compiled kernel for this plan-time key, from the module cache.
 
@@ -693,6 +716,7 @@ def compile_topk_kernel(
 
     dtype = _torch_to_cutlass_dtype(torch_dtype)
     bucketed_num_cols = _bucket_num_cols(num_cols)
+    assert not no_scratch or num_cols <= top_k
 
     large_occupancy = num_rows > 148
     if torch.cuda.get_device_capability() in _SM120_FAMILY_ARCH:
@@ -726,18 +750,22 @@ def compile_topk_kernel(
         deterministic,
         deterministic_ordering,
         has_starts,
+        # Exact widths in one bucket can fall on either side of top_k.
+        no_scratch,
     )
     if key not in _compile_cache:
         n_rows = cute.sym_int()
         n_cols = cute.sym_int()
         n_batch = cute.sym_int()
         input_fake = cute.runtime.make_fake_compact_tensor(dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=INPUT_ALIGN)
-        buffer_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (cute.sym_int(), cute.sym_int(), cute.sym_int()),
-            stride_order=(2, 1, 0),
-            assumed_align=32,
-        )
+        buffer_fake = None
+        if not no_scratch:
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
         seqlen_fake = cute.runtime.make_fake_compact_tensor(
             cute.Int32,
             (n_batch,),
@@ -806,12 +834,11 @@ def launch_topk_kernel(
 ):
     """Launch on the TVM-FFI environment stream (torch's current stream).
 
-    ``out_indices`` / ``out_values`` and the int32 radix scratch ``buffer`` of shape
-    ``(num_rows, buffer_numbers, num_cols)`` are the caller's (R2); nothing is
-    allocated here.
+    The caller owns the outputs and any int32 radix scratch (R2). ``buffer``
+    has shape ``(num_rows, buffer_numbers, num_cols)`` when scratch is required.
     """
     num_rows, num_cols = input_values.shape
-    elems_per_row = buffer.shape[1] * num_cols
+    elems_per_row = buffer.shape[1] * num_cols if buffer is not None else 0
     int32_max = (1 << 31) - 1
 
     if num_rows * elems_per_row <= int32_max:

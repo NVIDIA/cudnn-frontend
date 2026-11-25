@@ -1327,6 +1327,102 @@ def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, determini
 
 @pytest.mark.L0
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
+@pytest.mark.parametrize("tie_break", [0, 1, 2])
+@pytest.mark.parametrize("return_val", [False, True], ids=["indices", "values"])
+def test_indexer_top_k_zero_scratch(dtype, has_starts, tie_break, return_val, compile_allocates_nothing):
+    """The workspace-free plan copies original values and pads ragged rows."""
+    dsa = _import_dsa()
+    k, next_n = 513, 3
+    width = k - int(has_starts)
+    ends = torch.tensor([0, 2, width, width - 1], device="cuda", dtype=torch.int32)
+    rows = ends.numel() * next_n
+    columns = torch.arange(width, device="cuda")
+    scores = ((columns[None, :] + torch.arange(rows, device="cuda")[:, None]) % 11 - 5).to(dtype)
+    scores[:, 0], scores[:, 1] = -0.0, 0.0
+    starts = torch.tensor([0, 1, 0, 1, 0, 1, 0, 7, 1, width - 2, width, 5], device="cuda", dtype=torch.int32) if has_starts else None
+    op = dsa.IndexerTopK(scores, ends, k, next_n=next_n, return_val=return_val, tie_break=tie_break, deterministic=True, has_starts=has_starts)
+    assert op.check_support()
+    compile_allocates_nothing(op)
+    assert op.scratch_workspace_bytes() == 0
+    indices = torch.empty((rows, k), dtype=torch.int32, device="cuda")
+    values = torch.empty((rows, k), dtype=dtype, device="cuda") if return_val else None
+
+    def execute(out_indices, out_values):
+        op.execute(scores, ends, out_indices=out_indices, out_values=out_values, starts=starts)
+        return {"indices": out_indices, "values": out_values} if return_val else {"indices": out_indices}
+
+    def run():
+        return execute(torch.empty_like(indices), torch.empty_like(values) if return_val else None)
+
+    def reference():
+        expected = {"indices": torch.full_like(indices, -1)}
+        if return_val:
+            expected["values"] = torch.full_like(values, -torch.inf)
+        for row in range(rows):
+            start = int(starts[row]) if has_starts else 0
+            end = int(ends[row // next_n]) - next_n + row % next_n + 1
+            if end > start:
+                expected["indices"][row, : end - start] = columns[start:end]
+                if return_val:
+                    expected["values"][row, : end - start] = scores[row, start:end]
+        return expected
+
+    allowed_inf = {"values": -torch.inf}
+    expected = assert_replays(run, allowed_inf=allowed_inf)
+    assert_bitwise(expected, reference(), "fixed input")
+    if has_starts and return_val and tie_break == 1:
+        assert_golden(
+            f"dsa-indexer-top-k-zero-scratch-{str(dtype).split('.')[-1]}",
+            {"scores": scores, "starts": starts, "ends": ends},
+            expected,
+            allowed_inf=allowed_inf,
+        )
+    for groups in ([2], [3, 2, 2, 0] * 13):
+        order = (torch.tensor(groups, device="cuda")[:, None] * next_n + torch.arange(next_n, device="cuda")).flatten()
+        result = dsa.indexer_top_k_wrapper(
+            scores[order],
+            ends[groups],
+            k,
+            next_n=next_n,
+            return_val=return_val,
+            tie_break=tie_break,
+            deterministic=True,
+            starts=starts[order] if has_starts else None,
+        )
+        assert_bitwise({name: result[name] for name in expected}, {name: tensor[order] for name, tensor in expected.items()}, f"batch {groups}")
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            execute(indices, values)
+        scores.neg_()
+        ends.copy_(ends.flip(0))
+        if has_starts:
+            starts.copy_(starts.flip(0))
+        graph.replay()
+        assert_bitwise({"indices": indices, "values": values} if return_val else {"indices": indices}, reference(), "changed-input replay")
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
+def test_indexer_top_k_zero_scratch_cache_boundary():
+    """Width K and K+1 in the same width bucket require different kernels."""
+    dsa = _import_dsa()
+    k = 513
+    for width in (k, k + 1, k):
+        scores = torch.arange(width, device="cuda", dtype=torch.float32)[None, :]
+        ends = torch.full((1,), width, dtype=torch.int32, device="cuda")
+        plan = dsa.IndexerTopK(scores, ends, k, deterministic=True)
+        assert (plan.scratch_workspace_bytes() == 0) == (width == k)
+        result = dsa.indexer_top_k_wrapper(scores, ends, k, deterministic=True)
+        ids = torch.arange(width - k, width, dtype=torch.int32, device="cuda")[None, :]
+        assert_bitwise({"indices": result["indices"], "values": result["values"]}, {"indices": ids, "values": scores[:, -k:]})
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_indexer_top_k_starts_golden(dtype):
     """Pin cutoff ties and padding for deterministic standalone selection."""
     dsa = _import_dsa()

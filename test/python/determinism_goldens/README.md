@@ -4844,7 +4844,30 @@ The same command above on B300 reported 200 passed, 9 SM120/121 skips
 and 6 deselected. All three golden files matched, and the refill stress
 observed zero differences in 128 warm and 128 poisoned launches. The B300
 pooled selector regression reported 17 passed and 95 deselected. This
-revision was unverified on SM90 because the GPU session was unavailable.
+revision was initially unverified on SM90 because the GPU session was
+unavailable.
+
+The same revision (`82dc9325`) subsequently reported 200 passed, 9 SM120/121
+skips and 6 deselected on H20-3e (cc 9.0, 78 SMs) with PyTorch 2.12.1
+cu130, cuDNN 9.19.0, and CuTe DSL 4.8.0 (CUDA 13.4 compiler).
+The three H20 golden input and output hashes agree with both `ceab650c`
+on H20 and the previously recorded L20X and B300 results. The refill
+stress observed zero differences in 128 warm and 128 poisoned launches.
+
+The zero-scratch path for `num_cols <= top_k` adds 37 L0 cases. They
+cover FP32, FP16 and BF16, all three tie policies, with and without
+`starts`, indices-only and indices with values, and widths on both sides
+of K. They check raw bytes against an independent interval copy, replay
+with fresh outputs under concurrent work, batch isolation and duplication
+across the occupancy threshold, and CUDA Graph replay after changing the
+scores and bounds. Three golden cases per GPU pin output values and
+indices for the new path.
+
+On H20-3e and B300 (cc 10.3, 148 SMs) with the same PyTorch, cuDNN and
+DSL versions, the L0/L1 command above reported 237 passed,
+9 SM120/121 skips and 6 deselected on each device. The B300 pooled DSA
+regression reported 17 passed. The zero-scratch path is unverified on
+cc 10.0, cc 10.7 and SM12x.
 
 ### DSA BF16 indexer: 46 cases
 
