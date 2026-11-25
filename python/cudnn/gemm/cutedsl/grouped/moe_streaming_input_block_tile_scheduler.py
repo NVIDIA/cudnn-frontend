@@ -691,9 +691,12 @@ class StreamingInputSignalMixin:
         use_pdl: bool = False,
         launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
+        cluster_barrier_at_exit: bool = False,
     ) -> None:
         """Check and keep the options.  ``unmet_requirement``: what this kernel configuration lacks for a producer (for
-        example "dense weights"), or None."""
+        example "dense weights"), or None.  ``cluster_barrier_at_exit``: the kernel has no 2-CTA MMA and every CTA passes
+        a cluster barrier before it exits (the SM90 kernels), so a peer's last arrive always lands; a producer then needs
+        cluster (2, 1)."""
         self.streaming_signal_capacity = streaming_signal_capacity
         self.use_streaming_signal_sched = streaming_signal_capacity is not None
         if self.use_streaming_signal_sched and not use_dynamic_sched:
@@ -704,7 +707,10 @@ class StreamingInputSignalMixin:
             raise ValueError("device_layout requires streaming_signal_capacity")
         if launch_pdl_dependents_at_all_streaming_signal_slots_ready and not self.use_streaming_signal_sched:
             raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
-        if self.use_streaming_signal_sched:
+        if self.use_streaming_signal_sched and cluster_barrier_at_exit:
+            if tuple(cluster_shape_mn) != (2, 1):
+                raise ValueError(f"streaming_signal_capacity requires cluster_shape_mn=(2, 1) on this kernel, got {tuple(cluster_shape_mn)}")
+        elif self.use_streaming_signal_sched:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
         self.device_layout = device_layout
         self.use_pdl = use_pdl

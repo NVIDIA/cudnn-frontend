@@ -18,6 +18,8 @@ Kernels:
   (`quant/grouped_gemm_quant.py`, FC2 forward) in the output direction (section 4b).
 - dGLU backward on SM100, input direction (section 4a): `MoEGroupedGemmDgluDbiasBf16Kernel` (BF16) and
   `BlockScaledMoEGroupedGemmDgluDbiasKernel` (MXFP8).
+- BF16 on SM90 (Hopper), input direction (section 4c): `MoEGroupedGemmBf16KernelSm90` (`unfused/`),
+  `MoEGroupedGemmGluBf16KernelSm90` (`glu/`) and `MoEGroupedGemmDgluBf16KernelSm90` (`dglu/`).
 
 The Rubin (SM107) twins of the block-scaled and dGLU kernels take the same options in a later change. Both directions need
 `use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is the same as without this
@@ -254,6 +256,19 @@ holds unchanged, with these limits:
 | inputs | Unchanged: E4M3 / E2M1 codes with SF atoms, read in full before any chunk is published. |
 | other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`. |
 
+### 4c. SM90 (Hopper) BF16 kernels, input direction
+
+The SM90 plain, GLU and dGLU kernels take the input direction with sections 1 and 2 unchanged (the dGLU without
+`device_layout`, as on SM100):
+
+| Item | Contract |
+|---|---|
+| options | `streaming_signal_capacity`, `use_pdl` and `launch_pdl_dependents_at_entry`; the plain and GLU kernels also `device_layout`. There is no all-slots-ready trigger. |
+| M tile t | A rows `[256 t, 256 (t + 1))`: the two CTA tiles (M 128) of a (2, 1) cluster, which multicasts B. |
+| schedules | Cooperative (both MMA warp groups on one tile) and pingpong (128x192 tile, each warp group on alternate tiles of the scheduler's sequence) for the plain and GLU kernels; the dGLU is cooperative. |
+| GEMM | The scheduler warp's claim acquires `signal[t]`; the TMA warp issues `fence.proxy.async.global` before each tile's loads. Every CTA passes a cluster barrier before it exits. |
+| other | Dense weights, `padded_offsets` in global memory, `use_dynamic_sched=True`. |
+
 ## 5. Programmatic dependent launch (PDL) options
 
 | Option | Effect | Use |
@@ -312,8 +327,8 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 
 ## 7. Constraints
 
-- Cluster shapes: the input direction (`streaming_signal_capacity`) supports only (2, 1) with the 2-CTA MMA; a (1, 1)
-  cluster is **not supported** (the scheduler broadcasts each claim into a peer CTA's shared memory and asserts at
+- Cluster shapes: the input direction (`streaming_signal_capacity`) supports only (2, 1) with the 2-CTA MMA (on SM90,
+  (2, 1) with CTA tile M 128); a (1, 1) cluster is **not supported** (the scheduler broadcasts each claim into a peer CTA's shared memory and asserts at
   least two CTAs). `N_CHUNK` supports (2, 1) with the 2-CTA MMA and (1, 1) with the 1-CTA MMA. Other shapes raise
   `ValueError`, because a CTA could exit while a peer still arrives on its shared memory.
 - `streaming_signal_capacity` and `N_CHUNK` cannot be combined in one kernel; both need `use_dynamic_sched=True`.
@@ -322,7 +337,8 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
   exists on the GLU kernels only and requires `streaming_signal_capacity`.
 - Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3); on SM100 the input direction on the
   block-scaled GLU forward kernel and the BF16 and MXFP8 dGLU kernels (section 4a), and `N_CHUNK` on the block-scaled
-  quant forward kernel with BF16 D (section 4b). The Rubin (SM107) kernels and other recipes are not wired up yet.
+  quant forward kernel with BF16 D (section 4b); on SM90 the input direction on the BF16 plain, GLU and dGLU kernels
+  (section 4c). The Rubin (SM107) kernels and other recipes are not wired up yet.
 
 ## Acknowledgements
 

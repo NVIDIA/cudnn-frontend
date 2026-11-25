@@ -36,6 +36,8 @@ class MoEGroupedGemmGluBf16KernelSm90(MoEGroupedGemmBf16KernelSm90):
         two TMA boxes into the stage's halves and pairs accumulator column j with j + N_tile/2; C stores go to the
         branch's columns. The math per output element is the same as interleaved_32's.
     :param pingpong: The pingpong warp-group schedule (see the base kernel).
+    :param streaming_signal_capacity, device_layout, use_pdl, launch_pdl_dependents_at_entry: a streaming input producer
+        of A (see the base kernel).
     """
 
     def __init__(
@@ -53,6 +55,10 @@ class MoEGroupedGemmGluBf16KernelSm90(MoEGroupedGemmBf16KernelSm90):
         act_func: str = "swiglu",
         glu_layout: str = "interleaved_32",
         pingpong: bool = False,
+        streaming_signal_capacity: Optional[int] = None,
+        device_layout: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         if act_func not in ("swiglu", "geglu"):
             raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {act_func!r}")
@@ -70,6 +76,10 @@ class MoEGroupedGemmGluBf16KernelSm90(MoEGroupedGemmBf16KernelSm90):
             use_dynamic_sched,
             act_func=act_func,
             pingpong=pingpong,
+            streaming_signal_capacity=streaming_signal_capacity,
+            device_layout=device_layout,
+            use_pdl=use_pdl,
+            launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
         )
         self.glu_layout = glu_layout
         self.gate_then_up = glu_layout == "gate_then_up"

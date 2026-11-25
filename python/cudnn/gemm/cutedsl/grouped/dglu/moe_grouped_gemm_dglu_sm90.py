@@ -14,6 +14,7 @@ columns [0, N) then up columns [N, 2 N) (``glu_layout="gate_then_up"``, N a mult
 Supports:
     - Dynamic persistent tile scheduling only, dense K- or N-major weights
     - No dbias and no activation output
+    - A streaming input producer of A = dY (streaming_signal_capacity; docs/operations/moe/streaming_signal_contract.md)
 """
 
 from typing import Type, Tuple, Union, Optional
@@ -38,11 +39,12 @@ from ..glu_layout import validate_glu_layout
 from ..moe_utils import MoEWeightMode, compute_expert_token_range, rewrite_tensor_shape
 from ..moe_sched_extension import ContiguousGroupedGemmSchedExtension
 from ..moe_kernel_helpers import atomic_add_float32, compute_grid, fmax, fmin, sigmoid_f32
+from ..moe_streaming_input_block_tile_scheduler import MoEInputBlockSignalSchedulerParams, StreamingInputSignalMixin
 from ..unfused.moe_grouped_gemm_sm90 import _widen_for_cluster, check_register_split
 from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
 
-class MoEGroupedGemmDgluBf16KernelSm90:
+class MoEGroupedGemmDgluBf16KernelSm90(StreamingInputSignalMixin):
     """BF16 grouped GEMM with a fused dGLU for Hopper; takes the SM100 dGLU kernel's arguments.
 
     Reads C (gate | up) through a C-load warp and writes D (dgate | dup) and dprob. WGMMA accumulates
@@ -51,6 +53,8 @@ class MoEGroupedGemmDgluBf16KernelSm90:
     :param mma_tiler_mn: CTA tile shape; M is 128 (two MMA warp groups), N 128 or 256.
     :param act_func: "dswiglu" or "dgeglu".
     :param round_dgrad_to_input_dtype: Round the scaled dgrad to the A/B dtype before the activation.
+    :param streaming_signal_capacity, use_pdl, launch_pdl_dependents_at_entry: a streaming input producer of A (the
+        dispatched output gradient), cluster (2, 1); see docs/operations/moe/streaming_signal_contract.md (sections 4a, 4c).
     """
 
     FIX_PAD_SIZE = 256
@@ -115,6 +119,9 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         round_dgrad_to_input_dtype: bool = False,
         glu_layout: str = "interleaved_32",
         deterministic: bool = False,
+        streaming_signal_capacity: Optional[int] = None,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % (mma_tile_m * cluster_shape_mn[0]) != 0:
@@ -136,6 +143,15 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         if act_func not in ("dswiglu", "dgeglu"):
             raise ValueError(f"act_func must be 'dswiglu' or 'dgeglu', got {act_func!r}")
         validate_glu_layout(glu_layout)
+        self.init_streaming_input_signal(
+            streaming_signal_capacity,
+            use_dynamic_sched=use_dynamic_sched,
+            use_2cta_instrs=False,
+            cluster_shape_mn=cluster_shape_mn,
+            use_pdl=use_pdl,
+            launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
+            cluster_barrier_at_exit=True,
+        )
         self.act_func = act_func
         self.geglu_alpha = geglu_alpha
         self.glu_clamp_max = glu_clamp_max
@@ -338,7 +354,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         return 0
 
     def get_workspace_bytes(self) -> int:
-        return 4
+        return 4 + self.streaming_input_workspace_bytes()
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):
@@ -477,18 +493,13 @@ class MoEGroupedGemmDgluBf16KernelSm90:
             tma_tensor_c = _widen_for_cluster(tma_tensor_c, 1, self.mma_tiler_d[1], cluster_n)
             tma_tensor_d = _widen_for_cluster(tma_tensor_d, 1, self.mma_tiler_d[1], cluster_n)
 
-        # ---- Helper kernel: dynamic scheduler counter reset ----
-        self.helper_kernel(workspace_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream, min_blocks_per_mp=1)
+        # ---- Helper kernel: dynamic scheduler counter reset (the signal scheduler's caller resets it with signal[]) ----
+        if cutlass.const_expr(not self.use_streaming_signal_sched):
+            self.helper_kernel(workspace_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream, min_blocks_per_mp=1)
 
         # ---- Grid computation via MoE scheduler ----
         b_n, b_k, b_l = cute.shape(b)
-        sched_params = MoESchedulerParams(
-            scenario="2Dx3D",
-            expert_shape=(self.expert_cnt, b_n, b_k),
-            cta_tile_shape_mnk=self.cta_tile_shape_mnk,
-            cluster_shape_mn=self.cluster_shape_mn,
-            use_dynamic_sched=True,
-        )
+        sched_params = self.make_streaming_input_sched_params((self.expert_cnt, b_n, b_k), self.cta_tile_shape_mnk, self.cluster_shape_mn, True)
         self.sched_params, grid = compute_grid(sched_params, max_active_clusters, False)
         self.buffer_align_bytes = 1024
 
@@ -553,6 +564,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -693,13 +705,14 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         d_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cutlass.Constexpr,
-        sched_params: MoESchedulerParams,
+        sched_params: Union[MoESchedulerParams, MoEInputBlockSignalSchedulerParams],
         rz_arg: cutlass.Int32,
     ):
         # The release-zero argument of tile_dsl.consume: the host passes 0; its only use is this call.
         rz = release_zero(rz_arg)
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        self.streaming_input_entry()
 
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -756,14 +769,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         )
 
         # ---- Scheduler ----
-        scheduler = MoEPersistentTileScheduler.create(
-            sched_params,
-            padded_offsets,
-            cute.arch.block_idx(),
-            cute.arch.grid_dim(),
-            counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
-            sched_storage=sched_storage,
-        )
+        scheduler = self.create_streaming_input_scheduler(sched_params, padded_offsets, self._get_sched_counter_ptr(workspace_ptr), sched_storage, rz)
         scheduler.internal_init()
 
         if cute.size(self.cluster_shape_mn) > 1:
@@ -958,6 +964,9 @@ class MoEGroupedGemmDgluBf16KernelSm90:
                 mma_tile_coord_n = work_tile_info.tile_n_idx
                 tAgA_slice = tAgA[(None, mma_tile_coord_m, None, 0)]
                 tBgB_slice = tBgB[(None, mma_tile_coord_n, None, 0)]
+
+                # The producer wrote A through the generic proxy: order it before this tile's TMA loads.
+                self.streaming_input_tile_fence()
 
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
@@ -1207,10 +1216,12 @@ class MoEGroupedGemmDgluBf16KernelSm90:
             d_pipeline.producer_tail()
 
         # Cluster-exit barrier from ALL threads: a non-leader CTA's last claim arrives on the leader's mbarrier, which
-        # could already be gone ("Cluster target block not present"). SM100 gets this from its TMEM dealloc handshake.
-        if cutlass.const_expr(self.cluster_shape_mn[0] * self.cluster_shape_mn[1] > 1):
+        # could already be gone ("Cluster target block not present"). SM100 gets this from its TMEM dealloc handshake.  The
+        # signal scheduler's exit is the same barrier.
+        if cutlass.const_expr(self.cluster_shape_mn[0] * self.cluster_shape_mn[1] > 1 and not self.use_streaming_signal_sched):
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
+        self.streaming_input_exit(scheduler)
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
