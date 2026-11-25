@@ -775,6 +775,7 @@ class MoEPersistentTileScheduler:
             self._current_work_linear_idx = self._fetch_next_cluster_idx(loc=loc, ip=ip)
             work_tile_info = self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
             self._release_cluster_idx(loc=loc, ip=ip)
+            self._wait_last_cluster_release(work_tile_info, loc=loc, ip=ip)
             return work_tile_info
         return self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
 
@@ -788,6 +789,7 @@ class MoEPersistentTileScheduler:
             self._current_work_linear_idx = self._fetch_next_cluster_idx(loc=loc, ip=ip)
             work_tile_info = self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
             self._release_cluster_idx(loc=loc, ip=ip)
+            self._wait_last_cluster_release(work_tile_info, loc=loc, ip=ip)
             return work_tile_info
         else:
             self._current_work_linear_idx += self.num_persistent_clusters
@@ -916,6 +918,21 @@ class MoEPersistentTileScheduler:
             ds = self._dynamic_state
             self._cluster_consumer_release(loc=loc, ip=ip)
             ds.consumer_state.advance()
+
+    @dsl_user_op
+    @cute.jit
+    def _wait_last_cluster_release(self, work_tile_info: MoEWorkTileInfo, *, loc=None, ip=None) -> None:
+        """After the last (invalid) claim, hold the leader CTA until every CTA of the cluster has released it.
+
+        Each CTA releases a claim with a remote arrive on the leader's empty barrier.  No producer_acquire follows
+        the last claim, so without this wait the leader can exit first and a peer's arrive targets the shared memory
+        of an exited CTA.
+        """
+        if const_expr(self.cluster_shape_mn[0] * self.cluster_shape_mn[1] > 1):
+            ds = self._dynamic_state
+            if ds.is_leader_cta:
+                if work_tile_info.expert_idx < Int32(0):
+                    self.cluster_pipeline.producer_acquire(ds.producer_state, loc=loc, ip=ip)
 
     @dsl_user_op
     @cute.jit
