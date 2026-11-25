@@ -4797,7 +4797,7 @@ SM107 and SM12x interval coverage remains unverified.
 
 The interval and radix-spill optimizations on baseline `0e6176e1` were checked
 with CUDA 13.0 PyTorch 2.12.1, cuDNN backend 9.19.0, and CuTe DSL 4.8.0
-(CUDA 13.4 compiler) on NVIDIA L20X reporting cc 9.0 and B300 reporting cc 10.3.
+(CUDA 13.4 compiler) on NVIDIA H200 reporting cc 9.0 and B300 reporting cc 10.3.
 The wide FP32 interval test checks bitwise replay, reordered and duplicated
 rows across the occupancy boundary, and isolation from changed neighbor rows.
 The BF16 mixed-interval test covers both sides of the bitmap capacity. The
@@ -4851,7 +4851,7 @@ The same revision (`86828dd5`) subsequently reported 200 passed, 9 SM120/121
 skips and 6 deselected on H20-3e (cc 9.0, 78 SMs) with PyTorch 2.12.1
 cu130, cuDNN 9.19.0, and CuTe DSL 4.8.0 (CUDA 13.4 compiler).
 The three H20 golden input and output hashes agree with both `f32cc458`
-on H20 and the previously recorded L20X and B300 results. The refill
+on H20 and the previously recorded H200 and B300 results. The refill
 stress observed zero differences in 128 warm and 128 poisoned launches.
 
 The zero-scratch path for `num_cols <= top_k` adds 37 L0 cases. They
@@ -4883,14 +4883,14 @@ SM120/121 skips and 6 deselected. Refill stress observed zero differences
 in 128 warm and 128 poisoned launches.
 
 With the bindings built from `bd250511`, the same L0/L1 command reported
-243 passed, 9 SM120/121 skips and 6 deselected on L20X (cc 9.0, 132 SMs)
+243 passed, 9 SM120/121 skips and 6 deselected on H200 (cc 9.0, 132 SMs)
 and B300 (cc 10.3, 148 SMs). Both runs used PyTorch 2.12.1 cu130,
 cuDNN 9.19.0 and CuTe DSL 4.8.0 (CUDA 13.4 compiler). Each GPU passed
 the seven golden comparisons and had zero differences in 128 warm and
 128 poisoned refill launches. All seven input and output hashes agree
-across L20X, B300 and H20-3e.
+across H200, B300 and H20-3e.
 
-Compute Sanitizer memcheck on L20X and B300 reported zero errors in 19
+Compute Sanitizer memcheck on H200 and B300 reported zero errors in 19
 cases per GPU with the standard PyTorch allocator and cuDNN 9.20.0.
 The selected cases used
 `-k "coarse_bin_refinement or zero_scratch_cache_boundary or spilled_candidate_planes"`.
@@ -4903,9 +4903,23 @@ set spilled before entering the reuse path. The L0 spill suite adds six
 indices-only cases and includes a full-width row whose cutoff candidates
 fit in shared memory alongside rows that spill. The independent interval
 reference checks selection in either bounds mode for each tie policy.
-L20X and B300 each reported 249 passed, 9 SM120/121 skips and 6
+H200 and B300 each reported 249 passed, 9 SM120/121 skips and 6
 deselected with the same L0/L1 command and binding build. Memcheck
 reported zero errors in all 18 spill and shared-candidate cases per GPU.
+
+The repository benchmark follow-up gates spill-buffer reuse at compile time
+and reuses the aligned vector-load predicate during deterministic radix
+selection. An added FP32 L0 case checks exact values, canonical indices
+and gather consistency at 16 rows, 131,072 columns and K=2048. The L0/L1
+command above reported 250 passed, 9 SM120/121 skips and 6 deselected
+on both H200 (cc 9.0) and B300 (cc 10.3). Both runs used PyTorch 2.12.1
+cu130, cuDNN 9.19.0, CuTe DSL 4.8.0 with the CUDA 13.4 compiler, and
+bindings from `bd250511`. All seven checked goldens per GPU matched.
+Refill stress observed zero differences in 128 warm and 128 poisoned
+launches per GPU. Compute Sanitizer memcheck reported 15 passed and zero
+errors per GPU with the native PyTorch allocator and
+`-n0 -o addopts= -m L0 -k "deterministic_random_exact or starts_bf16_mixed_interval_widths or ignores_vector_padding"`.
+The updated kernel remains unverified on cc 10.0, cc 10.7 and SM12x.
 
 ### DSA BF16 indexer: 46 cases
 

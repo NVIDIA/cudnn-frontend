@@ -803,18 +803,15 @@ def compile_topk_kernel(
         )
 
         min_blocks_per_mp = 1
-        if (
-            capability == (9, 0)
-            and large_occupancy
-            and dtype == cutlass.Float32
-            and top_k == 2048
-            and bucketed_num_cols >= 131072
-            and tie_break != 0
-            and not deterministic
-            and not return_val
-        ):
-            # Keep three resident CTAs when directed tie selection increases register pressure.
-            min_blocks_per_mp = 3
+        if large_occupancy and dtype == cutlass.Float32 and tie_break != 0 and not deterministic and not return_val:
+            # Preserve CTA residency for directed tie selection.
+            if capability == (9, 0) and top_k == 2048 and bucketed_num_cols >= 131072:
+                min_blocks_per_mp = 3
+            if not has_starts and (
+                (capability in ((9, 0), (10, 3)) and top_k == 1024 and bucketed_num_cols == 131072)
+                or (capability == (9, 0) and top_k == 2048 and bucketed_num_cols == 8192)
+            ):
+                min_blocks_per_mp = 4
 
         # Compile the kernel
         compiled_kernel = cute.compile(

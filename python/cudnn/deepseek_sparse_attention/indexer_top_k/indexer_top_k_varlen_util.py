@@ -1020,9 +1020,13 @@ class IndexerTopKKernelVarlen:
                     self._fill_oob(tXrX, tXpX_tile[None, None, None], -tXrX.element_type.inf)
                 cur_tXcX = tXcX[None, None, None, tile_idx]
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
-                    relative_idx = cutlass.Int32(cur_tXcX[i // vec_size][1] + i % vec_size)
-                    # Predicated lanes may retain register values from the previous tile.
-                    if relative_idx < aligned_size:
+                    if cutlass.const_expr(self.deterministic):
+                        # The aligned interior contains only complete vectors.
+                        in_bounds = tXpX_tile[i // vec_size, 0, 0]
+                    else:
+                        relative_idx = cutlass.Int32(cur_tXcX[i // vec_size][1] + i % vec_size)
+                        in_bounds = relative_idx < aligned_size
+                    if in_bounds:
                         bin_val = self.to_coarse_key(tXrX[i])
                         atomicAdd(
                             s_histogram.iterator + cutlass.Int32(bin_val),
@@ -1116,7 +1120,11 @@ class IndexerTopKKernelVarlen:
                         for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                             cur_tXcX = tXcX[None, None, None, tile_idx]
                             relative_idx = cutlass.Int32(cur_tXcX[i // vec_size][1] + i % vec_size)
-                            if relative_idx < aligned_size:
+                            if cutlass.const_expr(self.deterministic):
+                                in_bounds = tXpX_tile[i // vec_size, 0, 0]
+                            else:
+                                in_bounds = relative_idx < aligned_size
+                            if in_bounds:
                                 raw_input = tXrX[i]
                                 bin_val = self.to_coarse_key(raw_input)
                                 idx = self.index_type(relative_idx + vec_start)
@@ -1199,57 +1207,37 @@ class IndexerTopKKernelVarlen:
                     self.cta_sync(s_cta_mbarrier, sync_phase)
 
             if refine_required:
-                reuse_spilled_planes = length >= 16384
+                refine_args = (
+                    score,
+                    row_start,
+                    length,
+                    buffer,
+                    s_indices,
+                    s_input_idx,
+                    s_histogram,
+                    s_threshold_bin_id,
+                    s_num_input,
+                    s_counter,
+                    s_last_remain,
+                    s_warp_sums,
+                    num_warps,
+                    s_cta_mbarrier,
+                    sync_phase,
+                    topk_remaining,
+                    threshold_bin,
+                )
+                # Keep the spill-buffer read out of shared-memory-only specializations.
                 if cutlass.const_expr(self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048):
+                    reuse_spilled_planes = length >= 16384
                     if cutlass.const_expr(not self.deterministic and not self.return_val and self.tie_break != 0):
                         # The candidate set only shrinks after the coarse pass.
                         reuse_spilled_planes = reuse_spilled_planes and s_num_input[0] > self.indexer_topk_smem_input_size
-                if cutlass.const_expr(self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048) and reuse_spilled_planes:
-                    self._refine_topk_candidates(
-                        score,
-                        row_start,
-                        length,
-                        buffer,
-                        s_indices,
-                        s_input_idx,
-                        s_histogram,
-                        s_threshold_bin_id,
-                        s_num_input,
-                        s_counter,
-                        s_last_remain,
-                        s_warp_sums,
-                        num_warps,
-                        s_cta_mbarrier,
-                        sync_phase,
-                        topk_remaining,
-                        threshold_bin,
-                        True,
-                        first_round,
-                        fp32_prefix,
-                    )
+                    if reuse_spilled_planes:
+                        self._refine_topk_candidates(*refine_args, True, first_round, fp32_prefix)
+                    else:
+                        self._refine_topk_candidates(*refine_args, False, 0, cutlass.Uint32(0))
                 else:
-                    self._refine_topk_candidates(
-                        score,
-                        row_start,
-                        length,
-                        buffer,
-                        s_indices,
-                        s_input_idx,
-                        s_histogram,
-                        s_threshold_bin_id,
-                        s_num_input,
-                        s_counter,
-                        s_last_remain,
-                        s_warp_sums,
-                        num_warps,
-                        s_cta_mbarrier,
-                        sync_phase,
-                        topk_remaining,
-                        threshold_bin,
-                        False,
-                        0,
-                        cutlass.Uint32(0),
-                    )
+                    self._refine_topk_candidates(*refine_args, False, 0, cutlass.Uint32(0))
 
             if cutlass.const_expr(self.deterministic):
                 self.sort_selected_indices(
