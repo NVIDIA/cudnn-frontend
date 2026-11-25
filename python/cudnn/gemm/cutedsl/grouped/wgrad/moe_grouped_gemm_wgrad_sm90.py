@@ -48,7 +48,7 @@ from ..unfused.moe_grouped_gemm_sm90 import apply_schedule_override, pingpong_co
 from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
 
-def use_pingpong_wgrad(n: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]]) -> bool:
+def use_pingpong(n: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]]) -> bool:
     """The override, else pingpong for output N >= 2048 (from an H100 sweep over N) on the 128x192 / (2, 1) configuration only."""
     return apply_schedule_override(n >= 2048 and pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
 

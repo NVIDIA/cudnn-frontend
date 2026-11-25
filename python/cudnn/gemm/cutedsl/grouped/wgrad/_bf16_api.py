@@ -40,7 +40,7 @@ from ..canonical import validate_once
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
 from ..unfused.moe_grouped_gemm_sm90 import pingpong_config_error
-from .moe_grouped_gemm_wgrad_sm90 import MoEGroupedGemmWgradBF16KernelSm90, use_pingpong_wgrad
+from .moe_grouped_gemm_wgrad_sm90 import MoEGroupedGemmWgradBF16KernelSm90, use_pingpong
 
 
 def _output_dtypes():
@@ -110,7 +110,7 @@ class GroupedGemmWgradBf16API(APIBase):
         # arch="sm90" (GroupedGemmWgradSm90) runs the Hopper kernel: tile M <= 128 and a (2, 1) cluster by default.
         self._is_sm90 = arch == "sm90"
         # The SM90 schedule comes from the output N (wgrad_shape is (M, N)) and the tile.
-        self.pingpong = self._is_sm90 and len(self.wgrad_shape) == 2 and use_pingpong_wgrad(self.wgrad_shape[1], mma_tiler_mn, cluster_shape_mn)
+        self.pingpong = self._is_sm90 and len(self.wgrad_shape) == 2 and use_pingpong(self.wgrad_shape[1], mma_tiler_mn, cluster_shape_mn)
         default_tile = ((128, 192) if self.pingpong else (128, 256)) if self._is_sm90 else (256, 256)
         self.mma_tiler_mn = tuple(mma_tiler_mn or default_tile)
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256

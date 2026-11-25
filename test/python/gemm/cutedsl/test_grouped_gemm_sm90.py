@@ -345,7 +345,7 @@ def test_sm90_pingpong_rejects(kwargs, match):
 def test_sm90_schedule_heuristic(n, k, tile, cluster, expected):
     # Pingpong for K <= 3072 and N >= 2048 on 128x192 tiles and (2, 1) clusters.
     from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import GroupedGemmBf16API
-    from cudnn.gemm.cutedsl.grouped.wgrad.moe_grouped_gemm_wgrad_sm90 import use_pingpong_wgrad
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_grouped_gemm_wgrad_sm90 import use_pingpong
 
     m, dev = 256, "cuda"
     a = torch.zeros((m, k), dtype=torch.bfloat16, device=dev)
@@ -357,13 +357,13 @@ def test_sm90_schedule_heuristic(n, k, tile, cluster, expected):
     api = GroupedGemmBf16API(a, c, d, arch="sm90", **common)
     assert (api._pingpong, api.mma_tiler_mn) == expected
     # wgrad: pingpong for output N >= 2048 on 128x192 tiles and (2, 1) clusters.
-    assert use_pingpong_wgrad(2048, None, None) and not use_pingpong_wgrad(1024, None, None)
-    assert use_pingpong_wgrad(4096, (128, 192), (2, 1))
-    assert not use_pingpong_wgrad(4096, (128, 256), None)
-    assert not use_pingpong_wgrad(4096, (128, 160), None)
-    assert not use_pingpong_wgrad(4096, None, (1, 2))
+    assert use_pingpong(2048, None, None) and not use_pingpong(1024, None, None)
+    assert use_pingpong(4096, (128, 192), (2, 1))
+    assert not use_pingpong(4096, (128, 256), None)
+    assert not use_pingpong(4096, (128, 160), None)
+    assert not use_pingpong(4096, None, (1, 2))
     with override_schedule("cooperative"):
-        assert not use_pingpong_wgrad(4096, None, None)
+        assert not use_pingpong(4096, None, None)
 
 
 def test_sm90_names_match_sm100_signatures():
