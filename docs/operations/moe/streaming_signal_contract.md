@@ -199,6 +199,8 @@ __global__ void consume_chunks(const int* signal, const T* d, int chunk_count) {
         __syncthreads();
         send_columns(d, u);  // coherent loads of columns [u*C, min((u+1)*C, N)) of every row
     }
+    // The per-chunk acquires make D visible; they do not complete the PDL dependency on the GEMM grid.
+    cudaGridDependencySynchronize();  // also when chunk_count == 0
 }
 ```
 
