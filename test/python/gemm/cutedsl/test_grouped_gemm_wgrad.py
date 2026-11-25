@@ -1283,3 +1283,21 @@ def test_wgrad_scheduler_advances_before_producer_tail(kernel):
                     tails += 1
                     assert previous is not None and calls(previous, "sched_producer_state", "advance"), f"{source}:{statement.lineno}"
     assert tails == 1
+
+
+@pytest.mark.parametrize("a_major,b_major", [("m", "n"), ("k", "n"), ("m", "k"), ("k", "k")])
+def test_grouped_gemm_wgrad_bf16_infers_zero_token_majors(a_major, b_major):
+    """Zero tokens (every expert empty): torch's dense K-major operands have stride (1, 1), which must still infer."""
+    from types import SimpleNamespace
+
+    from cudnn.gemm.cutedsl.grouped.wgrad._bf16_api import GroupedGemmWgradBf16API
+
+    m, n = 64, 32
+    a = torch.empty((0, m)).t() if a_major == "m" else torch.empty((m, 0))
+    b = torch.empty((0, n)) if b_major == "n" else torch.empty((n, 0)).t()
+
+    def desc(t):
+        return SimpleNamespace(shape=tuple(t.shape), stride=tuple(t.stride()))
+
+    assert GroupedGemmWgradBf16API._infer_a_major(desc(a)) == a_major
+    assert GroupedGemmWgradBf16API._infer_b_major(desc(b)) == b_major

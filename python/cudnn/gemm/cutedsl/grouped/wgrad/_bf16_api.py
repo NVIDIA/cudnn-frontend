@@ -162,7 +162,8 @@ class GroupedGemmWgradBf16API(APIBase):
     def _infer_a_major(desc: TensorDesc) -> str:
         m, tokens = desc.shape
         stride = canonicalize_unit_dim_strides(desc.shape, desc.stride)
-        if stride == canonicalize_unit_dim_strides(desc.shape, (tokens, 1)):
+        # A zero-token operand has no elements; torch gives its dense layout the stride max(tokens, 1).
+        if stride in {canonicalize_unit_dim_strides(desc.shape, (t, 1)) for t in (tokens, max(tokens, 1))}:
             return "k"
         if stride == canonicalize_unit_dim_strides(desc.shape, (1, m)):
             return "m"
@@ -172,7 +173,7 @@ class GroupedGemmWgradBf16API(APIBase):
     def _infer_b_major(desc: TensorDesc) -> str:
         tokens, n = desc.shape
         stride = canonicalize_unit_dim_strides(desc.shape, desc.stride)
-        if stride == canonicalize_unit_dim_strides(desc.shape, (1, tokens)):
+        if stride in {canonicalize_unit_dim_strides(desc.shape, (1, t)) for t in (tokens, max(tokens, 1))}:
             return "k"
         if stride == canonicalize_unit_dim_strides(desc.shape, (n, 1)):
             return "n"
