@@ -9648,5 +9648,9 @@ run within this result. All xfails remain byte-comparison failures.
 Native SM103 pipeline 85191475 stopped before tests because Enroot pulled
 the private image anonymously and received HTTP 403. Pipelines 85192768
 (cuDNN 9.28.1.4 / CuTe DSL 4.8.0) and 85192784 (9.30.0.9 / 4.9.0a0)
-retry the affected suites with the public PyTorch 26.09 base image. Their
-results are pending. The version overrides differ from the default job names.
+retry the affected suites with the public PyTorch 26.09 base image. Both
+4.8.0 jobs import the image, then fail before pytest: Enroot cannot mount
+the workspace (`Operation not permitted`), and `scontrol` cannot read
+`/etc/slurm/slurm.conf`. The 4.9.0a0 attempt fails at the same mount step.
+Native SM103 execution remains unverified. The version overrides differ
+from the default job names.
