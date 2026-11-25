@@ -21,16 +21,16 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 
-from ..tmem_transpose import _TmemTranspose16x32Core
 from .dglu_mxfp8_fc12_epilogue import DgluMxfp8Epilogue
 from .....schedulers.fc12_mapping import BlockPhase
 from .....schedulers.base import WorkIdAcquisitionMode
 from .dglu_mxfp8_schedule import build_dgrad_scheduler
 from .dglu_mxfp8_fc12_extension import DgluMxFp8Fc12SchedExtension
-from ..fwd_glu.glu_mxfp8_fc12_extension import WeightStorageMode, raw_discrete_weight_descriptor_pointer
+from ......helpers.discrete_weight import WeightStorageMode, initialize_discrete_weight_descriptors
 from ......api import KernelClass, StaticOrRuntimeIntegerType
 from ..helpers.constants import SupportedMmaTileM, SupportedMmaTileN
 from ......helpers.iket_compat import iket
+from ......helpers.tmem_transpose import _TmemTranspose16x32Core
 from ......helpers.dsl_helpers import spin_wait
 from ......helpers.ptx_helpers import nanosleep
 from ......quant_def import CombineFormat, QuantKind
@@ -47,19 +47,6 @@ class _EpilogueCommView:
     fc2_output_sf: Any = None
     fc2_done_counter: Any = None
     fc2_output_workspace: Any = None
-
-
-@cute.jit
-def _int64_pointer_array_tensor(pointer_array: cute.Pointer, element_count: int):
-    return cute.make_tensor(
-        cute.make_ptr(
-            cutlass.Int64,
-            pointer_array.toint(),
-            cute.AddressSpace.gmem,
-            assumed_align=8,
-        ),
-        cute.make_layout((element_count,)),
-    )
 
 
 # =============================================================================
@@ -94,9 +81,6 @@ class Sm107Mxfp8DgluDfc21Kernel:
         sf_padding_block: int,
         load_balance_mode: Literal["static", "atomic_counter"] = "static",
         static_expert_shape: Optional[Tuple[int, int, int]] = None,
-        force_static_sched: bool = True,
-        clc_bundle_size: Optional[int] = None,
-        num_sched_stages: Optional[int] = None,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         sf_vec_size: int = 32,
         ab_dtype: Type[cutlass.Numeric] = cutlass.Float4E2M1FN,
@@ -104,7 +88,6 @@ class Sm107Mxfp8DgluDfc21Kernel:
         dfc2_recompute: bool = False,
         dfc2_col_output: bool = False,
         dfc2_subtile_publish: bool = False,
-        fc2_in_kernel_topk_reduce: bool = False,
         act_func: str = "swiglu",
         gate_up_clamp: Optional[float] = None,
         dfc2_c_pipe_stages: int = 1,
@@ -114,28 +97,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
         phase_interleave_prologue_tiles: Optional[int] = None,
         phase_interleave_defer_consumers_until_full: bool = False,
         phase_interleave_fuse_ready_probe_and_producer_claim: bool = False,
-        phase_interleave_defer_linear1_until_input_ready: bool = False,
-        prefetch_tma_descriptors: bool = False,
-        dfc1_weight_l2_prefetch_depth: int = 0,
         use_scaled_cvt: bool = False,
         weight_storage_mode: WeightStorageMode = "contiguous",
     ) -> None:
-        if (type(phase_interleave_defer_linear1_until_input_ready) is not bool
-                or type(prefetch_tma_descriptors) is not bool
-                or type(dfc1_weight_l2_prefetch_depth) is not int):
-            raise TypeError("Archived tuning controls require bool/bool/int values.")
-        if (phase_interleave_defer_linear1_until_input_ready
-                or prefetch_tma_descriptors or dfc1_weight_l2_prefetch_depth != 0):
-            raise NotImplementedError(
-                "External-ready admission and TMA/weight prefetch experiments "
-                "are archived; keep their constructor controls disabled."
-            )
-        if not force_static_sched:
-            raise NotImplementedError(
-                "v1 only implements force_static_sched=True (lean 7-warp). "
-                "Dynamic CLC (force_static_sched=False) is future work."
-            )
-
         # Validate (ab_dtype, sf_vec_size) pairing.
         if sf_vec_size in self.VALID_AB_DTYPE_SF_SIZE:
             valid_ab = self.VALID_AB_DTYPE_SF_SIZE[sf_vec_size]
@@ -245,15 +209,8 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 "Discrete weights require static_expert_shape so descriptor "
                 "shapes can be constructed without contiguous weight tensors."
             )
-        if act_func not in ("swiglu", "geglu"):
-            raise ValueError(
-                f"act_func must be 'swiglu' or 'geglu'; got {act_func!r}."
-            )
         if act_func != "swiglu":
-            raise NotImplementedError(
-                f"act_func={act_func!r} is not yet implemented; only "
-                "'swiglu' is currently supported (geglu support is planned)."
-            )
+            raise NotImplementedError(f"act_func={act_func!r}: only 'swiglu' is implemented.")
         if dfc2_c_pipe_stages not in (1, 2):
             raise ValueError(
                 "dfc2_c_pipe_stages must be 1 (baseline) or 2 "
@@ -291,11 +248,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         self.mma_tiler_mnk = mma_tiler_mnk
         self.cluster_shape_mn = (cluster_shape_mnk[0], cluster_shape_mnk[1])
         self.use_2cta_instrs = use_2cta_instrs
-        self.force_static_sched = force_static_sched
-        # static_expert_shape / clc_bundle_size / num_sched_stages
         self.static_expert_shape = static_expert_shape
-        self.clc_bundle_size = clc_bundle_size
-        self.num_sched_stages = num_sched_stages
 
         # Fused fc12 sched-side knobs
         self.group_hint = group_hint
@@ -311,11 +264,6 @@ class Sm107Mxfp8DgluDfc21Kernel:
         self.phase_interleave_fuse_ready_probe_and_producer_claim = (
             phase_interleave_fuse_ready_probe_and_producer_claim
         )
-        self.phase_interleave_defer_linear1_until_input_ready = (
-            phase_interleave_defer_linear1_until_input_ready
-        )
-        self.prefetch_tma_descriptors = prefetch_tma_descriptors
-        self.dfc1_weight_l2_prefetch_depth = dfc1_weight_l2_prefetch_depth
 
         self.sf_vec_size = sf_vec_size
         self.arch = "sm_107"
@@ -327,7 +275,6 @@ class Sm107Mxfp8DgluDfc21Kernel:
         self.dfc2_d_pipe_stages = dfc2_d_pipe_stages
         self.dfc2_acc_early_release = dfc2_acc_early_release
         self.use_scaled_cvt = use_scaled_cvt
-        self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self.weight_storage_mode = weight_storage_mode
         self.gate_up_clamp = abs(gate_up_clamp) if gate_up_clamp is not None else None
 
@@ -600,16 +547,12 @@ class Sm107Mxfp8DgluDfc21Kernel:
             dfc2_subtile_publish=self.dfc2_subtile_publish,
             dfc2_acc_early_release=self.dfc2_acc_early_release,
             use_scaled_cvt=self.use_scaled_cvt,
-            fc2_in_kernel_topk_reduce=self.fc2_in_kernel_topk_reduce,
             combine_format=getattr(self, "combine_format", None),
             combine_hidden=getattr(self, "hidden", None),
             act_func=self.act_func,
             gate_up_clamp=self.gate_up_clamp,
         )
         self.epilogue = DgluMxfp8Epilogue(**_epi_common)
-
-        if self.num_sched_stages is None:
-            self.num_sched_stages = 2
 
         # Each logical preactivation-C pipeline stage owns a gate/up pair of
         # physical SMEM slots.  Keep one logical stage as the production
@@ -641,7 +584,6 @@ class Sm107Mxfp8DgluDfc21Kernel:
         (
             self.num_acc_stage,
             self.num_ab_stage,
-            self.num_sched_stages,
         ) = self._compute_stages(
             tiled_mma,
             self.mma_tiler,
@@ -653,7 +595,6 @@ class Sm107Mxfp8DgluDfc21Kernel:
             self.d_bytes_total,
             self.smem_capacity,
             self.occupancy,
-            self.num_sched_stages,
             self._smem_misc_budget_bytes() - self._SmemMiscBudget,
         )
 
@@ -763,10 +704,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
         d_bytes_total: int,
         smem_capacity: int,
         occupancy: int,
-        num_sched_stages: int,
         extra_misc_bytes: int = 0,
-    ) -> Tuple[int, int, int]:
-        """Compute stage counts for ACC, AB+SF, and scheduler.
+    ) -> Tuple[int, int]:
+        """Compute stage counts for ACC and AB+SF.
         """
         num_acc_stage = 2
 
@@ -797,7 +737,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         num_ab_stage = (
             smem_capacity // occupancy - fixed_overhead
         ) // ab_bytes_per_stage
-        return num_acc_stage, num_ab_stage, num_sched_stages
+        return num_acc_stage, num_ab_stage
 
     def get_workspace_size_in_bytes(
         self,
@@ -902,7 +842,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
     # =========================================================================
     # Token-comm hook surface (MegaMoE-only; lean base = no-op stubs)
     #
-    # Mirrors the hook interface in ``moe_mxfp8_glu.kernel_mxfp8_glu_fc12``
+    # Mirrors the hook interface in the sibling forward GLU fc12 kernel
     # so that ``Sm107MegaMoEMxfp8DgluKernel`` can override exactly the same
     # methods.  The mega wrapper places dispatch in a contiguous block beginning
     # at warp 8 and relocates ``c_load_warp_id`` above the transfer block; the
@@ -965,157 +905,6 @@ class Sm107Mxfp8DgluDfc21Kernel:
     def token_comm_hook_kernel_tail(self, token_comm_args, *, warp_idx, lane_idx, tidx):
         """All-warp kernel tail (NVLink release, etc.).  No-op base."""
         pass
-
-    @cute.kernel
-    def _initialize_discrete_weight_descriptors(
-        self,
-        fc1_weight_ptrs: cute.Pointer,
-        fc1_weight_sf_ptrs: cute.Pointer,
-        fc2_weight_ptrs: cute.Pointer,
-        fc2_weight_sf_ptrs: cute.Pointer,
-        fc1_n: cutlass.Int32,
-        fc1_k: cutlass.Int32,
-        fc1_stride_n: cutlass.Int64,
-        fc2_n: cutlass.Int32,
-        fc2_k: cutlass.Int32,
-        fc2_stride_n: cutlass.Int64,
-        descriptor_workspace: cute.Pointer,
-        tiled_mma: cute.TiledMma,
-        tiled_mma_sfb: cute.TiledMma,
-        b_smem_layout,
-        sfb_smem_layout,
-        cluster_layout_vmnk_shape: cutlass.Constexpr,
-        cluster_layout_sfb_vmnk_shape: cutlass.Constexpr,
-    ) -> None:
-        """Build the four expert-specific dFC2/dFC1 weight TensorMaps."""
-        expert_idx = cute.arch.block_idx()[0]
-        expert_count = self.static_expert_shape[0]
-        singleton = cutlass.Int32(1)
-        zero = cutlass.Int64(0)
-
-        fc1_weight_pointer_values = _int64_pointer_array_tensor(
-            fc1_weight_ptrs, expert_count
-        )
-        fc1_weight_sf_pointer_values = _int64_pointer_array_tensor(
-            fc1_weight_sf_ptrs, expert_count
-        )
-        fc2_weight_pointer_values = _int64_pointer_array_tensor(
-            fc2_weight_ptrs, expert_count
-        )
-        fc2_weight_sf_pointer_values = _int64_pointer_array_tensor(
-            fc2_weight_sf_ptrs, expert_count
-        )
-
-        b_operation = sm100_utils.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-        sfb_operation = sm100_utils.cluster_shape_to_tma_atom_SFB(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-
-        fc1_weight_tensor = cute.make_tensor(
-            cute.make_ptr(
-                self.ab_dtype,
-                fc1_weight_pointer_values[expert_idx],
-                cute.AddressSpace.gmem,
-            ),
-            cute.make_layout(
-                (fc1_n, fc1_k, singleton),
-                stride=(fc1_stride_n, cutlass.Int64(1), zero),
-            ),
-        )
-        fc1_weight_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
-            b_operation,
-            fc1_weight_tensor,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            cluster_layout_vmnk_shape,
-        )
-        cpasync.copy_tensormap(
-            fc1_weight_atom,
-            raw_discrete_weight_descriptor_pointer(
-                descriptor_workspace, "fc1_weight", expert_idx
-            ),
-        )
-
-        fc1_weight_sf_tensor = cute.make_tensor(
-            cute.make_ptr(
-                self.sf_dtype,
-                fc1_weight_sf_pointer_values[expert_idx],
-                cute.AddressSpace.gmem,
-            ),
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (fc1_n, fc1_k, singleton), self.sf_vec_size
-            ),
-        )
-        fc1_weight_sf_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
-            sfb_operation,
-            fc1_weight_sf_tensor,
-            sfb_smem_layout,
-            self.mma_tiler_sfb,
-            tiled_mma_sfb,
-            cluster_layout_sfb_vmnk_shape,
-            internal_type=cutlass.Uint64,
-        )
-        cpasync.copy_tensormap(
-            fc1_weight_sf_atom,
-            raw_discrete_weight_descriptor_pointer(
-                descriptor_workspace, "fc1_weight_sf", expert_idx
-            ),
-        )
-
-        fc2_weight_tensor = cute.make_tensor(
-            cute.make_ptr(
-                self.ab_dtype,
-                fc2_weight_pointer_values[expert_idx],
-                cute.AddressSpace.gmem,
-            ),
-            cute.make_layout(
-                (fc2_n, fc2_k, singleton),
-                stride=(fc2_stride_n, cutlass.Int64(1), zero),
-            ),
-        )
-        fc2_weight_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
-            b_operation,
-            fc2_weight_tensor,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            cluster_layout_vmnk_shape,
-        )
-        cpasync.copy_tensormap(
-            fc2_weight_atom,
-            raw_discrete_weight_descriptor_pointer(
-                descriptor_workspace, "fc2_weight", expert_idx
-            ),
-        )
-
-        fc2_weight_sf_tensor = cute.make_tensor(
-            cute.make_ptr(
-                self.sf_dtype,
-                fc2_weight_sf_pointer_values[expert_idx],
-                cute.AddressSpace.gmem,
-            ),
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (fc2_n, fc2_k, singleton), self.sf_vec_size
-            ),
-        )
-        fc2_weight_sf_atom, _ = cute.nvgpu.make_tiled_tma_atom_B(
-            sfb_operation,
-            fc2_weight_sf_tensor,
-            sfb_smem_layout,
-            self.mma_tiler_sfb,
-            tiled_mma_sfb,
-            cluster_layout_sfb_vmnk_shape,
-            internal_type=cutlass.Uint64,
-        )
-        cpasync.copy_tensormap(
-            fc2_weight_sf_atom,
-            raw_discrete_weight_descriptor_pointer(
-                descriptor_workspace, "fc2_weight_sf", expert_idx
-            ),
-        )
 
     @cute.jit
     def __call__(
@@ -1292,11 +1081,11 @@ class Sm107Mxfp8DgluDfc21Kernel:
                     assumed_align=16,
                 ),
                 cute.make_layout(
-                    (fc1_weight_n, fc1_weight_k, cutlass.Int32(1)),
+                    (fc1_weight_n, fc1_weight_k, 1),
                     stride=(
                         cutlass.Int64(hidden_b),
                         cutlass.Int64(1),
-                        cutlass.Int64(0),
+                        0,
                     ),
                 ),
             )
@@ -1366,7 +1155,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
             fc1_weight_sf_shape = (
                 fc1_weight_n,
                 fc1_weight_k,
-                cutlass.Int32(1),
+                1,
             )
         fc1_weight_sf_gemm = cute.make_tensor(
             fc1_weight_sf_iterator,
@@ -1404,11 +1193,11 @@ class Sm107Mxfp8DgluDfc21Kernel:
                     assumed_align=16,
                 ),
                 cute.make_layout(
-                    (fc2_weight_n, fc2_weight_k, cutlass.Int32(1)),
+                    (fc2_weight_n, fc2_weight_k, 1),
                     stride=(
                         cutlass.Int64(intermediate_downproj_b2),
                         cutlass.Int64(1),
-                        cutlass.Int64(0),
+                        0,
                     ),
                 ),
             )
@@ -1465,7 +1254,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
             fc2_weight_sf_shape = (
                 fc2_weight_n,
                 fc2_weight_k,
-                cutlass.Int32(1),
+                1,
             )
         fc2_weight_sf_gemm = cute.make_tensor(
             fc2_weight_sf_iterator,
@@ -1659,17 +1448,17 @@ class Sm107Mxfp8DgluDfc21Kernel:
         )
 
         if cutlass.const_expr(self.weight_storage_mode == "discrete"):
-            self._initialize_discrete_weight_descriptors(
+            initialize_discrete_weight_descriptors(
                 fc1_weight,
                 fc1_weight_sf,
                 fc2_weight,
                 fc2_weight_sf,
-                fc1_weight_n,
-                fc1_weight_k,
-                cutlass.Int64(hidden_b),
-                fc2_weight_n,
-                fc2_weight_k,
-                cutlass.Int64(intermediate_downproj_b2),
+                intermediate_gateup,
+                hidden_b,
+                hidden_b,
+                hidden_b2,
+                intermediate_downproj_b2,
+                intermediate_downproj_b2,
                 weight_descriptor_workspace,
                 tiled_mma,
                 tiled_mma_sfb,
@@ -1677,6 +1466,13 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 sfb_smem_layout,
                 self.cluster_layout_vmnk.shape,
                 self.cluster_layout_sfb_vmnk.shape,
+                self.ab_dtype,
+                self.sf_dtype,
+                self.sf_vec_size,
+                self.cluster_shape_mn,
+                self.mma_tiler,
+                self.mma_tiler_sfb,
+                self.static_expert_shape,
             ).launch(
                 grid=(expert_cnt, 1, 1),
                 block=(1, 1, 1),

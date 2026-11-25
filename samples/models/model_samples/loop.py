@@ -19,8 +19,7 @@ sequence by one token; the chosen ids stay on the GPU, and the one host read of 
 sample's own loop -- there is no ``generate()`` here.  ``trace`` replays the first steps of the recorded run under the profiler for the report's GPU-side
 lines (``timing``); it leaves the run's state and record as they were.  Asked for launch records, the same pass also keeps
 what the kernel check needs (``census.Traced``): the sites of a step in wiring order, the log of every block call of the
-traced steps and the profiler's record of every launch -- and, for a stack that declares a target kernel set, what the run can
-say about that set (``claim``).  ``trace_request`` is the other form of a traced pass, for a request that is timed and
+traced steps and the profiler's record of every launch.  ``trace_request`` is the other form of a traced pass, for a request that is timed and
 then traced (``model_samples.perf``): it replays nothing and traces steps of the request that is running, issued by the
 caller's own loop body; such a request starts from ``reset(fresh=False, recorded=False)`` -- the state zeroed in place,
 nothing recorded.
@@ -50,6 +49,22 @@ the cache holds the prompt when the first step drafts.  The drafter has a plan o
 its table stands under the session's two, its load takes the model's embedding table, its memory is in the one
 sentence.  ``speculate`` reads nothing and compares nothing: the count is the caller's (``accept``).
 
+A session built with ``capture=True`` records its decode step once as a launch sequence and replays it for every token
+(:class:`Recorded`): ``prefill`` and ``step`` then issue one replay where they issue every block's launch from Python, and
+Python runs nothing between two tokens but the caller's one host read.  Whether a step can be recorded is the plan's data
+(``recordable``: every block of it says so, and the step is the plain decode step -- one token per sequence, no draft
+tokens, no drafter, no copies made per call); a session whose step cannot be launches from Python and says why
+(``python_reason``).  The step is recorded at the first replay of a state (``record_step`` brings that forward), on that
+state: a recorded launch keeps the addresses of its operands, so the token and the position rows a step reads stand at
+fixed addresses (``state.Cursor``) and the step's own last launches write the chosen ids and move the rows on.  A
+replayed step returns that ids buffer, so what its caller hands back is what the next lookup reads, however it was
+changed in between; any other tensor is copied into the buffer.  Four things an eager step has for free are code
+here, in front of every replay: the capacity test, the ids the caller handed over, the cursor at the state's
+position, and the state the sequence was recorded on.  The record of a replayed step holds the ids its caller handed
+over, and the checks of a run launch the recorded steps again from Python (``tie_out.run_checks``): what a replay
+computed is held to that, ids and logits, byte for byte.  Every step with a tap or a call log, the traced pass and
+the checks' own passes are launched from Python.
+
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
 what ``reset`` clears.
@@ -63,7 +78,7 @@ import torch
 
 from . import blocks, census
 from .sampling import GREEDY
-from .state import DecodeState
+from .state import Cursor, DecodeState
 from .timing import Report, Stages, now, trace_steps
 
 STACKS = ("fe-cublas", "native", "fe-entries", "reference")
@@ -79,6 +94,167 @@ DRAFTER_ROWS = (
     "and every pass over the prompt at S rows; every row of this table serves any row count"
 )
 ONE_SEQUENCE = "a session with a drafter serves one sequence: one request, as the drafter rows are for"
+#: what the memory sentence adds for PyTorch's pool to what the checks hold for every sequence beyond the first, as a share of
+#: that part: the pool keeps blocks beyond the tensors that are alive, and a run whose pool is capped at the tensors' own
+#: figure fails to allocate inside its checks.  The smallest of a tenth, a quarter and four tenths with which capped runs at
+#: 256 and at 1,024 sequences both passed (the family README has the runs); an allowance from runs, not a bound
+CHECK_POOL = 0.4
+
+
+#: the steps of a traced pass that a session which replays its step runs once more as replays, behind those launched from Python
+REPLAYED_TRACED = 2
+#: why a session's steps are launched from Python where recording was not asked for
+NOT_ASKED = "recording the step was not asked for (Session(capture=True))"
+#: ... and where the step is not the plain decode step: the kinds of session whose step is not recorded
+NOT_PLAIN = {
+    "tokens": "a step of several tokens per sequence (a verify step) is not recorded: the count it keeps is the host's, between two steps",
+    "draft_tokens": "a session that verifies behind its prompt is not recorded: its steps are verify steps, whose kept count is the host's",
+    "drafter": "a step of speculative decoding is not recorded: the drafter's passes run on reference blocks, which a recorded launch sequence cannot hold",
+    "on_demand": "the reference session of a run's checks makes a copy of a weight per call, which a recorded launch sequence cannot hold",
+    "device": "a launch sequence is recorded on a CUDA device",
+}
+
+
+class LaunchGraph:
+    """The launches of one pass of a step's Python, recorded on PyTorch's capture stream (``torch.cuda.graph``) and issued
+    again as one launch (``replay``).  ``record(body)`` runs ``body`` once with the capture stream current: every launch
+    of it lands in the sequence and none runs.  A pass the installation refuses (a host read, a copy from pageable
+    host memory, a set-up inside the step) raises what PyTorch raised -- and where the refusal leaves the thread on the
+    capture stream, the stream that was current is put back first: nothing computes on a side stream afterwards."""
+
+    @staticmethod
+    def serves(device) -> bool:
+        """Whether a launch sequence can be recorded on ``device``: a CUDA device."""
+        return torch.device(device).type == "cuda"
+
+    def __init__(self, device):
+        self.device = device
+        try:  # where the build keeps the recorded sequence itself, the CUDA runtime can be asked what it holds (``nodes``)
+            self.graph, self.kept = torch.cuda.CUDAGraph(keep_graph=True), True
+        except TypeError:
+            self.graph, self.kept = torch.cuda.CUDAGraph(), False
+
+    def record(self, body):
+        before = torch.cuda.current_stream(self.device)
+        try:
+            with torch.cuda.graph(self.graph):
+                return body()
+        except BaseException:
+            torch.cuda.set_stream(before)  # the context's exit raised before it put the stream back, or never ran
+            raise
+
+    def replay(self) -> None:
+        self.graph.replay()
+
+    def reset(self) -> None:
+        """Release the sequence and the memory it kept, now: a sequence left to the collector can be destroyed inside a
+        later recording, which that invalidates."""
+        self.graph.reset()
+
+    def nodes(self) -> Optional[list]:
+        """``(kind, kernel name)`` of every node of the recorded sequence as the CUDA runtime states it -- kind ``"kernel"``,
+        ``"copy"``, ``"fill"`` or the runtime's own word -- or ``None`` where this installation does not state it (a
+        PyTorch that keeps no sequence to ask, or no binding of the runtime's reader)."""
+        if not self.kept:
+            return None
+        try:
+            from cuda.bindings import driver, runtime
+
+            def checked(result):
+                if int(result[0]) != 0:
+                    raise RuntimeError(f"the CUDA runtime declined: {result[0]!r}")
+                return result[1:] if len(result) > 2 else result[1]
+
+            raw = self.graph.raw_cuda_graph()
+            _, count = checked(runtime.cudaGraphGetNodes(raw, numNodes=0))
+            handles, count = checked(runtime.cudaGraphGetNodes(raw, numNodes=count))
+            kinds = {
+                runtime.cudaGraphNodeType.cudaGraphNodeTypeKernel: "kernel",
+                runtime.cudaGraphNodeType.cudaGraphNodeTypeMemcpy: "copy",
+                runtime.cudaGraphNodeType.cudaGraphNodeTypeMemset: "fill",
+            }
+            found = []
+            for index in range(count):
+                kind = checked(runtime.cudaGraphNodeGetType(handles[index]))
+                name = ""
+                if kinds.get(kind) == "kernel":
+                    error, parameters = driver.cuGraphKernelNodeGetParams(driver.CUgraphNode(init_value=int(handles[index])))
+                    if int(error) == 0 and int(parameters.func):
+                        error, symbol = driver.cuFuncGetName(driver.CUfunction(init_value=int(parameters.func)))
+                        if int(error) == 0:
+                            name = symbol.decode() if isinstance(symbol, bytes) else str(symbol)
+                found.append((kinds.get(kind, getattr(kind, "name", str(kind)).replace("cudaGraphNodeType", "").lower()), name))
+            return found
+        except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+
+
+class Recorded:
+    """One decode step of a session recorded as a launch sequence, with what its replays read and write at fixed
+    addresses: the cursor of the state it was recorded on (the ids buffer the lookup reads, the position rows), and the
+    tensors the recorded pass returned -- the chosen ids, the logits, the final-norm rows -- which every replay writes
+    again where the pass allocated them.  ``calls``: the block calls of the step; ``launches``: what the sequence holds,
+    as the CUDA runtime states it and held against the plan (``census.recorded_launches``), or ``None`` where the
+    installation does not state it; ``seconds`` and ``pool_bytes``: what recording took, and what PyTorch reserved
+    for the sequence's own pool, in which the working memory of one step stays for as long as the sequence lives.
+
+    The ids buffer is also what a replayed step hands back to its caller (``Session.step``): the sequence's own last
+    copy has written the chosen ids into it, and handed back it is read as it then is.  The chosen ids as the token
+    choice left them (``next_ids``) stay the sequence's own: the state and the record read those."""
+
+    def __init__(self, graph, state: DecodeState, cursor: Cursor, next_ids, logits, hidden, calls: int, launches=None, seconds=0.0, pool_bytes=0, planned=0):
+        self.graph, self.state, self.cursor = graph, state, cursor
+        self.next_ids, self.logits, self.hidden = next_ids, logits, hidden
+        self.calls, self.launches, self.seconds, self.pool_bytes = calls, launches, seconds, pool_bytes
+        self.planned = planned  # the launches of the step's blocks on exact rows, as the plan has them
+        self.replays = 0
+        #: whether a replay was the last to write the ids buffer for this session -- the step's own copy of the ids it
+        #: chose -- and nothing has been fed since: what the tail of a request is read on (``Session.read_tail``)
+        self.chosen = False
+
+    def feed(self, ids: torch.Tensor) -> None:
+        """The ids the next replay's lookup reads are the ids its caller hands over: one copy into the ids buffer --
+        unless the caller hands over that buffer itself, the tensor a replayed step returns.  The lookup then reads
+        what the buffer holds, whatever has written it since: no copy, and nothing to compare."""
+        if ids is not self.cursor.ids:
+            self.cursor.ids.copy_(ids)
+        self.chosen = False
+
+    def replay(self, state: DecodeState) -> None:
+        """One replay on ``state``, which stands where the step is to run.  A sequence writes the memory of the state it was
+        recorded on: another state is a ``ValueError`` and launches nothing.  The cursor is held to the state's
+        position by its host integer and set from the tables where the two differ -- behind steps launched from
+        Python, a reset in place, a restored snapshot."""
+        if state is not self.state:
+            raise ValueError(
+                "a recorded step is replayed on the state it was recorded on: this session's state is another one, and a replay would write the first"
+            )
+        if self.cursor.position != state.position:
+            self.cursor.set(state.position)
+        self.graph.replay()
+        self.cursor.position = state.position + 1  # the sequence's own last launches moved the rows on
+        self.replays += 1
+        self.chosen = True
+
+    def text(self) -> str:
+        """What the recorded step holds, for the line a run prints behind its load.  Where the installation states the
+        sequence (``launches``) the count is the CUDA runtime's, with what of it was held to the plan kernel by kernel;
+        where it does not, the count is worded as the plan's: ``planned`` launches of its blocks."""
+        tail = f"{self.cursor.launches()} position updates"
+        if self.launches is None:
+            return (
+                f"step recorded: by the plan {self.planned} launches of its blocks, then the token choice, 1 copy of the chosen ids and {tail} "
+                "(this installation does not state what the recorded sequence holds); replayed once per token"
+            )
+        held = self.launches
+        return (
+            f"step recorded: {held['launches']} launches, as the CUDA runtime states the recorded sequence -- {held['held']} of the plan's block "
+            f"launches held kernel by kernel, the lookup, {held['token_choice']} of the token choice, {held['copies']} copy of the chosen ids "
+            f"and {tail} -- replayed once per token"
+        )
+
+    def release(self) -> None:
+        self.graph.reset()
 
 
 class StopRule:
@@ -154,13 +330,15 @@ class Session:
         tokens: int = 1,
         draft_tokens: Optional[int] = None,
         drafter=None,
+        max_model_len: Optional[int] = None,
+        capture: bool = False,
     ):
         """``capacity`` is the number of positions (prompt + new tokens) a sequence may reach.  ``checkpoint`` defaults to the
         model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
         ``record_steps`` bounds the steps whose ids and logits are kept on the GPU for the checks (default: every step).
         ``check_kernels`` says that the run will check its kernels: what that needs of a provider is then part of the plan
-        (a decline is a SKIP before the load), and the traced pass keeps its launch records.  A stack that declares a target
-        kernel set (the family's ``target_stacks``) always checks its kernels: its statement is about them.
+        (a decline is a SKIP before the load), and the traced pass keeps its launch records.  A stack whose rows are kernels
+        on the stored formats (the family's ``checked_stacks``) always checks its kernels.
         ``on_demand`` (``weights.OnDemand``) is for the reference session of a run's checks, which runs on the weights of the
         session it checks: where that load kept a weight on its stored format alone, the blocks of this session get a bf16
         copy of it made for the one call and dropped after it, and the object counts what that cost.  It is refused for
@@ -175,7 +353,17 @@ class Session:
         ``QwenDenseDrafter``), the drafter's: the session then runs its passes (``speculate``).  A drafter needs
         ``draft_tokens`` and serves one sequence.  It drafts for this session's weights and widths: a checkpoint's
         drafter is refused where the session that loads was handed none (its weights are seeded), one of another
-        model's widths by the first width that differs -- each a ``ValueError`` here, before anything is planned."""
+        model's widths by the first width that differs -- each a ``ValueError`` here, before anything is planned.
+        ``max_model_len`` is the positions a sequence of the run may reach at most, its context length: a constant of
+        the run, which every block of the session's plans is handed in its options, and
+        the state where a block reads the page table and the lengths of a paged cache (``attended_tables``).  Left
+        out it is ``capacity``; below ``capacity`` it is a ``ValueError``: no step of the session writes a position past
+        it.
+        ``capture`` asks for the decode step to be recorded once as a launch sequence and replayed for every token
+        (``prefill``, ``step``).  It is recorded where the plan says it can be (``recordable``); a session whose step
+        cannot be, or whose recording the installation declines, launches every step from Python as a session without
+        the flag does, and says why (``python_reason``).  Under replay the tensor ``prefill`` and ``step`` return is
+        the session's ids buffer: the next step reads the ids it is fed from it and writes the next ids into it."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if on_demand is not None and (share is None or stack != REFERENCE):
@@ -189,6 +377,14 @@ class Session:
             raise ValueError(f"a session needs at least one sequence; got {sequences}")
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1:
             raise ValueError(f"a session's step feeds at least one token per sequence; got tokens={tokens!r}")
+        if max_model_len is not None:
+            if isinstance(max_model_len, bool) or not isinstance(max_model_len, int) or max_model_len < 1:
+                raise ValueError(f"max_model_len is the positions a sequence of the run may reach at most: a whole number from 1; got {max_model_len!r}")
+            if max_model_len < int(capacity):
+                raise ValueError(
+                    "max_model_len is the positions a sequence of the run may reach at most, and this session is built for "
+                    f"capacity={int(capacity)} positions per sequence; got max_model_len={max_model_len}"
+                )
         if draft_tokens is not None:
             if isinstance(draft_tokens, bool) or not isinstance(draft_tokens, int) or draft_tokens < 1:
                 raise ValueError(
@@ -227,13 +423,18 @@ class Session:
         self.draft_weights = None
         self.device = torch.device(device)
         self.overrides, self.reference_precision, self.capacity = dict(overrides or {}), reference_precision, int(capacity)
+        self.max_model_len = self.capacity if max_model_len is None else max_model_len  # of the run: what a kernel that is told a maximum length is told
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
         self.record_steps = self.capacity if record_steps is None else max(1, min(int(record_steps), self.capacity))
-        self.check_kernels = bool(check_kernels) or stack in getattr(model, "target_stacks", ())
+        self.check_kernels = bool(check_kernels) or stack in getattr(model, "checked_stacks", ())
         self.on_demand = on_demand  # the maker of the bf16 copies this session's blocks read and its weights do not hold
         self.traced: Optional[census.Traced] = None  # of the last traced pass that kept its launch records
         self._call_log: Optional[list] = None  # the block calls of the traced step that is running
-        self.stages = Stages(sync=lambda: torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None)
+        # the stage clock synchronises the session's device and is handed the device, never the session: a closure over the
+        # session would close a reference cycle, and a session in a cycle is released when Python next collects cycles, not
+        # when its last holder lets go -- the reference session of a run's checks would outlive them with its state and record
+        device = self.device
+        self.stages = Stages(sync=lambda: torch.cuda.synchronize(device) if device.type == "cuda" else None)
         self.plan: Optional[blocks.Plan] = None
         self.prefill_plan: Optional[blocks.Plan] = None  # the decode plan of the prompt of a session built with draft_tokens=
         self.weights = None
@@ -245,6 +446,14 @@ class Session:
         self._report = self._new_report()
         self._calls = 0
         self._prefill_start = 0.0
+        self.capture = bool(capture)  # whether the step is to be recorded and replayed
+        self.recorded: Optional[Recorded] = None  # the recorded step of the session's present state, once it has one
+        #: why the steps of this session are launched from Python; "" while they are replayed, or will be at the first replay
+        self.python_reason = "" if self.capture else NOT_ASKED
+        #: of a request that was replayed, read behind it (``read_tail``): whether the ids buffer held the ids the last
+        #: replay chose, whether the position rows stood where the request left the state, and that position
+        self.tail: Optional[tuple] = None
+        self.pool_bytes: List[int] = []  # of every recording of this session: what PyTorch reserved for the sequence's own pool
         self._running: Optional[blocks.Plan] = None  # the plan of the step that is running, and its rows
         self._rows = self.sequences * self.tokens
         self._open = False  # a verify step has run and has not been told how many of its tokens are kept
@@ -271,6 +480,7 @@ class Session:
             "device": str(self.device),
             "check_kernels": self.check_kernels,
             "merge_rule": self.merge_rule,
+            "max_model_len": self.max_model_len,
             **more,
         }
         facts = self.device if self.device.type == "cuda" else blocks.DeviceFacts((0, 0), "cpu")
@@ -292,6 +502,18 @@ class Session:
         steps of its prompt (a session built with ``draft_tokens=``), then its own step."""
         self.resolve()
         return [*([(self.prefill_plan, 1)] if self.prefill_plan is not None else []), (self.plan, self.tokens)]
+
+    def recordable(self) -> str:
+        """Whether this session's step can be recorded once as a launch sequence and replayed: ``""``, or why not, in one
+        sentence.  Decided before anything is loaded, from what the session is and from its plan's data: only the
+        plain decode step is recorded -- one token per sequence, no draft tokens, no drafter, no copies made per call,
+        on a CUDA device -- and only where every block of the plan says a recorded sequence can hold its calls
+        (``Plan.recordable``)."""
+        kinds = (("drafter", self.drafter is not None), ("draft_tokens", self.draft_tokens is not None), ("tokens", self.tokens != 1))
+        for kind, is_one in (*kinds, ("on_demand", self.on_demand is not None), ("device", not LaunchGraph.serves(self.device))):
+            if is_one:
+                return NOT_PLAIN[kind]
+        return self.resolve().recordable()
 
     def _plans(self, own: bool = False) -> list:
         """The plans of the run this session's load serves: its own -- its step's and, where it has one, its prompt's --
@@ -391,11 +613,32 @@ class Session:
             )
         return next(iter(asked), None)
 
+    def attended_tables(self) -> bool:
+        """Whether a block of this session's plans reads its attention cache through the state's page table and lengths
+        (``Block.attended_tables``): of its step's plan and, where it has one, of its prompt's, every part of a block
+        that several rows serve included.  The state is then built with both, for the run's maximum length
+        (``max_model_len``).  They are tables of a pool of pages: such a block in a session whose blocks ask for no
+        paged cache is a ``ValueError``, a wrong table, named with its plan."""
+        for plan, _ in self._kinds():
+            for label, _, _, _, block in plan.parts():
+                if not getattr(block, "attended_tables", False):
+                    continue
+                if self.cache_page() is None:
+                    where = f"{label} in the plan of {plan.sequences} sequence{'s' if plan.sequences > 1 else ''}{plan.tokens_text()}"
+                    raise ValueError(
+                        f"the provider table is wrong: {where} reads the page table and the lengths of a paged attention cache, "
+                        "and no block of this session asks for one (cache_page)"
+                    )
+                return True
+        return False
+
     def _paged(self) -> dict:
-        """The page of this session's attention cache as a keyword of a family's memory arithmetic, where a block of its
-        plans asks for a paged cache (a family whose states are plain is never asked)."""
-        page = self.cache_page()
-        return {} if page is None else {"page": page}
+        """The layout of this session's attention cache as keywords of its state and of a family's memory arithmetic: the
+        page, where a block of its plans asks for a paged cache, and with it the run's maximum length where a block
+        reads the page table and the lengths (a family whose states are plain is never asked).  Both wrong tables of
+        that layout are named here (``cache_page``, ``attended_tables``)."""
+        page, tables = self.cache_page(), self.attended_tables()
+        return {} if page is None else {"page": page, **({"max_model_len": self.max_model_len} if tables else {})}
 
     def _kept(self) -> dict:
         """What the plans of the run ask the family's loader to keep, as its keyword arguments: nothing for a run whose every
@@ -436,22 +679,18 @@ class Session:
             if not on_stored and (names(uncopied, name, site) or partly) and self.on_demand is None:
                 raise ValueError(f"{block.entry} reads a bf16 copy of the weight of {label}, and the load kept its stored format alone: {other}")
 
-    def claim(self) -> Optional[census.Claim]:
-        """What this session's run can say about the target kernel set of its stack -- the identity of every block call, the
-        three numbers, the reasons its GPU class is not claimed (``census.Claim``) -- or ``None`` for a stack that declares no
-        target.  Decided from the plan and the family's census file: before anything is loaded.  ``ValueError`` when that
-        file is not a census of this model."""
-        if self.stack not in getattr(self.model, "target_stacks", ()):
-            return None
-        plan = self.resolve()
-        return self.model.target().claim(plan, self.model, census.configuration_of(plan))
-
-    def plan_table(self, later: Sequence["Session"] = ()) -> str:
+    def plan_table(self, later: Sequence["Session"] = (), references: int = 1) -> str:
         """The served-by table and the memory sentence; raises ``NotImplementedError`` (a SKIP) before anything is loaded.
 
         ``later`` are the sessions that will run after this one in the same process on its weights (``share=self``).  Their
         plans are resolved here too, and the memory sentence then covers the whole run -- this session's need plus their
         state -- against what is free now: every decline of a run comes before its first load, none after it.
+
+        The sentence counts what a session that records its step keeps in the pool of its recorded sequence
+        (``_recorded_bytes``: the family's arithmetic), and what the checks of the run hold for every sequence beyond the first (``_check_rows``:
+        the family's arithmetic, nothing at one sequence and nothing on the reference stack, which runs no checks),
+        names that part, and adds a share of it for PyTorch's pool (``CHECK_POOL``).  ``references``: how many reference
+        stacks the checks of the run replay (2 for a run that checks a second one).
 
         In this order: the tables of every session are resolved, which allocates nothing; the memory sentence says whether
         the whole run fits; and only then do the entries of each plan make their first use (``Plan.first_use``: an entry
@@ -471,7 +710,7 @@ class Session:
         if self._share is None:
             self.stored_layouts()  # one weight in two row orders is a wrong table: named here, with the plans, before anything is built or read
         for session in (self, *later):
-            session.cache_page()  # ... and so are two layouts of one session's attention cache
+            session._paged()  # ... and so are two layouts of one session's attention cache, and tables of a pool that no block asks for
         sentence = ""
         if self.device.type == "cuda":
             # what the load of the first session holds follows the plans: the stored format of the weights a block multiplies
@@ -483,21 +722,50 @@ class Session:
             # a session whose blocks ask for a paged attention cache holds a pool and its tables where a plain one holds two tensors a layer
             need += sum(session.model.state_bytes(session.sequences, session.capacity, **session._per_token(), **session._paged()) for session in later)
             need += sum(session._drafter_bytes() for session in (self, *later))
+            need += sum(session._recorded_bytes() for session in (self, *later))  # what a recorded step keeps in a pool of its own
             # one state per session: a session that feeds its prompt through decode steps runs them on the state of its verify
             # steps, so it is counted once.  Nothing is added for its second plan either: what a first launch of the fused step
             # reserves outside the pool is reserved once in a process, and the sentence carries it once (``Plan.memory``)
             counts = [self.sequences, *(session.sequences for session in later)]
             what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
-            if any(session.draft_tokens is not None for session in (self, *later)):  # a run with two kinds of step names them
+            kinded = any(session.draft_tokens is not None for session in (self, *later))
+            if kinded:  # a run with two kinds of step names them
                 kinds = [session._kind() for session in (self, *later)]
                 what = f" for {', '.join(kinds[:-1])} and {kinds[-1]}, one after the other" if later else f" for {kinds[0]}"
-            # the part of the need that is the checks': the reference's copy of a weight the load keeps no copy of, one at a time
+            # the part of the need that is the checks': the reference's copy of a weight the load keeps no copy of, one at a time,
+            # and what they hold for every sequence beyond the first -- with a share of that for PyTorch's pool, which is not named
             checks = self.model.check_bytes(held["uncopied"]) if "uncopied" in held else 0
-            sentence = "\n  " + plan.memory(need, what, checks)  # before anything is built on the GPU: this is where a run that does not fit ends
+            rows = self._check_rows(later, references)
+            need += rows + int(rows * CHECK_POOL)
+            beyond = f"the {self.sequences - 1} sequence{'s' if self.sequences > 2 else ''} beyond the first"
+            if later:
+                beyond = "the sequences beyond the first of a " + ("session" if kinded else "count")
+            sentence = "\n  " + plan.memory(need, what, checks, rows, beyond)  # before anything is built on the GPU: here a run that does not fit ends
         for session in (self, *later):
             for each in session._first_used():
                 each.first_use()
         return self._tables() + sentence
+
+    def _check_rows(self, later: Sequence["Session"], references: int) -> int:
+        """What the checks of this run hold for every sequence beyond the first, in bytes: of each session what its family
+        counts at its sequences less what it counts at one (``check_row_bytes``; a session of the reference stack runs
+        no checks, and a family that counts nothing is not asked).  The checks of one session run at a time and drop
+        what they held when they return -- the reference session they build is released there with its state and its
+        record, by its last reference: its stage clock holds the device, not the session (``__init__``), and nothing
+        but the checks holds it --, so the run takes the largest such part -- and of every other session its record,
+        which stays allocated while another count runs."""
+        parts, records = [], []
+        for session in (self, *later):
+            count = getattr(session.model, "check_row_bytes", None) if session.stack != REFERENCE else None
+            if count is None:
+                parts.append(0)
+                records.append(0)
+                continue
+            shape = (session.capacity, session.tokens, session.record_steps)
+            parts.append(count(session.sequences, *shape, references) - count(1, *shape, references))
+            records.append(session.model.check_row_terms(session.sequences, *shape)["record"] - session.model.check_row_terms(1, *shape)["record"])
+        most = max(range(len(parts)), key=parts.__getitem__)
+        return parts[most] + sum(record for index, record in enumerate(records) if index != most)
 
     def _first_used(self) -> list:
         """The plans whose blocks make their first use for this session: its own and, where it has one, its drafter's."""
@@ -510,6 +778,12 @@ class Session:
         if self.drafter is None:
             return 0
         return self.drafter.memory_bytes(self.sequences, self.capacity) + self.drafter.working_bytes()
+
+    def _recorded_bytes(self) -> int:
+        """What this session's recorded step adds to the need of a run, in bytes; 0 for a session that records none
+        (``recordable``) and for a family that states no such figure (``recorded_step_bytes``)."""
+        count = getattr(self.model, "recorded_step_bytes", None)
+        return count(self.sequences) if self.capture and count is not None and not self.recordable() else 0
 
     def _tables(self) -> str:
         """The served-by table of this session's step; for a session built with ``draft_tokens=`` the table of its verify
@@ -544,7 +818,7 @@ class Session:
         # the layout of a stored weight a provider multiplies on, where it has its own: asked first, so that plans that ask for
         # two row orders of one weight end here -- before an entry builds anything, before a byte is read
         layouts = self.stored_layouts() if self._share is None else {}
-        self.cache_page()  # two layouts of this session's attention cache: the same kind of wrong table, named at the same place
+        self._paged()  # two layouts of this session's attention cache, or its tables without a pool: the same kind of wrong table, named at the same place
         for each in self._first_used():
             each.first_use()  # made with the table (``plan_table``); a session that is loaded without one makes it here, before the weights
         if self.reference_precision == "ieee-fp32" and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
@@ -584,9 +858,14 @@ class Session:
                 self._run(plan, self.tokens, torch.zeros(self.sequences * self.tokens, dtype=torch.int32, device=self.device))
             else:  # the step of such a session, behind that prompt step: the drafter's passes, the window, the verify step, the pair
                 self._calls = 0
-                self._engine(None, 0)
+                self._speculative_step(None, 0)
         self._report.calls_per_step = self._calls
         self.reset(fresh=True)
+        if self.capture:  # the plan's data decides; the state the first request runs on is recorded here, as a stage of its own
+            self.python_reason = self.recordable()
+            if not self.python_reason:
+                with self.stages.stage("capture"):
+                    self.record_step()
 
     def reset(self, fresh: bool = True, recorded: bool = True) -> None:
         """Back to the start of a prompt set: zero state at position 0 and an empty record (both records of a session built
@@ -598,6 +877,7 @@ class Session:
         the state zeroed in place): its steps keep nothing for the checks.  The record is then one of 0 steps, the form
         the traced pass runs on -- a step copies no ids and no logits into it -- until the next reset that records."""
         if fresh or self.state is None:
+            self._release()  # a recorded step writes the state it was recorded on: it goes with that state
             self.state = self._fresh_state()
             self.record = self._record(self.record_steps)
             self.prompt_record = self._prompt_record(self.record_steps)
@@ -608,6 +888,7 @@ class Session:
             self.record.accepted_all.clear()
             if self.prompt_record is not None:
                 self.prompt_record.count, self.prompt_record.prompt = 0, None
+        self.tail = None
         steps = self.record_steps if recorded else 0
         if self.record.inputs.shape[0] != steps:  # a request that keeps nothing, or the first one behind it that records again
             self.record, self.prompt_record = self._record(steps), self._prompt_record(steps)
@@ -618,9 +899,10 @@ class Session:
 
     def _fresh_state(self) -> DecodeState:
         """A zero state at position 0 for this session's sequences and tokens per sequence, in allocations of its own; its
-        attention caches in the layout the blocks of the session's plans ask for (``cache_page``)."""
+        attention caches in the layout the blocks of the session's plans ask for (``cache_page``), with the page table
+        and the lengths of the run's maximum length where a block reads them (``attended_tables``)."""
         shapes = self.model.state_shapes()
-        state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, shapes, self.device, self.tokens, page=self.cache_page())
+        state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, shapes, self.device, self.tokens, **self._paged())
         if self.drafter is not None:  # the drafter's own cache: as many positions as the model's
             state.draft = self.drafter.state(self.sequences, self.capacity, self.device)
         return state
@@ -633,6 +915,140 @@ class Session:
     def _prompt_record(self, steps: int) -> Optional[Record]:
         """An empty record of the prompt's decode steps, one row per sequence, for a session built with ``draft_tokens=``."""
         return Record(steps, self.sequences, self.model.geometry.vocab, self.device) if self.draft_tokens is not None else None
+
+    # ------------------------------------------------------------------ the recorded step
+    def _release(self) -> None:
+        """Drop the recorded step, if there is one, and what it kept."""
+        if self.recorded is not None:
+            self.recorded.release()
+            self.recorded = None
+
+    def close(self) -> None:
+        """Release the recorded step of a session that is done: the sequence and its pool go now, not when the session is
+        collected (a sequence the collector destroys inside a later recording invalidates that recording).  The session
+        stays usable: its next replay records the step again."""
+        self._release()
+
+    def record_step(self) -> str:
+        """Record the decode step on the session's present state, where that state has no recorded step yet: one pass of
+        the step's Python on PyTorch's capture stream, in which nothing runs.  The first replay of a state does this
+        itself; a caller brings it forward to keep it out of a timed interval.  Returns ``python_reason``: ``""`` where
+        the step is recorded, else why this session's steps are launched from Python -- recording was not asked for,
+        the plan or the kind of session says it cannot be (``recordable``), or this installation declined the pass.
+
+        A declined pass is a net under the plan's data, never the mechanism: the session is left as it was -- the host
+        position, the count of block calls, the state's bytes, PyTorch's current stream -- and launches from Python
+        from then on, with the first sentence of what was raised as its reason.  A recorded sequence that does not
+        hold the plan's launches is not a decline: it is a ``ValueError``, a wrong sequence, named kernel by kernel."""
+        if self.python_reason or (self.recorded is not None and self.recorded.state is self.state):
+            return self.python_reason
+        self.python_reason = self.recordable()
+        if self.python_reason:
+            return self.python_reason
+        self._release()  # of another state: a session holds one recorded step
+        state = self.state
+        cursor = state.step_cursor()
+        cursor.set(state.position)
+        position, hidden, greedy, calls = state.position, state.hidden, state.greedy, self._calls
+        cuda = self.device.type == "cuda"
+        if cuda:  # what the sequence's own pool takes is read off PyTorch's reservation, the cache emptied on both sides
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+        reserved = torch.cuda.memory_reserved(self.device) if cuda else 0
+        graph = LaunchGraph(self.device)
+
+        def step():
+            next_ids, logits = self._run(self.plan, 1, cursor.ids)
+            cursor.ids.copy_(next_ids)  # the step's own copy of the ids it chose: the next replay feeds on them
+            cursor.advance()  # ... and its own move to the next position: an add per row
+            return next_ids, logits, state.hidden
+
+        started, cursor.on = now(), True
+        try:
+            next_ids, logits, normed = graph.record(step)
+        except (RuntimeError, NotImplementedError, ValueError) as error:
+            if cuda:
+                torch.cuda.synchronize(self.device)
+            try:
+                graph.reset()
+            except RuntimeError:
+                pass  # a recording that never began holds nothing to release
+            words = (str(error).splitlines() or [type(error).__name__])[0].split(". ")[0].strip().rstrip(".")
+            self.python_reason = f"the capture of the step was declined on this installation ({words[:160] or type(error).__name__})"
+            return self.python_reason
+        finally:  # the pass ran the step's Python and no kernel: the host's side of it is put back, the rows stand where they stood
+            cursor.on = False
+            made = self._calls - calls
+            state.position, state.hidden, state.greedy, self._calls, cursor.position = position, hidden, greedy, calls, position
+        seconds = now() - started
+        pool = max(torch.cuda.memory_reserved(self.device) - reserved, 0) if cuda else 0
+        launches, differs = None, []
+        sites, nodes = census.expected(self.plan, self.model), graph.nodes()
+        if nodes is not None:
+            launches, differs = census.recorded_launches(nodes, sites, copies=1, updates=cursor.launches())
+        if differs:
+            graph.reset()
+            raise ValueError("the recorded step does not hold the launches of the plan: " + "; ".join(differs))
+        planned = sum(kernel.launches for site in sites for kernel in site.kernels if kernel.relation == "exact")
+        self.recorded = Recorded(graph, state, cursor, next_ids, logits, normed, made, launches, seconds, pool, planned)
+        self.pool_bytes.append(pool)
+        return ""
+
+    def _replays(self) -> bool:
+        """Whether the next decode step is a replay: recording was asked for and stands, and nothing asks for Python
+        between two blocks -- no tap of a check, no call log of a traced step.  Records the step where the present
+        state has none (the first replay of a state)."""
+        if self.python_reason or self.tap is not None or self._call_log is not None:
+            return False
+        return not self.record_step()
+
+    def _replay(self, ids: torch.Tensor) -> torch.Tensor:
+        """One decode step as one replay of the recorded step: ``ids`` are fed, the next ids returned -- in the session's
+        ids buffer, into which the sequence's own last copy has written them and which the next replay's lookup
+        reads.  Handed back, that tensor is fed as it then is; any other tensor is copied into it first.  In front
+        of the replay what a step launched from Python has for free: the capacity test (a replay past the capacity
+        is the same ``ValueError`` and launches nothing), the ids the caller handed over, the cursor at the state's
+        position, the state the sequence was recorded on.  The record holds, for a recorded step, the ids the caller
+        HANDED OVER -- copied before the replay, which writes the buffer -- and the logits and the ids the replay
+        left: the ids as the token choice wrote them, the tensor the state keeps too (``state.greedy``), never the
+        buffer."""
+        self._fits(1)
+        recorded, record, state = self.recorded, self.record, self.state
+        kept = record.count < record.inputs.shape[0]
+        recorded.feed(ids)
+        if kept:
+            record.inputs[record.count].copy_(ids)
+        recorded.replay(state)
+        state.position += 1
+        state.hidden, state.greedy = recorded.hidden, recorded.next_ids  # what the step leaves on the state, as from Python
+        if kept:
+            record.outputs[record.count].copy_(recorded.next_ids)
+            record.logits[record.count].copy_(recorded.logits)
+            record.accepted.append(0)
+        record.count += 1
+        self._calls += recorded.calls
+        self._report.replayed, self._report.launches = True, None if recorded.launches is None else recorded.launches["launches"]
+        return recorded.cursor.ids
+
+    @property
+    def replays(self) -> bool:
+        """Whether the steps of the request this session has run were replays of its recorded step."""
+        return self._report.replayed
+
+    def read_tail(self) -> Optional[tuple]:
+        """Behind a replayed request, the step's own tail, which no recomputation from Python sees: ``(ids, rows,
+        position)`` -- whether the ids buffer holds the ids the last replay chose (its own copy of them), whether the
+        position rows stand at the state's position (its own adds), and that position.  Kept on the session
+        (``tail``) for the checks' line; ``None`` where the request was not replayed.  Host reads: behind a request,
+        in front of anything that replays again -- and of any write of the caller's to the tensor the last step
+        returned, which is that buffer."""
+        recorded = self.recorded
+        if not self.replays or recorded is None or recorded.state is not self.state:
+            return None
+        cursor = recorded.cursor
+        ids = bool(recorded.chosen) and cursor.ids.tolist() == recorded.next_ids.tolist()
+        self.tail = (ids, cursor.position == self.state.position and cursor.holds(), self.state.position)
+        return self.tail
 
     # ------------------------------------------------------------------ run
     def _call(self, name: str, layer: int, *operands):
@@ -721,7 +1137,7 @@ class Session:
         if self.state.hidden is None:
             raise ValueError("the first step of a session with a drafter drafts behind the last prompt position: feed the prompt first (Session.prefill)")
 
-    def _engine(self, force: Optional[torch.Tensor], accept: Optional[int]) -> torch.Tensor:
+    def _speculative_step(self, force: Optional[torch.Tensor], accept: Optional[int]) -> torch.Tensor:
         """One step of speculative decoding: the drafter's passes; the window -- the greedy token the run kept last, then
         the proposals (``force``: these drafted tokens in their place) --; the verify step on it; -> the pair ``[sequences,
         2, tokens]`` of the window and the greedy id after each of its tokens.  The window and the pair are one
@@ -773,13 +1189,19 @@ class Session:
             self.prompt_record.prompt = ids if fed is None else torch.cat([fed, ids], dim=1)
             self._report.prompt_tokens = self.prompt_record.prompt.shape[1]
             feed = self._feed
+        elif self._replays():  # one copy of the token into the ids buffer and one replay per prompt token
+            feed = self._replay
         next_ids = None
         for t in range(ids.shape[1]):
             next_ids = feed(ids[:, t].contiguous())
         return next_ids
 
     def step(self, ids: torch.Tensor) -> torch.Tensor:
-        """One decode step for every sequence: the ids to feed ``[sequences]`` -> the next ids ``[sequences]``, on the GPU."""
+        """One decode step for every sequence: the ids to feed ``[sequences]`` -> the next ids ``[sequences]``, on the GPU.
+        The ids handed over are fed whatever they are.  On a session that records its step this is one replay, and
+        the tensor returned is the session's ids buffer: the next step reads the ids it is fed from it and writes
+        the ids it chooses into it.  Handed back, it is fed as it then is, changed in place or not; any other tensor
+        is copied into it.  A caller that keeps the ids of a step past the next one copies them."""
         if self.drafter is not None:
             raise ValueError(
                 "behind its prompt a session with a drafter runs steps of speculative decoding (Session.speculate); a decode step behind a keep is not built"
@@ -789,8 +1211,9 @@ class Session:
                 "behind its prompt a session built with draft_tokens= runs verify steps (Session.verify); a decode step behind a keep is not built"
             )
         self._decode_only("Session.step")
+        replays = self._replays()  # in front of the clock: the first replay of a state records the step
         self._report.clock.mark_launch()
-        return self._advance(ids)
+        return self._replay(ids) if replays else self._advance(ids)
 
     def verify(self, ids: torch.Tensor, accept: Optional[int] = None) -> torch.Tensor:
         """One verify step for every sequence: ``ids`` ``[sequences, tokens]`` on the GPU -- per sequence the token the run
@@ -858,7 +1281,7 @@ class Session:
         self._behind_prompt()  # a refused step runs nothing and leaves nothing: no pass, no entry of the record, no mark on the report's clock
         self._fits(self.tokens)  # before the passes: a step past the capacity writes nothing, the drafter's cache included
         self._report.clock.mark_launch()
-        pair = self._engine(force, None)
+        pair = self._speculative_step(force, None)
         self._open = True
         self.record.forced += force is not None
         return pair
@@ -912,11 +1335,15 @@ class Session:
         recorded verify steps with their kept counts under it.  The launch records are those of verify steps alone, held
         against the verify plan; the kernels of the prompt's decode steps are not observed.
 
+        On a session that replayed its request the pass runs ``REPLAYED_TRACED`` steps more: the first traced steps
+        again as replays of the recorded step, on the run's own state from zero (saved before, written back after).
+        The report then has the GPU-busy figure and the launches of both forms (``Trace.replayed``), and the launch
+        records of the replays are kept beside those of the steps launched from Python (``Traced.replayed``).
+
         With a drafter a traced step is the step ``speculate`` runs, fed the recorded drafted tokens: the passes, the
         window, the verify step and the pair, ended by the host read of the pair.  The sites of such a step are, for
-        every pass, the drafter's wiring with the pass's number in the place of the layer, then the model's; the claim
-        is the verify plan's and speaks about the model's sites (``census.Traced.first``).  The passes over the prompt
-        run in front of the window, untraced, with the prompt."""
+        every pass, the drafter's wiring with the pass's number in the place of the layer, then the model's.  The passes
+        over the prompt run in front of the window, untraced, with the prompt."""
         if self.on_demand is not None:  # the reference of a run's checks: its calls carry the copies it makes, which no step of a run does
             raise ValueError(
                 "a session that makes bf16 copies of its weights per call (on_demand) is the reference of a run's checks; its steps are not traced"
@@ -924,7 +1351,6 @@ class Session:
         records = self.check_kernels if records is None else bool(records)
         passes = census.passes(self.draft_plan, self.drafter, self.draft_tokens) if records and self.drafter is not None else []
         sites = passes + census.expected(self.plan, self.model) if records else []
-        claim = self.claim() if records else None
         self._closed("a traced pass")
         count = min(steps, self.record.count, self.record.inputs.shape[0])
         if count < 1:
@@ -932,11 +1358,19 @@ class Session:
             if self.draft_tokens is not None:  # the prompt's decode steps are replayed in front of the pass, never traced
                 self._report.trace_missing = "needs a recorded verify step behind the prompt on a CUDA device"
             if records:
-                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences * self.tokens, claim=claim, first=len(passes))
+                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences * self.tokens)
             return
         inputs, accepted, calls = self.record.inputs[:count], list(self.record.accepted[:count]), self._calls
         kept = (self.state, self.record, self.prompt_record)
         prompt = None if self.prompt_record is None else self.prompt_record.prompt
+        # a session that replayed its request: the first of the traced steps once more as replays, in the same pass, on the
+        # run's own state -- the one the sequence was recorded on -- from zero; what that state held is saved and written back
+        own, live = self.state, self.recorded
+        tail = min(REPLAYED_TRACED, count) if self.replays and live is not None and live.state is own else 0
+        saved = own.snapshot() if tail else None
+        if tail:  # in front of the profiler: the traced replays then hold a step's launches and nothing of this
+            own.clear()
+            live.cursor.set(0)
         self.state = self._fresh_state()
         self.record = self._record(0)
         self.prompt_record = self._prompt_record(0)
@@ -944,13 +1378,17 @@ class Session:
         launches: list = []
 
         def step(i: int) -> None:
+            if i >= count:  # the tail: step ``i - count`` again, by replay, ended by its host read
+                self.state, self._call_log = own, None
+                self._replay(inputs[i - count]).tolist()
+                return
             if records:
                 self._call_log = []
                 call_log.append(self._call_log)
             if self.drafter is None:
                 self._advance(inputs[i], accepted[i]).tolist()
             else:  # the step as ``speculate`` runs it, on the recorded drafted tokens; the host read is the pair's
-                self._engine(inputs[i].view(self.sequences, self.tokens)[:, 1:], accepted[i]).tolist()
+                self._speculative_step(inputs[i].view(self.sequences, self.tokens)[:, 1:], accepted[i]).tolist()
 
         try:  # the device is trace_steps' to decline: what is swapped here is put back whatever it does
             if prompt is not None:  # the prompt of the traced steps, from the zero state: in front of the profiler, in no record of it
@@ -959,14 +1397,19 @@ class Session:
                     # ... ended as the loop ends a prompt, by the host read of its last ids: none of its kernels is in flight when the window opens
                     if t + 1 == prompt.shape[1]:
                         next_ids.tolist()
+            more = {"tail": tail} if tail else {}  # a pass without replays is asked for as it always was
             if records:
-                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device, records=launches)
+                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device, records=launches, **more)
             else:
-                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device)
+                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device, **more)
         finally:
             (self.state, self.record, self.prompt_record), self._calls, self._call_log = kept, calls, None
+            if saved is not None:
+                own.restore(saved)
         if records:
-            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens, claim, len(passes))
+            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences * self.tokens, **more)
+            if tail:  # what the recorded step launches behind its blocks: the copy of the chosen ids, the position updates
+                self.traced.own_tail = (1, live.cursor.launches())
 
     def trace_request(self, step, steps: int) -> None:
         """The traced steps of a request that is running (the performance mode's traced request): ``step(i)`` for ``i`` in
@@ -979,7 +1422,7 @@ class Session:
         self._decode_only("Session.trace_request")
         if self.on_demand is not None or self.draft_tokens is not None:  # the reference of a run's checks, as in ``trace``; a session behind a prompt
             raise ValueError("Session.trace_request traces decode steps of a session that runs on its own weights (no on_demand, no draft_tokens)")
-        sites, claim = census.expected(self.plan, self.model), self.claim()
+        sites = census.expected(self.plan, self.model)
         call_log: List[list] = []
         launches: list = []
 
@@ -992,7 +1435,27 @@ class Session:
             self._report.trace, self._report.trace_missing = trace_steps(logged, steps, self.device, records=launches)
         finally:
             self._call_log = None
-        self.traced = census.Traced.of(sites, call_log, launches, steps, self._report.trace_missing, self.sequences, claim)
+        self.traced = census.Traced.of(sites, call_log, launches, steps, self._report.trace_missing, self.sequences)
+
+    def trace_replays(self, step, steps: int) -> tuple:
+        """The replayed steps of a request that is running, under the profiler: ``step(i)`` for ``i`` in ``range(steps)``, the
+        caller's own loop body -- one ``Session.step``, which is one replay, and its host read.  For a caller that has
+        traced the same steps launched from Python (``trace_request``): the launch records of the replays are kept
+        beside those (``Traced.replayed``), so the kernel check holds the recorded step to the step launched from
+        Python, launch by launch.  Returns ``(timing.Trace, "")`` of the replayed steps, or ``(None, reason)`` where
+        their records cannot be had.  ``ValueError`` on a session whose present state has no recorded step, or that
+        has traced no request."""
+        self._decode_only("Session.trace_replays")
+        if self.recorded is None or self.recorded.state is not self.state or self.python_reason:
+            raise ValueError("Session.trace_replays traces replays of the recorded step: this session's present state has none")
+        if self.traced is None:
+            raise ValueError("Session.trace_replays follows a traced request of steps launched from Python (Session.trace_request), which it is held against")
+        launches: list = []
+        trace, missing = trace_steps(step, steps, self.device, records=launches)
+        cut, _ = census.split_steps(launches)
+        self.traced.replayed = cut if launches and len(cut) == steps else []
+        self.traced.own_tail = (1, self.recorded.cursor.launches())
+        return trace, missing
 
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""

@@ -475,6 +475,8 @@ def test_gnn_mha_gat_v2_head_dimensions(num_heads, dim_head):
 )
 def test_gnn_mha_gat_v2_gradient_precision(deterministic, input_dtype, high_precision_grad):
     _require_gnn_mha("gat_v2")
+    if input_dtype != torch.float32 and high_precision_grad and not hasattr(torch.Tensor, "grad_dtype"):
+        pytest.skip("FP32 leaf gradients for half inputs require Tensor.grad_dtype")
     grad_dtype = torch.float32 if high_precision_grad else input_dtype
     graph = CscGraph(
         torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32), torch.tensor([0, 2, 1, 2, 3], device="cuda", dtype=torch.int32), num_src_nodes=4

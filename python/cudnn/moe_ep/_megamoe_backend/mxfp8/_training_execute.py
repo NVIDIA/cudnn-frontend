@@ -15,8 +15,11 @@ from ..._types import (
     MoeEpNativeDiscreteForwardWeights,
     MoeEpNativeForwardWeights,
     MoeEpTrainingBackwardOutputs,
+    MoeEpTrainingDiscreteWgradOutputs,
     MoeEpTrainingForwardOutputs,
     MoeEpTrainingWgradOperands,
+    MoeEpTrainingWgradOutputs,
+    MoeEpWgradLayout,
     MoeTensor,
 )
 from .._runtime import _runtime_debug
@@ -43,6 +46,13 @@ from ._training_weights import (
     forward_native_to_kernel,
 )
 from ._training_wgrad import assemble_training_wgrad_operands
+from ._wgrad_compile import (
+    Mxfp8WgradVariant,
+    compile_wgrad_or_get,
+    discrete_output_view,
+    launch_wgrad,
+    scale_view,
+)
 
 
 def _activation_views(
@@ -186,9 +196,6 @@ def launch_training_forward(
         if not isinstance(weights, MoeEpNativeForwardWeights):
             raise TypeError("contiguous training requires MoeEpNativeForwardWeights")
         kernel_weights = forward_native_to_kernel(weights)
-    if config.fc2_in_kernel_topk_reduce:
-        # The kernel accumulates every peer's routes straight into out.output, so each call starts from zero.
-        out.output[:token_count].zero_()
     inputs = Mxfp8LaunchInputs(
         activation=activation_data,
         activation_sf=activation_sf,
@@ -374,7 +381,65 @@ def launch_training_backward(
     return grad_activation, dprob, operands
 
 
+def launch_training_wgrad(
+    state: _Mxfp8TrainingState,
+    execution: Mxfp8TrainingExecutionViews,
+    operands: MoeEpTrainingWgradOperands,
+    *,
+    out: MoeEpTrainingWgradOutputs | MoeEpTrainingDiscreteWgradOutputs,
+    dense_layouts: dict[str, tuple[torch.dtype, MoeEpWgradLayout]] | None,
+    accumulate: bool,
+) -> MoeEpTrainingWgradOutputs | MoeEpTrainingDiscreteWgradOutputs:
+    """Launch dW1 then dW2 on the current stream, reading every operand in place."""
+
+    prepared = state.wgrad_prepared
+    if prepared is None:
+        raise RuntimeError(state.wgrad_unavailable_reason)
+    workspace = execution.wgrad_workspace
+    assert workspace is not None
+    discrete = isinstance(out, MoeEpTrainingDiscreteWgradOutputs)
+    stream = torch.cuda.current_stream(state.device)
+    _runtime_debug("training-wgrad.begin", discrete=discrete, accumulate=accumulate)
+    gemms = (
+        ("fc1", operands.fc1_a, operands.fc1_sfa, operands.fc1_b, operands.fc1_sfb),
+        ("fc2", operands.fc2_a, operands.fc2_sfa, operands.fc2_b, operands.fc2_sfb),
+    )
+    for name, a, sfa, b, sfb in gemms:
+        gemm = prepared.gemm(name)
+        if discrete:
+            dtype, layout = out.dtype, out.layout
+            pointers = out.fc1_ptrs if name == "fc1" else out.fc2_ptrs
+            output = discrete_output_view(pointers, dtype, (prepared.experts, gemm.m, gemm.n))
+        else:
+            assert dense_layouts is not None
+            dtype, layout = dense_layouts[name]
+            output = out.fc1 if name == "fc1" else out.fc2
+        variant = Mxfp8WgradVariant(
+            output_dtype=dtype,
+            n_major=layout is MoeEpWgradLayout.GEMM_ROW_MAJOR,
+            storage="discrete" if discrete else "dense",
+            accumulate=accumulate,
+        )
+        _runtime_debug(f"training-wgrad.{name}.compile.begin")
+        compiled = compile_wgrad_or_get(prepared, gemm, variant)
+        _runtime_debug(f"training-wgrad.{name}.launch.begin")
+        launch_wgrad(
+            compiled,
+            mat_a=a.transpose(0, 1),
+            mat_b=b,
+            scale_a=scale_view(sfa, gemm.m, prepared.pool_rows),
+            scale_b=scale_view(sfb, gemm.n, prepared.pool_rows),
+            output=output,
+            expert_offsets=operands.expert_offsets,
+            workspace=workspace,
+            stream=stream,
+        )
+    _runtime_debug("training-wgrad.end")
+    return out
+
+
 __all__ = [
     "launch_training_backward",
     "launch_training_forward",
+    "launch_training_wgrad",
 ]

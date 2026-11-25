@@ -502,27 +502,16 @@ class Mxfp8InputAdapter:
                 name="shared workspace",
             )
             self._initialized_workspace_key = workspace_key
-        if config.fc2_in_kernel_topk_reduce:
-            if (
-                pre_reduced_activation_offset is not None
-                or pre_reduced_activation_bytes_per_token != 0
-                or pre_reduced_activation_sf_offset is not None
-                or pre_reduced_activation_sf_bytes_per_token != 0
-            ):
-                raise ValueError("in-kernel top-k reduction must not receive a " "standalone pre-reduced activation workspace")
-            # The kernel accumulates every peer's routes straight into output_data, so each call starts from zero.
-            output_data[:token_count].zero_()
-        else:
-            if pre_reduced_activation_offset is None or pre_reduced_activation_bytes_per_token <= 0:
-                raise ValueError("standalone top-k reduction requires a pre-reduced " "activation workspace")
-            # Dense routing guarantees that every active (token, top-k) row is
-            # completely overwritten before the standalone reduction.
-            quantized_combine = config.combine_format != "bf16"
-            if quantized_combine:
-                if pre_reduced_activation_sf_offset is None or pre_reduced_activation_sf_bytes_per_token <= 0:
-                    raise ValueError("quantized standalone top-k reduction requires a " "pre-reduced scale workspace")
-            elif pre_reduced_activation_sf_offset is not None or pre_reduced_activation_sf_bytes_per_token != 0:
-                raise ValueError("BF16 standalone top-k reduction must not receive a " "pre-reduced scale workspace")
+        if pre_reduced_activation_offset is None or pre_reduced_activation_bytes_per_token <= 0:
+            raise ValueError("standalone top-k reduction requires a pre-reduced " "activation workspace")
+        # Dense routing guarantees that every active (token, top-k) row is
+        # completely overwritten before the standalone reduction.
+        quantized_combine = config.combine_format != "bf16"
+        if quantized_combine:
+            if pre_reduced_activation_sf_offset is None or pre_reduced_activation_sf_bytes_per_token <= 0:
+                raise ValueError("quantized standalone top-k reduction requires a " "pre-reduced scale workspace")
+        elif pre_reduced_activation_sf_offset is not None or pre_reduced_activation_sf_bytes_per_token != 0:
+            raise ValueError("BF16 standalone top-k reduction must not receive a " "pre-reduced scale workspace")
 
         weights = self._prepare_weights(request, config)
         return Mxfp8LaunchInputs(

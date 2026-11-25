@@ -1875,7 +1875,7 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         "*Against the model's tokens* (reported, no gate): the checkpoint run below, with the same pass run on wrong inputs beside it.",
         "The blocks that call them are held one layer up: every block of the drafter's plan, as the plan builds it, against the function it stands for",
         "and every block of a pass over two sequences gives, for each sequence, the bytes that sequence gives alone,",
-        "No kernel serves a block of the drafter and none has read these 8-bit weights: the kernel census holds the model's steps and no draft pass",
+        "No kernel serves a block of the drafter and none has read these 8-bit weights.",
         # how the pass is reached: the lines themselves are run where the README's call of the loader is run
         "A draft step from Python, behind the call of the loader above (its `model`, `drafter` and `weights`):",
         "they read nothing of the checkpoint.",
@@ -1906,8 +1906,7 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
         '(the section "Speculative decoding"); both are reached from the helper layer as well,',
         "how many were kept; handed the drafter, the session drafts them itself (**The speculative step**, below).",
         "**What is not here.** Kernels for the drafter: every block of its passes but the embedding lookup is a reference chain, so no rate is "
-        "printed for such a run "
-        "and the kernel census holds no draft pass.",
+        "printed for such a run.",
         "Without a drafter nothing decides how many tokens to keep: the caller says it.",
     )
     assert [sentence for sentence in elsewhere if sentence not in whole] == []
@@ -1916,7 +1915,7 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     # ... from the table: every block a reference chain in every stack, but the lookup, which is the gather
     rows = {block: rows[0] for block, rows in configs.DRAFTER_PROVIDERS.items()}
     assert all(row.fallback.startswith("reference chain") and row.stacks == configs.EVERY for block, row in rows.items() if block != "draft.embedding")
-    assert (rows["draft.embedding"].key, rows["draft.embedding"].fallback) == ("torch.index_select", "") and not hasattr(QwenDenseDrafter, "target_stacks")
+    assert (rows["draft.embedding"].key, rows["draft.embedding"].fallback) == ("torch.index_select", "") and not hasattr(QwenDenseDrafter, "checked_stacks")
     # a session takes the drafter and hands its passes the rows of its own state; the drafter knows no session
     loop = (MODELS / "model_samples" / "loop.py").read_text()
     assert not any("Session" in name for name in dir(QwenDenseDrafter)) and "drafter=None," in loop and "state.hidden, state.greedy" in loop
@@ -1995,7 +1994,7 @@ def test_the_readme_says_what_the_drafters_pass_is_and_what_runs_it():
     assert counted == (207, 204, 201, 198, 195) and sum(by_prompt) == 167 and sum(by_kept) == counted[4]
     assert f"{sum(kept * positions for kept, positions in enumerate(by_kept)) / sum(by_kept):.2f}" == "2.37", "drafted tokens kept, 0 to 5, by positions"
     assert drafter.memory_bytes(1, max(prompts) + new_tokens + 5 + 2) == 2135219200 and max(prompts) + new_tokens + 5 + 2 == 194
-    # no count of the launches of a pass, of any kind of them: the kernel census holds none, and the section states none
+    # no count of the launches of a pass, of any kind of them: the section states none
     counted = r"(?:[\d,]+|one|two|three|four|five|six|no|none) (?:kernel |gather |copy )?(?:launch(?:es)?|gathers?|kernels?|cop(?:y|ies))"
     assert re.findall(rf"\b{counted} (?:per|a|of a|of one|in a) (?:draft )?(?:pass|step|call)\b", section) == []
     assert re.findall(r"[\d,]+ (?:kernel )?launch(?:es)?\b|\blaunch(?:es)? (?:of|per) (?:a|one|the) (?:draft )?pass\b", section) == []
