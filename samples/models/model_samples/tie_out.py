@@ -80,8 +80,9 @@ arithmetic of a block, which both runs share.
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
-``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``swiglu_fp4`` = see below; ``same`` = the provider is the reference
-chain, nothing to compare.
+``gate_fp8`` = see below; ``add_norm_quant`` = see below; ``swiglu_fp4`` = see below; ``attention_prepare`` = see below;
+``row_quantize_fp4`` = see below; ``same`` = the provider is the reference chain, nothing to compare.
+``attention_bf16_weights`` = see below: the bound of a stated model, for a library kernel that documents no contract.
 
 **What a provider block is compared with.**  The reference block of the same name -- unless the provider's kernel rounds at
 other points than the reference chain: then the block names its twin (``Block.twin``), a reference block written at the
@@ -89,6 +90,11 @@ kernel's rounding points, and is compared with that.  The reference is matched t
 band is never widened to cover a chain that rounds elsewhere.  **A band is judged per output**: it names the outputs it
 applies to and what it needs of the twin; an output it does not name is compared by its dtype (bf16: within one bf16
 unit; anything else: bytes), and state a call updates is compared byte for byte unless the band has a rule for it.
+
+**The one exception to a twin at the kernel's rounding points** is a library kernel that documents no numerics contract
+and whose rounding points are not established: its twin is the reference chain itself, which also keeps the operand
+terms of a bound, and its band is that bound -- derived from a stated model of the kernel's arithmetic, declared with
+that model before any run of the row, and never taken from a measured distance (``attention_bf16_weights`` below).
 
 ``gate_fp8``, the band of the attention gate + quantise entry, is that entry's documented numerics contract, not a share.
 Its kernel forms the gated value as the quotient ``attn / (1 + exp(-gate))`` in fp32, rounds it once to bf16 and once to an
@@ -115,6 +121,21 @@ values around it.  Per output of a call, whatever the form of its call site writ
 Every value finite.  The line prints how many elements took the other bf16 value, and how many codes are not the ones
 of the nearest value; anything outside these sets is a failure, never a share.
 
+``row_quantize_fp4``, the band of the 4-bit row quantise entry, is that entry's documented numerics contract
+(``docs/operations/block_scaling/row_quantize_fp4_decode.md``).  Its kernel scales a block of sixteen by ``fp32(1 / 6)`` of
+its largest magnitude under the global scale, rounds that once to E4M3, and encodes every element through two approximate
+reciprocals; the twin writes the block-scale byte of that rule and keeps, per element, the two adjacent codes the
+reciprocals' bound admits under it (``torch_ref.nvfp4_code_bracket``).  Per call:
+
+* every block-scale byte is the twin's byte;
+* every code is one of the two codes of its element's bracket, under the twin's block scale.
+
+Every block scale finite.  The line prints how many block scales and codes were judged and how many codes are the second
+code of their bracket (printed, not gated); anything else is outside and a failure, never a share.  Where the bracket
+holds one code the judge is byte for byte.  One thing this band cannot see: at an exact rounding tie the
+bracket holds the two codes around the midpoint, also where the scale and the block scale are powers of two and the
+page states the even code: there the band takes either, and the tie rule is the entry's own suite's to hold.
+
 ``swiglu_fp4``, the band of the fused 4-bit gate / up entry, is that entry's documented numerics contract as well
 (``docs/operations/gemm_fusions/swiglu_fp4_decode.md``), and it is an interval, not a bracket.  The kernel accumulates the
 gate and the up product in fp32 over the whole input width, rounds each once to bf16, forms ``silu(gate) * up`` with an
@@ -135,6 +156,65 @@ kernel's points, and the largest share of its bound a code used; anything outsid
 this band cannot see is the entry's to hold: one bf16 unit of the product hides behind half a 4-bit code step, which
 the exact cells of the entry's own suite cover.
 
+``attention_prepare``, the band of the attention preparation entry, is that entry's documented numerics contract
+(``docs/operations/attention/attention_prepare_decode.md``).  Its kernel normalises a head row in fp32 with an approximate
+division and reciprocal root, rounds the normalised value once to bf16, rotates the rotary part of it with one fp32 product
+and one fused sum per element and rounds once more; the gate rows and the value rows are bit copies; and it writes the
+keys and values of a step's rows into the cache's pool in the same launch.  The twin has the same rounding points with
+the mean and the root evaluated in fp64, and writes the cache through its accessor at the positions of the call, which
+it is handed as a host integer.  Per call:
+
+* a query element that is not rotated: within one bf16 unit of the twin's, the unit taken at the larger magnitude;
+* a rotated one: inside that unit plus ``|cos|`` and ``|sin|`` times one unit of its two normalised operands (each may be
+  one unit off in the kernel; the twin keeps that part per element, ``torch_ref.prepare_rows``);
+* the gate rows: the twin's bytes;
+* the cache: the key rows at the positions of the call held as the query rows are, against the key rows the twin wrote;
+  their value rows the twin's bytes; and every other byte of the pool the byte the twin's pool has -- a row the kernel
+  wrote at another slot, or a row no position of the call names, fails here.  Which rows of the pool the positions of
+  the call are is formed from host integers: the position, the tokens per sequence and the shape of the pool.
+
+Every value a call wrote must be finite: the queries, the gate rows, and the key and the value rows at the positions of
+the call.  The gate rows and the value rows are held finite beside their bytes: the twin copies them from the same
+operand, so a NaN or an infinity there is the twin's byte too.  The line prints how many query and key elements are not
+the twin's byte -- the approximate root moves a few by a unit, inside their band; the entry's page states no share for
+them, and none is gated -- and how many of them are outside their band.
+
+``attention_bf16_weights``, the band of an attention kernel of a library that documents no numerics contract, is not a
+contract of that kernel: it is the bound of a stated model of the kernel's arithmetic, declared here before any run of a
+row that names it.  Which values such a kernel rounds is not established, so no twin can be written at its rounding
+points.  The twin is the reference chain itself (``torch_ref.AttentionBound``), which also keeps, per output element, the
+two operand terms of the bound -- in fp64, whatever precision the run's reference accumulates in.  With ``p_j`` the
+softmax weight of the attended row ``j`` and ``v_j`` that row's value::
+
+    chain  = sum_j p_j v_j        (the reference attention before its rounding to bf16)
+    spread = sum_j p_j |v_j|
+
+The model: every softmax weight carries one rounding to nearest at eight significant bits, ``p_j (1 + d_j)`` with ``|d_j|
+<= u`` and ``u = 2**-8 / (1 + 2**-8)``; the number the weighted sum is divided by carries one of its own, ``1 + e`` with
+``|e| <= u``; and the output is rounded to bf16 once.  Before that last rounding the model's output is ``(sum_j p_j (1 +
+d_j) v_j) / (1 + e)``, so its distance from the chain is ``|sum_j p_j d_j v_j - e chain| / (1 + e)``, at most ``u (spread +
+|chain|) / (1 - u)`` -- and ``u / (1 - u)`` is exactly ``2**-8``.  The output's own rounding adds half a spacing of bf16
+values at the output.  The band, element by element::
+
+    out is finite and |out - chain| <= 1 x [ 2**-8 x (spread + |chain|) + 1 x spacing ]
+
+``spacing`` is the distance between two neighbouring bf16 values at the magnitude of the chain (at the smallest normal
+fp32 value where the chain is below it): the chain's alone, neither the output's nor the tensor's largest value's.  The
+coefficient, the weight term and the count of spacings are ``ATTENTION_BAND_COEFFICIENT``, ``ATTENTION_WEIGHT_TERM`` and
+``ATTENTION_SPACINGS``.  An element whose chain or spread is not finite is outside, whatever the output is.  The call
+writes nothing, so the cache it reads is held byte for byte.  The line prints how many
+elements are not the reference chain's byte, how many are outside their bound, and the largest share of its bound an
+element used with the chain and the spread of that element; the share is printed, not gated.
+
+What this band is and is not.  It is derived from a model and from no measured distance, and it states nothing about
+what the kernel rounds.  It is the model's bound to first order: one spacing at the chain covers the output's rounding
+wherever the chain is not far below its bound, and where it is, half a spacing at the output is more than one spacing at
+the chain -- there an output of the model itself can use up to ``1 + 2**-8`` of its bound.  So an element outside is a
+finding, read with its share, its chain and its spread; it is never a reason for another coefficient, a further term or
+a shape left out.  A block in this band is not within one bf16 unit of the chain: the band's term is the weighted
+magnitude of the attended values, not the output's.  And what the band cannot see is the row's to say: one wrong,
+missing or extra attended row whose softmax weight is below the band's term.
+
 ``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
 output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
 of the state's largest value (of 1 when that is larger), every value finite, the conv history byte-identical and the null
@@ -143,7 +223,7 @@ and so its natural unit of failure: over the run, more than 99 % of the cell's o
 the cell's state within 1e-4.  The null slot is in no share.
 
 Why the state band has a share and a cap: the fused step rounds its beta / alpha projection, its conv taps and its SiLU to
-bf16 as a serving chain does, and it accumulates them in fp32 in its own order.  Against an fp64-accumulated reference a few of
+bf16 as the reference chain does, and it accumulates them in fp32 in its own order.  Against an fp64-accumulated reference a few of
 those roundings fall on the other side of a midpoint; one such unit moves one head's write gate, its decay or one key column,
 and with it that head's state, by up to a few 1e-3 of the state's largest value, while every other element agrees to fp32
 rounding.  A state "within 1e-4 everywhere" therefore does not hold against this reference (measured by this sample: the
@@ -191,6 +271,14 @@ GATE_MARGIN_ULP32 = 2.5
 #: (``docs/operations/normalizations/add_norm_quant_decode.md``), which is at most 20 fp32 units; beyond that distance
 #: from the midpoint of the two bf16 values around it the kernel rounds to the nearest one.  It moves only with that page
 NORM_MARGIN_ULP32 = 20.0
+#: the band of a library attention kernel that documents no numerics contract (``attention_bf16_weights``): an element is
+#: inside where ``|out - chain| <= COEFFICIENT * (WEIGHT_TERM * (spread + |chain|) + SPACINGS * spacing(|chain|))``.  The
+#: bound of a stated model of the kernel's arithmetic (the module's docstring), declared before any run of a row that
+#: names the band and never taken from a measured distance: an element outside is a finding, and none of the three
+#: moves to make a run pass
+ATTENTION_BAND_COEFFICIENT = 1.0
+ATTENTION_WEIGHT_TERM = 2.0**-8
+ATTENTION_SPACINGS = 1.0
 BANDS = {
     "same": "the provider is the reference chain",
     "bitwise": "byte-identical",
@@ -212,10 +300,28 @@ BANDS = {
         "the normed rows the kernel wrote, or of one of the two bf16 values where it wrote codes alone; 4-bit block scales those of a block maximum the "
         "two values admit, 4-bit codes inside the bracket of the kernel's two approximate reciprocals under its own block scale; every value finite"
     ),
+    "row_quantize_fp4": (
+        "against the quantisation at the kernel's rounding points: every block-scale byte that of e4m3(global x (largest x fp32(1/6))) for the largest "
+        "magnitude of its block, every 4-bit code one of the two adjacent codes the kernel's two approximate reciprocals admit under that block scale; "
+        "every block scale finite"
+    ),
     "swiglu_fp4": (
         "against the gate / up multiply with SiLU x up evaluated in fp64 on the dequantised operands, with the error bound of the kernel's contract: "
         "every block-scale byte inside the interval of bytes that bound admits for the largest magnitude of its block, every 4-bit code within half "
         "a code step of the fp64 value under the kernel's own block scale plus that bound; every value finite"
+    ),
+    "attention_prepare": (
+        "against the preparation at the kernel's rounding points (the norm's mean and root in fp64): every query element that is not rotated within one "
+        "bf16 unit at the larger magnitude, every rotated one inside that unit plus |cos| and |sin| times one unit of its two normalised operands; the gate "
+        "rows bitwise; in the cache, the key rows at the positions of the call held as the query rows, their value rows and every other byte of the pool "
+        "bitwise; every value finite"
+    ),
+    "attention_bf16_weights": (
+        "against the reference chain before its rounding to bf16 (chain = sum p v over the attended rows under their softmax weights p, spread = sum p |v|, "
+        f"both in fp64): every element finite and within {ATTENTION_BAND_COEFFICIENT:g} x [2**{math.log2(ATTENTION_WEIGHT_TERM):g} x (spread + |chain|) + "
+        f"{ATTENTION_SPACINGS:g} spacing of bf16 values at |chain|] -- the bound of a stated model of the kernel's arithmetic (every weight one rounding at "
+        "eight significant bits, the divisor one of its own, the output one), declared before any run and never taken from a measured distance; the cache "
+        "bitwise"
     ),
 }
 
@@ -297,13 +403,22 @@ class BlockStats:
     conv_equal: bool = True
     null_equal: bool = True
     state_equal: bool = True  # of a band without a rule for state: what the call updated, byte for byte
-    outside: int = 0  # gate_fp8, add_norm_quant: bytes (elements) that are the code of neither bf16 value around the judged value
+    #: gate_fp8, add_norm_quant: bytes (elements) that are the code of neither bf16 value around the judged value; row_quantize_fp4: block
+    #: scales that are not the twin's byte and codes outside their bracket
+    outside: int = 0
     off_nearest: int = 0  # gate_fp8, add_norm_quant: bytes off the nearest value's code although the judged value is beyond the margin
     other_value: int = 0  # add_norm_quant: normed elements that are the other bf16 value around the normalised value (inside the margin)
     not_of_out: int = 0  # add_norm_quant: 8-bit codes that are not those of the normed rows the same call wrote
-    blocks: int = 0  # swiglu_fp4: block scales judged, and those of them that are the byte of the fp64 chain
+    blocks: int = 0  # swiglu_fp4: block scales judged, and those of them that are the byte of the fp64 chain; row_quantize_fp4: of the twin
     blocks_equal: int = 0
+    second_codes: int = 0  # row_quantize_fp4: codes that are the second code of their bracket and not its first
     worst_share: float = 0.0  # swiglu_fp4: the largest distance of a code's value from the fp64 value, as a share of its bound
+    keys_outside: int = 0  # attention_prepare: key elements at the positions of a call outside their band (``outside``: query elements)
+    gates_equal: bool = True  # attention_prepare: the gate rows, byte for byte
+    values_equal: bool = True  # attention_prepare: the value rows at the positions of a call, byte for byte (``state_equal``: the rest of the pool)
+    #: attention_bf16_weights: the chain and the spread of the element that used the largest share of its bound (``worst_share``, for this band the
+    #: largest distance of an element from the chain as a share of its bound)
+    worst_at: Tuple[float, float] = (0.0, 0.0)
     cells: Dict[int, _Cells] = field(default_factory=dict)
     cell_bytes: Dict[int, Tuple[float, str]] = field(default_factory=dict)  # layer -> (the smallest share of a cell, which cell)
     cell_state: Dict[int, Tuple[float, str]] = field(default_factory=dict)
@@ -341,11 +456,29 @@ class BlockStats:
                 f"{self.not_of_out:,} 8-bit codes not those of the normed rows of their call; {self.off_nearest:,} off the nearest value more than "
                 f"{NORM_MARGIN_ULP32:g} fp32 units from the midpoint; {self.outside:,} outside{loud}"
             )
+        if self.band == "row_quantize_fp4":
+            return (
+                f"{self.blocks:,} block scales, {self.blocks - self.blocks_equal:,} of them not the twin's byte; {self.total_bytes:,} codes, "
+                f"{self.second_codes:,} of them the second code of their bracket (printed, not gated); {self.outside:,} outside{loud}"
+            )
         if self.band == "swiglu_fp4":
             return (
                 f"{self.blocks:,} block scales, {self.blocks - self.blocks_equal:,} of them another byte than the fp64 chain's; {self.total_bytes:,} codes, "
                 f"{self.total_bytes - self.equal_bytes:,} of them another code than the fp64 chain's; the largest distance of a code from the fp64 value "
                 f"{self.worst_share:.0%} of its bound; {self.outside:,} outside their bounds{loud}"
+            )
+        if self.band == "attention_prepare":
+            return (
+                f"{self.elements:,} query and key elements, {self.other_value:,} of them not the twin's byte; "
+                f"{self.outside:,} query and {self.keys_outside:,} key elements outside their band; gate rows {'equal' if self.gates_equal else 'DIFFER'}; "
+                f"value rows {'equal' if self.values_equal else 'DIFFER'}; the rest of the pool {'untouched' if self.state_equal else 'WRITTEN'}{loud}"
+            )
+        if self.band == "attention_bf16_weights":
+            chain, spread = self.worst_at
+            return (
+                f"{self.elements:,} elements, {self.other_value:,} of them not the reference chain's byte; {self.outside:,} outside their bound; the largest "
+                f"distance {self.worst_share:.3f} of its bound, at a chain of {chain:.4g} with a spread of {spread:.4g} (printed, not gated); "
+                f"the cache {'untouched' if self.state_equal else 'WRITTEN'}{loud}"
             )
         share = self.off_by_one / max(self.elements, 1)
         state = "" if self.state_equal else "; STATE DIFFERS"
@@ -467,9 +600,22 @@ class BlockTap:
         if stats.band == "add_norm_quant":
             _judge_norm(stats, out, ref, twin)
             return
+        if stats.band == "row_quantize_fp4":
+            _judge_row_quantize(stats, out, ref, twin)
+            stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)  # the call updates nothing
+            stats.ok = stats.ok and stats.state_equal
+            return
         if stats.band == "swiglu_fp4":
             _judge_swiglu(stats, out, ref, twin)
             stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)
+            stats.ok = stats.ok and stats.state_equal
+            return
+        if stats.band == "attention_prepare":
+            _judge_prepare(stats, out, ref, state, ref_state, twin)
+            return
+        if stats.band == "attention_bf16_weights":
+            _judge_attention_core(stats, out, ref, twin)
+            stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)  # the call writes nothing: what it reads, byte for byte
             stats.ok = stats.ok and stats.state_equal
             return
         if stats.band == "gdn_step":
@@ -599,6 +745,114 @@ def _judge_norm(stats: BlockStats, out, ref, twin) -> None:
     stats.ok = stats.finite and stats.outside == 0 and stats.off_nearest == 0 and stats.not_of_out == 0 and stats.state_equal
 
 
+def _judge_row_quantize(stats: BlockStats, out, ref, twin) -> None:
+    """One call of the 4-bit row quantise entry against its twin (band ``row_quantize_fp4``): ``out`` / ``ref`` are the packed
+    codes and the block scales of the two, row by row; the twin keeps the two codes of every element's bracket under its
+    own block scales.  A block scale is the twin's byte or outside; a code is one of the two of its bracket or outside."""
+    bracket = getattr(twin, "bracket", None)
+    if bracket is None:  # a table that names this band for a block whose twin is another chain
+        raise ValueError("the band row_quantize_fp4 is judged against the quantisation at the kernel's rounding points: the block's twin keeps no bracket")
+    low, high = bracket
+    if len(out) != 2 or len(ref) != 2 or out[1].shape != ref[1].shape or 2 * out[0].numel() != low.numel():
+        stats.outside += 1  # other outputs than the packed codes and the block scales of the call's rows: nothing can be compared
+        stats.ok = False
+        return
+    (packed, scales), of_twin = out, ref[1]
+    codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)  # one nibble per element, the even element first
+    first, second = codes == low, codes == high
+    stats.finite = stats.finite and bool(((scales & 0x7F) != 0x7F).all())  # E4M3 has no infinity; these two codes are its NaN
+    stats.blocks += scales.numel()
+    stats.blocks_equal += int((scales == of_twin).sum())
+    stats.total_bytes += codes.numel()
+    stats.equal_bytes += int(first.sum())
+    stats.second_codes += int((~first & second).sum())
+    stats.outside += int((scales != of_twin).sum()) + int((~first & ~second).sum())
+    stats.ok = stats.finite and stats.outside == 0
+
+
+def _judge_prepare(stats: BlockStats, out, ref, state, ref_state, twin) -> None:
+    """One call of the attention preparation entry against its twin (band ``attention_prepare``): ``out`` / ``ref`` are the
+    queries and the gates of the two, ``state`` / ``ref_state`` the pool of the layer's cache as each left it; the twin
+    keeps the band of every rotated element, the key rows it wrote and the position of the call.  The rows of the pool
+    the call's positions name are formed here from host integers -- the position and the tokens per sequence of the
+    call, the sequences of the step and the shape of the pool -- and from no table and no accessor of the cache."""
+    from .providers import torch_ref
+
+    terms = getattr(twin, "terms", None)
+    if terms is None:  # a table that names this band for a block whose twin is another chain
+        raise ValueError(
+            "the band attention_prepare is judged against the preparation at the kernel's rounding points: the block's twin keeps no band of its rotated elements"
+        )
+    pools = [tensors[0] for tensors in (*state, *ref_state) if len(tensors) == 1 and tensors[0].dim() == 4]
+    if len(out) != 2 or len(ref) != 2 or any(o.shape != r.shape for o, r in zip(out, ref)) or len(pools) != 2 or pools[0].shape != pools[1].shape:
+        stats.outside += 1  # other outputs than the queries and the gates, or a cache that is no pool of pages: nothing can be compared
+        stats.ok = False
+        return
+
+    def held(got, want, band) -> int:
+        """The elements of ``got`` outside ``|got - want| <= unit(the larger magnitude) + band``; a value that is not finite is outside."""
+        g, w = got.double(), want.double()
+        stats.finite = stats.finite and bool(torch.isfinite(g).all())
+        stats.elements += g.numel()
+        stats.other_value += int((torch_ref._bf16_bits(got) != torch_ref._bf16_bits(want)).sum())
+        return int((~((g - w).abs() <= torch_ref.bf16_unit(torch.maximum(g.abs(), w.abs())) + band)).sum())  # element by element: outside for a NaN
+
+    (q, gate), (q_ref, gate_ref) = out, ref
+    stats.outside += held(q, q_ref, terms.q_band)
+    stats.gates_equal = stats.gates_equal and bytes_equal(gate, gate_ref)
+    pool, ref_pool = pools
+    tokens, page, width = terms.tokens, int(pool.shape[2]), int(pool.shape[-1]) // 2
+    sequences = int(q.shape[0]) // tokens
+    pages = int(pool.shape[0]) // sequences  # of one sequence: sequence i owns the pages i * pages .. (i + 1) * pages - 1
+    at = [(sequence * pages + (terms.position + token) // page, (terms.position + token) % page) for sequence in range(sequences) for token in range(tokens)]
+    index = torch.tensor(at, dtype=torch.long, device=pool.device)  # the row of the pool of every row of the step, in the step's order
+    written = pool[index[:, 0], :, index[:, 1]]  # [rows, key / value heads, 2 * head width]
+    stats.keys_outside += held(written[..., :width], terms.k, terms.k_band)
+    stats.values_equal = stats.values_equal and bytes_equal(written[..., width:], terms.v)
+    # the gate rows and the value rows are bit copies of the call's operand, which the twin copies too: a NaN or an infinity
+    # there is the twin's byte, so the two comparisons above do not see it
+    stats.finite = stats.finite and bool(torch.isfinite(gate).all()) and bool(torch.isfinite(written[..., width:]).all())
+    rest = torch.ones(pool.shape[0], page, dtype=torch.bool, device=pool.device)
+    rest[index[:, 0], index[:, 1]] = False
+    stats.state_equal = stats.state_equal and bytes_equal(pool.transpose(1, 2)[rest], ref_pool.transpose(1, 2)[rest])
+    stats.ok = stats.finite and stats.outside == 0 and stats.keys_outside == 0 and stats.gates_equal and stats.values_equal and stats.state_equal
+
+
+def _judge_attention_core(stats: BlockStats, out, ref, twin) -> None:
+    """One call of a library attention kernel that documents no numerics contract against its twin (band
+    ``attention_bf16_weights``): ``out`` is the kernel's output and ``ref`` the reference chain's bytes, ``[rows, heads *
+    D]`` bf16 each; the twin keeps the chain of every element before its rounding to bf16 and the weighted magnitude of
+    the values it attends to, both in fp64.  The bound, the distance and the comparison are formed in fp64, element by
+    element; the spacing is the chain's own.  The largest share of its bound an element used is kept with the chain and
+    the spread of that element: printed, not gated."""
+    from .providers import torch_ref
+
+    if getattr(twin, "bound", None) is None:  # a table that names this band for a block whose twin is another chain
+        raise ValueError(
+            "the band attention_bf16_weights is judged against the reference chain with the operand terms of its bound: the block's twin keeps no such terms"
+        )
+    chain, spread = twin.bound
+    if len(out) != 1 or len(ref) != 1 or out[0].dtype != torch.bfloat16 or out[0].shape != ref[0].shape or out[0].shape != chain.shape:
+        stats.outside += 1  # other outputs than the one bf16 tensor of the chain's shape: nothing can be compared
+        stats.ok = False
+        return
+    got = out[0].double()
+    spacing = torch_ref.bf16_unit(chain.abs().clamp_min(torch.finfo(torch.float32).tiny))  # of two neighbouring bf16 values at |chain|
+    bound = ATTENTION_BAND_COEFFICIENT * (ATTENTION_WEIGHT_TERM * (spread + chain.abs()) + ATTENTION_SPACINGS * spacing)
+    distance = (got - chain).abs()
+    stats.finite = stats.finite and bool(torch.isfinite(got).all())
+    stats.elements += got.numel()
+    stats.other_value += int((torch_ref._bf16_bits(out[0]) != torch_ref._bf16_bits(ref[0])).sum())
+    inside = (distance <= bound) & torch.isfinite(bound)  # element by element: a NaN is outside, and so is an element whose chain is not finite
+    stats.outside += int((~inside).sum())
+    share = (distance / bound).flatten()
+    at = int(torch.where(torch.isnan(share), torch.full_like(share, float("inf")), share).argmax())  # an element that is no number comes first
+    worst = float(share[at])
+    if math.isnan(worst) or worst > stats.worst_share or stats.elements == got.numel():  # (a NaN stays; the first judged call's element is kept at any share)
+        stats.worst_share, stats.worst_at = worst, (float(chain.flatten()[at]), float(spread.flatten()[at]))
+    stats.ok = stats.finite and stats.outside == 0
+
+
 def _judge_swiglu(stats: BlockStats, out, ref, twin) -> None:
     """One call of the fused 4-bit gate / up entry against its twin (band ``swiglu_fp4``): ``out`` are the packed codes and
     the block scales the kernel wrote, row by row; ``ref`` the same of the fp64 chain at the kernel's rounding points; the
@@ -674,6 +928,11 @@ class Checks:
     unobserved: str = ""  # why the kernels were not observed
     on_demand: Optional[OnDemand] = None  # what the reference's copies of the weights the run keeps no copy of cost
     positions: Tuple[int, ...] = ()  # of a run with judged positions: the steps at which its blocks were held against the reference
+    #: of a run whose steps were replays: the verdict of its ``recorded step`` lines as one word (``PASS``, or ``FAIL`` with
+    #: what failed), how many steps were launched again from Python, and what ``digest`` gave of the state behind them
+    recorded: str = ""
+    recomputed: int = 0
+    end_state: Optional[str] = None
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -735,6 +994,35 @@ def on_demand_line(cost: OnDemand, blocks=()) -> str:
     )
 
 
+def recomputed_text(steps: int, prompt_tokens: int, page: Optional[int] = None) -> str:
+    """What the ``recorded step`` line of a replayed run says was recomputed: the replayed steps at positions 0 to ``steps -
+    1`` launched again from Python from a fresh state, with what those positions are -- the prompt positions among them,
+    the steps behind the prompt, which feed on their own token, and whether they cross the first page boundary of the
+    attention cache (``page``: its positions; ``None``: a cache without pages)."""
+    prompt = min(prompt_tokens, steps)
+    parts = [f"{prompt} prompt position{'s' if prompt != 1 else ''}"]
+    if steps > prompt:
+        own = steps - prompt
+        parts.append(f"{own} step{'s' if own != 1 else ''} that feed{'s' if own == 1 else ''} on {'its' if own == 1 else 'their'} own token")
+    if page is not None and steps > page:
+        parts.append(f"across the page boundary at position {page}")
+    return f"the replayed steps at positions {positions_text(range(steps))} ({', '.join(parts)}) launched again from Python from a fresh state"
+
+
+def tail_line(tail: Optional[tuple]) -> Tuple[bool, str]:
+    """The line under ``recorded step``: what ``Session.read_tail`` read behind the replayed request -- ``(held, text)``.  A
+    request whose tail was not read holds nothing: the part of a recorded step no recomputation from Python sees was
+    then not looked at, and the line fails."""
+    if tail is None:
+        return False, "the step's own tail was not read behind the request (Session.read_tail): the ids buffer and the position rows were not held"
+    ids, rows, position = tail
+    buffer = "held the last chosen ids" if ids else "did NOT hold the last chosen ids"
+    stood = (
+        f"stood at position {position}, where the request left the state" if rows else f"did NOT stand at position {position}, where the request left the state"
+    )
+    return bool(ids and rows), f"behind the request the ids buffer {buffer} and the position rows {stood}"
+
+
 def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
     """The kernel check on what the session's traced pass kept: ``(PASS | FAIL | NOT OBSERVED, why not observed, lines)``.  A
     session whose traced pass kept no launch records (it was not asked to) has observed nothing."""
@@ -745,6 +1033,11 @@ def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
     status, sentences = traced.judge()
     lines = [f"  kernels           {traced.summary()}    {status}"]
     lines += [f"    kernels: {sentence}" for sentence in sentences]
+    recorded, text = traced.recorded_step()  # of a session that replays its step: the replayed steps against those launched from Python
+    if recorded:
+        lines.append(f"    {text}    {recorded}")
+        if recorded == census.FAIL:
+            status = census.FAIL
     lines += [f"    {detail}" for detail in traced.details()]
     return status, traced.unobserved if status == census.NOT_OBSERVED else "", lines
 
@@ -805,14 +1098,16 @@ def run_checks(
     kernels: Optional[object] = None,  # True | False | DEFERRED; None: the session's own decision
     max_prompt_steps: Optional[int] = None,
     positions: Optional[Sequence[int]] = None,
+    reach: Optional[int] = None,
+    digest=None,
 ) -> Checks:
     """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded: its recorded steps, or the first
     ``max_steps`` of them (a long run of a deep model is checked on its first steps).  Leaves the session reset.
 
     ``kernels`` adds the kernel check on the traced pass the session made before this call (``Session.trace`` with launch
     records): a failure fails the run; kernels that could not be observed are reported, and ``Checks.unobserved`` says why.
-    Left out, it is the session's own decision (``Session.check_kernels``): a session of a stack that declares a target
-    kernel set is checked without being asked, so no caller can print a verdict for such a run that never looked at its
+    Left out, it is the session's own decision (``Session.check_kernels``): a session of a stack that always checks its
+    kernels (the family's ``checked_stacks``) is checked without being asked, so no caller can print a verdict for such a run that never looked at its
     kernels.  For such a session ``kernels=False`` is refused.  ``kernels=DEFERRED`` is for a caller that traces after
     these checks (the performance mode: no profiler pass comes before its last timed request): no kernel line is printed
     here, ``Checks.kernels`` says ``DEFERRED``, and the caller makes the check itself behind its traced request
@@ -825,6 +1120,26 @@ def run_checks(
     line of the checks then names the positions, and ``Checks.positions`` holds them: what was judged, for a caller that
     says so.  A position the run did not record is a ``ValueError``, never left out; so is a session built with
     ``draft_tokens=``.
+
+    ``reach`` is for a run whose steps were replays of a recorded step (``Session.replays``): the recorded run is launched
+    again from Python up to that step (exclusive) -- past ``max_steps``, which stays the bound of the block check and
+    of the reference stack's own pass -- and every step of it is held to what the replay left, ids and logits, byte
+    for byte.  So the recomputation can reach steps that feed on their own token and a page boundary of the attention
+    cache where the block check covers the first steps alone; it ends at the last recorded step where the run
+    recorded fewer.  Behind the prompt (``prompt_tokens``) a step is launched again as the loop launched it, on the
+    ids the step in front of it chose, and the ids every step was fed are held with its logits and the ids it chose:
+    a replayed step that was fed other ids than the step in front of it chose differs at that step.
+
+    **A run that replayed its steps** has another first check line, named for what it is: ``recorded step``, the replayed
+    steps launched again from Python from a fresh state, with the positions that were recomputed and, where it fails,
+    the first step that differs; and under it the step's own tail, read behind the request (``Session.read_tail``):
+    the ids buffer held the last chosen ids and the position rows stood where the request left the state.  A recorded
+    step that does not compute what the same steps compute from Python fails the run.  The recomputation, the block
+    check, the reference passes and the traced steps the kernel check judges are all launched from Python.
+
+    ``digest`` (a function of a decode state) is called on the state the recomputation from Python leaves, where it
+    recomputed every step the run recorded: ``Checks.end_state`` then holds what it returned, for a caller that holds
+    the end state of a replayed request against it.
 
     ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
     reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
@@ -842,12 +1157,11 @@ def run_checks(
 
     **With a drafter** the replay runs the drafter's passes again -- over the prompt, and in front of every verify step,
     which is fed the recorded window -- and ``replay`` holds the drafter's proposals of every recorded step beside the
-    ids and logits.  The reference sessions have no drafter: they are fed the recorded windows.  Under the kernel check
-    stands what a run can say about the kernels of the passes: nothing (``DRAFTER_KERNELS``)."""
+    ids and logits.  The reference sessions have no drafter: they are fed the recorded windows."""
     if kernels is None:
         kernels = session.check_kernels
-    elif not kernels and session.stack in getattr(session.model, "target_stacks", ()):
-        raise ValueError(f"stack {session.stack} declares a target kernel set: its kernel check cannot be switched off")
+    elif not kernels and session.stack in getattr(session.model, "checked_stacks", ()):
+        raise ValueError(f"stack {session.stack} always checks its kernels: the check cannot be switched off")
     if positions is not None and session.draft_tokens is not None:
         raise ValueError("judged positions are steps of a decode run; a session built with draft_tokens= has two kinds of step")
     session._closed("run_checks")
@@ -859,6 +1173,9 @@ def run_checks(
     if judged_at and not 0 <= min(judged_at) <= max(judged_at) < last:  # a position that was asked for is judged, or the run says no
         raise ValueError(f"judged positions {positions_text(judged_at)}: the run recorded {last} steps, the positions 0 to {last - 1}")
     last = steps if judged_at is None else max(steps, max(judged_at, default=-1) + 1)
+    if reach is not None:  # the recomputation of a replayed run reaches further than its block check; never past what was recorded
+        last = max(last, min(int(reach), main.count, main.inputs.shape[0]))
+    replays, tail = session.replays, session.tail  # read now: the session is reset below
     inputs, logits, ids = main.inputs[:last].clone(), main.logits[:last].clone(), main.outputs[:last].clone()
     accepted = list(main.accepted[:last])  # per step the tokens behind the first that the run kept: 0 for a decode step
     proposals = None if main.proposals is None else main.proposals[:steps].clone()  # of a session with a drafter: what it proposed
@@ -914,13 +1231,25 @@ def run_checks(
             session.tap = prompt_tap if t < judged_prompt else None
             prompt_tap.step = t
             session._feed(prompt[:, t].contiguous())
-        for t in range(last):  # every step replayed; the blocks judged at every one, or at the judged positions alone
-            session.tap = tap if judged_at is None or t in judged_at else None
+        own = None  # of a replayed run: the ids the step in front chose, as this pass computed them
+        for t in range(last):  # every step again, from Python; the blocks judged at the first ``steps``, or at the judged positions alone
+            session.tap = tap if (t < steps if judged_at is None else t in judged_at) else None
             tap.step = t
-            session._advance(inputs[t], accepted[t])
+            # a step of a replayed run behind its prompt is launched again as the loop launched it: on the ids the step in front
+            # of it chose.  A replayed step that was fed anything else -- an ids buffer that did not hold them -- differs from here on
+            feeds = own if replays and own is not None and t >= prompt_tokens else inputs[t]
+            own = session._advance(feeds, accepted[t])
     finally:
         session.tap = None
-    replay_ok = bytes_equal(session.record.logits[:last], logits) and bytes_equal(session.record.outputs[:last], ids)
+    compared = [(session.record.logits, logits), (session.record.outputs, ids)]
+    if replays:  # ... and the ids every step was fed, with the logits and the ids it chose
+        compared.append((session.record.inputs, inputs))
+    replay_ok = all(bytes_equal(mine[:last], theirs[:last]) for mine, theirs in compared)
+    # of a replayed run, the first step whose recomputation from Python is not what the replay left
+    first_wrong = None
+    if replays and not replay_ok:
+        first_wrong = next(t for t in range(last) if not all(bytes_equal(mine[t], theirs[t]) for mine, theirs in compared))
+    end_state = digest(session.state) if digest is not None and last == main.count else None  # behind every recorded step, launched from Python
     logits, ids = logits[:steps], ids[:steps]  # the reference stack's own pass stays on the first ``steps``
     if proposals is not None:  # ... and what the drafter proposed in front of every step
         replay_ok = replay_ok and bytes_equal(session.record.proposals[:steps], proposals)
@@ -987,7 +1316,17 @@ def run_checks(
         lines[0] = lines[0][:-1] + f"; behind a prompt of {fed} decode steps{some})"
         taps = [("the prompt's decode steps: ", prompt_tap), ("the verify steps: ", tap)]
     what = "ids and logits" if proposals is None else "ids, logits and the drafter's proposals"
-    lines.append(f"  replay            {what} byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
+    tail_ok = True
+    if replays:  # the record came out of replays: the line says what it holds, and the step's own tail stands under it
+        page = session.cache_page()
+        lines.append(
+            f"  recorded step     {recomputed_text(last, prompt_tokens, page)}: ids and logits byte-identical    {_verdict(replay_ok)}"
+            + ("" if replay_ok else f" (first at step {first_wrong})")
+        )
+        tail_ok, text = tail_line(tail)
+        lines.append(f"                    {text}    {_verdict(tail_ok)}")
+    else:
+        lines.append(f"  replay            {what} byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
     blocks_ok, judged = True, 0
     for what, each in taps:
         held, count, block_lines = _block_lines(each, session.reference_precision, what)
@@ -1014,11 +1353,12 @@ def run_checks(
             lines.append(
                 f"    the prompt's decode steps: {fed} replayed in front of the traced window, their kernels not observed (the check is of the verify steps)"
             )
-        if session.drafter is not None:
-            lines.append(f"    {DRAFTER_KERNELS}")
     session.reset(fresh=True)
-    ok = replay_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
-    return Checks(lines, ok, judged, status, unobserved, cost, tuple(sorted(judged_at or ())))
+    ok = replay_ok and tail_ok and blocks_ok and tokens_ok and batch_ok and stored_ok and status != census.FAIL
+    recorded = ""
+    if replays:
+        recorded = "PASS" if replay_ok and tail_ok else (f"FAIL (first at step {first_wrong})" if not replay_ok else "FAIL (the step's own tail)")
+    return Checks(lines, ok, judged, status, unobserved, cost, tuple(sorted(judged_at or ())), recorded, last if replays else 0, end_state)
 
 
 @dataclass
@@ -1228,13 +1568,6 @@ def verify_checks(session: Session, decode: Session, stream: Optional[Stream] = 
             lines.append(f"    {name}: {block.batch_note}")
     decode.reset(fresh=True)
     return Checks(lines, tokens_ok and state_ok, gated)
-
-
-#: what a run says of the kernels of a drafter's passes: they are attributed like every launch, and held to no census
-DRAFTER_KERNELS = (
-    "kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and the output head behind it; "
-    "no section holds a draft pass)"
-)
 
 
 class _Shadow:
@@ -1464,7 +1797,7 @@ def speculative_checks(session: Session, decode: Session, scheduled: Optional[Se
     band_units = None if band_units is None else float(band_units)
     plural = "s" if S > 1 else ""
     lines = [
-        f"speculative against decode ({S} sequence{plural} x {T} tokens per sequence, {steps} engine steps behind a prompt of {fed} tokens; "
+        f"speculative against decode ({S} sequence{plural} x {T} tokens per sequence, {steps} speculative steps behind a prompt of {fed} tokens; "
         f"tokens kept behind the first: {', '.join(str(count) for count in counts)}; {layers} layers)"
     ]
     near = [False] * steps

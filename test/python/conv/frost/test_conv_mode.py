@@ -9,7 +9,10 @@ import cudnn
 import pytest
 
 from cudnn.conv.frost.engine import FrostConvEngine
-from utils import requires_block_scale_cutedsl, requires_dense_cutedsl, requires_sm100
+from utils import _SM, requires_block_scale_cutedsl, requires_dense_cutedsl, requires_sm100
+
+# The block-scaled plan declines every part but SM100/SM103 before it reads the convolution mode.
+requires_block_scale_sm = pytest.mark.skipif(_SM not in (100, 103), reason=f"frost_conv block-scale serves SM100/SM103 only, have sm_{_SM}")
 
 pytestmark = [pytest.mark.L0, requires_sm100]
 
@@ -18,7 +21,7 @@ pytestmark = [pytest.mark.L0, requires_sm100]
     "block_scaled",
     (
         pytest.param(False, marks=requires_dense_cutedsl, id="dense"),
-        pytest.param(True, marks=requires_block_scale_cutedsl, id="block-scaled"),
+        pytest.param(True, marks=(requires_block_scale_cutedsl, requires_block_scale_sm), id="block-scaled"),
     ),
 )
 @pytest.mark.parametrize("mode", (None, "CROSS_CORRELATION", "CONVOLUTION"), ids=("default", "cross-correlation", "convolution"))

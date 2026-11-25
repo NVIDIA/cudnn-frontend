@@ -37,7 +37,7 @@ def skip_without_cuda13_for_12q1kv(hkv):
         pytest.skip("12Q/1KV QSA backward requires the CUDA 13 build of CuTe DSL")
 
 
-def make_inputs(lengths, hq, hkv, *, empty=False, all_selected=False):
+def make_inputs(lengths, hq, hkv, *, empty=False, all_selected=False, dtype=torch.bfloat16):
     rng = torch.Generator().manual_seed(123)
     total = sum(lengths)
     first, last, bases, origins = [], [], [], []
@@ -58,7 +58,7 @@ def make_inputs(lengths, hq, hkv, *, empty=False, all_selected=False):
         sel[::7] = False
 
     def normal(heads):
-        return torch.randn((total, heads, 256), generator=rng).to(torch.bfloat16).cuda()
+        return torch.randn((total, heads, 256), generator=rng).to(dtype).cuda()
 
     return dict(
         q=normal(hq),
@@ -188,7 +188,7 @@ def check_case(inputs):
     grads = qsa_backward(grad_out, **inputs, out_fp32=result["out_fp32"], lse=result["lse"])
     assert list(grads.keys()) == ["dq", "dk", "dv"]
     for actual, ref in zip(grads, expected_grads):
-        assert actual.dtype == torch.bfloat16
+        assert actual.dtype == inputs["q"].dtype
         assert_close(actual, ref)
 
 
@@ -221,6 +221,15 @@ def test_backward_bounds_reach_keys_after_the_query(supported_gpu, heads, length
 def test_six_query_heads_forward_routes(supported_gpu, lengths):
     """6Q/1KV takes the dense-tile route and the gathered route like 12Q/1KV. Neither is specialised for 12 heads."""
     check_case(make_inputs(lengths, 6, 1, empty=True))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
+@pytest.mark.parametrize("lengths", [(3, 5, 9), (513,), (2056,)], ids=["packed", "gated-dense", "gathered"])
+def test_fp16(supported_gpu, heads, lengths):
+    """BF16 and FP16 calls of one shape alternate in one process, so each must compile its own kernels."""
+    for dtype in (torch.bfloat16, torch.float16, torch.bfloat16):
+        check_case(make_inputs(lengths, *heads, empty=True, dtype=dtype))
 
 
 @pytest.mark.L1
@@ -269,10 +278,15 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
-@pytest.mark.parametrize("poison", [(torch.nan, torch.inf), (torch.inf, torch.nan), (1e20, -1e20)], ids=["nan-inf", "inf-nan", "finite"])
-def test_masked_kv_poison(supported_gpu, heads, poison):
+@pytest.mark.parametrize("poison", [(torch.nan, torch.inf), (torch.inf, torch.nan), "finite"], ids=["nan-inf", "inf-nan", "finite"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_masked_kv_poison(supported_gpu, heads, poison, dtype):
     skip_without_cuda13_for_12q1kv(heads[1])
-    inputs = make_inputs((3, 5), *heads, all_selected=True)
+    if poison == "finite":
+        # FP16 stores at most 65504
+        big = min(1e20, torch.finfo(dtype).max)
+        poison = (big, -big)
+    inputs = make_inputs((3, 5), *heads, all_selected=True, dtype=dtype)
     inputs["sel_blocks"][3:] = 0
     inputs["hi"][:3] = 0
     clean = qsa_forward(**inputs)

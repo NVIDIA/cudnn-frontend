@@ -58,15 +58,24 @@ under `cudnn.gemm`) is a direct-call step entry of the same kind.
 `cudnn.attention_prepare.frost`) is a direct-call step entry of the same kind.
 `RowQuantizeFp4Decode` (the FP4 row quantization decode step, also under
 `cudnn.row_quantize.frost`) is a direct-call step entry of the same kind.
+`RowQuantizeFp8Decode` (the FP8 row quantization decode step, also under
+`cudnn.row_quantize.frost`) is a direct-call step entry of the same kind.
+`RowArgmaxDecode` (the row argmax decode step, also under
+`cudnn.row_argmax.frost`) is a direct-call step entry of the same kind.
 The block-sparse attention (BSA) APIs `block_sparse_attention_forward`,
 `block_sparse_attention_backward` and `block_sparse_attention_backward_metadata`
 are in `cudnn.ops`; their rows cover the blk64 kernels (`sparse_block_size=64`).
+`MoeEp` (expert-parallel MoE, `cudnn.MoeEp`) has an inference entry (`__call__`)
+and stateless training entries (`training_forward`, `training_backward`,
+`training_wgrad`).
 The required settings below apply to this table. The `pygraph.custom_reduction`
 rows describe only the named reducer bodies and consumed graph outputs, not
 arbitrary user callbacks.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
+| `pygraph.matmul` with numerical note `BATCH_INVARIANT`, optional column bias | fprop | BF16 inputs and output, FP32 accumulation | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
+| Scaled `pygraph.matmul` with numerical note `BATCH_INVARIANT` | fprop | Per-tensor E4M3/E5M2, groupwise E4M3, MXFP8, NVFP4, MXFP4, MXFP8 × MXFP4. FP16/BF16 output | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
 | `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
 | `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
@@ -74,6 +83,7 @@ arbitrary user callbacks.
 | `cudnn.ops.gemm_glu_forward`, `act_func="swiglu"` / `"geglu"` | fprop | BF16, FP8 E4M3; block-scaled MXFP8 E4M3/E8M0 and NVFP4 E2M1/E4M3; FP32 or BF16 AB12, BF16 C | Unsupported | Supported (SM100, tested configurations; FP4-input amax reduces over the whole launch, so it is repeatable but not per-batch-element); SM103 unverified | Unverified |
 | `grouped_gemm_wgrad_wrapper_sm100`, empty-expert output contract | wgrad | NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 or FP32 dW | Unsupported | Supported for empty experts (SM100); general nonempty determinism and SM103 unverified | Unverified |
 | `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | bprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported with reduction limits below (SM100); SM103 unverified | Unsupported |
+| `grouped_gemm_dglu_wrapper_sm100` and `GroupedGemmDgluSm100`, `activation_tensor` (`dgeglu`, `dswiglu`) | bprop | BF16 C/D_row and activation | Unsupported | Supported for `activation_tensor` and `D_row` (SM100, tested configurations); atomic dprob/dbias are not guaranteed; SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3; BF16 C/D | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
 | `grouped_gemm_glu_hadamard_quant_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3; BF16 saved C; BF16 or NVFP4 rowwise RHT | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
 | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` (Torch); colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales; both GLU input layouts | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unverified for interleaved input; gate/up unsupported |
@@ -87,20 +97,26 @@ arbitrary user callbacks.
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
 | `cudnn.ops.causal_conv1d_update`, width four | fprop (inference step) | FP16 inputs, output, and state with FP32 accumulation | Supported (GH200, tested configurations) | Unverified | Unsupported |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
+| `MoeEp.__call__` (expert-parallel MoE inference) | fprop | MXFP8 activation and weights; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_forward` | fprop | MXFP8 compute; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_backward` | bprop | MXFP8 compute; FP32 dprob | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_wgrad` | wgrad | MXFP8 operands; BF16 or FP32 dW | Unsupported | Unsupported | Supported (replay, expert invariance and warm stress; no golden) |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
 | `AddNormQuantDecode` (add + RMSNorm + quantize decode step) | fprop (inference step) | BF16 in; BF16, FP8 E4M3 or NVFP4 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `SwigluFp4Decode` (block-scaled FP4 gate / up product with SwiGLU for decode rows) | fprop (inference step) | FP4 E2M1 in / out with E4M3 block scales; FP32 accumulate; BF16 intermediate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `AttentionPrepareDecode` (attention preparation decode step) | fprop (inference step) | BF16 in and out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `RowQuantizeFp4Decode` (4-bit block-scaled quantization of decode rows) | fprop (inference step) | BF16 in; FP4 E2M1 codes with E4M3 block scales out | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
+| `RowQuantizeFp8Decode` (per-row FP8 quantization of decode rows) | fprop (inference step) | BF16 in; FP8 E4M3 codes with one FP32 scale per row out | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
+| `RowArgmaxDecode` (row argmax with an id-table lookup for decode rows) | fprop (inference step) | BF16 in; INT32 or INT64 out (the column, or the id table's element) | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `simplified_sparse_attention_forward` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Replay only | Unsupported |
 | `simplified_sparse_attention_forward` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
 | `simplified_sparse_attention_forward_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Replay only | Unsupported |
 | `simplified_sparse_attention_forward_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
 | `dense_indexer_kl_forward`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Replay only | Unverified |
 | `dense_indexer_kl_forward`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
-| `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
-| `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
+| `qsa_forward` | fprop | BF16, FP16 | Unverified | Replay only | Replay only |
+| `qsa_backward`, `qsa_indexed_backward` | bprop | BF16, FP16 | Unverified | Replay only | Replay only |
 | `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Unverified | Supported | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
@@ -112,6 +128,7 @@ arbitrary user callbacks.
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | NVFP4 packed E2M1 Q/K; E4M3 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
+| `DSA.indexer_top_k_wrapper` with `starts` and `deterministic=True` | fprop | FP32, FP16, BF16 | Supported | Supported | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Unsupported | Unsupported |
@@ -168,8 +185,9 @@ arbitrary user callbacks.
 | `pygraph.sdpa_mxfp8` with `causal_exclude_own_block=32` | fprop | MXFP8 E4M3 or E5M2 Q/K/V; E8M0 scales; BF16 O, FP32 Stats | Unsupported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unsupported |
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
+| `grouped_gemm_dglu_wrapper_sm100` with `deterministic=True`, BF16 kernel (`dswiglu`, `dgeglu`; Torch; no dbias) | bprop | BF16 A/B/C/D_row; FP32 dprob | Unsupported | Supported for dprob and D_row (SM100, tested configurations); SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
-| `cutemok_forward` / `cutemok_backward` | fprop, bprop | BF16; MXFP8 routed weights | Unsupported | Unverified | Unsupported |
+| `cutemok_forward` / `cutemok_backward` | fprop, bprop | BF16; MXFP8 routed weights | Unsupported | Unverified (SM100 MXFP8 replay checked; batch invariance and SM103 unverified) | Unsupported |
 
 On SM89 (GeForce RTX 4090), the FP16 width-four `cudnn.ops.causal_conv1d_update`
 passed replay, batch-isolation, and golden checks for both output and state.
@@ -385,12 +403,21 @@ for replay, batch-invariance, and stress-test results.
   failing case IDs and do not establish determinism. See the
   [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#simplified-sparse-attention-ci-failures--2026-11-20).
 
+- `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel: by default dprob combines its
+  N-tiles with an fp32 atomic, so it changes between runs once N spans more
+  than one tile (256 columns at the default tile). With `deterministic=True`,
+  dprob and D_row repeat byte for byte. They are also unchanged when experts
+  are reordered or duplicated, or their neighbors change. D_row does not
+  depend on the flag. dbias and JAX inputs raise under the flag. See the
+  [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#grouped-bf16-dglu-deterministic-dprob--sm100-2026-11-23-utc).
+
 - Canonical grouped GLU: the new branch-order option is distinct from the
   APIs' natural-rank tensor support. The forward suite checks C, both D
   orientations and their scale factors; backward checks both D orientations,
   scales, dprob and optional dbias. Deterministic dprob uses the existing
-  deterministic reduction for MXFP8/NVFP4 (`deterministic=True`). BF16 dprob
-  byte qualification is limited to the tested single-N-tile F=128 case.
+  deterministic reduction for MXFP8/NVFP4 and BF16 (`deterministic=True`).
+  With the flag, BF16 dprob is byte-qualified at four N-tiles (F=1024). Without
+  it, BF16 dprob byte qualification is limited to the tested single-N-tile F=128 case.
   Atomic dbias and legacy-alias atomic dprob are separate numerical checks
   and carry no new bitwise guarantee. SM100 passed independent references,
   replay and batch invariance; SM103 is unverified.
@@ -480,6 +507,28 @@ for replay, batch-invariance, and stress-test results.
   belong to one cc 10.3 runtime and one cc 10.7 runtime: on cc 10.0 the
   status rests on the replay and batch-invariance cells, and the golden
   comparison is not covered there. SM90 and SM120 are declined by type.
+- Expert-parallel MoE (`MoeEp`): no deterministic mode and no determinism
+  suite yet, so SM107 is unverified; SM90, SM100/103 and SM120 are declined by
+  the capability check. Known order-dependent reduction: training backward
+  adds per-tile dprob partials with FP32 atomics. Training forward and
+  backward route tokens in a fixed sequence; inference token communication
+  does not. The functionality tests check that the forward tuning fields write
+  the default tuning's output bytes, and that repeated calls do not
+  accumulate. Neither check qualifies replay or batch invariance.
+  `training_wgrad` is the exception: each output tile is reduced by one CTA
+  over its expert's whole padded segment, with no split-K and no atomics.
+  `test_moe_ep_wgrad.py` checks the following on raw bytes, also on a shape
+  that spans more than one wave of clusters and up to 16 K tiles per expert:
+  - replay with fresh outputs under concurrent work, for dense and discrete
+    destinations and for `accumulate=True` from the same starting value;
+  - that an expert's bytes survive new neighbors, reordering and duplication;
+  - that every output layout and storage form stores the same FP32
+    accumulator;
+  - a warm and poisoned stress against the grouped WGrad API's bytes.
+
+  `accumulate=True` adds to the destination once per element, so its bytes
+  also depend on the destination's prior contents. The bytes equal the
+  grouped WGrad API's on the same operands. No golden is recorded.
 - Attention gate + quantize decode step (`AttentionGateQuantDecode`): no
   determinism switch and no numerics knob. The kernel has no reduction, so a
   row's bytes are a function of its own operand values and of the scale: a
@@ -615,6 +664,50 @@ for replay, batch-invariance, and stress-test results.
   exact rounding tie under a block scale that is not a power of two follows
   the approximate reciprocal), and a golden recorded on one runtime does not
   qualify another. No backward entry point exists.
+- FP8 row quantization decode step (`RowQuantizeFp8Decode`): no
+  determinism switch and no numerics knob. A row's bytes -- its codes and its
+  one scale -- are a function of its values: the one reduction, the row
+  maximum of magnitudes, never leaves the row's thread block and is exact in
+  any order, and every step behind it (two correctly rounded divisions, one
+  maximum, one multiplication and one nearest-even conversion per element) is
+  exactly specified. A row alone writes the bytes it writes inside a call of
+  up to 1024 rows, at any position and among any neighbours. The launch knobs
+  (`pdl`, `pdl_release`), the row stride of `x` and the owner of an output
+  write the same bytes. The status covers finite rows: a row that holds a NaN
+  or an infinity has unspecified bytes and leaves every other row as it is.
+  SM100 is verified on cc 10.0 (148 SMs) with the committed goldens of that
+  one runtime, recorded under CuTe DSL 4.8.0 and checked under both of its
+  compiler flavours. cc 10.3 and cc 10.7 have not been run, so SM103 and SM107
+  are unverified: the entry admits compute capability 10.x, the kernel
+  compiles for the `sm_100a`, `sm_103a` and `sm_107a` targets, and cc 10.7
+  needs the DSL's CUDA 13 compiler flavour. SM90 and SM120 are declined by
+  type. The 1024-row call crosses scheduling waves on every served part (seven
+  waves on 148 SMs, where one thread block occupies an SM); the kernel holds
+  no state between thread blocks. No
+  instruction of the chain is approximate, so the bytes are not expected to
+  differ between GPU architectures; that is unverified until a second
+  architecture has run, and a golden recorded on one runtime does not qualify
+  another. No backward entry point exists.
+- Row argmax decode step (`RowArgmaxDecode`): no determinism switch and no
+  numerics knob. A row's result -- the lowest column of the row maximum, or
+  the id table's element at that column -- is a function of the row's values
+  and of the table. The op is exact (compares and bit copies, no arithmetic),
+  so no association and no rounding can differ: the one reduction of the
+  kernel, over the thread block of the row, returns the maximum and the lowest
+  index that holds it in any order. A row alone gives the result it gives
+  inside a call of up to 1024 rows, at any position and among any neighbours.
+  The table kind (none, int32, int64) and the owner of the output change
+  nothing but the result's dtype. SM100 is verified on cc 10.0 (148 SMs) with
+  the committed goldens of that one runtime, recorded under CuTe DSL 4.8.0 and
+  checked under both of its compiler flavours; the suites also ran under CuTe
+  DSL 4.8.1 with the same results. cc 10.3 and cc 10.7 have not been
+  run, so SM103 and SM107 are unverified: the entry admits compute capability
+  10.x, the kernel's rendering is checked for the `sm_100a`, `sm_103a` and
+  `sm_107a` targets, and cc 10.7 needs the DSL's CUDA 13 compiler flavour.
+  SM90 and SM120 are declined by type. On cc 10.0 the driver reports two
+  thread blocks of the kernel per SM, so a call of more than 296 rows crosses
+  a scheduling wave on a 148-SM part (no other part was asked); the kernel
+  holds no state between thread blocks. No backward entry point exists.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in

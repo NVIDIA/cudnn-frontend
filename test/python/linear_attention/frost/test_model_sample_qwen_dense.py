@@ -2,11 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """GPU smoke of the dense Qwen model sample (``samples/models/qwen_dense/00_decode.py``): the script is loaded by path and its
-``main()`` is called as a user's default run -- the reduced seeded model, 1 and 4 sequences, the sample's own checks against its
+``main()`` is called -- the reduced seeded model, 1 and 4 sequences, the sample's own checks against its
 fp64-accumulated reference (replay, every provider block teacher-forced, the greedy tokens, each sequence alone against the
 same sequence in the batch).  The run must print ``[00] PASS`` and the environment line; on a GPU, a library version or a
 free-memory budget the sample does not serve it prints ``[00] SKIP <requirement>`` and the cell is reported as skipped with
-that sentence -- unless a check failed before it: a skip never covers a failure.  Every line of the run is read from
+that sentence -- unless a check failed before it: a skip never covers a failure.
+
+The sample's stack is ``native``, the default of a run that names none: its step is recorded once and replayed.  That
+stack calls a library, so the cell of the default run runs where the library is installed and is skipped elsewhere --
+uncovered, not passing.  Every other stack is one for functional validation and is run here by its name (``--stack
+fe-cublas``, ``--stack fe-entries``): the in-process cell of this module is the run on ``fe-cublas``.  One cell holds what
+a default run does where a package of the stack is missing, without uninstalling anything: one ``[NN] ERROR`` line that
+names the package, exit code 1, nothing loaded.  Every line of the run is read from
 standard error, and standard output must stay empty: it is kept for generated text, which a seeded run does not have.
 Each sequence count also reports its
 traced pass (GPU busy, idle and launches per step from kernel activity records, or the reason there are none) and the
@@ -14,22 +21,35 @@ bytes of a step.  The performance mode of the same seeded model (``--perf``) run
 its verdict, its report in the reduced-model form and its report file are held, none of its times.  The
 verdict line, the stack, the versions and the wall time are recorded through ``frost_routing.measured``, so the result -- or
 the skip -- reaches the job log of a passing run.  L0 runs the two-layer model (one linear-attention + one attention layer), L1
-the four-layer one (three + one).
+the four-layer one (three + one), and a run of 85 sequences of the two-layer model, whose peak of allocated memory is held to the memory
+sentence and to the count behind it.
 
 The ``fe-entries`` cell runs the same default run on the stack ``fe-entries``: every cuDNN Frontend row of the stack ``native``
 (the fused linear-attention step in its wait + release form; on compute capability 10.x the attention gate + quantise
-entry, the add + RMSNorm + quantise entry in the form of each call site and the fused 4-bit gate / up entry, each judged
-against its twin) with every other block on its fallback row -- no package beyond cuDNN Frontend and PyTorch.
-That stack always checks its kernels: the profiler's record of every launch of the traced steps is held against the plan,
-the entries' own launch facts and, where the family's kernel census has a section for the GPU, the recorded launch shapes.
+entry, the add + RMSNorm + quantise entry in the form of each call site, the fused 4-bit gate / up entry and the attention
+preparation entry, which writes a paged attention cache, each judged against its twin) with every other block on its
+fallback row -- no package beyond cuDNN Frontend and PyTorch.
+That stack always checks its kernels: the profiler's record of every launch of the traced steps is held against the plan
+and against the entries' own launch facts.
 Where the profiler's records cannot be had the sample ends in ``[00] RAN fe-entries stack (kernels not observed: <reason>)``:
 the cell then passes on the other checks and the recorded line says that the kernels were not observed -- uncovered
 there, not verified.
 
-The ``native`` cell runs the default run on the stack ``native`` itself, which has three rows more: the multiplies the target
-runs on a library, FlashInfer, on the stored weights.  FlashInfer is an optional package of that stack alone, so the cell runs
-where it is installed at a validated version and is skipped elsewhere -- by this module where the package is absent, by the
-sample's own ``[00] SKIP`` line where its version is not validated.  A skipped cell is uncovered, not passing.
+The ``native`` cell is the default run -- no flag -- on the stack ``native`` itself, which has four rows more: three multiplies of a
+library, FlashInfer, on the stored weights, and the attention core on that library's paged decode attention.
+FlashInfer is an optional package of that stack alone, so the cell runs where it is installed at a validated version with
+its kernel-binary package and is skipped elsewhere -- by this module where the library is absent, by the sample's own
+``[00] SKIP`` line where its version is not validated or a kernel binary is not on the machine.  A skipped cell is
+uncovered, not passing.  A second cell of that stack sets the library's directory variable to an empty directory: the
+run ends in ``[00] SKIP`` before anything is loaded, by one of the sample's own sentences, and neither stream holds a path.
+
+The attention core's cells run no script: a small program in a fresh interpreter takes the block of the stack ``native``
+for a step shape and calls it on a paged cache whose every row is drawn, judged in the row's band the way a run judges
+a call.  One cell holds five drawn cases at one sequence; one runs the control arms, each of which must fail -- a
+masked row let in, the newest row dropped, the last page exchanged with a full one, the scores at the library's default
+scale, a twin that reads a value row from the next slot or lets every row of a step attend to all of them -- and the
+adapter's own decline of 64-bit tables; one (L1) runs a step shape for each kernel form of the library and records the
+kernel's name.
 
 That cell runs the sample in a FRESH INTERPRETER, as a user does.  The kernel check compares the profiler's kernel names
 with the symbols the entries state, and the profiler names a kernel wrongly after a kernel module was unloaded in the same
@@ -44,8 +64,7 @@ script reaches it, so a small program drives the helper layer in a fresh interpr
 session of the stack ``fe-entries`` on one load of the reduced seeded model; the decode run's token stream through verify
 steps that keep every possible number of tokens once, against the decode steps (``tie_out.verify_checks``); then the
 verify session's own checks with its kernel check (``tie_out.run_checks``).  The fused verify entry is judged, token by
-token, against reference decode steps; its launch against the entry's own facts and, at one sequence of six tokens on a
-GPU the census has a section for, against the recorded launch shape.  The out-projection of the linear-attention layer is
+token, against reference decode steps; its launch against the entry's own facts.  The out-projection of the linear-attention layer is
 the FP8 projection entry's in such a step where a row of the stack holds the step's rows (compute capability 10.0: 2 to
 16 rows; 10.3 and 10.7: 2 to 32), in the split of that row range, and is judged against the reference multiply under the
 name of its call site; the attention layer's out-projection, and both beyond those rows, are the multiply over a copy.
@@ -59,13 +78,30 @@ streams held; it launches two forms no other L0 cell launches -- the fused verif
 took.  The L1 cell is the same run on the stack ``fe-entries`` in a fresh interpreter: its kernel check holds whole steps,
 the lookups of the drafter's passes and the verify plan's rows.
 
-The paged-cache cell runs no script: no provider row asks for the paged attention cache of a state yet
-(``state.PagedKvCache``), so no run builds one.  A small program in a fresh interpreter runs the two reference chains of an
+The attention preparation's cell runs 80 plain steps of the stack ``fe-entries`` at two sequences, across the first page
+boundary of the attention cache, and holds the pool its entry wrote against a plain cache that the entry's twin fills
+from the rows the in-projection handed the entry: read by index arithmetic of its own -- value rows bitwise, key rows
+inside the entry's band, every row behind the last position still zero --, the cache's accessors against the same
+arithmetic, then the session's own checks over all 80 steps.  Two verify cells run steps of several tokens on that pool:
+two sequences of six tokens with a step across the boundary and rejected rows on either side of it, and 16 sequences
+of five tokens, 80 rows in one launch.
+
+The paged-cache cell runs no script: it holds the two reference chains of an attention layer on the paged attention cache
+of a state (``state.PagedKvCache``), without the entry.  A small program in a fresh interpreter runs the two reference chains of an
 attention layer on a plain cache and on a paged one at the published widths, across the first page boundary, and holds
 the bytes of the two against each other, the pool against index arithmetic of its own, the state's cos / sin table against
 the chain's function on the device, and the kernels the chains launch on the pool to their families.  It runs where the
 family serves the GPU and on compute capability 8.0, and is skipped by name on any other class; a host case holds that
 condition on stated compute capabilities.
+
+The recorded-step cells run no script either: a small program in a fresh interpreter builds two sessions of the stack
+``native`` on one load -- one launched from Python, one that records its decode step once and replays it
+(``Session(capture=True)``) -- and holds a replayed request to the same request launched from Python: the ids, the
+logits byte for byte, the end-state digest, at 1 and at 4 sequences; then that a planted difference is found at its
+step, that a replay past the capacity launches nothing, and that a declined recording leaves PyTorch's current stream
+where it was.  A second program holds that a replayed step feeds the ids it is handed: the tensor such a step returns,
+changed in place and handed back, gives the request launched from Python on the changed ids.  They run where the
+library is installed, as the ``native`` cell does.
 
 Every line of a run is read from standard error, which is not the sample's alone: a library may print there first, and
 behind the run's last line.  A cell that reads the header of a run finds it by the script's tag (``_header``), and
@@ -117,26 +153,28 @@ def speculative(monkeypatch):
     yield from _loaded(monkeypatch, SPECULATIVE)
 
 
-FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2"
-#: with the gate entry, the norm entry and the fused gate / up entry (compute capability 10.x) three more blocks are cuDNN Frontend's:
-#: two reference chains and one multiply over a copy fewer are fallbacks
-FE_ENTRIES = "by provider: cuDNN FE 4 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
+FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 9 (cuBLAS over copies 4, PyTorch chains 5) | PyTorch 2"
+#: with the gate entry, the norm entry, the fused gate / up entry, the attention preparation entry and the entry of the head's
+#: quantise (compute capability 10.x) five more blocks are cuDNN Frontend's: four reference chains and one multiply over a copy
+#: fewer are fallbacks
+FE_ENTRIES = "by provider: cuDNN FE 6 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
 #: on compute capability 10.0 the in-projection is the FP8 projection entry's as well; the out-projection stays a multiply over a copy
-FE_ENTRIES_CC100 = "by provider: cuDNN FE 5 | fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2) | PyTorch 2"
-#: the stack native on compute capability 10.x: the three multiplies FlashInfer serves are no fallbacks, and no lane of this
-#: repository runs them
-NATIVE = "by provider: cuDNN FE 4 | FlashInfer 3 | fallbacks 3 (cuBLAS over copies 1, PyTorch chains 2) | PyTorch 2 | unverified in CI: 3"
-NATIVE_CC100 = "by provider: cuDNN FE 5 | FlashInfer 3 | fallbacks 2 (PyTorch chains 2) | PyTorch 2 | unverified in CI: 3"
+FE_ENTRIES_CC100 = "by provider: cuDNN FE 7 | fallbacks 4 (cuBLAS over copies 3, PyTorch chains 1) | PyTorch 2"
+#: the stack native on compute capability 10.x: the three multiplies and the attention core FlashInfer serves are no fallbacks,
+#: and no lane of this repository runs them
+NATIVE = "by provider: cuDNN FE 6 | FlashInfer 4 | fallbacks 1 (cuBLAS over copies 1) | PyTorch 2 | unverified in CI: 4"
+NATIVE_CC100 = "by provider: cuDNN FE 7 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4"
 
 
 CHILD_SECONDS = 1200  # the fresh interpreter's deadline: imports, the compiles of both sequence counts and the run, far above what they take
 
 
-def _fresh_interpreter(arguments, script=SCRIPT, tag="[00]"):
+def _fresh_interpreter(arguments, script=SCRIPT, tag="[00]", environment=None):
     """A sample script as a user runs it: in a fresh interpreter, which imports the ``cudnn`` package this process imported.
     Returns ``(exit code, the run's lines, what the run wrote to standard output)``: a sample writes every line of a run
     to standard error and keeps standard output for generated text.  The child arms its own stack dump before the
-    parent's deadline; where the deadline passes, the failure carries what the child had printed."""
+    parent's deadline; where the deadline passes, the failure carries what the child had printed.  ``environment``:
+    variables the child has beside this process's."""
     import cudnn
 
     package_root = str(Path(cudnn.__file__).resolve().parent.parent)
@@ -150,7 +188,8 @@ def _fresh_interpreter(arguments, script=SCRIPT, tag="[00]"):
         f"runpy.run_path({str(script)!r}, run_name='__main__')\n"
     )
     try:
-        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=CHILD_SECONDS)
+        env = None if environment is None else {**os.environ, **environment}
+        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=CHILD_SECONDS, env=env)
     except subprocess.TimeoutExpired as late:
         shown = [part.decode(errors="replace") if isinstance(part, bytes) else (part or "") for part in (late.stdout, late.stderr)]
         pytest.fail(f"the sample did not end within {CHILD_SECONDS} s in a fresh interpreter\n--- stdout\n{shown[0][-6000:]}\n--- stderr\n{shown[1][-6000:]}")
@@ -159,6 +198,9 @@ def _fresh_interpreter(arguments, script=SCRIPT, tag="[00]"):
             f"the sample printed no verdict in a fresh interpreter (exit code {done.returncode})\n--- stdout\n{done.stdout[-3000:]}\n--- stderr\n{done.stderr[-6000:]}"
         )
     return done.returncode, done.stderr, done.stdout
+
+
+FE_CUBLAS_STACK = ["--stack", "fe-cublas"]  # the functional-validation stack the in-process cells run, by its name
 
 
 def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, unobserved=False):
@@ -191,18 +233,88 @@ def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, un
     assert code == 0 and held, out[-6000:]
     assert "distribution" in versions and "source hash" in versions, "the environment check ran and its line was printed"
     assert by_provider in out
-    for check in ("replay", "blocks", "tokens"):
+    first = "recorded step" if "[00] step recorded: " in out else "replay"  # of a replayed run: the replayed steps launched again from Python
+    for check in (first, "blocks", "tokens"):
         assert out.count(f"  {check} ") == 2 and f"  {check} " in out, f"the {check} check ran at both sequence counts"
     assert "linear_attention.step equal (gated)" in out or "REPORTED" in out, "batch invariance was checked at 4 sequences"
     assert out.count("\ntraced pass ") == 2 and out.count("\nbytes per step ") == 2, "each count reports its traced pass (or why there is none) and its bytes"
     assert " FAIL" not in out
+    # every session says in one line whether its step is recorded or launched from Python, and a validation stack says what it is
+    launch = [line for line in out.splitlines() if line.startswith(("[00] step recorded: ", "[00] launched from Python: "))]
+    assert len(launch) == 2, launch
+    if stack != "native":
+        told = f"[00] launched from Python: {stack} is a functional-validation stack, taken by --stack alone -- "
+        assert all(line.startswith(told) and line.endswith("; the sample's stack is native") for line in launch), launch
     return out
 
 
 @pytest.mark.L0
-def test_default_run_passes_its_own_checks(sample, capsys):
-    out = _run(sample, capsys, [])
-    assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "20 block calls per step" in out
+def test_the_run_on_the_fe_cublas_stack_passes_its_own_checks(sample, capsys):
+    """``--stack fe-cublas``, a functional-validation stack, loaded by path and run in this process: launched from Python,
+    and it says so in one line behind each load."""
+    out = _run(sample, capsys, FE_CUBLAS_STACK)
+    assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "21 block calls per step" in out
+    assert "| stack fe-cublas\n" in out and "[00] step recorded: " not in out and "\n  recorded step " not in out, "nothing of a recorded step"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("script", ["00_decode.py", "02_speculative_decode.py"])
+def test_a_default_run_without_a_package_of_its_stack_stops_and_names_the_package(script, monkeypatch, capsys):
+    """A run that names no stack is a run of ``native``, and where a package that stack calls is not installed it stops:
+    one ``[NN] ERROR`` line that names the package and the command that installs it, exit code 1, before anything is
+    built or loaded -- never a ``SKIP``, and never another stack in its place.  The package's absence is stated to the
+    adapter (its reader of the distribution's metadata answers "not installed"): nothing is uninstalled.  Then the
+    kernel-binary package alone is missing: the same stop, by that package's name.  A functional-validation stack is
+    untouched by either (the run on ``fe-entries`` plans to its load).  On a class the library's rows do not claim the
+    stack needs no package: skipped by name there."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the library rows of the stack native claim compute capability 10.x: on this class the stack calls no package")
+    module = next(_loaded(monkeypatch, MODELS / "qwen_dense" / script))
+    tag = module.TAG
+    from model_samples import Session
+    from model_samples.providers import flashinfer_calls
+
+    def no_load(session):
+        raise AssertionError("reached a load")
+
+    monkeypatch.setattr(Session, "load", no_load)
+    monkeypatch.setattr(flashinfer_calls, "installed", lambda: None)
+    code = module.main([])
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith(f"{tag} ")]
+    stop = (
+        f"{tag} ERROR the stack native cannot run: flashinfer.gemm.bmm_fp8 needs flashinfer-python 0.7.2.post1, which is not installed: "
+        "pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt; "
+        "--stack fe-entries runs the cuDNN Frontend rows of this stack without the package"
+    )
+    frost_routing.measured(f"model sample qwen_dense {script} (default), the library not installed", lines[-1])
+    assert code == 1 and lines[-1] == stop and captured.out == "", captured.err[-4000:]
+    assert sum(" ERROR " in line for line in lines) == 1 and not any(" SKIP " in line or "stage " in line for line in lines), "one message, nothing loaded"
+    assert any(line.endswith("| stack native") for line in lines), "the run was the sample's own stack"
+    # a functional-validation stack does not call the package: its run plans to its load
+    with pytest.raises(AssertionError, match="reached a load"):
+        module.main(["--stack", "fe-entries"])
+    capsys.readouterr()
+    # the kernel-binary package alone is missing: found where the attention core holds its binaries, before anything is loaded
+    monkeypatch.undo()
+    module = next(_loaded(monkeypatch, MODELS / "qwen_dense" / script))
+    from model_samples import Session as Again
+    from model_samples.providers import flashinfer_calls as calls
+
+    if calls.installed() not in calls.VALIDATED:
+        return  # the library itself is not installed here: the stop above is this installation's own
+    monkeypatch.setattr(Again, "load", no_load)
+    monkeypatch.setattr(calls, "binaries_package", lambda: (None, False))
+    monkeypatch.setattr(calls, "hold_binaries", lambda folder, family, cc, manifest=None: "its manifest is not there")
+    monkeypatch.delenv(calls.BINARIES_DIRECTORY, raising=False)
+    code = module.main([])
+    captured = capsys.readouterr()
+    last = [line for line in captured.err.splitlines() if line.startswith(f"{tag} ")][-1]
+    frost_routing.measured(f"model sample qwen_dense {script} (default), the kernel-binary package not installed", last)
+    head = f"{tag} ERROR the stack native cannot run: flashinfer.decode.trtllm_batch_decode_with_kv_cache needs the kernel-binary package flashinfer-cubin "
+    assert code == 1 and last.startswith(head) and ", which is not installed: pip install --no-deps --index-url " in last, captured.err[-4000:]
 
 
 @pytest.mark.L0
@@ -210,10 +322,11 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
     """The cuDNN Frontend rows of the stack ``native``, on real launches: the fused step in its wait + release form and, on
     compute capability 10.x, the gate + quantise entry, the add + RMSNorm + quantise entry (four of its forms on the
     two-layer model, each call served by the instance of its call site) and the fused 4-bit gate / up entry (the kernel
-    stated whole, in the token tile of the row count) inside their bands against their twins; on compute capability 10.0
+    stated whole, in the token tile of the row count) and the attention preparation entry (on a paged attention cache, the
+    kernel stated whole) inside their bands against their twins; on compute capability 10.0
     the FP8 projection entry for the in-projections (one instance per weight shape) inside the band of the reference
     multiply, and on every other class that block on its multiply over a copy; the kernel check on every launch of the
-    traced steps; the census line, which claims nothing while a row is a fallback.
+    traced steps, and under each kernel table its count of a step.
     Where an entry that multiplies on the stored format serves both sequence counts -- the fused gate / up entry on
     compute capability 10.x, the projection entry on 10.0 -- the run holds those weights on their stored format alone, so
     the reference of the checks makes its own bf16 copies: the run says that the stored bytes they are made from are those
@@ -229,9 +342,13 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
     by_provider = FE_ENTRIES_CC100 if projection else (FE_ENTRIES if gate else FE_CUBLAS)
     out = _run(None, capsys, ["--stack", "fe-entries"], "fe-entries", by_provider, unobserved=True)
     assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "stack fe-entries" in out
-    assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the fused step in the target's form"
+    assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the fused step in the form of the stack's row"
     assert out.count("\nkernels, planned (decided before the load") == 2 and out.count("\n  kernels  ") == 2, "the kernel check ran at both sequence counts"
-    assert out.count(": NOT CLAIMED (") == 2 and ": EQUAL" not in out, "nothing is claimed while a row of the stack is a fallback"
+    counted = [line for line in out.splitlines() if line.startswith("  per step: ") and " exact row" in line]
+    assert len(counted) == 2 and counted[0] == counted[1], "the count of a step under the kernel table, the same at both sequence counts"
+    if projection:  # every entry row of the stack serves this class: the four blocks a library serves in native are on their fallback rows
+        assert counted[0].startswith("  per step: 14 launches on 8 exact rows, checked one by one in the wiring order; the launches of 6 fallback calls ")
+    assert "; the library launched " not in out, "no row of this stack is a library's"
     if gate:
         assert "cudnn.AttentionGateQuantDecode [THREADS 256, PDL_RELEASE True]" in out
         assert out.count("[band: gate_fp8]  PASS") == 2, "the gate entry was judged against its twin at both sequence counts"
@@ -247,6 +364,24 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         assert fused in out, "the fused gate / up entry, the kernel stated whole: 1 and 4 rows run the 8-token tile"
         assert out.count("[band: swiglu_fp4]  PASS") == 2, "judged against its twin at both sequence counts"
         assert "mlp.gate_up equal (gated)" in out or "REPORTED" in out
+        assert "cudnn.RowQuantizeFp4Decode [WIDTH 5120, PDL True, PDL_RELEASE True]" in out, "the entry of the head's quantise, its whole config"
+        quantised = [line for line in out.splitlines() if line.split()[:1] == ["output_head.quantize"] and "calls" in line and "[band: " in line]
+        assert len(quantised) == 2 and all(
+            line.endswith("; 0 outside  [band: row_quantize_fp4]  PASS") for line in quantised
+        ), "the head's quantise was judged against its twin at both sequence counts"
+        assert "output_head.quantize equal (gated)" in out or "REPORTED" in out
+        assert (
+            "cudnn.AttentionPrepareDecode [POSITIONS 3d, SECTION (11, 11, 10), PAGE_SIZE 64, POSITION_DTYPE int64, SLOT_DTYPE int64, PDL False, PDL_RELEASE False]"
+            in out
+        ), "the attention preparation entry, the kernel stated whole"
+        prepared = [line for line in out.splitlines() if line.split()[:1] == ["attention.prepare"] and "[band: " in line]
+        whole = (
+            "0 query and 0 key elements outside their band; gate rows equal; value rows equal; the rest of the pool untouched  [band: attention_prepare]  PASS"
+        )
+        assert len(prepared) == 2 and all(
+            line.endswith(whole) for line in prepared
+        ), "judged against its twin, and its pool row by row, at both sequence counts"
+        assert "attention.prepare equal (gated)" in out or "REPORTED" in out
         stated = [line for line in out.splitlines() if line.strip().startswith(f"mlp.gate_up: {fused}, 2 launches per step") and "; the entry states " in line]
         assert len(stated) == 2 and all("block (192, 1, 1), shared memory 231,424 B" in line for line in stated), "one launch per MLP, at both sequence counts"
         # the weights the run keeps on their stored format alone: the gate / up weights, and on 10.0 the in-projections too
@@ -256,8 +391,9 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
             f"weights this run keeps on their stored format alone ({kept})" in line for line in made
         ), "no bf16 copy of these weights is held: the reference of the checks made its own, at both sequence counts"
         assert (
-            "GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)" in out
-        ), "and the memory sentence says so"
+            "GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none, and what they hold for the sequences "
+            "beyond the first of a count)" in out
+        ), "and the memory sentence says so, beside what the checks hold for the sequences beyond the first"
         held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
         assert len(held) == 2 and all(
             line.startswith(f"  stored weights    {count} of {count} weights this run keeps on their stored format alone hold the bytes of their load, ")
@@ -269,9 +405,13 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
         peak = float(out.split("GPU memory: PyTorch peak ", 1)[1].split(" GiB allocated", 1)[0])
         assert 0.0 < peak < need, f"PyTorch held {peak} GiB at its peak; the memory sentence states {need} GiB"
     else:
-        assert "\n  on demand " not in out and " for the checks (" not in out, "every weight has its bf16 copy: nothing is made on demand"
+        assert "\n  on demand " not in out and "the reference's bf16 copy of one weight" not in out, "every weight has its bf16 copy: nothing is made on demand"
+        assert (
+            "GiB of it for the checks (what they hold for the sequences beyond the first of a count)" in out
+        ), "the checks' part of the sentence is of the rows alone"
         assert "\n  stored weights " not in out, "and the reference reads the copies of the load: no stored bytes to hold"
-        assert "cudnn.SwigluFp4Decode" not in out, "the rows claim compute capability 10.x only"
+        assert "cudnn.SwigluFp4Decode" not in out and "cudnn.AttentionPrepareDecode" not in out, "the rows claim compute capability 10.x only"
+        assert "cudnn.RowQuantizeFp4Decode" not in out, "and so does the row of the head's quantise"
         assert any(line.split()[:1] == ["mlp.gate_up"] and line.endswith("fallback: bf16 copy of 4-bit weights") for line in out.splitlines())
     multiply = [line for line in out.splitlines() if line.split()[:1] == ["projection.fp8.in"] and "calls" in line and "[band: " in line]
     assert len(multiply) == 2 and all(line.endswith("[band: bf16_rounding]  PASS") for line in multiply), "the in-projection was judged at both sequence counts"
@@ -291,7 +431,7 @@ def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kerne
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries"])
+@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries", "native"])
 def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stack, tmp_path):
     """``--perf`` on the reduced seeded model, on the two stacks the tests of this repository run, in a fresh interpreter
     (the kernel check reads kernel names from the profiler: the module docstring): the checked request and its reference
@@ -310,8 +450,11 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
 
     if not torch.cuda.is_available():  # decided here, before a child is started
         pytest.skip("needs a CUDA GPU")
+    if stack == "native":  # the sample's own stack: its requests are replays of the recorded step, where its library is installed
+        _needs_the_library()
     report = tmp_path / "report.json"
-    arguments = ["--stack", stack, "--perf", "--perf-steps", "16", "--perf-requests", "2", "--perf-warmup", "4", "--perf-report", str(report)]
+    named = [] if stack == "native" else ["--stack", stack]  # the sample's stack is the default; a validation stack is named
+    arguments = [*named, "--perf", "--perf-steps", "16", "--perf-requests", "2", "--perf-warmup", "4", "--perf-report", str(report)]
     start = time.perf_counter()
     code, out, written = _fresh_interpreter(arguments)
     tagged = [line for line in out.splitlines() if line.startswith("[00] ")]
@@ -334,24 +477,31 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     said = " ".join(line.strip() for line in screen)
     assert "timed requests give the checked request's tokens and state: PASS" in said
     assert ("kernels, traced steps: NOT OBSERVED (" if unobserved else "kernels, traced steps: PASS") in said
-    assert "protocol    warm-up 4 steps | timed 16 steps x 2, end token ignored | launched from Python, not captured" in screen
+    replayed = stack == "native" and tuple(torch.cuda.get_device_capability()) == (10, 0)  # every row a kernel: the step is recorded and replayed
+    path = "launch sequence captured" if replayed else "launched from Python, not captured"
+    assert f"protocol    warm-up 4 steps | timed 16 steps x 2, end token ignored | {path}" in screen
+    if replayed:
+        assert "the replayed steps are the same steps launched from Python, ids and logits, all " in said and "and leave the same state: PASS" in said
+        assert any(line.startswith("[00] step recorded: ") for line in tagged) and not any("launch overhead" in line for line in screen)
+        assert any("one replay of " in line and line.strip().endswith("and one host read") for line in screen)
     assert any(line.startswith("[00] performance mode: at most ") for line in tagged), "what the mode will run, before the load"
 
     def refuse(constant):
         raise AssertionError(f"the report file holds {constant}")
 
     data = json.loads(report.read_text(encoding="utf-8"), parse_constant=refuse)
-    assert data["schema"] == "model-sample-performance/4" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
+    assert data["schema"] == "model-sample-performance/6" and data["record"]["class"] == "orientation" and data["checks"]["last_line"] == verdict
     assert data["protocol"]["stack"] == stack and str(tmp_path) not in report.read_text(encoding="utf-8"), "no path in the file"
     requests = data["raw"]["requests"]
-    assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced"]
+    assert [request["kind"] for request in requests] == ["checked", "warm-up", "timed", "timed", "traced", *(["traced replay"] if replayed else [])]
     assert requests[2]["ids_sha256"] == requests[3]["ids_sha256"] == requests[0]["ids_sha256"], "every timed request: the checked request's ids"
     assert requests[2]["end_state_sha256"] == requests[3]["end_state_sha256"] == requests[0]["end_state_sha256"], "and its end state, byte for byte"
     assert data["protocol"]["profiler_first_started"] == (None if unobserved else "behind the last timed request, in the traced request")
-    # the record class: every reason, in the order of the conditions; a stack that declares a target kernel set names its identity
-    identity = "no target kernel set declared" if stack == "fe-cublas" else "kernel identity not claimed on this GPU class"
+    # the record class: every reason, in the order of the conditions; both stacks have a block on a fallback row
     observed = ["kernels not observed"] if unobserved else []
-    fixed = ["reduced model", "fallback rows present", identity, "launched from Python", *observed]
+    fixed = ["reduced model", *([] if replayed else ["fallback rows present", "launched from Python"]), *observed]
+    assert data["protocol"]["launch_path"] == ("captured" if replayed else "python") and bool(data["protocol"]["launch_path_reason"]) == (not replayed)
+    assert (data["traced"]["replayed"] is not None) == replayed and (data["checks"]["recorded_step"] == "PASS") == replayed
     # what the run observed of its GPU: the reasons behind the fixed ones are those of its two verdicts, which the screen prints
     watched = data["observation"]
     seen, clocks = watched["other_compute_processes"], watched["clocks"]
@@ -362,7 +512,7 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
     assert "locked" not in " ".join(screen), "the report never prints the word"
     if watched["source"] == "nvidia-smi":  # the driver's tool was found: a reading before the load, before the warm-up request and behind the timed requests
         assert [made["when"] for made in watched["readings"]] == ["before the load", "before the warm-up request", "behind the last timed request"]
-        assert [made["kind"] for made in watched["requests"]] == ["warm-up", "timed", "timed", "traced"]
+        assert [made["kind"] for made in watched["requests"]] == ["warm-up", "timed", "timed", "traced", *(["traced replay"] if replayed else [])]
         child = "a child process that the timing process neither reads nor polls between its start and its stop"
         assert data["protocol"]["in_a_timed_request"]["sampler"] in (child, "none (the sampler could not be started)")
     else:
@@ -387,38 +537,90 @@ def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(stac
         # the step taken apart: a remainder per timed step at a traced position; its mean and the means of the same steps add up
         step, host, overhead = (data["statistics"][key] for key in ("step", "host", "launch_overhead"))
         assert overhead["n"] == step["n"] == host["n"] == 2 * data["traced"]["steps"], "every timed step at a traced position"
-        assert overhead["remainder_ms"] == overhead["mean"] and overhead["label"].startswith("an estimate") and overhead["value"] in (None, overhead["mean"])
         of_gpu = data["statistics"]["gpu_busy"]["mean"]
         assert abs(of_gpu - sum(busy) / len(busy)) <= 1e-9 * of_gpu, "the mean of GPU busy of the traced steps"
-        assert abs(step["mean"] - (of_gpu + overhead["remainder_ms"] + host["mean"])) <= 1e-9 * step["mean"], "the terms of the step add up"
+        if replayed:  # a replayed step has no launch path from Python to estimate: GPU busy of the replayed traced steps stands in the step line
+            again, of_replays = data["traced"]["replayed"], data["statistics"]["gpu_busy_replayed"]
+            assert overhead["value"] is None and overhead["reason"].startswith("not formed: a replayed step has no launch path from Python")
+            assert 1 <= again["steps"] <= 16 and len(again["per_step"]["gpu_busy_ms"]) == again["steps"] and min(again["per_step"]["gpu_busy_ms"]) > 0
+            assert of_replays["value"] == again["gpu_busy_ms"] > 0 and of_replays["n"] == again["steps"] and requests[5]["ids_sha256"] is not None
+            assert data["protocol"]["recorded_step"]["block_launches_planned"] == kernels["exact_launches_per_step"]
+        else:
+            assert (
+                overhead["remainder_ms"] == overhead["mean"] and overhead["label"].startswith("an estimate") and overhead["value"] in (None, overhead["mean"])
+            )
+            assert abs(step["mean"] - (of_gpu + overhead["remainder_ms"] + host["mean"])) <= 1e-9 * step["mean"], "the terms of the step add up"
         assert 0 < data["traced"]["time_resolution_us"] <= 1 and data["per_kernel"]["us_per_launch_printed"] == (data["traced"]["time_resolution_us"] < 1)
-    if kernels["stated"]:  # a target stack on a GPU the census has a section for: the three numbers add up
-        assert kernels["on_target"] == kernels["code"] + kernels["port"] + kernels["stand_ins"] and kernels["launches"] == 20
-    else:
-        assert (stack == "fe-cublas") == (not kernels["declared"]), "fe-cublas declares no target kernel set; fe-entries does"
+    # the launches of a step as the plan states them: on exact rows, by provider, and the block calls on fallback rows -- an exact
+    # row launches once per call, so the two add up to the 20 block calls of a step of the two-layer model that are no host path
+    # (the sample's own stack on compute capability 10.0 has no block on a fallback row: every call is a launch on an exact row)
+    assert kernels["exact_launches_per_step"] == sum(kernels["by_provider"].values()) and bool(kernels["fallback_rows"]) == (not replayed)
+    assert kernels["exact_launches_per_step"] + kernels["fallback_calls"] == 20
+    if stack == "fe-cublas":
+        assert kernels["by_provider"] == {"PyTorch": 1, "cuDNN Frontend": 1}
+    elif stack == "native":
+        if replayed:
+            assert kernels["by_provider"] == {"cuDNN Frontend": 13, "FlashInfer": 6, "PyTorch": 1} and kernels["fallback_calls"] == 0
+    elif tuple(torch.cuda.get_device_capability()) == (10, 0):
+        assert kernels["by_provider"] == {"cuDNN Frontend": 13, "PyTorch": 1}
+    else:  # a row of an entry claims its GPU classes: off compute capability 10.0 fewer of the 13 are exact rows
+        assert kernels["by_provider"]["PyTorch"] == 1 and 1 <= kernels["by_provider"]["cuDNN Frontend"] < 13 and len(kernels["by_provider"]) == 2
+    at = next(index for index, line in enumerate(screen) if line.startswith("kernels     "))
+    assert screen[at] == f"kernels     {kernels['exact_launches_per_step']} launches per step on exact rows: " + ", ".join(
+        f"{provider} {count}" for provider, count in kernels["by_provider"].items()
+    )
+    assert screen[at + 1].startswith(f"            {kernels['fallback_calls'] or 'no'} block calls on fallback rows; ")
+    assert (
+        "scope       the decode loop of one process: no request queue, no scheduler, no network" in screen[2:5]
+    ), "behind the record class, however many lines that takes"
 
 
 @pytest.mark.L0
 def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
     """The stack ``native`` with the rows a library serves, on real launches, where FlashInfer is installed: the MLP's down
     multiply and the output head on ``flashinfer.gemm.mm_fp4`` and the out-projections on ``flashinfer.gemm.bmm_fp8``, each
-    on the stored weight and each inside the band of the reference multiply at both sequence counts; the first use of the
-    library announced while the run is planned; the 4-bit multiply outside any tuning context (``TUNED False`` in the call
-    log, or the kernel check fails); every weight of a multiply on its stored format alone.  On the GPU class the family's
-    census has a section for, the down multiply is held to the recorded kernel class and launch shape, and the kernel the
-    library chose for the out-projection is printed beside the recorded pick.  Skipped where the package is absent."""
-    if not torch.cuda.is_available():  # decided here, before a child is started
-        pytest.skip("needs a CUDA GPU")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("the library rows of the stack native claim compute capability 10.x")
-    if importlib.util.find_spec("flashinfer") is None:  # looked up, not imported: the package is the child's to import
-        pytest.skip("the stack native calls FlashInfer, which is not installed here (samples/models/requirements-flashinfer.txt): uncovered, not passing")
+    on the stored weight and each inside the band of the reference multiply at both sequence counts; the attention core
+    on the library's paged decode attention, inside the band of its own row at both counts, the cache it reads left as
+    it was; the two first uses of the library announced once each while the run is planned; the 4-bit multiply outside
+    any tuning context (``TUNED False`` in the call log, or the kernel check fails); every weight of a multiply on its
+    stored format alone.  Where the kernels of the traced steps were observed, the line of every row the library serves
+    names the kernel the library launched, at both sequence counts.
+    Skipped where the library is absent, and by the sample's own line where a kernel binary is."""
+    _needs_the_library()
     cc100 = tuple(torch.cuda.get_device_capability()) == (10, 0)
-    out = _run(None, capsys, ["--stack", "native"], "native", NATIVE_CC100 if cc100 else NATIVE, unobserved=True)
-    assert "stack native" in out and out.count("[00] planning: first use of FlashInfer ") == 1, "the library's first use is announced once, while the run plans"
+    out = _run(None, capsys, [], "native", NATIVE_CC100 if cc100 else NATIVE, unobserved=True)  # no flag: the sample's stack is the default
+    assert (
+        "| stack native\n" in out and out.count("[00] planning: first use of FlashInfer ") == 1
+    ), "the library's first use is announced once, while the run plans"
+    if cc100:  # every row of the stack is a kernel here: the step is recorded once per sequence count and replayed
+        recorded = [line for line in out.splitlines() if line.startswith("[00] step recorded: ")]
+        assert len(recorded) == 2 and all(
+            line.endswith("replayed once per token (--no-capture launches every block from Python)") for line in recorded
+        ), recorded
+        assert out.count(" | capture ") == 2, "recording the step is a stage of each load"
+        held = [line for line in out.splitlines() if line.startswith("  recorded step ")]
+        assert len(held) == 2 and all(
+            "launched again from Python from a fresh state: ids and logits byte-identical    PASS" in line for line in held
+        ), "the replayed steps were launched again from Python, at both sequence counts"
+        tails = [
+            line for line in out.splitlines() if "behind the request the ids buffer held the last chosen ids and the position rows stood at position " in line
+        ]
+        assert len(tails) == 2 and all(line.endswith("    PASS") for line in tails), "the step's own tail was held behind each request"
+        assert out.count("one replay of ") == 2 and "\nnote  " not in out, "the step line names the replay; a replayed run prints no note"
+    assert out.count("[00] planning: first use of the paged decode attention of FlashInfer ") == 1, "and so is the first use of its attention"
+    core = [line for line in out.splitlines() if line.split()[:1] == ["attention.core"] and "calls" in line and "[band: " in line]
+    assert len(core) == 2 and all(
+        "; 0 outside their bound; " in line and line.endswith("the cache untouched  [band: attention_bf16_weights]  PASS") for line in core
+    ), "the attention core was judged in the band of its row at both sequence counts"
+    served = "attention.core: flashinfer.decode.trtllm_batch_decode_with_kv_cache [KV_LAYOUT HND], 1 launch per step"
+    assert sum(line.strip().startswith(served) for line in out.splitlines()) == 2, "one launch of the library's kernel per step, at both sequence counts"
     for block in ("projection.fp8.out", "mlp.down", "output_head"):
         judged = [line for line in out.splitlines() if line.split()[:1] == [block] and "calls" in line and "[band: " in line]
         assert len(judged) == 2 and all(line.endswith("[band: bf16_rounding]  PASS") for line in judged), f"{block} was judged at both sequence counts"
+    quantised = [line for line in out.splitlines() if line.split()[:1] == ["output_head.quantize"] and "calls" in line and "[band: " in line]
+    assert len(quantised) == 2 and all(
+        line.endswith("; 0 outside  [band: row_quantize_fp4]  PASS") for line in quantised
+    ), "the head's quantise, whose codes the library's head multiply reads as they are, was judged at both sequence counts"
     down = [
         line for line in out.splitlines() if line.strip().startswith("mlp.down: flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False], 2 launches per step")
     ]
@@ -434,18 +636,816 @@ def test_default_run_on_the_native_stack_with_its_library_rows(capsys):
     ), "no bf16 copy of a multiply's weight"
     held = [line for line in out.splitlines() if line.startswith("  stored weights ")]
     assert len(held) == 2 and all(line.startswith(f"  stored weights    {count} of {count} weights") and line.endswith("    PASS") for line in held)
-    if cc100 and torch.cuda.get_device_properties(0).multi_processor_count == 148:  # the class the census has a section for, at 1 sequence
-        assert "17 of 20 launches of a step are target kernels (7 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results)" in out
-        assert sum("in the kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records" in line for line in down) == 1
-        assert out.count("chosen by the library for projection.fp8.out at ") == 2, "the library's pick at both call sites: printed and compared, never gated"
+    if cc100:  # every row of the stack serves this class: no block call of a step is on a fallback row
+        counted = "  per step: 20 launches on 12 exact rows, checked one by one in the wiring order; the launches of 0 fallback calls "
+        assert sum(line.startswith(counted) for line in out.splitlines()) == 2, "the count of a step under the kernel table, at both sequence counts"
     observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
+    if len(observed) == 2 and all(line.endswith("    PASS") for line in observed):  # the kernels of the traced steps were observed
+        if cc100:  # ... and the replayed steps of the traced pass against them
+            again = [line for line in out.splitlines() if line.strip().startswith("the recorded step: 2 replayed steps launch the ")]
+            assert len(again) == 2 and all(line.endswith("position updates    PASS") for line in again), again
+        launched = [line.strip().split(": ", 1)[0] for line in out.splitlines() if "; the library launched " in line]
+        rows = ["projection.fp8.out at linear_attention.out", "mlp.down", "attention.core", "projection.fp8.out at full_attention.out", "output_head"]
+        assert launched == rows * 2, "the line of every row the library serves names the kernel the library launched, at both sequence counts"
+        named = [line for line in out.splitlines() if line.strip().startswith(served) and "; the library launched " in line]
+        assert len(named) == 2 and all(line.endswith(" over the traced steps") and " fi_decode_attention by name; " in line for line in named)
     frost_routing.measured("model sample qwen_dense 00_decode --stack native: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
+
+
+def _needs_the_library():
+    """Skips by name where a cell of the library's rows cannot run: no GPU, another class than the rows claim, no library."""
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the library rows of the stack native claim compute capability 10.x")
+    if importlib.util.find_spec("flashinfer") is None:  # looked up, not imported: the package is the child's to import
+        pytest.skip("the stack native calls FlashInfer, which is not installed here (samples/models/requirements-flashinfer.txt): uncovered, not passing")
+
+
+@pytest.mark.L0
+def test_the_native_stack_with_an_empty_kernel_binary_directory_is_a_skip_that_names_no_path(tmp_path):
+    """``--stack native`` with the library's directory variable naming an empty directory: the run ends in ``[00] SKIP``
+    while it is planned, by the sentence of the installation it finds -- with the kernel-binary package installed, that
+    the library would read the directory in the place of the package; without it, that the directory does not hold the
+    kernel binaries.  Exit code 0, standard output empty, nothing loaded, the directory's path on neither stream, and
+    the directory still empty: nothing was fetched into it."""
+    _needs_the_library()
+    empty = tmp_path / "kernel_binaries"
+    empty.mkdir()
+    code, out, written = _fresh_interpreter(["--stack", "native"], environment={"FLASHINFER_CUBIN_DIR": str(empty)})
+    verdict = [line for line in out.splitlines() if line.startswith("[00] ")][-1]
+    frost_routing.measured("model sample qwen_dense 00_decode --stack native, an empty kernel-binary directory", verdict)
+    if importlib.util.find_spec("flashinfer_cubin") is None:
+        sentence = (
+            "the directory FLASHINFER_CUBIN_DIR names does not hold the kernel binaries the library's table names for this call's data types, head width, "
+            "paging and page on this GPU's class as their manifest lists them ("
+        )
+    else:
+        sentence = "FLASHINFER_CUBIN_DIR is set and the kernel-binary package flashinfer-cubin is installed, "
+    assert code == 0 and verdict.startswith("[00] SKIP ") and sentence in verdict, out[-6000:]
+    assert written == "" and "\n[00] stage " not in out and "\nchecks" not in out, "nothing was loaded and nothing checked"
+    assert str(tmp_path) not in out and list(empty.iterdir()) == [], "no path on either stream, and nothing written into the directory"
+
+
+RECORDED_PROGRAM = """
+import faulthandler, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import perf, tie_out
+from model_samples.qwen_dense import QwenDense
+
+SEQUENCES, PROMPT, STEPS, PLANTED = {sequences}, 26, 70, 31  # positions 0 to 95: across the first page boundary of the attention cache
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+failed = []
+
+
+def hold(name, held, text):
+    say(f"  {{name:<10}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+model = QwenDense.reduced()
+text = model_samples.TextIO.synthetic(model.geometry.vocab)
+common = dict(sequences=SEQUENCES, stack="native", device="cuda:0", capacity=PROMPT + STEPS)  # the request fills the state: no position is left
+eager = model_samples.Session(model, text, **common)
+session = model_samples.Session(model, text, share=eager, capture=True, **common)
+try:
+    for note in dict.fromkeys(eager.resolve().announcements()):
+        say(f"[recorded] planning: {{note}}")
+    say(eager.plan_table([session]))
+except NotImplementedError as error:
+    say(f"[recorded] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[recorded] {{model_samples.check_environment().header()}}")
+if session.recordable():  # a class on which a block of the stack is on a fallback row: its step is not recorded there
+    say(f"[recorded] SKIP the step of the stack native is not recorded on this GPU: {{session.recordable()}}")
+    raise SystemExit(0)
+eager.load()
+session.load()
+generator = torch.Generator().manual_seed(0)
+prompts = [torch.randint(0, model.geometry.vocab, (PROMPT,), generator=generator, dtype=torch.int32) for _ in range(SEQUENCES)]
+
+
+def request(of, between=None, steps=STEPS):
+    # a prompt, its first new token and ``steps`` steps, each ended by its host read: (the reads, ids fed, ids chosen, logits, end state)
+    of.reset(fresh=False)
+    ids = of.prefill(prompts)
+    reads = [of.read(ids)]
+    for index in range(steps):
+        if between is not None:
+            between(index)
+        ids = of.step(ids)
+        reads.append(of.read(ids))
+    torch.cuda.synchronize()
+    count = of.record.count
+    return reads, of.record.inputs[:count].clone(), of.record.outputs[:count].clone(), of.record.logits[:count].clone(), perf.state_digest(of.state)
+
+
+def equal(a, b):
+    return a[0] == b[0] and all(tie_out.bytes_equal(x, y) for x, y in zip(a[1:4], b[1:4])) and a[4] == b[4]
+
+
+recorded = session.recorded
+hold("recorded", session.python_reason == "" and recorded is not None and "capture" in session.stages.seconds, f"the step was recorded by the load ({{session.python_reason or 'a stage of its own'}})")
+say(f"[recorded] the sequence holds, as this installation states it: {{recorded.launches}}; its own pool {{recorded.pool_bytes}} bytes")
+zero = perf.state_digest(session.state)
+session.reset(fresh=True)
+before = perf.state_digest(session.state)
+session.record_step()
+torch.cuda.synchronize()
+recorded = session.recorded
+hold("nothing", before == zero == perf.state_digest(session.state) and recorded.replays == 0, "recording the step launched nothing: the state holds the bytes it held")
+want = request(eager)
+again = request(eager)
+hold("python", equal(want, again), f"the request launched from Python twice: the ids of {{len(want[0])}} reads, {{want[3].shape[0]}} steps of ids and logits, the end state")
+got = [request(session) for _ in range(3)]
+steps = want[3].shape[0]
+hold("replayed", all(equal(want, each) for each in got) and recorded.replays == 3 * steps, f"three replayed requests against it, {{steps}} steps each: the ids of every read, the ids fed and chosen, the logits byte for byte, the end-state digest")
+cursor = recorded.cursor
+# the buffer against the ids as the token choice left them: the tensor the state keeps and the record's last row, never a read of the buffer
+last = recorded.next_ids.tolist()
+hold("tail", cursor.holds() and cursor.position == session.state.position == steps and cursor.ids.tolist() == last == got[-1][2][-1].tolist() and session.state.greedy is recorded.next_ids, f"behind a request the ids buffer holds the last chosen ids and the position rows stand at position {{cursor.position}}")
+
+
+def planted(index):
+    if index == PLANTED - PROMPT:  # in front of the step at position PLANTED: the length the attention reads, one too small from there on
+        cursor.lengths.sub_(1)
+
+
+wrong = request(session, planted)
+differs = [step for step in range(steps) if not tie_out.bytes_equal(wrong[3][step], want[3][step])]
+hold("planted", differs[:1] == [PLANTED] and wrong[0][: PLANTED - PROMPT + 1] == want[0][: PLANTED - PROMPT + 1], f"a length one too small from position {{PLANTED}} on: the logits differ first at step {{differs[:1]}}, {{len(differs)}} steps differ")
+hold("restored", equal(want, request(session)), "the next request, its cursor set from the tables at its first replay, is the request again")
+# past the capacity: the step is refused and nothing is launched
+ids, replays, position = recorded.next_ids, recorded.replays, session.state.position
+try:
+    session.step(ids)
+    refused = ""
+except ValueError as error:
+    refused = str(error)
+hold("capacity", "positions per sequence" in refused and (recorded.replays, session.state.position) == (replays, position), f"a replay past the capacity is refused and launches nothing ({{refused[:60]}})")
+# a pass the installation declines: a block that waits for its stream inside the step.  The CUDA runtime refuses the wait on a
+# capturing stream and invalidates the capture, and PyTorch's context then leaves the thread on that stream: the refusal
+# behind which the session itself has to put the stream back (a host read is refused by PyTorch, which puts it back)
+kind = type(session.plan["token_choice"])
+call = kind.__call__
+
+
+def waits_for_its_stream(self, logits):
+    out = call(self, logits)
+    torch.cuda.current_stream().synchronize()
+    return out
+
+
+session.reset(fresh=True)
+stream = torch.cuda.current_stream()
+kind.__call__ = waits_for_its_stream
+try:
+    reason = session.record_step()
+finally:
+    kind.__call__ = call
+say(f"[recorded] {{reason}}")
+declined = reason.startswith("the capture of the step was declined on this installation (") and session.recorded is None
+hold("declined", declined and torch.cuda.current_stream() == stream, "a pass the CUDA runtime refuses is declined, no sequence is kept and PyTorch's current stream is the one it was")
+hold("from python", equal(want, request(session)) and session.recorded is None, "the session then launches from Python and computes the request")
+session.close()
+say("[recorded] FAIL" if failed else "[recorded] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sequences", [1, 4])
+def test_a_recorded_request_equals_the_same_request_from_python(sequences):
+    """One decode step of the stack ``native`` recorded as a launch sequence and replayed for a request, against the same
+    request launched from Python (``Session(capture=True)`` beside a session without it, on one load): the reduced seeded
+    model, a prompt of 26 tokens and 70 steps behind it, across the first page boundary of the attention cache, in a
+    state of exactly those 96 positions.  A small program in a fresh interpreter holds, at 1 and at 4 sequences:
+
+    * recording the step launches nothing: the state holds the bytes it held;
+    * three replayed requests give the ids of every host read, the ids fed to and chosen by every step, the logits of
+      every step byte for byte and the end-state digest of the request launched from Python;
+    * behind a request the ids buffer holds the last chosen ids and the position rows stand at the last position;
+    * a planted difference -- the length the attention reads, one too small from one position on -- moves the logits
+      first at that step; the next request is the request again;
+    * a replay past the capacity is refused and launches nothing;
+    * a pass that waits for its stream inside the step is refused by the CUDA runtime, which leaves the thread on the
+      capture stream: it is declined, no sequence is kept, PyTorch's current stream is the one it was, and the session
+      computes the request from Python.
+
+    The stack calls a library: skipped where that is absent, by the program's own line where the plan declines the GPU
+    or a block of the stack is on a fallback row.  A skipped cell is uncovered, not passing."""
+    _needs_the_library()
+    key = f"model sample qwen_dense: a recorded decode step against the step launched from Python, {sequences} sequence(s), stack native"
+    out = _program(RECORDED_PROGRAM, "[recorded]", key, "run of a recorded step", unobserved="RAN (never printed: ", sequences=sequences)
+    lines = out.splitlines()
+    for name in ("recorded", "nothing", "python", "replayed", "tail", "planted", "restored", "capacity", "declined", "from python"):
+        (line,) = [line for line in lines if line.startswith(f"  {name} ")]
+        assert line.endswith("    PASS"), line
+    assert "the logits differ first at step [31]" in out and "three replayed requests against it, 96 steps each" in out
+    stated = next(line for line in lines if line.startswith("[recorded] the sequence holds, as this installation states it: "))
+    frost_routing.measured(key + ": the recorded sequence", stated[len("[recorded] ") :])
+
+
+HANDED_PROGRAM = """
+import faulthandler, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import tie_out
+from model_samples.qwen_dense import QwenDense
+
+SEQUENCES, PROMPT, STEPS = {sequences}, 26, 12
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+failed = []
+
+
+def hold(name, held, text):
+    say(f"  {{name:<10}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+model = QwenDense.reduced()
+vocab = model.geometry.vocab
+text = model_samples.TextIO.synthetic(vocab)
+common = dict(sequences=SEQUENCES, stack="native", device="cuda:0", capacity=PROMPT + STEPS)
+eager = model_samples.Session(model, text, **common)
+session = model_samples.Session(model, text, share=eager, capture=True, **common)
+try:
+    for note in dict.fromkeys(eager.resolve().announcements()):
+        say(f"[handed] planning: {{note}}")
+    say(eager.plan_table([session]))
+except NotImplementedError as error:
+    say(f"[handed] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[handed] {{model_samples.check_environment().header()}}")
+if session.recordable():  # a class on which a block of the stack is on a fallback row: its step is not recorded there
+    say(f"[handed] SKIP the step of the stack native is not recorded on this GPU: {{session.recordable()}}")
+    raise SystemExit(0)
+eager.load()
+session.load()
+generator = torch.Generator().manual_seed(0)
+prompts = [torch.randint(0, vocab, (PROMPT,), generator=generator, dtype=torch.int32) for _ in range(SEQUENCES)]
+unseen, returned = [], []
+
+
+def another(ids):  # another tensor that holds the changed ids
+    return (ids + 1) % vocab
+
+
+def clone(ids):  # an equal clone of the tensor the step returned, changed
+    return ids.clone().add_(1).remainder_(vocab)
+
+
+def in_place(ids):  # the tensor the step returned, changed in place
+    return ids.add_(1).remainder_(vocab)
+
+
+def alias(ids):  # ... changed through an alias of its memory: a write its version counter does not count
+    version = ids._version
+    torch.from_dlpack(ids).add_(1).remainder_(vocab)
+    unseen.append(ids._version == version)
+    return ids
+
+
+def view(ids):  # ... changed in place and handed back as a view of it
+    return ids.add_(1).remainder_(vocab)[:]
+
+
+def request(of, change):
+    # a prompt and STEPS steps behind it, every one of them on the ids the step in front chose, CHANGED: (the reads, the ids
+    # handed to every step, what the state kept of the step in front at that moment, the record's inputs, outputs and logits)
+    of.reset(fresh=False)
+    ids = of.prefill(prompts)
+    reads, handed, kept, back = [of.read(ids)], [], [], [ids]
+    for _ in range(STEPS):
+        ids = change(ids)
+        handed.append(ids.tolist())
+        kept.append(of.state.greedy.tolist())
+        ids = of.step(ids)
+        back.append(ids)
+        reads.append(of.read(ids))
+    torch.cuda.synchronize()
+    if of is session:  # what the replayed prompt and every replayed step handed back to the loop
+        returned.extend(each is session.recorded.cursor.ids for each in back)
+    count = of.record.count
+    return reads, handed, kept, of.record.inputs[:count].clone(), of.record.outputs[:count].clone(), of.record.logits[:count].clone()
+
+
+def equal(a, b):
+    return a[:3] == b[:3] and all(tie_out.bytes_equal(x, y) for x, y in zip(a[3:], b[3:]))
+
+
+hold("recorded", session.python_reason == "" and session.recorded is not None, f"the step was recorded by the load ({{session.python_reason or 'a stage of its own'}})")
+want = request(eager, another)
+changed = all(fed != read for fed, read in zip(want[1], want[0])) and want[2] == want[0][:-1]
+hold("python", changed and equal(want, request(eager, another)) and not eager.replays, f"the request launched from Python twice, every step behind the prompt on ids changed behind the step in front: {{STEPS}} steps, the first on {{want[1][0]}} for {{want[0][0]}}")
+buffer = session.recorded.cursor.ids
+for name, change, what in (
+    ("clone", clone, "an equal clone of the changed ids"),
+    ("in place", in_place, "the tensor the step in front returned, changed in place"),
+    ("alias", alias, "that tensor, changed through an alias of its memory that its version counter does not count"),
+    ("view", view, "that tensor, changed in place and handed back as a view"),
+):
+    got = request(session, change)
+    fed = [row.tolist() for row in got[3][PROMPT:]]
+    held = equal(want, got) and fed == got[1] == want[1] and session.replays and session.recorded.cursor.ids is buffer
+    hold(name, held, f"replayed steps handed {{what}}: the reads, the logits byte for byte and the record of the request launched from Python on the changed ids; the record's inputs are the ids handed over")
+hold("returned", len(returned) == 4 * (STEPS + 1) and all(returned), "the prompt and every step of the replayed requests returned the session's ids buffer itself: handed back, it is read as it then is and nothing is copied")
+hold("unseen", len(unseen) == STEPS and all(unseen), "no write through the alias was counted by the tensor's version counter")
+hold("replays", session.recorded.replays == 4 * (PROMPT + STEPS), f"{{session.recorded.replays}} replays of one recorded sequence")
+session.close()
+say("[handed] FAIL" if failed else "[handed] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sequences", [1, 4])
+def test_a_replayed_step_feeds_the_ids_it_is_handed_however_they_were_changed(sequences):
+    """``Session.step`` feeds the ids it is handed, on a session that replays its recorded step as on one launched from
+    Python.  The tensor a replayed step returns is the buffer the next replay's lookup reads, so ids changed IN PLACE in
+    it and handed back are fed.  A small program in a fresh interpreter runs, on the stack ``native`` at 1 and at 4
+    sequences, a prompt of 26 tokens and 12 steps behind it, every step on the ids the step in front chose, changed; and
+    holds the replayed request to the same request launched from Python -- the ids of every host read, the logits of
+    every step byte for byte, the record's inputs and outputs -- where the changed ids are handed over as
+
+    * an equal clone;
+    * the returned tensor itself, changed in place;
+    * that tensor, changed through an alias of its memory, a write its version counter does not count;
+    * a view of that tensor.
+
+    In each the record's inputs are the ids that were handed over, and what the state keeps of the step in front -- the
+    ids as the token choice left them -- is not changed with the returned tensor.  The tensor the replayed prompt and
+    every replayed step return is the session's ids buffer itself: a session that returned a copy of it would compute
+    the same ids, with a copy launched from Python per token.
+
+    Skipped as its neighbour is: where the library is absent, and by the program's own line where the plan declines the
+    GPU or a block of the stack is on a fallback row.  A skipped cell is uncovered, not passing."""
+    _needs_the_library()
+    key = f"model sample qwen_dense: a recorded decode step on ids changed in place and handed back, {sequences} sequence(s), stack native"
+    out = _program(HANDED_PROGRAM, "[handed]", key, "run of a recorded step on changed ids", unobserved="RAN (never printed: ", sequences=sequences)
+    lines = out.splitlines()
+    for name in ("recorded", "python", "clone", "in place", "alias", "view", "returned", "unseen", "replays"):
+        (line,) = [line for line in lines if line.startswith(f"  {name} ")]
+        assert line.endswith("    PASS"), line
+    assert (
+        "replayed steps handed the tensor the step in front returned, changed in place: " in out and f"{4 * (26 + 12)} replays of one recorded sequence" in out
+    )
+
+
+CORE_PROGRAM = """
+import faulthandler, os, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+os.environ.setdefault("KINETO_LOG_LEVEL", "6")  # as the sample's scripts set it: the profiler's own lines stay off standard error
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from types import SimpleNamespace
+from model_samples import tie_out, timing
+from model_samples.providers import torch_ref
+from model_samples.qwen_dense import QwenDense
+from model_samples.state import DecodeState, KvCache
+
+DEVICE, PAGE, DEFAULT_LENGTH, BF16 = "cuda:0", 64, 2051, torch.bfloat16
+model = QwenDense.reduced()
+failed = []
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+def hold(name, held, text):
+    say(f"  {{name:<52}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+def drawn(sequences, tokens, live, limit, pool_seed, query_seed, scale=1.0, pages=None):
+    # the block of the stack native for a step of this shape, drawn queries, a paged cache of `live` positions per sequence
+    # whose every row is drawn, and the position the step starts at
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    session = model_samples.Session(model, text, sequences=sequences, tokens=tokens, stack="native", device=DEVICE, capacity=live, max_model_len=limit)
+    block = session.resolve()["attention.core"]
+    block.first_use(sequences, tokens)
+    shapes, device = model.state_shapes(), torch.device(DEVICE)
+    cache = DecodeState(("full_attention",), sequences, live, shapes, device, tokens=tokens, page=PAGE, pages=pages, max_model_len=limit).layers[0]
+    cache.pool.copy_(torch.randn(cache.pool.shape, generator=torch.Generator("cpu").manual_seed(pool_seed)).to(BF16))
+    rows = sequences * tokens, model.geometry.attn_heads, model.geometry.attn_head_dim
+    queries = torch.randn(rows, generator=torch.Generator("cpu").manual_seed(query_seed)) * scale
+    return block, queries.to(BF16).to(DEVICE), cache, live - tokens
+
+
+def judged(block, queries, cache, position, twin=None):
+    # one call of the block, judged in the band of its row the way a run judges a call; `twin`: a twin with a defect in the
+    # place of the correct one.  With the statistics, the names of the library's attention kernels the profiler recorded
+    correct = torch_ref.AttentionBound(None, None, None, {{}})
+    reference, before, outputs, records = correct(queries, cache, position), cache.pool.clone(), [], []
+
+    def step(index):
+        outputs.append(block(queries, cache, position))
+        outputs[0].float().sum().item()  # the host read a traced step ends in
+
+    timing.trace_steps(step, 1, DEVICE, records=records)
+    if not outputs:  # no kernel activity records on this build: the call alone
+        step(0)
+    names = sorted({{record.name for record in records if record.name.startswith("fmha")}})
+    stats = tie_out.BlockStats("attention_bf16_weights")
+    tie_out.BlockTap._judge(stats, (outputs[0],), (reference,), [cache.pool], [before], 0, twin or correct)
+    return stats, ", ".join(names) or "kernel not observed"
+
+
+def cases():
+    # one sequence at the maximum length the scripts default to, in a pool of 39 pages: two live rows at a step of one
+    # row -- the queries of the third draw four times as large --, six live rows at a step of six
+    for pool_seed, query_seed, scale, tokens in ((1002, 2002, 1.0, 1), (2002, 4002, 1.0, 1), (3002, 6002, 4.0, 1), (3012, 4012, 1.0, 6), (6012, 8012, 1.0, 6)):
+        live = 2 if tokens == 1 else 6
+        stats, kernel = judged(*drawn(1, tokens, live, DEFAULT_LENGTH, pool_seed, query_seed, scale, pages=39))
+        hold(f"1 x {{tokens}} rows, {{live}} live, seeds {{pool_seed}} / {{query_seed}}", stats.ok and stats.worst_share <= 1.0, f"{{stats.line()}}; {{kernel}}")
+
+
+def forms():
+    # a step shape for each kernel form of the library: sequences x tokens per sequence at a maximum length, 100 live rows
+    # per sequence (a full page and 36 rows of a second), 37 where the maximum length is 40
+    for sequences, tokens, limit in ((1, 1, DEFAULT_LENGTH), (1, 6, DEFAULT_LENGTH), (7, 1, DEFAULT_LENGTH), (1, 8, DEFAULT_LENGTH), (16, 5, DEFAULT_LENGTH), (4, 6, DEFAULT_LENGTH), (1, 1, 512), (1, 6, 40)):
+        stats, kernel = judged(*drawn(sequences, tokens, min(100, limit - 3), limit, 7001 + sequences, 9001 + tokens))
+        hold(f"{{sequences}} x {{tokens}} rows at a maximum length of {{limit}}", stats.ok and stats.worst_share <= 1.0, f"{{stats.line()}}; {{kernel}}")
+
+
+def arms():
+    # every arm must FAIL.  One sequence, 100 live rows: a full page and 36 rows of a second
+    live = 100
+    block, queries, cache, position = drawn(1, 1, live, DEFAULT_LENGTH, 7001, 9001)
+    stats, kernel = judged(block, queries, cache, position)
+    hold("no defect", stats.ok, f"{{stats.line()}}; {{kernel}}")
+    table, lengths, blocks = cache.table, cache.table.lengths.clone(), cache.table.blocks.clone()
+
+    def longer(by):
+        table.lengths[position] += by
+
+    def exchanged():
+        table.blocks[0, :2] = table.blocks[0, :2].flip(0)
+
+    def unscaled():  # the library's own default for the scale of the scores
+        library = sys.modules["flashinfer"].decode
+        real = library.trtllm_batch_decode_with_kv_cache
+        library.trtllm_batch_decode_with_kv_cache = lambda **passed: real(**{{name: value for name, value in passed.items() if name != "bmm1_scale"}})
+        return lambda: setattr(library, "trtllm_batch_decode_with_kv_cache", real)
+
+    in_the_call = (
+        ("the lengths one too long: a masked row let in", lambda: longer(1)),
+        ("the lengths one too short: the newest row dropped", lambda: longer(-1)),
+        ("the last attended page exchanged with a full one", exchanged),
+        ("the scores at the library's default scale", unscaled),
+    )
+    for name, put in in_the_call:
+        undo = put()
+        stats, _ = judged(block, queries, cache, position)
+        table.lengths.copy_(lengths), table.blocks.copy_(blocks), undo and undo()
+        hold(name, not stats.ok and stats.finite and stats.outside > 0, stats.line())
+
+    def twin_on(rows, values, attended):  # the terms of a twin that reads `values`, row `r` of the step attending to `attended[r]` positions
+        terms = []
+        for row, count in enumerate(attended):
+            twin = torch_ref.AttentionBound(None, None, None, {{}})
+            twin(rows[row : row + 1], KvCache(cache.keys(count, BF16), values[:, :, :count], 1), count - 1)
+            terms.append(twin.bound)
+        return SimpleNamespace(bound=tuple(torch.cat([term[part] for term in terms]) for part in (0, 1)))
+
+    values = cache.values(live + 1, BF16)
+    newest, oldest = values.clone(), values.clone()
+    newest[:, :, live - 1], oldest[:, :, 0] = values[:, :, live], values[:, :, 1]
+    for name, wrong in (("a twin: the newest value row read from the next slot", newest), ("a twin: the value row of position 0 read from slot 1", oldest)):
+        stats, _ = judged(block, queries, cache, position, twin_on(queries, wrong, [live]))
+        hold(name, not stats.ok and stats.finite and stats.outside > 0, stats.line())
+    block, queries, cache, position = drawn(1, 6, live, DEFAULT_LENGTH, 7001, 9001)
+    stats, _ = judged(block, queries, cache, position, twin_on(queries, cache.values(live, BF16), [live] * 6))
+    hold("a twin: every row of a step of six attends to all rows", not stats.ok and stats.finite and stats.outside > 0, stats.line())
+    # tables of 64-bit words are the adapter's own decline, at two sequences of two pages: the library would read them as 32-bit words
+    block, queries, cache, position = drawn(2, 1, live, DEFAULT_LENGTH, 7001, 9001)
+    for name, wide in (("lengths", dict(lengths=cache.table.lengths.long())), ("blocks", dict(blocks=cache.table.blocks.long()))):
+        kept = {{field: getattr(cache.table, field) for field in wide}}
+        vars(cache.table).update(wide)
+        try:
+            block(queries, cache, position)
+            declined = "no error"
+        except ValueError as error:
+            declined = str(error)
+        vars(cache.table).update(kept)
+        hold(f"{{name}} of 64-bit words", "the kernel reads 32-bit words" in declined, f"the adapter declines: {{declined[:160]}}")
+
+
+try:
+    {{"cases": cases, "forms": forms, "arms": arms}}[{selected!r}]()
+except NotImplementedError as error:
+    say(f"[core] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[core] {{model_samples.check_environment().header()}}")
+say("[core] FAIL" if failed else "[core] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.parametrize(
+    "selected", [pytest.param("cases", marks=pytest.mark.L0), pytest.param("arms", marks=pytest.mark.L0), pytest.param("forms", marks=pytest.mark.L1)]
+)
+def test_the_librarys_attention_on_drawn_operands_is_inside_its_band_and_every_control_arm_fails(selected):
+    """The block of the attention core on the stack ``native``, called on drawn operands and judged in the band of its
+    row (``CORE_PROGRAM``, a fresh interpreter), where the library and its kernel binaries are installed.  ``cases``:
+    five drawn cases at one sequence, each inside the band.  ``arms``: the same call with one thing wrong must be
+    outside it -- in the call: the lengths one too long, one too short, the entry of the last attended page exchanged
+    with a full one's, the scores at the library's default scale; in the twin: a value row read from the next slot, at
+    the newest position and at position 0, and every row of a step of six attending to all rows -- and tables of 64-bit
+    words are declined by the adapter.  ``forms``: a step shape for each kernel form of the library, each inside the
+    band, the kernel the profiler recorded printed beside it."""
+    _needs_the_library()
+    out = _program(
+        CORE_PROGRAM,
+        "[core]",
+        f"model sample qwen_dense: the library's attention on drawn operands, {selected}",
+        "run of the attention core",
+        selected=selected,
+    )
+    held = [line for line in out.splitlines() if line.startswith("  ") and line.endswith(("    PASS", "    FAIL"))]
+    assert len(held) == {"cases": 5, "arms": 10, "forms": 8}[selected] and all(line.endswith("    PASS") for line in held), out[-6000:]
+    if selected != "arms":  # the kernel the profiler recorded under each call, at the end of its line
+        kernels = sorted({line.rsplit("; ", 1)[1].split("    ")[0] for line in held})
+        frost_routing.measured(f"model sample qwen_dense: the library's attention on drawn operands, {selected}: kernels", "; ".join(kernels))
+
+
+QUANTISE_PROGRAM = """
+import faulthandler, os, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+os.environ.setdefault("KINETO_LOG_LEVEL", "6")  # as the sample's scripts set it: the profiler's own lines stay off standard error
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import tie_out, timing
+from model_samples.providers import Quant, torch_ref
+from model_samples.qwen_dense import QwenDense
+from model_samples.weights import tile_scale_index
+
+DEVICE, BF16, WIDTH = "cuda:0", torch.bfloat16, 5120
+model = QwenDense.reduced()
+failed = []
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+def hold(name, held, text):
+    say(f"  {{name:<44}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+def planned(stack, rows):
+    # a session of `rows` sequences on `stack` and the block of the head's quantise in its plan, its first use made
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    session = model_samples.Session(model, text, sequences=rows, stack=stack, device=DEVICE, capacity=8)
+    block = session.resolve()["output_head.quantize"]
+    block.first_use(rows, 1)
+    return session, block
+
+
+def traced(block, x, quant):
+    # one call of the block under the profiler: what it returned, and the records of its entry's kernel
+    outputs, records = [], []
+
+    def step(index):
+        outputs.append(block(x, quant))
+        outputs[0].codes.sum().item()  # the host read a traced step ends in
+
+    timing.trace_steps(step, 1, DEVICE, records=records)
+    if not outputs:  # no kernel activity records on this build: the call alone
+        step(0)
+    return outputs[0], [record for record in records if record.name.startswith("cudnn_kernel_frost_row_quantize_fp4_")]
+
+
+def drawn(rows):
+    # drawn rows under the seeded model's head scale and under one whose reciprocal is rounded: the block against the
+    # quantisation at the kernel's rounding points, in the band of its row; and the launch against what the entry states
+    _, block = planned("fe-entries", rows)
+    facts = block.launch_facts(rows)
+    for seed, scale in ((7, 8.0 / (448.0 * 6.0)), (11, 0.0205544)):
+        x = (torch.randn((rows, WIDTH), generator=torch.Generator("cpu").manual_seed(seed + rows)) * 1.7).to(BF16).to(DEVICE)
+        quant = Quant("nvfp4", scale)
+        out, launches = traced(block, x, quant)
+        twin = torch_ref.QuantizeBracket(None, None, None, {{}})
+        expected = twin(x, quant)
+        stats = tie_out.BlockStats("row_quantize_fp4")
+        tie_out.BlockTap._judge(stats, out.tensors(), expected.tensors(), [], [], 0, twin)
+        hold(f"{{rows}} rows, scale {{scale:.6g}}: the band", stats.ok and stats.outside == 0, stats.line())
+        if launches:
+            (launch,) = launches
+            same = launch.name in facts.symbols and tuple(launch.shape) == tuple(facts.shape)
+            hold(f"{{rows}} rows, scale {{scale:.6g}}: the launch", same, f"{{launch.name}} in grid {{launch.shape[0]}}, block {{launch.shape[1]}}, shared memory {{launch.shape[2]}} B")
+        else:
+            hold(f"{{rows}} rows, scale {{scale:.6g}}: the launch", True, "kernel not observed")
+
+
+def exact():
+    # a power-of-two scale and power-of-two block scales, rows that hold every rounding tie of the code grid at both signs:
+    # the entry's codes are e2m1 of the exact quotient with ties to the even code, its block scales those powers of two
+    rows, scale = 4, 2.0**-5
+    even = {{0.25: 0, 0.75: 2, 1.25: 2, 1.75: 4, 2.5: 4, 3.5: 6, 5.0: 6}}  # the even code of the two around each midpoint
+    x, want = torch.zeros((rows, WIDTH)), torch.zeros((rows, WIDTH), dtype=torch.uint8)
+    bytes_wanted, ties = torch.zeros((rows, WIDTH // 16), dtype=torch.uint8), 0
+    for r in range(rows):
+        for block in range(WIDTH // 16):
+            exponent = (block + r) % 9 - 6
+            unit, first = 2.0**exponent, block * 16
+            bytes_wanted[r, block] = (exponent + 5 + 7) * 8  # the E4M3 byte of unit x 32: a power of two, mantissa zero
+            x[r, first], want[r, first] = 6.0 * unit, 7
+            x[r, first + 1], want[r, first + 1] = 3.0 * unit, 5
+            for j, middle in enumerate(even):
+                for sign, at in ((1.0, 2 + 2 * j), (-1.0, 3 + 2 * j)):
+                    x[r, first + at], want[r, first + at] = sign * middle * unit, even[middle] + (8 if sign < 0 else 0)
+                    ties += 1
+    _, block = planned("fe-entries", rows)
+    out = block(x.to(BF16).to(DEVICE), Quant("nvfp4", scale))
+    codes, scales = (tensor.cpu() for tensor in out.tensors())
+    nibbles = torch.stack((codes & 0xF, codes >> 4), dim=-1).flatten(-2)
+    off = int((nibbles != want).sum())
+    hold("exact cells: the codes", off == 0 and ties == rows * (WIDTH // 16) * 14, f"{{ties:,}} ties judged, {{off:,}} codes not e2m1 of the exact quotient with ties to even")
+    hold("exact cells: the block scales", torch.equal(scales, bytes_wanted), f"{{int((scales != bytes_wanted).sum()):,}} of {{scales.numel():,}} not their power of two")
+
+
+def handover():
+    # the two blocks of a session on the stack native, block by block: the head's logits with the padded rows of the scale
+    # buffer as the quantise returned them, set to zero, and set to a pattern that is no finite value
+    for rows in (1, 129):
+        text = model_samples.TextIO.synthetic(model.geometry.vocab)
+        session = model_samples.Session(model, text, sequences=rows, stack="native", device=DEVICE, capacity=8)
+        session.plan_table()
+        session.load()
+        quantise, head, weights = session.plan["output_head.quantize"], session.plan["output_head"], session.weights
+        x = (torch.randn((rows, WIDTH), generator=torch.Generator("cpu").manual_seed(100 + rows)) * 1.7).to(BF16).to(DEVICE)
+        q = quantise(x, weights.head_quant)
+        padded = torch.ones(q.tiled_scales.numel(), dtype=torch.bool, device=DEVICE)
+        padded[tile_scale_index(rows, WIDTH // 16, DEVICE)] = False
+        as_returned = head(q, weights.head).clone()
+        results = []
+        for pattern in (0x00, 0x7F):
+            q.tiled_scales.view(-1)[padded] = pattern
+            results.append(head(q, weights.head).clone())
+        same = all(torch.equal(as_returned.view(torch.int16), other.view(torch.int16)) for other in results)
+        finite = bool(torch.isfinite(as_returned.float()).all())
+        hold(f"{{rows}} rows: the head behind the quantise", same and finite, f"{{int(padded.sum()):,}} padded scale bytes as returned, at zero and at 0x7F: {{as_returned.numel():,}} logits, the same bytes" if same else "the logits moved with the padded rows of the scale buffer")
+
+
+try:
+    selected = {selected!r}
+    if selected.startswith("drawn"):
+        drawn(int(selected.split()[1]))
+        if selected == "drawn 1":
+            exact()
+    else:
+        handover()
+except NotImplementedError as error:
+    say(f"[quantise] SKIP {{error}}")
+    raise SystemExit(0)
+say(f"[quantise] {{model_samples.check_environment().header()}}")
+say("[quantise] FAIL" if failed else "[quantise] PASS")
+raise SystemExit(1 if failed else 0)
+"""
+
+
+@pytest.mark.parametrize(
+    "selected", [pytest.param("drawn 1", marks=pytest.mark.L0), pytest.param("drawn 6", marks=pytest.mark.L1), pytest.param("drawn 1024", marks=pytest.mark.L1)]
+)
+def test_the_head_quantise_on_drawn_operands_is_inside_its_band_and_launches_what_its_entry_states(selected):
+    """The block of the output head's quantise on its entry, called on drawn operands (``QUANTISE_PROGRAM``, a fresh
+    interpreter): at 1, 6 and 1,024 rows, under the seeded model's head scale and under one whose reciprocal is rounded,
+    every block scale the byte of the kernel's rule and every code inside its bracket, and the one launch of a call in
+    the shape and under the symbol the entry states.  In the cell of 1 row also the exact cells: under a power-of-two
+    scale with power-of-two block scales, on four rows that hold every rounding tie of the code grid at both signs, the codes are
+    ``e2m1`` of the exact quotient with ties to the even code -- written out in the program, not taken from the twin,
+    whose low code is another byte at three of the seven midpoints."""
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the row of the output head's quantise claims compute capability 10.x")
+    out = _program(
+        QUANTISE_PROGRAM,
+        "[quantise]",
+        f"model sample qwen_dense: the head's quantise on drawn operands, {selected}",
+        "run of the head's quantise",
+        selected=selected,
+    )
+    held = [line for line in out.splitlines() if line.startswith("  ") and line.endswith(("    PASS", "    FAIL"))]
+    assert len(held) == (6 if selected == "drawn 1" else 4) and all(line.endswith("    PASS") for line in held), out[-6000:]
+    if selected == "drawn 1":
+        assert "17,920 ties judged, 0 codes not e2m1 of the exact quotient with ties to even" in out, "every tie of the built rows was judged"
+    # what the profiler recorded under each call, or that it recorded nothing: a launch that was not observed is uncovered, and the record says so
+    launches = sorted({line.split(": the launch", 1)[1].rsplit("    ", 1)[0].strip() for line in held if ": the launch" in line})
+    frost_routing.measured(f"model sample qwen_dense: the head's quantise on drawn operands, {selected}: the launch", "; ".join(launches))
+
+
+@pytest.mark.L0
+def test_the_heads_logits_do_not_move_with_the_padded_rows_of_the_scale_buffer():
+    """The hand-over of the stack ``native``, block by block: the quantise's entry writes the block scales of the live rows
+    into a buffer of whole bands of 128 rows that the adapter does not initialise, and the library's head multiply is
+    handed that buffer as it is.  At 1 row and at 129 rows the head's logits are the same bytes with the padded rows as
+    the adapter returned them, set to zero, and set to a pattern that is no finite value: nothing reads them."""
+    _needs_the_library()
+    out = _program(
+        QUANTISE_PROGRAM, "[quantise]", "model sample qwen_dense: the head behind the quantise's scale buffer", "run of the hand-over", selected="handover"
+    )
+    held = [line for line in out.splitlines() if line.startswith("  ") and line.endswith(("    PASS", "    FAIL"))]
+    assert len(held) == 2 and all(line.endswith("    PASS") for line in held), out[-6000:]
+
+
+@pytest.mark.L1
+def test_the_memory_sentence_holds_what_a_run_of_85_sequences_takes(sample):
+    """``--stack fe-entries --sequences 85`` in a fresh interpreter, on compute capability 10.x: a run of many sequences holds,
+    beyond its weights and its state, what its checks keep for every sequence, and the memory sentence counts it.  The run
+    passes its checks; PyTorch's peak of allocated bytes is below the sentence; and it is within 5 % of the weights the
+    plan holds, the state and what the family counts for the checks (``check_row_bytes``), formed here from the model's own
+    functions for the plan of this GPU.  This cell is what holds the judge's own tensors -- two fp64 copies of a pool,
+    their difference and its square -- to the count: they are alive inside one call, where no host case looks.
+    The run takes about 8 GiB of device memory, so the cell is L1: at L0 the count is held by the host cases alone, and
+    its largest term on a GPU is uncovered there.  Skipped by name on a class the stack's entries do not claim and
+    where the sentence declines the GPU."""
+    import re
+
+    if not torch.cuda.is_available():  # decided here, before a child is started
+        pytest.skip("needs a CUDA GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the runs this count is held to are of the rows of compute capability 10.x: uncovered on this class, not passing")
+    start = time.perf_counter()
+    code, out, written = _fresh_interpreter(["--stack", "fe-entries", "--sequences", "85"])
+    tagged = [line for line in out.splitlines() if line.startswith("[00] ")]
+    verdict = tagged[-1] if tagged else "no output"
+    frost_routing.measured("model sample qwen_dense 00_decode --stack fe-entries --sequences 85", f"{verdict}; {time.perf_counter() - start:.0f} s")
+    if verdict.startswith("[00] SKIP"):
+        assert " FAIL" not in out and "[00] ERROR" not in out, out[-6000:]  # a skip never covers a failed check
+        pytest.skip(verdict)
+    unobserved = verdict.startswith("[00] RAN fe-entries stack (kernels not observed: ")
+    assert code == 0 and (verdict == "[00] PASS" or unobserved) and " FAIL" not in out, out[-6000:]
+    assert written == "", f"a seeded run writes nothing to standard output; it holds\n{written[-3000:]}"
+    sentence = next(line.strip() for line in out.splitlines() if line.strip().startswith("this stack needs about "))
+    assert "what they hold for the 84 sequences beyond the first); " in sentence, sentence
+    need = float(sentence.split("this stack needs about ", 1)[1].split(" GiB", 1)[0])
+    peak = float(out.split("GPU memory: PyTorch peak ", 1)[1].split(" GiB allocated", 1)[0])
+    assert 0.0 < peak < need, f"PyTorch held {peak} GiB at its peak; the memory sentence states {need} GiB"
+    # the arithmetic of the sentence's parts, without its allowances: the weights and the state of this GPU's plan, and the count
+    from model_samples import Session, TextIO
+    from model_samples.qwen_dense import QwenDense
+
+    request = re.search(r"decoding: (\d+) prompt tokens through the decode step, then (\d+) new tokens", out)
+    capacity = int(request.group(1)) + int(request.group(2))  # the positions of the run: its prompt and its new tokens
+    model = QwenDense.reduced(2)
+    text = TextIO.synthetic(model.geometry.vocab)
+    session = Session(model, text, sequences=85, stack="fe-entries", device=f"cuda:{torch.cuda.current_device()}", capacity=capacity)
+    session.resolve()  # the tables of this GPU: nothing is built or loaded
+    held = model.copy_bytes(session.uncopied_weights()) + model.stored_bytes(session.stored_weights())
+    page = session.cache_page()
+    state = model.state_bytes(85, capacity, **({} if page is None else {"page": page}))
+    counted = (held + state + model.check_row_bytes(85, capacity)) / 2**30
+    frost_routing.measured(
+        "model sample qwen_dense 00_decode --stack fe-entries --sequences 85: memory",
+        f"the sentence {need} GiB; PyTorch's peak {peak} GiB; counted {counted:.2f} GiB",
+    )
+    assert abs(peak / counted - 1.0) <= 0.05, (
+        f"PyTorch held {peak} GiB at its peak; the weights held, the state and what the checks hold are {counted:.2f} GiB by the count "
+        f"({held / 2**30:.2f} + {state / 2**30:.2f} + {model.check_row_bytes(85, capacity) / 2**30:.2f})"
+    )
 
 
 @pytest.mark.L1
 def test_four_layer_run_passes_its_own_checks(sample, capsys):
-    out = _run(sample, capsys, ["--layers", "4"])
-    assert "4 of 64 layers (3 linear-attention + 1 attention)" in out and "34 block calls per step" in out
+    out = _run(sample, capsys, [*FE_CUBLAS_STACK, "--layers", "4"])  # in this process: the functional-validation stack, by its name
+    assert "4 of 64 layers (3 linear-attention + 1 attention)" in out and "35 block calls per step" in out
 
 
 VERIFY_PROGRAM = """
@@ -467,13 +1467,13 @@ def say(text):
 
 model = QwenDense.reduced()
 text = model_samples.TextIO.synthetic(model.geometry.vocab)
-common = dict(stack="fe-entries", device="cuda:0", capacity=40)
+common = dict(stack="fe-entries", device="cuda:0", capacity={capacity})
 decode = model_samples.Session(model, text, sequences={sequences}, **common)
 verify = model_samples.Session(model, text, sequences={sequences}, tokens={tokens}, share=decode, **common)
 try:
     say(decode.plan_table([verify]))
     say(verify.resolve().table())
-    say(census.table(verify.plan, verify.claim()))
+    say(census.table(verify.plan))
 except NotImplementedError as error:
     say(f"[verify] SKIP {{error}}")
     raise SystemExit(0)
@@ -482,7 +1482,7 @@ decode.load()
 verify.load()
 generator = torch.Generator().manual_seed(0)
 ids = decode.prefill([torch.randint(0, model.geometry.vocab, (8,), generator=generator, dtype=torch.int32) for _ in range({sequences})])
-for _ in range(23):
+for _ in range({steps}):
     ids = decode.step(ids)
 against = tie_out.verify_checks(verify, decode)
 say(against.text())
@@ -534,17 +1534,20 @@ def _program(program, tag, key, what, unobserved="RAN fe-entries stack (kernels 
     return out
 
 
-def _verify(sequences, tokens):
+def _verify(sequences, tokens, steps=23, capacity=40):
     """A decode session and a verify session of ``tokens`` tokens per sequence in a fresh interpreter (``VERIFY_PROGRAM``):
-    the run's lines."""
+    the run's lines.  The decode run is a prompt of 8 tokens and ``steps`` steps behind it, in a state of ``capacity``
+    positions."""
     key = f"model sample qwen_dense verify step, {sequences} x {tokens} tokens, stack fe-entries"
-    return _program(VERIFY_PROGRAM, "[verify]", key, "verify run", sequences=sequences, tokens=tokens)
+    return _program(VERIFY_PROGRAM, "[verify]", key, "verify run", sequences=sequences, tokens=tokens, steps=steps, capacity=capacity)
 
 
 def _verify_asserts(out, sequences, tokens):
     several = f"{sequences} sequence{'s' if sequences > 1 else ''} x {tokens} tokens per sequence"
     assert f"stack fe-entries, {several}" in out, "the plan of a step of several tokens per sequence"
-    assert f"cudnn.GdnVerifyFused [PDL True, PDL_RELEASE True, TOKENS {tokens}]" in out, "the fused verify entry in the target's form, its tokens a field of it"
+    assert (
+        f"cudnn.GdnVerifyFused [PDL True, PDL_RELEASE True, TOKENS {tokens}]" in out
+    ), "the fused verify entry in the form of its row, its tokens a field of it"
     assert f"verify against decode ({several}, " in out
     rows = [line for line in out.splitlines() if line.startswith("  tokens  ")]
     assert len(rows) == 2 and all(line.endswith("    PASS") for line in rows), "against the decode steps, and against the reference stack's verify steps"
@@ -560,6 +1563,10 @@ def _verify_asserts(out, sequences, tokens):
     # this step on this class -- the kernel of that row range, stated whole -- and the multiply over a copy at the attention
     # layer's call; beyond those rows, and on a class the rows do not claim, the multiply over a copy at both call sites
     cc, rows = tuple(torch.cuda.get_device_capability()), sequences * tokens
+    if cc[0] == 10:  # the attention preparation on its entry: one launch for all rows of the step, each at its own position and slot
+        prepared = [line for line in out.splitlines() if line.split()[:1] == ["attention.prepare"] and "[band: " in line]
+        assert len(prepared) == 1 and prepared[0].endswith("the rest of the pool untouched  [band: attention_prepare]  PASS"), prepared
+        assert " 0 query and 0 key elements outside their band; gate rows equal; value rows equal; " in prepared[0]
     one, other = "projection.fp8.out at linear_attention.out", "projection.fp8.out at full_attention.out"
     if (cc == (10, 0) and rows <= 16) or (cc in ((10, 3), (10, 7)) and rows <= 32):
         split, stages = (2, 11) if cc == (10, 0) and rows <= 8 else (4, 7)
@@ -585,19 +1592,18 @@ def _verify_asserts(out, sequences, tokens):
 
 @pytest.mark.L0
 def test_a_verify_step_on_the_fe_entries_stack_is_the_decode_steps_of_its_tokens_and_passes_its_kernel_check():
-    """One sequence of six tokens: the step shape the census of the target has a recorded section for on compute capability
-    10.0 with 148 SMs.  The decode run's 32 tokens go through verify steps that keep 0 to 5 tokens in turn; every row is
+    """One sequence of six tokens.  The decode run's 32 tokens go through verify steps that keep 0 to 5 tokens in turn; every row is
     compared with the decode step of its token, the state of the kept tokens with the decode steps' state, the verify
     entry token by token with reference decode steps, and every launch of the traced verify steps with the plan.  Six
     rows are a row of the FP8 projection entry for the linear-attention layer's out-projection on compute capability
-    10.x: where the census holds the run, 13 launches of a step are target kernels."""
+    10.x: on compute capability 10.0 the kernel table counts 15 launches of a step on exact rows."""
     out = _verify(1, 6)
     _verify_asserts(out, 1, 6)
     assert "tokens kept behind the first: 0, 1, 2, 3, 4, 5" in out, "every number of tokens is kept once"
     assert "batch invariance  not applicable at 1 sequence" in out
-    if "kernel identity, as planned: " in out:  # a GPU the census has a section for: what the plan reaches of the target, with its split
-        reached = "13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)"
-        assert f"kernel identity, as planned: {reached}; not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1" in out
+    if tuple(torch.cuda.get_device_capability()) == (10, 0):  # every entry row of the stack serves this class
+        counted = "  per step: 15 launches on 9 exact rows, checked one by one in the wiring order; the launches of 5 fallback calls and of the host path "
+        assert counted + "are attributed by family\n" in out, "the count of a step under the kernel table of the verify plan"
 
 
 @pytest.mark.L1
@@ -611,6 +1617,39 @@ def test_a_verify_step_of_four_sequences_runs_each_sequence_alone_with_its_token
     _verify_asserts(out, 4, 6)
     assert "batch invariance  one sequence alone vs among 4 (step t: sequence t mod 4)" in out
     assert "linear_attention.step equal (gated)" not in out, "the entry states no batch invariance: nothing is gated on it"
+
+
+@pytest.mark.L1
+def test_verify_steps_on_either_side_of_a_page_boundary_of_the_attention_cache_and_across_it():
+    """Two sequences of six tokens over a decode run of 72 tokens: the verify steps keep 0 to 5 tokens in turn, so one of
+    them starts at position 63 -- its first row the last of a sequence's first page, its other five on the second -- and
+    keeps that first row alone: five rejected rows are written to the second page and written again by the step behind
+    it.  The step in front of it fills positions 57 to 62 and keeps them all, and the one that starts at 52 rejects
+    position 57, on the first page.  Every row is held against the decode step of its token and the kept state against
+    the decode steps', as in the other verify cells; on compute capability 10.x the attention preparation's entry writes
+    all twelve rows of a step in one launch, each to the slot of its position, and its pool is judged row by row."""
+    schedule, start = [], 0  # the comparison's schedule, by its rule: each step starts behind the kept tokens of the one before it
+    while start + 6 <= 72:
+        schedule.append((start, len(schedule) % 6))
+        start += schedule[-1][1] + 1
+    assert schedule[16:19] == [(52, 4), (57, 5), (63, 0)] and len(schedule) == 21, "rejected rows on both pages, and a step across the boundary"
+    out = _verify(2, 6, steps=64, capacity=80)
+    _verify_asserts(out, 2, 6)
+    assert "21 verify steps over 72 tokens of a run of 72 decode steps; tokens kept behind the first: " + ", ".join(str(kept) for _, kept in schedule) in out
+
+
+@pytest.mark.L1
+def test_a_verify_step_of_16_sequences_of_five_tokens_prepares_its_80_rows_in_one_launch():
+    """16 sequences of five tokens, 80 rows of a step: past the rows of both projection entries, which are multiplies over
+    copies there, and inside the 1,024 rows of the attention preparation's entry on compute capability 10.x -- one launch
+    per step for all 80 rows, each sequence's rows on its own pages of the pool."""
+    out = _verify(16, 5)
+    _verify_asserts(out, 16, 5)
+    if torch.cuda.get_device_capability()[0] == 10:
+        stated = [
+            line for line in out.splitlines() if line.strip().startswith("attention.prepare: cudnn.AttentionPrepareDecode [") and "; the entry states " in line
+        ]
+        assert len(stated) == 1 and "1 launch per step (1 call x 1 per call); the entry states grid (80, 28, 1), block (128, 1, 1)" in stated[0], stated
 
 
 def _header(lines, tag):
@@ -770,6 +1809,11 @@ for count in (1, 63, 64, 65, LAST + 1):
 hold("accessors", reads == 10, f"keys and values of the first 1, 63, 64, 65 and {{LAST + 1}} positions, in bf16 and in fp64: {{reads}} of 10 reads are the pool's rows")
 chain = torch.stack([torch.cat(torch_ref.rope_cos_sin(position, g.rotary_dim, g.rope_theta, device)) for position in range(capacity)])
 hold("cos / sin", same(table.cos_sin, chain), f"the table's row of each of {{capacity}} positions is what the chain forms for that position on this device, bit for bit")
+# the unit of the attention preparation's band, on this device: the exact power of two for every binade of a bf16 value (a
+# power function on a CUDA device is not: a unit that is one fp64 unit low refuses an element exactly one unit away)
+binades = range(-125, 128)
+units = torch_ref.bf16_unit(torch.tensor([2.0**e for e in binades], dtype=torch.float64).to(device)).cpu()
+hold("unit", units.tolist() == [2.0 ** (e - 7) for e in binades], f"the bf16 unit of the band of the attention preparation is the exact power of two in each of {{len(binades)}} binades")
 # a step of three tokens per sequence across the boundary: positions 62 to 64, on states of that layout
 several = [DecodeState(kinds, SEQUENCES, capacity, shapes, device, tokens=3, **layout) for layout in ({{}}, {{"page": PAGE}})]
 for position in range(62):
@@ -806,14 +1850,15 @@ raise SystemExit(1 if failed else 0)
 @pytest.mark.L0
 def test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_launch_no_gather():
     """The paged attention cache of a state (``state.PagedKvCache``) under the two reference chains of an attention layer,
-    on the device, at the published widths and two sequences -- no provider row asks for that layout yet, so no run of a
-    script builds it.  A small program in a fresh interpreter runs the attention preparation and the attention core at
+    on the device, at the published widths and two sequences -- the layout a run builds where the attention preparation's
+    entry serves, here under the chains alone.  A small program in a fresh interpreter runs the attention preparation and the attention core at
     positions 0 to 68 on a plain cache and on a paged one, the steps at 60 to 68 of the paged one under the profiler:
 
     * the queries, gates and attention outputs of every step are the plain cache's bytes;
     * the pool, read by index arithmetic written in the program, holds the plain cache's key and value row of every
       position, and the accessors return those rows;
     * the cos / sin table of the state is, row for row, what the chain forms for that position on this device;
+    * the bf16 unit of the attention preparation's band is the exact power of two on this device, in every binade;
     * a step of three tokens per sequence across positions 62 to 64 gives the plain cache's bytes;
     * no kernel the chains launch on the pool has the id of a step's embedding lookup, and none is unnamed: a gather
       through an index tensor would be counted as the embedding's launch by the kernel check of every stack.
@@ -838,7 +1883,7 @@ def test_the_reference_chains_on_a_paged_cache_give_the_plain_caches_bytes_and_l
     )
     lines = out.splitlines()
     assert any(line.startswith("[paged] ") and line.endswith("positions 0 to 68, the steps at 60 to 68 under the profiler") for line in lines)
-    for name in ("outputs", "pool", "accessors", "cos / sin", "verify"):
+    for name in ("outputs", "pool", "accessors", "cos / sin", "unit", "verify"):
         (line,) = [line for line in lines if line.startswith(f"  {name} ")]
         assert line.endswith("    PASS"), line
     assert "queries, gates and attention outputs of 69 of 69 steps" in out and "138 of 138 rows of the pool" in out and "0 of the 118 rows behind" in out
@@ -890,6 +1935,149 @@ def test_the_cell_of_the_paged_cache_runs_where_the_family_serves_the_gpu_and_on
     assert cell(None) == "runs", "without a GPU the cell asks for no class: the runner of its program skips"
 
 
+PREPARE_PROGRAM = """
+import faulthandler, sys
+faulthandler.dump_traceback_later({deadline}, exit=True)
+sys.path.insert(0, {package_root!r})
+import cudnn
+assert cudnn.__file__ == {cudnn_file!r}, f'the child imported another cudnn: {{cudnn.__file__}}'
+import torch
+sys.path.insert(0, {models!r})
+import model_samples
+from model_samples import tie_out
+from model_samples.providers import torch_ref
+from model_samples.qwen_dense import QwenDense
+from model_samples.state import DecodeState
+
+PAGE, SEQUENCES, STEPS = 64, 2, 80  # positions 0 to 79: a whole first page of every sequence and 16 rows of its second
+
+
+def say(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+def same(a, b):
+    return a.shape == b.shape and torch.equal(a.contiguous().view(torch.int16), b.contiguous().view(torch.int16))
+
+
+failed = []
+
+
+def hold(name, held, text):
+    say(f"  {{name:<10}} {{text}}    {{'PASS' if held else 'FAIL'}}")
+    if not held:
+        failed.append(name)
+
+
+model = QwenDense.reduced()
+session = model_samples.Session(model, model_samples.TextIO.synthetic(model.geometry.vocab), sequences=SEQUENCES, stack="fe-entries", device="cuda:0", capacity=STEPS + 8)
+try:
+    say(session.plan_table())
+    block = session.resolve()["attention.prepare"]
+except NotImplementedError as error:
+    say(f"[prepare] SKIP {{error}}")
+    raise SystemExit(0)
+if session.cache_page() != PAGE:
+    say(f"[prepare] SKIP no row of the stack fe-entries writes a paged attention cache on this GPU (attention.prepare is {{block.entry}}): uncovered, not passing")
+    raise SystemExit(0)
+say(f"[prepare] {{model_samples.check_environment().header()}}")
+session.load()
+fed, kind = [], type(block)
+entry_call = kind.__call__
+
+
+def recorded(self, *operands):  # what the in-projection handed the entry at every step: its row, the position and the layer's weights
+    if self is block:
+        fed.append((operands[0].clone(), operands[2], operands[3]))
+    return entry_call(self, *operands)
+
+
+kind.__call__ = recorded
+generator = torch.Generator().manual_seed(0)
+ids = session.prefill([torch.randint(0, model.geometry.vocab, (8,), generator=generator, dtype=torch.int32) for _ in range(SEQUENCES)])
+for _ in range(STEPS - 8):
+    ids = session.step(ids)
+kind.__call__ = entry_call
+hold("calls", [position for _, position, _ in fed] == list(range(STEPS)), f"the entry was called once per step, at positions 0 to {{STEPS - 1}}: {{len(fed)}} calls")
+# the twin, teacher-forced on those rows, fills a plain cache; it keeps the band of every key element it wrote
+cache = next(layer for layer in session.state.layers if hasattr(layer, "pool"))
+plain = DecodeState(("full_attention",), SEQUENCES, STEPS + 8, model.state_shapes(), torch.device("cuda:0")).layers[0]
+bands = [torch_ref.attention_prepare_rounded(row, plain, position, 1, params, model.geometry.norm_eps)[2].k_band for row, position, params in fed]
+# the pool, read by arithmetic written here: position p of sequence i is row p % 64 of page i * pages + p // 64, keys then values
+pool, heads = cache.pool, cache.pool.shape[1]
+pages, width = pool.shape[0] // SEQUENCES, pool.shape[-1] // 2
+keys, values, behind = [0, 0], [0, 0], 0  # per page of a sequence
+for sequence in range(SEQUENCES):
+    for position in range(pages * PAGE):
+        row = pool[sequence * pages + position // PAGE, :, position % PAGE]
+        if position >= STEPS:
+            behind += int(bool(row.any()))
+            continue
+        got, want = row[:, :width].double().cpu(), plain.k[sequence, :, position].double().cpu()  # compared on the host
+        larger = torch.maximum(got.abs(), want.abs())
+        unit = torch.ldexp(torch.ones_like(larger), torch.frexp(larger).exponent - 8)  # one bf16 unit at the larger magnitude, formed on the host
+        keys[position // PAGE] += int(bool(((got - want).abs() <= unit + bands[position][sequence].cpu()).all()))
+        values[position // PAGE] += int(same(row[:, width:], plain.v[sequence, :, position]))
+# the unit this program holds the key rows with is its own.  It is formed on the host and asked of no device: there it is the exact
+# power of two in every binade of a bf16 value, which the line below holds (the sample's own unit on this device is the other cell's)
+binades = range(-125, 128)
+units = torch.ldexp(torch.ones(len(binades), dtype=torch.float64), torch.tensor([e - 7 for e in binades]))
+hold("unit", units.tolist() == [2.0 ** (e - 7) for e in binades], f"the bf16 unit of this comparison, formed on the host, is the exact power of two in each of {{len(binades)}} binades")
+first, second = SEQUENCES * PAGE, SEQUENCES * (STEPS - PAGE)
+hold("pool", keys == values == [first, second] and behind == 0,
+     f"{{keys[0]}} of {{first}} key rows of the first pages and {{keys[1]}} of {{second}} of the second inside the entry's band around the twin's; "
+     f"{{values[0]}} of {{first}} and {{values[1]}} of {{second}} value rows the twin's bytes; {{behind}} of the {{SEQUENCES * (pages * PAGE - STEPS)}} rows "
+     f"behind position {{STEPS - 1}} hold anything")
+reads = 0
+for count in (1, 63, 64, 65, STEPS):
+    for dtype in (torch.bfloat16, torch.float64):
+        k = torch.stack([pool[sequence * pages + p // PAGE, :, p % PAGE, :width] for sequence in range(SEQUENCES) for p in range(count)])
+        v = torch.stack([pool[sequence * pages + p // PAGE, :, p % PAGE, width:] for sequence in range(SEQUENCES) for p in range(count)])
+        k, v = (t.view(SEQUENCES, count, heads, width).transpose(1, 2).to(dtype) for t in (k, v))
+        reads += int(torch.equal(cache.keys(count, dtype), k) and torch.equal(cache.values(count, dtype), v))
+hold("accessors", reads == 10, f"keys and values of the first 1, 63, 64, 65 and {{STEPS}} positions, in bf16 and in fp64: {{reads}} of 10 reads are the pool's rows")
+session.trace(STEPS)
+own = tie_out.run_checks(session, prompt_tokens=8)
+say(own.text())
+if failed or not own.ok:
+    say("[prepare] FAIL")
+elif own.unobserved:
+    say(f"[prepare] RAN fe-entries stack (kernels not observed: {{own.unobserved}})")
+else:
+    say("[prepare] PASS")
+raise SystemExit(1 if failed or not own.ok else 0)
+"""
+
+
+@pytest.mark.L0
+def test_the_attention_preparations_entry_writes_the_pool_its_twin_would_across_a_page_boundary():
+    """80 plain steps of the stack ``fe-entries`` at two sequences (``PREPARE_PROGRAM``, a fresh interpreter): the attention
+    preparation's entry writes positions 0 to 79 of a paged attention cache, 64 on a sequence's first page and 16 on its
+    second.  The program keeps the row the in-projection handed the entry at every step and runs the entry's twin on
+    those rows over a plain cache; then it reads the pool by index arithmetic of its own and holds, on both pages, every
+    value row to the twin's bytes and every key row inside the entry's band around the twin's -- with a bf16 unit of its
+    own, formed on the host, where it is an exact power of two -- every row behind
+    position 79 still zero, and the cache's accessors to the same arithmetic.  The session's own checks follow, over
+    all 80 steps: the entry against its twin at every step, the kernel check on every traced step -- the steps past
+    position 63 among them, where the attention core reads two pages of a sequence.  On a class whose plan has no such
+    row the program says so and the cell is skipped: uncovered, not passing."""
+    out = _program(
+        PREPARE_PROGRAM, "[prepare]", "model sample qwen_dense: the attention preparation's entry across a page boundary", "run of the attention preparation"
+    )
+    lines = out.splitlines()
+    for name in ("calls", "unit", "pool", "accessors"):
+        (line,) = [line for line in lines if line.startswith(f"  {name} ")]
+        assert line.endswith("    PASS"), line
+    assert "128 of 128 key rows of the first pages and 32 of 32 of the second inside the entry's band" in out and "0 of the 96 rows behind position 79" in out
+    (judged,) = [line for line in lines if line.split()[:1] == ["attention.prepare"] and "[band: " in line]
+    assert judged.split()[1:3] == ["80", "calls"] and judged.endswith("the rest of the pool untouched  [band: attention_prepare]  PASS"), judged
+    observed = [line for line in lines if line.startswith("  kernels  ")]
+    frost_routing.measured(
+        "model sample qwen_dense: the attention preparation's entry across a page boundary, the kernel check",
+        "; ".join(line.split("    ")[-1] for line in observed),
+    )
+
+
 def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     """Run ``main()`` of the speculative script and hold what every such run prints; with ``sample`` None, run the script in
     a fresh interpreter instead.  Standard output must stay empty (a seeded run has no language); the verdict is ``[02]
@@ -925,8 +2113,7 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert "acceptance is scheduled, not measured: the drafted tokens of every step are replaced by the plain run's tokens for 0, 1, .., 5 positions" in header
     load = next(index for index, line in enumerate(lines) if line.startswith("[02] stage "))
     before = (
-        '[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, '
-        "use_local_argmax_reduction true.",
+        '[02] --speculative-config (the default): read: method "mtp", num_speculative_tokens 5, use_local_argmax_reduction true.',
         "[02] draft vocabulary seeded list (seed 0): 3,880 ids of the model's 15,520, in ascending order (3,880 entries listed, none dropped)",
         "[02] prompt of 26 tokens = 26 decode steps and 25 passes of the drafter before the first token; then every step is 5 draft passes and one "
         "verify step of 6 tokens, and keeps 1 to 6 of them",
@@ -938,7 +2125,7 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert "with its drafter, one after the other" in out and out.count("this stack needs about ") == 1, "one memory sentence, the drafter in it"
     # the report, in front of the comparison: the schedule, no rate, the bytes of a step
     against = lines.index(
-        "speculative against decode (1 sequence x 6 tokens per sequence, 10 engine steps behind a prompt of 26 tokens; "
+        "speculative against decode (1 sequence x 6 tokens per sequence, 10 speculative steps behind a prompt of 26 tokens; "
         "tokens kept behind the first: 0, 1, 2, 3, 4, 5, 0, 1, 2, 3; 2 layers)"
     )
     report = lines.index("acceptance            scheduled, not measured (reduction): 10 steps; kept 1: 2, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1")
@@ -948,7 +2135,7 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
     assert any(
         line.startswith("first token ") and "each but the first behind one pass of the drafter over the position in front of it" in line for line in lines
     )
-    assert any(line.startswith("steps (10) ") and line.endswith(" | 110 block calls per step") for line in lines), "five passes of 18 calls and the model's 20"
+    assert any(line.startswith("steps (10) ") and line.endswith(" | 111 block calls per step") for line in lines), "five passes of 18 calls and the model's 21"
     assert any(line.startswith("bytes per step ") and " + drafter 5 x " in line for line in lines[:against])
     assert any(line.startswith("text out              32 tokens in 10 steps (seeded weights: not language): ") for line in lines[:against])
     # the comparison with decode steps of the same tokens: every line of it, and the script's own line of the ids
@@ -981,16 +2168,19 @@ def _speculative_run(sample, capsys, arguments, stack="fe-cublas"):
 
 
 @pytest.mark.L0
-def test_the_speculative_default_run_passes_its_own_checks(speculative, capsys):
-    """The default run of ``02_speculative_decode.py``, loaded by path, in this process: the stack ``fe-cublas``, both
+def test_the_speculative_run_on_the_fe_cublas_stack_passes_its_own_checks(speculative, capsys):
+    """``02_speculative_decode.py --stack fe-cublas``, a functional-validation stack, loaded by path, in this process, both
     streams held.  It is the only L0 cell that launches the fused verify step and the fused decode step on token 0 of a
-    state of six tokens per sequence in the form of the default stack; what their first launches took is recorded.  The
-    kernels are not checked on this stack unless asked: no kernel line, and no statement about the drafter's kernels."""
-    out = _speculative_run(speculative, capsys, [])
+    state of six tokens per sequence in the form of that stack; what their first launches took is recorded.  The
+    kernels are not checked on this stack unless asked: no kernel line, and no statement about the drafter's kernels.
+    The run says in one line that it is launched from Python and what its stack is."""
+    out = _speculative_run(speculative, capsys, FE_CUBLAS_STACK)
     lines = out.splitlines()
+    told = "[02] launched from Python: fe-cublas is a functional-validation stack, taken by --stack alone -- "
+    assert sum(line.startswith(told) and line.endswith("; the sample's stack is native") for line in lines) == 1
     assert "stack fe-cublas, 1 sequence x 6 tokens per sequence" in out and "cudnn.GdnVerifyFused " in out and "cudnn.GdnDecodeFused " in out
     assert "[PDL " not in out, "an entry's form is printed with the kernel table, which this stack prints on request"
-    assert "\n  kernels  " not in out and "kernel identity" not in out, "the default stack declares no target and its kernels are checked on request"
+    assert "\n  kernels  " not in out and "\nkernels, planned" not in out, "the kernels of this stack are checked on request"
     stages = next(line for line in lines if line.startswith("[02] the session with the drafter: stage  "))
     forms = [part.strip() for part in stages.split("stage  ", 1)[1].split(" | ") if part.strip().startswith("compile and first launch linear_attention.step ")]
     assert [form.rsplit(" ", 2)[0] for form in forms] == [
@@ -999,7 +2189,24 @@ def test_the_speculative_default_run_passes_its_own_checks(speculative, capsys):
     ], "the decode step on token 0 of the state of six tokens, then the verify step"
     # an entry builds its kernel at the plan (its first use) and launches it once at the load: both are recorded with their seconds
     plan = next(part.strip() for line in lines if line.startswith("[02] stage  ") for part in line.split(" | ") if part.strip().startswith("plan "))
-    frost_routing.measured("model sample qwen_dense 02_speculative_decode (default): the two forms this cell alone launches", "; ".join([plan, *forms]))
+    frost_routing.measured("model sample qwen_dense 02_speculative_decode --stack fe-cublas: the two forms this cell alone launches", "; ".join([plan, *forms]))
+
+
+@pytest.mark.L0
+def test_the_speculative_default_run_is_the_native_stack_launched_from_python(capsys):
+    """The default run of ``02_speculative_decode.py`` -- no flag: the stack ``native`` --, in a fresh interpreter, both
+    streams held, where the library the stack calls is installed.  A step of speculative decoding is not recorded: the
+    run says so in one line, with the reason, and passes its checks on steps launched from Python."""
+    _needs_the_library()
+    out = _speculative_run(None, capsys, [], "native")
+    lines = out.splitlines()
+    assert any(line.startswith("[02] ") and line.endswith("| stack native") for line in lines), "the sample's stack, by default"
+    told = [line for line in lines if line.startswith("[02] launched from Python: ")]
+    assert told == [
+        "[02] launched from Python: a step of speculative decoding is not recorded: the drafter's passes run on reference blocks, "
+        "which a recorded launch sequence cannot hold"
+    ], told
+    assert "step recorded" not in out
 
 
 @pytest.mark.L1
@@ -1008,9 +2215,8 @@ def test_the_speculative_run_on_the_fe_entries_stack_passes_its_kernel_check(cap
     held: the cuDNN Frontend rows of ``native`` under the verify step and under the prompt's decode steps, the drafter's
     passes on reference blocks in front of every verify step.  The traced pass holds whole steps behind the replayed
     prompt, and the kernel check holds them: the lookups of the passes and the verify plan's rows one by one, the
-    chains of the passes by family; under it the run says that the prompt's decode steps were not observed and that it
-    states nothing of the drafter's kernels.  Where the census has a section for the GPU, the verify plan's share of
-    the target kernel set is stated with its split."""
+    chains of the passes by family; under it the run says that the prompt's decode steps were not observed.  The
+    kernel table of the verify plan ends in its count of a step."""
     if not torch.cuda.is_available():  # decided here, before a child is started
         pytest.skip("needs a CUDA GPU")
     out = _speculative_run(None, capsys, ["--stack", "fe-entries"], "fe-entries")
@@ -1020,17 +2226,14 @@ def test_the_speculative_run_on_the_fe_entries_stack_passes_its_kernel_check(cap
     assert out.count("\nkernels, planned (decided before the load") == 1, "the kernel table of the verify plan"
     traced = [line for line in lines if line.startswith("traced pass (")]
     assert not traced or traced[0].endswith(" | behind the prompt's 26 decode steps, replayed untraced")
-    if "kernel identity, as planned: " in out:  # a GPU the census has a section for: the verify plan's share of the target, with its split
-        reached = "13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results)"
-        assert f"kernel identity, as planned: {reached}; not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1" in out
+    if tuple(torch.cuda.get_device_capability()) == (10, 0):  # every entry row of the stack serves this class
+        counted = "  per step: 15 launches on 9 exact rows, checked one by one in the wiring order; the launches of 5 fallback calls and of the host path "
+        assert counted + "are attributed by family\n" in out, "the count of a step under the kernel table of the verify plan"
     observed = [line for line in lines if line.startswith("  kernels  ")]
     assert len(observed) == 1, "the kernel check of the traced steps ran, or said why it could not look"
-    # the kernel check is of the verify steps: beside its verdict the run says what it did not look at, and what it does not state
+    # the kernel check is of the verify steps: beside its verdict the run says what it did not look at
     assert "    the prompt's decode steps: 26 replayed in front of the traced window, their kernels not observed (the check is of the verify steps)" in lines
-    assert (
-        "    kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and the output head behind it; "
-        "no section holds a draft pass)"
-    ) in lines
+    assert "; the library launched " not in out, "no row of this stack is a library's"
     frost_routing.measured(
         "model sample qwen_dense 02_speculative_decode --stack fe-entries: the kernel check", "; ".join(line.split("    ")[-1] for line in observed)
     )

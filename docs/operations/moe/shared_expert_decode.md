@@ -47,6 +47,23 @@ token count of its band (a captured CUDA graph replays its own `T`). The entry o
 (`act` [32, I] bf16, `gate_part` [32, I / 4] fp32), allocated once per form at the first compile; build
 one entry per concurrently running stream.
 
+**The pair is ordered behind the stream work of the entry's own allocations.** The scratch of a form (zero-filled)
+and the entry-owned output buffer (used when a call passes no `out`) are allocated on torch's current stream of the
+entry's device at that moment, and that stream can still write them: the zero-fill, a fill torch adds to the output
+buffer under deterministic algorithms, a write the stream still owes a recycled block. Every call that writes their
+bytes -- the scratch, the output buffer by default or its rows passed back as `out`, by this entry or by another
+entry that orders its launches the same way (through `cudnn.frost.init_order`; rule 16 of
+`python/cudnn/frost/README.md` lists the entries that do and those that do not yet) -- is ordered behind that work on
+whatever stream it runs: the launch stream waits for an event
+recorded behind the allocation, without a host wait and without synchronizing a stream or the device (one ordering in
+front of the pair: the second launch follows the first on the same stream). A captured call that finds the work still
+pending waits for that one event on the host before its launches (set-up, never part of a replay; compile without
+`out` before the capture and let that stream's work finish to avoid it). Not ordered: an allocation made inside a
+stream capture. An allocation on the legacy default stream while a blocking stream of another host thread captures
+raises torch's error: allocate before that capture or on a stream of your own. The caller's: `x` and the weights,
+which the launches only read, and its own reads and writes of the
+returned `out` outside a call. `scratch_for(cfg)` returns a copy of the entry's table.
+
 Knobs (`cudnn.moe.frost.kernel.shared_expert_decode_config.Cfg`, passed as `cfg=`): bit-neutral `N_GROUPS` (row-pair
 groups per CTA; 0 = the one-wave rule), `X_BULK_ROWS` (x resident by bulk row copies; off = the first release's `cp.async`
 ring), `X_STAGES`, `W_PHASES`, `ROWS_PER_CTA`, `MIN_CTAS_PER_SM`, `KRED_SPLIT` (the cluster-fold barrier split between the

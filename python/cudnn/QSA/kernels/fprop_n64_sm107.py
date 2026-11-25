@@ -27,7 +27,7 @@ from cudnn.frost.compiled_cache import compile_cached, template_key
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 OPS_SOURCE_DIGEST = hashlib.sha256(Path(ops.__file__).read_bytes()).hexdigest()
 
-I32, I64, F32, BF16 = cutlass.Int32, cutlass.Int64, cutlass.Float32, cutlass.BFloat16
+I32, I64, F32 = cutlass.Int32, cutlass.Int64, cutlass.Float32
 D = 256
 THREADS, TILE_N, KV_STAGES, S_STAGES = 448, 64, 3, 2
 OFF_Q, OFF_P, OFF_KV = 0, 8192, 12288
@@ -114,14 +114,14 @@ def gather(
 
 
 @cute.jit
-def issue_score(raw, tmem, kv_full, kv_empty, s_full, s_empty, ordinal, tile):
+def issue_score(raw, tmem, kv_full, kv_empty, s_full, s_empty, ordinal, tile, dtype: cutlass.Constexpr):
     ks, kp = ordinal % 3, (ordinal // 3) & 1
     ss, sp = tile % 2, (tile // 2) & 1
     wait(kv_full.subview(ks), kp)
     wait(s_empty.subview(ss), sp ^ 1)
     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
     for k16 in cutlass.range_constexpr(16):
-        ops.score(raw, OFF_KV + ks * KV_BYTES, tmem, ss * 16, k16, k16 > 0)
+        ops.score(raw, OFF_KV + ks * KV_BYTES, tmem, ss * 16, k16, k16 > 0, dtype)
     if prims.elect_sync():
         prims.tcgen05_commit(s_full.subview(ss), group=prims.CTAGroup.CTA_1)
         prims.tcgen05_commit(kv_empty.subview(ks), group=prims.CTAGroup.CTA_1)
@@ -258,9 +258,9 @@ def frost_qsa_fprop_n64_sm107(
                 for r in cutlass.range_constexpr(2):
                     probability = cute.math.exp2(scaled[2 * j + r] - safe_new, fastmath=True)
                     next_norm.append(F32(norm[2 * j + r]) * a + probability)
-                    ops.store_p(raw, OFF_P + slot * P_BYTES, row0 + r * 8, h, probability)
+                    ops.store_p(raw, OFF_P + slot * P_BYTES, row0 + r * 8, h, probability, out.element_type)
             for r in cutlass.range_constexpr(2):
-                ops.store_p(raw, OFF_P + slot * P_BYTES, row0 + r * 8, lane % 4 + 12, F32(0))
+                ops.store_p(raw, OFF_P + slot * P_BYTES, row0 + r * 8, lane % 4 + 12, F32(0), out.element_type)
             maximum = cutlass.Vector.from_elements(next_max, F32)
             norm = cutlass.Vector.from_elements(next_norm, F32)
             prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
@@ -346,7 +346,7 @@ def frost_qsa_fprop_n64_sm107(
                         result = choose_f(dead != 0, F32(0), F32(values[j]) * inverse)
                         coord = (I64(query), I64(head * 12 + h), I64(tid + half * 128))
                         out_fp32[coord] = result
-                        out[coord] = result.to(BF16)
+                        out[coord] = result.to(out.element_type)
                         if cutlass.const_expr(half == 0):
                             stat = F32(
                                 prims.shfl_sync(
@@ -425,11 +425,11 @@ def frost_qsa_fprop_n64_sm107(
     elif warp == 12:
         wait(qf, 0)
         ordinal = I32(0)
-        issue_score(raw, tmem, kf, ke, sf, se, ordinal, 0)
+        issue_score(raw, tmem, kf, ke, sf, se, ordinal, 0, out.element_type)
         ordinal = ordinal + 1
         for tile in cutlass.range(tiles, unroll=1):
             if tile + 1 < tiles:
-                issue_score(raw, tmem, kf, ke, sf, se, ordinal, tile + 1)
+                issue_score(raw, tmem, kf, ke, sf, se, ordinal, tile + 1, out.element_type)
                 ordinal = ordinal + 1
             slot, phase = ordinal % 3, (ordinal // 3) & 1
             ps, pp = tile % 2, (tile // 2) & 1
@@ -447,6 +447,7 @@ def frost_qsa_fprop_n64_sm107(
                         half,
                         k16,
                         (tile > 0) | (k16 > 0),
+                        out.element_type,
                     )
             if prims.elect_sync():
                 prims.tcgen05_commit(vf.subview(ps), group=prims.CTAGroup.CTA_1)
@@ -542,8 +543,8 @@ def _fprop_host(q, k, v, out, out_fp32, lse, ids, counts, lo, hi, first, last, m
 def compile_kernel(dtype, query_heads, kv_heads, arch, gated=False):
     from .fprop_sm100 import _compile_args, FROST_SOURCE_DIGEST as args_source_digest
 
-    if arch != 107 or dtype != cutlass.BFloat16 or query_heads != 12 * kv_heads or gated:
-        raise ValueError("64-key QSA forward requires SM107, BF16 and 12 query heads per KV head, without gated tiles")
+    if arch != 107 or dtype not in (cutlass.BFloat16, cutlass.Float16) or query_heads != 12 * kv_heads or gated:
+        raise ValueError("64-key QSA forward requires SM107, BF16 or FP16 and 12 query heads per KV head, without gated tiles")
     # Keep imported callables out of the serializable specialization key.
     key = template_key(
         globals(),

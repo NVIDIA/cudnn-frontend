@@ -446,7 +446,9 @@ op.execute(
 ```
 
 `use_dynamic_sched=False` uses static scheduling; `True` caches a dynamic-M
-callable for compatible shapes. Cache keys include compile-sensitive layouts,
+callable for compatible shapes. Wrapper calls allocate their scheduler counter
+and tensor maps per call, so same-signature wrapper calls may overlap on
+different streams. Cache keys include compile-sensitive layouts,
 dtypes, features, activation, scheduler, tile/cluster, output policy, and
 overlap margin, but not the runtime GeGLU `linear_offset`.
 

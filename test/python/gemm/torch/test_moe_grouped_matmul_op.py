@@ -67,3 +67,98 @@ class TestMoEGroupedMatmul:
         Y_ref = ref_moe_grouped_matmul(token, weight, fto, num_experts)
 
         torch.testing.assert_close(Y_ref, result, atol=0.125, rtol=0.125)
+
+
+def _fresh_handle_cache(monkeypatch, op):
+    if hasattr(op, "_handles"):
+        monkeypatch.setattr(op, "_handles", type(op._handles)())
+    monkeypatch.setattr(op, "_tls", __import__("threading").local(), raising=False)
+    monkeypatch.setattr(op, "_cudnn_handles", {}, raising=False)
+
+
+@pytest.mark.L0
+def test_handle_cache_is_thread_local_and_pinned_to_the_token_device(monkeypatch):
+    """Each host thread gets its own handle, created on the token's GPU and bound to that thread's stream."""
+    import contextlib
+    import importlib
+    import threading
+    from types import SimpleNamespace
+
+    op = importlib.import_module("cudnn.gemm.ops.moe_grouped_matmul")
+
+    _fresh_handle_cache(monkeypatch, op)
+    local = threading.local()
+    active = threading.local()
+    lock = threading.Lock()
+    created, bindings, results = [], [], []
+    barrier = threading.Barrier(2)
+
+    @contextlib.contextmanager
+    def device(index):
+        active.index = index
+        try:
+            yield
+        finally:
+            active.index = None
+
+    def create_handle():
+        with lock:
+            handle = (len(created) + 1, getattr(active, "index", None))
+            created.append(handle)
+            return handle
+
+    def set_stream(*, handle, stream):
+        with lock:
+            bindings.append((handle, stream))
+
+    monkeypatch.setattr(op.torch.cuda, "device", device)
+    monkeypatch.setattr(op.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(op.torch.cuda, "current_stream", lambda unused=None: local.stream)
+    monkeypatch.setattr(op.cudnn, "create_handle", create_handle)
+    monkeypatch.setattr(op.cudnn, "set_stream", set_stream)
+
+    def worker(stream):
+        local.stream = SimpleNamespace(cuda_stream=stream)
+        barrier.wait()
+        first = op._get_handle(torch.device("cuda", 1))
+        second = op._get_handle(torch.device("cuda", 1))
+        results.append((stream, first, second))
+        barrier.wait()  # both threads are alive while either takes its handle
+
+    threads = [threading.Thread(target=worker, args=(stream,)) for stream in (101, 202)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 2 and all(first is second for _, first, second in results)
+    assert len({first for _, first, _ in results}) == 2, "threads share one re-streamed handle"
+    assert all(index == 1 for _, index in created), f"handles were not created on the token's device: {created}"
+    for stream, handle, _ in results:
+        assert {s for h, s in bindings if h == handle} == {stream}
+
+
+@pytest.mark.L0
+def test_handle_cache_reuses_the_handles_of_exited_threads(monkeypatch):
+    """Short-lived workers must not leave one native handle each behind: a finished thread's handle
+    serves the next thread, and none is destroyed while a cached graph may still hold it."""
+    import contextlib
+    import importlib
+    import threading
+    from types import SimpleNamespace
+
+    op = importlib.import_module("cudnn.gemm.ops.moe_grouped_matmul")
+    _fresh_handle_cache(monkeypatch, op)
+    created, destroyed = [], []
+    monkeypatch.setattr(op.torch.cuda, "device", lambda index: contextlib.nullcontext())
+    monkeypatch.setattr(op.torch.cuda, "current_stream", lambda unused=None: SimpleNamespace(cuda_stream=7))
+    monkeypatch.setattr(op.cudnn, "create_handle", lambda: created.append(object()) or created[-1])
+    monkeypatch.setattr(op.cudnn, "destroy_handle", destroyed.append)
+    monkeypatch.setattr(op.cudnn, "set_stream", lambda *, handle, stream: None)
+
+    for _ in range(4):
+        worker = threading.Thread(target=op._get_handle, args=(torch.device("cuda", 0),))
+        worker.start()
+        worker.join()
+    assert len(created) == 1, f"{len(created)} native handles for 4 sequential threads"
+    assert destroyed == []

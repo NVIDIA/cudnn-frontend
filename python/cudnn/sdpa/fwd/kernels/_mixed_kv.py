@@ -5,20 +5,17 @@
 import cutlass
 import cutlass.cute as cute
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
+from cutlass.base_dsl.version_info import CUDA_VERSION
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 
 
 def _packed_asm(src_dtype, out_dtype, *, global_src=False):
-    # Packed widening preserves every finite FP8 value, including subnormals.
-    # BF16 widening needs PTX 9.2, supplied by the supported DSL 4.7 compiler.
-    # https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt
     src = "e4m3x2" if src_dtype == cutlass.Float8E4M3FN else "e5m2x2"
     dst = "bf16x2" if out_dtype == cutlass.BFloat16 else "f16x2"
-    # The SM120 global loader also supports the DSL's CUDA 12.9 compiler.
-    # Its PTX predates direct FP8 -> BF16 packed widening. Every finite FP8
-    # value is exactly representable in both half types, so widening through
-    # FP16 is exact (including subnormals and signed zero).
-    if global_src and out_dtype == cutlass.BFloat16:
+    # Direct FP8 -> BF16 packed widening requires PTX 9.2 (CUDA 13.2).
+    # Older DSL compilers and the global loader widen through FP16, which
+    # represents every finite FP8 value exactly, including subnormals and signed zero.
+    if out_dtype == cutlass.BFloat16 and (global_src or (CUDA_VERSION.major, CUDA_VERSION.minor) < (13, 2)):
         convert = (
             "{ .reg .b16 lo, hi; "
             + " ".join(

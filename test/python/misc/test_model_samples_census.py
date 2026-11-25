@@ -12,16 +12,17 @@ records: the clean stand-ins pass, and an adapter that DECLARES one kernel and l
 the run is ``RAN ... (kernels not observed: <reason>)`` and never ``PASS``: held on the last line of the sample's own
 ``main()``, run to its end on the CPU.
 
-And the target kernel set (``samples/models/model_samples/qwen_dense/kernel_census.json``, the stacks ``native`` and
-``fe-entries``): the census file against its own three numbers and against the wiring of the model, the identity of every
-block call, every reason a GPU class is not claimed, a target launch in another shape than the recorded one, "claimed
-implies no fallback row and a recorded basis", the adapter of the attention gate + quantise entry over a stand-in entry,
-its twin and its band on stated tensors, and ``main()`` with ``--stack native`` to its last line.  No GPU, no weights, no
-profiler."""
+And the stacks ``native`` and ``fe-entries``: the adapter of every entry and of every library call over a stand-in, each
+row through a real session with the controls that must fail it, the adapter of the attention gate + quantise entry over a
+stand-in entry, its twin and its band on stated tensors, and ``main()`` with ``--stack native`` to its last line.  No GPU,
+no weights, no profiler."""
 
+import dataclasses
 import hashlib
 import json
+import math
 import re
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -36,13 +37,24 @@ pytestmark = [pytest.mark.L0]
 MODELS = Path(__file__).resolve().parents[3] / "samples" / "models"
 GIB = 1024**3
 
+
+#: the stack the host runs of this module are planned on where a run names none: a functional-validation stack, as the
+#: stand-ins and the stated plans of these tests are.  The sample's own stack is named where a test runs it
+VALIDATION_STACK = ("--stack", "fe-cublas")
+
+
+def _stacked(arguments):
+    """The arguments of a host run, with the validation stack named where they name no stack."""
+    return list(arguments) if "--stack" in arguments else [*VALIDATION_STACK, *arguments]
+
+
 # kernel names as the profiler reports them (heads of the names of one traced default run; a name is matched by its head)
 SYMBOL = (
     "cudnn_kernel_frost_gdn_decode_fused_CfgTHREADS256TPR4K_RESIDENTTrueWARPGROUP_SPLITTrueCTAS_PER_SM0STATE_LOAD_PATHbulkSTATE_STREAMFalse"
     "MIN_CTAS_PER_SM1PDLFalsePDL_RELEASEFalsePIN_ENTRY_L_0"
 )
 SHAPE = ((96, 1, 1), (256, 1, 1), 42112)
-TARGET_SYMBOL = SYMBOL.replace("PDLFalsePDL_RELEASEFalsePIN_ENTRY_L_0", "PDLTruePDL_RELEASETruePIN_ENTRY_LOA_0")  # the wait + release form
+WAITING_SYMBOL = SYMBOL.replace("PDLFalsePDL_RELEASEFalsePIN_ENTRY_L_0", "PDLTruePDL_RELEASETruePIN_ENTRY_LOA_0")  # the wait + release form
 GATE_SYMBOL = (
     "cudnn_kernel_frost_attention_gate_quant_CfgTHREADS256PDL_RELEASETrue_tensorptrbf16gmemalign16o1_tensorptrbf16gmemalign16o1_tensorptrf32gmemo11_"
     "tensorptri8gmemalign16o1__0"
@@ -67,7 +79,7 @@ PROJECTION_SYMBOL = (
     "tensorptrbf16gmemalign32o21_tensorptrf32gmemo11_0"
 )
 #: of the same entry for the out-projection of a linear-attention layer in a step of several tokens per sequence: at 2 to 8 rows
-#: two K slices per 64 weight rows (a step of six rows: the recorded launch), at 9 to 16 rows four slices and the 16-row tile
+#: two K slices per 64 weight rows (a step of six rows), at 9 to 16 rows four slices and the 16-row tile
 OUT_SHAPE = ((80, 2, 1), (256, 1, 1), 103808)
 OUT_SHAPE_SPLIT_4 = ((80, 4, 1), (256, 1, 1), 84352)
 #: of the fused verify step at one sequence of six tokens, and a symbol of its kernel (cut in front of its launch knobs and tokens)
@@ -76,8 +88,7 @@ VERIFY_SYMBOL = (
     "cudnn_kernel_frost_gdn_verify_fused_CfgTPR4K_RESIDENTTrueNBUF3STATE_STREAMFalseMIN_CTAS_PER_SM1CTAS_PER_SM0BA_PREFETCH_CHUNKS3"
     "NORM_FORMctas2STATE_LOAD_PATHbulkSTATE_STORE_PATHbulkBULK_I_0"
 )
-CENSUS_VERIFY = "target census verify / cc 10.0 / 148 SMs (recorded 2026-11-12)"
-#: the form of the row of that entry in the target stacks, and the further fields of its two call sites
+#: the form of the row of that entry in ``native`` and ``fe-entries``, and the further fields of its two call sites
 PROJECTION_FORM = "[SPLIT_K 1, MMA_M 128, STAGES 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True"
 #: of the fused gate / up entry at 1 to 32 rows on a part with at least 148 SMs: one thread block per 128 weight rows up to the cap
 SWIGLU_SHAPE = ((1, 1, 148), (192, 1, 1), 231424)
@@ -86,32 +97,13 @@ SWIGLU_SYMBOL = (
     "cudnn_kernel_frost_swiglu_fp4_decode_h5120_i17408_t8_pw2_evf_c148_pdl_SwigluFp4DecodeKernel_TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____"
     "MMAAtom_ThrID10_ShapeMNK128864_TVLayoutA1128_0"
 )
-#: the form of the row of that entry in the target stacks at 1 to 8 rows
+#: the form of the row of that entry in ``native`` and ``fe-entries`` at 1 to 8 rows
 SWIGLU_FORM = "[TOKEN_TILE 8, PREWAIT_STAGES 2, L2_EVICT_FIRST True, MAX_CLUSTERS 148, PDL True]"
-RECORDED = {"torch": "2.14.0+cu130", "nvidia-cutlass-dsl": "4.8.0"}  # installed versions equal to the census's recorded ones
-CENSUS = "target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12)"
-#: what the census line says was compared when the gather, the fused step, the gate, the five norms, the two in-projections
-#: and the two gate / up multiplies of the two-layer model held: three numbers
-COMPARED_12 = (
-    "12 launches of a step compared by launch shape (2 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results "
-    "+ 0 declared stand-ins)"
-)
-#: the same on the stack ``native`` of the two-layer model: the two down multiplies of the library are held to their recorded
-#: class and shape as well; its two out-projections and the output head of the reduced vocabulary by membership alone
-COMPARED_14 = (
-    "14 launches of a step compared by launch shape (4 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results "
-    "+ 0 declared stand-ins)"
-)
-OTHER_VOCAB = "no recorded launch shape of output_head for this model: vocab 15520 (recorded 248320)"
-COMPARED_2 = (
-    "2 launches of a step compared by launch shape (2 the target's own compiled kernels + 0 cuDNN Frontend entries with byte-equal results "
-    "+ 0 declared stand-ins)"
-)
-WHOLE = "the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): "
 GATHER = "void at::native::(anonymous namespace)::indexSelectSmallIndex<BFloat16, int, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<...>)"
-# the kernel torch.index_select launched for the embedding from 17 rows (compute capability 10.0, PyTorch 2.13.0), as recorded
+# the kernel torch.index_select launched for the embedding from 17 rows (compute capability 10.0, PyTorch 2.13.0), as a run reported it
 GATHER_VECTORIZED = "void at::native::vectorized_gather_kernel<16, int>(char*, char*, int*, int, long, long, long, long, bool)"
 ELEMENTWISE = "void at::native::vectorized_elementwise_kernel<2, at::native::CUDAFunctorOnSelf_add<double>, std::array<char*, 2ul> >(int, ...)"
+FILL = "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, ...)"
 ARGMAX = "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<BFloat16, at::native::ArgMaxOps<BFloat16>, unsigned int, long, 4, 4> >(...)"
 SOFTMAX = "void (anonymous namespace)::softmax_warp_forward<double, double, double, 3, false, false, 32>(double*, double const*, int, int, int, ...)"
 ARANGE = "void (anonymous namespace)::elementwise_kernel_with_index<int, at::native::arange_cuda_out(...)::{lambda(long)#1}>(int, ...)"
@@ -121,10 +113,10 @@ GEMV = "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, d
 GEMM_FP64 = "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x64_16x4_nn_align1>(cutlass_80_tensorop_d884gemm_32x64_16x4_nn_align1::Params)"
 HOST_READ = "Memcpy DtoH (Device -> Pageable)"
 COPY_IN = "Memcpy HtoD (Pageable -> Device)"
-# the kernels of FlashInfer's multiplies on the stored formats, as recorded on compute capability 10.0 with 148 SMs: the two
-# classes of its 4-bit multiply (the down multiply and the output head of the published widths, with their launch shapes), its
-# own CUTLASS 8-bit multiply (what the call launches where no tuner has chosen; the profiler leaves the name mangled) and the
-# cuBLASLt kernel the census records as the tuner's pick
+# the kernels of FlashInfer's multiplies on the stored formats, as runs on compute capability 10.0 with 148 SMs reported them: the
+# two classes of its 4-bit multiply (the down multiply and the output head of the published widths, with their launch shapes), its
+# own CUTLASS 8-bit multiply (what the call launches where no tuner has chosen; the profiler leaves the name mangled) and a
+# cuBLASLt kernel, which a tuner may pick for the call
 FI_SPLIT_K = (
     "kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100_splitkSm100BlockScaledSplitKGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_0"
 )
@@ -148,14 +140,41 @@ FP8_SHAPE = ((1, 80, 1), (256, 1, 1), 227328)
 #: the same CUTLASS multiply on 4-bit operands: the name the library's own kernel would carry for another operand type
 FI_CUTLASS_FP4 = FI_CUTLASS_FP8.replace("NS_12float_e4m3_tE", "NS_12float_e2m1_tE")
 VALIDATED_LIBRARY = "0.7.2.post1"
+#: the kernels of FlashInfer's paged decode attention at the published attention widths, as runs on compute capability 10.0
+#: with 148 SMs reported them: the variant of one sequence at a maximum length of 2,051, and a variant the library launches at
+#: other step shapes
+FI_ATTENTION = "fmhaSm100fKernel_QkvBfloat16OBfloat16H256PagedKvCausalP64MultiCtasKvCgaVarSeqQ8Kv256StaticGroupedSwapsAbForGen"
+FI_ATTENTION_OTHER = "fmhaSm100fKernel_QkvBfloat16OBfloat16H256PagedKvCausalP64MultiCtasKvVarSeqQ8Kv256StaticGroupedSwapsAbForGen"
+ATTENTION_ENTRY = "flashinfer.decode.trtllm_batch_decode_with_kv_cache"
+#: the maximum length the scripts default to
+DEFAULT_LENGTH = 2051
+#: the table of the stand-in library's attention kernel set, as (architecture, kernel): the two kernels its call reads at
+#: a step, one of the same geometry for compute capability 10.0 alone and one for 10.3 alone, and one of another head width
+ATTENTION_CONTEXT = "Kernel_QkvBfloat16OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContext"
+ATTENTION_SET = (
+    ("kSM_100f", FI_ATTENTION),
+    ("kSM_100f", FI_ATTENTION_OTHER),
+    ("kSM_100", "fmhaSm100a" + ATTENTION_CONTEXT),
+    ("kSM_103", "fmhaSm103a" + ATTENTION_CONTEXT),
+    ("kSM_100f", FI_ATTENTION.replace("H256", "H128")),
+)
+#: the kernel-binary directory the stand-in library reads where a test names none: every file of its set (built at its first use)
+ATTENTION_BINARIES = []
+#: what the stand-in of the library's attention was handed, per call: every argument by name, as the objects it was handed
+ATTENTION_CALLS = []
 #: what the stand-in of the library was called with, per call: (function, backend, rows of the activation, shape of the weight as it was
 #: handed over), in call order; and the shapes of the tiny model's down weight, head and out-projection weight as a step hands them over
 LIBRARY_CALLS, LIBRARY_WEIGHTS = [], [(48, 64), (32, 272), (1, 16, 64)]
+#: what the stand-in of the attention preparation entry was asked, per compile and per launch (:func:`_prepare_entry`), in call order
+PREPARE_CALLS = []
+#: the compiles and the launches of the stand-in of the 4-bit row quantise entry, in order
+ROW_QUANTIZE_CALLS = []
 #: the sentences of the area README that state the dependency policy of the library rows, as they were agreed
 AREA_POLICY = (
     "FlashInfer is imported inside the adapters of the rows that call it, on a device, in the stack `native` alone; no other stack and no plan on "
     "stated device facts imports it.",
-    "FlashInfer is an optional package of that stack alone; the stack `fe-entries` runs the cuDNN Frontend rows without it.",
+    "FlashInfer is a package of that stack: where it is not installed a run stops before anything is loaded with `[NN] ERROR`, one line that names "
+    "the package and the command that installs it, and no other stack takes its place.",
     "no requirement file of this repository's tests names the package `native` needs (FlashInfer), which is why `fe-entries` exists. The GPU test "
     "has an L0 cell for `native` that runs where the package is installed at a validated version and is skipped elsewhere: skipped is uncovered, "
     "not passing",
@@ -163,12 +182,17 @@ AREA_POLICY = (
     "requests, and are handled by the maintainers of this repository, as for its other requirement files. The packages `constraints-native.txt` "
     "pins are on the ignore list of that entry, each by its name with the three update types of a version update and nothing else: the entry "
     "proposes no version update for them -- not for a pin, and not for the lower bound of `flashinfer-python` in `requirements-flashinfer.txt` "
-    "either, which is covered through the exact pin of the same package --, and a security update is not ignored. The pins are the versions a "
-    "family's kernel census was recorded with, and a pin changes only together with a recorded run; a security update of one fails the host tests "
-    "until that run is made.",
+    "either, which is covered through the exact pin of the same package --, and a security update is not ignored. The pins are the versions the "
+    "stack `native` was last run and checked with, and a pin changes only together with a run of the stack on the new version; a security update "
+    "of one fails the host tests until that run is made.",
 )
-#: what a run of the stack ``native`` at 65,535 rows needs: the library rows hold their weights on the stored codes at every row count
-MOST_NATIVE = "263.3 GiB on this GPU, 0.17 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)"
+#: the two parts of a memory sentence that are the checks' own, as the sentence names them
+COPY = "the reference's bf16 copy of one weight at a time, where the run keeps none"
+BEYOND = "what they hold for the sequences beyond the first of a count"
+#: what a run of 65,535 rows needs: its state, what its checks hold for 65,534 sequences beyond the first, and four tenths of
+#: that for PyTorch's pool; on the stack ``native`` the library rows hold their weights on the stored codes at every row count
+MOST = "6652.2 GiB on this GPU, 4563.36 GiB of it for the checks (what they hold for the 65534 sequences beyond the first)"
+MOST_NATIVE = f"6652.0 GiB on this GPU, 4563.53 GiB of it for the checks ({COPY}, and what they hold for the 65534 sequences beyond the first)"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -247,7 +271,7 @@ def test_canonical_ids_of_the_kernel_families_a_sample_launches():
         return canonical(Launch(name, "kernel", 0.0, 1.0))
 
     assert kernel(SYMBOL) == "gdn_decode_fused" and kernel(SYMBOL.replace("PDLFalsePDL_RELEASEFalse", "PDLTruePDL_RELEASETrue")) == "gdn_decode_fused"
-    assert kernel(TARGET_SYMBOL) == "gdn_decode_fused" and kernel(GATE_SYMBOL) == "gate_quant", "each entry's kernel has an id of its own"
+    assert kernel(WAITING_SYMBOL) == "gdn_decode_fused" and kernel(GATE_SYMBOL) == "gate_quant", "each entry's kernel has an id of its own"
     assert kernel(NORM_SYMBOL) == kernel(NORM_SYMBOL_FIRST) == "add_norm_quant", "one id for every form of the norm entry's kernel"
     assert kernel(PROJECTION_SYMBOL) == kernel(PROJECTION_SYMBOL.replace("n16384", "n14336").replace("r1_", "r32_")) == "fp8_projection"
     assert kernel(PROJECTION_SYMBOL) != kernel(NVJET), "the entry's symbol is its own, whatever of a library's name it holds further on"
@@ -258,6 +282,7 @@ def test_canonical_ids_of_the_kernel_families_a_sample_launches():
         kernel("cudnn_kernel_frost_gdn_verify_fused_CfgTPR4K_RESIDENTTrue_0") == "gdn_verify_fused"
     ), "the verify step is a kernel of its own, never the decode step's"
     assert kernel("cudnn_kernel_frost_shared_expert_decode_CfgTOKENS4_0") == "cudnn_fe", "a cuDNN Frontend kernel no pattern names is no family's member"
+    assert kernel(_row_quantize_symbol(dict(width=5120, pdl=True, pdl_release=True))) == "row_quantize_fp4", "the 4-bit row quantise, by its symbol's head"
     assert kernel(GATHER) == "embedding_gather" and kernel(GATHER.replace("SmallIndex", "LargeIndex")) == "embedding_gather"
     assert kernel(GATHER_VECTORIZED) == "embedding_gather", "from 17 rows the index-select of the embedding is PyTorch's vectorized gather"
     assert kernel("void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<...> >(long, ...)") == "pytorch", "indexing is not the gather"
@@ -303,16 +328,19 @@ def test_canonical_ids_of_the_kernel_families_a_sample_launches():
         "add_norm_quant",
         "fp8_projection",
         "swiglu_fp4",
+        "attention_prepare",
+        "row_quantize_fp4",
         "embedding_gather",
         "fi_mm_fp4",
         "cublaslt_fp8_gemm",
+        "fi_decode_attention",
     } and judged <= set(named), "a pattern of its own each"
     # the library's kernels: both classes of its 4-bit multiply under one id; for its 8-bit multiply the cuBLASLt kernel of
     # 8-bit operands and the library's own CUTLASS multiply (a mangled name), each in front of the family it would fall to
     assert kernel(FI_SPLIT_K) == kernel(FI_PERSISTENT) == "fi_mm_fp4" and kernel(NVJET_FP8) == kernel(FI_CUTLASS_FP8) == "cublaslt_fp8_gemm"
     assert kernel("nvjet_sm103_qqtst_64x8_64x16_2x1_v_bz_splitK_TNT") == "cublaslt_fp8_gemm" and kernel(NVJET) == "cublas", "8-bit operands alone"
     assert named.index("cublaslt_fp8_gemm") < named.index("cublas") and census.FAMILY_OF["cublaslt_fp8_gemm"] == "cublas"
-    for kernel_id in ("gdn_decode_fused", "gdn_verify_fused", "gate_quant", "add_norm_quant", "fp8_projection", "swiglu_fp4"):
+    for kernel_id in ("gdn_decode_fused", "gdn_verify_fused", "gate_quant", "add_norm_quant", "fp8_projection", "swiglu_fp4", "row_quantize_fp4"):
         assert named.index(kernel_id) < named.index("cudnn_fe"), f"{kernel_id}: in front of the catch-all"
     with pytest.raises(ValueError, match="an exact kernel states its launches per call"):
         census.Kernel("k", "PyTorch", "exact")
@@ -404,8 +432,9 @@ def test_the_wiring_order_of_a_decode_step():
 
     full = QwenDense()
     wiring = full.wiring()
-    assert len(wiring) == full.calls_per_step() == 484 and Counter(block for block, _ in wiring) == {b: sum(c) for b, c in full.calls().items()}
-    assert wiring[0] == ("embedding", -1) and wiring[-3:] == (("add_norm_quantize", 64), ("output_head", -1), ("token_choice", -1))
+    assert len(wiring) == full.calls_per_step() == 485 and Counter(block for block, _ in wiring) == {b: sum(c) for b, c in full.calls().items()}
+    assert wiring[0] == ("embedding", -1)
+    assert wiring[-4:] == (("add_norm_quantize", 64), ("output_head.quantize", -1), ("output_head", -1), ("token_choice", -1))
     assert [block for block, layer in wiring if layer == 3] == [
         "add_norm_quantize",
         "projection.fp8.in",
@@ -419,7 +448,7 @@ def test_the_wiring_order_of_a_decode_step():
     ], "the fourth layer is an attention layer: nine calls"
     assert [block for block, layer in wiring if layer == 0][2] == "linear_attention.step" and len([1 for _, layer in wiring if layer == 0]) == 7
     reduced = QwenDense.reduced(2)
-    assert len(reduced.wiring()) == reduced.calls_per_step() == 20
+    assert len(reduced.wiring()) == reduced.calls_per_step() == 21
     session, text = _tiny_session(sequences=2, stack="reference")
     session.prefill([text.encode("ab" + str(s)) for s in range(2)])
     session._call_log = []
@@ -458,7 +487,7 @@ def test_a_clean_step_passes_and_says_what_it_attributed():
         "(cublas 2, pytorch 5); 2 copies per step"
     )
     details = traced.details()
-    assert details[0] == "embedding: torch.index_select, 1 launch per step (1 call x 1 per call); embedding_gather by name (no launch shape is declared for it)"
+    assert details[0] == "embedding: torch.index_select, 1 launch per step (1 call x 1 per call); embedding_gather by name"
     step = "linear_attention.step: cudnn.GdnDecodeFused [PDL False, PDL_RELEASE False], 1 launch per step (1 call x 1 per call); "
     assert details[1] == step + f"the entry states grid (96, 1, 1), block (256, 1, 1), shared memory 42,112 B and the kernel {SYMBOL}"
     assert details[2].startswith("chosen by a library inside the fallback rows (printed, not gated): cublas: ") and NVJET + " x 1" in details[2]
@@ -729,7 +758,7 @@ def test_a_row_serves_the_layer_widths_it_names():
     model of the family with another width is not that row's: the next row of the block is asked, and where there is none
     the decline is a ``NotImplementedError`` that names both -- a SKIP, never "the provider table is wrong".  The norm
     entry serves one hidden width; its row says so, and a checkpoint with another one plans on the reference chain on a
-    real device, with no kernel identity stated: what the family README says of such a checkpoint."""
+    real device: what the family README says of such a checkpoint."""
     from dataclasses import replace
     from types import SimpleNamespace
 
@@ -774,8 +803,11 @@ def test_a_row_serves_the_layer_widths_it_names():
         "fe.add_norm_quant_decode",
         "fe.fp8_projection_decode",
         "fe.swiglu_fp4_decode",
+        "fe.attention_prepare_decode",
+        "fe.row_quantize_fp4_decode",
         "flashinfer.mm_fp4",
-        "torch_ref.quantize+flashinfer.mm_fp4",
+        "flashinfer.mm_fp4_head",
+        "flashinfer.decode_attention",
     }, "the rows of the table whose entries serve some widths only"
     assert narrow_rows["flashinfer.mm_fp4"] == (("hidden", 5120), ("mlp", 17408)), "a library row names the widths its operand layout was run with"
     # the fused gate / up entry serves one pair of widths, the published model's: each of its four rows names both, and the
@@ -813,24 +845,19 @@ def test_a_row_serves_the_layer_widths_it_names():
         cudnn.AddNormQuantDecode("cpu", 4096, 1e-6, **form)
 
     # a model of the family with other layer widths, on a device with memory (the real entries are asked for their launch): the norm
-    # block is the reference chain's in the target stacks, the plan holds, and the run states no kernel identity
+    # block is the reference chain's in ``native`` and ``fe-entries``, and the plan holds
     reduced = QwenDense.reduced(2).geometry
     other = QwenDense(replace(reduced, hidden=4096, la_key_heads=8, la_value_heads=32, attn_heads=16), ("other widths",))
-    reason = (
-        "no recorded section for this model's widths on cc 10.0 / 148 SMs: hidden 4096 (recorded 5120), la_key_heads 8 (recorded 16), "
-        "la_value_heads 32 (recorded 48), attn_heads 16 (recorded 24)"
-    )
-    for stack in configs.TARGET_STACKS:
+    for stack in configs.CHECKED_STACKS:
         planned = plan(other.provider_table, other.regimes, facts, 1, 1, stack, model=other, options={"device": "cpu"})
         assert planned.rows["add_norm_quantize"].key == "torch_ref.add_norm_quantize" and planned.rows["add_norm_quantize"].fallback == "reference chain"
         assert planned.rows["attention.gate_quantize"].key == "fe.attention_gate_quant_decode", "an entry that serves the width keeps its row"
         assert planned.rows["projection.fp8.in"].key == "cublas.bf16_dequantized", "other weight shapes: the in-projection stays on the multiply over a copy"
         assert planned.rows["mlp.gate_up"].key == "cublas.bf16_dequantized+torch_ref.silu_mul_quantize", "another hidden width: so does the gate / up multiply"
-        claim = QwenDense.target().claim(planned, other, installed=RECORDED)
-        assert claim.coverage() == [f"kernel identity: not stated for this run ({reason})"] and not claim.known
         line = next(line for line in planned.table().splitlines() if line.split()[0] == "add_norm_quantize")
         assert "torch_ref.add_norm_quantize" in line and line.endswith("fallback: reference chain"), line
-        assert "by provider: cuDNN FE 2 | fallbacks 7 (cuBLAS over copies 4, PyTorch chains 3) | PyTorch 2" in planned.table()
+        assert planned.rows["output_head.quantize"].key == "torch_ref.quantize", "another hidden width: the head's quantise stays on its reference chain"
+        assert "by provider: cuDNN FE 2 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2" in planned.table()
     with pytest.raises(NotImplementedError, match=r"^cudnn.AddNormQuantDecode serves hidden 5120; this model has hidden 4096$"):
         plan(
             other.provider_table,
@@ -844,7 +871,7 @@ def test_a_row_serves_the_layer_widths_it_names():
             options={"device": "cpu"},
         )
     # the published widths, the same device: the entry's row, and the table prints the width with what the row serves
-    served, _, _ = _target_plan(2)
+    served, _ = _stack_plan(2)
     assert served.rows["add_norm_quantize"] is row
     line = next(line for line in served.table().splitlines() if line.split()[0] == "add_norm_quantize")
     assert "cudnn.AddNormQuantDecode" in line and "rows 1-1,024, hidden 5120" in line, line
@@ -920,7 +947,7 @@ def test_the_kernel_table_of_the_default_plan():
     assert row["attention.core"].endswith("pytorch, cublas -- by family; fallback: reference chain over a plain per-layer cache")
     assert row["token_choice"] == "token_choice 1 PyTorch torch.argmax pytorch -- host path, not compared"
     assert text[-1] == (
-        "  per step: 2 launches on 2 exact rows, checked one by one in the wiring order; the launches of 17 fallback calls and of the host path "
+        "  per step: 2 launches on 2 exact rows, checked one by one in the wiring order; the launches of 18 fallback calls and of the host path "
         "are attributed by family"
     )
     assert len(plan) == len(text) - 3, "one line per block of the plan"
@@ -1093,31 +1120,16 @@ def _tiny_model():
 
 def _table_of(geometry):
     """The family's provider table with the layer widths a row names re-stated for ``geometry``: the stand-in entries of this
-    module serve whatever the widths, so the rows of the published widths are the rows of the tiny geometry (as
-    ``_census_of`` re-states the census section)."""
+    module serve whatever the widths, so the rows of the published widths are the rows of the tiny geometry."""
     from dataclasses import replace
 
     from model_samples.qwen_dense import configs
 
-    return {
-        block: [replace(row, widths=tuple((name, getattr(geometry, name)) for name, _ in row.widths)) for row in rows]
-        for block, rows in configs.PROVIDERS.items()
-    }
+    def restated(row):  # the widths a row names, and the row width a form names (the row quantise entry's ``WIDTH``: the hidden width)
+        form = tuple((name, geometry.hidden if name == "WIDTH" else value) for name, value in row.form)
+        return replace(row, widths=tuple((name, getattr(geometry, name)) for name, _ in row.widths), form=form)
 
-
-def _census_of(model):
-    """The family's census with its sections re-stated for the layer widths of ``model``: the stand-in providers of this
-    module launch the recorded shapes whatever the widths, so a run of the tiny geometry is a run a section holds for."""
-    import copy
-
-    from model_samples import census
-    from model_samples.qwen_dense import QwenDense
-
-    data = copy.deepcopy(QwenDense.target().data)
-    for sections in data["configurations"].values():  # the decode step's and the verify step's
-        for section in sections.values():
-            section["geometry"] = {name: getattr(model.geometry, name) for name in section["geometry"]}
-    return census.Target(data)
+    return {block: [restated(row) for row in rows] for block, rows in configs.PROVIDERS.items()}
 
 
 def _tiny_session(sequences, stack="reference"):
@@ -1235,6 +1247,285 @@ def _swiglu_symbol(form):
     return f"cudnn_kernel_frost_swiglu_fp4_decode_h64_i96_t{form['TOKEN_TILE']}_pw{form['PREWAIT_STAGES']}_{policy}_c{form['MAX_CLUSTERS']}_{launch}_0"
 
 
+#: the form of the row of the attention preparation entry in ``native`` and ``fe-entries``
+PREPARE_FORM = "[POSITIONS 3d, SECTION (11, 11, 10), PAGE_SIZE 64, POSITION_DTYPE int64, SLOT_DTYPE int64, PDL False, PDL_RELEASE False]"
+
+
+def _prepare_shape(rows):
+    """The launch of the attention preparation entry at ``rows`` tokens, as the entry states it at the published widths: one
+    thread block per (token, head) over 24 query and 4 key / value heads, 128 threads, one fp32 slot of shared memory per warp."""
+    return ((rows, 28, 1), (128, 1, 1), 16)
+
+
+def _prepare_symbol(built):
+    """The symbol a stand-in instance of the attention preparation entry states: the form's text behind the kernel's name, as
+    the entry writes it -- the geometry, the position form with its section, the page, the two integer dtypes, the launch arm."""
+    g = built["geometry"]
+    section = "".join(f"_{part}" for part in built["mrope_section"] or ())
+    arm = "plain" if not built["pdl"] else ("wait" if built["pdl_release"] is False else "release_wait")
+    return (
+        f"cudnn_kernel_frost_attention_prepare_h{g.HEADS}_{g.KV_HEADS}_d{g.HEAD_DIM}_r{g.ROTARY_DIM}_{built['positions']}{section}_p{built['page_size']}"
+        f"_i{built['position_dtype'][3:]}_i{built['slot_dtype'][3:]}_{arm}_eps358637bd_0"
+    )
+
+
+def _prepare_entry(calls, launch=None, defect="", decline=None, shape=None):
+    """A stand-in for ``cudnn.AttentionPrepareDecode`` on the CPU, at any widths.  It keeps what it was built with, states the
+    entry's facts from it and writes its compiles and its launches into ``calls`` (a launch: the operands it was handed, by
+    name).  A call runs the kernel's own chain in fp32 -- the mean of squares, a reciprocal root that is a few parts in ten
+    million off (the kernel's is approximate), the gain, ONE rounding to bf16; the rotation by the table row each rotary index reads for the token's position, one fp32 product and a fused sum,
+    one rounding more -- and writes what the kernel writes: the queries and the gates into the outputs it is handed, the keys
+    and the values into the two pools at the row of each token's slot.  A token whose slot is negative or past the pool,
+    or that lies past the slot vector, writes no pool row.  ``launch(name, shape)`` records the launch it makes (``shape``:
+    another one than the recorded).  ``decline``: a one-element list whose text, when set, its build raises.  ``defect``
+    makes a call ``"extra"`` (launch one more kernel in front of its own), ``"missing"`` (not launch), ``"chain"`` (launch a
+    chain of PyTorch kernels in place of its own), or write a wrong query ``"element"``, another ``"gate"`` bit, another
+    ``"value"`` bit, the key row of its first token at the ``"neighbour"`` of its slot as well, or a ``"nan"``."""
+
+    def rounded(x, weight, cos, sin, eps, order):  # [tokens, heads, D] bf16 -> the same, normalised and rotated
+        half = cos.shape[-1]
+        xf = x.float()
+        root = torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps) * torch.tensor(1.0 + 3e-7, dtype=torch.float32)
+        normed = ((xf * root) * (1.0 + weight.float())).to(torch.bfloat16)
+        n1, n2 = normed[..., :half].float(), normed[..., half : 2 * half].float()
+        first = (n1.double() * cos.double() - (n2 * sin).double()).float().to(torch.bfloat16)
+        if order == "3d":
+            second = (n2.double() * cos.double() + (n1 * sin).double()).float().to(torch.bfloat16)
+        else:
+            second = (n1.double() * sin.double() + (n2 * cos).double()).float().to(torch.bfloat16)
+        return torch.cat((first, second, normed[..., 2 * half :]), dim=-1)
+
+    class Prepare:
+        limit = 1024
+
+        def __init__(self, device, geometry, eps, *, positions, page_size, position_dtype, slot_dtype, mrope_section=None, pdl=None, pdl_release=None):
+            if (positions == "3d") != (mrope_section is not None):
+                raise ValueError(f"positions={positions!r} with mrope_section={mrope_section!r}")
+            self.built = dict(
+                device=str(device),
+                geometry=geometry,
+                eps=eps,
+                positions=positions,
+                page_size=page_size,
+                position_dtype=position_dtype,
+                slot_dtype=slot_dtype,
+                mrope_section=mrope_section,
+                pdl=pdl,
+                pdl_release=pdl_release,
+            )
+
+        def compile(self, rows=None):
+            calls.append(("prepare compile", rows))
+            if decline and decline[0]:
+                raise NotImplementedError(decline[0])
+
+        def kernel_symbols_for(self, rows):
+            return (_prepare_symbol(self.built),)
+
+        def form_for(self, rows):
+            b = self.built
+            pdl = bool(b["pdl"])
+            return dict(
+                GEOMETRY={name: getattr(b["geometry"], name) for name in ("HEADS", "KV_HEADS", "HEAD_DIM", "ROTARY_DIM")},
+                EPS=b["eps"],
+                POSITIONS=b["positions"],
+                SECTION=b["mrope_section"],
+                PAGE_SIZE=b["page_size"],
+                POSITION_DTYPE=b["position_dtype"],
+                SLOT_DTYPE=b["slot_dtype"],
+                PDL=pdl,
+                PDL_RELEASE=pdl if b["pdl_release"] is None else b["pdl_release"],
+            )
+
+        def launch_shape_for(self, rows):
+            if rows > self.limit:
+                raise NotImplementedError(f"this stand-in serves at most {self.limit} rows (tokens) per call; got {rows}")
+            return shape or _prepare_shape(rows)
+
+        def __call__(self, q, gate, k, v, q_weight, k_weight, cos_sin, positions, k_pool, v_pool, slot_mapping, q_out=None, gate_out=None):
+            b, tokens = self.built, q.shape[0]
+            operands = dict(q=q, gate=gate, k=k, v=v, q_weight=q_weight, k_weight=k_weight, cos_sin=cos_sin, positions=positions)
+            calls.append(("prepare launch", dict(operands, k_pool=k_pool, v_pool=v_pool, slot_mapping=slot_mapping, q_out=q_out, gate_out=gate_out)))
+            if tuple(k_pool.shape[1:]) != (b["geometry"].KV_HEADS, b["page_size"], b["geometry"].HEAD_DIM):
+                raise ValueError(f"k_pool must be [num_pages >= 1, H={b['geometry'].KV_HEADS}, page_size={b['page_size']}, D={b['geometry'].HEAD_DIM}]")
+            if tuple(positions.shape) != ((3, tokens) if b["positions"] == "3d" else (tokens,)):
+                raise ValueError(f"positions must be {[3, tokens] if b['positions'] == '3d' else [tokens]} under positions={b['positions']!r}")
+            if launch is not None:
+                if defect == "chain":
+                    launch(ELEMENTWISE)
+                    launch(ELEMENTWISE)
+                else:
+                    if defect == "extra":
+                        launch(ELEMENTWISE)  # in front of its own kernel: behind the in-projection's
+                    if defect != "missing":
+                        launch(_prepare_symbol(b), shape or _prepare_shape(tokens))
+            half = b["geometry"].ROTARY_DIM // 2
+            index = torch.arange(half)
+            which = torch.zeros(half, dtype=torch.long)  # the position row each rotary index reads
+            if b["positions"] == "3d":
+                _, tall, wide = b["mrope_section"]
+                which = torch.where((index % 3 == 1) & (index < 3 * tall), 1, torch.where((index % 3 == 2) & (index < 3 * wide), 2, 0))
+            read = positions.reshape(-1, tokens).long()[which].t()  # [tokens, half]: the position of rotary index r for each token
+            cos, sin = cos_sin[read, index][:, None], cos_sin[read, index + half][:, None]
+            q_out[:tokens] = rounded(q, q_weight, cos, sin, b["eps"], b["positions"])
+            gate_out[:tokens] = gate
+            keys = rounded(k, k_weight, cos, sin, b["eps"], b["positions"])
+            slots = slot_mapping.tolist()
+            for token, slot in enumerate(slots[:tokens]):
+                if 0 <= slot < k_pool.shape[0] * b["page_size"]:
+                    page, row = divmod(slot, b["page_size"])
+                    k_pool[page, :, row] = keys[token]
+                    v_pool[page, :, row] = v[token]
+                    if defect == "neighbour" and token == 0:
+                        other, at = divmod((slot + 1) % (k_pool.shape[0] * b["page_size"]), b["page_size"])
+                        k_pool[other, :, at] = keys[token]
+            if defect == "element":
+                q_out[0, 0, 0] = q_out[0, 0, 0].float() * 1.5 + 1.0
+            if defect == "nan":
+                q_out[0, 0, -1] = float("nan")
+            if defect == "gate":
+                gate_out.view(torch.int16)[0, 0, 0] ^= 1
+            if defect == "value" and slots and 0 <= slots[0] < v_pool.shape[0] * b["page_size"]:
+                v_pool.view(torch.int16)[slots[0] // b["page_size"], 0, slots[0] % b["page_size"], 0] ^= 1
+            return q_out, gate_out
+
+    return Prepare
+
+
+def _row_quantize_shape(rows, width=5120):
+    """The launch the 4-bit row quantise entry states at ``rows`` rows: one thread block per row, one thread per block of
+    sixteen elements, no shared memory."""
+    return ((rows, 1, 1), (width // 16, 1, 1), 0)
+
+
+def _row_quantize_symbol(built):
+    """The symbol a stand-in instance of the 4-bit row quantise entry states: the form's text behind the kernel's name, as the
+    entry writes it -- the row width and the launch arm."""
+    arm = ("wait_release" if built["pdl_release"] in (None, True) else "wait") if built["pdl"] else ("release" if built["pdl_release"] else "plain")
+    return f"cudnn_kernel_frost_row_quantize_fp4_w{built['width']}_{arm}_0"
+
+
+def _row_quantize_entry(calls, launch=None, defect="", decline=None, shape=None):
+    """A stand-in for ``cudnn.RowQuantizeFp4Decode`` on the CPU, at any width, with the entry's signature and defaults.  It
+    keeps what it was built with (``built``: a knob that was not passed stays ``None``), states the entry's facts from it and
+    writes its compiles and its launches into ``calls`` (a launch: the operands it was handed, by name).  A call runs
+    the kernel's rule in fp32 -- the block scale ``e4m3(scale * (largest * fp32(1 / 6)))``, the encode scale as the reciprocal
+    of ``value * (1 / scale)`` formed with two IEEE divisions, the codes with the sign kept on a zero -- and writes what the
+    kernel writes: the packed codes of the live rows and their block-scale bytes at their places of the 128 x 4 layout,
+    into the outputs it is handed, or into its own pair of the row count (scales zero-filled) for an output it is not
+    handed.  ``launch(name, shape)`` records the launch it makes: one thread block per row (``shape``: another).
+    ``decline``: a one-element list whose text, when set, its build raises.  ``defect`` makes a call ``"extra"`` (launch
+    one more kernel in front of its own), ``"behind"`` (one more behind it), ``"fill"`` (PyTorch's fill of the scale buffer
+    in front of its kernel), ``"memset"`` (the same fill as a record of the profiler's fill category), ``"bands"`` (launch
+    its kernel in a grid of whole bands of 128 rows, which is not the shape it states), ``"missing"`` (not launch), ``"chain"`` (launch a chain of
+    PyTorch kernels in place of its own), or write per call a ``"code"`` two steps off, a block ``"scale"`` one step off,
+    an ``"unsigned"`` zero, or the block scales ``"row-major"``."""
+    from model_samples.weights import BLOCK, _e2m1, _e4m3, _e4m3_values, tile_scale_index
+
+    class RowQuantize:
+        limit = 1024
+
+        def __init__(self, device, width, *, pdl=None, pdl_release=None):
+            self.built = dict(device=str(device), width=width, pdl=pdl, pdl_release=pdl_release)
+            self.owned = {}
+
+        def compile(self, rows=None):
+            calls.append(("row quantize compile", rows))
+            if decline and decline[0]:
+                raise NotImplementedError(decline[0])
+
+        def kernel_symbols_for(self, rows):
+            return (_row_quantize_symbol(self.built),)
+
+        def form_for(self, rows):
+            b, wait = self.built, bool(self.built["pdl"])
+            return dict(WIDTH=b["width"], PDL=wait, PDL_RELEASE=wait if b["pdl_release"] is None else b["pdl_release"])
+
+        def launch_shape_for(self, rows):
+            if not 1 <= rows <= self.limit:
+                raise NotImplementedError(f"this stand-in serves 1 to {self.limit} rows per call; got {rows}")
+            return shape or _row_quantize_shape(rows, self.built["width"])
+
+        def outputs(self, rows):
+            width = self.built["width"]
+            if rows not in self.owned:
+                scales = torch.zeros((-(-rows // 128) * 128, width // BLOCK), dtype=torch.float8_e4m3fn)
+                self.owned[rows] = dict(codes=torch.empty((rows, width // 2), dtype=torch.uint8), scales=scales)
+            return self.owned[rows]
+
+        def __call__(self, x, scale, codes=None, scales=None):
+            b, rows = self.built, x.shape[0]
+            calls.append(("row quantize launch", dict(x=x, scale=scale, codes=codes, scales=scales)))
+            if tuple(x.shape[1:]) != (b["width"],) or x.dtype != torch.bfloat16 or scale.dtype != torch.float32 or scale.numel() != 1:
+                raise ValueError(f"x must be bf16 [rows, {b['width']}] and scale one fp32 element")
+            if launch is not None:
+                if defect == "chain":
+                    launch(ELEMENTWISE)
+                    launch(ELEMENTWISE)
+                else:
+                    if defect in ("extra", "fill"):
+                        launch(FILL if defect == "fill" else ELEMENTWISE)  # in front of its own kernel: behind the final norm's
+                    if defect == "memset":
+                        launch("Memset (Device)", kind="copy")
+                    if defect == "bands":  # the grid of whole bands of 128 rows, where the entry states one thread block per row
+                        launch(_row_quantize_symbol(b), ((-(-rows // 128) * 128, 1, 1), (b["width"] // 16, 1, 1), 0))
+                    elif defect != "missing":
+                        launch(_row_quantize_symbol(b), shape or _row_quantize_shape(rows, b["width"]))
+                    if defect == "behind":
+                        launch(ELEMENTWISE)  # behind its own kernel: in front of the head's
+            sixth = torch.tensor(0x3E2AAAAB, dtype=torch.int32).view(torch.float32)
+            blocks = x.float().unflatten(-1, (-1, BLOCK))
+            stored = _e4m3(scale * (blocks.abs().amax(-1) * sixth))
+            if defect == "scale":
+                stored[0, 0] += 1  # one step up: not the byte of the kernel's rule
+            value = _e4m3_values(stored)
+            live = value != 0
+            encode = torch.where(live, 1.0 / (torch.where(live, value, torch.ones_like(value)) * (1.0 / scale)), torch.zeros_like(value))
+            nibbles = _e2m1(blocks * encode.unsqueeze(-1), signed_zero=defect != "unsigned").flatten(-2)
+            if defect == "code":  # two steps off its code, the sign kept: outside every bracket
+                nibbles[0, 0] = (nibbles[0, 0] & 0x8) | (((nibbles[0, 0] & 0x7) + 2) % 8)
+            owned = self.outputs(rows) if codes is None or scales is None else {}
+            codes, scales = owned["codes"] if codes is None else codes, owned["scales"] if scales is None else scales
+            codes[:rows] = nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)
+            where = scales.view(torch.uint8).view(-1)
+            if defect == "row-major":
+                where[: stored.numel()] = stored.flatten()
+            else:
+                where[tile_scale_index(rows, stored.shape[-1], "cpu")] = stored
+            return codes, scales
+
+    return RowQuantize
+
+
+def _kernel_binaries(directory, kernels=ATTENTION_SET, without=(), changed=(), unlisted=(), misnamed=(), manifest=True, header=None):
+    """A kernel-binary directory of the stand-in library at ``directory``, laid out as the library's: the folder of the
+    attention kernel set, named as the backend, with a manifest (a line per file: SHA-256, name), a header whose table
+    names ``kernels`` with their architecture and SHA-256, and a binary per kernel.  ``without``: kernels whose binary is
+    left out; ``changed``: files one byte of which differs from what the manifest lists (a kernel, or the header);
+    ``unlisted``: kernels the manifest has no line for; ``misnamed``: kernels whose SHA-256 in the header is another
+    file's; ``manifest`` false: no manifest; ``header``: another text in the header's place.  Returns ``directory``."""
+    from model_samples.providers import flashinfer_calls
+
+    folder = Path(directory) / "2d6a" / "fmha" / flashinfer_calls.DECODE_ATTENTION_BACKEND
+    (folder / "include").mkdir(parents=True)
+    digests = {name: hashlib.sha256(f"the binary of {name}".encode()).hexdigest() for _, name in kernels}
+    named = {name: hashlib.sha256(b"another file").hexdigest() if name in misnamed else digest for name, digest in digests.items()}
+    records = "\n".join(f'{{ 8, {architecture}, "{name}", 178456, "{named[name]}"}},' for architecture, name in kernels)
+    declared = (
+        "struct KernelMetaInfo\n{\n    int mTileSizeQ;\n    int mSM;\n    const char* mFuncName;\n    int mSharedMemBytes;\n    const char* sha256;\n};\n"
+    )
+    if header is None:
+        header = f"#pragma once\n\n{declared}\nstatic const KernelMetaInfo sKernelMetaInfos[] = {{\n{records}\n}};\n"
+    (folder / "include" / "flashInferMetaInfo.h").write_bytes(header.encode() + (b"\n" if "include/flashInferMetaInfo.h" in changed else b""))
+    for _, name in kernels:
+        if name not in without:
+            (folder / f"{name}.cubin").write_bytes(f"the binary of {name}".encode() + (b"." if name in changed else b""))
+    lines = [f"{digest}  {name}.cubin" for name, digest in digests.items() if name not in unlisted]
+    if manifest:
+        (folder / "checksums.txt").write_text("\n".join([*lines, f"{hashlib.sha256(header.encode()).hexdigest()}  include/flashInferMetaInfo.h"]) + "\n")
+    return Path(directory)
+
+
 def _stand_ins(
     monkeypatch,
     step_launches=None,
@@ -1257,6 +1548,15 @@ def _stand_ins(
     out_defect="",
     library_defect="",
     library_installed=VALIDATED_LIBRARY,
+    library_binaries=(VALIDATED_LIBRARY, True),
+    kernel_binaries=None,
+    attention_defect="",
+    prepare_defect="",
+    prepare_serves=None,
+    prepare_shape=None,
+    quantize_defect="",
+    quantize_serves=None,
+    quantize_shape=None,
 ):
     """The provider factories of a device that exists only as a log: every provider of the provider rows is a stand-in that
     runs the reference's arithmetic and writes the launches a real provider of its row would make into the log; a stand-in
@@ -1270,8 +1570,8 @@ def _stand_ins(
     with the gate's real twin; ``gate_defect`` makes it write one wrong byte per call.
 
     The stand-in of the norm entry runs that kernel's fp32 chain in the form of the call's site -- one instance per form,
-    the residual stream updated in place, the 4-bit block scales as the kernel forms them and in its 128 x 4 layout, the
-    bf16 rows handed over unquantised where the form writes no codes -- states and launches one thread block per row (or
+    the residual stream updated in place, the 4-bit block scales as the kernel forms them and in its 128 x 4 layout, no
+    quantised operand where the form writes no codes -- states and launches one thread block per row (or
     ``norm_shape``) and is compared with the norm's real twin.  ``norm_serves(site)`` replaces what it says served a call; ``norm_defect`` makes
     it ``"extra"`` (launch one more kernel in front of its own), ``"missing"`` (not launch at the output head), ``"chain"`` (launch a
     chain of PyTorch kernels in place of its own), or write per call a wrong ``"code"``, block ``"scale"``, ``"bf16"``
@@ -1310,25 +1610,48 @@ def _stand_ins(
     The library rows run the REAL adapters (``providers.flashinfer_calls``) over a stand-in of the library: its 4-bit
     multiply decodes the packed codes and the block scales out of the 128 x 4 layout of both operands, accumulates in
     fp32, applies ``alpha`` and rounds once; its 8-bit multiply does the same on the 8-bit codes; each launches the
-    kernel the library launched for that call on the recorded GPU -- the split-K class of the 4-bit multiply in the
-    recorded shape for a weight of up to 128 rows (the down multiply of the tiny geometry), its persistent class for
+    kernel the library launched for that call on compute capability 10.0 with 148 SMs -- the split-K class of the 4-bit
+    multiply in its shape for a weight of up to 128 rows (the down multiply of the tiny geometry), its persistent class for
     a larger one (the output head), the library's own CUTLASS multiply for the 8-bit call -- and its tuner says
     that nothing was tuned.  ``library_installed`` is the version the distribution's metadata states (``None``: not
     installed).  ``library_defect`` makes it: ``"class"`` (the persistent class at the down multiply, in the recorded
     shape), ``"shape"`` (the split-K class in another grid), ``"tuning"`` (its tuner is in tuning mode at every call),
     ``"has tuned"`` (its tuner has tuned the 4-bit multiply in this process), ``"extra"`` (one more kernel in front of
     the down multiply's), ``"chain"`` (the kernels of a multiply over a copy in place of the 4-bit kernel), ``"element"``
-    (one wrong element per 4-bit call), ``"pick"`` (the 8-bit call launches the cuBLASLt kernel the census records),
-    ``"split"`` (a split pick of cuBLASLt: its kernel and a reduce launch behind it), ``"mixed"`` (the recorded pick in
+    (one wrong element per 4-bit call), ``"pick"`` (the 8-bit call launches a kernel of cuBLASLt),
+    ``"split"`` (a split pick of cuBLASLt: its kernel and a reduce launch behind it), ``"mixed"`` (that kernel in
     every other step), ``"other"`` (the 8-bit call launches a kernel of neither family), ``"twin"`` (the 8-bit call
     launches the same CUTLASS multiply on 4-bit operands: another kernel, whose name differs from the library's own far
     from its start), ``"refuses"`` (the library refuses the operands of its first use), ``"mistyped"`` (the same, as a
-    ``TypeError``), ``"build"`` (it cannot build its kernel at its first use) or ``"import"`` (the package is installed
-    and cannot be imported).  Every call of the stand-in is written to ``LIBRARY_CALLS`` with the backend it was handed
+    ``TypeError``), ``"build"`` (it cannot build its kernel at its first use), ``"import"`` (the package is installed
+    and cannot be imported) or ``"paths"`` (its artifact paths name no folder of the attention kernel set) or ``"checksums"`` (its checksums name no manifest of that set).  Every call of the stand-in is written to ``LIBRARY_CALLS`` with the backend it was handed
     -- its defaults are the library's own, which are not the rows' --, its row count and the shape of its weight.
 
+    The library's paged decode attention is the same stand-in's ``decode`` call, under the REAL adapter
+    (``flashinfer_calls.DecodeAttentionBlock``): it keeps the library's defaults, writes what it is handed to
+    ``ATTENTION_CALLS`` by name, reads the page table and the lengths as adjacent 32-bit words, gathers the attended rows
+    of every sequence out of the two pool halves through them and returns a kernel-like chain in fp32 (the scores, the
+    softmax and the weighted sum accumulated in fp32, one rounding to bf16: some elements another byte than the fp64
+    chain's, every one inside the band) in the buffer it was handed; it launches one
+    variant of its kernel, in its shape for the tokens of the call, for one sequence at a maximum length of 2,051,
+    and another variant of that kernel elsewhere.  ``library_binaries`` is the kernel-binary package as the installation
+    has it: (the version its metadata states, whether its module can be found).  ``kernel_binaries`` is the kernel-binary
+    directory the library resolved (:func:`_kernel_binaries`; left out: one that holds every file); the SHA-256 the
+    library names for the manifest of its kernel set is that of the directory's manifest as the stand-in finds it.  The call reads two
+    binaries of it, as the library does at a step of one sequence: first the variant it launches elsewhere, then the kernel
+    it launches.  Without the first, or with one that is not the file the header names, it raises the library's
+    refusal of a kernel binary; without the second it raises nothing, writes lines of its own with a local path to
+    standard error and launches the first.  ``attention_defect`` makes the call:
+    ``"variant"`` (the other variant where the first belongs), ``"shape"`` (the first variant in another
+    grid), ``"fill"`` or ``"multiply"`` (one PyTorch launch in front of the kernel), ``"behind"`` (a second kernel of
+    the library behind it), ``"width"`` (the kernel of another head width), ``"page"`` (of another page), ``"element"`` (one wrong element per call),
+    ``"writes"`` (it writes a byte of the pool), ``"refuses"`` / ``"mistyped"`` (the library's own check of an operand),
+    ``"manifest"`` (the library's refusal of a manifest that is not on the machine), ``"binary"`` (its refusal of a
+    kernel binary: the error of its loader's callback goes to the interpreter's hook, the call raises another) or
+    ``"build"`` (it cannot build its launcher).
+
     A plan of several tokens per sequence has two more stand-ins.  The fused verify step runs the reference's verify
-    step and launches the verify kernel's symbol in the recorded shape of one sequence of six tokens.  The FP8
+    step and launches the verify kernel's symbol in the shape its entry states for one sequence of six tokens.  The FP8
     projection entry's stand-in serves the out-projection of the linear-attention layers too, on the row of the step's
     rows: it states and launches one thread block per K slice and 64 weight rows, with the shared memory of that row's
     kernel.  ``out_defect`` is a defect of that call: ``"split"`` (the kernel of the other row range: four K slices, its
@@ -1336,10 +1659,30 @@ def _stand_ins(
     row's name), ``"behind"`` (one more launch behind its kernel), ``"missing"`` (no launch), ``"element"`` (one wrong
     element per call), ``"weight"`` (another weight of the same shape under the row's name: its rows in reverse),
     ``"writes"`` (it writes into the stored weight it multiplies on); and ``"attention"`` is a defect of the other call
-    site: the attention layers' call, a multiply over a copy in the plan, launches the entry's kernel."""
+    site: the attention layers' call, a multiply over a copy in the plan, launches the entry's kernel.
+
+    The row of the attention preparation runs the REAL adapter (``fe.AttentionPrepareDecodeBlock``) over a stand-in of its
+    entry (:func:`_prepare_entry`): the kernel's chain in fp32 on the four views, the table rows and the two pool views the
+    adapter hands it, one launch per call in the shape the entry states for the call's rows (or ``prepare_shape``), compared with
+    the entry's real twin; the session then builds its attention cache as a pool of pages.  ``prepare_serves`` replaces
+    what the adapter says served a call; ``prepare_defect`` is a defect of the stand-in entry: ``"extra"``, ``"missing"``,
+    ``"chain"``, a wrong ``"element"``, ``"gate"`` bit or ``"value"`` bit, the key row at the ``"neighbour"`` of its
+    slot as well, or a ``"nan"``.
+
+    The row of the output head's quantise runs the REAL adapter (``fe.RowQuantizeFp4DecodeBlock``) over a stand-in of its
+    entry (:func:`_row_quantize_entry`): the kernel's rule in fp32 on the rows and the one scale element the adapter hands
+    it, into the two buffers the adapter hands it, one launch per call in the shape the entry states for the call's rows
+    (or ``quantize_shape``), compared with the entry's real twin.  ``quantize_serves`` replaces what the adapter says
+    served a call; ``quantize_defect`` is a defect of the stand-in entry: ``"extra"``, ``"behind"``, ``"fill"``,
+    ``"memset"``, ``"missing"``, ``"chain"``, a wrong ``"code"`` or block ``"scale"``, the ``"unsigned"`` zero, or the block
+    scales ``"row-major"``."""
+    from types import SimpleNamespace
+
+    import cudnn
+
     from model_samples import loop
     from model_samples.census import Facts, Kernel, Launch
-    from model_samples.providers import factories, flashinfer_calls, torch_ref
+    from model_samples.providers import factories, fe, flashinfer_calls, torch_ref
     from model_samples.timing import Trace
     from model_samples.weights import (
         BLOCK,
@@ -1347,7 +1690,6 @@ def _stand_ins(
         InterleavedBlockScaledTensor,
         ScaledTensor,
         TiledBlockScaledTensor,
-        Unquantized,
         _e2m1,
         _e2m1_values,
         _e4m3_values,
@@ -1381,7 +1723,7 @@ def _stand_ins(
         kernels = declares or (Kernel("gdn_decode_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)
 
         def _symbol(self):
-            return TARGET_SYMBOL if dict(self.row.form).get("PDL") else SYMBOL
+            return WAITING_SYMBOL if dict(self.row.form).get("PDL") else SYMBOL
 
         def launch_facts(self, rows, site=""):
             return Facts((self._symbol(),), dict(self.row.form), ((96, rows, 1), (256, 1, 1), 42112))
@@ -1468,10 +1810,6 @@ def _stand_ins(
                 self._twin.forms = {site: self._form(site) for site, _ in self.row.sites}
             return self._twin
 
-        def compared(self, out):
-            q, normed, residual = out
-            return (None if isinstance(q, Unquantized) else q, normed, residual)
-
         def __call__(self, branch, residual, weight, quant, site=""):
             form, rows = self._form(site), branch.shape[0]
             self._site = site
@@ -1513,8 +1851,8 @@ def _stand_ins(
                 tiled = torch.zeros((128, y.shape[-1] // BLOCK), dtype=torch.uint8)
                 tiled.view(-1)[tile_scale_index(rows, y.shape[-1] // BLOCK, "cpu")] = scales
                 q = TiledBlockScaledTensor(nibbles[..., 0::2] | (nibbles[..., 1::2] << 4), tiled, float(quant.scale))
-            else:  # the form ends at the bf16 rows: the consumer quantises
-                q = None if quant is None else Unquantized(y, quant.fmt, float(quant.scale))
+            else:  # the form ends at the bf16 rows: no quantised operand
+                q = None
             return q, (y if form["BF16_OUT"] else None), residual
 
     class Projection(torch_ref.Linear):
@@ -1722,11 +2060,151 @@ def _stand_ins(
         def get(cls):
             return cls
 
+    def attended_rows(pool, table, sequence, attended):
+        """The first ``attended`` positions of ``sequence`` out of one half of a pool, through its page-table row:
+        ``[key / value heads, attended, D]``."""
+        at = torch.arange(attended)
+        return pool[table[sequence, at // pool.shape[2]].long(), :, at % pool.shape[2]].transpose(0, 1)
+
+    def words(tensor, *shape):
+        """The memory of ``tensor`` as a kernel reads it: adjacent 32-bit words from its first element, whatever its dtype."""
+        count = 1
+        for extent in shape:
+            count *= extent
+        return tensor.contiguous().view(-1).view(torch.int32)[:count].view(*shape)
+
+    kernel_set = f"2d6a/fmha/{flashinfer_calls.DECODE_ATTENTION_BACKEND}"  # the folder of the attention kernel set, as the library's artifact path names it
+    if kernel_binaries is None:
+        if not ATTENTION_BINARIES:
+            import tempfile
+
+            ATTENTION_BINARIES.append(_kernel_binaries(Path(tempfile.mkdtemp(prefix="kernel_binaries_")) / "cubins"))
+        kernel_binaries = ATTENTION_BINARIES[0]
+
+    published = Path(kernel_binaries) / kernel_set / "checksums.txt"  # the manifest the stand-in library names: the directory's, as it stands now
+    manifest_digest = hashlib.sha256(published.read_bytes()).hexdigest() if published.is_file() else ""
+
+    def on_the_machine(name):
+        """Whether the library's loader finds the binary of ``name``: the file is there and is the one the header names."""
+        binary = Path(kernel_binaries) / kernel_set / f"{name}.cubin"
+        return binary.is_file() and binary.read_bytes() == f"the binary of {name}".encode()
+
+    def loader_callback(name):
+        """The library's loader callback for a kernel binary that is not on the machine: it raises where only the
+        interpreter's hook for an exception nobody can catch sees it, as a callback of ``ctypes`` does."""
+        import ctypes
+
+        def get_cubin_callback():
+            raise RuntimeError(
+                f"Artifact not found locally: {kernel_set}/{name}.cubin (looked at /a/local/path/cubins/{kernel_set}/{name}.cubin). "
+                "FLASHINFER_NO_DOWNLOAD is set \u2014 refusing to download. This means flashinfer-cubin is missing this file."
+            )
+
+        get_cubin_callback.__module__ = flashinfer_calls.LOADER
+        ctypes.CFUNCTYPE(None)(get_cubin_callback)()
+
     class Library:
-        """The stand-in of the library: the two multiplies the adapters call, and its tuner."""
+        """The stand-in of the library: the two multiplies and the attention the adapters call, its tuner, the one size
+        function the attention's adapter asks, the kernel-binary directory it resolved and its artifact paths."""
 
         class autotuner:
             AutoTuner = Tuner
+
+        class jit:
+            env = SimpleNamespace(FLASHINFER_CUBIN_DIR=Path(kernel_binaries))
+
+        class artifacts:
+            @dataclasses.dataclass(frozen=True)
+            class ArtifactPath:
+                MULTIPLY: str = "7b1f/gemm/"
+                ATTENTION: str = ("2d6a/fmha/another" if library_defect == "paths" else kernel_set) + "/"
+                ARCHS: tuple = ("sm_100a", "sm_103a")
+
+            class CheckSumHash:
+                map_checksums = {} if library_defect == "checksums" else {f"{kernel_set}/checksums.txt": manifest_digest}
+
+        class utils:
+            @staticmethod
+            def get_trtllm_gen_multi_ctas_kv_counter_bytes(batch_size, num_qo_heads, sm_count):
+                return (max(batch_size * num_qo_heads, sm_count) + 7) // 8 * 8 * 4
+
+        class decode:
+            @staticmethod
+            def trtllm_batch_decode_with_kv_cache(
+                query,
+                kv_cache,
+                workspace_buffer,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                bmm1_scale=1.0,
+                bmm2_scale=1.0,
+                window_left=-1,
+                out=None,
+                kv_layout="HND",
+                enable_pdl=None,
+                backend="auto",
+                q_len_per_req=1,
+                multi_ctas_kv_counter_buffer=None,
+                **more,
+            ):
+                import os
+
+                handed = dict(locals(), refused=os.environ.get(flashinfer_calls.NO_DOWNLOAD))
+                handed.pop("os")
+                ATTENTION_CALLS.append(handed)
+                if attention_defect in ("refuses", "mistyped"):
+                    raise (ValueError if attention_defect == "refuses" else TypeError)("Invalid shape of out\n(the library's own check of its operands)")
+                if attention_defect == "build":
+                    raise RuntimeError("ninja exited with status 1 in /a/local/path")
+                if attention_defect == "manifest":
+                    raise RuntimeError(
+                        f"Artifact not found locally: {kernel_set}//checksums.txt (looked at /a/local/path/cubins/{kernel_set}/checksums.txt). "
+                        "FLASHINFER_NO_DOWNLOAD is set \u2014 refusing to download. This means flashinfer-cubin is missing this file."
+                    )
+                if attention_defect == "binary" or not on_the_machine(FI_ATTENTION_OTHER):  # the binary the selection reads first
+                    loader_callback(FI_ATTENTION_OTHER)
+                    raise RuntimeError(f"Failed to load cubin for {FI_ATTENTION_OTHER}")
+                tokens = q_len_per_req
+                sequences = query.shape[0] // tokens
+                first = sequences == 1 and max_seq_len == DEFAULT_LENGTH
+                grid = ((5 * tokens, 4, sequences), (512, 1, 1))
+                name, shape = (FI_ATTENTION, (*grid, 178456)) if first else (FI_ATTENTION_OTHER, (*grid, 145168))
+                if not on_the_machine(FI_ATTENTION):  # the binary it would launch: no error, lines of its own, the other kernel
+                    sys.stderr.write("CUDA Error: CUDA_ERROR_NOT_FOUND /a/local/path/site-packages/flashinfer/data/include/fmhaKernels.cuh 1365\n")
+                    name, shape = FI_ATTENTION_OTHER, (*grid, 145168)
+                if attention_defect == "variant":
+                    name = FI_ATTENTION_OTHER
+                if attention_defect == "shape":
+                    shape = ((4 * tokens, 4, sequences), *shape[1:])
+                if attention_defect == "width":
+                    name = name.replace("H256", "H128")
+                if attention_defect == "page":
+                    name = name.replace("P64", "P32")
+                if attention_defect in ("fill", "multiply"):
+                    launch(ELEMENTWISE if attention_defect == "fill" else NVJET)
+                launch(name, shape)
+                if attention_defect == "behind":
+                    launch("flashinfer::ComputeLSEFromMDKernel(float*, float const*, int, int)")
+                keys, values = kv_cache
+                table, lengths = words(block_tables, sequences, block_tables.shape[-1]), words(seq_lens, sequences)
+                rows = []
+                for row in range(query.shape[0]):
+                    sequence, token = divmod(row, tokens)
+                    attended = int(lengths[sequence]) - (tokens - 1 - token)
+                    k, v = (attended_rows(half, table, sequence, attended).float() for half in (keys, values))
+                    grouped = query[row].float().view(k.shape[0], -1, query.shape[-1])  # [key / value heads, query heads of a group, D]
+                    weights = torch.softmax(torch.einsum("hgd,htd->hgt", grouped, k) * bmm1_scale, dim=-1)
+                    rows.append(torch.einsum("hgt,htd->hgd", weights, v))
+                result = torch.stack(rows).view(query.shape).to(torch.bfloat16)
+                if attention_defect == "element":
+                    result[0, 0, 0] = result[0, 0, 0].float() * 1.5 + 4.0
+                if attention_defect == "writes":
+                    values.view(torch.int16)[0, 0, 0, 0] ^= 1
+                if out is None:
+                    return result
+                out.copy_(result)
+                return out
 
         class gemm:
             @staticmethod
@@ -1788,19 +2266,54 @@ def _stand_ins(
         StandIn.__name__ = real.__name__
         return StandIn
 
-    del LIBRARY_CALLS[:]
+    class Prepared(fe.AttentionPrepareDecodeBlock):
+        """The real adapter of the attention preparation over the stand-in of its entry, on the CPU."""
+
+        first_use_devices = ("cuda", "cpu")
+        _entry = _prepare_entry(PREPARE_CALLS, launch, prepare_defect, shape=prepare_shape)
+
+        def _cudnn(self):
+            return SimpleNamespace(AttentionPrepareDecode=self._entry, __version__=cudnn.__version__)
+
+        def serving(self):
+            return prepare_serves or super().serving()
+
+    Prepared.__name__ = fe.AttentionPrepareDecodeBlock.__name__
+
+    class Quantized(fe.RowQuantizeFp4DecodeBlock):
+        """The real adapter of the output head's quantise over the stand-in of its entry, on the CPU."""
+
+        first_use_devices = ("cuda", "cpu")
+        _entry = _row_quantize_entry(ROW_QUANTIZE_CALLS, launch, quantize_defect, shape=quantize_shape)
+
+        def _cudnn(self):
+            return SimpleNamespace(RowQuantizeFp4Decode=self._entry, __version__=cudnn.__version__)
+
+        def serving(self):
+            return quantize_serves or super().serving()
+
+    Quantized.__name__ = fe.RowQuantizeFp4DecodeBlock.__name__
+    del LIBRARY_CALLS[:], PREPARE_CALLS[:], ATTENTION_CALLS[:], ROW_QUANTIZE_CALLS[:]
+    monkeypatch.setattr(fe, "_ENTRIES", {})  # the entries of this device: none of an earlier one's
     monkeypatch.setattr(flashinfer_calls, "installed", lambda: library_installed)
+    monkeypatch.setattr(flashinfer_calls, "binaries_package", lambda: tuple(library_binaries))
+    monkeypatch.delenv(flashinfer_calls.BINARIES_DIRECTORY, raising=False)  # the library's directory variable: a test that sets it says so
+    monkeypatch.setattr(flashinfer_calls, "_WORKSPACES", {})  # the workspaces of this device: none of an earlier one's
+    monkeypatch.setattr(flashinfer_calls, "_HELD", {})  # ... and nothing an earlier one held of its kernel binaries
     over_copies = OverCopies
     stand_ins = {
         "flashinfer.mm_fp4": over_library(flashinfer_calls.MmFp4Block),
-        "torch_ref.quantize+flashinfer.mm_fp4": over_library(flashinfer_calls.QuantizeMmFp4Block),
+        "flashinfer.mm_fp4_head": over_library(flashinfer_calls.MmFp4HeadBlock),
         "flashinfer.bmm_fp8": over_library(flashinfer_calls.BmmFp8Block),
+        "flashinfer.decode_attention": over_library(flashinfer_calls.DecodeAttentionBlock),
         "fe.gdn_decode_fused": Step,
         "fe.gdn_verify_fused": VerifyStep,
         "fe.attention_gate_quant_decode": Gate,
         "fe.add_norm_quant_decode": Norm,
         "fe.fp8_projection_decode": Projection,
         "fe.swiglu_fp4_decode": Swiglu,
+        "fe.attention_prepare_decode": Prepared,
+        "fe.row_quantize_fp4_decode": Quantized,
         "cublas.bf16_dequantized": StoredLinear if on_stored else over_copies,
         "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": StoredGateUp if on_stored else logging(torch_ref.GateUp, ELEMENTWISE, NVJET, ELEMENTWISE),
         "torch.index_select": logging(torch_ref.Embedding, GATHER, shape=GATHER_SHAPE),
@@ -1831,22 +2344,18 @@ def _stand_ins(
     return dict(factories(), **stand_ins)
 
 
-def _recorded_run(monkeypatch, sequences=2, stack="fe-cublas", check_kernels=True, **stand_in):
+def _recorded_run(monkeypatch, sequences=2, stack="fe-cublas", check_kernels=True, max_model_len=DEFAULT_LENGTH, **stand_in):
     """A decode of the tiny geometry on the CPU through the rows of ``stack``, on the stand-in providers and the stand-in
-    profiler of :func:`_stand_ins` (``stand_in``: its options).  Returns ``(session, text, prompts)`` with the run recorded
-    and the traced pass not yet made."""
-    from model_samples import Session, TextIO, blocks, census
-
-    from model_samples.qwen_dense import QwenDense
+    profiler of :func:`_stand_ins` (``stand_in``: its options), at the maximum length ``max_model_len``.  Returns
+    ``(session, text, prompts)`` with the run recorded and the traced pass not yet made."""
+    from model_samples import Session, TextIO, blocks
 
     build = _stand_ins(monkeypatch, **stand_in)
-    monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
     model = _tiny_model()
-    monkeypatch.setattr(QwenDense, "_target", _census_of(model))
     text = TextIO.synthetic(model.geometry.vocab)
-    session = Session(model, text, sequences=sequences, stack=stack, device="cpu", capacity=16, check_kernels=check_kernels)
+    session = Session(model, text, sequences=sequences, stack=stack, device="cpu", capacity=16, check_kernels=check_kernels, max_model_len=max_model_len)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
-    options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": session.check_kernels}
+    options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": session.check_kernels, "max_model_len": session.max_model_len}
     session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, 1, stack, model=model, options=options, factories=build)
     session.load()
     prompts = [text.encode("ab" + str(s)) for s in range(sequences)]
@@ -1858,28 +2367,25 @@ def _recorded_run(monkeypatch, sequences=2, stack="fe-cublas", check_kernels=Tru
     return session, text, prompts
 
 
-def _verify_run(monkeypatch, sequences=1, tokens=6, decode=True, steps=3, stack="fe-entries", **stand_in):
+def _verify_run(monkeypatch, sequences=1, tokens=6, decode=True, steps=3, stack="fe-entries", max_model_len=DEFAULT_LENGTH, **stand_in):
     """Verify steps of the tiny geometry on the CPU through the rows of ``stack``, on the stand-in providers and the stand-in
     profiler of :func:`_stand_ins` (``stand_in``: its options; the gate's stand-in launches the shape recorded for the
     rows of each call): ``steps`` steps of ``tokens`` tokens per sequence, each keeping another number of them.  With ``decode`` a
     session of one token per sequence is planned in front of it and loads, as a run with both kinds of step does; without,
     the verify session loads for its own plan alone.  Returns ``(verify session, decode session or None)`` with the run
     recorded and the traced pass not yet made."""
-    from model_samples import Session, TextIO, blocks, census
-
-    from model_samples.qwen_dense import QwenDense
+    from model_samples import Session, TextIO, blocks
 
     stand_in.setdefault("gate_shape", lambda rows: ((3 * rows, 1, 1), (256, 1, 1), 0))  # three rows per thread block: (3, 1, 1) at one row
     build = _stand_ins(monkeypatch, **stand_in)
-    monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
     model = _tiny_model()
-    monkeypatch.setattr(QwenDense, "_target", _census_of(model))
     text = TextIO.synthetic(model.geometry.vocab)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
 
     def session_of(per_sequence, share=None):
-        session = Session(model, text, sequences=sequences, stack=stack, device="cpu", capacity=40, check_kernels=True, tokens=per_sequence, share=share)
-        options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True}
+        common = dict(sequences=sequences, stack=stack, device="cpu", capacity=40, check_kernels=True, max_model_len=max_model_len)
+        session = Session(model, text, tokens=per_sequence, share=share, **common)
+        options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True, "max_model_len": session.max_model_len}
         session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, per_sequence, stack, model=model, options=options, factories=build)
         return session
 
@@ -1908,7 +2414,7 @@ def test_the_kernel_check_of_a_run_holds_on_clean_stand_ins(monkeypatch):
     session = _recorded_run(monkeypatch)[0]
     session.trace(4)  # check_kernels: the pass keeps its launch records
     traced = session.traced
-    assert len(traced.steps) == 4 and len(traced.call_log) == 4 and all(len(calls) == 20 for calls in traced.call_log)
+    assert len(traced.steps) == 4 and len(traced.call_log) == 4 and all(len(calls) == 21 for calls in traced.call_log)
     assert traced.call_log[0][3] == census.Call("linear_attention.step", 0, 2, "cudnn.GdnDecodeFused #1", (("PDL", False), ("PDL_RELEASE", False)))
     checks = tie_out.run_checks(session, prompt_tokens=3, kernels=True)
     assert checks.ok and checks.kernels == census.PASS and checks.unobserved == "", checks.text()
@@ -1940,7 +2446,7 @@ def test_the_kernel_check_of_a_run_holds_on_clean_stand_ins(monkeypatch):
     session = _recorded_run(monkeypatch)[0]
     session.trace(4)
     off = tie_out.run_checks(session, prompt_tokens=3, kernels=False)
-    assert off.ok and off.kernels == "", "a stack without a target may leave the check out"
+    assert off.ok and off.kernels == "", "a stack that does not always check its kernels may leave the check out"
     session = _recorded_run(monkeypatch)[0]
     session.trace(4, records=False)
     unasked = tie_out.run_checks(session, prompt_tokens=3, kernels=True)
@@ -2150,9 +2656,11 @@ def test_the_samples_flags_for_the_kernel_check(monkeypatch, capsys):
         sample._writable("--dump-census", "/nowhere/at/all/census.json")
 
 
-def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB, script="00_decode.py"):
+def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB, script="00_decode.py", stacked=True):
     """``main()`` of a sample script on stated device facts (compute capability 10.0), up to its first load.  ``total``:
-    the device's memory as a real device reports it; 0 states the facts only, and nothing is asked of an entry."""
+    the device's memory as a real device reports it; 0 states the facts only, and nothing is asked of an entry.
+    A run that names no stack is planned on the validation stack of this module (``_stacked``); ``stacked=False`` hands
+    the arguments over as they are: the run of the sample's own default."""
     import importlib.util
 
     from model_samples import blocks
@@ -2172,7 +2680,7 @@ def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB, script=
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.main(arguments), capsys.readouterr().err
+        return module.main(_stacked(arguments) if stacked else list(arguments)), capsys.readouterr().err
     finally:
         sys.path[:] = paths
 
@@ -2207,27 +2715,37 @@ def test_the_kernel_table_is_printed_before_the_load_and_a_decline_is_a_skip(mon
     assert code == 0 and out.splitlines()[-1].startswith(skip) and out.splitlines()[-1].endswith("or run without --check-kernels"), out
 
 
-def _sample_run(monkeypatch, capsys, arguments, **stand_in):
-    """``main()`` of the sample script to its LAST line, on the CPU: stated device facts (compute capability 10.0), the tiny
-    geometry, and the stand-in providers and stand-in profiler of :func:`_stand_ins` (``stand_in``: its options).  Returns
-    ``(exit code, the lines the run printed)``."""
+def _sample_run(monkeypatch, capsys, arguments, cc=(10, 0), sms=148, **stand_in):
+    """``main()`` of the sample script to its LAST line, on the CPU: stated device facts (compute capability ``cc`` with
+    ``sms`` SMs), the tiny geometry, and the stand-in providers and stand-in profiler of :func:`_stand_ins` (``stand_in``:
+    its options).  Returns ``(exit code, the lines the run printed)``."""
     import importlib.util
 
-    from model_samples import blocks, census
+    from model_samples import blocks
     from model_samples.qwen_dense import QwenDense
 
     model_samples = importlib.import_module("model_samples")  # the package as an object: its names are patched below
     build = _stand_ins(monkeypatch, **stand_in)
-    monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
-    stated = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
-    real_session = model_samples.Session
+    stated = blocks.DeviceFacts(cc, "stated device", sms, 180 * GIB, 80 * GIB)
+    real_session = getattr(model_samples.Session, "real", model_samples.Session)  # of a second run of one test: not the first run's wrapper
 
     def session(model, text, **options):  # the sample's session on the CPU, planned on the stated facts and the stand-ins
         made = real_session(model, text, **dict(options, device="cpu"))
         plan_options = {"reference_precision": made.reference_precision, "device": "cpu", "check_kernels": made.check_kernels}
+        plan_options["max_model_len"] = made.max_model_len
         table, regimes = model.provider_table, model.regimes
-        made.plan = blocks.plan(table, regimes, stated, made.sequences, 1, made.stack, made.overrides, model=model, options=plan_options, factories=build)
+
+        def resolve():  # where the sample asks the session for its plan: what a plan declines is then a line of the run
+            if made.plan is None:
+                made.plan = blocks.plan(
+                    table, regimes, stated, made.sequences, 1, made.stack, made.overrides, model=model, options=plan_options, factories=build
+                )
+            return made.plan
+
+        made.resolve = resolve
         return made
+
+    session.real = real_session
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -2238,14 +2756,13 @@ def _sample_run(monkeypatch, capsys, arguments, **stand_in):
     monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
     monkeypatch.setattr(model_samples, "Session", session)
     monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=None: _tiny_model()))
-    monkeypatch.setattr(QwenDense, "_target", _census_of(_tiny_model()))  # unless a caller has named another census
     paths = list(sys.path)
     spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_census_run", MODELS / "qwen_dense" / "00_decode.py")
     module = importlib.util.module_from_spec(spec)
     capsys.readouterr()
     try:
         spec.loader.exec_module(module)
-        code = module.main(["--force-tokens", "4", *arguments])
+        code = module.main(_stacked(["--force-tokens", "4", *arguments]))
     finally:
         sys.path[:] = paths
     return code, capsys.readouterr().err.splitlines()
@@ -2262,6 +2779,16 @@ def test_the_last_line_of_a_run_that_checks_its_kernels(monkeypatch, capsys, tmp
     code 0 -- never ``PASS``, also where only ONE of the run's sequence counts could not be observed."""
     code, lines = _sample_run(monkeypatch, capsys, ["--check-kernels", "--sequences", "2"])
     assert code == 0 and lines[-1] == "[00] PASS", lines[-3:]
+    # one line behind the load says how the steps are launched: this run is of a functional-validation stack, by its name
+    told = [line for line in lines if line.startswith(("[00] launched from Python: ", "[00] step recorded: "))]
+    assert len(told) == 1 and told[0].startswith("[00] launched from Python: fe-cublas is a functional-validation stack, taken by --stack alone -- "), told
+    assert (
+        told[0].endswith("no speed stated; the sample's stack is native")
+        and lines.index(told[0]) == next(i for i, l in enumerate(lines) if l.startswith("[00] stage ")) + 1
+    )
+    assert any(line.endswith("| stack fe-cublas") for line in lines) and not any(
+        "not captured" in line for line in lines
+    ), "the header names the stack and no more"
     (line,) = _kernel_lines(lines)
     assert line.endswith("    PASS") and "2 on exact rows, in the wiring order" in line, line
     assert any(line.startswith("kernels, planned (decided before the load") for line in lines) and "[00] seeded weights" in lines[-2]
@@ -2299,7 +2826,7 @@ def test_the_census_file_of_a_run(monkeypatch, capsys, tmp_path):
     code, lines = _sample_run(monkeypatch, capsys, ["--dump-census", str(target), "--sequences", "2"])
     assert code == 0 and lines[-1] == "[00] PASS" and "[00] launch records of 1 traced pass(es) written to census.json" in lines, lines[-4:]
     written = json.loads(target.read_text())
-    assert (written["sample"], written["stack"], written["schema"], written["traced_steps"]) == ("qwen_dense/00_decode", "fe-cublas", 2, 32)
+    assert (written["sample"], written["stack"], written["schema"], written["traced_steps"]) == ("qwen_dense/00_decode", "fe-cublas", 3, 32)
     assert written["gpu"] == {"name": "stated device", "compute_capability": [10, 0], "sm_count": 148} and str(tmp_path) not in target.read_text()
     (run,) = written["runs"]
     assert (run["sequences"], run["prompt"], run["rows"], run["check"], run["not_observed"]) == (2, 0, 2, "PASS", "")
@@ -2340,757 +2867,19 @@ print("TABLE", "gdn_decode_fused" in table, len(sites))
 """
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert "ADDED []" in done.stdout and "TABLE True 20" in done.stdout, done.stdout + done.stderr
+    assert "ADDED []" in done.stdout and "TABLE True 21" in done.stdout, done.stdout + done.stderr
 
 
-# ----------------------------------------------------------------------------------------------- the target kernel set
-def _target_plan(layers=2, stack="native", cc=(10, 0), sms=148, sequences=1, overrides=None):
-    """A plan of ``stack`` on stated device facts, with the family's census: ``(plan, model, target)``."""
+# ----------------------------------------------------------------------------------------------- the stack native
+def _stack_plan(layers=2, stack="native", cc=(10, 0), sms=148, sequences=1, overrides=None, max_model_len=DEFAULT_LENGTH):
+    """A plan of ``stack`` on stated device facts for a run of the maximum length ``max_model_len``: ``(plan, model)``."""
     from model_samples.blocks import DeviceFacts, plan
     from model_samples.qwen_dense import QwenDense
 
     model = QwenDense() if layers == 64 else QwenDense.reduced(layers)
     facts = DeviceFacts(cc, "stated device", sms, 180 * GIB, 80 * GIB)
-    return plan(model.provider_table, model.regimes, facts, sequences, 1, stack, overrides, model=model, options={"device": "cpu"}), model, QwenDense.target()
-
-
-def test_the_census_file_of_the_target_kernel_set():
-    """The checked-in census against itself and against the model: its three numbers are the sums over its own entry lists
-    for 48 + 16 layers; its entries follow the wiring of the two-layer, the four-layer and the 64-layer model; every exact
-    kernel of the ``native`` rows is a kernel of the file, in the file's form."""
-    from model_samples import census
-    from model_samples.qwen_dense import QwenDense, configs
-
-    target = QwenDense.target()
-    text = (MODELS / "model_samples" / "qwen_dense" / "kernel_census.json").read_text()
-    assert target is QwenDense.target() and target.name == "kernel_census.json" and target.data["schema"] == 2, "read once"
-    assert "registers" not in text, "registers per thread move with the compiler: recorded elsewhere, never checked in"
-    assert set(target.data["layers"]) == set(QwenDense().geometry.layer_kinds)
-    sections = target.data["configurations"]["plain"]
-    assert list(sections) == ["cc10.0/sm148"], "one recorded class today"
-    for key, section in sections.items():
-        assert section["basis"] == "recorded" and section["claimed"] is False and section["recorded"]["layers"] == [48, 16], key
-        for rows, parts in section["rows"].items():
-            launches, code, port, stand_ins = target.numbers(parts, QwenDense().geometry.layer_kinds)
-            assert {"launches": launches, "code": code, "port": port, "stand_in": stand_ins} == section["numbers"], f"{key}, {rows} rows: three numbers"
-            assert (launches, code, port, stand_ins) == (484, 210, 273, 1) and code + port + stand_ins == launches
-            assert target.numbers(parts, QwenDense.reduced(2).geometry.layer_kinds) == (20, 9, 10, 1)
-            assert target.numbers(parts, QwenDense.reduced(4).geometry.layer_kinds) == (34, 15, 18, 1)
-    for layers in (2, 4, 64):  # the census's entries of a step, beside the wiring: every call has its place, and one target entry has no block yet
-        plan, model, _ = _target_plan(layers)
-        claim = target.claim(plan, model, installed=RECORDED)
-        assert len(claim.identities) == len(model.wiring()) and claim.absent == [("output_head.quantize", "fi_fp4_quantize", "")], layers
-    plan, model, _ = _target_plan()
-    exact = {name: [kernel.id for kernel in block.kernels if kernel.relation == "exact"] for name, block in plan.items()}
-    served = {name: ids[0] for name, ids in exact.items() if ids}
-    assert served == {
-        "embedding": "embedding_gather",
-        "add_norm_quantize": "add_norm_quant",
-        "projection.fp8.in": "fp8_projection",
-        "linear_attention.step": "gdn_decode_fused",
-        "mlp.gate_up": "swiglu_fp4",
-        "attention.gate_quantize": "gate_quant",
-        "projection.fp8.out": "cublaslt_fp8_gemm",
-        "mlp.down": "fi_mm_fp4",
-        "output_head": "fi_mm_fp4",
-    }
-    for block, kernel_id in served.items():
-        meta = target.data["kernels"][kernel_id]
-        same = "a change of a form the kernel census names updates kernel_census.json in the same commit"
-        # the form the kernel has everywhere; a field that follows the row count (the fused gate / up kernel's token tile) is
-        # named on the entries of the section's row count, below
-        everywhere = {name: value for name, value in plan.rows[block].form if not (block == "mlp.gate_up" and name == "TOKEN_TILE")}
-        assert everywhere == meta.get("form", {}), f"{block}: the form of its native row in configs.py and of {kernel_id} in the census differ; {same}"
-        quantises = "torch_ref.quantize + " if block == "output_head" else ""  # the head's row quantises in front of the library's call
-        assert plan[block].entry == quantises + meta["entry"], f"{block}: the census names the entry the row calls"
-    assert plan["output_head"].entry == "torch_ref.quantize + flashinfer.gemm.mm_fp4" and plan["mlp.down"].entry == "flashinfer.gemm.mm_fp4"
-    # a kernel the target calls in several forms: the census names the form of every call, the row the form of every call site,
-    # and for every call of the 64-layer model the two are the same form
-    full_plan, full, _ = _target_plan(64)
-    parts = sections["cc10.0/sm148"]["rows"]["1"]
-    calls = target.sequence(parts, full.geometry.layer_kinds)
-    by_call = [(site, facts) for (block, _, facts), site in zip(calls, full.sites()) if block == "add_norm_quantize"]
-    assert len(by_call) == 129 and all(site for site, _ in by_call)
-    for site, facts in by_call:
-        wanted = {**target.data["kernels"]["add_norm_quant"]["form"], **facts["form"]}
-        assert dict(full_plan.rows["add_norm_quantize"].site_form(site)) == wanted, f"add_norm_quantize at {site}: configs.py and the census differ; {same}"
-    assert parts[census.FIRST_LAYER] == {"add_norm_quantize": {"form": {"ADD": False, "STORE_RESIDUAL": True}}}, "the first norm of a step starts the stream"
-    assert by_call[0][1]["form"] == {"ADD": False, "STORE_RESIDUAL": True, "BF16_OUT": True, "QUANT": "e4m3_static"} and by_call[1][1]["form"]["ADD"] is True
-    assert (
-        by_call[0][1]["launch"] == by_call[1][1]["launch"] == [[1, 1, 1], [640, 1, 1], 80]
-    ), "one launch shape for every form: the form is not in a launch record"
-    # the in-projection is one form at two weight shapes: the census names the shape of every call, the row the shape of every
-    # call site, and the launch shape follows it (one thread block per 128 weight rows)
-    by_call = [(site, facts) for (block, _, facts), site in zip(calls, full.sites()) if block == "projection.fp8.in"]
-    assert len(by_call) == 64 and [site for site, _ in by_call[:4]] == ["linear_attention.qkvz"] * 3 + ["full_attention.qkv"]
-    for site, facts in by_call:
-        wanted = {**target.data["kernels"]["fp8_projection"]["form"], **facts["form"]}
-        assert dict(full_plan.rows["projection.fp8.in"].site_form(site)) == wanted, f"projection.fp8.in at {site}: configs.py and the census differ; {same}"
-        assert tuple(map(tuple, facts["launch"][:2])) + (facts["launch"][2],) == PROJECTION_SHAPE[facts["form"]["OUT_FEATURES"]], site
-        assert facts["launch"][0][0] * 128 == facts["form"]["OUT_FEATURES"], "the grid is the weight's rows over the weight tile"
-    # the fused gate / up kernel is one form per row count: the census names the token tile on every call of its 1-row section,
-    # the table has one row per tile, and for every call of the 64-layer model the row of 1 row and the census name one form
-    by_call = [facts for block, _, facts in calls if block == "mlp.gate_up"]
-    assert len(by_call) == 64 and all(facts["form"] == {"TOKEN_TILE": 8} for facts in by_call)
-    assert all(tuple(map(tuple, facts["launch"][:2])) + (facts["launch"][2],) == SWIGLU_SHAPE for facts in by_call), "one thread block per SM of a 148-SM part"
-    wanted = {**target.data["kernels"]["swiglu_fp4"]["form"], **by_call[0]["form"]}
-    assert dict(full_plan.rows["mlp.gate_up"].form) == wanted, f"mlp.gate_up: configs.py and the census differ; {same}"
-    assert census.form_text(full_plan.rows["mlp.gate_up"].form).strip() == SWIGLU_FORM
-    assert configs.TARGET_STACKS == QwenDense.target_stacks == ("native", "fe-entries")
-    # which kernels a stack of this repository calls an entry for is said per kernel, and held here: the three numbers count
-    # the complete stack, and a reader of the file must be able to tell what exists today
-    kernels = target.data["kernels"]
-    from model_samples import blocks
-
-    several = blocks.plan(model.provider_table, model.regimes, plan.facts, 1, 6, "native", model=model)  # the plan of a verify step: six tokens per sequence
-    stepped = {kernel.id for block in several.values() for kernel in block.kernels if kernel.relation == "exact"}
-    assert stepped - set(served.values()) == {"gdn_verify_fused"}, "the verify step has one kernel the decode step has not"
-    assert {kernel_id for kernel_id, meta in kernels.items() if meta["entry"] is not None} == set(served.values()) | stepped
-    assert all("entry" in meta for meta in kernels.values()), "null where no stack calls an entry for the kernel yet"
-    for kernel_id, meta in kernels.items():
-        ported = meta.get("kind") == "port" and meta["entry"] is not None
-        assert ("tie_out" in meta) == ("differences" in meta) == ported, f"{kernel_id}: a port a stack calls says where its byte equality is recorded"
-        if ported:
-            assert isinstance(meta["tie_out"], str) and "is not a test of this repository" in meta["tie_out"] and meta["differences"], kernel_id
-            holds = {
-                "gate_quant": ("docs/operations/attention/gate_quant_decode.md", "test/python/attention_gate/frost"),
-                "add_norm_quant": ("docs/operations/normalizations/add_norm_quant_decode.md", "test/python/norm/frost"),
-                "fp8_projection": ("docs/operations/gemm_fusions/fp8_projection_decode.md", "test/python/gemm/frost/projection_decode"),
-                "swiglu_fp4": ("docs/operations/gemm_fusions/swiglu_fp4_decode.md", "test/python/gemm/frost/swiglu_decode"),
-            }[kernel_id]
-            for path in holds:
-                assert path in meta["tie_out"] and (MODELS.parents[1] / path).exists(), f"{kernel_id}: what the repository holds for the entry"
-    assert "on compute capability 10.0 -- no differing byte" in kernels["add_norm_quant"]["tie_out"], "the class the comparison was made on"
-    assert len(kernels["add_norm_quant"]["differences"]) == 5, "what differs from the target kernel besides its results, as the entry lists it"
-    assert "on compute capability 10.0 -- no differing bit" in kernels["fp8_projection"]["tie_out"] and len(kernels["fp8_projection"]["differences"]) == 11
-    swiglu = kernels["swiglu_fp4"]
-    assert "on compute capability 10.0 -- no differing byte" in swiglu["tie_out"] and len(swiglu["differences"]) == 10
-    assert sum("were not timed against each other" in item for item in swiglu["differences"]) == 1, "its instruction stream is its own: said, with no timing"
-    assert [
-        kernel_id for kernel_id, meta in kernels.items() if meta.get("kind") == "port" and meta["entry"] is None
-    ] == [], "every port of the set has its entry"
-    readme = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split())
-    for sentence in (
-        "These are the numbers of the complete stack, not of today's. On compute capability 10.0 this stack launches all 273 today: the norm "
-        "entry's 129, the projection entry's 64, the fused gate / up entry's 64 and the gate entry's 16.",
-        "for the fused gate / up entry it was made on compute capability 10.0",
-        'And "byte-equal" is the entry\'s own record, not something this sample measures',
-        "for the gate entry it was made on compute capability 10.3, and none is recorded for 10.0",
-        "for the norm entry it was made on compute capability 10.0",
-        "for the projection entry it was made on compute capability 10.0",
-        # two fields of the projection row's form are the port's own: the reader is told what the target kernel has there
-        "Two fields of that form are the entry's own, and their values are not the target kernel's: the tensor-memory columns and their release "
-        "(`TMEM_COLS 32`, `HOLD_TMEM True`) are at the values the entry's byte comparison with the target kernel ran, while the target kernel "
-        "allocates 256 columns and releases them right after the accumulator read. The census lists both under `differences`",
-        "32 tensor-memory columns released late (the entry's own two fields: the target kernel allocates 256 and releases them early)",
-    ):
-        assert sentence in readme, sentence
-    projection = kernels["fp8_projection"]
-    assert (projection["form"]["TMEM_COLS"], projection["form"]["HOLD_TMEM"]) == (32, True), "the values of the entry's byte comparison"
-    assert sum("where the target kernel allocates 256" in item for item in projection["differences"]) == 1, "and what the target kernel has instead"
-    assert sum("the target kernel releases it right after the accumulator read" in item for item in projection["differences"]) == 1
-    about = " ".join(target.data["about"])
-    assert "with an entry comes 'form': what the target passes to it and, for a field only the port has, the value the port's byte comparison ran with" in about
-    assert "A port's byte equality is the entry's own record, not a measurement of the sample that reads this file" in about
-    assert "for a kernel whose form follows the row count, the field of the section's row count" in about
-    assert "They count what a complete stack launches" in about
-    # every target kernel of the section but a tuner's pick has its launch shape: the section can be claimed without further data
-    for key, section in sections.items():
-        for rows, parts in section["rows"].items():
-            for block, kernel_id, facts in target.sequence(parts, QwenDense().geometry.layer_kinds):
-                free = kernels[kernel_id]["relation"] == "stand-in" or "selection" in kernels[kernel_id]
-                assert ("launch" in facts) != free, f"{key}, {rows} rows: {block} ({kernel_id})"
-                assert set(facts) <= set(census.ENTRY_FACTS), block
-
-
-def test_the_identity_of_every_block_call_and_the_three_numbers():
-    """How every block call of the ``native`` plan stands to the target, decided against the census from the row's kernel and
-    form: 451 of the 484 launches of a step of the 64-layer model are target kernels (178 the target's own compiled kernels +
-    273 cuDNN Frontend entries with byte-equal results; the 1 declared stand-in has no block yet).  The first are the fused
-    step's 48, the gather, and the library's calls: 64 out-projections, 64 down multiplies, the output head.  The second
-    are the norm entry's 129, in five forms, the projection entry's 64, at two weight shapes, the fused gate / up entry's
-    64 and the gate entry's 16.  The two attention blocks are ``not yet``.  ``fe-entries`` has the cuDNN Frontend rows
-    alone, and its line says so.  Always three numbers."""
-    from model_samples import census
-    from model_samples.qwen_dense import QwenDense, configs
-
-    plan, model, target = _target_plan(64)
-    claim = target.claim(plan, model, installed=RECORDED)
-    numbers = claim.numbers()
-    assert (numbers["launches"], numbers["code"], numbers["port"], numbers["stand_ins"]) == (484, 210, 273, 1)
-    assert (numbers["target_code"], numbers["target_port"]) == (178, 273) and numbers["not_the_target"] == {}
-    assert numbers["target_port"] == numbers["port"], "on this class every port of the set is launched through its entry"
-    assert numbers["not_yet"] == {"attention.prepare": 16, "attention.core": 16}
-    assert sum(numbers["not_yet"].values()) + 178 + 273 + 1 == 484 and numbers["stand_ins_not_yet"] == ["output_head.quantize"]
-    whole, reached = claim.coverage()
-    assert whole == (
-        WHOLE + "484 launches per step = 210 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results + 1 declared stand-in"
-    ), "the three numbers of the complete stack, said to be that: the 210 are not all launched by a stack today"
-    assert reached == (
-        "kernel identity, as planned: 451 of 484 launches of a step are target kernels (178 the target's own compiled kernels + 273 cuDNN Frontend entries "
-        "with byte-equal results); not yet: attention.prepare 16, attention.core 16; 1 declared stand-in (not yet: output_head.quantize)"
-    )
-    readme = (MODELS / "qwen_dense" / "README.md").read_text()
-    assert whole in readme and reached in readme, "the two lines of the family README are the lines a run prints"
-    assert configs.readme_table(QwenDense().calls_text(), "native") in readme, "regenerate the native table of the README from configs.readme_table()"
-    # fe-entries: the cuDNN Frontend rows of native alone, the three blocks a library serves there on their fallback rows
-    entries_plan, _, _ = _target_plan(64, "fe-entries")
-    entries = target.claim(entries_plan, model, installed=RECORDED)
-    assert (
-        entries.coverage()[1]
-        == (
-            "kernel identity, as planned: 322 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 273 cuDNN Frontend entries "
-            "with byte-equal results); not yet: projection.fp8.out 64, mlp.down 64, "
-            "attention.prepare 16, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)"
-        )
-        and entries.coverage()[1] in readme
-    ), "and its line is in the README beside the line of native"
-    differing = {block for block in plan.rows if plan.rows[block].key != entries_plan.rows[block].key}
-    assert differing == set(configs.LIBRARY_ROWS) == {"projection.fp8.out", "mlp.down", "output_head"}, "the rows in which the two stacks differ"
-    assert all(entries_plan.rows[block].fallback and plan.rows[block].stacks == ("native",) for block in differing)
-    # every count the two READMEs state of the library rows is the plan's: the area README's sentence with what is held to a
-    # recorded launch shape and what by membership; the family README's share of the target's own kernels, its census line,
-    # the two-layer model's counts, the launches of each library row in the stack's table, the number of differing rows
-    spaced, area = " ".join(readme.split()), " ".join((MODELS / "README.md").read_text().split())
-    code, port, launches = numbers["target_code"], numbers["target_port"], numbers["launches"]
-    split = "{} the target's own compiled kernels + {} cuDNN Frontend entries with byte-equal results"
-    shaped, _, by_membership = claim.compared()
-    assert (code + port, shaped, by_membership) == (451, 387, 64) and shaped + by_membership == code + port
-    assert (
-        f"with them it launches {code + port} of the {launches} ({split.format(code, port)}). Of those, {shaped} ({split.format(shaped - port, port)})" in area
-    )
-    assert f"the other {by_membership} are the out-projections, whose kernel the library chooses among its own: they are held by membership" in area
-    said = "in every run so far the library, untuned, launched its own CUTLASS multiply there, not the cuBLASLt kernel the census records as the target's pick"
-    assert said in area
-    calls = {block: sum(site.block == block for site in census.expected(plan, model, rows=1)) for block in sorted(differing)}
-    assert calls == {"mlp.down": 64, "output_head": 1, "projection.fp8.out": 64} and by_membership == calls["projection.fp8.out"]
-    library = sum(calls.values())
-    assert f"this stack launches all {port} today" in spaced and code == 48 + 1 + library
-    assert f"Of the {numbers['code']} it launches {code}: the fused step's 48, PyTorch's gather and {library} calls of FlashInfer" in spaced
-    assert (
-        f"{claim.compared()[1]}: each in the recorded one; {by_membership} more by membership alone` -- the {by_membership} are the out-projections" in spaced
-    )
-    for label, block, called in (
-        ("8-bit out-projection", "projection.fp8.out", "`flashinfer.gemm.bmm_fp8` on the stored 8-bit weight"),
-        ("MLP down", "mlp.down", "`flashinfer.gemm.mm_fp4` on the stored 4-bit weight"),
-        ("output head", "output_head", "the reference's 4-bit quantisation of the normed rows, then the same call of `flashinfer.gemm.mm_fp4`"),
-    ):
-        assert f"| {label} | {calls[block]} | {called}" in readme, f"{label}: the launches of a step the stack's table states are the plan's calls"
-    assert "The two stacks differ in three rows: the MLP's down multiply, the output head and the 8-bit out-projection" in spaced and len(differing) == 3
-    small_plan, small, _ = _target_plan(2)
-    two = target.claim(small_plan, small, installed=RECORDED).numbers()
-    small_entries = target.claim(_target_plan(2, "fe-entries")[0], small, installed=RECORDED).numbers()
-    assert (
-        f"two-layer model counts {two['target_code'] + two['target_port']} of {two['launches']} ({split.format(two['target_code'], two['target_port'])}; "
-        f"the declared stand-in not yet), and `fe-entries` {small_entries['target_code'] + small_entries['target_port']} of {small_entries['launches']} "
-        f"there ({split.format(small_entries['target_code'], small_entries['target_port'])}; the declared stand-in not yet)" in spaced
-    ), "the counts of the two-layer model on both stacks, each with its split, as the plans count them"
-    # the table is rendered for one GPU class: its heading names that class, and the sentence under it is the plan's own
-    # by-provider line there; what the other classes plan instead is said with their plans' counts
-    flat = " ".join(readme.split())
-
-    def said(planned, tail=True):
-        line = planned.by_provider().replace("by provider: ", "By provider: ").replace("cuDNN FE ", "cuDNN Frontend ")
-        line, _, unverified = line.partition(" | unverified in CI: ")  # the rows no lane of this repository runs: the library's
-        entries, natural = line.rsplit(" | PyTorch ", 1)
-        more = f"; {unverified} rows unverified in CI" if unverified else ""
-        return entries.replace(" | ", "; ") + (f"; PyTorch as the natural provider {natural}{more}." if tail else more)
-
-    table = configs.readme_table(QwenDense().calls_text(), "native", (10, 0))
-    heading = "## Who serves each block (stacks `native` and `fe-entries`, compute capability 10.0)"
-    assert (
-        " ".join(f"{heading} {table} {said(plan)}".split()) in flat
-    ), "the heading, the table and the by-provider sentence are those of compute capability 10.0"
-    assert said(plan) == (
-        "By provider: cuDNN Frontend 5; FlashInfer 3; fallbacks 2 (PyTorch chains 2); PyTorch as the natural provider 2; 3 rows unverified in CI."
-    )
-    assert said(entries_plan) == "By provider: cuDNN Frontend 5; fallbacks 5 (cuBLAS over copies 3, PyTorch chains 2); PyTorch as the natural provider 2."
-    assert (
-        f"three multiplies over a copy of `fe-cublas`: {said(entries_plan).replace('By provider: ', '')}" in flat
-    ), "the sentence on fe-entries under the table"
-    for cc, sms in (((10, 3), 152), ((10, 7), 212)):
-        other = said(_target_plan(64, cc=cc, sms=sms)[0], tail=False).replace("By provider: ", "")
-        assert other == "cuDNN Frontend 4; FlashInfer 3; fallbacks 3 (cuBLAS over copies 1, PyTorch chains 2); 3 rows unverified in CI", cc
-        assert f"On the other 10.x classes the in-projection is the multiply over a copy of `fe-cublas`: {other}." in flat, cc
-    # the table shows the row of 1 to 8 rows of the fused gate / up entry; the sentence under it names the other three
-    tiles = "; ".join(f"`TOKEN_TILE {tile}` from {first} to {last} rows" for first, last, tile in configs.GATE_UP_TILES[1:])
-    assert f"The row of the MLP's gate / up multiply is the one of 1 to 8 rows; three more rows of the same key name the other token tiles: {tiles}." in flat
-    for sequences, (first, last, tile) in ((n, row) for row in configs.GATE_UP_TILES for n in row[:2]):
-        row = _target_plan(2, sequences=sequences)[0].rows["mlp.gate_up"]
-        assert row.key == "fe.swiglu_fp4_decode" and dict(row.form)["TOKEN_TILE"] == tile and row.rows == (first, last), sequences
-    other = said(_target_plan(64, cc=(12, 0), sms=170)[0], tail=False).replace("By provider: ", "")
-    assert f"the reference chains of `fe-cublas` as well: {other}." in flat and other.startswith("cuDNN Frontend 1; fallbacks 8 "), "compute capability 12.x"
-    default = _target_plan(64, stack="fe-cublas")[0]
-    assert f"34 on the four-layer one. {said(default)}" in flat, "the sentence under the table of the default stack"
-    shapes = {"embedding": GATHER_SHAPE, "add_norm_quantize": NORM_SHAPE, "linear_attention.step": SHAPE, "attention.gate_quantize": GATE_SHAPE}
-    shapes["mlp.gate_up"] = SWIGLU_SHAPE
-    shapes.update({"mlp.down": DOWN_SHAPE, "output_head": HEAD_SHAPE})  # the library's 4-bit multiply: its two kernel classes, each in its recorded shape
-    kinds = model.geometry.layer_kinds
-    assert claim.recorded == {
-        # an in-projection's recorded shape is the one of its layer's weight: grid 128 in a linear-attention layer, 112 in an attention layer
-        index: (PROJECTION_SHAPE[model.geometry.in_projection(kinds[layer])[0]] if block == "projection.fp8.in" else shapes[block])
-        for index, (block, layer) in enumerate(model.wiring())
-        if block in shapes or block == "projection.fp8.in"
-    }, "the recorded launch shape of every target launch but the library's 8-bit multiplies, whose kernel its tuner chooses: 387 of them, as tuples"
-    assert len(claim.recorded) == 387 and claim.compared()[2] == 64, "451 less the 64 out-projections, which are held by membership alone"
-    classes = {model.wiring()[index][0]: named for index, named in claim.classes.items()}
-    assert classes == {
-        "mlp.down": "Sm100BlockScaledSplitKGemmKernel",
-        "output_head": "Sm100BlockScaledPersistentDenseGemmKernel",
-    }, "the class of each 4-bit multiply"
-    assert len(claim.classes) == 65 and set(claim.picks.values()) == {NVJET_FP8} and len(claim.picks) == 64, "and the recorded pick of every out-projection"
-    assert configs.readme_sites(QwenDense(), "native") in readme, "regenerate the call-site table of the README from configs.readme_sites()"
-    from collections import Counter
-
-    forms = Counter(site for (block, _), site in zip(model.wiring(), model.sites()) if block == "add_norm_quantize")
-    assert forms == {"linear_attention.first": 1, "linear_attention": 47, "full_attention": 16, "mlp": 64, "output_head": 1}, "five forms: 1 / 47 / 16 / 64 / 1"
-    shapes_called = Counter(site for (block, _), site in zip(model.wiring(), model.sites()) if block == "projection.fp8.in")
-    assert shapes_called == {"linear_attention.qkvz": 48, "full_attention.qkv": 16}, "two weight shapes: 48 / 16"
-
-    plan, model, _ = _target_plan(2)
-    claim = target.claim(plan, model, installed=RECORDED)
-    assert claim.coverage()[1] == (
-        "kernel identity, as planned: 17 of 20 launches of a step are target kernels (7 the target's own compiled kernels + 10 cuDNN Frontend entries "
-        "with byte-equal results); not yet: attention.prepare 1, attention.core 1; 1 declared stand-in (not yet: output_head.quantize)"
-    )
-    head = claim.identities[claim.blocks.index("output_head")]
-    assert (head.relation, head.launch, head.named) == (
-        "target",
-        None,
-        "",
-    ) and head.reason == "vocab 15520 (recorded 248320)", "another vocabulary: held by name alone"
-    kinds = {block: (identity.relation, identity.kind) for block, identity in zip(claim.blocks, claim.identities)}
-    for block in (
-        "add_norm_quantize",
-        "projection.fp8.in",
-        "linear_attention.step",
-        "mlp.gate_up",
-        "attention.gate_quantize",
-    ):  # the class their target forms ran on: 2 or more sequences gate them
-        assert plan.rows[block].batch_invariant == ("cc10.0",), f"{block}: batch invariance of its native row is a gate on compute capability 10.0"
-    assert kinds["embedding"] == kinds["linear_attention.step"] == ("target", "code") and kinds["attention.gate_quantize"] == ("target", "port")
-    assert kinds["token_choice"] == ("host", "") and kinds["attention.core"] == ("not yet", "code") and kinds["add_norm_quantize"] == ("target", "port")
-    assert kinds["mlp.gate_up"] == ("target", "port")
-    assert (
-        kinds["mlp.down"] == kinds["projection.fp8.out"] == kinds["output_head"] == ("target", "code")
-    ), "the library's own kernels, called as the target calls them"
-    for block in configs.LIBRARY_ROWS:  # the library states no batch invariance for these calls; no lane of this repository runs them
-        assert plan.rows[block].batch_invariant == () and plan.rows[block].ci is False and plan.rows[block].band == "bf16_rounding", block
-    table = census.table(plan, claim).splitlines()
-    assert table[1].split()[-1] == "identity" and table[0].startswith("kernels, planned (decided before the load from the family's configs.py; stack native,")
-    row = {line.split()[0]: line for line in table[2:14]}
-    assert row["embedding"].endswith("  name  target") or row["embedding"].rstrip().endswith("target")
-    assert (
-        row["linear_attention.step"].split("cudnn.GdnDecodeFused")[1].split()
-        == "[PDL True, PDL_RELEASE True] gdn_decode_fused 1 name and launch shape, as the entry states them target".split()
-    )
-    gate = "[THREADS 256, PDL_RELEASE True] gate_quant 1 name and launch shape, as the entry states them target"
-    assert row["attention.gate_quantize"].split("cudnn.AttentionGateQuantDecode")[1].split() == gate.split()
-    assert row["mlp.down"].split("flashinfer.gemm.mm_fp4")[1].split() == "[BACKEND cute-dsl, TUNED False] fi_mm_fp4 2 name target".split()
-    assert row["output_head"].split("flashinfer.gemm.mm_fp4")[1].split() == "[BACKEND cute-dsl, TUNED False] pytorch, fi_mm_fp4 1 name target".split()
-    assert row["projection.fp8.out"].split("flashinfer.gemm.bmm_fp8")[1].split() == "[BACKEND auto] cublaslt_fp8_gemm, cublas 2 name target".split()
-    assert (
-        row["attention.core"].split("torch_ref.attention")[1].split()
-        == "pytorch, cublas -- by family not yet (reference chain over a plain per-layer cache)".split()
-    )
-    assert row["token_choice"].rstrip().endswith("host path, not compared                          --")
-    norm = "[PDL True, PDL_RELEASE True] + one of 6 forms, by call site add_norm_quant 5 name and launch shape, as the entry states them target"
-    assert row["add_norm_quantize"].split("cudnn.AddNormQuantDecode")[1].split() == norm.split()
-    assert table[14:20] == [f"  add_norm_quantize at {site}:{census.form_text(fields)}" for site, fields in configs.NORM_FORMS], "the form of every call site"
-    assert table[16] == "  add_norm_quantize at linear_attention: [ADD True, STORE_RESIDUAL False, BF16_OUT True, QUANT e4m3_static]"
-    multiply = f"{PROJECTION_FORM}] + one of 2 forms, by call site fp8_projection 2 name and launch shape, as the entry states them target"
-    assert row["projection.fp8.in"].split("cudnn.Fp8ProjectionDecode")[1].split() == multiply.split()
-    assert table[20:22] == [f"  projection.fp8.in at {site}:{census.form_text(fields)}" for site, fields in configs.PROJECTION_SITES], "and the weight's shape"
-    fused = f"{SWIGLU_FORM} swiglu_fp4 2 name and launch shape, as the entry states them target"
-    assert row["mlp.gate_up"].split("cudnn.SwigluFp4Decode")[1].split() == fused.split(), "the kernel stated whole, the token tile of the row count in it"
-    assert table[-3].startswith("  per step: 17 launches on 9 exact rows") and table[-2:] == [f"  {line}" for line in claim.coverage()]
-    assert "identity" not in census.table(_plan(options={"device": "cpu"})[0]).splitlines()[1], "a stack without a target has no such column"
-
-    # fe-entries: the cuDNN Frontend rows of native, so the same identities there; the three blocks a library serves are not yet
-    other, model, _ = _target_plan(2, "fe-entries")
-    there = target.claim(other, model, installed=RECORDED)
-    assert there.coverage()[1].startswith(
-        "kernel identity, as planned: 12 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 10 cuDNN Frontend entries "
-        "with byte-equal results); not yet: projection.fp8.out 2, mlp.down 2, "
-    )
-    for block, mine, theirs in zip(claim.blocks, claim.identities, there.identities):
-        assert (theirs == mine) != (block in configs.LIBRARY_ROWS), block
-        assert block not in configs.LIBRARY_ROWS or (theirs.relation, theirs.kernel, theirs.kind) == ("not yet", mine.kernel, "code"), block
-    assert census.table(other, there).splitlines()[-3].startswith("  per step: 12 launches on 6 exact rows")
-    # a row selected with --provider: the fused step in its fe-cublas form is the same kernel in another form
-    selected, model, _ = _target_plan(2, overrides={"linear_attention.step": "fe.gdn_decode_fused"})
-    assert selected.overridden == ("linear_attention.step",) and selected.rows["linear_attention.step"].form == (("PDL", False), ("PDL_RELEASE", False))
-    differs = target.claim(selected, model, installed=RECORDED)
-    step = differs.identities[3]
-    assert step.text() == "not the target (the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True])" and step.launch is None
-    assert differs.numbers()["not_the_target"] == {"linear_attention.step": 1} and "; not the target: linear_attention.step 1; " in differs.coverage()[1]
-    assert 3 not in differs.recorded and len(differs.recorded) == 13, "no recorded launch shape is held against a call that is not the target's"
-    # compute capability 12.x: the gate and the norm entry do not serve there, the blocks stay on their reference chains, and the census has no section
-    plan12, model, _ = _target_plan(2, cc=(12, 0), sms=170)
-    assert plan12.rows["attention.gate_quantize"].key == "torch_ref.gate_quantize" and plan12.rows["linear_attention.step"].form == (
-        ("PDL", True),
-        ("PDL_RELEASE", True),
-    )
-    assert plan12.rows["add_norm_quantize"].key == "torch_ref.add_norm_quantize" and plan12.rows["add_norm_quantize"].site_form("mlp") == ()
-    assert plan12.rows["projection.fp8.in"].key == "cublas.bf16_dequantized" and plan12.rows["projection.fp8.in"].site_form("full_attention.qkv") == ()
-    assert plan12.rows["mlp.gate_up"].key == "cublas.bf16_dequantized+torch_ref.silu_mul_quantize" and plan12.rows["mlp.gate_up"].form == ()
-    claim12 = target.claim(plan12, model, installed=RECORDED)
-    assert not claim12.known and claim12.coverage() == [
-        "kernel identity: not stated for this run (no recorded section for cc 12.0 / 170 SMs: recorded is cc 10.0 / 148 SMs)"
-    ]
-    assert "identity" not in census.table(plan12, claim12).splitlines()[1] and census.table(plan12, claim12).splitlines()[-1] == "  " + claim12.coverage()[0]
-    # ... and with a section for that class the gate would read "not yet": a kernel of one class is never taken for another
-    import copy
-
-    data = copy.deepcopy(target.data)
-    data["configurations"]["plain"]["cc12.0/sm170"] = copy.deepcopy(data["configurations"]["plain"]["cc10.0/sm148"])
-    there = census.Target(data).claim(plan12, model, installed=RECORDED)
-    gate = there.identities[there.blocks.index("attention.gate_quantize")]
-    assert there.known and gate.text() == "not yet (reference chain)" and (there.numbers()["target_code"], there.numbers()["target_port"]) == (2, 0)
-    assert there.numbers()["not_yet"]["add_norm_quantize"] == 5 and there.numbers()["not_yet"]["projection.fp8.in"] == 2
-    assert there.numbers()["not_yet"]["mlp.gate_up"] == 2
-
-
-def test_every_reason_a_class_is_not_claimed():
-    """The census line says ``NOT CLAIMED`` with every reason that applies, in a fixed order: a row selected with
-    ``--provider``, fallback rows, a launch shape recorded with a width this model does not have, a kernel of the target the
-    plan has no block for, no recorded section for the GPU class and SM count (both are named) or for the row count,
-    versions other than the recorded ones."""
-    from model_samples import census
-
-    plan, model, target = _target_plan()
-    claim = target.claim(plan, model, installed=RECORDED)
-    fallback, absent = "fallback rows present", "the plan has no block for output_head.quantize"
-    several = f"{fallback}; {OTHER_VOCAB}; {absent}"
-    assert claim.reasons == [fallback, OTHER_VOCAB, absent] and claim.name == CENSUS and (claim.basis, claim.claimed, claim.rows) == ("recorded", False, 1)
-    assert claim.line(census.PASS) == f"{CENSUS}: NOT CLAIMED ({several}); {COMPARED_14}: each in the recorded one; 3 more by membership alone"
-    assert claim.compared() == (14, COMPARED_14, 3), "what item 7 compares: a count of target launches is three numbers here too"
-    assert claim.line(census.NOT_OBSERVED) == f"{CENSUS}: NOT CLAIMED ({several}); the launch shapes of its target launches were not observed"
-    assert claim.line(census.FAIL) == f"{CENSUS}: NOT CLAIMED ({several})", "a failed check says nothing about the recorded shapes"
-    entries = target.claim(_target_plan(stack="fe-entries")[0], model, installed=RECORDED)  # the cuDNN Frontend rows alone: nothing is held by membership
-    assert entries.reasons == [fallback, absent] and entries.compared() == (12, COMPARED_12, 0)
-    assert entries.line(census.PASS) == f"{CENSUS}: NOT CLAIMED ({fallback}; {absent}); {COMPARED_12}: each in the recorded one"
-    selected, model, _ = _target_plan(overrides={"linear_attention.step": "fe.gdn_decode_fused", "mlp.down": "torch_ref.linear"})
-    assert target.claim(selected, model, installed=RECORDED).reasons == [
-        "not the target set: linear_attention.step selected by --provider",
-        "not the target set: mlp.down selected by --provider",
-        fallback,
-        OTHER_VOCAB,
-        absent,
-    ]
-    other_sms, model, _ = _target_plan(sms=152)
-    claim = target.claim(other_sms, model, installed=RECORDED)
-    assert claim.reasons == [fallback, "no recorded section for cc 10.0 / 152 SMs: recorded is cc 10.0 / 148 SMs"], "both SM counts are named"
-    assert (
-        claim.name == "target census plain"
-        and not claim.known
-        and claim.recorded == {}
-        and claim.line(census.PASS)
-        == (f"target census plain: NOT CLAIMED ({fallback}; no recorded section for cc 10.0 / 152 SMs: recorded is cc 10.0 / 148 SMs)")
-    )
-    four, model, _ = _target_plan(sequences=4)
-    claim = target.claim(four, model, installed=RECORDED)
-    assert claim.reasons == [fallback, "no recorded section for 4 rows on cc 10.0 / 148 SMs: recorded is 1 row"] and claim.name == CENSUS and not claim.known
-    assert claim.coverage() == ["kernel identity: not stated for this run (no recorded section for 4 rows on cc 10.0 / 148 SMs: recorded is 1 row)"]
-    older = {"torch": "2.13.0+cu130", "nvidia-cutlass-dsl": "4.8.1", "triton": "3.7.1"}
-    versions = "versions other than the recorded ones: PyTorch 2.13.0 (recorded with 2.14.0), CuTe DSL 4.8.1 (recorded with 4.8.0)"
-    assert target.claim(plan, model, installed=older).reasons == [fallback, OTHER_VOCAB, absent, versions], "only the packages a provider of this area imports"
-    assert target.claim(plan, model, installed={"torch": None, "nvidia-cutlass-dsl": "4.8.0"}).reasons == [
-        fallback,
-        OTHER_VOCAB,
-        absent,
-    ], "not installed: not compared"
-    found = census.installed_versions(("torch", "no-such-distribution-of-this-test"))
-    assert found["no-such-distribution-of-this-test"] is None and found["torch"].split("+")[0] == torch.__version__.split("+")[0]
-    assert set(target.data["validated"]["recorded"]) >= set(census.PACKAGES), "the census records a version of every package that is compared"
-    dumped = target.claim(plan, model, installed=RECORDED).dump()
-    assert dumped["claimed"] is False and dumped["not_claimed"] == [fallback, OTHER_VOCAB, absent] and dumped["numbers"]["launches"] == 20
-    assert (dumped["census"], dumped["configuration"], dumped["device"], dumped["basis"], dumped["recorded"]) == (
-        "kernel_census.json",
-        "plain",
-        "cc 10.0 / 148 SMs",
-        "recorded",
-        "2026-11-12",
-    )
-
-
-def _small_census(claimed=True, basis="recorded", form=None):
-    """A census of a step with three block calls -- a gather, one fused step, the host path -- as a constructed file."""
-    step = {"origin": "cuDNN Frontend", "relation": "target", "kind": "code", "form": {"PDL": True, "PDL_RELEASE": True} if form is None else form}
-    return {
-        "schema": 2,
-        "validated": {"recorded": {"torch": "2.14.0", "nvidia-cutlass-dsl": "4.8.0"}},
-        "kernels": {"embedding_gather": {"origin": "PyTorch", "relation": "target", "kind": "code"}, "gdn_decode_fused": step},
-        "layers": {"linear_attention": "layer"},
-        "configurations": {
-            "plain": {
-                "cc10.0/sm148": {
-                    "claimed": claimed,
-                    "basis": basis,
-                    "recorded": {"date": "2026-11-12"},
-                    "geometry": {"hidden": 5120},
-                    "rows": {
-                        "1": {
-                            "prologue": [["embedding", "embedding_gather", {"launch": [[40, 1, 1], [128, 1, 1], 0]}]],
-                            "layer": [["linear_attention.step", "gdn_decode_fused", {"launch": [[96, 1, 1], [256, 1, 1], 42112]}]],
-                            "epilogue": [],
-                            "after_step": [],
-                        }
-                    },
-                }
-            }
-        },
-    }
-
-
-def _small_plan(step_row=None, overridden=()):
-    """The plan and the model of :func:`_small_census`: stand-in objects with what a claim reads of them."""
-    from types import SimpleNamespace
-
-    from model_samples.blocks import DeviceFacts, Plan, ProviderRow
-    from model_samples.census import Kernel
-
-    any_row = (("any",), (1, None), (1, None))
-    rows = {
-        "embedding": ProviderRow(*any_row, "torch.index_select", "native", serves="any"),
-        "linear_attention.step": step_row or ProviderRow(*any_row, "fe.gdn_decode_fused", "native", serves="any", form=(("PDL", True), ("PDL_RELEASE", True))),
-        "token_choice": ProviderRow(*any_row, "torch.argmax", "native", serves="any"),
-    }
-    step = (
-        (Kernel("pytorch", "PyTorch"),)
-        if rows["linear_attention.step"].fallback
-        else (Kernel("gdn_decode_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)
-    )
-    blocks = {
-        "embedding": SimpleNamespace(kernels=(Kernel("embedding_gather", "PyTorch", "exact", launches=1),)),
-        "linear_attention.step": SimpleNamespace(kernels=step),
-        "token_choice": SimpleNamespace(kernels=(Kernel("pytorch", "PyTorch", "host"),)),
-    }
-    plan = Plan(blocks, rows, {}, DeviceFacts((10, 0), "stated device", 148, 0, 0), 1, 1, "native", None, "a test", overridden)
-    model = SimpleNamespace(
-        geometry=SimpleNamespace(layer_kinds=("linear_attention",), hidden=5120, vocab=272),
-        wiring=lambda: (("embedding", -1), ("linear_attention.step", 0), ("token_choice", -1)),
-    )
-    return plan, model
-
-
-def test_a_complete_census_is_equal_and_a_claimed_section_needs_a_recorded_basis_and_no_fallback_row():
-    """``EQUAL`` is printed only for a section that says ``claimed``, on a plan whose every block call is on its target kernel,
-    with the recorded versions -- and then only when the kernel check held.  The implication the other way is held too: a
-    file that says ``claimed`` on a basis that is not ``recorded`` is refused when it is read, and one that says
-    ``claimed`` for a class on which a row of the stack is still a fallback is caught here and never printed as ``EQUAL``."""
-    import copy
-    from dataclasses import replace
-
-    from model_samples import census
-    from model_samples.qwen_dense import QwenDense
-
-    plan, model = _small_plan()
-    complete = census.Target(_small_census()).claim(plan, model, installed=RECORDED)
-    assert complete.reasons == [] and complete.claimed and complete.line(census.PASS) == f"{CENSUS}: EQUAL ({COMPARED_2}, 0 by membership alone)"
-    assert (
-        complete.line(census.FAIL) == f"{CENSUS}: NOT EQUAL (the kernel check did not hold)" and complete.line(census.NOT_OBSERVED) == f"{CENSUS}: NOT OBSERVED"
-    )
-    assert complete.coverage() == [
-        "kernel identity, as planned: 2 launches per step = 2 the target's own compiled kernels + 0 cuDNN Frontend entries with byte-equal results "
-        "+ 0 declared stand-ins"
-    ], "three numbers, also where two of them are zero"
-    assert complete.dump()["claimed"] is True and complete.recorded == {0: GATHER_SHAPE, 1: SHAPE}
-    unclaimed = census.Target(_small_census(claimed=False)).claim(plan, model, installed=RECORDED)
-    assert unclaimed.reasons == ["the census does not claim this class yet"] and unclaimed.line(census.PASS).startswith(
-        f"{CENSUS}: NOT CLAIMED (the census does"
-    )
-    planned = census.Target(_small_census(claimed=False, basis="planned")).claim(plan, model, installed=RECORDED)
-    assert planned.name == "target census plain / cc 10.0 / 148 SMs (planned)" and planned.reasons == ["the census does not claim this class yet"]
-    assert census.Target(_small_census()).claim(plan, model, installed={"torch": "2.15.0"}).line(census.PASS) == (
-        f"{CENSUS}: NOT CLAIMED (versions other than the recorded ones: PyTorch 2.15.0 (recorded with 2.14.0)); {COMPARED_2}: each in the recorded one"
-    )
-    # another form than the census's, without --provider: the table is not the target, and the line says which block
-    row = plan.rows["linear_attention.step"]
-    other_form, _ = _small_plan(replace(row, form=(("PDL", True),)))
-    differs = census.Target(_small_census()).claim(other_form, model, installed=RECORDED)
-    reason = "not the target set: linear_attention.step (the row's form is [PDL True], the target's [PDL True, PDL_RELEASE True])"
-    assert differs.reasons == [reason] and differs.recorded == {0: GATHER_SHAPE}
-    with_provider, _ = _small_plan(replace(row, form=(("PDL", True),)), overridden=("linear_attention.step",))
-    assert census.Target(_small_census()).claim(with_provider, model, installed=RECORDED).reasons == [
-        "not the target set: linear_attention.step selected by --provider"
-    ]
-    other_kernel = census.Target(_small_census())
-    other_kernel.data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["layer"][0][1] = "embedding_gather"
-    assert other_kernel.claim(plan, model, installed=RECORDED).reasons == [
-        "not the target set: linear_attention.step (the row launches gdn_decode_fused, the target embedding_gather)"
-    ]
-
-    # claimed implies a recorded basis: refused when the file is read
-    with pytest.raises(ValueError, match=r"^kernel_census.json: plain / cc10.0/sm148: claimed on the basis planned; only a recorded section can be claimed$"):
-        census.Target(_small_census(basis="planned"))
-    # claimed implies no fallback row: a plan with a fallback row on a section that says claimed is caught, and is never EQUAL
-    fallback_row, _ = _small_plan(replace(row, key="torch_ref.gdn_decode_step", form=(), fallback="reference chain"))
-    caught = census.Target(_small_census()).claim(fallback_row, model, installed=RECORDED)
-    assert (
-        caught.claimed and caught.reasons == ["fallback rows present"] and caught.line(census.PASS).startswith(f"{CENSUS}: NOT CLAIMED (fallback rows present)")
-    )
-    assert caught.identities[1].text() == "not yet (reference chain)" and caught.dump()["claimed"] is False
-
-    def claimed_wrongly(target, stack):
-        """The sections of ``target`` that say claimed although the stack's plan on their class cannot be: the rule of the file."""
-        wrong = []
-        for configuration, sections in target.data["configurations"].items():
-            for key, section in sections.items():
-                cc, sms = key[2:].split("/sm")
-                for rows in section["rows"]:
-                    facts = (tuple(int(n) for n in cc.split(".")), int(sms))
-                    plan, model, _ = _target_plan(64, stack, facts[0], facts[1], int(rows))
-                    reasons = [r for r in target.claim(plan, model, configuration, installed=RECORDED).reasons if not r.startswith("the census does not claim")]
-                    if section["claimed"] and (section["basis"] != "recorded" or reasons):
-                        wrong.append((configuration, key, rows, reasons))
-        return wrong
-
-    real = QwenDense.target()
-    for stack in QwenDense.target_stacks:
-        assert (
-            claimed_wrongly(real, stack) == []
-        ), "a section of the checked-in census says claimed while a row of the stack is a fallback, or on a planned basis"
-    tampered = census.Target(copy.deepcopy(real.data))
-    tampered.data["configurations"]["plain"]["cc10.0/sm148"]["claimed"] = True
-    assert claimed_wrongly(tampered, "native") == [
-        ("plain", "cc10.0/sm148", "1", ["fallback rows present", "the plan has no block for output_head.quantize"])
-    ], "the rule sees a census that claims too early"
-
-    # a file that is not such a census is refused by its own name
-    for change, sentence in (
-        (lambda d: d.update(schema=1), "not a kernel census of schema 2"),
-        (lambda d: d.pop("layers"), "a kernel census holds kernels, layers and configurations"),
-        (lambda d: d["kernels"]["gdn_decode_fused"].update(kind="copy"), "kernel gdn_decode_fused: a kernel is a target of kind code or port, or a stand-in"),
-        (lambda d: d["configurations"]["plain"].update({"cc10/148": {}}), "plain / cc10/148: a section is keyed by ccMAJOR.MINOR/smCOUNT"),
-        (lambda d: d["configurations"]["plain"]["cc10.0/sm148"].pop("basis"), "plain / cc10.0/sm148: a section holds claimed (true or false), basis"),
-        (lambda d: d["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"].pop("epilogue"), "plain / cc10.0/sm148, 1 rows: no entry list epilogue"),
-        (
-            lambda d: d["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["layer"].append(["mlp.down", "no_such_kernel", {}]),
-            "is not [block, kernel of the",
-        ),
-    ):
-        data = _small_census()
-        change(data)
-        with pytest.raises(ValueError) as refused:
-            census.Target(data)
-        assert str(refused.value).startswith("kernel_census.json: ") and sentence in str(refused.value), sentence
-    # a census that does not follow the model's wiring
-    swapped = _small_census()
-    parts = swapped["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]
-    parts["prologue"], parts["layer"] = parts["layer"], parts["prologue"]
-    with pytest.raises(
-        ValueError, match="the census does not follow this model's wiring: call 1 of a step is embedding, the census has linear_attention.step there"
-    ):
-        census.Target(swapped).claim(plan, model, installed=RECORDED)
-    longer = _small_census()
-    longer["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["after_step"].append(
-        ["embedding", "embedding_gather", {"launch": [[40, 1, 1], [128, 1, 1], 0]}]
-    )
-    with pytest.raises(ValueError, match="the census does not follow this model's wiring: it has embedding after the last call of a step"):
-        census.Target(longer).claim(plan, model, installed=RECORDED)
-    with pytest.raises(ValueError, match="the census has no entry list for the layer kind 'full_attention'"):
-        census.Target(_small_census()).claim(*_target_plan()[:2], installed=RECORDED)
-
-
-def test_reading_a_census_file(tmp_path):
-    from model_samples import census
-
-    path = tmp_path / "some_census.json"
-    path.write_text(json.dumps(_small_census()))
-    assert census.Target.load(str(path)).name == "some_census.json"
-    path.write_text("{not json")
-    with pytest.raises(ValueError, match=r"^some_census.json: not JSON \(") as refused:
-        census.Target.load(str(path))
-    assert str(tmp_path) not in str(refused.value)
-    with pytest.raises(ValueError, match=r"^gone.json: No such file or directory$"):
-        census.Target.load(str(tmp_path / "gone.json"))
-
-
-def test_a_target_launch_in_another_shape_than_the_recorded_one_fails():
-    """Item 7.  Every launch of a block call whose identity is ``target`` has the launch shape the census recorded for it --
-    also where the entry itself states and launches another shape (item 5 then holds, and only the census sees it), and for
-    a kernel whose shape no entry states (the gather)."""
-    from dataclasses import replace
-
-    from model_samples import census
-    from model_samples.census import HOST, NOT_YET, TARGET, Claim, Facts, Identity
-
-    sites = _sites()
-    identities = [
-        Identity(TARGET, "embedding_gather", "code", "", GATHER_SHAPE),
-        Identity(NOT_YET, "add_norm_quant", "port", "reference chain"),
-        Identity(TARGET, "gdn_decode_fused", "code", "", SHAPE),
-        Identity(NOT_YET, "cublaslt_fp8_gemm", "code", "bf16 copy of 8-bit weights"),
-        Identity(HOST),
-    ]
-    blocks = [site.block for site in sites]
-    claim = Claim("kernel_census.json", "plain", "cc 10.0 / 148 SMs", 1, "2026-11-12", "recorded", False, blocks, identities, reasons=["fallback rows present"])
-    assert claim.recorded == {0: GATHER_SHAPE, 2: SHAPE}
-    clean = census.Traced.of(sites, _log(sites), _step(), 1, "", rows=1, claim=claim)
-    assert clean.judge() == (census.PASS, [])
-    assert clean.details()[0] == (
-        "embedding: torch.index_select, 1 launch per step (1 call x 1 per call); embedding_gather by name, and in the launch shape the census records: "
-        "grid (40, 1, 1), block (128, 1, 1), shared memory 0 B"
-    )
-    assert clean.details()[-3:] == [
-        WHOLE + "4 launches per step = 3 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results + 0 declared stand-ins",
-        (
-            "kernel identity, as planned: 2 of 4 launches of a step are target kernels (2 the target's own compiled kernels + 0 cuDNN Frontend entries "
-            "with byte-equal results); not yet: add_norm_quantize 1, projection.fp8.out 1; 0 declared stand-ins"
-        ),
-        f"{CENSUS}: NOT CLAIMED (fallback rows present); {COMPARED_2}: each in the recorded one",
-    ]
-    assert clean.dump()["target"]["not_claimed"] == ["fallback rows present"] and [site["identity"] for site in clean.dump()["sites"]] == [
-        "target",
-        "not yet (reference chain)",
-        "target",
-        "not yet (bf16 copy of 8-bit weights)",
-        "host path, not compared",
-    ]
-    # the fused step states and launches a grid of 48: item 5 holds, the census has 96
-    other = ((48, 1, 1), (256, 1, 1), 42112)
-    moved = [sites[0], sites[1], replace(sites[2], facts=Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, other)), *sites[3:]]
-    assert census.compare([_step(fused=(SYMBOL, other))], moved).ok, "without a census nothing is wrong with it"
-    traced = census.Traced.of(moved, _log(moved), _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim)
-    status, lines = traced.judge()
-    assert status == census.FAIL and lines == [
-        "step 0: linear_attention.step (layer 0) launched gdn_decode_fused with grid (48, 1, 1), block (256, 1, 1), shared memory 42,112 B; "
-        f"the {CENSUS} has grid (96, 1, 1), block (256, 1, 1), shared memory 42,112 B"
-    ]
-    assert traced.details()[-1] == f"{CENSUS}: NOT CLAIMED (fallback rows present)"
-    # ... and so for each of the three parts of a launch shape: another block, another shared memory, the grid as recorded
-    for other, text in (
-        (((96, 1, 1), (128, 1, 1), 42112), "grid (96, 1, 1), block (128, 1, 1), shared memory 42,112 B"),
-        (((96, 1, 1), (256, 1, 1), 42128), "grid (96, 1, 1), block (256, 1, 1), shared memory 42,128 B"),
-    ):
-        moved = [sites[0], sites[1], replace(sites[2], facts=Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, other)), *sites[3:]]
-        status, lines = census.Traced.of(moved, _log(moved), _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim).judge()
-        assert status == census.FAIL and lines == [
-            f"step 0: linear_attention.step (layer 0) launched gdn_decode_fused with {text}; "
-            f"the {CENSUS} has grid (96, 1, 1), block (256, 1, 1), shared memory 42,112 B"
-        ], text
-    other = ((48, 1, 1), (256, 1, 1), 42112)
-    moved = [sites[0], sites[1], replace(sites[2], facts=Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, other)), *sites[3:]]
-    # the gather in another shape than the recorded one: no entry states a shape for it, the census does
-    step = _step()
-    step[0] = step[0]._replace(grid=(80, 1, 1))
-    assert census.compare([step], sites).ok
-    status, lines = census.Traced.of(sites, _log(sites), step, 1, "", rows=1, claim=claim).judge()
-    assert status == census.FAIL and lines == [
-        f"step 0: embedding launched embedding_gather with grid (80, 1, 1), block (128, 1, 1), shared memory 0 B; the {CENSUS} has grid (40, 1, 1), "
-        "block (128, 1, 1), shared memory 0 B"
-    ]
-    # records without launch arguments: the recorded shapes were not observed
-    bare = [record._replace(grid=None, block=None, shared_memory=None) for record in _step()]
-    unstated = [replace(site, facts=None) if site.facts else site for site in sites]
-    unseen = census.Traced.of(unstated, _log(unstated), bare, 1, "", rows=1, claim=claim)
-    assert unseen.judge() == (census.NOT_OBSERVED, []) and unseen.details()[-1].endswith("; the launch shapes of its target launches were not observed")
-    # a call that is not the target's (another form, a fallback row) is held to no recorded shape -- whatever its identity carries
-    reason = "the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True]"
-    claim.identities[2] = Identity(census.OTHER, "gdn_decode_fused", "code", reason, SHAPE)
-    assert claim.recorded == {0: GATHER_SHAPE}, "only a call whose identity is target (or stand-in) is held to the census"
-    assert census.Traced.of(moved, _log(moved), _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim).judge() == (census.PASS, [])
+    options = {"device": "cpu", "max_model_len": max_model_len}
+    return plan(model.provider_table, model.regimes, facts, sequences, 1, stack, overrides, model=model, options=options), model
 
 
 def test_the_gate_entrys_adapter_over_a_stand_in_entry(monkeypatch):
@@ -3491,36 +3280,78 @@ def test_the_gates_bracket_holds_both_bf16_values_around_the_quotient():
 
 def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tmp_path):
     """The sample's ``main()`` with ``--stack native``, on stand-in providers, to its last line.  The kernel check runs without
-    a flag; the planned table has the identity column and the three numbers; the gate entry is judged against its twin
-    inside its band; the census line reads ``NOT CLAIMED (fallback rows present; ...)`` and, where the launches hold, says
-    that the target launches have the recorded shape.  A target launch in another shape than the recorded one fails the run;
-    a wrong byte of the gate fails its block; ``--provider`` is said; without a profiler the run is ``RAN native stack``."""
+    a flag; the planned table ends in its count of a step; the gate entry is judged against its twin inside its band,
+    and the attention core, the library's, in the band of its row; both first uses of the library are announced once;
+    every row a library serves names the kernel the library launched on its own line of the check.  A wrong byte of
+    the gate fails its block, and so does a wrong element of the attention core; kernel binaries that are not on the
+    machine are a ``SKIP`` before anything is loaded; a row selected with ``--provider`` is printed in its own form;
+    without a profiler the run is ``RAN native stack``."""
+    from model_samples import census, tie_out
+
     target = tmp_path / "census.json"
     code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1", "--dump-census", str(target)])
     assert code == 0 and lines[-1] == "[00] PASS", lines[-4:]
+    # the sample's own stack on a device no sequence is recorded on: one line says so, and the run is launched from Python
+    told = [line for line in lines if line.startswith(("[00] launched from Python: ", "[00] step recorded: "))]
+    assert told == ["[00] launched from Python: a launch sequence is recorded on a CUDA device"], told
+    code, flagged = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1", "--no-capture"])
+    assert (
+        code == 0
+        and flagged[-1] == "[00] PASS"
+        and [line for line in flagged if line.startswith("[00] launched from Python: ")] == ["[00] launched from Python: --no-capture"]
+    )
     planned = lines.index(next(line for line in lines if line.startswith("kernels, planned (decided before the load")))
-    assert lines[planned + 1].split()[-1] == "identity" and "stack native" in lines[planned]
-    assert lines[planned + 14] == "  add_norm_quantize at linear_attention.first: [ADD False, STORE_RESIDUAL True, BF16_OUT True, QUANT e4m3_static]"
-    assert lines[planned + 20 : planned + 22] == [
+    assert lines[planned + 1].split()[-1] == "checked" and "stack native" in lines[planned]
+    assert lines[planned + 15] == "  add_norm_quantize at linear_attention.first: [ADD False, STORE_RESIDUAL True, BF16_OUT True, QUANT e4m3_static]"
+    assert lines[planned + 21 : planned + 23] == [
         "  projection.fp8.in at linear_attention.qkvz: [OUT_FEATURES 16384, IN_FEATURES 5120]",
         "  projection.fp8.in at full_attention.qkv: [OUT_FEATURES 14336, IN_FEATURES 5120]",
     ], "the weight's shape at each call site of the in-projection"
-    assert lines[planned + 23].strip().startswith(WHOLE + "20 launches per step = 9 ")
-    reached = (
-        "kernel identity, as planned: 17 of 20 launches of a step are target kernels (7 the target's own compiled kernels + 10 cuDNN Frontend entries with "
-    )
-    assert lines[planned + 24].strip().startswith(reached + "byte-equal results); not yet: attention.prepare 1, attention.core 1; ")
+    count = "  per step: 20 launches on 12 exact rows, checked one by one in the wiring order; the launches of 0 fallback calls and of the host path "
+    assert lines[planned + 23] == count + "are attributed by family" and lines[planned + 24].startswith("[00] stage "), "the table ends in its count of a step"
     (kernels,) = _kernel_lines(lines)
-    assert kernels.endswith("    PASS") and "17 on exact rows, in the wiring order" in kernels
-    # the head's launch shape was recorded with the published vocabulary: on another one it is held by its name alone, and the line says so
-    tiny_vocab = "no recorded launch shape of output_head for this model: vocab 272 (recorded 248320)"
-    not_claimed = f"    {CENSUS}: NOT CLAIMED (fallback rows present; {tiny_vocab}; the plan has no block for output_head.quantize)"
-    assert not_claimed + f"; {COMPARED_14}: each in the recorded one; 3 more by membership alone" in lines
+    assert kernels.endswith("    PASS") and "20 on exact rows, in the wiring order" in kernels
+    # the head's quantise on its entry: judged against the quantisation at the kernel's rounding points, every call inside the band
+    quantised = next(line for line in lines if line.strip().startswith("output_head.quantize ") and "calls" in line)
+    assert quantised.endswith("; 0 outside  [band: row_quantize_fp4]  PASS") and " of them not the twin's byte; " in quantised, quantised
+    assert lines.count(f"    band row_quantize_fp4: {tie_out.BANDS['row_quantize_fp4']}") == 1
+    # the attention core on the library: both first uses announced before the tables, the block in the band its row names,
+    # and the kernel the library launched on the block's own line of the check, as for every row a library serves
+    first_uses = [line for line in lines if line.startswith("[00] planning: first use of ")]
+    assert [line.split(" FlashInfer ")[0] for line in first_uses] == [
+        "[00] planning: first use of",
+        "[00] planning: first use of the paged decode attention of",
+    ]
+    assert all(lines.index(line) < planned and "FlashInfer 0.7.2.post1" in line for line in first_uses) and "FLASHINFER_NO_DOWNLOAD" in first_uses[1]
+    core = next(line for line in lines if line.strip().startswith("attention.core ") and "calls" in line)
+    assert core.endswith("the cache untouched  [band: attention_bf16_weights]  PASS") and "; 0 outside their bound; the largest distance " in core, core
+    assert lines.count(f"    band attention_bf16_weights: {tie_out.BANDS['attention_bf16_weights']}") == 1
+    traced = int(_kernel_lines(lines)[0].split("kernels")[1].split(" traced steps")[0])
+    multiply = census._named(FI_CUTLASS_FP8, 160)  # the library's own 8-bit multiply: the profiler leaves its name mangled
+    launched = {line.strip().split(": ", 1)[0]: line.split("; the library launched ", 1)[1] for line in lines if "; the library launched " in line}
+    assert launched == {
+        "projection.fp8.out at linear_attention.out": f"{multiply} x {traced} over the traced steps",
+        "mlp.down": f"{FI_SPLIT_K} x {2 * traced} over the traced steps",
+        "attention.core": f"{FI_ATTENTION} x {traced} over the traced steps",
+        "projection.fp8.out at full_attention.out": f"{multiply} x {traced} over the traced steps",
+        "output_head": f"{FI_PERSISTENT} x {traced} over the traced steps",
+    }, "every row a library serves, and no other: the kernel the library launched, by name, and how often"
+    assert (
+        multiply.endswith("... (1,360 characters, sha256 c7be255bb9ea)") and len(FI_SPLIT_K) < 160
+    ), "a long name: its start, its length and a digest of the whole"
+    assert (
+        f"    attention.core: {ATTENTION_ENTRY} [KV_LAYOUT HND], 1 launch per step (1 call x 1 per call); fi_decode_attention by name; "
+        f"the library launched {FI_ATTENTION} x {traced} over the traced steps"
+    ) in lines
+    assert "    embedding: torch.index_select, 1 launch per step (1 call x 1 per call); embedding_gather by name" in lines, "PyTorch's gather: its name"
+    assert not any("launched by the library for" in line or "chosen by the library for" in line or "no launch shape is declared" in line for line in lines)
     gate = next(line for line in lines if line.strip().startswith("attention.gate_quantize ") and "calls" in line)
     assert gate.endswith("[band: gate_fp8]  PASS") and "0 the code of neither" in gate, gate
     norm = next(line for line in lines if line.strip().startswith("add_norm_quantize ") and "calls" in line)
     assert norm.endswith("[band: add_norm_quant]  PASS") and "residual stream equal" in norm and norm.split("; ")[-1].startswith("0 outside"), norm
-    assert any(line.startswith("  blocks            8 of 8 provider blocks inside their bands") and line.endswith("PASS") for line in lines)
+    assert any(line.startswith("  blocks            11 of 11 provider blocks inside their bands") and line.endswith("PASS") for line in lines)
+    prepared = next(line for line in lines if line.strip().startswith("attention.prepare ") and "calls" in line)
+    assert prepared.endswith("[band: attention_prepare]  PASS") and "; 0 query and 0 key elements outside their band; " in prepared, prepared
     multiply = next(line for line in lines if line.strip().startswith("projection.fp8.in ") and "calls" in line)
     assert multiply.endswith("[band: bf16_rounding]  PASS"), multiply
     fused = next(line for line in lines if line.strip().startswith("mlp.gate_up ") and "calls" in line)
@@ -3545,24 +3376,22 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     assert "2 x cudnn.AddNormQuantDecode #5 [PDL True, PDL_RELEASE True, ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT nvfp4]" in served
     written = json.loads(target.read_text())
     (run,) = written["runs"]
-    assert written["stack"] == "native" and run["target"]["not_claimed"][0] == "fallback rows present" and run["target"]["numbers"]["target_port"] == 10
+    assert written["stack"] == "native" and set(run) == {"sequences", "prompt", "rows", "check", "not_observed", "sites", "names", "fields", "steps"}
+    assert all(set(site) == {"block", "layer", "site", "entry", "instance", "form", "served", "kernels", "stated"} for site in run["sites"])
     fused = [site for site in run["sites"] if site["block"] == "mlp.gate_up"]
-    assert [(site["layer"], site["instance"], site["identity"]) for site in fused] == [
-        (0, "cudnn.SwigluFp4Decode #1", "target"),
-        (1, "cudnn.SwigluFp4Decode #1", "target"),
-    ]
+    assert [(site["layer"], site["instance"]) for site in fused] == [(0, "cudnn.SwigluFp4Decode #1"), (1, "cudnn.SwigluFp4Decode #1")]
     assert all(site["served"] == site["form"] and site["form"]["TOKEN_TILE"] == 8 and site["form"]["MAX_CLUSTERS"] == 148 for site in fused)
     assert all(site["stated"]["launch"] == [[1, 1, 148], [192, 1, 1], 231424] for site in fused), "one entry instance serves every layer"
     multiplies = [site for site in run["sites"] if site["block"] == "projection.fp8.in"]
-    assert [(site["site"], site["instance"], site["identity"]) for site in multiplies] == [
-        ("linear_attention.qkvz", "cudnn.Fp8ProjectionDecode #1", "target"),
-        ("full_attention.qkv", "cudnn.Fp8ProjectionDecode #2", "target"),
+    assert [(site["site"], site["instance"]) for site in multiplies] == [
+        ("linear_attention.qkvz", "cudnn.Fp8ProjectionDecode #1"),
+        ("full_attention.qkv", "cudnn.Fp8ProjectionDecode #2"),
     ]
     assert all(site["served"] == site["form"] and site["form"]["STAGES"] == 8 and site["form"]["HOLD_TMEM"] is True for site in multiplies)
     assert [site["stated"]["launch"] for site in multiplies] == [[[128, 1, 1], [256, 1, 1], 139520], [[112, 1, 1], [256, 1, 1], 139520]]
     norms = [site for site in run["sites"] if site["block"] == "add_norm_quantize"]
     assert [site["site"] for site in norms] == ["linear_attention.first", "mlp", "full_attention", "mlp", "output_head"]
-    assert all(site["identity"] == "target" and site["served"] == site["form"] and site["instance"].startswith("cudnn.AddNormQuantDecode #") for site in norms)
+    assert all(site["served"] == site["form"] and site["instance"].startswith("cudnn.AddNormQuantDecode #") for site in norms)
     assert norms[1]["form"]["QUANT"] == "nvfp4" and norms[4]["form"] == {
         "PDL": True,
         "PDL_RELEASE": True,
@@ -3571,92 +3400,207 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
         "BF16_OUT": True,
         "QUANT": None,
     }
-    assert [site["identity"] for site in run["sites"] if site["block"] in ("embedding", "attention.gate_quantize", "mlp.down", "attention.core")] == [
-        "target",
-        "target",
-        "not yet (reference chain over a plain per-layer cache)",
-        "target",
-        "target",
-    ]
-
-    # the gate entry states and launches another grid than the census recorded: only the census sees it
-    code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], gate_shape=((6, 1, 1), (256, 1, 1), 0))
-    assert code == 1 and lines[-1] == "[00] FAIL", lines[-4:]
-    differs = (
-        "attention.gate_quantize (layer 1) launched gate_quant with grid (6, 1, 1), block (256, 1, 1), shared memory 0 B; "
-        f"the {CENSUS} has grid (3, 1, 1), block (256, 1, 1), shared memory 0 B"
-    )
-    assert [line.split(": ", 2)[2] for line in lines if line.startswith("    kernels: step 0")] == [differs], "one kind of difference, in every traced step"
-    assert not_claimed in lines, "a failed check says nothing about the recorded shapes"
+    (core_site,) = [site for site in run["sites"] if site["block"] == "attention.core"]
+    assert (core_site["instance"], core_site["served"], core_site["stated"]) == (ATTENTION_ENTRY, {"KV_LAYOUT": "HND"}, None)
+    assert core_site["served"] == core_site["form"] and [kernel["id"] for kernel in core_site["kernels"]] == ["fi_decode_attention"]
+    (prepare,) = [site for site in run["sites"] if site["block"] == "attention.prepare"]
+    assert (prepare["instance"], prepare["stated"]["launch"]) == ("cudnn.AttentionPrepareDecode #1", [[1, 28, 1], [128, 1, 1], 16])
+    assert prepare["served"] == prepare["form"] and prepare["form"]["SECTION"] == [11, 11, 10] and prepare["form"]["POSITIONS"] == "3d"
 
     # one wrong byte of the gate per call: the block check fails, the kernel check holds
     code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], gate_defect=True)
     gate = next(line for line in lines if line.strip().startswith("attention.gate_quantize ") and "calls" in line)
     assert code == 1 and lines[-1] == "[00] FAIL" and gate.endswith("[band: gate_fp8]  FAIL") and _kernel_lines(lines)[0].endswith("    PASS"), gate
 
-    # --provider: the fused step in its fe-cublas form.  The run holds; it is not the target set, and the line says so first
+    # one wrong element of the attention core per call: its block fails in its band, the kernel check holds
+    code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], attention_defect="element")
+    core = next(line for line in lines if line.strip().startswith("attention.core ") and "calls" in line)
+    assert code == 1 and lines[-1] == "[00] FAIL" and core.endswith("[band: attention_bf16_weights]  FAIL") and "; 0 outside their bound; " not in core, core
+    assert _kernel_lines(lines)[0].endswith("    PASS")
+
+    # the head's quantise.  One code two steps off its own, per call: outside its bracket, and the block fails by its own line
+    # while the kernel check holds.  And the scale handed to the entry un-inverted -- the consumer's static scale where the
+    # kernel takes its reciprocal: other block scales and other codes, the same line
+    code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], quantize_defect="code")
+    quantised = next(line for line in lines if line.strip().startswith("output_head.quantize ") and "calls" in line)
+    assert code == 1 and lines[-1] == "[00] FAIL" and quantised.endswith("[band: row_quantize_fp4]  FAIL") and "; 0 outside" not in quantised, quantised
+    assert _kernel_lines(lines)[0].endswith("    PASS")
+    from model_samples.providers import fe
+
+    with monkeypatch.context() as wrong:
+        wrong.setattr(fe.RowQuantizeFp4DecodeBlock, "_scale", lambda self, value, device: torch.tensor([float(value)], dtype=torch.float32, device=device))
+        code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"])
+    quantised = next(line for line in lines if line.strip().startswith("output_head.quantize ") and "calls" in line)
+    assert (
+        code == 1 and lines[-1] == "[00] FAIL" and quantised.endswith("[band: row_quantize_fp4]  FAIL") and " 0 of them not the twin's byte" not in quantised
+    ), quantised
+
+    # kernel binaries that are not on the machine as their manifest lists them, before anything is loaded and in the sample's
+    # own words: the library is not called, no line follows, no path is printed.  With no kernel-binary package installed
+    # the run STOPS -- the stack cannot run, one ERROR line that names the package, exit code 1.  With the package installed
+    # and a binary missing -- the one the library would launch, in whose place it would launch another kernel and print a
+    # path -- it is a SKIP: the package is there, and what it holds is the installation's
+    for defect, binaries, sentence, ended in (
+        (
+            {"manifest": False},
+            (None, False),
+            f"{ATTENTION_ENTRY} needs the kernel-binary package flashinfer-cubin 0.7.2.post1, which is not installed: ",
+            (1, "[00] ERROR the stack native cannot run: "),
+        ),
+        (
+            {"without": [FI_ATTENTION]},
+            (VALIDATED_LIBRARY, True),
+            f"{ATTENTION_ENTRY}: the installed flashinfer-cubin 0.7.2.post1 does not hold the kernel binaries the library's table names for this call's "
+            "data types, head width, paging and page on this GPU's class ",
+            (0, "[00] SKIP "),
+        ),
+    ):
+        directory = _kernel_binaries(tmp_path / f"binaries_{len(defect)}_{binaries[1]}", **defect)
+        code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], kernel_binaries=directory, library_binaries=binaries)
+        assert code == ended[0] and lines[-1].startswith(f"{ended[1]}{sentence}") and "/a/local/path" not in "\n".join(lines), lines[-1]
+        assert sum(line.startswith(("[00] ERROR", "[00] SKIP")) for line in lines) == 1, "one message"
+        assert ATTENTION_CALLS == [], "the library's attention was not called"
+        assert lines[-1].endswith("--stack fe-entries runs the cuDNN Frontend rows of this stack without the package") and not any(
+            line.startswith(("checks", "[00] stage")) for line in lines
+        ), "nothing was loaded and nothing checked"
+
+    # --provider: the fused step in its fe-cublas form.  The run holds, and both kernel tables print the row in that form
     selected = ["--stack", "native", "--sequences", "1", "--provider", "linear_attention.step=fe.gdn_decode_fused"]
     code, lines = _sample_run(monkeypatch, capsys, selected)
     assert code == 0 and lines[-1] == "[00] PASS", lines[-4:]
-    assert (
-        f"    {CENSUS}: NOT CLAIMED (not the target set: linear_attention.step selected by --provider; fallback rows present; {tiny_vocab}; the plan has no "
-        "block for output_head.quantize); 13 launches of a step compared by launch shape (3 the target's own compiled kernels + 10 cuDNN Frontend entries "
-        "with byte-equal results + 0 declared stand-ins): each in the recorded one; 3 more by membership alone"
-    ) in lines
-    assert any("not the target (the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True])" in line for line in lines)
+    printed = [line for line in lines if line.strip().startswith("linear_attention.step") and "cudnn.GdnDecodeFused [" in line]
+    assert len(printed) == 3 and all("cudnn.GdnDecodeFused [PDL False, PDL_RELEASE False]" in line for line in printed), printed
 
     # no profiler: RAN, never PASS -- and the stack's name is in the line
     reason = "the profiler failed (no tracing library)"
     code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], profiler=reason)
     assert code == 0 and lines[-1] == f"[00] RAN native stack (kernels not observed: {reason})" and "[00] PASS" not in lines
-    assert not_claimed + "; the launch shapes of its target launches were not observed" in lines
+    assert not any("; the library launched " in line for line in lines), "nothing was observed: no kernel is named as launched"
 
-    # fe-entries at two sequences: the same rows; the census holds no 2-row section, so no identity is stated
+    # fe-entries at two sequences: the cuDNN Frontend rows alone, the blocks a library serves in native on their fallback rows
     code, lines = _sample_run(monkeypatch, capsys, ["--stack", "fe-entries", "--sequences", "2"])
     assert code == 0 and lines[-1] == "[00] PASS" and _kernel_lines(lines)[0].endswith("    PASS"), lines[-4:]
-    unstated = "no recorded section for 2 rows on cc 10.0 / 148 SMs: recorded is 1 row"
-    assert f"  kernel identity: not stated for this run ({unstated})" in lines
-    assert f"    {CENSUS}: NOT CLAIMED (fallback rows present; {unstated})" in lines
+    left = [
+        line.split()[0]
+        for line in lines
+        if line.rstrip().endswith(("by family; fallback: bf16 copy of 8-bit weights", "by family; fallback: bf16 copy of 4-bit weights"))
+    ]
+    assert left == ["projection.fp8.out", "mlp.down", "output_head"] and any(
+        line.rstrip().endswith("by family; fallback: reference chain over the attention cache") for line in lines
+    )
+    assert (
+        "  per step: 14 launches on 8 exact rows, checked one by one in the wiring order; the launches of 6 fallback calls and of the host path are attributed by family"
+        in lines
+    )
     invariance = next(line for line in lines if line.startswith("  batch invariance  "))
     assert "linear_attention.step equal (gated)" in invariance and "attention.gate_quantize equal (gated)" in invariance and invariance.endswith("PASS")
     assert "add_norm_quantize equal (gated)" in invariance, "a sequence alone writes the bytes it writes among two: the norm row gates it on this class"
     assert "projection.fp8.in equal (gated)" in invariance, "and so does the row of the FP8 projection entry"
     assert "mlp.gate_up equal (gated)" in invariance, "and the row of the fused gate / up entry"
+    assert "output_head.quantize equal (gated)" in invariance, "and the row of the head's quantise"
 
-    # the default stack is untouched by all of this: no kernel line without the flag
+    # the stack fe-cublas is untouched by all of this: no kernel line without the flag
     code, lines = _sample_run(monkeypatch, capsys, ["--sequences", "1"])
-    assert code == 0 and lines[-1] == "[00] PASS" and _kernel_lines(lines) == [] and not any("target" in line for line in lines)
+    assert code == 0 and lines[-1] == "[00] PASS" and _kernel_lines(lines) == [] and not any(line.startswith("kernels, ") for line in lines)
 
 
-def test_a_census_that_is_not_one_of_this_model_is_an_error_before_the_load(monkeypatch, capsys):
-    """The census is read with the plan.  A file that does not follow the model's wiring, or is no census, ends the run in
-    one ``ERROR`` line that names the file, before anything is loaded; a stack without a target never reads it."""
-    from model_samples.qwen_dense import QwenDense
+def test_the_recorded_step_line_against_the_traced_step():
+    """``census.recorded_step``: the launch records of a replayed step against those of the same step launched from Python.
+    The sequence's own records are those that carry its graph id; they are the step's kernels and copies in its order,
+    name and launch shape each, a copy as a copy in either spelling, and behind them the copy of the chosen ids and
+    the position updates and nothing else.  What was issued from Python around the replay -- the copy of the ids the
+    step is fed, the host read -- is not compared.  One launch missing, one more, two exchanged, another grid, another
+    shared memory, a tail without its copy, a tail with a launch too many: each fails with its sentence.  Records
+    without a graph id, and no step to hold a replay against, are reported as not observed."""
+    from model_samples import census
+    from model_samples.census import Launch
 
-    def not_this_model(cls):
-        raise ValueError(
-            "kernel_census.json: the census does not follow this model's wiring: call 2 of a step is add_norm_quantize, the census has mlp.down there"
-        )
+    def kernel(name, grid=(1, 1, 1), block=(128, 1, 1), shared=0, graph=0):
+        return Launch(name, "kernel", 0.0, 0.0, grid, block, shared, 16, (graph, 1 if graph else 0))
 
-    monkeypatch.setattr(QwenDense, "target", classmethod(not_this_model))
-    code, out = _sample_main(monkeypatch, capsys, ["--stack", "native"])
-    assert code == 1 and out.splitlines()[-1].startswith("[00] ERROR kernel_census.json: the census does not follow this model's wiring: call 2"), out
-    with pytest.raises(AssertionError, match="reached a load"):
-        _sample_main(monkeypatch, capsys, [])
+    def copy(name="Memcpy DtoD (Device -> Device)", graph=0):
+        return Launch(name, "copy", 0.0, 0.0, graph=(graph, 1 if graph else 0))
+
+    read = copy("Memcpy DtoH (Device -> Pinned)")
+    add = "void at::native::vectorized_elementwise_kernel<2, at::native::CUDAFunctorOnSelf_add<long>>"
+    names = [
+        "void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::BFloat16>",
+        "cudnn_kernel_frost_gdn_decode_fused_Cfg",
+        "fmhaSm100fKernel_QkvBfloat16OBfloat16H256PagedKvCausalP64",
+    ]
+    step = [kernel(names[0]), kernel(names[1], (2, 1, 1), (256, 1, 1), 4096), copy("Memset (Device)"), kernel(names[2], (1, 1, 148)), read]
+
+    def replayed(blocks=None, tail=None):
+        blocks = [record._replace(graph=(7, 1)) for record in step[:-1]] if blocks is None else blocks
+        tail = [kernel("memcpy32_post", graph=7), *(kernel(add, graph=7) for _ in range(3))] if tail is None else tail  # the copy node as a kernel record
+        return [copy(), *blocks, *tail, read]  # in front: the copy of the ids the step is fed, issued from Python
+
+    status, line = census.recorded_step([step, step], [replayed(), replayed()])
+    assert (status, line) == (
+        "PASS",
+        "the recorded step: 2 replayed steps launch the 4 kernels and copies of the same steps launched from Python, in their order and launch shapes, "
+        "and behind them 1 copy of the chosen ids and 3 position updates",
+    )
+    blocks = [record._replace(graph=(7, 1)) for record in step[:-1]]
+    for wrong, sentence in (
+        (
+            replayed(blocks[:1] + blocks[2:]),
+            "replayed step 0 launches a copy at launch 1, where the step launched from Python launches 'cudnn_kernel_frost_gdn_decode_fused_Cfg'",
+        ),
+        (
+            replayed([blocks[0], blocks[0], *blocks[1:]]),
+            "at launch 1, where the step launched from Python launches 'cudnn_kernel_frost_gdn_decode_fused_Cfg' (grid (2, 1, 1)",
+        ),
+        (
+            replayed([blocks[1], blocks[0], *blocks[2:]]),
+            "replayed step 0 launches 'cudnn_kernel_frost_gdn_decode_fused_Cfg' (grid (2, 1, 1), block (256, 1, 1), shared memory 4,096 B) at launch 0",
+        ),
+        (
+            replayed([blocks[0], blocks[1]._replace(grid=(3, 1, 1)), *blocks[2:]]),
+            "(grid (3, 1, 1), block (256, 1, 1), shared memory 4,096 B) at launch 1, where the step launched from Python launches",
+        ),
+        (replayed([blocks[0], blocks[1]._replace(shared_memory=8192), *blocks[2:]]), "shared memory 8,192 B) at launch 1"),
+        (replayed(tail=[kernel(add, graph=7)] * 3), "behind the 4 launches of the step launched from Python replayed step 0 holds"),
+        (
+            replayed(tail=[kernel("memcpy32_post", graph=7), *[kernel(add, graph=7)] * 4]),
+            "where the recorded step has 1 copy of the chosen ids and 3 position updates",
+        ),
+        (replayed(blocks[:3], tail=[]), "replayed step 0 holds 3 launches where the step launched from Python has 4: it ends in front of"),
+    ):
+        status, line = census.recorded_step([step, step], [wrong, replayed()])
+        assert status == "FAIL" and sentence in line and line.startswith("the recorded step: 2 replayed steps: ") and "replayed step 0 " in line, line
+    status, line = census.recorded_step([step, step], [replayed(), replayed(blocks[:1] + blocks[2:])])
+    assert status == "FAIL" and "replayed step 1 launches a copy at launch 1" in line, "the second replayed step is held as the first"
+    without = [record._replace(graph=(0, 0)) for record in replayed()]
+    assert census.recorded_step([step], [without]) == (
+        "NOT OBSERVED",
+        "the recorded step: 1 replayed step: not observed: the profiler's records of a replayed step carry no graph id",
+    )
+    assert census.recorded_step([step], [replayed(), replayed()])[0] == "NOT OBSERVED" and census.recorded_step([], [])[0] == "NOT OBSERVED"
+    # through a traced pass: the replayed steps are kept apart, the line stands under the kernel check and fails it
+    sites = _sites()
+    traced = census.Traced.of(sites, [[], []], [*step, *step, *replayed(), *replayed()], 2, "", 1, tail=2)
+    assert len(traced.steps) == 2 and len(traced.replayed) == 2 and traced.recorded_step()[0] == "PASS"
+    assert census.Traced.of(sites, [[], []], [*step, *step], 2, "", 1).recorded_step() == ("", ""), "a pass that replayed nothing has no such line"
+    short = census.Traced.of(sites, [[], []], [*step, *step, *replayed()], 2, "", 1, tail=2)
+    assert short.steps is None and short.undeclared == "the records show 3 host reads for 4 traced steps"
+    assert short.recorded_step() == ("NOT OBSERVED", "the recorded step: not observed: the launch records cannot be cut into the traced steps")
 
 
-def test_the_target_stacks_always_check_their_kernels(monkeypatch, capsys):
+def test_native_and_fe_entries_always_check_their_kernels(monkeypatch, capsys):
     from model_samples import Session, TextIO, loop
 
     sample = _sample_script(monkeypatch)
-    assert sample.STACKS == loop.STACKS == ("fe-cublas", "native", "fe-entries", "reference")
+    assert sample.STACKS == ("native", "fe-entries", "fe-cublas", "reference") and set(sample.STACKS) == set(loop.STACKS)
     assert sample._arguments(["--stack", "native"]).stack == "native" and sample._arguments(["--stack", "fe-entries"]).stack == "fe-entries"
     with pytest.raises(SystemExit):
         sample._arguments(["--help"])
     shown = " ".join(capsys.readouterr().out.split())
     for part in (
-        "native: the target kernel set of the decode step",
-        "fe-entries: the cuDNN Frontend rows of native",
+        "native (default): the sample's stack, every block on a kernel that works on the stored weights (entries of cuDNN Frontend and four calls of FlashInfer)",
+        "its step recorded once and replayed",
+        "a package the stack calls that is not installed stops the run",
+        "The other stacks are for functional validation, launched from Python: fe-entries, the cuDNN Frontend rows of native",
         "always on in the stacks native and fe-entries",
     ):
         assert part in shown, part
@@ -3665,25 +3609,22 @@ def test_the_target_stacks_always_check_their_kernels(monkeypatch, capsys):
     for stack, checks in (("native", True), ("fe-entries", True), ("fe-cublas", False), ("reference", False)):
         session = Session(model, text, stack=stack, device="cpu", capacity=8)
         assert session.check_kernels is checks, stack
-    assert Session(model, text, stack="fe-cublas", device="cpu", capacity=8).claim() is None, "a stack without a target says nothing about one"
     with pytest.raises(AssertionError, match="reached a load"):  # through main(): the kernel table is printed without --check-kernels
         _sample_main(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"])
     out = capsys.readouterr().err
     assert (
         "kernels, planned (decided before the load from model_samples/qwen_dense/configs.py; stack native" in out
-        and "kernel identity, as planned: 17 of 20 launches of a step are target kernels (7 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results)"
-        in out
+        and "  per step: 20 launches on 12 exact rows, checked one by one in the wiring order; the launches of 0 fallback calls" in out
     )
 
 
 def test_a_dry_plan_of_the_native_stack_imports_nothing_new():
-    """In a fresh interpreter: planning the ``native`` stack on stated device facts, reading the census and stating the claim
-    add only ``model_samples`` and standard-library modules -- the versions the census compares are read from the
-    distributions' metadata, no package is imported for them."""
+    """In a fresh interpreter: planning the ``native`` stack on stated device facts and printing its kernel table add only
+    ``model_samples`` and standard-library modules: the rows a library serves are planned and their package is not imported."""
     code = f"""
 import sys
 import cudnn, torch
-cudnn.GdnDecodeFused, cudnn.AttentionGateQuantDecode, cudnn.AddNormQuantDecode, cudnn.SwigluFp4Decode
+cudnn.GdnDecodeFused, cudnn.AttentionGateQuantDecode, cudnn.AddNormQuantDecode, cudnn.SwigluFp4Decode, cudnn.AttentionPrepareDecode
 import importlib.metadata
 before = set(sys.modules)
 sys.path.insert(0, {str(MODELS)!r})
@@ -3691,148 +3632,34 @@ from model_samples import census
 from model_samples.blocks import DeviceFacts, plan
 from model_samples.qwen_dense import QwenDense
 model = QwenDense.reduced(2)
-planned = plan(model.provider_table, model.regimes, DeviceFacts((10, 0), "stated", 148, 0, 0), 1, 1, "native", model=model, options={{"check_kernels": True}})
-claim = model.target().claim(planned, model)
-table = census.table(planned, claim)
+planned = plan(model.provider_table, model.regimes, DeviceFacts((10, 0), "stated", 148, 0, 0), 1, 1, "native", model=model, options={{"check_kernels": True, "max_model_len": 2051}})
+table = census.table(planned)
 added = sorted({{name.split(".")[0] for name in set(sys.modules) - before}})
 print("ADDED", [name for name in added if name not in sys.stdlib_module_names and name not in ("model_samples", "cudnn")])
-print("TABLE", "gate_quant" in table, "add_norm_quant" in table, "fp8_projection" in table and "swiglu_fp4" in table and "17 of 20 launches of a step are target kernels (7 the target's own compiled kernels + 10 cuDNN Frontend entries with byte-equal results)" in table, claim.reasons[0])
+print("TABLE", "gate_quant" in table, "add_norm_quant" in table, "fp8_projection" in table and "swiglu_fp4" in table and "attention_prepare" in table and "row_quantize_fp4" in table, "per step: 20 launches on 12 exact rows" in table)
 print("LIBRARY", "fi_mm_fp4" in table and "cublaslt_fp8_gemm" in table, sorted(name for name in sys.modules if name.split(".")[0] in ("flashinfer", "tvm_ffi", "triton")))
 print("NOTE", planned.announcements())
 """
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert "ADDED []" in done.stdout and "TABLE True True True fallback rows present" in done.stdout, done.stdout + done.stderr
+    assert "ADDED []" in done.stdout and "TABLE True True True True" in done.stdout, done.stdout + done.stderr
     # the library rows are planned and their package is not imported; a plan on stated device facts makes no first use of
     # the library and announces none
     assert "LIBRARY True []" in done.stdout and "NOTE []" in done.stdout, done.stdout + done.stderr
 
 
-# ----------------------------------------------------------------------------------------------- what the review of the stack found
-def test_a_count_of_target_launches_in_the_readmes_carries_its_split():
-    """A count of target launches is three numbers, never one, wherever it stands.  In the READMEs and the guide of this
-    area every "N of the M launches of a step" -- and every count of launches "on target kernels" or of "target launches" --
-    is followed by its split into the target's own compiled kernels and cuDNN Frontend entries."""
-    import re
-
-    counts = (
-        r"\b\d+ of (?:the )?(?:484|20)\b(?! block calls)",  # of the launches of a step: the 64-layer and the two-layer model
-        r"\b\d+ launches of every one of the \d+ traced steps on target kernels",
-        r"\bthe \d+ (?:remaining )?target launch(?:es)?\b",
-    )
-    split = re.compile(r"\d+ (?:of )?the target's own compiled kernels? \+ \d+ (?:of a )?cuDNN Frontend entr(?:y|ies)|=\s*49 \+ 273\b")
-    found = 0
-    for name in ("README.md", "AGENTS.md", "qwen_dense/README.md"):
-        text = " ".join((MODELS / name).read_text().split())
-        for pattern in counts:
-            for match in re.finditer(pattern, text):
-                found += 1
-                after = text[match.start() : match.end() + 260]
-                assert split.search(after), f"{name}: {after[:120]!r} gives a count of target launches without its split"
-    assert found >= 5, "the patterns still find the counts of the READMEs"
-    area = " ".join((MODELS / "README.md").read_text().split())
-    assert "321 of the 484 launches of a step of the 64-layer model, 48 the target's own compiled kernels + 273 cuDNN Frontend entries" in area
-    assert "322 of the 484" not in area, "the five entries are 321 launches; the 322nd is PyTorch's gather"
-    assert "(322 = 49 + 273 with PyTorch's gather" in area and "on compute capability 10.0, 321 of the 484" in area, "said for the class it holds on"
-    for wrong in ("counts 3 of 20.", "(65 of the 484 launches of a step of the 64-layer model)"):  # the two sentences the review found
-        assert not split.search(wrong + " " * 10), "the rule sees a count without its split"
-
-
-def test_a_section_holds_for_the_layer_widths_it_was_recorded_with():
-    """A census section is keyed by the GPU class, the SM count, the row count -- and the layer widths of the model: a
-    checkpoint of the family with other widths has other grids (and, where an entry picks by width, other kernels).  Such
-    a run is told that no identity is stated and is held to no recorded launch shape; the reduced default model keeps the
-    published widths, so the section holds for it.  A launch shape that also depends on a field beyond the layer widths
-    (the output head's: the vocabulary) names it, and is held only for a model that shares it."""
-    import copy
-    from dataclasses import replace
-    from types import SimpleNamespace
-
-    from model_samples import census
-    from model_samples.blocks import DeviceFacts, plan as make_plan
-    from model_samples.qwen_dense import Geometry, QwenDense
-
-    target = QwenDense.target()
-    section = target.data["configurations"]["plain"]["cc10.0/sm148"]
-    full = Geometry()
-    widths = ("hidden", "mlp", "la_key_heads", "la_value_heads", "la_head_dim", "attn_heads", "attn_kv_heads", "attn_head_dim")
-    assert section["geometry"] == {name: getattr(full, name) for name in widths}, "the widths every recorded launch shape of a layer depends on"
-    reduced = QwenDense.reduced(2).geometry
-    assert all(getattr(reduced, name) == getattr(full, name) for name in widths) and reduced.vocab != full.vocab, "the reduced model keeps the widths"
-    plan, model, _ = _target_plan(2)
-    assert target.claim(plan, model, installed=RECORDED).known and len(target.claim(plan, model, installed=RECORDED).recorded) == 14
-
-    # stated facts: no entry is built.  The same plan on a device with memory, where the entries are asked for their launch, is
-    # held in test_a_row_serves_the_layer_widths_it_names: the norm block of such a model is the reference chain's
-    stated = DeviceFacts((10, 0), "stated device", 148, 0, 0)
-    other = QwenDense(replace(reduced, hidden=4096, la_key_heads=8, la_value_heads=32, attn_heads=16), ("other widths",))
-    planned = make_plan(other.provider_table, other.regimes, stated, 1, 1, "native", model=other, options={"device": "cpu"})
-    claim = target.claim(planned, other, installed=RECORDED)
-    reason = (
-        "no recorded section for this model's widths on cc 10.0 / 148 SMs: hidden 4096 (recorded 5120), la_key_heads 8 (recorded 16), "
-        "la_value_heads 32 (recorded 48), attn_heads 16 (recorded 24)"
-    )
-    assert not claim.known and claim.identities == [] and claim.recorded == {}, "no identity, and no recorded launch shape is held against the run"
-    assert claim.reasons == ["fallback rows present", reason]
-    assert claim.coverage() == [f"kernel identity: not stated for this run ({reason})"]
-    assert claim.line(census.PASS) == f"{CENSUS}: NOT CLAIMED (fallback rows present; {reason})"
-    assert "identity" not in census.table(planned, claim).splitlines()[1]
-    # the launches of such a run, in the shapes its own entries state, hold: nothing of the 27B's is asked of them
-    sites = _sites()
-    grids = {"gdn_decode_fused": ((64, 1, 1), (256, 1, 1), 42112)}
-    sites[2].facts = census.Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, grids["gdn_decode_fused"])
-    step = _step(fused=(SYMBOL, grids["gdn_decode_fused"]))
-    step[0] = step[0]._replace(grid=(32, 1, 1))  # the gather of a model 4,096 wide
-    unheld = Claim = census.Claim(
-        "kernel_census.json", "plain", "cc 10.0 / 148 SMs", 1, "2026-11-12", "recorded", False, [s.block for s in sites], [], reasons=[reason]
-    )
-    assert Claim.recorded == {} and census.Traced.of(sites, _log(sites), step, 1, "", rows=1, claim=unheld).judge() == (census.PASS, [])
-    # with the wide model's row count missing as well, the widths are what is said: the model comes first
-    four = make_plan(other.provider_table, other.regimes, stated, 4, 1, "native", model=other, options={"device": "cpu"})
-    assert target.claim(four, other, installed=RECORDED).reasons == ["fallback rows present", reason]
-
-    # a launch shape recorded with one more field of the geometry: held for a model that shares it, said for one that does not
-    small_plan, small_model = _small_plan()
-    data = _small_census()
-    data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["layer"][0][2]["at"] = {"vocab": 248320}
-    apart = census.Target(copy.deepcopy(data)).claim(small_plan, small_model, installed=RECORDED)
-    said = "no recorded launch shape of linear_attention.step for this model: vocab 272 (recorded 248320)"
-    assert apart.known and apart.reasons == [said] and apart.recorded == {0: GATHER_SHAPE} and apart.identities[1].relation == census.TARGET
-    assert apart.line(census.PASS).startswith(
-        f"{CENSUS}: NOT CLAIMED ({said}); 1 launch of a step compared by launch shape (1 the target's own compiled kernel + "
-    )
-    assert apart.line(census.PASS).endswith(": each in the recorded one; 1 more by membership alone")
-    shared = SimpleNamespace(geometry=SimpleNamespace(layer_kinds=("linear_attention",), hidden=5120, vocab=248320), wiring=small_model.wiring)
-    together = census.Target(copy.deepcopy(data)).claim(small_plan, shared, installed=RECORDED)
-    assert together.reasons == [] and together.recorded == {0: GATHER_SHAPE, 1: SHAPE}
-    head = [entry for entry in section["rows"]["1"]["after_step"] if entry[0] == "output_head"]
-    assert head[0][2]["at"] == {"vocab": full.vocab}, "the output head's launch shape is recorded with the vocabulary"
-    # a section without its widths is no section; a claimed one names at least one
-    for change, sentence in (
-        (lambda s: s.pop("geometry"), "plain / cc10.0/sm148: a section holds geometry, the layer widths of the model it was taken on"),
-        (lambda s: s.update(geometry={"hidden": "5120"}), "plain / cc10.0/sm148: a section holds geometry, the layer widths of the model it was taken on"),
-        (lambda s: s.update(geometry={}), "plain / cc10.0/sm148: claimed without the layer widths it holds for"),
-        (lambda s: s["rows"]["1"]["layer"][0][2].update(at={"vocab": "many"}), "at of linear_attention.step is not an object of geometry fields"),
-    ):
-        lacking = _small_census()
-        change(lacking["configurations"]["plain"]["cc10.0/sm148"])
-        with pytest.raises(ValueError) as refused:
-            census.Target(lacking)
-        assert str(refused.value).startswith("kernel_census.json: ") and sentence in str(refused.value), sentence
-
-
-def test_the_checks_of_a_target_stack_look_at_its_kernels_unasked(monkeypatch):
+def test_the_checks_of_native_look_at_its_kernels_unasked(monkeypatch):
     """Whether a run checks its kernels is the session's decision, read in one place.  A caller that follows the helper API
     -- ``Session(stack="native")``, ``trace``, ``run_checks`` -- without naming the kernel check gets it: the kernels line
     is printed and a launch under another symbol than the entry's fails the run.  The check of such a stack cannot be
     switched off."""
     from model_samples import census, tie_out
 
-    other_form = [(SYMBOL, ((96, 1, 1), (256, 1, 1), 42112))]  # the symbol of the form WITHOUT wait and release; the entry states the target's
+    other_form = [(SYMBOL, ((96, 1, 1), (256, 1, 1), 42112))]  # the symbol of the form WITHOUT wait and release; the entry states the row's
 
     def run(**stand_in):
         session = _recorded_run(monkeypatch, sequences=1, stack="native", check_kernels=False, **stand_in)[0]
-        assert session.check_kernels is True, "a stack that declares a target kernel set checks its kernels, whatever it was told"
+        assert session.check_kernels is True, "this stack checks its kernels, whatever it was told"
         session.trace(4)  # no argument: the session's decision
         return session
 
@@ -3840,85 +3667,12 @@ def test_the_checks_of_a_target_stack_look_at_its_kernels_unasked(monkeypatch):
     assert not checks.ok and checks.kernels == census.FAIL, checks.text()
     assert _line(checks, "kernels ").endswith("    FAIL")
     (sentence,) = [line.strip() for line in checks.lines if line.strip().startswith("kernels: step 0")]
-    assert f"linear_attention.step (layer 0) launched {SYMBOL!r}; cudnn.GdnDecodeFused names {TARGET_SYMBOL!r} for this run" in sentence
+    assert f"linear_attention.step (layer 0) launched {SYMBOL!r}; cudnn.GdnDecodeFused names {WAITING_SYMBOL!r} for this run" in sentence
     held = tie_out.run_checks(run(), prompt_tokens=3)
     assert held.ok and held.kernels == census.PASS and _line(held, "kernels ").endswith("    PASS"), held.text()
-    assert any(f"{CENSUS}: NOT CLAIMED (" in line and COMPARED_14 in line for line in held.lines), "and the census line with what was compared"
-    with pytest.raises(ValueError, match=r"^stack native declares a target kernel set: its kernel check cannot be switched off$"):
+    assert sum("; the library launched " in line for line in held.lines) == 5, "and the kernel of every row a library serves on the row's own line"
+    with pytest.raises(ValueError, match=r"^stack native always checks its kernels: the check cannot be switched off$"):
         tie_out.run_checks(run(), prompt_tokens=3, kernels=False)
-
-
-def test_equal_says_what_was_compared_and_a_file_that_records_less_is_refused():
-    """``EQUAL`` never stands for a comparison that was not made.  A section that says ``claimed`` records the launch shape
-    of every target kernel -- only a kernel a library's tuner selects and a stand-in have none; an entry with a fact the
-    reader does not know (a misspelt ``launch``) or with a ``launch`` that is no launch shape is refused in every section;
-    and the census line says how many launches of a step were compared by launch shape, as three numbers, and how many
-    by membership alone."""
-    from model_samples import census
-
-    plan, model = _small_plan()
-
-    def step_facts(data):
-        return data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["layer"][0][2]
-
-    def refused(data):
-        with pytest.raises(ValueError) as error:
-            census.Target(data)
-        assert str(error.value).startswith("kernel_census.json: plain / cc10.0/sm148, 1 rows, layer: "), str(error.value)
-        return str(error.value).split("layer: ", 1)[1]
-
-    bare = _small_census()
-    step_facts(bare).pop("launch")
-    assert refused(bare) == (
-        "claimed without the launch shape of linear_attention.step (gdn_decode_fused); only a kernel a library's tuner selects and a stand-in have none"
-    )
-    for claimed in (True, False):  # a misspelt key is a fact the reader does not know: never "nothing recorded"
-        misspelt = _small_census(claimed=claimed)
-        step_facts(misspelt)["lauch"] = step_facts(misspelt).pop("launch")
-        assert refused(misspelt) == "linear_attention.step states lauch; an entry states launch and at and form and class and pick"
-    for bad in (
-        [[96, 1], [256, 1, 1], 42112],
-        [[96, 1, 1], [256, 1, 1]],
-        [[96, 1, 1], [256, 1, 1], "42112"],
-        [[96, 1, 1], [256, 1, 1], -1],
-        [[0, 1, 1], [256, 1, 1], 0],
-        [[96, 1, 1.0], [256, 1, 1], 0],
-        [[True, 1, 1], [256, 1, 1], 0],
-        {"grid": [96, 1, 1]},
-    ):
-        wrong = _small_census(claimed=False)
-        step_facts(wrong)["launch"] = bad
-        assert refused(wrong) == "the launch of linear_attention.step is not [grid of three, block of three, shared memory in bytes]", bad
-
-    one = "1 launch of a step compared by launch shape (1 the target's own compiled kernel + 0 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins)"
-    # a section that claims nothing may record less: the launch is then held by membership alone, and the line says so
-    loose = _small_census(claimed=False)
-    step_facts(loose).pop("launch")
-    claim = census.Target(loose).claim(plan, model, installed=RECORDED)
-    assert claim.recorded == {0: GATHER_SHAPE} and claim.compared() == (1, one, 1)
-    assert (
-        claim.line(census.PASS)
-        == f"{CENSUS}: NOT CLAIMED (the census does not claim this class yet); {one}: each in the recorded one; 1 more by membership alone"
-    )
-    # a kernel a library's tuner selects, in a section that says claimed: by membership, and EQUAL carries both counts
-    tuned = _small_census()
-    tuned["kernels"]["gdn_decode_fused"]["selection"] = "the library's tuner chooses the kernel"
-    step_facts(tuned).pop("launch")
-    claim = census.Target(tuned).claim(plan, model, installed=RECORDED)
-    assert claim.reasons == [] and claim.line(census.PASS) == f"{CENSUS}: EQUAL ({one}, 1 by membership alone)"
-    complete = census.Target(_small_census()).claim(plan, model, installed=RECORDED)
-    assert complete.line(census.PASS) == f"{CENSUS}: EQUAL ({COMPARED_2}, 0 by membership alone)" and complete.compared() == (2, COMPARED_2, 0)
-    # the wrong launch under such a claim: the fused step at half the recorded grid, which its entry states too -- NOT EQUAL
-    sites = [site for site in _sites() if site.block in ("embedding", "linear_attention.step", "token_choice")]  # the calls of the small plan
-    other = ((48, 1, 1), (256, 1, 1), 42112)
-    sites[1].facts = census.Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, other)
-    at = _Clock()
-    step = [at(GATHER, GATHER_SHAPE), at(SYMBOL, other), at(ARGMAX), at(HOST_READ, kind="copy")]
-    assert census.compare([step], sites).ok, "without a census nothing is wrong with it"
-    traced = census.Traced.of(sites, _log(sites), step, 1, "", rows=1, claim=complete)
-    status, lines = traced.judge()
-    assert status == census.FAIL and len(lines) == 1 and f"the {CENSUS} has grid (96, 1, 1)" in lines[0], lines
-    assert traced.details()[-1] == f"{CENSUS}: NOT EQUAL (the kernel check did not hold)"
 
 
 def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
@@ -3986,7 +3740,7 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
             return operands[10]
 
         def kernel_symbols_for(self, rows):
-            return (TARGET_SYMBOL,)
+            return (WAITING_SYMBOL,)
 
         def form_for(self, rows):
             return {"PDL": True, "PDL_RELEASE": True}
@@ -4024,6 +3778,10 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     monkeypatch.setattr(cudnn, "AddNormQuantDecode", Norm, raising=False)
     monkeypatch.setattr(cudnn, "Fp8ProjectionDecode", _projection_entry(calls, projection_decline), raising=False)
     monkeypatch.setattr(cudnn, "SwigluFp4Decode", _swiglu_entry(calls, swiglu_decline), raising=False)
+    prepared = []  # the attention preparation's entry: its first use has a case of its own (the test of its adapter), its log here is its own
+    monkeypatch.setattr(cudnn, "AttentionPrepareDecode", _prepare_entry(prepared), raising=False)
+    quantize_decline = [""]
+    monkeypatch.setattr(cudnn, "RowQuantizeFp4Decode", _row_quantize_entry(calls, decline=quantize_decline), raising=False)
     monkeypatch.setattr(fe, "_ENTRIES", {})
     monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
     monkeypatch.setattr(fe, "_outside_pool", lambda device, launch: (launch(), 0)[1])
@@ -4060,9 +3818,11 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
         ("step compile", 4, (4, 10240)),
         ("swiglu compile", 4),  # the fused gate / up entry: its build takes the row count and no operand
         ("gate compile", (4, 6144), "cpu", (4, 6144)),
+        ("row quantize compile", None),  # the head's quantise: its build takes no operand and no row count
     ], "the first use of each entry, at the run's row count"
+    assert [kind for kind, *_ in prepared] == ["prepare compile", "prepare launch"], "the attention preparation: its build, then one call on scratch operands"
     table.first_use()
-    assert len(calls) == 9 and table.first_used, "made once per plan"
+    assert len(calls) == 10 and len(prepared) == 2 and table.first_used, "made once per plan"
     del calls[:]
     table["linear_attention.step"].compile(4, 1)
     table["attention.gate_quantize"].compile(4, 1)
@@ -4097,6 +3857,15 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
         (4, 8704),
         (128, 1088),
     ], "and for the fused gate / up entry: scratch operands in the entry's own layout, the outputs the call's own"
+    del calls[:]
+    table["output_head.quantize"].compile(4, 1)
+    assert [call[0] for call in calls] == ["row quantize compile", "row quantize launch"] and calls[0][1] is None
+    assert {name: tuple(operand.shape) for name, operand in calls[1][1].items()} == {
+        "x": (4, 5120),
+        "scale": (1,),
+        "codes": (4, 2560),
+        "scales": (128, 320),  # one band of the 128 x 4 layout for the rows of the run
+    }, "and for the head's quantise: the build again without an operand, then one launch on scratch rows into outputs of the call's own"
     # (0a) the build of the fused gate / up entry is handed the row count and nothing else, and the entry has stated a launch
     # for that row count before it is built: nothing of the adapter's is left for the build to decline.  So every typed decline
     # of it is the entry's answer about the installation and a SKIP in the entry's own words -- the compiler it is qualified
@@ -4210,6 +3979,28 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=12, minor=9))
     # (3) a CuTe DSL without the part's target (cuDNN Frontend's public probe): the fused step's decline is a SKIP too
     monkeypatch.setattr(Gate, "decline", "")
+    # (2c) the row quantise entry asks the same of the installation on compute capability 10.7.  Its build takes no operand: its
+    # own sentence is the SKIP where that requirement is unmet; with the CUDA 13.4 flavour, or on another class, the same
+    # decline is no answer about the installation this adapter can name -- an ERROR
+    quantize_flavour = "the FP4 row quantization decode step on compute capability 10.7 requires a CuTe DSL whose compiler is CUDA 13.4 or later"
+    quantize_decline[0] = quantize_flavour
+    for compiler, cc, outcome in (
+        ((12, 9), (10, 7), NotImplementedError),
+        ((13, 0), (10, 7), NotImplementedError),
+        ((13, 4), (10, 7), ValueError),
+        ((12, 9), (10, 0), ValueError),
+    ):
+        monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=compiler[0], minor=compiler[1]))
+        with pytest.raises(outcome) as declined:
+            planned(cc=cc)
+        own = (
+            quantize_flavour
+            if outcome is NotImplementedError
+            else f"cudnn.RowQuantizeFp4Decode declined the operands this adapter built for its first use: {quantize_flavour}"
+        )
+        assert str(declined.value) == own, (compiler, cc)
+    quantize_decline[0] = ""
+    monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=12, minor=9))
     monkeypatch.setattr(Step, "decline", "SM107 requires a CuTe DSL build supporting sm_107a; found 4.8.0 without that target")
     monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: tuple(cc) != (10, 7))
     with pytest.raises(NotImplementedError, match=r"^SM107 requires a CuTe DSL build supporting sm_107a"):
@@ -4265,7 +4056,8 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
     device a session resolves the tables of every sequence count, which allocates nothing, asks whether the whole run
     fits, and only then lets the entries make their first use -- still before anything is loaded.  A GPU that is too
     small gets the SKIP with the estimate on every provider stack, from the session and as the last line of the sample's
-    ``main()``, and nothing was built for it.  A toolchain an entry declines stays a SKIP before the weights, also for a
+    ``main()``, and nothing was built for it -- also a run of many sequences whose state would fit and whose checks
+    would not.  A toolchain an entry declines stays a SKIP before the weights, also for a
     session that is loaded without its table.  The library rows of ``native`` make their first use in the same place:
     behind the memory sentence, in the order of the blocks."""
     import cudnn
@@ -4314,6 +4106,15 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
     class Swiglu(Entry):
         name = "cudnn.SwigluFp4Decode"
 
+    class Prepare(Entry):
+        name = "cudnn.AttentionPrepareDecode"
+
+        def __call__(self, *operands):  # its first use makes one call behind the build
+            events.append(("launch", self.name))
+
+    class RowQuantize(Entry):
+        name = "cudnn.RowQuantizeFp4Decode"
+
     def scratch(block, sequences, tokens):  # in place of the adapters' scratch operands: what would be allocated, and when
         events.append(("scratch", block.entry, sequences * tokens))
         return block._build(block.options["device"]), ()
@@ -4323,9 +4124,9 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
 
     sentence = blocks.Plan.memory
 
-    def memory(plan, need_bytes, what="", checks_bytes=0):
+    def memory(plan, *parts):  # the need, what it covers, and the two parts of it that are the checks'
         events.append(("memory sentence", plan.stack))
-        return sentence(plan, need_bytes, what, checks_bytes)
+        return sentence(plan, *parts)
 
     def no_weights(model, *arguments, **options):
         raise AssertionError("reached a load")
@@ -4336,11 +4137,16 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
     monkeypatch.setattr(cudnn, "AddNormQuantDecode", Norm, raising=False)
     monkeypatch.setattr(cudnn, "Fp8ProjectionDecode", Projection, raising=False)
     monkeypatch.setattr(cudnn, "SwigluFp4Decode", Swiglu, raising=False)
+    monkeypatch.setattr(cudnn, "AttentionPrepareDecode", Prepare, raising=False)
+    monkeypatch.setattr(cudnn, "RowQuantizeFp4Decode", RowQuantize, raising=False)
     monkeypatch.setattr(fe, "_ENTRIES", {})
     monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
     monkeypatch.setattr(fe.GdnDecodeFusedBlock, "_scratch", scratch)
     monkeypatch.setattr(fe.AttentionGateQuantDecodeBlock, "_scratch", scratch)
+    monkeypatch.setattr(fe.AttentionPrepareDecodeBlock, "_scratch", scratch)
     monkeypatch.setattr(flashinfer_calls, "installed", lambda: VALIDATED_LIBRARY)  # the library's package as the validated version: its rows plan
+    monkeypatch.setattr(flashinfer_calls, "binaries_package", lambda: (VALIDATED_LIBRARY, True))  # ... and its kernel-binary package beside it
+    monkeypatch.delenv(flashinfer_calls.BINARIES_DIRECTORY, raising=False)
     monkeypatch.setattr(flashinfer_calls.LibraryBlock, "first_use", library_first_use)
     monkeypatch.setattr(blocks.Plan, "memory", memory)
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, gpu["total"], gpu["free"])))
@@ -4351,10 +4157,10 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
     assert state == 192 * GIB and model.state_bytes(65535, 256) > state + conv, "the scratch state of a first use at 65,535 rows: one slot pool of the run"
     assert configs.PROVIDERS["linear_attention.step"][0].sequences == (1, 65535), "the row count the fused step's rows admit"
 
-    def run(stack, *counts):
+    def run(stack, *counts, **request):  # ``capacity=58``: the positions of the sample's default request
         del events[:]
-        first = Session(model, text, sequences=counts[0], stack=stack, device="cuda:0")
-        later = [Session(model, text, sequences=count, stack=stack, device="cuda:0", share=first) for count in counts[1:]]
+        first = Session(model, text, sequences=counts[0], stack=stack, device="cuda:0", **request)
+        later = [Session(model, text, sequences=count, stack=stack, device="cuda:0", share=first, **request) for count in counts[1:]]
         return first, first.plan_table(later)
 
     def norm_builds(stack):
@@ -4365,9 +4171,11 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
 
     def first_uses(stack, *counts):
         """In the order of the blocks: the norm and the projection entry, the fused step on scratch operands, then -- in a stack
-        that has their rows -- the fused gate / up entry (its build takes the row count and no operand) and the gate entry;
-        and in the stack ``native`` the library's three calls, each at the place of its block: the out-projection, the
-        down multiply, the output head."""
+        that has their rows -- the fused gate / up entry (its build takes the row count and no operand), the attention
+        preparation entry (its build takes no operand: the scratch operands are made behind it, for its one call), the
+        gate entry and the entry of the head's quantise (its build takes no operand either); and in the stack ``native``
+        the library's four calls, each at the place of its block: the out-projection, the down multiply, the attention
+        core, the output head."""
         events = []
         for rows in counts:
             events += [*norm_builds(stack), ("scratch", "cudnn.GdnDecodeFused", rows), ("build", "cudnn.GdnDecodeFused")]
@@ -4375,8 +4183,11 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
             events += library("flashinfer.gemm.bmm_fp8")
             if stack != "fe-cublas":
                 events += [("build", "cudnn.SwigluFp4Decode"), *library("flashinfer.gemm.mm_fp4")]
+                prepare = "cudnn.AttentionPrepareDecode"
+                events += [("build", prepare), ("scratch", prepare, rows), ("launch", prepare), *library(ATTENTION_ENTRY)]
                 events += [("scratch", "cudnn.AttentionGateQuantDecode", rows), ("build", "cudnn.AttentionGateQuantDecode")]
-            events += library("torch_ref.quantize + flashinfer.gemm.mm_fp4")
+                events += [("build", "cudnn.RowQuantizeFp4Decode")]
+            events += library("flashinfer.gemm.mm_fp4")
         return events
 
     target = "SM100 requires a CuTe DSL build supporting sm_100a; found 4.8.0 without that target"
@@ -4386,7 +4197,7 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         gpu.update(total=180 * GIB, free=1 * GIB)
         with pytest.raises(NotImplementedError) as skipped:
             run(stack, 65535)
-        most = {"native": MOST_NATIVE}.get(stack, "263.5 GiB on this GPU")
+        most = {"native": MOST_NATIVE}.get(stack, MOST)
         assert str(skipped.value) == (
             f"stack {stack} needs about {most}; this GPU has 180.0 GiB in total: the run does not fit on it (CUDA_VISIBLE_DEVICES selects another GPU)"
         )
@@ -4395,15 +4206,26 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         # and whose gate / up multiply are on the stored weights at both counts keeps those and no bf16 copy of them (0.15 GiB
         # of 8-bit codes and 0.19 GiB of 4-bit codes where the copies are 0.29 and 0.66 GiB, for the two-layer model); the
         # reference of its checks then makes its copy of one such weight at a time (0.33 GiB the largest: a gate / up weight),
-        # and the sentence says that part
-        what, gib = " for 1 and 4 sequences, one count after the other", "3.7"
+        # and the sentence says that part beside what the checks hold for the three sequences beyond the first (0.14 GiB)
+        what, gib = f" for 1 and 4 sequences, one count after the other, 0.14 GiB of it for the checks ({BEYOND})", "3.9"
         if stack != "fe-cublas":
-            what += ", 0.33 GiB of it for the checks (the reference's bf16 copy of one weight at a time, where the run keeps none)"
-            gib = "3.2" if stack == "native" else "3.5"  # native keeps the out-projections, the down multiplies and the head on their stored codes too
+            what = f" for 1 and 4 sequences, one count after the other, 0.47 GiB of it for the checks ({COPY}, and {BEYOND})"
+            gib = "3.7"  # native keeps the out-projections, the down multiplies and the head on their stored codes too, and holds the library's workspace
         few = "^" + re.escape(f"stack {stack} needs about {gib} GiB on this GPU{what}; 1.0 GiB are free: free memory on this GPU")
         with pytest.raises(NotImplementedError, match=few):
-            run(stack, 1, 4)
+            run(stack, 1, 4, capacity=58)
         assert events == [("memory sentence", stack)], stack
+        # ... and a run of 1,024 sequences on a GPU with 30 GiB free: its state is 3.3 GiB and would fit, what its checks hold
+        # for 1,023 sequences beyond the first does not -- declined here, and not by an allocation inside the checks
+        gpu.update(free=30 * GIB)
+        many = {"fe-cublas": "72.8", "native": "73.1"}.get(stack, "72.9")  # the weights each stack holds at that count; on native the library's workspace
+        with pytest.raises(NotImplementedError) as skipped:
+            run(stack, 1024, capacity=58)
+        assert str(skipped.value).startswith(f"stack {stack} needs about {many} GiB on this GPU, ") and str(skipped.value).endswith(
+            "what they hold for the 1023 sequences beyond the first); 30.0 GiB are free: free memory on this GPU, or select another one with CUDA_VISIBLE_DEVICES"
+        ), str(skipped.value)
+        assert events == [("memory sentence", stack)], f"{stack}: nothing is built for a run whose checks do not fit"
+        gpu.update(free=1 * GIB)
         del events[:]
         with monkeypatch.context() as scoped:  # the sample's own run on such a device; what it patches ends with it
             code, out = _sample_main(scoped, capsys, ["--stack", stack], total=180 * GIB, free=1 * GIB)
@@ -4414,7 +4236,7 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         assert events == [("memory sentence", stack)], f"{stack}: the sample's own run builds nothing either"
         # (3) with room: the memory sentence, then the first use of every entry for every sequence count, then nothing more
         gpu.update(free=80 * GIB)
-        first, table = run(stack, 1, 4)
+        first, table = run(stack, 1, 4, capacity=58)
         assert f"this stack needs about {gib} GiB on this GPU{what}; 80.0 GiB are free" in table
         assert events == [("memory sentence", stack), *first_uses(stack, 1, 4)], f"{stack}: the budget first, then the builds"
         with pytest.raises(AssertionError, match="reached a load"):
@@ -4446,12 +4268,14 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         monkeypatch.setattr(Step, "decline", "")
         monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: True)
 
-    # (5) the library's package on such a device: missing, or another version than the validated one.  A SKIP that names the
-    # version, the command and the stack that runs without the package -- before the memory sentence, nothing built, nothing
-    # loaded; the sample's last line is that sentence and its exit code 0
+    # (5) the library's package on such a device: missing, or another version than the validated one.  A sentence that names
+    # the version, the command and the stack that runs without the package -- before the memory sentence, nothing built,
+    # nothing loaded.  A missing package STOPS the sample: its last line is ``ERROR the stack native cannot run:`` and that
+    # sentence, exit code 1 -- no other stack takes the place of the sample's own.  Another version than the validated one
+    # is a SKIP with that sentence, exit code 0
     fix = "pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt"
     without = "--stack fe-entries runs the cuDNN Frontend rows of this stack without the package"
-    validated = "a validated flashinfer-python (0.7.2.post1: the launch records of its kernels are data of that version)"
+    validated = "flashinfer-python 0.7.2.post1, the version this stack was run and checked with"
     for version, declined in (
         (None, f"flashinfer.gemm.bmm_fp8 needs flashinfer-python 0.7.2.post1, which is not installed: {fix}; {without}"),
         ("0.7.3", f"flashinfer.gemm.bmm_fp8 needs {validated}; this is 0.7.3: {fix}; {without}"),
@@ -4461,9 +4285,18 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         with pytest.raises(NotImplementedError) as skipped:
             run("native", 1, 4)
         assert str(skipped.value) == declined and events == [], "the first library row of the table names what is missing: nothing was asked of the GPU"
-        with monkeypatch.context() as scoped:
-            code, out = _sample_main(scoped, capsys, ["--stack", "native"], total=180 * GIB, free=80 * GIB)
-        assert code == 0 and out.splitlines()[-1] == f"[00] SKIP {declined}" and "first use of FlashInfer" not in out, out
+        from model_samples.blocks import MissingPackage
+
+        missing = isinstance(skipped.value, MissingPackage)
+        assert missing == (version is None) and getattr(skipped.value, "package", None) == ("flashinfer-python" if missing else None)
+        ended = (1, f"[00] ERROR the stack native cannot run: {declined}") if missing else (0, f"[00] SKIP {declined}")
+        for named in (["--stack", "native"], ["--sequences", "1,4"]):  # by name, and as the default of a run that names no stack
+            with monkeypatch.context() as scoped:
+                code, out = _sample_main(scoped, capsys, named, total=180 * GIB, free=80 * GIB, stacked=False)
+            assert (code, out.splitlines()[-1]) == ended and "first use of FlashInfer" not in out, out
+            assert (
+                "| stack native" in out and "\n[00] stage " not in out and out.count("[00] ERROR") + out.count("[00] SKIP") == 1
+            ), "one message, nothing loaded"
         del events[:]
         _, table = run("fe-entries", 1, 4)
         assert "FlashInfer" not in table and events == [
@@ -4474,7 +4307,7 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         # makes no call there: the test of the first use of a library row)
         gpu.update(total=0, free=80 * GIB)
         _, table = run("native", 1, 4)
-        assert table.count("none; unverified in CI") == 3, table
+        assert table.count("none; unverified in CI") == 4, table
         gpu.update(total=180 * GIB, free=80 * GIB)
     # ... and with the validated version a sample announces the library's first use while it plans, in one line: the plain
     # script, and the speculative script, whose plans hold the library's rows three times (one sentence, said once)
@@ -4506,7 +4339,7 @@ def test_the_call_sites_of_a_decode_step_and_the_forms_a_row_names_for_them(monk
 
     full = QwenDense()
     wiring, sites = full.wiring(), full.sites()
-    assert len(sites) == len(wiring) == 484 and census.call_sites(full) == sites
+    assert len(sites) == len(wiring) == 485 and census.call_sites(full) == sites
     every = [(block, layer, site) for (block, layer), site in zip(wiring, sites) if site]
     assert {block for block, _, _ in every} == {
         "add_norm_quantize",
@@ -4639,7 +4472,7 @@ def test_a_call_served_in_the_form_of_another_call_site_fails_the_form_check():
 
     from model_samples import census
 
-    plan, model, _ = _target_plan(64)
+    plan, model = _stack_plan(64)
     sites = census.expected(plan, model)
     norms = [(index, site) for index, site in enumerate(sites) if site.block == "add_norm_quantize"]
     assert Counter(site.site for _, site in norms) == {"linear_attention.first": 1, "linear_attention": 47, "full_attention": 16, "mlp": 64, "output_head": 1}
@@ -4649,7 +4482,7 @@ def test_a_call_served_in_the_form_of_another_call_site_fails_the_form_check():
         assert all(site.facts.form[name] == value for name, value in site.form) and site.facts.form["HIDDEN"] == 5120, "the entry instance of that form"
         assert site.row == f"add_norm_quantize at {site.site}" and site.name == f"add_norm_quantize (layer {site.layer})"
     assert len({site.form for _, site in norms}) == 5 and len({tuple(site.facts.shape) for _, site in norms}) == 1, "five forms, one launch shape"
-    assert [site.site for site in sites if site.block not in ("add_norm_quantize", "projection.fp8.in", "projection.fp8.out")] == [""] * 227
+    assert [site.site for site in sites if site.block not in ("add_norm_quantize", "projection.fp8.in", "projection.fp8.out")] == [""] * 228
     outs = [site for site in sites if site.block == "projection.fp8.out"]
     assert Counter(site.site for site in outs) == {"linear_attention.out": 48, "full_attention.out": 16}
     assert all(
@@ -4712,7 +4545,7 @@ def test_the_norm_entrys_adapter_over_a_stand_in_entry(monkeypatch):
     from model_samples.blocks import DeviceFacts, plan
     from model_samples.providers import Quant, fe, torch_ref
     from model_samples.qwen_dense import QwenDense, configs
-    from model_samples.weights import ScaledTensor, TiledBlockScaledTensor, Unquantized
+    from model_samples.weights import ScaledTensor, TiledBlockScaledTensor
 
     built = []
 
@@ -4810,13 +4643,15 @@ def test_the_norm_entrys_adapter_over_a_stand_in_entry(monkeypatch):
         built[0].calls[-1][3] is scale2 and q3.codes is not q2.codes and int(q2.codes[0, 0]) != int(q3.codes[0, 0])
     ), "one scale tensor per value; buffers of its own per call"
     assert tuple(block.compared((q2, None, residual))[0].tensors()[1].shape) == (2, 320), "compared row by row: the block scales gathered out of the layout"
-    # the final norm: the form ends at the bf16 rows; the 4-bit operand of the consumer is handed over unquantised
-    q4, normed4, _ = block(x, residual, weight, four, "output_head")
+    # the final norm: the form ends at the bf16 rows and the call returns no quantised operand; a step that asks for one there
+    # is refused before the launch (the consumer's operand is a block of its own)
+    with pytest.raises(ValueError, match=r"its form at output_head writes no codes; the step asks for a nvfp4 operand there$"):
+        block(x, residual, weight, four, "output_head")
+    q4, normed4, _ = block(x, residual, weight, None, "output_head")
     head = built[2]
     assert head.arguments["bf16"] is True and head.arguments["quant"] is None and head.calls[-1][3] is None and head.calls[-1][5] is None
-    assert isinstance(q4, Unquantized) and q4.data is normed4 and (q4.fmt, q4.scale) == ("nvfp4", 0.03125)
-    assert block.compared((q4, normed4, residual)) == (None, normed4, residual), "what the consumer quantises is not the kernel's output"
-    assert block(x, residual, weight, None, "output_head")[0] is None, "no quantised operand asked for: none handed over"
+    assert len([call for call in head.calls if call[0] == "launch"]) == 1, "the refused call launched nothing"
+    assert q4 is None and block.compared((q4, normed4, residual)) == (None, normed4, residual), "what the tie-out compares is what the call returned"
     assert block.serving() == ("cudnn.AddNormQuantDecode #3", row.site_form("output_head")) and len(built) == 3, "three forms called so far: three instances"
     assert (
         fe.AddNormQuantDecodeBlock(row, model, stated, options).launch_facts(1, "mlp") == facts and len(built) == 3
@@ -4899,91 +4734,6 @@ def test_the_norm_entrys_adapter_over_a_stand_in_entry(monkeypatch):
     monkeypatch.setattr(cudnn, "AddNormQuantDecode", type("NoFacts", (), {}), raising=False)
     with pytest.raises(NotImplementedError, match=r"the kernel check needs the launch facts of cudnn.AddNormQuantDecode \(kernel_symbols_for"):
         fe.AddNormQuantDecodeBlock(row, model, stated, options).check_support(1, 1)
-
-
-def test_a_census_names_the_form_of_every_call_of_a_kernel_with_several_forms():
-    """The target calls the norm kernel in another form at each call site, and the census says which: per entry of a section
-    the fields of that call (``form``), and what differs at a block's first call in the model's first layer
-    (``first_layer``).  A block call is the target's only where the row's form at ITS site is the census's form of THAT
-    call; a row that differs at one site is ``not the target`` there and nowhere else, and the reason is said once."""
-    import copy
-
-    from model_samples import census
-    from model_samples.qwen_dense import QwenDense
-
-    target = QwenDense.target()
-    parts = target.data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]
-    kinds = QwenDense().geometry.layer_kinds
-    calls = [facts for block, _, facts in target.sequence(parts, kinds) if block == "add_norm_quantize"]
-    first, later = calls[0]["form"], calls[2]["form"]
-    assert first == {"ADD": False, "STORE_RESIDUAL": True, "BF16_OUT": True, "QUANT": "e4m3_static"}, "the first layer's facts, merged field by field"
-    assert later == {"ADD": True, "STORE_RESIDUAL": False, "BF16_OUT": True, "QUANT": "e4m3_static"} and calls[-1]["form"]["QUANT"] is None
-    assert parts["linear_attention_layer"][0][2]["form"]["ADD"] is True, "the file's own entry is left as it is"
-    assert target.sequence(parts, kinds) == target.sequence(parts, kinds) and target.numbers(parts, kinds) == (484, 210, 273, 1)
-    attention_first = [facts["form"] for block, _, facts in target.sequence(parts, QwenDense.reduced(1).geometry.layer_kinds) if block == "add_norm_quantize"]
-    assert attention_first[0] == {"ADD": False, "STORE_RESIDUAL": True, "BF16_OUT": False, "QUANT": "e4m3_static"}, "whatever kind the first layer is"
-    plan1, model1, _ = _target_plan(1)
-    assert target.claim(plan1, model1, installed=RECORDED).of("add_norm_quantize") == "target", "and the row has that form at that site"
-
-    plan, model, _ = _target_plan(64)
-
-    def changed(change):
-        data = copy.deepcopy(target.data)
-        change(data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"])
-        return census.Target(data)
-
-    def with_normed_rows(rows):  # the census says the norm in front of an MLP also writes its bf16 rows
-        for kind in ("linear_attention_layer", "attention_layer"):
-            rows[kind][-3][2]["form"]["BF16_OUT"] = True
-
-    claim = changed(with_normed_rows).claim(plan, model, installed=RECORDED)
-    numbers = claim.numbers()
-    row_form = "[PDL True, PDL_RELEASE True, ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT nvfp4]"
-    reason = f"the row's form at mlp is {row_form}, the target's {row_form.replace('BF16_OUT False', 'BF16_OUT True')}"
-    assert numbers["not_the_target"] == {"add_norm_quantize": 64} and (numbers["target_code"], numbers["target_port"]) == (178, 209)
-    assert claim.reasons == [f"not the target set: add_norm_quantize ({reason})", "fallback rows present", "the plan has no block for output_head.quantize"][
-        1:2
-    ] + [
-        f"not the target set: add_norm_quantize ({reason})",
-        "the plan has no block for output_head.quantize",
-    ], "said once for its 64 calls"
-    assert (
-        claim.of("add_norm_quantize") == f"target; not the target ({reason})" and len(claim.recorded) == 387 - 64
-    ), "no recorded shape is held against those calls"
-
-    # a kernel whose form follows the row count: the census names the field on the entries of its row count.  A census that names
-    # another token tile there -- the same kernel, the same launch shape -- makes the row "not the target" by its form
-    def with_another_tile(rows):
-        for kind in ("linear_attention_layer", "attention_layer"):
-            rows[kind][-2][2]["form"]["TOKEN_TILE"] = 16
-
-    claim = changed(with_another_tile).claim(plan, model, installed=RECORDED)
-    everywhere = "PREWAIT_STAGES 2, L2_EVICT_FIRST True, MAX_CLUSTERS 148, PDL True"
-    reason = f"the row's form is [TOKEN_TILE 8, {everywhere}], the target's [{everywhere}, TOKEN_TILE 16]"
-    assert claim.numbers()["not_the_target"] == {"mlp.gate_up": 64} and claim.numbers()["target_port"] == 209 and len(claim.recorded) == 387 - 64
-    assert claim.of("mlp.gate_up") == f"not the target ({reason})" and claim.reasons[1] == f"not the target set: mlp.gate_up ({reason})"
-    unmerged = changed(lambda rows: rows.pop(census.FIRST_LAYER)).claim(plan, model, installed=RECORDED)
-    assert unmerged.numbers()["not_the_target"] == {"add_norm_quantize": 1} and unmerged.identities[1].reason.startswith(
-        "the row's form at linear_attention.first is [PDL True, PDL_RELEASE True, ADD False, STORE_RESIDUAL True, "
-    ), "without it the census would say that the first norm of a step adds to a residual"
-
-    with pytest.raises(ValueError, match="^kernel_census.json: first_layer names attention.core, which the first layer of this model does not call$"):
-        changed(lambda rows: rows[census.FIRST_LAYER].update({"attention.core": {"form": {}}})).claim(plan, model, installed=RECORDED)
-    for change, sentence in (
-        (lambda rows: rows["epilogue"][0][2].update(form=["BF16_OUT"]), "1 rows, epilogue: the form of add_norm_quantize is not an object of form fields"),
-        (
-            lambda rows: rows.update({census.FIRST_LAYER: [["add_norm_quantize", {}]]}),
-            "1 rows: first_layer is not an object of block: facts (launch and at and form and class and pick)",
-        ),
-        (
-            lambda rows: rows[census.FIRST_LAYER]["add_norm_quantize"].update(forms={}),
-            "1 rows: first_layer is not an object of block: facts (launch and at and form and class and pick)",
-        ),
-        (lambda rows: rows[census.FIRST_LAYER]["add_norm_quantize"].update(form="first"), "first_layer: the form of add_norm_quantize is not an object"),
-    ):
-        with pytest.raises(ValueError) as refused:
-            changed(change)
-        assert str(refused.value).startswith("kernel_census.json: plain / cc10.0/sm148, ") and sentence in str(refused.value), sentence
 
 
 def test_the_norms_twin_and_its_band_on_stated_tensors():
@@ -5248,7 +4998,7 @@ def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
     consumers on fallback rows reading the kernel's bytes as they are.  Then the negative controls, each of which must
     fail the kernel check with its own sentence -- a call served in the form of another site (the launch records of that
     run are clean), a chain of other kernels under the row's name, a launch more in front of its kernel, a launch less, a
-    launch in another shape than the census recorded, a launch under the symbol of another form, a traced step without its
+    launch in another shape than the entry states, a launch under the symbol of another form, a traced step without its
     call log -- or fail the block in its band while the kernel check holds: a wrong code, a wrong block scale, a wrong
     normed element, a wrong element of the residual stream.  And the one thing the check does not see, pinned as that: a
     launch more BEHIND the kernel, in front of a fallback row, is counted as that row's."""
@@ -5270,7 +5020,7 @@ def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
 
     session, checks = run()
     assert checks.ok and checks.kernels == census.PASS, checks.text()
-    assert "12 on exact rows, in the wiring order" in _line(checks, "kernels ") and norm_line(checks).endswith("[band: add_norm_quant]  PASS")
+    assert "14 on exact rows, in the wiring order" in _line(checks, "kernels ") and norm_line(checks).endswith("[band: add_norm_quant]  PASS")
     assert "add_norm_quantize equal (gated)" in _line(checks, "batch invariance"), "each sequence alone writes the bytes it writes among two"
     log = session.traced.call_log[0]
     assert log[1] == census.Call("add_norm_quantize", 0, 2, "cudnn.AddNormQuantDecode #1", row.site_form("linear_attention.first"))
@@ -5338,16 +5088,9 @@ def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
         ]
     ), checks.text()
 
-    # (5) at one sequence the census holds the run: a launch in another shape than the recorded one, although the entry states that shape too
-    _, checks = run(sequences=1, norm_shape=((1, 1, 1), (320, 1, 1), 80))
-    assert not checks.ok and checks.kernels == census.FAIL
-    assert sentences(checks) == [
-        f"kernels: step 0 (and 3 more of the 4 traced steps): add_norm_quantize (layer {layer}) launched add_norm_quant with grid (1, 1, 1), "
-        f"block (320, 1, 1), shared memory 80 B; the {CENSUS} has grid (1, 1, 1), block (640, 1, 1), shared memory 80 B"
-        for layer in (0, 1, 2)
-    ], checks.text()
+    # (5) the clean run at one sequence
     _, checks = run(sequences=1)
-    assert checks.ok and any(f"{CENSUS}: NOT CLAIMED (" in line and COMPARED_12 in line for line in checks.lines), "held to the recorded shape, and said"
+    assert checks.ok and checks.kernels == census.PASS, checks.text()
 
     def tampered(change):
         """The clean run at one sequence with the records of its traced pass changed before the checks read them."""
@@ -5382,10 +5125,10 @@ def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
     # (5b) what the check sees behind a norm's kernel, and what it does not.  A launch more in FRONT of the first norm's kernel
     # fails (case 3: the gather before it is judged one by one).  The same launch directly BEHIND the kernel of a layer's input
     # norm fails too on this class: its consumer, the in-projection, is an exactly judged row.  So it does behind the norm in
-    # front of an MLP: its consumer is the fused gate / up kernel.  Behind the FINAL norm it sits in front of a fallback row
-    # (the output head) and is attributed to it: the check holds.  That the adapter launches nothing but its entry is held
-    # on the adapter itself (test_the_norm_entrys_adapter_over_a_stand_in_entry: the tensors it returns are the ones the
-    # entry wrote)
+    # front of an MLP: its consumer is the fused gate / up kernel.  And behind the FINAL norm: its consumer is the quantise
+    # of the head's operand, on its entry an exactly judged row as well.  That the adapter launches nothing but its entry is
+    # also held on the adapter itself (test_the_norm_entrys_adapter_over_a_stand_in_entry: the tensors it returns are the
+    # ones the entry wrote)
     def one_more_behind(which):
         def change(traced):
             for step in traced.steps:
@@ -5414,11 +5157,16 @@ def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
             "mlp.gate_up (layer 0): a kernel of the fallback family pytorch, which no row there declares; nothing may sit between two exact rows"
         ]
     ), checks.text()
-    clean, _ = tampered(lambda traced: None)
-    session, checks = tampered(one_more_behind(4))
-    assert checks.ok and checks.kernels == census.PASS, checks.text()
-    assert session.traced.result.launches == [count + 1 for count in clean.traced.result.launches]
-    assert session.traced.result.families["pytorch"] == [count + 1 for count in clean.traced.result.families["pytorch"]], "counted as the fallback row's"
+    _, checks = tampered(one_more_behind(4))
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks)
+        == [
+            f"kernels: step 0 (and 3 more of the 4 traced steps): launched {ELEMENTWISE[:93] + '...'!r} between add_norm_quantize (layer 2) and "
+            "output_head.quantize: a kernel of the fallback family pytorch, which no row there declares; nothing may sit between two exact rows"
+        ]
+    ), checks.text()
 
     # (5c) the call log is what item 0 reads: a traced pass that kept none, or the log of one step of four, fails -- the launch
     # records are those of the clean run
@@ -5439,7 +5187,6 @@ def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
                 "entry instance served a call"
             ]
         ), checks.text()
-        assert not any(COMPARED_12 in line for line in checks.lines), "nothing is said to have been compared"
 
     # (6) wrong bytes: the block fails in its band, the kernel check holds
     for defect, said in (
@@ -5451,7 +5198,7 @@ def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
         _, checks = run(norm_defect=defect)
         line = norm_line(checks)
         assert not checks.ok and checks.kernels == census.PASS and line.endswith("[band: add_norm_quant]  FAIL") and said(line), (defect, line)
-        assert _line(checks, "blocks").endswith("FAIL") and "7 of 8 provider blocks inside their bands" in _line(checks, "blocks"), defect
+        assert _line(checks, "blocks").endswith("FAIL") and "9 of 10 provider blocks inside their bands" in _line(checks, "blocks"), defect
 
 
 # ----------------------------------------------------------------------------------------------- the row of the FP8 projection entry
@@ -5468,7 +5215,7 @@ def test_the_projection_entrys_adapter_over_a_stand_in_entry(monkeypatch):
     from model_samples.blocks import DeviceFacts
     from model_samples.providers import BlockBase, Quant, fe
     from model_samples.qwen_dense import QwenDense, configs
-    from model_samples.weights import Dequantized, ScaledTensor, Unquantized
+    from model_samples.weights import BlockScaledTensor, Dequantized, ScaledTensor
     from dataclasses import replace
 
     calls = []
@@ -5538,8 +5285,8 @@ def test_the_projection_entrys_adapter_over_a_stand_in_entry(monkeypatch):
     per_row = ScaledTensor(codes, torch.full((48,), 0.013))
     with pytest.raises(ValueError, match=r"the weight of this call has one scale per weight row"):
         block(qx, Dequantized(codes.to(torch.bfloat16), per_row.scale, stored=per_row), "linear_attention.qkvz")
-    with pytest.raises(ValueError, match=r"^cudnn.Fp8ProjectionDecode multiplies static 8-bit codes; this block is handed Unquantized$"):
-        block(Unquantized(torch.zeros((2, 64), dtype=torch.bfloat16), "fp8", 1.0), weight, "linear_attention.qkvz")
+    with pytest.raises(ValueError, match=r"^cudnn.Fp8ProjectionDecode multiplies static 8-bit codes; this block is handed BlockScaledTensor$"):
+        block(BlockScaledTensor(torch.zeros((2, 32), dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.uint8), 1.0), weight, "linear_attention.qkvz")
     with pytest.raises(ValueError, match=r"no form for the call site 'mlp'; the row names linear_attention.qkvz, full_attention.qkv$"):
         block(qx, weight, "mlp")
     merged = fe.Fp8ProjectionDecodeBlock(row, model, facts, {"device": "cpu", "merge_rule": "own_scale"})
@@ -5557,7 +5304,7 @@ def test_the_projection_entrys_adapter_over_a_stand_in_entry(monkeypatch):
     assert Quant("fp8", 1.0).fmt == "fp8"
 
     # the PUBLIC entry, built for the host from the same arguments: it states every field of the row's form at every row count
-    # the row claims, and the launch shape the census records at 1 row; a shape or a split it does not serve is a wrong table
+    # the row claims, and its launch shape at 1 row; a shape or a split it does not serve is a wrong table
     monkeypatch.undo()
     monkeypatch.setattr(fe, "_ENTRIES", {})
     real = fe.Fp8ProjectionDecodeBlock(row, model, facts, {"device": "cpu", "check_kernels": True})
@@ -5590,7 +5337,7 @@ def _weights_of(weights, block):
 
 
 FIVE = ("projection.fp8.in", "projection.fp8.out", "mlp.gate_up", "mlp.down", "output_head")
-#: the blocks whose weights a run of the target stacks keeps on their stored format on compute capability 10.0: the two rows of
+#: the blocks whose weights a run of ``native`` or ``fe-entries`` keeps on their stored format on compute capability 10.0: the two rows of
 #: an entry that multiplies there (8-bit codes; 4-bit codes in the fused kernel's layout)
 KEPT = ("projection.fp8.in", "mlp.gate_up")
 OTHER_PLAN = "the weights of this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
@@ -5604,7 +5351,7 @@ def test_the_loader_keeps_each_weight_in_the_forms_the_plans_read(monkeypatch):
     copy of every weight and no stored tensor, as every stack did.  The bytes the family states for each form are the
     bytes a load holds; a block it keeps nothing for, a weight left without any form and a multiply handed a weight
     without the form it reads are each named."""
-    from model_samples.providers import library, torch_ref
+    from model_samples.providers import flashinfer_calls, library, torch_ref
     from model_samples.qwen_dense import QwenDense
     from model_samples.qwen_dense import model as family
     from model_samples.timing import Stages
@@ -5774,9 +5521,10 @@ def test_the_loader_keeps_each_weight_in_the_forms_the_plans_read(monkeypatch):
     # the stack native with its library rows keeps the weight of every multiply on its stored codes on compute capability 10.0,
     # and all but the in-projections on the other 10.x classes: what its plan asks for, what it holds, what a step reads
     others = FIVE[1:]
-    asked = [full.memory_bytes(1, 90, kept, kept) for kept in (FIVE, others)]
+    # ... with the one workspace the library's attention is handed
+    asked = [full.memory_bytes(1, 90, kept, kept) + flashinfer_calls.WORKSPACE_BYTES for kept in (FIVE, others)]
     assert (
-        " ".join(f"{need / GIB:.1f}" for need in asked) == "27.9 32.1" and full.check_bytes(FIVE) == 2 * 248320 * 5120
+        " ".join(f"{need / GIB:.1f}" for need in asked) == "28.2 32.5" and full.check_bytes(FIVE) == 2 * 248320 * 5120
     ), "the checks' one copy: the output head"
     for said in (
         f"it holds {(full.copy_bytes(FIVE) + full.stored_bytes(FIVE)) / GIB:.1f} GiB of weights, and its plan asks for about {asked[0] / GIB:.1f} GiB, "
@@ -5785,7 +5533,8 @@ def test_the_loader_keeps_each_weight_in_the_forms_the_plans_read(monkeypatch):
         f"weight of a multiply on its stored codes there: {(whole['copies'] + whole['state']) / 1e9:.1f} GB per step, the model's own bytes",
     ):
         assert said in readme, said
-    assert f"about {asked[0] / GIB:.0f} GiB and about {asked[1] / GIB:.0f} GiB there" in script, "the help's figures for native"
+    figures = f"about {asked[0] / GIB:.0f} GiB of free GPU memory on compute capability 10.0 and about {asked[1] / GIB:.0f} GiB on the other 10.x classes"
+    assert figures in script, "the help's figures for native"
 
 
 def test_a_run_keeps_no_copy_of_a_weight_that_every_plan_multiplies_on_its_stored_format(monkeypatch):
@@ -6209,7 +5958,7 @@ def test_the_checks_hold_a_weight_kept_on_its_stored_format_alone_to_the_bytes_o
         return next(line for line in checks.lines if line.strip().startswith("projection.fp8.in ") and "calls" in line)
 
     session, checks = run(projection_defect="writes")
-    assert "8 of 8 provider blocks inside their bands" in _line(checks, "blocks") and _line(checks, "blocks").endswith("PASS")
+    assert "10 of 10 provider blocks inside their bands" in _line(checks, "blocks") and _line(checks, "blocks").endswith("PASS")
     assert "largest distance 0.00 bf16 units" in projection_line(checks) and projection_line(checks).endswith("[band: bf16_rounding]  PASS")
     assert _line(checks, "replay").endswith("PASS") and _line(checks, "tokens").endswith("PASS") and checks.kernels == census_pass(), "every other line holds"
     failed = lines(checks, "  stored weights ")
@@ -6240,7 +5989,9 @@ def test_the_checks_hold_a_weight_kept_on_its_stored_format_alone_to_the_bytes_o
 
     session, checks = run(swiglu_defect="writes")
     failed = lines(checks, "  stored weights ")
-    assert not checks.ok and fused_line(checks).endswith("[band: swiglu_fp4]  PASS") and "8 of 8 provider blocks inside their bands" in _line(checks, "blocks")
+    assert (
+        not checks.ok and fused_line(checks).endswith("[band: swiglu_fp4]  PASS") and "10 of 10 provider blocks inside their bands" in _line(checks, "blocks")
+    )
     assert failed == [
         "  stored weights    2 of 4 weights this run keeps on their stored format alone hold the bytes of their load; written to since: "
         "mlp.gate_up of layer 0 (before the checks), mlp.gate_up of layer 1 (before the checks).  The reference's copy of such a weight "
@@ -6397,7 +6148,7 @@ def test_every_multiply_on_its_stored_format_through_a_session(monkeypatch):
     session.trace(4)
     checks = tie_out.run_checks(session, prompt_tokens=3)
     assert checks.ok and checks.kernels == census.PASS, checks.text()
-    assert _line(checks, "blocks").endswith("PASS") and "8 of 8 provider blocks inside their bands" in _line(checks, "blocks")
+    assert _line(checks, "blocks").endswith("PASS") and "10 of 10 provider blocks inside their bands" in _line(checks, "blocks")
     for block in FIVE:
         line = next(line for line in checks.lines if line.strip().startswith(block + " ") and "calls" in line)
         assert line.endswith("[band: swiglu_fp4]  PASS" if block == "mlp.gate_up" else "[band: bf16_rounding]  PASS"), line
@@ -6453,47 +6204,38 @@ def test_every_multiply_on_its_stored_format_through_a_session(monkeypatch):
 
 
 def test_the_projection_row_on_other_classes_and_row_counts():
-    """The row of the FP8 projection entry is the target's on compute capability 10.0 and up to 32 rows: there the target
-    launches this kernel for the in-projections.  On every other class, and above 32 rows, the block stays on its multiply
-    over a copy and the plan prints the fallback reason; the entry is not selected onto a class or a row count its row does
-    not claim; and a row that names another kernel than the census is ``not the target`` by its form."""
+    """The row of the FP8 projection entry serves compute capability 10.0 and up to 32 rows.  On every other class, and
+    above 32 rows, the block stays on its multiply over a copy and the plan prints the fallback reason; the entry is not
+    selected onto a class or a row count its row does not claim; a block selected back onto the copy is on its fallback
+    row; and a row that names another form of the entry is served in that form."""
     from dataclasses import replace
 
     from model_samples import census
     from model_samples.blocks import DeviceFacts, plan
     from model_samples.qwen_dense import QwenDense, configs
 
-    target = QwenDense.target()
     for cc, sms in (((10, 3), 152), ((10, 7), 212), ((12, 0), 170)):
-        planned, model, _ = _target_plan(2, cc=cc, sms=sms)
+        planned, model = _stack_plan(2, cc=cc, sms=sms)
         assert planned.rows["projection.fp8.in"].key == "cublas.bf16_dequantized", cc
         line = next(line for line in planned.table().splitlines() if line.split()[0] == "projection.fp8.in")
         assert line.endswith("fallback: bf16 copy of 8-bit weights") and "torch.matmul over a bf16 copy" in line, line
-        assert not target.claim(planned, model, installed=RECORDED).known, "no recorded section of the class: no identity is stated"
         with pytest.raises(NotImplementedError, match=rf"^cudnn.Fp8ProjectionDecode serves compute capability 10.0; this device is {cc[0]}.{cc[1]}$"):
-            _target_plan(2, cc=cc, sms=sms, overrides={"projection.fp8.in": "fe.fp8_projection_decode"})
+            _stack_plan(2, cc=cc, sms=sms, overrides={"projection.fp8.in": "fe.fp8_projection_decode"})
     for sequences, key in ((32, "fe.fp8_projection_decode"), (33, "cublas.bf16_dequantized")):
-        planned, model, _ = _target_plan(2, sequences=sequences)
+        planned, model = _stack_plan(2, sequences=sequences)
         assert planned.rows["projection.fp8.in"].key == key, sequences
     with pytest.raises(
         NotImplementedError,
         match=r"^cudnn.Fp8ProjectionDecode serves rows 1-32, weights 16384 x 5120 and 14336 x 5120; this run has 33 sequences x 1 tokens per sequence$",
     ):
-        _target_plan(2, sequences=33, overrides={"projection.fp8.in": "fe.fp8_projection_decode"})
-    # on the class and at 1 row: the target; selected back onto the copy with --provider: not the target set, and said
-    planned, model, _ = _target_plan(2)
-    claim = target.claim(planned, model, installed=RECORDED)
-    assert claim.of("projection.fp8.in") == "target" and claim.numbers()["target_port"] == 10
-    selected, model, _ = _target_plan(2, overrides={"projection.fp8.in": "cublas.bf16_dequantized"})
-    claim = target.claim(selected, model, installed=RECORDED)
-    assert (
-        claim.reasons[0] == "not the target set: projection.fp8.in selected by --provider"
-        and claim.of("projection.fp8.in") == "not yet (bf16 copy of 8-bit weights)"
-    )
-    assert (
-        claim.numbers()["target_port"] == 8 and claim.compared()[0] == 12
-    ), "ten ports and code launches less two in-projections, and the library's two down multiplies"
-    # a row that states another kernel than the census names (a ring of 7 stages): the same entry, not the target, by its form
+        _stack_plan(2, sequences=33, overrides={"projection.fp8.in": "fe.fp8_projection_decode"})
+    # on the class and at 1 row: the entry's row; selected back onto the copy with --provider: the fallback row with its reason, two exact launches fewer
+    planned, model = _stack_plan(2)
+    assert planned.rows["projection.fp8.in"].key == "fe.fp8_projection_decode" and not planned.rows["projection.fp8.in"].fallback
+    selected, model = _stack_plan(2, overrides={"projection.fp8.in": "cublas.bf16_dequantized"})
+    assert selected.overridden == ("projection.fp8.in",) and selected.rows["projection.fp8.in"].fallback == "bf16 copy of 8-bit weights"
+    assert census.table(selected).splitlines()[-1].startswith("  per step: 18 launches on 11 exact rows"), "the twenty less the two in-projections"
+    # a row that states another form of the entry (a ring of 7 stages): the same entry, served in the row's form
     table = dict(configs.PROVIDERS)
     row = table["projection.fp8.in"][0]
     other = replace(row, form=tuple(("STAGES", 7) if name == "STAGES" else (name, value) for name, value in row.form))
@@ -6501,16 +6243,8 @@ def test_the_projection_row_on_other_classes_and_row_counts():
     model = QwenDense.reduced(2)
     facts = DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
     planned = plan(table, model.regimes, facts, 1, 1, "fe-entries", model=model, options={"device": "cpu"})
-    claim = target.claim(planned, model, installed=RECORDED)
-    form = PROJECTION_FORM + ", OUT_FEATURES 16384, IN_FEATURES 5120]"
-    assert claim.identities[2] == census.Identity(
-        census.OTHER, "fp8_projection", "port", f"the row's form at linear_attention.qkvz is {form.replace('STAGES 8', 'STAGES 7')}, the target's {form}"
-    )
-    assert claim.numbers()["not_the_target"] == {"projection.fp8.in": 2} and claim.numbers()["target_port"] == 8 and len(claim.recorded) == 10
     sites = census.expected(planned, model)
-    assert (
-        census.check_forms(sites) == [] and sites[2].facts.form["STAGES"] == 7
-    ), "the row and its entry agree: the form is the row's, and it is not the census's"
+    assert census.check_forms(sites) == [] and sites[2].facts.form["STAGES"] == 7, "the row and its entry agree: the form is the row's"
 
 
 def test_a_session_hands_its_merge_rule_to_the_plan(monkeypatch):
@@ -6566,7 +6300,7 @@ def test_the_projection_row_through_a_session_and_what_fails_it(monkeypatch):
     negative controls, each of which must fail the kernel check with its own sentence -- a call served by the instance of
     the other shape, the kernels of a multiply over a copy under the row's name, a launch more in front of its kernel, a
     launch more behind it where its consumer is judged one by one, a launch less, a launch in another shape than the
-    census recorded, the two launches of a step in each other's grid -- or fail the block in its band while the kernel
+    entry states, the two launches of a step in each other's grid -- or fail the block in its band while the kernel
     check holds: a wrong element.  And what the check does not see, pinned as that: a launch more behind the kernel in an
     attention layer is counted as the fallback row's that follows."""
     from model_samples import census, tie_out
@@ -6589,7 +6323,7 @@ def test_the_projection_row_through_a_session_and_what_fails_it(monkeypatch):
     every = "kernels: step 0 (and 3 more of the 4 traced steps): "
     session, checks = run()
     assert checks.ok and checks.kernels == census.PASS, checks.text()
-    assert "12 on exact rows, in the wiring order" in _line(checks, "kernels ") and multiply_line(checks).endswith("[band: bf16_rounding]  PASS")
+    assert "14 on exact rows, in the wiring order" in _line(checks, "kernels ") and multiply_line(checks).endswith("[band: bf16_rounding]  PASS")
     assert "projection.fp8.in equal (gated)" in _line(checks, "batch invariance"), "each sequence alone writes the bytes it writes among two"
     log = session.traced.call_log[0]
     assert [(call.layer, call.instance, call.form) for call in log if call.block == "projection.fp8.in"] == [
@@ -6628,13 +6362,18 @@ def test_the_projection_row_through_a_session_and_what_fails_it(monkeypatch):
         and sentences(checks) == [f"{every}{launched} add_norm_quantize (layer {layer}) and projection.fp8.in (layer {layer}): {nothing}" for layer in (0, 1)]
     ), checks.text()
 
-    # (4) one launch more behind its kernel: in a linear-attention layer its consumer is the fused step, judged one by one; in an
-    # attention layer the consumer is a reference chain, and the launch is counted as that row's -- what the check does not see
+    # (4) one launch more behind its kernel: in a linear-attention layer its consumer is the fused step, in an attention layer the
+    # attention preparation's entry -- both judged one by one, so the launch fails in both layers (while that consumer was a
+    # reference chain, the launch of the attention layer was counted as the chain's)
     _, checks = run(projection_defect="behind")
     assert (
         not checks.ok
         and checks.kernels == census.FAIL
-        and sentences(checks) == [f"{every}{launched} projection.fp8.in (layer 0) and linear_attention.step (layer 0): {nothing}"]
+        and sentences(checks)
+        == [
+            f"{every}{launched} projection.fp8.in (layer 0) and linear_attention.step (layer 0): {nothing}",
+            f"{every}{launched} projection.fp8.in (layer 1) and attention.prepare (layer 1): {nothing}",
+        ]
     ), checks.text()
 
     # (5) one launch less: the in-projection of the attention layer does not launch
@@ -6648,16 +6387,7 @@ def test_the_projection_row_through_a_session_and_what_fails_it(monkeypatch):
         ]
     ), checks.text()
 
-    # (6) at one sequence the census holds the run: a launch in another shape than the recorded one, although the entry states it too
-    _, checks = run(sequences=1, projection_shape=((128, 1, 1), (256, 1, 1), 147712))
-    assert not checks.ok and checks.kernels == census.FAIL
-    assert sentences(checks) == [
-        f"{every}projection.fp8.in (layer {layer}) launched fp8_projection with grid (128, 1, 1), block (256, 1, 1), shared memory 147,712 B; "
-        f"the {CENSUS} has grid ({grid}, 1, 1), block (256, 1, 1), shared memory 139,520 B"
-        for layer, grid in ((0, 128), (1, 112))
-    ], checks.text()
-
-    # (6a) the two launches of a step in each other's grid, under their own symbols: the census and the entry both see it
+    # (6) the two launches of a step in each other's grid, under their own symbols: each is held to the grid its entry states
     def swap_grids(traced):
         for step in traced.steps:
             first, second = (index for index, record in enumerate(step) if census.canonical(record) == "fp8_projection")
@@ -6670,17 +6400,15 @@ def test_the_projection_row_through_a_session_and_what_fails_it(monkeypatch):
     assert not checks.ok and checks.kernels == census.FAIL
     assert sentences(checks) == [
         f"{every}projection.fp8.in (layer {layer}) launched fp8_projection with grid ({found}, 1, 1), block (256, 1, 1), shared memory 139,520 B; "
-        f"{who} grid ({grid}, 1, 1), block (256, 1, 1), shared memory 139,520 B"
+        f"cudnn.Fp8ProjectionDecode states grid ({grid}, 1, 1), block (256, 1, 1), shared memory 139,520 B"
         for layer, found, grid in ((0, 112, 128), (1, 128, 112))
-        for who in (f"the {CENSUS} has", "cudnn.Fp8ProjectionDecode states")
     ], checks.text()
-    assert not any(COMPARED_12 in line for line in checks.lines), "nothing is said to have been compared"
 
     # (7) a wrong element: the block fails in its band, the kernel check holds
     _, checks = run(projection_defect="element")
     line = multiply_line(checks)
     assert not checks.ok and checks.kernels == census.PASS and line.endswith("[band: bf16_rounding]  FAIL"), line
-    assert _line(checks, "blocks").endswith("FAIL") and "7 of 8 provider blocks inside their bands" in _line(checks, "blocks")
+    assert _line(checks, "blocks").endswith("FAIL") and "9 of 10 provider blocks inside their bands" in _line(checks, "blocks")
 
 
 # ----------------------------------------------------------------------------------------------- the rows of the fused gate / up entry
@@ -6856,7 +6584,7 @@ def test_the_gate_up_entrys_adapter_over_a_stand_in_entry(monkeypatch):
             fe.SwigluFp4DecodeBlock(wrong, model, facts, {"device": "cpu"}).check_support(1, 1)
 
     # the PUBLIC entry, built for the host from the same arguments: it states every field of a row's form at every row count the
-    # row claims, the launch shape the census records up to 32 rows, and no symbol before a build.  The config's token tile is a
+    # row claims, its launch shape up to 32 rows, and no symbol before a build.  The config's token tile is a
     # FLOOR -- outside its row's range an instance runs another tile -- which is why the table has a row per tile
     monkeypatch.undo()
     monkeypatch.setattr(fe, "_ENTRIES", {})
@@ -7086,8 +6814,8 @@ def test_the_gate_up_row_through_a_session_and_what_fails_it(monkeypatch):
     MLP from one instance, inside the band of the entry's twin, a sequence alone as among two, the consumer on its fallback
     row reading the kernel's bytes as they are.  Then the negative controls, each of which must fail the kernel check with
     its own sentence -- a call served in another form, the kernels of a multiply over a copy under the row's name, a launch
-    more in front of its kernel (behind the norm's, which is judged one by one), a launch less, a launch in another shape
-    than the census recorded, a launch in another shape than the entry states -- or fail the block in its band while the
+    more in front of its kernel (behind the norm's, which is judged one by one), a launch less, a launch in another grid,
+    a launch in another shape than the entry states -- or fail the block in its band while the
     kernel check holds: a wrong code, a wrong block scale.  And what the check does not see, pinned as that: a launch more
     behind the kernel is counted as the fallback row's that follows."""
     from model_samples import census, tie_out
@@ -7110,7 +6838,7 @@ def test_the_gate_up_row_through_a_session_and_what_fails_it(monkeypatch):
     every = "kernels: step 0 (and 3 more of the 4 traced steps): "
     session, checks = run()
     assert checks.ok and checks.kernels == census.PASS, checks.text()
-    assert "12 on exact rows, in the wiring order" in _line(checks, "kernels ") and fused_line(checks).endswith("[band: swiglu_fp4]  PASS")
+    assert "14 on exact rows, in the wiring order" in _line(checks, "kernels ") and fused_line(checks).endswith("[band: swiglu_fp4]  PASS")
     assert "mlp.gate_up equal (gated)" in _line(checks, "batch invariance"), "each sequence alone writes the bytes it writes among two"
     log = session.traced.call_log[0]
     assert [(call.layer, call.instance, call.form) for call in log if call.block == "mlp.gate_up"] == [
@@ -7169,17 +6897,9 @@ def test_the_gate_up_row_through_a_session_and_what_fails_it(monkeypatch):
         == [f"{every}mlp.gate_up (layer 1) did not launch swiglu_fp4: the step has 1 launch(es) of swiglu_fp4, the plan 2 = 2 call(s) x 1 per call"]
     ), checks.text()
 
-    # (6) at one sequence the census holds the run: a launch on another thread-block count than the recorded one (the cap of a part
-    # with more SMs), although the entry states that shape too
-    _, checks = run(sequences=1, swiglu_shape=((1, 1, 152), (192, 1, 1), 231424))
-    assert not checks.ok and checks.kernels == census.FAIL
-    assert sentences(checks) == [
-        f"{every}mlp.gate_up (layer {layer}) launched swiglu_fp4 with grid (1, 1, 152), block (192, 1, 1), shared memory 231,424 B; "
-        f"the {CENSUS} has grid (1, 1, 148), block (192, 1, 1), shared memory 231,424 B"
-        for layer in (0, 1)
-    ], checks.text()
+    # (6) the clean run at one sequence
     _, checks = run(sequences=1)
-    assert checks.ok and any(f"{CENSUS}: NOT CLAIMED (" in line and COMPARED_12 in line for line in checks.lines), "held to the recorded shape, and said"
+    assert checks.ok and checks.kernels == census.PASS, checks.text()
 
     # (6a) the launch in another shape than the entry states, field by field: the grid, the block, the shared memory
     def tampered(**fields):
@@ -7209,7 +6929,7 @@ def test_the_gate_up_row_through_a_session_and_what_fails_it(monkeypatch):
         _, checks = run(swiglu_defect=defect)
         line = fused_line(checks)
         assert not checks.ok and checks.kernels == census.PASS and line.endswith("[band: swiglu_fp4]  FAIL"), (defect, line)
-        assert not line.split("; ")[-1].startswith("0 outside") and "7 of 8 provider blocks inside their bands" in _line(checks, "blocks"), defect
+        assert not line.split("; ")[-1].startswith("0 outside") and "9 of 10 provider blocks inside their bands" in _line(checks, "blocks"), defect
 
 
 def test_the_gate_up_rows_on_other_classes_row_counts_and_widths():
@@ -7217,24 +6937,22 @@ def test_the_gate_up_rows_on_other_classes_row_counts_and_widths():
     one row per token tile, selected by the row count; from 65 rows, on compute capability 12.x and for a checkpoint of
     the family with another MLP width the block stays on its multiply over a copy and the plan prints the fallback reason
     -- never an error.  The entry is not selected onto a class or a row count its rows do not claim.  On the other 10.x
-    classes the rows are selected and no identity is stated (the census has no section there).  And a row that names
-    another cluster cap than the census is ``not the target`` by its form."""
+    classes the rows are selected.  And a row that names another cluster cap is served in that form."""
     from dataclasses import replace
 
     from model_samples import census
     from model_samples.blocks import DeviceFacts, plan
     from model_samples.qwen_dense import QwenDense, configs
 
-    target = QwenDense.target()
     fallback = "cublas.bf16_dequantized+torch_ref.silu_mul_quantize"
     for sequences, tile in ((1, 8), (8, 8), (9, 16), (16, 16), (17, 32), (32, 32), (33, 64), (64, 64)):
-        planned, model, _ = _target_plan(2, sequences=sequences)
+        planned, model = _stack_plan(2, sequences=sequences)
         row = planned.rows["mlp.gate_up"]
         assert row.key == "fe.swiglu_fp4_decode" and dict(row.form)["TOKEN_TILE"] == tile and row.rows[0] <= sequences <= row.rows[1], sequences
         assert (
             census.check_forms(census.expected(planned, model)) == []
         ), f"{sequences} rows: the row's form is the entry's own (the public entry, built for the host)"
-    planned, model, _ = _target_plan(2, sequences=65)
+    planned, model = _stack_plan(2, sequences=65)
     assert planned.rows["mlp.gate_up"].key == fallback, "from 65 rows the block is the multiply over a copy"
     line = next(line for line in planned.table().splitlines() if line.split()[0] == "mlp.gate_up")
     assert line.endswith("fallback: bf16 copy of 4-bit weights") and "torch.matmul over a bf16 copy + torch_ref.silu_mul_quantize" in line, line
@@ -7242,65 +6960,45 @@ def test_the_gate_up_rows_on_other_classes_row_counts_and_widths():
         NotImplementedError,
         match=r"^cudnn.SwigluFp4Decode serves rows 1-8 of 1-64, hidden 5120, intermediate 17408; this run has 65 sequences x 1 tokens per sequence$",
     ):
-        _target_plan(2, sequences=65, overrides={"mlp.gate_up": "fe.swiglu_fp4_decode"})
-    assert _target_plan(2, sequences=40, overrides={"mlp.gate_up": "fe.swiglu_fp4_decode"})[0].rows["mlp.gate_up"].rows == (
+        _stack_plan(2, sequences=65, overrides={"mlp.gate_up": "fe.swiglu_fp4_decode"})
+    assert _stack_plan(2, sequences=40, overrides={"mlp.gate_up": "fe.swiglu_fp4_decode"})[0].rows["mlp.gate_up"].rows == (
         33,
         64,
     ), "--provider: the row of the run's rows"
-    # the other 10.x classes: the rows are the entry's, and the census has no section of the class -- no identity is stated
+    # the other 10.x classes: the rows are the entry's; the in-projection, whose row serves compute capability 10.0 alone, is on its
+    # multiply over a copy there, and the plan counts it so
     for cc, sms in (((10, 3), 152), ((10, 7), 212)):
-        planned, model, _ = _target_plan(64, cc=cc, sms=sms)
+        planned, model = _stack_plan(64, cc=cc, sms=sms)
         assert planned.rows["mlp.gate_up"].key == "fe.swiglu_fp4_decode" and planned.rows["projection.fp8.in"].key == "cublas.bf16_dequantized", cc
-        claim = target.claim(planned, model, installed=RECORDED)
-        assert not claim.known and claim.coverage()[0].startswith(
-            f"kernel identity: not stated for this run (no recorded section for cc {cc[0]}.{cc[1]} / {sms} SMs"
-        ), cc
-        # ... what a section of such a class would count: the target runs a library multiply for the in-projections there
-        data = __import__("copy").deepcopy(target.data)
-        data["configurations"]["plain"][f"cc{cc[0]}.{cc[1]}/sm{sms}"] = __import__("copy").deepcopy(data["configurations"]["plain"]["cc10.0/sm148"])
-        there = census.Target(data).claim(planned, model, installed=RECORDED).numbers()
-        assert (there["target_code"], there["target_port"]) == (178, 209) and there["not_yet"]["projection.fp8.in"] == 64, cc
+        assert census.table(planned).splitlines()[-1].startswith("  per step: 420 launches on 11 exact rows"), "the 484 less the 64 in-projections"
     # compute capability 12.x: the multiply over a copy, with its reason; --provider cannot put the entry there
-    planned, model, _ = _target_plan(2, cc=(12, 0), sms=170)
+    planned, model = _stack_plan(2, cc=(12, 0), sms=170)
     assert planned.rows["mlp.gate_up"].key == fallback
     with pytest.raises(NotImplementedError, match=r"^cudnn.SwigluFp4Decode serves compute capability 10.x; this device is 12.0$"):
-        _target_plan(2, cc=(12, 0), sms=170, overrides={"mlp.gate_up": "fe.swiglu_fp4_decode"})
-    # a checkpoint of the family with another MLP width: not this row's, on any class -- the next row, and no identity stated
+        _stack_plan(2, cc=(12, 0), sms=170, overrides={"mlp.gate_up": "fe.swiglu_fp4_decode"})
+    # a checkpoint of the family with another MLP width: not this row's, on any class -- the next row
     wider = QwenDense(replace(QwenDense.reduced(2).geometry, mlp=20480), ("another MLP width",))
     facts = DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
     planned = plan(wider.provider_table, wider.regimes, facts, 1, 1, "fe-entries", model=wider, options={"device": "cpu"})
     assert planned.rows["mlp.gate_up"].key == fallback and planned.rows["add_norm_quantize"].key == "fe.add_norm_quant_decode"
-    claim = target.claim(planned, wider, installed=RECORDED)
-    assert claim.coverage() == [
-        "kernel identity: not stated for this run (no recorded section for this model's widths on cc 10.0 / 148 SMs: mlp 20480 (recorded 17408))"
-    ]
     with pytest.raises(NotImplementedError, match=r"^cudnn.SwigluFp4Decode serves hidden 5120, mlp 17408; this model has mlp 20480$"):
         plan(wider.provider_table, wider.regimes, facts, 1, 1, "fe-entries", {"mlp.gate_up": "fe.swiglu_fp4_decode"}, model=wider, options={"device": "cpu"})
-    # on the class and at 1 row: the target; selected back onto the copy with --provider: not the target set, and said
-    planned, model, _ = _target_plan(2)
-    claim = target.claim(planned, model, installed=RECORDED)
-    assert claim.of("mlp.gate_up") == "target" and claim.numbers()["target_port"] == 10
-    selected, model, _ = _target_plan(2, overrides={"mlp.gate_up": fallback})
-    claim = target.claim(selected, model, installed=RECORDED)
-    assert claim.reasons[0] == "not the target set: mlp.gate_up selected by --provider" and claim.of("mlp.gate_up") == "not yet (bf16 copy of 4-bit weights)"
-    assert claim.numbers()["target_port"] == 8 and claim.compared()[0] == 12, "less the two gate / up launches, with the library's two down multiplies"
-    # a row that states another kernel than the census names (a cap of 152 thread blocks): the same entry, not the target, by its form
+    # on the class and at 1 row: the entry's row; selected back onto the copy with --provider: the fallback row with its reason, two exact launches fewer
+    planned, model = _stack_plan(2)
+    assert planned.rows["mlp.gate_up"].key == "fe.swiglu_fp4_decode" and not planned.rows["mlp.gate_up"].fallback
+    selected, model = _stack_plan(2, overrides={"mlp.gate_up": fallback})
+    assert selected.overridden == ("mlp.gate_up",) and selected.rows["mlp.gate_up"].fallback == "bf16 copy of 4-bit weights"
+    assert census.table(selected).splitlines()[-1].startswith("  per step: 18 launches on 11 exact rows"), "the twenty less the two gate / up launches"
+    # a row that states another form of the entry (a cap of 152 thread blocks): the same entry, served in the row's form
     table = dict(configs.PROVIDERS)
     rows = table["mlp.gate_up"]
     capped = replace(rows[0], form=tuple(("MAX_CLUSTERS", 152) if name == "MAX_CLUSTERS" else (name, value) for name, value in rows[0].form))
     table["mlp.gate_up"] = [capped, *rows[1:]]
     model = QwenDense.reduced(2)
     planned = plan(table, model.regimes, facts, 1, 1, "fe-entries", model=model, options={"device": "cpu"})
-    claim = target.claim(planned, model, installed=RECORDED)
-    everywhere = "PREWAIT_STAGES 2, L2_EVICT_FIRST True, MAX_CLUSTERS 148, PDL True"
-    reason = f"the row's form is {SWIGLU_FORM.replace('MAX_CLUSTERS 148', 'MAX_CLUSTERS 152')}, the target's [{everywhere}, TOKEN_TILE 8]"
-    assert claim.identities[claim.blocks.index("mlp.gate_up")] == census.Identity(census.OTHER, "swiglu_fp4", "port", reason)
-    assert claim.numbers()["not_the_target"] == {"mlp.gate_up": 2} and claim.numbers()["target_port"] == 8 and len(claim.recorded) == 10
     sites = census.expected(planned, model)
     fused = next(site for site in sites if site.block == "mlp.gate_up")
-    assert (
-        census.check_forms(sites) == [] and fused.facts.form["MAX_CLUSTERS"] == 152
-    ), "the row and its entry agree: the form is the row's, and it is not the census's"
+    assert census.check_forms(sites) == [] and fused.facts.form["MAX_CLUSTERS"] == 152, "the row and its entry agree: the form is the row's"
     assert tuple(fused.facts.shape) == ((1, 1, 152), (192, 1, 1), 231424), "the cap is the grid: this field of the form does show in a launch record"
 
 
@@ -7362,10 +7060,6 @@ LA_OUT, FA_OUT = "projection.fp8.out at linear_attention.out", "projection.fp8.o
 #: the form of the row of the FP8 projection entry for the out-projection of a verify step of 2 to 8 rows, at its one call site
 OUT_FORM = "[SPLIT_K 2, MMA_M 64, STAGES 11, TOKEN_TILE 8, TMEM_COLS 32, PREWAIT_WEIGHTS True, HOLD_TMEM True, PDL True, PDL_RELEASE True, OUT_FEATURES 5120, IN_FEATURES 6144]"
 OUT_SYMBOL = "cudnn_kernel_frost_fp8_projection_decode_n5120k6144s2r6_m64g11t8c32_w1h1p1q1_0"
-COMPARED_13 = (
-    "13 launches of a step compared by launch shape (2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results "
-    "+ 0 declared stand-ins)"
-)
 
 
 def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fails_it(monkeypatch):
@@ -7373,12 +7067,12 @@ def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fail
     decode session and a verify session of one sequence x six tokens on one load, on the stand-ins of the entries (the
     projection's multiplies on the stored codes the loader kept).  Clean, the verify run holds: the linear-attention
     layer's call is the entry's, judged against the reference multiply under its own name and served by the instance of
-    its row; the attention layer's call is the multiply over a copy; 13 launches of a step are judged one by one, each
-    in the recorded shape; and the decode session of the same load is the plan it was.  Then the negative controls on
+    its row; the attention layer's call is the multiply over a copy; 15 launches of a step are judged one by one; and
+    the decode session of the same load is the plan it was.  Then the negative controls on
     the verify plan, each of which must fail with its own sentence: the kernel of the other row range (another split);
     the entry's kernel at the attention layer's call; the kernels of a multiply over a copy under the row's name; a
     launch more in front of the kernel and behind it (it stands between two rows that are judged one by one); a launch
-    less; a launch in another shape than the recorded one; and, with the kernel check holding, a wrong element and
+    less; a launch in another shape than the entry states; and, with the kernel check holding, a wrong element and
     another weight of the same shape, which fail the block in its band.
 
     The ids of the steps are those of seed 0.  The token line of the tiny geometry moves with them -- its rows are 64
@@ -7404,12 +7098,12 @@ def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fail
     every = "kernels: step 0 (and 2 more of the 3 traced steps): "
     verify, decode, checks = run()
     assert checks.ok and checks.kernels == census.PASS, checks.text()
-    assert "13 on exact rows, in the wiring order" in _line(checks, "kernels ")
+    assert "15 on exact rows, in the wiring order" in _line(checks, "kernels ")
     assert judged(checks, LA_OUT).endswith("[band: bf16_rounding]  PASS") and judged(checks, FA_OUT).endswith("[band: bf16_rounding]  PASS")
     assert not any(
         line.split()[:1] == ["projection.fp8.out"] and line.split()[1].isdigit() for line in checks.lines
     ), "each call site is judged under its own name"
-    assert "9 of 9 provider blocks inside their bands" in _line(checks, "blocks")
+    assert "11 of 11 provider blocks inside their bands" in _line(checks, "blocks")
     log = verify.traced.call_log[0]
     assert [(call.layer, call.instance, call.form) for call in log if call.block == "projection.fp8.out"] == [
         (0, "cudnn.Fp8ProjectionDecode #1", small.site_form("linear_attention.out")),
@@ -7419,12 +7113,6 @@ def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fail
     assert _line(checks, f"{LA_OUT}: cudnn.Fp8ProjectionDecode {OUT_FORM}, 1 launch per step (1 call x 1 per call); ").endswith(
         f"the entry states grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B and the kernel {OUT_SYMBOL}"
     )
-    assert _line(checks, "kernel identity, as planned: ").strip() == (
-        "kernel identity, as planned: 13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries "
-        "with byte-equal results); not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1; 1 declared "
-        "stand-in (not yet: output_head.quantize)"
-    )
-    assert _line(checks, CENSUS_VERIFY).endswith(f"{COMPARED_13}: each in the recorded one")
     records = [record for record in verify.traced.steps[0] if census.canonical(record) == "fp8_projection"]
     assert [record.shape for record in records] == [PROJECTION_SHAPE[16384], OUT_SHAPE, PROJECTION_SHAPE[14336]], "in-projection, out-projection, in-projection"
 
@@ -7439,10 +7127,10 @@ def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fail
     plain = tie_out.run_checks(decode, prompt_tokens=3)
     assert plain.ok and plain.kernels == census.PASS, plain.text()
     assert judged(plain, "projection.fp8.out").endswith("[band: bf16_rounding]  PASS") and " at linear_attention.out" not in plain.text()
-    assert "12 on exact rows, in the wiring order" in _line(plain, "kernels ") and _line(plain, CENSUS).endswith(f"{COMPARED_12}: each in the recorded one")
+    assert "14 on exact rows, in the wiring order" in _line(plain, "kernels ")
 
     # (1) the split of the other row range: the kernel of 9 to 16 rows -- four K slices, its own symbol and shape -- from an
-    # instance that states that form.  The objects, the census and the entry's own symbol each say it
+    # instance that states that form.  The objects, the entry's own launch shape and its symbol each say it
     _, _, checks = run(out_defect="split")
     other = OUT_FORM.replace("SPLIT_K 2", "SPLIT_K 4").replace("STAGES 11", "STAGES 7").replace("TOKEN_TILE 8", "TOKEN_TILE 16")
     assert (
@@ -7453,10 +7141,6 @@ def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fail
             (
                 f"kernels: form: projection.fp8.out (layer 0), the call at linear_attention.out: the adapter served the call with the form {other} "
                 f"(cudnn.Fp8ProjectionDecode #2); the row says {OUT_FORM}"
-            ),
-            (
-                f"{every}projection.fp8.out (layer 0) launched fp8_projection with grid (80, 4, 1), block (256, 1, 1), shared memory 84,352 B; "
-                f"the {CENSUS_VERIFY} has grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B"
             ),
             (
                 f"{every}projection.fp8.out (layer 0) launched 'cudnn_kernel_frost_fp8_projection_decode_n5120k6144s4r6_m64g7t16c32_w1h1p1q1_0'; "
@@ -7498,7 +7182,7 @@ def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fail
         _, _, checks = run(out_defect=defect)
         assert not checks.ok and checks.kernels == census.FAIL and sentences(checks) == [f"{every}{launched} {where}: {nothing}"], checks.text()
 
-    # (7) a launch in another shape than the recorded one -- the shared memory of the 16-row token tile: the census and the entry
+    # (7) a launch in another shape than the entry states -- the shared memory of the 16-row token tile
     verify, _ = _verify_run(monkeypatch)
     verify.trace(4)
     for step in verify.traced.steps:
@@ -7511,11 +7195,9 @@ def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fail
         and checks.kernels == census.FAIL
         and sentences(checks)
         == [
-            f"{every}{found}the {CENSUS_VERIFY} has grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B",
             f"{every}{found}cudnn.Fp8ProjectionDecode states grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B",
         ]
     ), checks.text()
-    assert not any(COMPARED_13 in line for line in checks.lines), "nothing is said to have been compared"
 
     # (8) a wrong element, and (9) another weight of the same shape under the row's name: the block fails in its band against
     # the reference multiply, the kernel check holds
@@ -7523,7 +7205,7 @@ def test_the_out_projection_row_of_a_verify_step_through_a_session_and_what_fail
         _, _, checks = run(out_defect=defect)
         line = judged(checks, LA_OUT)
         assert not checks.ok and checks.kernels == census.PASS and line.endswith("[band: bf16_rounding]  FAIL"), line
-        assert _line(checks, "blocks").endswith("FAIL") and "8 of 9 provider blocks inside their bands" in _line(checks, "blocks")
+        assert _line(checks, "blocks").endswith("FAIL") and "10 of 11 provider blocks inside their bands" in _line(checks, "blocks")
         assert judged(checks, FA_OUT).endswith("PASS"), "the other call site is another row, judged on its own"
 
 
@@ -7669,7 +7351,7 @@ def test_the_loader_keeps_the_out_projection_weights_by_call_site(monkeypatch):
     ), "a step reads these weights at one byte per element, not two"
 
 
-def _draft_run(monkeypatch, drafted=5, steps=3, stack="fe-entries", verify=True, drafter=False, total=0, **stand_in):
+def _draft_run(monkeypatch, drafted=5, steps=3, stack="fe-entries", verify=True, drafter=False, total=0, max_model_len=DEFAULT_LENGTH, **stand_in):
     """A session built with ``draft_tokens=`` on the stand-in providers and the stand-in profiler of :func:`_stand_ins`,
     behind a plain session on the same load: a prompt through ``prefill``, then ``steps`` verify steps of seeded ids, each
     keeping another count (``verify=False``: the prompt alone).  Returns the session, its run recorded and no traced pass
@@ -7681,24 +7363,22 @@ def _draft_run(monkeypatch, drafted=5, steps=3, stack="fe-entries", verify=True,
     session starts with the session's own greedy token, and behind the ids of seed 1 the stand-ins leave the band in
     every stack).  ``total``: the memory of the device the plans are resolved for; 0 is a plan on stated device facts,
     which asks nothing of an installation."""
-    from model_samples import Session, TextIO, blocks, census
+    from model_samples import Session, TextIO, blocks
 
-    from model_samples.qwen_dense import QwenDense, QwenDenseDrafter
+    from model_samples.qwen_dense import QwenDenseDrafter
 
     stand_in.setdefault("gate_shape", lambda rows: ((3 * rows, 1, 1), (256, 1, 1), 0))
     build = _stand_ins(monkeypatch, **stand_in)
-    monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
     model = _tiny_model()
-    monkeypatch.setattr(QwenDense, "_target", _census_of(model))
     text = TextIO.synthetic(model.geometry.vocab)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, total, 80 * GIB if total else 0)
     tokens = drafted + 1
 
     def plan(per_sequence, **more):
-        options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True, **more}
+        options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True, "max_model_len": max_model_len, **more}
         return blocks.plan(model.provider_table, model.regimes, facts, 1, per_sequence, stack, model=model, options=options, factories=build)
 
-    common = dict(sequences=1, stack=stack, device="cpu", capacity=40, check_kernels=True)
+    common = dict(sequences=1, stack=stack, device="cpu", capacity=40, check_kernels=True, max_model_len=max_model_len)
     first = Session(model, text, **common)
     session = Session(model, text, share=first, draft_tokens=drafted, drafter=QwenDenseDrafter.seeded(model) if drafter else None, **common)
     first.plan, session.plan, session.prefill_plan = plan(1), plan(tokens), plan(1, state_tokens=tokens)
@@ -7723,7 +7403,7 @@ def _draft_run(monkeypatch, drafted=5, steps=3, stack="fe-entries", verify=True,
     return session
 
 
-def test_a_traced_pass_of_engine_steps_replays_the_prompt_untraced(monkeypatch):
+def test_a_traced_pass_of_speculative_steps_replays_the_prompt_untraced(monkeypatch):
     """The traced pass of a session that prefills and verifies behind its prompt: the prompt is replayed from a zero state
     in front of the profiler and ended by its host read, the traced window holds the verify steps alone -- one call log
     per traced step, the records of the verify plan's launches -- and the kernel check holds them against the verify
@@ -7754,13 +7434,13 @@ def test_a_traced_pass_of_engine_steps_replays_the_prompt_untraced(monkeypatch):
     assert order == ["host read behind prompt token 3", "the traced window"], order
     traced = session.traced
     assert len(traced.steps) == len(traced.call_log) == 3, "three verify steps were recorded: one call log and one cut of the records per traced step"
-    assert all(len(calls) == 20 and {call.rows for call in calls} == {6} for calls in traced.call_log), "the calls of a verify step, at its six rows"
+    assert all(len(calls) == 21 and {call.rows for call in calls} == {6} for calls in traced.call_log), "the calls of a verify step, at its six rows"
     names = [[record.name for record in step] for step in traced.steps]
     assert all(sum(name == VERIFY_SYMBOL for name in step) == 1 for step in names), "the fused verify step of the linear-attention layer"
     assert not any("gdn_decode_fused" in name for step in names for name in step), "no decode step of the prompt is in the traced window"
     assert all(step[-1] == HOST_READ and step.count(HOST_READ) == 1 for step in names), "a traced step ends in its one host read"
     assert (session.state.position, session.record.accepted, session.prompt_record.count) == (position, counts, 3), "the run's state and records are put back"
-    assert traced.rows == 6 and traced.claim is not None and census.configuration_of(session.plan) == "verify"
+    assert traced.rows == 6 and session.plan.tokens == 6, "the pass is held against the verify plan"
     report = next(line for line in session.report().text().splitlines() if line.startswith("traced pass (3)"))
     assert report.endswith(" | behind the prompt's 3 decode steps, replayed untraced")
     checks = tie_out.run_checks(session, prompt_tokens=3)
@@ -7808,7 +7488,7 @@ def test_a_traced_pass_of_engine_steps_replays_the_prompt_untraced(monkeypatch):
     assert (status, unobserved) == (census.NOT_OBSERVED, why) and lines[0].endswith(f"not observed: {why}    {census.NOT_OBSERVED}")
 
 
-# ---------------------------------------------------------------- the speculative script on a target stack, to its last line
+# ---------------------------------------------------------------- the speculative script on the stack native, to its last line
 def _speculative_run(monkeypatch, capsys, arguments, **stand_in):
     """``main()`` of ``02_speculative_decode.py`` to its LAST line, on the CPU: stated device facts (compute capability
     10.0), the tiny geometry with its seeded drafter, and the stand-in providers and stand-in profiler of
@@ -7817,21 +7497,21 @@ def _speculative_run(monkeypatch, capsys, arguments, **stand_in):
     reference's).  Returns ``(exit code, the lines the run printed, what it wrote to standard output)``."""
     import importlib.util
 
-    from model_samples import blocks, census
+    from model_samples import blocks
     from model_samples.qwen_dense import QwenDense
 
     model_samples = importlib.import_module("model_samples")  # the package as an object: its names are patched below
-    stand_in.setdefault("gate_shape", lambda rows: ((3 * rows, 1, 1), (256, 1, 1), 0))  # three rows per thread block, as the tiny census records it
+    stand_in.setdefault("gate_shape", lambda rows: ((3 * rows, 1, 1), (256, 1, 1), 0))  # three rows per thread block, as the entry states it for the tiny model
     build = _stand_ins(monkeypatch, **stand_in)
-    monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
     stated = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
-    real_session = model_samples.Session
+    real_session = getattr(model_samples.Session, "real", model_samples.Session)  # of a second run of one test: not the first run's wrapper
 
     def session(model, text, **options):  # a session of the script on the CPU, every one of its plans on the stated facts and the stand-ins
         made = real_session(model, text, **dict(options, device="cpu"))
 
         def plan(of, tokens, overrides, **more):
             plan_options = {"reference_precision": made.reference_precision, "device": "cpu", "check_kernels": made.check_kernels, **more}
+            plan_options["max_model_len"] = made.max_model_len
             table, regimes = of.provider_table, of.regimes
             return blocks.plan(
                 table, regimes, stated, 1, tokens, made.stack, overrides, model=of, options=plan_options, source=of.table_source, factories=build
@@ -7844,6 +7524,7 @@ def _speculative_run(monkeypatch, capsys, arguments, **stand_in):
             made.draft_plan = plan(made.drafter, 1, {})
         return made
 
+    session.real = real_session
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (80 * GIB, 180 * GIB))
@@ -7853,7 +7534,6 @@ def _speculative_run(monkeypatch, capsys, arguments, **stand_in):
     monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
     monkeypatch.setattr(model_samples, "Session", session)
     monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=2, vocab=15520: _tiny_model()))
-    monkeypatch.setattr(QwenDense, "_target", _census_of(_tiny_model()))
     paths = list(sys.path)
     spec = importlib.util.spec_from_file_location(
         "model_sample_qwen_dense_02_speculative_decode_census_run", MODELS / "qwen_dense" / "02_speculative_decode.py"
@@ -7862,23 +7542,21 @@ def _speculative_run(monkeypatch, capsys, arguments, **stand_in):
     capsys.readouterr()
     try:
         spec.loader.exec_module(module)
-        code = module.main(["--force-tokens", "24", *arguments])
+        code = module.main(_stacked(["--force-tokens", "24", *arguments]))
     finally:
         sys.path[:] = paths
     captured = capsys.readouterr()
     return code, captured.err.splitlines(), captured.out
 
 
-def test_the_speculative_sample_on_a_target_stack_to_its_last_line(monkeypatch, capsys):
+def test_the_speculative_sample_on_native_to_its_last_line(monkeypatch, capsys):
     """``main()`` of ``02_speculative_decode.py`` with ``--stack native``, on stand-in providers and the stand-in profiler,
     to its last line.  The kernel check runs without a flag, on whole steps -- the lookups of the drafter's passes and
-    the verify plan's rows, one by one --, and under it the run says what it states of the drafter's kernels: nothing.
+    the verify plan's rows, one by one.
     Launch records that hold: ``[02] PASS``.  A launch more between two exact rows of the verify step: ``[02] FAIL``,
-    exit code 1.  The profiler out: ``[02] RAN native stack (kernels not observed: <reason>)``, never ``PASS``.  A count
-    of drafted tokens the census holds no section for states no identity; the default count states the verify plan's
-    three numbers.  Standard output stays empty: a seeded run has no language."""
-    drafter = "    kernel identity of the drafter's passes: not stated (the kernel census holds the verify step and the output head behind it; "
-    drafter += "no section holds a draft pass)"
+    exit code 1.  The profiler out: ``[02] RAN native stack (kernels not observed: <reason>)``, never ``PASS``.  The
+    kernel table of the verify plan ends in its count of a step: no call on a fallback row on ``native``, the rows a
+    library serves on theirs on ``fe-entries``.  Standard output stays empty: a seeded run has no language."""
     unseen = "    the prompt's decode steps: 26 replayed in front of the traced window, their kernels not observed (the check is of the verify steps)"
     three = [
         "--stack",
@@ -7891,11 +7569,10 @@ def test_the_speculative_sample_on_a_target_stack_to_its_last_line(monkeypatch, 
     code, lines, out = _speculative_run(monkeypatch, capsys, three)
     assert (code, lines[-1], out) == (0, "[02] PASS", ""), lines[-6:]
     (kernels,) = _kernel_lines(lines)
-    # ... 13 of them the cuDNN Frontend rows' and the lookup's, four the library rows': two down multiplies, the attention layer's out-projection, the head
-    assert kernels.endswith("    PASS") and "20 on exact rows, in the wiring order" in kernels, "three lookups of the passes and the verify plan's 17"
-    assert lines.count(drafter) == 1 and lines.count(unseen) == 1 and lines.index(kernels.join(("  ", ""))) < lines.index(unseen) < lines.index(drafter)
-    unstated = "kernel identity: not stated for this run (no recorded section for 4 tokens per sequence on cc 10.0 / 148 SMs: "
-    assert any(line.strip().startswith(unstated) for line in lines), "three drafted tokens: a step shape the census holds no section for"
+    # ... 13 of them the cuDNN Frontend rows' and the lookup's, five the library rows': two down multiplies, the attention layer's
+    # out-projection, the attention core, the head
+    assert kernels.endswith("    PASS") and "23 on exact rows, in the wiring order" in kernels, "three lookups of the passes and the verify plan's 19"
+    assert lines.count(unseen) == 1 and lines.index(kernels.join(("  ", ""))) < lines.index(unseen), "what the check did not look at, under its lines"
     # 11 new tokens at three drafted tokens: the first from the prompt, then steps that keep 1, 2, 3 and 4 tokens -- four steps, every count once
     assert "  acceptance        4 of 4 steps kept the count they were scheduled to keep; every count from 0 to 3 was kept at least once    PASS" in lines
     blocks_lines = [line for line in lines if line.startswith("  blocks  ")]
@@ -7907,36 +7584,33 @@ def test_the_speculative_sample_on_a_target_stack_to_its_last_line(monkeypatch, 
     code, lines, out = _speculative_run(monkeypatch, capsys, three, projection_defect="extra")
     assert (code, lines[-1], out) == (1, "[02] FAIL", ""), lines[-6:]
     assert _kernel_lines(lines)[0].endswith("    FAIL") and any("nothing may sit between two exact rows" in line for line in lines)
-    assert lines.count(drafter) == 1, "what is not stated is said beside a failed check too"
+    assert lines.count(unseen) == 1, "what the check did not look at is said beside a failed check too"
 
     # the profiler out: every other line holds, the kernels were not observed -- RAN, with the stack's name and the reason
     reason = "the profiler failed (no tracing library)"
     code, lines, out = _speculative_run(monkeypatch, capsys, three, profiler=reason)
     assert (code, lines[-1], out) == (0, f"[02] RAN native stack (kernels not observed: {reason})", "") and "[02] PASS" not in lines
     assert _kernel_lines(lines) == [f"kernels           not observed: {reason}    NOT OBSERVED"]
-    assert f"traced pass           not available: {reason}" in lines and lines.count(drafter) == 1
+    assert f"traced pass           not available: {reason}" in lines
 
-    # the default configuration on a stack without a target, with its kernels checked: five lookups of the passes and the model's
+    # the default configuration on the stack fe-cublas, with its kernels checked: five lookups of the passes and the model's
     code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "fe-cublas", "--check-kernels"])
     assert (code, lines[-1], out) == (0, "[02] PASS", ""), lines[-6:]
-    assert _kernel_lines(lines)[0].endswith("    PASS") and lines.count(drafter) == 1 and not any("kernel identity, as planned" in line for line in lines)
+    assert _kernel_lines(lines)[0].endswith("    PASS")
     code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "fe-cublas"])  # ... and without the flag nothing is traced for a check
-    assert (code, lines[-1]) == (0, "[02] PASS") and _kernel_lines(lines) == [] and drafter not in lines
+    assert (code, lines[-1]) == (0, "[02] PASS") and _kernel_lines(lines) == [] and not any(line.startswith("kernels, planned") for line in lines)
 
-    # the default configuration on native: six tokens per sequence, the step shape the census records -- the three numbers, before the load
-    # and under the check, and every launch in its recorded shape
+    # the default configuration on native: six tokens per sequence -- the count of a step of the verify plan before the load, no call
+    # on a fallback row, and under the check the kernel the library launched on the line of each of its four rows
     code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "native"])
-    planned = (
-        "kernel identity, as planned: 17 of 20 launches of a step are target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries "
-        "with byte-equal results); not yet: attention.prepare 1, attention.core 1; 1 declared stand-in (not yet: output_head.quantize)"
-    )
+    planned = "  per step: 20 launches on 13 exact rows, checked one by one in the wiring order; the launches of 0 fallback calls and of the host path "
     load = next(index for index, line in enumerate(lines) if line.startswith("[02] stage "))
-    stated = [index for index, line in enumerate(lines) if line.strip().startswith(planned)]
-    assert len(stated) == 2 and stated[0] < load < stated[1], "with the plan, and again under the kernel check"
+    assert lines.count(planned + "are attributed by family") == 1 and lines.index(planned + "are attributed by family") < load, "with the plan, before the load"
     (kernels,) = _kernel_lines(lines)
-    assert kernels.endswith("    PASS") and "22 on exact rows, in the wiring order" in kernels, "five lookups of the passes and the verify plan's 17"
-    assert any(line.strip().startswith("target census verify / cc 10.0 / 148 SMs") and ": NOT CLAIMED (fallback rows present" in line for line in lines)
-    assert lines.count(drafter) == 1 and out == ""
+    assert kernels.endswith("    PASS") and "25 on exact rows, in the wiring order" in kernels, "five lookups of the passes and the verify plan's 20"
+    launched = [line.strip().split(": ", 1)[0] for line in lines if "; the library launched " in line]
+    assert launched == ["mlp.down", "attention.core", "projection.fp8.out at full_attention.out", "output_head"], "the rows a library serves in a verify step"
+    assert out == ""
     # On this tiny geometry the fp32 chains of the stand-ins leave the seeded model's declared logits band on a row of a rejected draft
     # at six tokens per sequence.  The band is the model's and no stand-in widens it: the token line of the run's own checks fails,
     # every line of the comparison with decode steps holds, and a failed line of the checks ends the run in FAIL.
@@ -7951,9 +7625,9 @@ def test_the_speculative_sample_on_a_target_stack_to_its_last_line(monkeypatch, 
     assert (code, lines[-1]) == (1, "[02] FAIL")
     # ... and on fe-entries, the cuDNN Frontend rows alone: the numbers of a verify plan without the rows a library serves
     code, lines, out = _speculative_run(monkeypatch, capsys, ["--stack", "fe-entries"])
-    alone = "kernel identity, as planned: 13 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 11 cuDNN Frontend entries "
-    alone += "with byte-equal results); not yet: mlp.down 2, attention.prepare 1, attention.core 1, projection.fp8.out 1, output_head 1"
-    assert sum(line.strip().startswith(alone) for line in lines) == 2 and "18 on exact rows, in the wiring order" in _kernel_lines(lines)[0]
+    alone = "  per step: 15 launches on 9 exact rows, checked one by one in the wiring order; the launches of 5 fallback calls and of the host path "
+    assert lines.count(alone + "are attributed by family") == 1 and "20 on exact rows, in the wiring order" in _kernel_lines(lines)[0]
+    assert not any("; the library launched " in line for line in lines), "no row of this stack is a library's"
     assert (code, lines[-1]) == (1, "[02] FAIL"), "the token line of the stand-ins, as on native"
 
 
@@ -7961,14 +7635,14 @@ def test_the_speculative_sample_on_a_target_stack_to_its_last_line(monkeypatch, 
 def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
     """The three rows of FlashInfer in the ``native`` stack through a real session on the CPU: the real adapters over a
     stand-in of the library (its multiplies decode the operands the adapters hand it, in the layout they hand them in).
-    Clean, the run holds: every multiply inside the band of the reference multiply, the down multiply in the kernel class
-    and the launch shape the census records, the out-projection held by membership with the kernel the library chose
-    printed beside the recorded pick, every weight on its stored format alone.  Then the controls.  The 4-bit multiply
-    is held exactly: another kernel class, another grid, a launch more, the kernels of a multiply over a copy -- and the
-    same call inside a tuning context of the library, or after one has tuned the operation in the process -- each fail
-    the kernel check with its own sentence; a wrong element fails the block in its band while the kernel check holds.
-    The 8-bit multiply is the library's choice: the recorded pick, a split pick with its reduce launch, the pick in every
-    other step and the library's own kernel all pass, each printed and compared; a kernel of neither family fails."""
+    Clean, the run holds: every multiply inside the band of the reference multiply, every row with the kernel the library
+    launched on its own line of the check, every weight on its stored format alone.  Then the controls.  What is the
+    sample's own of the 4-bit multiply is held: a launch more, the kernels of a multiply over a copy -- and the same
+    call inside a tuning context of the library, or after one has tuned the operation in the process -- each fail the
+    kernel check with its own sentence; a wrong element fails the block in its band while the kernel check holds.
+    Which of its kernels the library launches is the library's choice, printed and never gated: the other class of
+    the 4-bit multiply, another grid, a cuBLASLt kernel for the 8-bit multiply, a split pick with its reduce launch,
+    two kernels over the traced steps all pass, each named on its row's line; a kernel of neither family fails."""
     from model_samples import census, tie_out
     from model_samples.qwen_dense import configs
 
@@ -7980,15 +7654,15 @@ def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
     def sentences(checks):
         return [line.strip() for line in checks.lines if line.strip().startswith("kernels: ")]
 
-    def chosen(checks):
-        return [line.strip().split(": ", 1)[1] for line in checks.lines if line.strip().startswith("chosen by the library for projection.fp8.out")]
+    def launched(checks, block):
+        """What the lines of ``block`` -- one per call site -- say the library launched for it."""
+        return [line.split("; the library launched ", 1)[1] for line in checks.lines if line.strip().startswith(block) and "; the library launched " in line]
 
     every = "kernels: step 0 (and 3 more of the 4 traced steps): "
-    recorded_in = "the target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12)"
     rows = {block: configs.PROVIDERS[block][0] for block in ("mlp.down", "output_head")}
     assert [(row.key, row.form, row.stacks, row.ci) for row in rows.values()] == [
         ("flashinfer.mm_fp4", configs.MM_FP4_FORM, ("native",), False),
-        ("torch_ref.quantize+flashinfer.mm_fp4", configs.MM_FP4_FORM, ("native",), False),
+        ("flashinfer.mm_fp4_head", configs.MM_FP4_FORM, ("native",), False),
     ] and configs.MM_FP4_FORM == (("BACKEND", "cute-dsl"), ("TUNED", False)), "the rows name the library's untuned pick"
 
     session, checks = run()
@@ -7996,7 +7670,7 @@ def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
     for block, calls in (("projection.fp8.out", 14), ("mlp.down", 14), ("output_head", 7)):
         line = next(line for line in checks.lines if line.split()[:1] == [block])
         assert f"{calls} calls  largest distance 0.00 bf16 units" in line and line.endswith("[band: bf16_rounding]  PASS"), line
-    assert "17 on exact rows, in the wiring order" in _line(checks, "kernels ")
+    assert "20 on exact rows, in the wiring order" in _line(checks, "kernels ")
     assert (
         _line(checks, "stored weights")
         .strip()
@@ -8005,18 +7679,16 @@ def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
     held = "(projection.fp8.in, projection.fp8.out, mlp.gate_up, mlp.down, output_head)"
     assert held in _line(checks, "on demand"), "the reference's copies of every multiply's weight are made per call: the run keeps none"
     assert _line(checks, "mlp.down: ").strip() == (
-        "mlp.down: flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False], 2 launches per step (2 calls x 1 per call); fi_mm_fp4 by name, and in the "
-        "kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records: grid (40, 1, 2), block (192, 1, 1), shared memory 231,424 B"
+        "mlp.down: flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False], 2 launches per step (2 calls x 1 per call); fi_mm_fp4 by name; "
+        f"the library launched {FI_SPLIT_K} x 8 over the traced steps"
     )
-    assert _line(checks, "output_head: ").endswith("1 launch per step (1 call x 1 per call); fi_mm_fp4 by name (no launch shape is declared for it)")
-    assert OTHER_VOCAB.replace("15520", "272") in _line(
-        checks, "target census"
-    ), "the head of another vocabulary is another weight: no shape is held, and the line says so"
-    assert "3 more by membership alone" in _line(checks, "target census") and COMPARED_14 in _line(checks, "target census")
+    assert _line(checks, "output_head: ").endswith(
+        f"1 launch per step (1 call x 1 per call); fi_mm_fp4 by name; the library launched {FI_PERSISTENT} x 4 over the traced steps"
+    ), "the head's multiply: the other kernel class of the same call, by the weight's shape"
     digest = hashlib.sha256(FI_CUTLASS_FP8.encode()).hexdigest()[:12]
-    named = f"{FI_CUTLASS_FP8[:69]}... (1,360 characters, sha256 {digest})"
-    theirs = f"{named} x 4 over the traced steps; not the pick the census records ({NVJET_FP8}): another kernel of the same entry"
-    assert chosen(checks) == [theirs, theirs], "the library's own kernel at both call sites: printed, compared, not gated"
+    named = f"{FI_CUTLASS_FP8[:157]}... (1,360 characters, sha256 {digest})"
+    theirs = f"{named} x 4 over the traced steps"
+    assert launched(checks, "projection.fp8.out") == [theirs, theirs], "the library's own kernel at both call sites: printed, not gated"
     assert census._named(FI_CUTLASS_FP4) != census._named(FI_CUTLASS_FP8) and census._named(NVJET_FP8) == NVJET_FP8, "a long name is told from its twin"
     # what the library was handed: the backend each row names, never the library's own default, at every call of the run
     assert {call[:2] for call in LIBRARY_CALLS} == {("mm_fp4", "cute-dsl"), ("bmm_fp8", "auto")}, "the BACKEND of the rows reaches the library"
@@ -8028,26 +7700,21 @@ def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
         ("mlp.down", 0, "flashinfer.gemm.mm_fp4", configs.MM_FP4_FORM),
         ("projection.fp8.out", 1, "flashinfer.gemm.bmm_fp8", configs.BMM_FP8_FORM),
         ("mlp.down", 1, "flashinfer.gemm.mm_fp4", configs.MM_FP4_FORM),
-        ("output_head", -1, "torch_ref.quantize + flashinfer.gemm.mm_fp4", configs.MM_FP4_FORM),
+        ("output_head", -1, "flashinfer.gemm.mm_fp4", configs.MM_FP4_FORM),
     ], "the call log reads the form back from the call: what was passed, and how the library's tuner stood"
-    # at another row count no section is recorded: the class is not held there, and the run says that no identity is stated
+    # at another row count: the same lines, with the kernels the library launched there
     _, two = run(sequences=2)
-    assert two.ok and "mlp.down equal" not in _line(two, "batch invariance") and "12 of 12 blocks equal" in _line(two, "batch invariance")
-    assert _line(two, "mlp.down: ").endswith("fi_mm_fp4 by name (no launch shape is declared for it)") and chosen(two) == []
+    assert two.ok and "mlp.down equal" not in _line(two, "batch invariance") and "13 of 13 blocks equal" in _line(two, "batch invariance")
+    stated = "    attention.core: the library states no batch invariance for this call: "
+    assert sum(line.startswith(stated) for line in two.lines) == 1, "what the library states of the attention core, once beside the batch line"
+    assert launched(two, "mlp.down") == [f"{FI_SPLIT_K} x 8 over the traced steps"] and launched(two, "projection.fp8.out") == [theirs, theirs]
 
-    # (1) the other kernel class of the library in the recorded launch shape; (2) the recorded class in another grid
+    # (1) the other kernel class of the library's 4-bit multiply; (2) its class in another grid.  Which kernel a call launches, and in
+    # which grid, is the library's: the check holds -- the name is the multiply's, once per call, in its place -- and the line names it
     _, checks = run(library_defect="class")
-    assert not checks.ok and checks.kernels == census.FAIL, checks.text()
-    assert sentences(checks) == [
-        f"{every}mlp.down (layer {layer}) launched {FI_PERSISTENT!r}; {recorded_in} has the kernel class Sm100BlockScaledSplitKGemmKernel of fi_mm_fp4 there"
-        for layer in (0, 1)
-    ], checks.text()
+    assert checks.ok and checks.kernels == census.PASS and launched(checks, "mlp.down") == [f"{FI_PERSISTENT} x 8 over the traced steps"], checks.text()
     _, checks = run(library_defect="shape")
-    other = "launched fi_mm_fp4 with grid (1, 1, 40), block (192, 1, 1), shared memory 231,424 B"
-    assert not checks.ok and checks.kernels == census.FAIL, checks.text()
-    assert sentences(checks) == [
-        f"{every}mlp.down (layer {layer}) {other}; {recorded_in} has grid (40, 1, 2), block (192, 1, 1), shared memory 231,424 B" for layer in (0, 1)
-    ], checks.text()
+    assert checks.ok and checks.kernels == census.PASS and launched(checks, "mlp.down") == [f"{FI_SPLIT_K} x 8 over the traced steps"], checks.text()
     # (3), (4) the same call inside a tuning context, and after one has tuned the operation in this process: not the row's form
     for defect in ("tuning", "has tuned"):
         _, checks = run(library_defect=defect)
@@ -8055,7 +7722,7 @@ def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
         assert not checks.ok and checks.kernels == census.FAIL, defect
         assert sentences(checks) == [
             f"kernels: form: mlp.down (layer 0): {served} (flashinfer.gemm.mm_fp4); the row says [BACKEND cute-dsl, TUNED False]",
-            f"kernels: form: output_head: {served} (torch_ref.quantize + flashinfer.gemm.mm_fp4); the row says [BACKEND cute-dsl, TUNED False]",
+            f"kernels: form: output_head: {served} (flashinfer.gemm.mm_fp4); the row says [BACKEND cute-dsl, TUNED False]",
         ], defect
         for kept in ("replay", "blocks", "tokens"):
             assert _line(checks, kept).endswith("PASS"), "its bytes are the multiply's: only the kernel check sees a tuned call"
@@ -8076,13 +7743,13 @@ def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
 
     # the 8-bit multiply: whichever of its kernels the library chose passes, and the line says which it was
     _, checks = run(library_defect="pick")
-    assert checks.ok and chosen(checks) == [f"{NVJET_FP8} x 4 over the traced steps; the pick the census records"] * 2
+    assert checks.ok and launched(checks, "projection.fp8.out") == [f"{NVJET_FP8} x 4 over the traced steps"] * 2
     _, checks = run(library_defect="split")
-    split = "nvjet_sm100_qqtst_64x8_64x16_2x1_v_bz_splitK_TNT x 4 over the traced steps; not the pick"
-    assert checks.ok and checks.kernels == census.PASS and all(line.startswith(split) for line in chosen(checks)) and len(chosen(checks)) == 2
-    _, checks = run(library_defect="mixed")  # the recorded pick in every other step, the library's own kernel between: not that pick
-    mixed = [line for line in chosen(checks) if line.count(" x 2") == 2 and f"{NVJET_FP8} x 2" in line and "; not the pick" in line]
-    assert checks.ok and checks.kernels == census.PASS and len(mixed) == len(chosen(checks)) == 2, chosen(checks)
+    split = "nvjet_sm100_qqtst_64x8_64x16_2x1_v_bz_splitK_TNT x 4 over the traced steps"
+    assert checks.ok and checks.kernels == census.PASS and launched(checks, "projection.fp8.out") == [split, split]
+    _, checks = run(library_defect="mixed")  # a cuBLASLt kernel in every other step, the library's own kernel between: both are named
+    mixed = [line for line in launched(checks, "projection.fp8.out") if line.count(" x 2") == 2 and f"{NVJET_FP8} x 2" in line and "sha256" in line]
+    assert checks.ok and checks.kernels == census.PASS and len(mixed) == 2, launched(checks, "projection.fp8.out")
     absent = "did not launch cublaslt_fp8_gemm: the step has 0 launch(es) of cublaslt_fp8_gemm, the plan 2 = 2 call(s) x 1 per call"
     # ... a kernel of neither family, and the library's CUTLASS multiply of other operands: no member, each fails by name
     for defect in ("other", "twin"):
@@ -8090,60 +7757,28 @@ def test_the_library_rows_through_a_session_and_what_fails_them(monkeypatch):
         assert not checks.ok and checks.kernels == census.FAIL, defect
         assert sentences(checks) == [f"{every}projection.fp8.out (layer {layer}) {absent}" for layer in (0, 1)], checks.text()
 
-    # a step of several tokens per sequence: two rows serve the out-projection by call site.  What the census records for
-    # the projection entry's site is that site's: the library's row at the attention layers' site has no recorded shape,
-    # and its line says so
+    # a step of several tokens per sequence: two rows serve the out-projection by call site, and each line is its own site's:
+    # the entry's states its launch, the library's names the kernel the library launched there
     verify, _ = _verify_run(monkeypatch, stack="native")
     verify.trace(3)
     checks = tie_out.run_checks(verify, prompt_tokens=0)
     assert checks.ok and checks.kernels == census.PASS, checks.text()
     assert _line(checks, "projection.fp8.out at full_attention.out: ").strip() == (
         "projection.fp8.out at full_attention.out: flashinfer.gemm.bmm_fp8 [BACKEND auto], 1 launch per step (1 call x 1 per call); "
-        "cublaslt_fp8_gemm by name (no launch shape is declared for it)"
+        f"cublaslt_fp8_gemm by name; the library launched {named} x 3 over the traced steps"
     )
     entry_line = _line(checks, "projection.fp8.out at linear_attention.out: ")
     assert "cudnn.Fp8ProjectionDecode" in entry_line and "the entry states grid (80, 2, 1), block (256, 1, 1), shared memory 103,808 B" in entry_line
-    site = next(index for index, site in enumerate(verify.traced.sites) if (site.block, site.site) == ("projection.fp8.out", "full_attention.out"))
-    assert site not in verify.traced.claim.recorded and site not in verify.traced.claim.classes, "the census records no launch shape for that call"
-    # ... and the kernel class is looked up like the shape: were a shape recorded for the library's call and a class for the
-    # block's other call site alone, the library's line would state its own shape and no class
-    entry_site = next(index for index, site in enumerate(verify.traced.sites) if (site.block, site.site) == ("projection.fp8.out", "linear_attention.out"))
-    recorded, classes = dict(verify.traced.claim.recorded), dict(verify.traced.claim.classes)
-    with monkeypatch.context() as scoped:
-        scoped.setattr(census.Claim, "recorded", property(lambda self: {**recorded, site: FP8_SHAPE}))
-        scoped.setattr(census.Claim, "classes", property(lambda self: {**classes, entry_site: "TheClassOfTheOtherCallSite"}))
-        stated = [line for line in verify.traced.details() if line.startswith("projection.fp8.out at full_attention.out: ")]
-    assert stated == [
-        "projection.fp8.out at full_attention.out: flashinfer.gemm.bmm_fp8 [BACKEND auto], 1 launch per step (1 call x 1 per call); "
-        "cublaslt_fp8_gemm by name, and in the launch shape the census records: grid (1, 80, 1), block (256, 1, 1), shared memory 227,328 B"
-    ]
-    assert _line(checks, "mlp.down: ").endswith(
-        "fi_mm_fp4 by name, and in the kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records: "
-        "grid (40, 1, 2), block (192, 1, 1), shared memory 231,424 B"
-    )
-
-    # the census facts of a library kernel are names: a class or a pick that is not one is a file this reader refuses
-    data = json.loads((MODELS / "model_samples" / "qwen_dense" / "kernel_census.json").read_text())
-    layer = data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["linear_attention_layer"]
-    for name, block, recorded in (("class", "mlp.down", "Sm100BlockScaledSplitKGemmKernel"), ("pick", "projection.fp8.out", NVJET_FP8)):
-        (facts,) = [call[2] for call in layer if len(call) > 2 and name in call[2]]  # the layer's down multiply; its out-projection
-        assert facts[name] == recorded
-        for facts[name] in (7, ""):  # a number, and a name of no characters
-            with pytest.raises(ValueError, match=f"class and pick of {block} are names: a kernel class, a kernel"):
-                census.Target(data)
-        facts[name] = recorded  # the file as it is again: the other name is refused by itself
-    census.Target(data)
+    assert "the library launched" not in entry_line and launched(checks, "mlp.down") == [f"{FI_SPLIT_K} x 6 over the traced steps"]
 
 
 def test_the_library_rows_under_the_passes_of_a_speculative_step(monkeypatch):
     """The rows of FlashInfer in a step of speculative decoding on ``native``: a session with a drafter on the CPU, the real
     adapters over the stand-in of the library.  The library's rows serve the prompt's decode steps and the verify step as
     they serve a session without a drafter, and the passes of the drafter call none of them.  The sites of a traced step
-    are the passes' and then the model's, so what the census records of a library kernel -- the kernel class of the 4-bit
-    multiply with its launch shape, the pick of the 8-bit one -- is held and printed at the MODEL's sites, behind the
-    passes: the other kernel class and another grid at the down multiply each fail the kernel check by name there, and
-    the kernel the library chose for the attention layers' out-projection is compared with the recorded pick of that
-    call site."""
+    are the passes' and then the model's, and a line of the check is its own site's: the kernel the library launched is
+    named on the rows of the MODEL's sites, behind the passes, whichever class or grid the library chose there, and the
+    lookup of the passes on its own row; the same call after a tuning of the operation fails the check by its form."""
     from model_samples import census, tie_out
     from model_samples.qwen_dense import configs
 
@@ -8155,8 +7790,9 @@ def test_the_library_rows_under_the_passes_of_a_speculative_step(monkeypatch):
     def sentences(checks):
         return [line.strip() for line in checks.lines if line.strip().startswith("kernels: ")]
 
-    def chosen(checks):
-        return [line.strip() for line in checks.lines if line.strip().startswith("chosen by the library for ")]
+    def launched(checks, block):
+        """What the lines of ``block`` -- one per call site -- say the library launched for it."""
+        return [line.split("; the library launched ", 1)[1] for line in checks.lines if line.strip().startswith(block) and "; the library launched " in line]
 
     session, checks = run()
     traced, passes = session.traced, 5 * session.drafter.calls_per_pass()
@@ -8167,92 +7803,44 @@ def test_the_library_rows_under_the_passes_of_a_speculative_step(monkeypatch):
     assert all(row.key.startswith(("torch_ref.", "torch.")) for row in session.draft_plan.rows.values()), "no row of the drafter's table is a library's"
     # the three tables: the library's rows in the verify plan and in the prompt's decode plan, a chain in every row of the drafter's but its lookup
     tables = session._tables()
-    assert tables.count("  by provider: cuDNN FE 5 | FlashInfer 3 | fallbacks 2 (PyTorch chains 2) | PyTorch 2 | unverified in CI: 3\n") == 2
+    assert tables.count("  by provider: cuDNN FE 7 | FlashInfer 4 | PyTorch 2 | unverified in CI: 4\n") == 2
     assert tables.count("  by provider: fallbacks 12 (PyTorch chains 12) | PyTorch 1\n") == 1 and tables.count("served by (") == 3
     # a step of this session reads every weight of a multiply on its stored codes: the model's own bytes, no copy among them
     moved = session.report().bytes
     assert moved["copies"] == moved["weights"] and 0 < moved["stored"] < moved["weights"], moved
-    # the sites: five passes of the drafter, then the model's; the claim is the verify plan's and counts from the model's first site
-    assert (traced.first, len(traced.sites)) == (passes, passes + 20) and passes == 90
+    # the sites: five passes of the drafter, then the model's
+    assert len(traced.sites) == passes + 21 and passes == 90
     assert all(site.block.startswith("draft.") for site in traced.sites[:passes]) and traced.sites[passes].block == "embedding"
-    claim = traced.claim
-    assert sorted(claim.classes) == [7, 16] and set(claim.classes.values()) == {"Sm100BlockScaledSplitKGemmKernel"}, "the two down multiplies of the model"
-    assert traced._classes() == {index + passes: named for index, named in claim.classes.items()}
-    assert [traced.sites[index].block for index in traced._classes()] == ["mlp.down", "mlp.down"]
-    assert all(traced.sites[index].block.startswith("draft.") for index in claim.classes), "uncounted, the class would stand at a site of a pass"
-    assert len(claim.picks) == 1 and set(claim.picks.values()) == {NVJET_FP8}
-    assert traced._picks() == {index + passes: pick for index, pick in claim.picks.items()}
-    assert [(traced.sites[index].block, traced.sites[index].site) for index in traced._picks()] == [("projection.fp8.out", "full_attention.out")]
-    assert all(index + passes in traced._recorded() for index in claim.classes), "a class is recorded with a launch shape, and stands where that stands"
-    # the lines: the down multiply in the recorded class and shape, the out-projection's kernel beside the recorded pick of ITS call site
+    # the lines: a row a library serves names the kernel the library launched at the model's sites; the lookup of the passes its kernel by name
+    named = census._named(FI_CUTLASS_FP8, 160)
     assert _line(checks, "mlp.down: ").strip() == (
-        "mlp.down: flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False], 2 launches per step (2 calls x 1 per call); fi_mm_fp4 by name, and in the "
-        "kernel class Sm100BlockScaledSplitKGemmKernel and the launch shape the census records: grid (40, 1, 2), block (192, 1, 1), shared memory 231,424 B"
+        "mlp.down: flashinfer.gemm.mm_fp4 [BACKEND cute-dsl, TUNED False], 2 launches per step (2 calls x 1 per call); fi_mm_fp4 by name; "
+        f"the library launched {FI_SPLIT_K} x 6 over the traced steps"
     )
     assert _line(checks, "projection.fp8.out at full_attention.out: ").strip() == (
         "projection.fp8.out at full_attention.out: flashinfer.gemm.bmm_fp8 [BACKEND auto], 1 launch per step (1 call x 1 per call); "
-        "cublaslt_fp8_gemm by name (no launch shape is declared for it)"
+        f"cublaslt_fp8_gemm by name; the library launched {named} x 3 over the traced steps"
     )
-    digest = hashlib.sha256(FI_CUTLASS_FP8.encode()).hexdigest()[:12]
-    assert chosen(checks) == [
-        "chosen by the library for projection.fp8.out at full_attention.out (printed and compared, never gated): "
-        f"{FI_CUTLASS_FP8[:69]}... (1,360 characters, sha256 {digest}) x 3 over the traced steps; "
-        f"not the pick the census records ({NVJET_FP8}): another kernel of the same entry"
-    ]
-    assert (
-        _line(checks, "draft.embedding: ")
-        .strip()
-        .endswith("5 launches per step (5 calls x 1 per call); embedding_gather by name (no launch shape is declared for it)")
-    )
-    assert "22 on exact rows, in the wiring order" in _line(checks, "kernels "), "the five lookups of the passes and the 17 of the model"
-    planned = "kernel identity, as planned: 17 of 20 launches of a step are target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries"
-    assert _line(checks, "kernel identity, as planned").strip().startswith(planned)
-    line = _line(checks, "target census verify")
-    assert "15 launches of a step compared by launch shape (4 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results" in line
-    assert "each in the recorded one; 2 more by membership alone" in line
-    assert f"    {tie_out.DRAFTER_KERNELS}" in checks.lines, "nothing is stated about the kernels of the passes"
+    assert _line(checks, "draft.embedding: ").strip().endswith("5 launches per step (5 calls x 1 per call); embedding_gather by name")
+    assert "25 on exact rows, in the wiring order" in _line(checks, "kernels "), "the five lookups of the passes and the 20 of the model"
     blocks_lines = [line for line in checks.lines if line.startswith("  blocks ")]
-    assert ["8 of 8 provider blocks" in blocks_lines[0], "9 of 9 provider blocks" in blocks_lines[1]] == [True, True] and len(blocks_lines) == 2
+    assert ["11 of 11 provider blocks" in blocks_lines[0], "12 of 12 provider blocks" in blocks_lines[1]] == [True, True] and len(blocks_lines) == 2
     for block in ("projection.fp8.out at full_attention.out", "mlp.down", "output_head"):
         judged = [line for line in checks.lines if line.strip().startswith(f"{block}  ") and "[band: bf16_rounding]" in line]
         assert judged and all(line.endswith("[band: bf16_rounding]  PASS") for line in judged), block
     held = "(projection.fp8.in, projection.fp8.out, mlp.gate_up, mlp.down, output_head)"
     assert held in _line(checks, "on demand") and _line(checks, "stored weights").strip().startswith("stored weights    9 of 9 weights")
-    # were a shape recorded for the library's call and a class for the block's other call site alone, the library's line would
-    # state its own shape and no class: the lookup is per call site, behind the passes as without them
-    library_site = next(index for index, site in enumerate(traced.sites) if (site.block, site.site) == ("projection.fp8.out", "full_attention.out"))
-    entry_site = next(index for index, site in enumerate(traced.sites) if (site.block, site.site) == ("projection.fp8.out", "linear_attention.out"))
-    assert library_site - passes not in claim.recorded and min(library_site, entry_site) >= passes
-    recorded, classes = dict(claim.recorded), dict(claim.classes)
-    with monkeypatch.context() as scoped:
-        scoped.setattr(census.Claim, "recorded", property(lambda self: {**recorded, library_site - passes: FP8_SHAPE}))
-        scoped.setattr(census.Claim, "classes", property(lambda self: {**classes, entry_site - passes: "TheClassOfTheOtherCallSite"}))
-        stated = [line for line in traced.details() if line.startswith("projection.fp8.out at full_attention.out: ")]
-    assert stated == [
-        "projection.fp8.out at full_attention.out: flashinfer.gemm.bmm_fp8 [BACKEND auto], 1 launch per step (1 call x 1 per call); "
-        "cublaslt_fp8_gemm by name, and in the launch shape the census records: grid (1, 80, 1), block (256, 1, 1), shared memory 227,328 B"
-    ]
-
-    # the controls, at the model's sites of the traced step: (1) the other kernel class in the recorded shape, (2) the recorded
-    # class in another grid, (3) the same call after a tuning of the operation in this process
-    every = "kernels: step 0 (and 2 more of the 3 traced steps): "
-    recorded_in = "the target census verify / cc 10.0 / 148 SMs (recorded 2026-11-12)"
+    # the controls, at the model's sites of the traced step: (1) the other kernel class of the library's multiply and (2) its class in
+    # another grid are the library's choice, named on the row's line; (3) the same call after a tuning of the operation in this process
     _, checks = run(library_defect="class")
-    assert not checks.ok and checks.kernels == census.FAIL, checks.text()
-    assert sentences(checks) == [
-        f"{every}mlp.down (layer {layer}) launched {FI_PERSISTENT!r}; {recorded_in} has the kernel class Sm100BlockScaledSplitKGemmKernel of fi_mm_fp4 there"
-        for layer in (0, 1)
-    ]
+    assert checks.ok and checks.kernels == census.PASS and launched(checks, "mlp.down") == [f"{FI_PERSISTENT} x 6 over the traced steps"], checks.text()
     _, checks = run(library_defect="shape")
-    other = "launched fi_mm_fp4 with grid (1, 1, 40), block (192, 1, 1), shared memory 231,424 B"
-    assert not checks.ok and sentences(checks) == [
-        f"{every}mlp.down (layer {layer}) {other}; {recorded_in} has grid (40, 1, 2), block (192, 1, 1), shared memory 231,424 B" for layer in (0, 1)
-    ], checks.text()
+    assert checks.ok and checks.kernels == census.PASS and launched(checks, "mlp.down") == [f"{FI_SPLIT_K} x 6 over the traced steps"], checks.text()
     _, checks = run(library_defect="has tuned")
     served = "the adapter served the call with the form [BACKEND cute-dsl, TUNED True]"
     assert not checks.ok and sentences(checks) == [
         f"kernels: form: mlp.down (layer 0): {served} (flashinfer.gemm.mm_fp4); the row says [BACKEND cute-dsl, TUNED False]",
-        f"kernels: form: output_head: {served} (torch_ref.quantize + flashinfer.gemm.mm_fp4); the row says [BACKEND cute-dsl, TUNED False]",
+        f"kernels: form: output_head: {served} (flashinfer.gemm.mm_fp4); the row says [BACKEND cute-dsl, TUNED False]",
     ], checks.text()
     # such a session needs the library's package as a plain run does: on a device its plans decline before anything is loaded,
     # and the stack of the cuDNN Frontend rows runs the same session without it
@@ -8260,12 +7848,9 @@ def test_the_library_rows_under_the_passes_of_a_speculative_step(monkeypatch):
         _draft_run(monkeypatch, stack="native", drafter=True, total=180 * GIB, library_installed=None)
     without = _draft_run(monkeypatch, stack="fe-entries", drafter=True, total=180 * GIB, library_installed=None)
     assert without.record.count == 3 and LIBRARY_CALLS == [], "no row of fe-entries calls the library"
-    # the 8-bit multiply stays the library's choice: the recorded pick passes and the line says that it is that pick
+    # the 8-bit multiply stays the library's choice: a cuBLASLt kernel passes, and the line names it
     _, checks = run(library_defect="pick")
-    assert checks.ok and chosen(checks) == [
-        "chosen by the library for projection.fp8.out at full_attention.out (printed and compared, never gated): "
-        f"{NVJET_FP8} x 3 over the traced steps; the pick the census records"
-    ], checks.text()
+    assert checks.ok and launched(checks, "projection.fp8.out at full_attention.out") == [f"{NVJET_FP8} x 3 over the traced steps"], checks.text()
 
 
 def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypatch):
@@ -8280,7 +7865,7 @@ def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypa
 
     from model_samples import blocks
     from model_samples.providers import flashinfer_calls
-    from model_samples.weights import BlockScaledTensor, Dequantized, ScaledTensor, TiledBlockScaledWeight, Unquantized, dequantize, quantize_nvfp4, tile_scales
+    from model_samples.weights import BlockScaledTensor, Dequantized, ScaledTensor, TiledBlockScaledWeight, dequantize, quantize_nvfp4, tile_scales
 
     model = _tiny_model()
 
@@ -8292,13 +7877,21 @@ def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypa
 
     plan = planned()
     down, head, out = plan["mlp.down"], plan["output_head"], plan["projection.fp8.out"]
-    assert [type(block).__name__ for block in (down, head, out)] == ["MmFp4Block", "QuantizeMmFp4Block", "BmmFp8Block"]
+    assert [type(block).__name__ for block in (down, head, out)] == ["MmFp4Block", "MmFp4HeadBlock", "BmmFp8Block"]
     assert {block.provider for block in (down, head, out)} == {"FlashInfer"} and all(block.stored_weights for block in (down, head, out))
     note = (
         "first use of FlashInfer 0.7.2.post1: it builds the kernels of its multiplies now, in this process and with the installed CUDA compiler and "
         'ninja (minutes on the first run of a machine, nothing on a later one; the family README, "What the first run does")'
     )
-    assert plan.announcements() == [note] and planned("fe-entries").announcements() == [], "one sentence for the three rows; none where no row is the library's"
+    notes = plan.announcements()
+    assert (
+        notes[:1] == [note] and len(notes) == 2 and planned("fe-entries").announcements() == []
+    ), "one sentence for the three multiplies; none where no row is the library's"
+    assert notes[1].startswith(
+        "first use of the paged decode attention of FlashInfer 0.7.2.post1: this sample switches the library's download of kernel binaries off for the "
+        "process (FLASHINFER_NO_DOWNLOAD), so they are read from its kernel-binary package or from a directory filled beforehand and never fetched; "
+        "it holds the kernel binaries of this GPU to their manifest, and the library then builds its launcher"
+    ), "and one for the attention, which says what the sample does to the library's download and to its kernel binaries"
     assert "### What the first run does" in (MODELS / "qwen_dense" / "README.md").read_text(), "the section the sentence names"
     for block in (down, head, out):
         block.first_use(1, 1)
@@ -8320,7 +7913,7 @@ def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypa
     with pytest.raises(NotImplementedError) as skipped:
         unbuilt.first_use(1, 1)
     assert str(skipped.value) == (
-        "torch_ref.quantize + flashinfer.gemm.mm_fp4: FlashInfer could not make its first use on this installation (RuntimeError); it builds its "
+        "flashinfer.gemm.mm_fp4: FlashInfer could not make its first use on this installation (RuntimeError); it builds its "
         'kernels there and needs the CUDA compiler and ninja (the family README, "What the first run does"); '
         "--stack fe-entries runs the cuDNN Frontend rows of this stack without the package"
     ), "the type of the exception, never its text: that may hold a local path"
@@ -8344,7 +7937,7 @@ def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypa
     stated = planned(total=0, library_defect="refuses")
     stated["mlp.down"].first_use(1, 1)
     assert stated.announcements() == [] and LIBRARY_CALLS == [], "no first use is made there: nothing is announced, nothing called"
-    assert "FlashInfer  flashinfer.gemm.mm_fp4" in stated.table() and stated.table().count("none; unverified in CI") == 3
+    assert "FlashInfer  flashinfer.gemm.mm_fp4" in stated.table() and stated.table().count("none; unverified in CI") == 4
     with pytest.raises(NotImplementedError, match="needs flashinfer-python 0.7.2.post1, which is not installed"):
         planned(library_installed=None)
     # a form the adapter cannot pass is a wrong table, whatever the device
@@ -8372,8 +7965,8 @@ def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypa
     assert down.serving() == ("flashinfer.gemm.mm_fp4", (("BACKEND", "cute-dsl"), ("TUNED", False)))
     with pytest.raises(ValueError, match="the weight of this call has it in the checkpoint's layout: the weights of this session were loaded for another plan"):
         down(qx, Dequantized(None, 1.0, merged))
-    with pytest.raises(ValueError, match="multiplies packed 4-bit codes with their block scales; this block is handed Unquantized"):
-        down(Unquantized(torch.zeros((1, model.geometry.mlp), dtype=torch.bfloat16), "nvfp4", 1.0), Dequantized(None, 1.0, kept))
+    with pytest.raises(ValueError, match="multiplies packed 4-bit codes with their block scales; this block is handed ScaledTensor"):
+        down(ScaledTensor(torch.zeros((1, model.geometry.mlp), dtype=torch.uint8), 1.0), Dequantized(None, 1.0, kept))
     with pytest.raises(ValueError, match="multiplies on the stored 8-bit weight with its one scale; the weight of this call has no stored 8-bit codes"):
         out(ScaledTensor(torch.zeros((1, model.geometry.la_out), dtype=torch.uint8), 1.0), Dequantized(None, 1.0, kept))
     per_row = ScaledTensor(torch.zeros((model.geometry.hidden, model.geometry.la_out), dtype=torch.uint8), torch.ones(model.geometry.hidden))
@@ -8392,7 +7985,7 @@ def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypa
     def recoded(self, merged):
         return TiledBlockScaledWeight(merged.codes & 0xF0, tile_scales(merged.block_scales), float(merged.scale))
 
-    for wrong, adapter, at in [(w, *a) for w in (unswizzled, recoded) for a in (("MmFp4Block", "mlp.down (layer 0)"), ("QuantizeMmFp4Block", "output_head"))]:
+    for wrong, adapter, at in [(w, *a) for w in (unswizzled, recoded) for a in (("MmFp4Block", "mlp.down (layer 0)"), ("MmFp4HeadBlock", "output_head"))]:
         with monkeypatch.context() as scoped:
             scoped.setattr(getattr(flashinfer_calls, adapter), "stored_layout", wrong)  # the head's adapter alone: the load ends at the head
             with pytest.raises(ValueError) as error:
@@ -8403,15 +7996,21 @@ def test_the_first_use_of_a_library_row_and_the_weight_it_multiplies_on(monkeypa
         ), (wrong.__name__, adapter)
 
 
-def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(monkeypatch):
+def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(monkeypatch, tmp_path):
     """FlashInfer is an optional package of the stack ``native`` alone, at validated versions.  The version check reads the
     distribution's metadata and names the version, the command and the stack that runs without the package.  The
-    requirement file is a lower bound at the validated version; the constraints file pins what the census was recorded
-    with; the adapter's list is the same; none of them names Triton.  And the sentences that state this policy are in the
-    area's guide and READMEs as they were agreed."""
+    requirement file is a lower bound at the validated version; the constraints file pins the versions the stack was last
+    run and checked with; the adapter's list is the same; none of them names Triton.  The library's kernel-binary package
+    has a requirement file of its own, a lower bound without an index line, and is pinned at the library's version.  A
+    run never lets the library fetch a
+    kernel binary: every adapter reaches the library through one import, and the library's download is switched off
+    before it -- where the environment does not hold the variable and where it holds it empty; a text that is set
+    stays.  The level of the library's own lines is set before that import the same way, to ``warning``: where the
+    environment names none, and where it names an empty one or blanks alone, on which the library's import raises; a
+    level that is set stays; and a process the run starts finds both variables.  And the sentences that state this policy are in
+    the area's guide and READMEs as they were agreed."""
     from model_samples import providers
     from model_samples.providers import ENTRY_NAMES, KEYS, flashinfer_calls
-    from model_samples.qwen_dense import QwenDense
 
     assert (flashinfer_calls.DISTRIBUTION, flashinfer_calls.VALIDATED) == ("flashinfer-python", (VALIDATED_LIBRARY,))
     # the installed version is what the distribution's metadata states, whatever is importable: nothing is imported for
@@ -8429,7 +8028,9 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
         scoped.setattr(flashinfer_calls.metadata, "version", stated)
         version = flashinfer_calls.installed()
         assert version == "9.9.9" and asked == ["flashinfer-python"], "read from the metadata of the distribution, by its name"
-        with pytest.raises(NotImplementedError, match=r"needs a validated flashinfer-python \(0.7.2.post1: .*\); this is 9.9.9: pip install -c "):
+        with pytest.raises(
+            NotImplementedError, match=r"needs flashinfer-python 0.7.2.post1, the version this stack was run and checked with; this is 9.9.9: pip install -c "
+        ):
             flashinfer_calls.check_package("flashinfer.gemm.mm_fp4")
         scoped.setattr(flashinfer_calls.metadata, "version", unknown)
         version = flashinfer_calls.installed()
@@ -8444,15 +8045,57 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     assert [line for line in requirements if not line.startswith("#")] == [f"flashinfer-python>={VALIDATED_LIBRARY}"], "a lower bound, never a pin"
     assert f"# Validated with: flashinfer-python {VALIDATED_LIBRARY}" in requirements
     pins = dict(line.split("==") for line in constraints if not line.startswith("#"))
-    census_versions = QwenDense.target().data["validated"]["recorded"]
-    recorded = {name: version for name, version in census_versions.items() if name != "triton"}
-    assert "triton" in census_versions and pins == recorded, "the constraints are the versions the census was recorded with, without Triton: nothing calls it"
-    assert pins["flashinfer-python"] == VALIDATED_LIBRARY and not any("triton" in line.lower() for line in requirements + constraints)
+    # the versions the stack was last run and checked with, each by its name: an update of a pin alone fails here until the stack is
+    # run on the new version -- and the library's kernel-binary package, at the library's own version
+    assert pins == {
+        "torch": "2.14.0",
+        "nvidia-cutlass-dsl": "4.8.0",
+        flashinfer_calls.DISTRIBUTION: VALIDATED_LIBRARY,
+        "apache-tvm-ffi": "0.1.11",
+        flashinfer_calls.BINARIES_DISTRIBUTION: VALIDATED_LIBRARY,
+    }, "the constraints: the versions of the stack's last checked run, and the kernel-binary package"
+    assert flashinfer_calls.VALIDATED == (VALIDATED_LIBRARY,) and not any("triton" in line.lower() for line in requirements + constraints)
+    binaries_file = (root / flashinfer_calls.BINARIES_REQUIREMENTS).read_text().splitlines()
+    assert [line for line in binaries_file if not line.startswith("#")] == [
+        f"flashinfer-cubin>={VALIDATED_LIBRARY}"
+    ], "a lower bound, never a pin, and no index line"
+    assert f"# Validated with: flashinfer-cubin {VALIDATED_LIBRARY}" in binaries_file and f"#   {flashinfer_calls.BINARIES_INSTALL}" in binaries_file
+    assert flashinfer_calls.BINARIES_INSTALL == (
+        "pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt"
+    ), "the index is named on the command, for this one package"
+    # the refusal and the level of the library's own lines, through every library adapter's import of a package of the
+    # library's name: it notes what it finds at its import and makes a logger at the level the variable names, as the
+    # library does -- "info" where the variable names none, and an error where its text is no level name
+    refusal, level = flashinfer_calls.NO_DOWNLOAD, "FLASHINFER_LOGGING_LEVEL"
+    package = tmp_path / "flashinfer"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        f"import logging\nimport os\nFOUND = os.environ.get({refusal!r})\nLEVEL = os.getenv({level!r}, 'info')\nlogging.Logger('flashinfer.jit').setLevel(LEVEL.upper())\n"
+    )
+    (package / "autotuner.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    adapters = {key: factory for key, factory in providers.factories().items() if "flashinfer" in key}
+    child = [sys.executable, "-c", f"import os; print(os.environ.get({refusal!r}), os.environ.get({level!r}))"]
+    for held, found in (((None, None), ("1", "warning")), (("", ""), ("1", "warning")), (("0", "  "), ("0", "warning")), (("0", "debug"), ("0", "debug"))):
+        for key, adapter in adapters.items():
+            for name in ("flashinfer", "flashinfer.autotuner"):
+                monkeypatch.delitem(sys.modules, name, raising=False)
+            for variable, text in zip((refusal, level), held):
+                monkeypatch.setenv(variable, "")  # what the adapter sets is then taken back behind the case
+                if text is None:
+                    monkeypatch.delenv(variable)
+                else:
+                    monkeypatch.setenv(variable, text)
+            library = adapter._library(None)
+            assert (library.FOUND, library.LEVEL) == found, f"{key}, {held!r} in the environment: the library finds {found!r} at its import"
+        started = subprocess.run(child, capture_output=True, text=True, timeout=120)
+        assert tuple(started.stdout.split()) == found, f"{held!r} in the environment: a process this one starts finds {found!r}"
     # the keys of the library's rows, and what the list of keys says about itself
     assert set(ENTRY_NAMES) == set(KEYS) and {key: entry for key, entry in ENTRY_NAMES.items() if "flashinfer" in key} == {
         "flashinfer.mm_fp4": "flashinfer.gemm.mm_fp4",
-        "torch_ref.quantize+flashinfer.mm_fp4": "torch_ref.quantize + flashinfer.gemm.mm_fp4",
+        "flashinfer.mm_fp4_head": "flashinfer.gemm.mm_fp4",
         "flashinfer.bmm_fp8": "flashinfer.gemm.bmm_fp8",
+        "flashinfer.decode_attention": ATTENTION_ENTRY,
     }
     guide = " ".join((MODELS / "AGENTS.md").read_text().split())
     area = " ".join((MODELS / "README.md").read_text().split())
@@ -8465,14 +8108,33 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
         "A third-party provider may build its own kernels at its first use; a sample makes that first use while the run is planned, before anything "
         "is loaded, and says so in one line.",
         "A third-party provider is imported inside its adapter, on a device; its version is read from the distribution's metadata there and held to "
-        "the validated list, and a missing or unvalidated version is a `SKIP` that names it, the requirement file and the nearest command that runs "
-        "without it. A plan on stated device facts imports no third-party package.",
+        "the validated list: a missing package stops the run (rule 1), an unvalidated version is a `SKIP`, and either sentence names the version, the "
+        "requirement file and the nearest command that runs without it. A plan on stated device facts imports no third-party package.",
+        "A package the run's stack calls that is not installed is not a `SKIP`: the run stops while it is planned, before anything is loaded, with one "
+        "`[NN] ERROR the stack <stack> cannot run:` line that names the package and the command that installs it, exit code 1 (`blocks.MissingPackage`). "
+        "No other stack takes the stack's place.",
         'A library whose kernels a stack calls has a requirement file of its own, a lower bound with its "Validated with" line '
-        "(`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the versions the launch records of "
-        "the family's census were recorded with. The maintainers of this area own that list; a version joins it with a recorded run, never with an "
+        "(`requirements-flashinfer.txt`), and `constraints-native.txt` holds the validated versions as exact pins: the versions the stack `native` "
+        "was last run and checked with. The maintainers of this area own that list; a version joins it with a run of the stack on it, never with an "
         "update of the pin alone.",
     ):
         assert sentence in guide, sentence
+    # the two exceptions as they were agreed, each directly behind the sentence it is the exception to and once
+    built, fetched = (
+        "A third-party provider may build its own kernels at its first use; a sample makes that first use while the run is planned, before anything "
+        "is loaded, and says so in one line.",
+        "A provider's precompiled kernel binaries are not built: they come from a package of that provider at a pinned version "
+        "(`constraints-native.txt`) or from a directory the user filled beforehand, never from a fetch inside a run -- a sample switches the "
+        "provider's own download off before its first use, and a binary that is not on the machine is named with the fix: a `SKIP` where a package "
+        "or a directory is there and does not hold it, the stop of rule 1 where no package of the binaries is installed.",
+    )
+    joined, exception = (
+        "The maintainers of this area own that list; a version joins it with a run of the stack on it, never with an update of the pin alone.",
+        "The library's kernel-binary package (`requirements-flashinfer-cubin.txt`) is one of the pins, at the library's own version: the one "
+        "version at which the library reads it.",
+    )
+    assert f"{built} {fetched} 6. **The sample's stack is `native`.**" in guide and guide.count(fetched) == 1, "rule 5 and its exception, in front of rule 6"
+    assert f"{joined} {exception} 13. **The report's GPU side" in guide and guide.count(exception) == 1, "rule 12 and its exception, in front of rule 13"
     assert (
         "FlashInfer is imported inside the adapters of the rows that call it, on a device, in the stack `native` alone; no other stack and no plan on "
         "stated device facts imports it." in area
@@ -8485,17 +8147,19 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
     assert "no provider module imports a third-party package: an adapter to one imports it inside the functions that run on a device." in stated
     # where the area README's first paragraph goes on from the library rows to speculative decoding, and where its table of modules has the adapter
     assert (
-        "The two attention blocks are still on their fallback rows, printed as `not yet`; their kernels and a captured decode step (a step recorded "
-        "once and replayed without Python between its launches) follow in that stack. Speculative decoding has its first pieces: the loader of the "
+        "The kernels of the attention core are precompiled binaries of the library's kernel-binary package: a run reads them and never fetches "
+        "one. The decode step of the plain sample is recorded once and replayed without Python between its launches; `--no-capture` launches every "
+        "block from Python, as the checks' own passes, the traced steps and the speculative sample do. Speculative "
+        "decoding has its first pieces: the loader of the "
         "checkpoint's drafter (its tensors, its rows of the output head, its 8-bit weights); the drafter's draft pass on reference blocks,"
     ) in area
     # ... and what its table of tests says of the library rows in a step of speculative decoding, and of the Dependabot entry
     assert (
-        "the same rows in a step of speculative decoding, behind the drafter's passes: the kernel class and the launch shape of the 4-bit multiply and "
-        "the recorded pick of the 8-bit one held and printed at the model's call sites;" in area
+        "the same rows in a step of speculative decoding, behind the drafter's passes: the kernel the library launched named at the model's call "
+        "sites;" in area
         and "the ignore list of the Dependabot entry against the packages the constraints pin, and the form of its items (a name and the three "
         "update types of a version update, nothing else);" in area
-        and "a launch in another shape than the recorded one at the model's site, a kernel class and a recorded pick at the model's site);" in area
+        and "two host reads, a launch in another shape than the entry states at the model's site);" in area
     )
     modules = [line.split("|")[1].strip() for line in (MODELS / "README.md").read_text().splitlines() if line.startswith("| `providers/")]
     assert modules == ["`providers/fe.py`", "`providers/library.py`", "`providers/flashinfer_calls.py`", "`providers/torch_ref.py`"]
@@ -8503,27 +8167,144 @@ def test_the_librarys_package_its_requirement_files_and_the_policy_sentences(mon
         "| `providers/flashinfer_calls.py` | adapters to library kernels of FlashInfer on the stored weights: the 4-bit multiply (`flashinfer.gemm.mm_fp4`,"
         in area
     )
-    assert "FlashInfer is an optional package of this stack alone." in family
+    assert "FlashInfer is a package of this stack alone: the sample's own stack calls it, the `nvidia-cudnn-frontend` package does not depend on it." in family
     script = " ".join((MODELS / "qwen_dense" / "00_decode.py").read_text().split())
     assert fix in area and fix in family and fix in script
     assert "### The rows a library serves" in (MODELS / "qwen_dense" / "README.md").read_text()
-    skipped = "`--stack native` on compute capability 10.x ends in `[00] SKIP` before anything is loaded, exit code 0"
-    assert f"Without the package, or with another version of it, {skipped}" in family
-    assert "on compute capability 10.x ``--stack native`` is a ``SKIP`` before anything is loaded" in script
-    assert "# without the package, on compute capability 10.x: SKIP before anything is loaded" in (MODELS / "README.md").read_text()
+    stopped = "a run on compute capability 10.x stops before anything is loaded: `[00] ERROR the stack native cannot run:`"
+    assert f"Without either package {stopped}" in " ".join(family.split())
+    assert "with another version of one it ends in `[00] SKIP` before anything is loaded, exit code 0" in " ".join(family.split())
+    assert "Without either, on compute capability 10.x, the run stops with ``[00] ERROR`` and names the package" in script
+    assert "with a version this area has not validated it is a ``SKIP`` before anything is loaded" in script
+    assert (
+        "# without the two packages, on compute capability 10.x: ERROR, a line that names the package, before anything is loaded"
+        in (MODELS / "README.md").read_text()
+    )
+    assert (
+        flashinfer_calls.BINARIES_INSTALL in area and flashinfer_calls.BINARIES_INSTALL in family
+    ), "the install line of the kernel-binary package, as it is typed"
     assert "--dry-plan" not in family + area + script, "the script has no such flag: a plan on stated device facts is made through the helper layer"
     assert "the call log reads `TUNED True`, and the kernel check fails with the form it found beside the form the row names" in family
-    assert "prints the kernel that was chosen beside the pick the census records, says whether it is that pick, and never fails on it" in family
+    assert "prints the kernel that was launched on the row's line, and never fails on which it is" in family
     for sentence in (  # what the library rows are, where they serve and where they have run (a comment mark of a command block left out)
-        "Three more blocks are multiplies the target runs on a library, FlashInfer, on the stored weights",
+        "Four are calls of a library, FlashInfer, on compute capability 10.x:",
         "so give native an environment of its own",
         "the out-projection FlashInfer's (a multiply over a copy in `fe-entries`)",
         "On compute capability 12.x no row of the library serves, so the three multiplies are over copies again",
-        "have run on 10.0 alone: on 10.3 and 10.7 the rows are unrun, the census has no section",
+        "have run on 10.0 alone: on 10.3 and 10.7 the rows are unrun",
         "8-bit multiply the same way: in `native` it starts on the release of the fused step or of the gate, and waits.",
         "Version updates come through the `pip` entry for `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers.",
     ):
         assert sentence in (area + family + guide).replace(" # ", " "), sentence
+
+
+def test_the_level_of_the_librarys_own_lines_through_a_run_and_a_text_that_names_no_level(monkeypatch, capsys, tmp_path):
+    """The level of the library's own lines through ``main()`` on the stack ``native``: the stand-in adapters reach a
+    package of the library's name through the adapters' one import, and that package does at its import what the
+    library does with the variable -- it upper-cases the text and hands it to ``setLevel`` of a logger.  Where the
+    environment names no level -- the variable unset, empty, or blanks alone -- the run sets ``warning`` before the
+    import and ends in ``PASS``; a level that is named stays as it was written.  A text that names no level ends the
+    run in ``[00] ERROR`` while it is planned, before the library is imported, in a sentence of its own that names the
+    variable and not its text -- never as operands an adapter built and the library declined.  What is declined is
+    what the library's import raises on and nothing it takes: a level name in either case passes, a name with a blank
+    beside it does not.  A plan on stated device facts asks nothing of the environment, and where the library is not
+    installed the run is the ``SKIP`` of the missing package whatever the text.  The check sets no logger of the
+    process."""
+    import importlib
+    import logging
+    import os
+
+    from model_samples import blocks
+    from model_samples.providers import flashinfer_calls
+
+    refusal, level = "FLASHINFER_NO_DOWNLOAD", "FLASHINFER_LOGGING_LEVEL"
+    package = tmp_path / "flashinfer"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        f"import logging\nimport os\nLEVEL = os.getenv({level!r}, 'info')\nlogging.Logger('flashinfer.jit').setLevel(LEVEL.upper())\n"
+    )
+    (package / "autotuner.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    found = []  # the level the package found at every import an adapter made of it
+    root = logging.getLogger().level
+    built_by_the_area = _stand_ins
+
+    def stand_ins(patch, **options):
+        built = built_by_the_area(patch, **options)
+        for key, stand_in in list(built.items()):
+            if "flashinfer" in key:  # the stand-in library, behind the adapters' own import of the package
+
+                def _library(self, stand_in=stand_in):
+                    found.append(flashinfer_calls.LibraryBlock._library(self).LEVEL)
+                    return stand_in._library(self)
+
+                built[key] = type(stand_in.__name__, (stand_in,), {"_library": _library})
+        return built
+
+    def fresh(text):
+        """The environment names ``text`` (``None``: nothing), and the package is not imported yet."""
+        for name in ("flashinfer", "flashinfer.autotuner"):
+            sys.modules.pop(name, None)
+        del found[:]
+        monkeypatch.setenv(level, "" if text is None else text)
+        if text is None:
+            monkeypatch.delenv(level)
+
+    monkeypatch.setattr(sys.modules[__name__], "_stand_ins", stand_ins)
+    for variable in (refusal, level):  # what an adapter sets in the environment is taken back behind this case
+        monkeypatch.setenv(variable, "")
+        monkeypatch.delenv(variable)
+    for name in ("flashinfer", "flashinfer.autotuner"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    run = ["--stack", "native", "--sequences", "1"]
+    try:
+        for text, expected in ((None, "warning"), ("", "warning"), (" \t", "warning"), ("debug", "debug")):  # blanks: a blank and a tab
+            fresh(text)
+            code, lines = _sample_run(monkeypatch, capsys, run)
+            assert code == 0 and lines[-1] == "[00] PASS", (text, lines[-3:])
+            assert (
+                found and set(found) == {expected} and os.environ[level] == expected
+            ), f"{text!r} in the environment: the library finds {expected!r} at its import"
+        # a text that names no level: the run's ERROR, in a sentence of its own, while it is planned -- the library not imported
+        fresh("loud")
+        code, lines = _sample_run(monkeypatch, capsys, run)
+        sentence = (
+            f": the environment's {level} names no level of Python's logging module, and FlashInfer takes its text for one when it is imported; "
+            "name a level there (debug, info, warning, error or critical), or unset the variable and this sample sets it to warning"
+        )
+        assert code == 1 and lines[-1].startswith("[00] ERROR flashinfer.") and lines[-1].endswith(sentence), lines[-1]
+        assert "loud" not in lines[-1].lower() and not any("declined the operands" in line for line in lines), "the variable is named, its text is not"
+        assert found == [] and "flashinfer" not in sys.modules and os.environ[level] == "loud", "the library was not imported, and the text stays"
+        assert (
+            LIBRARY_CALLS == [] and ATTENTION_CALLS == [] and not any(line.startswith(("checks", "[00] stage")) for line in lines)
+        ), "nothing was called or loaded"
+        # every row of the library asks, not the attention's alone: with the attention core on the chain a multiply's row declines it
+        code, lines = _sample_run(monkeypatch, capsys, [*run, "--provider", "attention.core=torch_ref.attention"])
+        assert code == 1 and lines[-1].endswith(sentence) and not any("declined the operands" in line for line in lines), lines[-1]
+        assert "flashinfer" not in sys.modules and LIBRARY_CALLS == []
+        # where the library is not installed nothing would import it, so its level is not asked: the stop of the missing package
+        fresh("loud")
+        code, lines = _sample_run(monkeypatch, capsys, run, library_installed=None)
+        assert code == 1 and lines[-1].startswith("[00] ERROR the stack native cannot run: flashinfer.") and "which is not installed" in lines[-1], lines[-1]
+        # a plan on stated device facts makes no first use and asks nothing of the environment: the same text, and the row is planned
+        model, stated = _tiny_model(), blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
+        rows = blocks.plan(model.provider_table, model.regimes, stated, 1, 1, "native", model=model, options={"device": "cpu"}).rows
+        assert rows["attention.core"].key == "flashinfer.decode_attention" and "flashinfer" not in sys.modules, "the table is stated, nothing is imported"
+        # what is declined is what the library's import raises on, and nothing it takes
+        for text, taken in (("WARN", True), ("Critical", True), ("notset", True), (" info", False), ("info ", False), ("10", False)):
+            fresh(text)
+            if taken:
+                flashinfer_calls.check_level("an entry")
+                assert logging.getLogger().level == root, "the check decides on a logger of its own: the root logger is where it was"
+                assert importlib.import_module("flashinfer").LEVEL == text
+            else:
+                with pytest.raises(ValueError, match=f"an entry: the environment's {level} names no level of Python's logging module"):
+                    flashinfer_calls.check_level("an entry")
+                with pytest.raises(ValueError, match="Unknown level"):
+                    importlib.import_module("flashinfer")
+    finally:
+        for name in ("flashinfer", "flashinfer.autotuner"):
+            sys.modules.pop(name, None)
 
 
 def _ignored_by_dependabot(text: str, ecosystem: str, directory: str) -> list:
@@ -8556,7 +8337,7 @@ def _ignored_by_dependabot(text: str, ecosystem: str, directory: str) -> list:
 
 
 def test_the_dependabot_entry_ignores_exactly_the_packages_the_native_constraints_pin():
-    """The exact pins of ``constraints-native.txt`` are the versions the kernel census was recorded with, so an update of
+    """The exact pins of ``constraints-native.txt`` are the versions the stack ``native`` was run and checked with, so an update of
     one fails this module by design, and the ``pip`` entry for ``/samples/models`` of ``.github/dependabot.yml`` must not
     propose one as a version update: its ignore list names the packages the file pins -- each by its own name, none by a
     pattern, none twice, no package more and none less.  A pin that is added without its ignore line fails here, and so
@@ -8596,3 +8377,2713 @@ def test_the_dependabot_entry_ignores_exactly_the_packages_the_native_constraint
         _ignored_by_dependabot(mine.replace('        update-types: ["x:y", z]\n', "        update-types:\n          - x\n"), "pip", "/samples/models")
     with pytest.raises(AssertionError, match="a key stands once in an item"):
         _ignored_by_dependabot(mine.replace(": b\n", ": b\n        versions: [1]\n        versions: [2]\n"), "pip", "/samples/models")
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# The attention preparation on its entry (``fe.attention_prepare_decode`` -> ``cudnn.AttentionPrepareDecode``): the row, the
+# adapter as it is over a stand-in entry, its operands through the entry's real host check, its twin and its band, the
+# kernel check on constructed records, the counts, and the control arms through ``main()``.
+# ---------------------------------------------------------------------------------------------------------------------------
+def _prepare_block(monkeypatch, calls, sequences=1, tokens=1, capacity=130, model=None, row=None, **entry):
+    """The real adapter of the attention preparation over a stand-in entry (:func:`_prepare_entry`; ``entry``: its
+    options) on the CPU, at the published widths, with a paged state of ``sequences`` x ``tokens`` and operands of one
+    call: ``(block, cache of the model's attention layer, in-projection rows, the layer's parameters, state, model)``."""
+    import cudnn
+
+    from model_samples.blocks import DeviceFacts
+    from model_samples.providers import AttentionParams, fe
+    from model_samples.qwen_dense import QwenDense, configs
+    from model_samples.state import DecodeState
+
+    monkeypatch.setattr(cudnn, "AttentionPrepareDecode", _prepare_entry(calls, **entry), raising=False)
+    monkeypatch.setattr(fe, "_ENTRIES", {})
+    model = QwenDense.reduced(2) if model is None else model
+    g = model.geometry
+    row = configs.PROVIDERS["attention.prepare"][0] if row is None else row
+    block = fe.AttentionPrepareDecodeBlock(row, model, DeviceFacts((10, 0), "stated device", 148, 0, 0), {"device": "cpu", "check_kernels": True})
+    state = DecodeState(g.layer_kinds, sequences, capacity, model.state_shapes(), "cpu", tokens, page=64)
+    generator = torch.Generator().manual_seed(7)
+    rows = sequences * tokens
+    qkv = (torch.randn(rows, 2 * g.attn_out + 2 * g.attn_kv_heads * g.attn_head_dim, generator=generator) * 3).bfloat16()
+    weights = [(torch.randn(g.attn_head_dim, generator=generator) * 0.3).bfloat16() for _ in range(2)]
+    params = AttentionParams(g.attn_heads, g.attn_kv_heads, g.attn_head_dim, g.rotary_dim, g.rope_theta, *weights)
+    return block, state.layers[g.layer_kinds.index("full_attention")], qkv, params, state, model
+
+
+def test_the_attention_preparation_row_and_what_falls_to_the_chain(tmp_path):
+    """The row of ``cudnn.AttentionPrepareDecode``: ``native`` and ``fe-entries``, compute capability 10.x, 1 to 1,024 rows of a
+    step of one token per sequence or of several, in the row's form, at the published attention widths and the published
+    rotary section.  Past 1,024 rows, on compute capability 12.x, on the two other stacks and for a checkpoint of the
+    family with another head width, rotary width or rotary section the block is the reference chain -- never an error.
+    The section is read from a checkpoint's configuration."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from model_samples import blocks, census
+    from model_samples.blocks import DeviceFacts
+    from model_samples.qwen_dense import Geometry, QwenDense, configs
+
+    row, chain = configs.PROVIDERS["attention.prepare"]
+    assert row.key == "fe.attention_prepare_decode" and row.classes == ("cc10.x",) and row.sequences == (1, 1024) and row.tokens == (1, None)
+    assert row.rows == (1, 1024) and set(row.stacks) == {"native", "fe-entries"} and row.band == "attention_prepare" and row.batch_invariant == ("cc10.0",)
+    assert (
+        not row.fallback and row.ci and row.serves == "rows 1-1,024, 24 heads of width 256 on 4 key / value heads, rotary width 64 in the sections 11 + 11 + 10"
+    )
+    form = {"POSITIONS": "3d", "SECTION": (11, 11, 10), "PAGE_SIZE": 64, "POSITION_DTYPE": "int64", "SLOT_DTYPE": "int64", "PDL": False, "PDL_RELEASE": False}
+    assert dict(row.form) == form, "the row's form, stated whole: three position rows in the published sections, pages of 64, an ordinary launch"
+    assert census.form_text(row.form).strip() == PREPARE_FORM
+    assert row.widths == (("attn_heads", 24), ("attn_kv_heads", 4), ("attn_head_dim", 256), ("rotary_dim", 64), ("rotary_section", (11, 11, 10)))
+    assert chain.key == "torch_ref.attention_prepare" and chain.fallback == "reference chain" and set(chain.stacks) == set(configs.EVERY)
+    assert Geometry().rotary_section == (11, 11, 10) and sum(Geometry().rotary_section) == Geometry().rotary_dim // 2
+    for stack in ("native", "fe-entries"):
+        for sequences in (1, 85, 1024):  # the first row count, one past a scheduling wave of 84 tokens, the last
+            planned, model = _stack_plan(2, stack, sequences=sequences)
+            assert planned.rows["attention.prepare"] is row and planned["attention.prepare"].cache_page == 64, (stack, sequences)
+            assert (
+                census.check_forms(census.expected(planned, model)) == []
+            ), f"{sequences} rows: the row's form is the entry's own (the public entry, built for the host)"
+        planned, model = _stack_plan(2, stack, sequences=1025)
+        assert planned.rows["attention.prepare"] is chain and planned["attention.prepare"].cache_page is None, "past 1,024 rows: the chain, on a plain cache"
+        line = next(line for line in planned.table().splitlines() if line.split()[0] == "attention.prepare")
+        assert line.endswith("fallback: reference chain") and "torch_ref.attention_prepare" in line, line
+        with pytest.raises(
+            NotImplementedError,
+            match=r"^cudnn.AttentionPrepareDecode serves rows 1-1,024, 24 heads of width 256 on 4 key / value heads, rotary width 64 in the sections "
+            r"11 \+ 11 \+ 10; this run has 1025 sequences x 1 tokens per sequence$",
+        ):
+            _stack_plan(2, stack, sequences=1025, overrides={"attention.prepare": "fe.attention_prepare_decode"})
+        # a step of several tokens per sequence: one launch for its rows -- 1 x 6, and the largest verify step the rows serve, 16 x 5
+        model = QwenDense.reduced(2)
+        facts = DeviceFacts((10, 0), "stated device", 148, 0, 0)
+        for sequences, tokens in ((1, 6), (16, 5), (4, 8)):
+            several = blocks.plan(model.provider_table, model.regimes, facts, sequences, tokens, stack, model=model, options={"device": "cpu"})
+            assert several.rows["attention.prepare"] is row, (stack, sequences, tokens)
+    for stack in ("fe-cublas", "reference"):
+        assert _stack_plan(2, stack)[0].rows["attention.prepare"] is chain, f"{stack}: the reference chain, as before"
+    # the other 10.x classes: the row is the entry's
+    for cc, sms in (((10, 3), 152), ((10, 7), 212)):
+        planned, model = _stack_plan(2, cc=cc, sms=sms)
+        assert planned.rows["attention.prepare"] is row, cc
+    # compute capability 12.x: the chain; --provider cannot put the entry there
+    planned, model = _stack_plan(2, cc=(12, 0), sms=170)
+    assert planned.rows["attention.prepare"] is chain and planned["attention.prepare"].cache_page is None
+    with pytest.raises(NotImplementedError, match=r"^cudnn.AttentionPrepareDecode serves compute capability 10.x; this device is 12.0$"):
+        _stack_plan(2, cc=(12, 0), sms=170, overrides={"attention.prepare": "fe.attention_prepare_decode"})
+    # a checkpoint of the family with another head width, rotary width or rotary section: not this row's -- the chain
+    facts = DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+    for field, value, said in (
+        ("attn_head_dim", 128, "attn_head_dim 128"),
+        ("rotary_dim", 32, "rotary_dim 32"),
+        ("rotary_section", (16, 8, 8), "rotary_section (16, 8, 8)"),
+    ):
+        other = QwenDense(replace(QwenDense.reduced(2).geometry, **{field: value}), (f"another {field}",))
+        planned = blocks.plan(other.provider_table, other.regimes, facts, 1, 1, "fe-entries", model=other, options={"device": "cpu"})
+        assert planned.rows["attention.prepare"] is chain and planned.rows["add_norm_quantize"].key == "fe.add_norm_quant_decode", field
+        serves = "attn_heads 24, attn_kv_heads 4, attn_head_dim 256, rotary_dim 64, rotary_section (11, 11, 10)"
+        with pytest.raises(NotImplementedError, match=rf"^cudnn.AttentionPrepareDecode serves {re.escape(serves)}; this model has {re.escape(said)}$"):
+            blocks.plan(other.provider_table, other.regimes, facts, 1, 1, "fe-entries", {"attention.prepare": "fe.attention_prepare_decode"}, model=other)
+    # the section of a checkpoint is what its configuration names under its rotary parameters; the published one where it names none
+    config = dict(model_type="qwen3_5_text", layer_types=["linear_attention", "full_attention"], head_dim=256, hidden_size=5120, vocab_size=272)
+    config.update(intermediate_size=17408, linear_num_key_heads=16, linear_num_value_heads=48, linear_value_head_dim=128, linear_conv_kernel_dim=4)
+    config.update(num_attention_heads=24, num_key_value_heads=4, rms_norm_eps=1e-6, rope_parameters={"partial_rotary_factor": 0.25, "rope_theta": 1.0e7})
+    tensors = {"embed_tokens.weight": None, "layers.0.input_layernorm.weight": None}
+
+    def described(**rope):
+        made = dict(config, rope_parameters=dict(config["rope_parameters"], **rope))
+        return QwenDense.describe(SimpleNamespace(config=made, label="a checkpoint", tensors=tensors, bind=lambda specs, keys: None)).geometry
+
+    assert described().rotary_section == (11, 11, 10) and described(mrope_section=[11, 11, 10]).rotary_section == (11, 11, 10)
+    assert described(mrope_section=[16, 8, 8]).rotary_section == (16, 8, 8) and described().rotary_dim == 64
+    for wrong in ([11, 11], "11, 11, 10", [11, 11, 10.5], [11, True, 10], 32):
+        with pytest.raises(ValueError, match=r"^a checkpoint: config.json has mrope_section = .* where three whole numbers are expected$"):
+            described(mrope_section=wrong)
+    # the tables of the family README are the table's own rendering, with this row in them
+    readme = (MODELS / "qwen_dense" / "README.md").read_text()
+    native = configs.readme_table(QwenDense().calls_text(), "native")
+    assert f"| attention preparation | 16 | `fe.attention_prepare_decode` | cudnn.AttentionPrepareDecode {PREPARE_FORM} |" in native and native in readme
+    default = configs.readme_table(QwenDense().calls_text())
+    assert (
+        "| attention preparation | 16 | `torch_ref.attention_prepare` | torch_ref.attention_prepare, fallback: reference chain |" in default
+        and default in readme
+    )
+
+
+def test_the_attention_preparation_entrys_adapter_over_a_stand_in_entry(monkeypatch):
+    """``fe.attention_prepare_decode`` as it is, over a stand-in entry that records what it is handed.  The seven fields of
+    the row's form reach the constructor as the entry's own arguments, one instance per (device, geometry, epsilon,
+    form).  A call hands the entry four VIEWS of the in-projection's row (nothing copied), the layer's two norm weights,
+    the cos / sin table and the position and slot rows of ``cache.at(position)``, the two halves of the cache's pool,
+    and outputs of its own; what it returns are the tensors the entry wrote.  Handed a second state, it hands its entry
+    that state's pool and table rows: nothing of a call is kept.  A row that leaves a field of the form out, a cache
+    that is no pool of pages, a pool of pages of another size and a decline inside a step are errors.  The first use,
+    while the run is planned: the entry's build, whose every typed decline is the installation's, then one call on
+    scratch operands, whose decline is of the adapter's operands -- unless the installation cannot import what the
+    call needs."""
+    from dataclasses import replace
+
+    import cudnn
+    from cudnn.attention_prepare import AttentionPrepareGeometry
+
+    from model_samples import census
+    from model_samples.blocks import DeviceFacts
+    from model_samples.providers import fe, torch_ref
+    from model_samples.qwen_dense import configs
+    from model_samples.state import DecodeState
+
+    calls = []
+    block, cache, qkv, params, state, model = _prepare_block(monkeypatch, calls, sequences=3)
+    row = block.row
+    block.check_support(3, 1)
+    assert fe._ENTRIES == {} and block.serving() == ("cudnn.AttentionPrepareDecode", ()), "on stated facts nothing is built; before a call nothing has served"
+    assert block.kernels == (census.Kernel("attention_prepare", "cuDNN FE", "exact", launches=1, shape="entry"),)
+    assert (block.per_row, block.state_args, block.cache_page, block.provider, block.entry) == ((0, 1), (1,), 64, "cuDNN FE", "cudnn.AttentionPrepareDecode")
+    facts = block.launch_facts(3)
+    (entry,) = fe._ENTRIES.values()
+    seven = dict(positions="3d", page_size=64, position_dtype="int64", slot_dtype="int64", mrope_section=(11, 11, 10), pdl=False, pdl_release=False)
+    built = dict(seven, device="cpu", geometry=AttentionPrepareGeometry(24, 4, 256, 64), eps=1e-6)
+    assert entry.built == built, "the row's seven fields, as the entry's own arguments, beside the model's geometry and its epsilon"
+    assert facts.shape == ((3, 28, 1), (128, 1, 1), 16) and facts.symbols == (
+        "cudnn_kernel_frost_attention_prepare_h24_4_d256_r64_3d_11_11_10_p64_i64_i64_plain_eps358637bd_0",
+    )
+    assert {name: facts.form[name] for name, _ in row.form} == dict(row.form)
+
+    first = block(qkv, cache, 63, params)
+    second = block(qkv, cache, 64, params)
+    assert [kind for kind, _ in calls] == ["prepare launch", "prepare launch"], "a call launches its entry and nothing else: no compile inside a step"
+    (_, one), (_, two) = calls
+    base, row_bytes = qkv.data_ptr(), 2 * qkv.shape[1]
+    for name, offset, heads, stride in (("q", 0, 24, 512), ("gate", 256, 24, 512), ("k", 12288, 4, 256), ("v", 13312, 4, 256)):
+        view = one[name]
+        assert tuple(view.shape) == (3, heads, 256) and view.stride() == (14336, stride, 1) and view.data_ptr() == base + 2 * offset, name
+        assert base <= view.data_ptr() < base + 3 * row_bytes and torch.equal(
+            view, qkv[:, offset : offset + heads * stride].view(3, heads, stride)[..., :256]
+        ), name
+    assert one["q_weight"] is params.q_norm and one["k_weight"] is params.k_norm, "the layer's two norm weights, as the loader holds them"
+    for at, call in ((63, one), (64, two)):
+        cos_sin, positions, slots = cache.at(at)
+        assert call["cos_sin"] is state.table.cos_sin and call["cos_sin"] is cos_sin
+        assert call["positions"].data_ptr() == positions.data_ptr() == state.table.positions[at].data_ptr() and tuple(call["positions"].shape) == (3, 3)
+        assert call["slot_mapping"].data_ptr() == slots.data_ptr() == state.table.slots[at].data_ptr() and call["slot_mapping"].tolist() == [
+            sequence * 3 * 64 + at for sequence in range(3)
+        ], "the slots of the step: sequence x pages x 64 + position, read from the cache's table and from nowhere else"
+        assert call["positions"].tolist() == [[at] * 3] * 3 and call["positions"].dtype == call["slot_mapping"].dtype == torch.int64
+        assert call["k_pool"].data_ptr() == cache.pool.data_ptr() and call["v_pool"].data_ptr() == cache.pool.data_ptr() + 2 * 256
+        assert tuple(call["k_pool"].shape) == tuple(call["v_pool"].shape) == (9, 4, 64, 256), "the two halves of the whole pool: views"
+    assert one["q_out"] is not two["q_out"] and one["gate_out"] is not two["gate_out"], "outputs of the call's own: never the entry's pair"
+    assert first[0] is one["q_out"] and second[0] is two["q_out"], "what a call returns are the tensors its entry wrote"
+    assert first[1].data_ptr() == one["gate_out"].data_ptr() and tuple(first[1].shape) == (3, 6144) and tuple(first[0].shape) == (3, 24, 256)
+    assert first[0].dtype == first[1].dtype == torch.bfloat16 and one["q_out"].is_contiguous() and one["gate_out"].is_contiguous()
+    assert torch.equal(first[1].view(torch.int16), qkv[:, :12288].view(3, 24, 512)[..., 256:].reshape(3, 6144).view(torch.int16)), "the gates: a bit copy"
+    assert block.serving() == ("cudnn.AttentionPrepareDecode #1", row.form), "the call log reads the instance that was called"
+    # one sequence alone, as the batch-invariance check runs it: the same pool, the window's columns of the same table rows
+    alone = cache.rows(1, 2)
+    block(qkv[1:2], alone, 64, params)
+    call = calls[-1][1]
+    assert call["slot_mapping"].tolist() == [3 * 64 + 64] and call["positions"].tolist() == [[64]] * 3 and call["k_pool"].data_ptr() == cache.pool.data_ptr()
+    assert call["q"].data_ptr() == base + row_bytes and call["slot_mapping"].data_ptr() == state.table.slots[64].data_ptr() + 8
+    # a second state under the same block, as the checks of a run hand it one: that state's pool and table rows, nothing of the first
+    again = DecodeState(model.geometry.layer_kinds, 3, 130, model.state_shapes(), "cpu", page=64)
+    second_cache = again.layers[model.geometry.layer_kinds.index("full_attention")]
+    assert second_cache.pool.data_ptr() != cache.pool.data_ptr() and not second_cache.pool.any()
+    block(qkv, second_cache, 63, params)
+    call = calls[-1][1]
+    assert call["k_pool"].data_ptr() == second_cache.pool.data_ptr() and call["v_pool"].data_ptr() == second_cache.pool.data_ptr() + 2 * 256, "its pool"
+    assert call["positions"].data_ptr() == again.table.positions[63].data_ptr() and call["slot_mapping"].data_ptr() == again.table.slots[63].data_ptr()
+    assert (
+        call["cos_sin"] is again.table.cos_sin and second_cache.pool[:, :, 63].any() and not second_cache.pool[:, :, :63].any()
+    ), "and its tables: its row 63 written"
+    # the form and the instances
+    with pytest.raises(ValueError) as wrong:
+        fe.AttentionPrepareDecodeBlock(replace(row, form=row.form[:-1]), model, block.facts, block.options).check_support(1, 1)
+    assert str(wrong.value) == (
+        "provider row fe.attention_prepare_decode: its form does not name PDL_RELEASE; this adapter passes POSITIONS, SECTION, PAGE_SIZE, POSITION_DTYPE, "
+        "SLOT_DTYPE, PDL, PDL_RELEASE to cudnn.AttentionPrepareDecode, and never leaves one of them to the entry's own default"
+    )
+    with pytest.raises(ValueError, match=r"^provider row fe.attention_prepare_decode: its form names THREADS; this adapter passes POSITIONS, "):
+        fe.AttentionPrepareDecodeBlock(replace(row, form=(*row.form, ("THREADS", 128))), model, block.facts, block.options).check_support(1, 1)
+    assert fe.AttentionPrepareDecodeBlock(row, model, block.facts, block.options).launch_facts(1).symbols == facts.symbols and len(fe._ENTRIES) == 1
+    other = type(model)(replace(model.geometry, norm_eps=1e-5), model.reductions)
+    fe.AttentionPrepareDecodeBlock(row, other, block.facts, block.options).launch_facts(1)
+    assert [built.built["eps"] for built in fe._ENTRIES.values()] == [1e-6, 1e-5], "the epsilon is a compile key of the entry: two values, two instances"
+    one_row = fe.AttentionPrepareDecodeBlock(replace(row, form=(("POSITIONS", "1d"), ("SECTION", None), *row.form[2:])), model, block.facts, block.options)
+    one_row(qkv, cache, 5, params)
+    assert tuple(calls[-1][1]["positions"].shape) == (3,) and calls[-1][1]["positions"].data_ptr() == state.table.positions[5].data_ptr()
+    assert one_row.serving() == ("cudnn.AttentionPrepareDecode #3", (("POSITIONS", "1d"), ("SECTION", None), *row.form[2:])), "one position row: another form"
+    # what is not a call of this row
+    launched = len(calls)
+    plain = DecodeState(model.geometry.layer_kinds, 3, 130, model.state_shapes(), "cpu").layers[1]
+    with pytest.raises(ValueError) as wrong:
+        block(qkv, plain, 0, params)
+    assert str(wrong.value) == (
+        "cudnn.AttentionPrepareDecode writes an attention cache that is a pool of pages of 64 positions; this block is handed KvCache: "
+        "the session's state was built for another plan"
+    )
+    halved = DecodeState(model.geometry.layer_kinds, 3, 130, model.state_shapes(), "cpu", page=32).layers[1]
+    with pytest.raises(ValueError) as wrong:
+        block(qkv, halved, 0, params)
+    assert str(wrong.value) == (
+        "cudnn.AttentionPrepareDecode writes an attention cache that is a pool of pages of 64 positions; this block is handed pages of 32 positions: "
+        "the session's state was built for another plan"
+    ), "a pool of pages of another size is not this adapter's either"
+    doubled = DecodeState(model.geometry.layer_kinds, 3, 130, model.state_shapes(), "cpu", page=128).layers[1]
+    with pytest.raises(ValueError) as wrong:
+        block(qkv, doubled, 0, params)
+    assert str(wrong.value) == (
+        "cudnn.AttentionPrepareDecode writes an attention cache that is a pool of pages of 64 positions; this block is handed pages of 128 positions: "
+        "the session's state was built for another plan"
+    ), "nor is a pool of larger pages"
+    assert len(calls) == launched, "neither cache was handed to the entry"
+    declined = "the attention preparation decode step serves at most 1024 rows (tokens) per call; got 1025"
+    with monkeypatch.context() as patched:
+        patched.setattr(type(entry), "__call__", lambda self, *operands: (_ for _ in ()).throw(NotImplementedError(declined)))
+        with pytest.raises(RuntimeError, match=rf"^cudnn.AttentionPrepareDecode declined the operands of this step: {re.escape(declined)}$"):
+            block(qkv, cache, 0, params)
+    for name in (
+        "attention_prepare/frost/prepare_decode.py",
+        "attention_prepare/frost/kernel/prepare_decode_config.py",
+        "attention_prepare/frost/kernel/prepare_decode_f16.py",
+        "gated_attention_block/cache_write_contract.py",
+        "frost/init_order.py",  # what a call of this entry runs in front of its launch: the order behind the initialisation of entry-owned outputs
+    ):
+        assert name in fe.SOURCE_FILES and (Path(cudnn.__file__).parent / name).is_file(), f"the source hash of a run covers {name}"
+    importers = [
+        name for name in fe.SOURCE_FILES if re.search(r"^from cudnn\.frost import init_order\b", (Path(cudnn.__file__).parent / name).read_text(), re.M)
+    ]
+    assert (
+        "attention_prepare/frost/prepare_decode.py" in importers and fe.SOURCE_FILES.count("frost/init_order.py") == 1
+    ), "this entry's file imports it: hashed once"
+    reference = torch_ref.AttentionPrepare(configs.PROVIDERS["attention.prepare"][1], model, block.facts, block.options)
+    twin = block.twin(reference)
+    assert type(twin) is torch_ref.AttentionPrepareRounded and block.twin(reference) is twin and twin.order == "3d" and reference.twin(reference) is reference
+    assert one_row.twin(reference).order == "1d" and one_row.twin(reference) is not twin, "the twin of a row of one position row rotates in that row's order"
+
+    # the first use, while the run is planned: on a real device alone
+    real = DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+
+    class OnTheCpu(fe.AttentionPrepareDecodeBlock):
+        first_use_devices = ("cpu",)
+
+    def planned(count, decline=None, **more):
+        del calls[:]
+        monkeypatch.setattr(cudnn, "AttentionPrepareDecode", _prepare_entry(calls, decline=decline, **more), raising=False)
+        monkeypatch.setattr(fe, "_ENTRIES", {})
+        made = OnTheCpu(row, model, real, {"device": "cpu", "check_kernels": True})
+        made.check_support(count, 1)
+        return made
+
+    block.first_use(4, 1)
+    assert calls[-1][0] == "prepare launch" and len(fe._ENTRIES) == 3, "on stated device facts a plan builds nothing and launches nothing"
+    made = planned(5)
+    made.first_use(5, 1)
+    assert [kind for kind, *_ in calls] == ["prepare compile", "prepare launch"] and calls[0] == ("prepare compile", None), "the build takes no operand"
+    scratch = calls[1][1]
+    assert tuple(scratch["q"].shape) == (5, 24, 256) and tuple(scratch["k_pool"].shape) == (1, 4, 64, 256) and tuple(scratch["positions"].shape) == (3, 5)
+    assert scratch["slot_mapping"].tolist() == [0, 1, 2, 3, 4] and tuple(scratch["cos_sin"].shape) == (1, 64) and not scratch["positions"].any()
+    assert scratch["q"].stride() == (14336, 512, 1) and scratch["k"].stride() == (14336, 256, 1), "scratch operands in the layout a step hands the entry"
+    made.compile(5, 1)
+    assert [kind for kind, *_ in calls[2:]] == ["prepare compile", "prepare launch"], "at load: the entry finds its kernel built, and launches once"
+    needs = ["the attention preparation decode step on compute capability 10.7 requires a CuTe DSL whose compiler is CUDA 13.4 or later"]
+    made = planned(1, decline=needs)
+    with pytest.raises(NotImplementedError, match=rf"^{re.escape(needs[0])}$"):
+        made.first_use(1, 1)  # the entry's own words: the SKIP
+    assert [kind for kind, *_ in calls] == ["prepare compile"], "declined by the build: nothing was launched"
+    made = planned(2)
+    for raised, text in ((ValueError, "k_pool must be [num_pages >= 1, H=4, page_size=64, D=256]"), (TypeError, "positions must be torch.int64")):
+        monkeypatch.setattr(
+            type(fe._ENTRIES and list(fe._ENTRIES.values())[0] or made._build("cpu")),
+            "__call__",
+            lambda self, *o, e=raised, t=text: (_ for _ in ()).throw(e(t)),
+        )
+        with pytest.raises(ValueError) as wrong:
+            made.first_use(2, 1)
+        assert str(wrong.value) == f"cudnn.AttentionPrepareDecode declined the operands this adapter built for its first use: {text}", "an ERROR: the adapter's"
+
+    def from_import(self, *operands):
+        try:
+            raise ImportError("No module named 'cutlass'")
+        except ImportError as error:
+            raise NotImplementedError("the attention preparation decode step requires nvidia-cutlass-dsl >= 4.8.0; the CuTe DSL is not installed") from error
+
+    monkeypatch.setattr(type(made._build("cpu")), "__call__", from_import)
+    with pytest.raises(NotImplementedError, match=r"requires nvidia-cutlass-dsl >= 4.8.0; the CuTe DSL is not installed$"):
+        made.first_use(2, 1)  # what the call needs of the installation cannot be imported: the installation's, a SKIP
+    monkeypatch.setattr(
+        type(made._build("cpu")), "__call__", lambda self, *o: (_ for _ in ()).throw(NotImplementedError("serves a torch.bfloat16 cos_sin table"))
+    )
+    with pytest.raises(ValueError, match=r"^cudnn.AttentionPrepareDecode declined the operands this adapter built for its first use: serves a torch.bfloat16"):
+        made.first_use(2, 1)  # any other decline of that call is of the operands this adapter built
+    # a page-16 entry on the pool of 64-row pages: the entry declines the pool by name, and the adapter says whose operands they are
+    made = planned(1)
+    small = OnTheCpu(
+        replace(row, form=tuple(("PAGE_SIZE", 16) if name == "PAGE_SIZE" else (name, value) for name, value in row.form)), model, real, made.options
+    )
+    small.check_support(1, 1)
+    with pytest.raises(ValueError) as wrong:
+        small.first_use(1, 1)
+    assert str(wrong.value) == (
+        "cudnn.AttentionPrepareDecode declined the operands this adapter built for its first use: k_pool must be [num_pages >= 1, H=4, page_size=16, D=256]"
+    )
+    # on a real device the adapter asks the entry, at plan time, for the launch of the run's row count: a decline is a wrong table
+    made = planned(1024)
+    monkeypatch.setattr(type(made._build("cpu")), "limit", 1000)
+    with pytest.raises(ValueError) as wrong:
+        OnTheCpu(row, model, real, made.options).check_support(1024, 1)
+    assert str(wrong.value) == (
+        "the provider table is wrong: the row of fe.attention_prepare_decode claims this run (1024 rows on compute capability 10.0), and "
+        "cudnn.AttentionPrepareDecode declines it: this stand-in serves at most 1000 rows (tokens) per call; got 1024"
+    )
+
+
+def test_a_decline_of_the_attention_preparations_entry_at_load_is_an_error_that_says_whose_it_is(monkeypatch):
+    """After the plan nothing skips.  At load the adapter of ``cudnn.AttentionPrepareDecode`` asks its entry for its
+    kernel once more and launches it once, on scratch operands of the run's row count.  A typed decline there -- of the
+    build or of that launch -- is a ``RuntimeError`` raised from the entry's own: never a return, never a SKIP.  Its
+    sentence says whose the decline is: the installation's where the adapter can name a requirement that is not met (a
+    CuTe DSL without the part's target, by cuDNN Frontend's public probe; on compute capability 10.7 a CuTe DSL whose
+    compiler is older than CUDA 13.4, which the entry's page asks for there), the operands this adapter built where it
+    can name none."""
+    from types import SimpleNamespace
+
+    import cudnn
+    import cudnn.frost
+    import cutlass.base_dsl.version_info as dsl_version
+
+    from model_samples.blocks import DeviceFacts
+    from model_samples.providers import fe
+    from model_samples.qwen_dense import QwenDense, configs
+
+    calls, declines = [], [""]
+    row, model = configs.PROVIDERS["attention.prepare"][0], QwenDense.reduced(2)
+
+    class OnTheCpu(fe.AttentionPrepareDecodeBlock):
+        first_use_devices = ("cpu",)
+
+    def planned(cc, sms):  # the block of a run on a real device of that class, behind its plan: the entry built, nothing declined
+        del calls[:]
+        declines[0] = ""
+        monkeypatch.setattr(cudnn, "AttentionPrepareDecode", _prepare_entry(calls, decline=declines), raising=False)
+        monkeypatch.setattr(fe, "_ENTRIES", {})
+        made = OnTheCpu(row, model, DeviceFacts(cc, "stated device", sms, 180 * GIB, 80 * GIB), {"device": "cpu", "check_kernels": True})
+        made.check_support(2, 1)
+        made.first_use(2, 1)
+        assert [kind for kind, *_ in calls] == ["prepare compile", "prepare launch"]
+        return made
+
+    needs = "the attention preparation decode step on compute capability 10.7 requires a CuTe DSL whose compiler is CUDA 13.4 or later"
+    pool = "the attention preparation decode step serves at most 1024 rows (tokens) per call; got 1025"
+    installation = "cudnn.AttentionPrepareDecode declines this installation at its first launch: "
+    operands = "cudnn.AttentionPrepareDecode declined the operands this adapter built for its first launch: "
+    for cc, sms, target, compiler, whose in (
+        ((10, 0), 148, True, (12, 9), operands),  # the part's target is there, and either flavour of the CuTe DSL serves this class
+        ((10, 0), 148, False, (13, 4), installation),  # a CuTe DSL without the part's target
+        ((10, 3), 152, True, (12, 9), operands),
+        ((10, 7), 212, True, (12, 9), installation),  # the entry's page: on this class a compiler of CUDA 13.4 or later
+        ((10, 7), 212, True, (13, 3), installation),
+        ((10, 7), 212, True, (13, 4), operands),
+        ((10, 7), 212, True, (14, 0), operands),
+    ):
+        monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None, target=target: target)
+        monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=compiler[0], minor=compiler[1]))
+        made = planned(cc, sms)
+        made.compile(2, 1)
+        assert [kind for kind, *_ in calls[2:]] == ["prepare compile", "prepare launch"], "a load nothing declines: the kernel found, one launch"
+        # the build declines at load
+        declines[0] = needs
+        del calls[:]
+        with pytest.raises(RuntimeError) as declined:
+            made.compile(2, 1)
+        assert str(declined.value) == whose + needs, f"compute capability {cc}, compiler {compiler}: the sentence says whose the decline of the build is"
+        assert type(declined.value.__cause__) is NotImplementedError and str(declined.value.__cause__) == needs, "raised from the entry's own decline"
+        assert [kind for kind, *_ in calls] == ["prepare compile"], "declined by the build: nothing was launched"
+        # the launch on the scratch operands declines at load
+        declines[0] = ""
+        with monkeypatch.context() as patched:
+            patched.setattr(type(made._build("cpu")), "__call__", lambda self, *handed: (_ for _ in ()).throw(NotImplementedError(pool)))
+            with pytest.raises(RuntimeError) as declined:
+                made.compile(2, 1)
+        assert str(declined.value) == whose + pool, f"compute capability {cc}, compiler {compiler}: the sentence says whose the decline of the launch is"
+        assert type(declined.value.__cause__) is NotImplementedError and str(declined.value.__cause__) == pool
+    # what is no typed decline of the entry is not reworded: an operand the entry refuses by type or value is the adapter's defect as it is raised
+    made = planned((10, 0), 148)
+    for raised in (TypeError, ValueError):
+        with monkeypatch.context() as patched:
+            patched.setattr(
+                type(made._build("cpu")), "__call__", lambda self, *handed, error=raised: (_ for _ in ()).throw(error("positions must be torch.int64"))
+            )
+            with pytest.raises(raised, match=r"^positions must be torch.int64$"):
+                made.compile(2, 1)
+
+
+@pytest.mark.parametrize("sequences, tokens, position", [(1, 1, 0), (1, 1, 63), (3, 1, 64), (2, 3, 62), (16, 5, 125), (1, 6, 0)])
+def test_the_adapters_operands_pass_the_entrys_own_host_check(monkeypatch, sequences, tokens, position):
+    """What the adapter hands its entry, through the entry's REAL binding check (``check_binding``: types, dtypes, shapes,
+    strides, alignment, overlap, the paged-pool contract) on CPU tensors: at the first position, on both sides of a page
+    boundary, at several sequences, at several tokens per sequence across the boundary, at the largest verify step the
+    rows serve, and for every sequence alone (the window of the pool a check cuts out)."""
+    from cudnn.attention_prepare.frost import prepare_decode
+
+    calls = []
+    block, cache, qkv, params, state, model = _prepare_block(monkeypatch, calls, sequences=sequences, tokens=tokens)
+    form = dict(positions="3d", mrope_section=(11, 11, 10), page_size=64, position_dtype="int64", slot_dtype="int64")
+    cfg = prepare_decode.make_cfg(prepare_decode.AttentionPrepareGeometry(24, 4, 256, 64), 1e-6, **form)
+
+    def checked(operands):
+        try:
+            return prepare_decode.check_binding(cfg, *(operands[name] for name in prepare_decode.OPERAND_NAMES))
+        except NotImplementedError as error:
+            if isinstance(error.__cause__, ImportError):  # the paged-pool contract's package imports the CuTe DSL
+                pytest.skip(f"the entry's binding check needs the CuTe DSL: {error}")
+            raise
+
+    block(qkv, cache, position, params)
+    assert checked(calls[-1][1]) == sequences * tokens
+    for sequence in range(sequences):  # one sequence alone: its rows, and its window of the pool
+        first, last = sequence * tokens, (sequence + 1) * tokens
+        block(qkv[first:last], cache.rows(first, last), position, params)
+        assert checked(calls[-1][1]) == tokens, sequence
+    block.options["device"] = "cpu"
+    entry, operands = block._scratch(sequences, tokens)
+    entry(*operands)
+    assert checked(calls[-1][1]) == sequences * tokens, "and the scratch operands of its first use"
+
+
+def _suite_twin():
+    """The helper module of the entry's own suite (``test/python/attention_prepare/frost/attention_prepare_utils.py``), loaded by
+    its path: the twin the entry's device cells are held to."""
+    import importlib.util
+
+    path = MODELS.parents[1] / "test" / "python" / "attention_prepare" / "frost" / "attention_prepare_utils.py"
+    spec = importlib.util.spec_from_file_location("attention_prepare_utils_of_the_entrys_suite", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_attention_preparations_twin_and_its_band_on_stated_tensors(monkeypatch):
+    """The attention preparation at the kernel's rounding points, and the band its entry is judged with.  The twin is the
+    twin of the entry's own suite, line by line: equal to it bit for bit, and its band's terms are that file's.  It is
+    held against a version written out from the operation's definition, row by row.  Its position is the integer the
+    step hands it: a state whose tables are shifted leaves its bytes as they were.  The kernel's chain in fp32 is inside
+    the band; outside, each alone and by its own rule: a rotated element and a pass-through element two units off, of
+    a query row and of a key row the call wrote, a gate bit, a value bit, the key rows of two neighbouring slots
+    exchanged, a pool row no position of the call names, and a value that is not finite.  The epsilon the twin adds is
+    the fp32 value the kernel adds: one searched row, stated here, is another byte with the fp64 value."""
+    import math
+
+    from cudnn.attention_prepare.frost import prepare_decode
+
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import configs
+
+    # the twin's rows against the suite's twin, on that suite's own draws: the same bytes and the same band
+    suite = _suite_twin()
+    cfg = prepare_decode.make_cfg(
+        suite.GEOMETRY, suite.EPS, positions="3d", mrope_section=suite.SECTION, page_size=64, position_dtype="int64", slot_dtype="int64"
+    )
+    # (1,024 random tokens: among millions of elements a root taken in fp32 moves some to the other bf16 value; and operands whose
+    # rotary products underflow, where the sign of a zero says which product of the second half is the fused one)
+    draws = [(kind, suite.make_operands(tokens, seed=seed, kind=kind)) for kind, tokens, seed in (("random", 7, 0), ("structured", 9, 1), ("edge", 6, 2))]
+    draws += [("random, 1,024 tokens", suite.make_operands(1024, seed=3, kind="random")), ("underflow", suite.underflow_operands(8, seed=4))]
+    for kind, ops in draws:
+        tokens = ops["positions"].shape[-1]
+        at = ops["positions"][0].clone()
+        ops["positions"] = at.expand(3, tokens).contiguous()  # one position per token: three equal rows, as a text position is
+        table = ops["cos_sin"][at]
+        cos, sin = table[:, None, :32], table[:, None, 32:]
+        for name, weight in (("q", "q_weight"), ("k", "k_weight")):
+            want, want_band = suite.twin_rows(ops[name], ops[weight], ops["positions"], ops["cos_sin"], cfg)
+            got, band = torch_ref.prepare_rows(ops[name], ops[weight], cos, sin, suite.EPS)
+            assert torch.equal(suite.bits(got), suite.bits(want)), f"{kind}, {name}: the twin is the suite's twin, bit for bit"
+            assert band.dtype == torch.float64 and torch.equal(band, want_band), f"{kind}, {name}: and its band is the suite's"
+    one_row = prepare_decode.make_cfg(suite.GEOMETRY, suite.EPS, positions="1d", page_size=64, position_dtype="int64", slot_dtype="int64")
+    three, _ = torch_ref.prepare_rows(ops["q"], ops["q_weight"], cos, sin, suite.EPS)  # the last draw: every rotary product underflows
+    got, _ = torch_ref.prepare_rows(ops["q"], ops["q_weight"], cos, sin, suite.EPS, order="1d")
+    want, _ = suite.twin_rows(ops["q"], ops["q_weight"], at.reshape(1, -1), ops["cos_sin"], one_row)
+    assert torch.equal(suite.bits(got), suite.bits(want)) and not torch.equal(suite.bits(got), suite.bits(three)), "the order of one position row: other zeros"
+    values = torch.tensor([0.0, 1.0, 1.5, -3.0, 2.0**-130, 255.0, 256.0, 1e30], dtype=torch.float64)
+    assert torch.equal(torch_ref.bf16_unit(values), suite.unit(values)), "one bf16 unit at a magnitude: the suite's"
+    assert torch_ref.bf16_unit(torch.tensor([1.0, 1.99, 2.0], dtype=torch.float64)).tolist() == [2.0**-7, 2.0**-7, 2.0**-6]
+    # the epsilon under the root is the fp32 value of the model's, as the kernel adds it.  The suite's draws are of ordinary magnitude,
+    # where either value gives the same root; a row whose mean of squares is of the epsilon's order tells them apart.  ONE searched
+    # row, stated whole: its first 128 elements are 37 * 2**-18 and its last 128 are 167 * 2**-18, under the weights i / 256 -- with
+    # the fp32 value the bytes are the suite's twin's, with the fp64 value the root is another fp32 value and element 100 another byte
+    small = suite.make_operands(1, seed=5, kind="random")
+    where = small["positions"][0].clone()
+    small["positions"] = where.expand(3, 1).contiguous()
+    small["q"][:] = torch.cat((torch.full((128,), 37 * 2.0**-18), torch.full((128,), 167 * 2.0**-18))).bfloat16()
+    small["q_weight"][:] = (torch.arange(256) / 256).bfloat16()
+    table = small["cos_sin"][where]
+    want, _ = suite.twin_rows(small["q"], small["q_weight"], small["positions"], small["cos_sin"], cfg)
+    got, _ = torch_ref.prepare_rows(small["q"], small["q_weight"], table[:, None, :32], table[:, None, 32:], suite.EPS)
+    assert torch.equal(suite.bits(got), suite.bits(want)), "the searched row: the twin adds the fp32 value of the epsilon, as the suite's twin does"
+    searched, gain = small["q"][0, 0].float(), small["q_weight"].float() + 1.0
+    assert searched.tolist() == [37 * 2.0**-18] * 128 + [167 * 2.0**-18] * 128 and gain.tolist() == [1.0 + i / 256 for i in range(256)], "as stated"
+    mean = sum(element**2 for element in searched.tolist()) / 256  # exact: every square and the sum are whole multiples of 2**-36
+    roots = []
+    for epsilon, moved in ((float(torch.tensor(suite.EPS, dtype=torch.float32)), []), (suite.EPS, [100])):
+        roots.append(torch.tensor(1.0 / math.sqrt(mean + epsilon), dtype=torch.float32))
+        normed = ((searched * roots[-1]) * gain).bfloat16()  # the elements behind the rotary part are the normalised values themselves
+        other = (suite.bits(normed[64:]) != suite.bits(got[0, 0, 64:])).nonzero().flatten()
+        assert (other + 64).tolist() == moved, f"the epsilon {epsilon!r}: the fp32 value gives the twin's bytes, the fp64 value another byte at element 100"
+    assert float(roots[0]) != float(roots[1]), "two epsilons, two roots in fp32"
+
+    # one call of the adapter over the kernel's fp32 chain, and of its twin: two sequences x three tokens across a page boundary
+    calls = []
+    block, cache, qkv, params, state, model = _prepare_block(monkeypatch, calls, sequences=2, tokens=3)
+    g, position, rows = model.geometry, 62, 6
+    reference = torch_ref.AttentionPrepare(configs.PROVIDERS["attention.prepare"][1], model, block.facts, block.options)
+    twin = block.twin(reference)
+    before = cache.pool.clone()
+    out = tuple(t.clone() for t in block(qkv, cache, position, params))
+    after = cache.pool.clone()
+    cache.pool.copy_(before)
+    ref = tuple(t.clone() for t in twin(qkv, cache, position, params))
+    ref_after = cache.pool.clone()
+    assert tuple(ref[0].shape) == (rows, 24, 256) and tuple(ref[1].shape) == (rows, 6144) and ref[0].dtype == ref[1].dtype == torch.bfloat16
+    # the bands the twin hands the judge are the bands of its rows for THESE rows, element for element, and no multiple of them
+    turns = [torch_ref.rope_cos_sin(position + token, g.rotary_dim, g.rope_theta, "cpu") for token in range(3)]
+    cos, sin = (torch.stack([turn[part] for turn in turns]).repeat(2, 1)[:, None] for part in (0, 1))  # row (sequence, token): its token's position
+    for name, x, weight, kept in (
+        ("query", qkv[:, :12288].view(rows, 24, 512)[..., :256], params.q_norm, twin.terms.q_band),
+        ("key", qkv[:, 12288:13312].view(rows, 4, 256), params.k_norm, twin.terms.k_band),
+    ):
+        band = torch_ref.prepare_rows(x, weight, cos, sin, model.norm_eps)[1]
+        assert band[..., :64].amin() > 0 and torch.equal(kept, band), f"the band of the {name} rows that the judge is handed is the band of the twin's rows"
+
+    # ... the twin against the operation written out row by row from its definition (mean and root in fp64, rounded to fp32 once)
+    eps32 = float(torch.tensor(1e-6, dtype=torch.float32).double())
+
+    def defined(x, weight, at):  # one head row [D] at one position
+        mean = sum(float(element) ** 2 for element in x.float().tolist()) / 256
+        normed = ((x.float() * torch.tensor(1.0 / math.sqrt(mean + eps32), dtype=torch.float32)) * (weight.float() + 1.0)).bfloat16()
+        cos, sin = torch_ref.rope_cos_sin(at, g.rotary_dim, g.rope_theta, "cpu")
+        n1, n2 = normed[:32].float(), normed[32:64].float()
+        first = (n1.double() * cos.double() - (n2 * sin.float()).double()).float().bfloat16()
+        second = (n2.double() * cos.double() + (n1 * sin.float()).double()).float().bfloat16()
+        return torch.cat((first, second, normed[64:]))
+
+    pairs = qkv[:, :12288].view(rows, 24, 512)
+    keys = qkv[:, 12288:13312].view(rows, 4, 256)
+    paged = ref_after.view(2, 3, 4, 64, 512)
+    for row in range(rows):
+        sequence, token = divmod(row, 3)
+        at = position + token
+        for head in (0, 11, 23):
+            assert torch.equal(ref[0][row, head].view(torch.int16), defined(pairs[row, head, :256], params.q_norm, at).view(torch.int16)), (row, head)
+        for head in range(4):
+            written = paged[sequence, at // 64, head, at % 64]
+            assert torch.equal(written[:256].view(torch.int16), defined(keys[row, head], params.k_norm, at).view(torch.int16)), (row, head)
+            assert torch.equal(written[256:].view(torch.int16), qkv[row, 13312 + 256 * head : 13568 + 256 * head].view(torch.int16)), "the value: a bit copy"
+    assert torch.equal(ref[1].view(torch.int16), pairs[..., 256:].reshape(rows, 6144).view(torch.int16)), "the gates: a bit copy"
+    live = torch.zeros(6, 64, dtype=torch.bool)
+    for sequence in range(2):
+        for at in (62, 63, 64):
+            live[sequence * 3 + at // 64, at % 64] = True
+    assert int(live.sum()) == 6 and not ref_after.permute(0, 2, 1, 3)[~live].any(), "the twin wrote the rows of the call's positions and no other"
+
+    # ... a state whose tables are shifted: the twin never reads them
+    shifted_block, shifted, _, _, shifted_state, _ = _prepare_block(monkeypatch, [], sequences=2, tokens=3)
+    shifted_state.table.positions += 1
+    shifted_state.table.slots += 1
+    moved = tuple(t.clone() for t in shifted_block.twin(reference)(qkv, shifted, position, params))
+    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(moved, ref)) and torch.equal(
+        shifted.pool.view(torch.int16), ref_after.view(torch.int16)
+    )
+
+    def judged(q=out[0], gate=out[1], pool=after, against=twin):
+        stats = tie_out.BlockStats("attention_prepare")
+        tie_out.BlockTap._judge(stats, (q, gate), ref, [(pool,)], [(ref_after,)], 1, against)
+        return stats
+
+    clean = judged()
+    assert clean.ok and clean.finite and clean.elements == rows * 28 * 256 and (clean.outside, clean.keys_outside) == (0, 0), clean.line()
+    assert (
+        clean.gates_equal and clean.values_equal and clean.state_equal and 0 < clean.other_value < clean.elements // 100
+    ), "the fp32 root moves a few elements by a unit"
+    assert clean.line().startswith(
+        f"{clean.elements:,} query and key elements, {clean.other_value:,} of them not the twin's byte; 0 query and 0 key elements outside"
+    )
+    exact = judged(q=ref[0], pool=ref_after)
+    assert exact.ok and exact.other_value == 0, "the twin against itself"
+
+    def altered(tensor, at, units):  # one element moved by so many of its own bf16 units
+        changed = tensor.clone()
+        value = changed[at].double()
+        changed[at] = float(value + units * torch_ref.bf16_unit(value))
+        return changed
+
+    one_off = judged(q=altered(ref[0], (0, 0, 200), 1), pool=ref_after)
+    assert one_off.ok and one_off.other_value == 1, "a pass-through element one unit off: inside"
+    toward_zero = -2 if float(ref[0][0, 0, 200]) > 0 else 2  # the unit is taken at the larger magnitude: the twin's
+    two_off = judged(q=altered(ref[0], (0, 0, 200), toward_zero), pool=ref_after)
+    assert not two_off.ok and two_off.outside == 1, "a pass-through element two units off: outside, its band is one unit"
+    for name, at in (("a pass-through element", (0, 0, 200)), ("a rotated element", (4, 23, 40))):
+        far = ref[0][at].double() + 3 * (torch_ref.bf16_unit(ref[0][at].double()) + twin.terms.q_band[at])
+        bad = ref[0].clone()
+        bad[at] = float(far)
+        stats = judged(q=bad, pool=ref_after)
+        assert not stats.ok and (stats.outside, stats.keys_outside) == (1, 0) and stats.gates_equal and stats.values_equal and stats.state_equal, name
+        assert stats.line().split("; ")[1] == "1 query and 0 key elements outside their band", name
+    rotated = judged(q=altered(ref[0], (4, 23, 40), 2), pool=ref_after)
+    assert rotated.outside == 1 - int(
+        float(twin.terms.q_band[4, 23, 40]) >= torch_ref.bf16_unit(ref[0][4, 23, 40].double())
+    ), "two units: outside unless the band of that element admits them"
+
+    # the key rows are held element by element, as the queries are: ONE key element of a row the call wrote, moved in the twin's own pool
+    def keyed(at, value):  # the verdict on the twin's own outputs and pool with the key element ``at`` = (row of the step, head, element) set to ``value``
+        (row, head, element), paged = at, ref_after.clone().view(2, 3, 4, 64, 512)
+        sequence, token = divmod(row, 3)
+        slot = position + token
+        assert float(paged[sequence, slot // 64, head, slot % 64, element]) == float(twin.terms.k[at]), "the twin's key element of that row of the step"
+        paged[sequence, slot // 64, head, slot % 64, element] = float(value)
+        return judged(q=ref[0], pool=paged.view(6, 4, 64, 512))
+
+    plain_key, rotated_key = (0, 0, 200), (4, 3, 40)
+    assert float(twin.terms.k_band[plain_key]) == 0.0 < float(twin.terms.k_band[rotated_key]) < float(twin.terms.k_band.amax()), "a band per key element"
+    value = twin.terms.k[plain_key].double()
+    one_off = keyed(plain_key, value + torch_ref.bf16_unit(value))
+    assert one_off.ok and one_off.other_value == 1, "a key element that is not rotated one unit off: inside"
+    toward_zero = -2 if float(value) > 0 else 2  # the unit is taken at the larger magnitude: the twin's
+    two_off = keyed(plain_key, value + toward_zero * torch_ref.bf16_unit(value))
+    outside = (two_off.outside, two_off.keys_outside)
+    assert not two_off.ok and outside == (0, 1), "a key element that is not rotated two units off: outside, its band is one unit"
+    for name, at in (("a key element that is not rotated", plain_key), ("a rotated key element", rotated_key)):
+        value = twin.terms.k[at].double()
+        stats = keyed(at, value + 3 * (torch_ref.bf16_unit(value) + twin.terms.k_band[at]))
+        assert not stats.ok and (stats.outside, stats.keys_outside) == (0, 1) and stats.gates_equal and stats.values_equal and stats.state_equal, name
+        assert stats.line().split("; ")[1] == "0 query and 1 key elements outside their band", name
+    # a rotated key element is held to ITS OWN band and to no multiple of it: the first that tells one band from two (a band of half its unit or more),
+    # moved toward zero by whole bf16 units (the unit is then the twin's) -- the most units inside `unit + band` are inside, one more is outside
+    units = torch_ref.bf16_unit(twin.terms.k.double())
+    tells = (twin.terms.k_band >= units / 2) & (twin.terms.k.double().abs() > (3 + torch.floor(twin.terms.k_band / units)) * units)
+    assert tells[..., 64:].sum() == 0 and tells.any(), "a rotated key element whose band tells one band from two"
+    at = tuple(int(i) for i in tells.nonzero()[0])
+    value, unit, band = twin.terms.k[at].double(), float(units[at]), float(twin.terms.k_band[at])
+    most = 1 + int(band // unit)  # the most whole units that stay inside unit + band
+    sign = -1.0 if float(value) > 0 else 1.0
+    inside = keyed(at, value + sign * most * unit)
+    assert inside.ok and inside.keys_outside == 0, "a rotated key element moved by the most units its band admits: inside"
+    one_more = keyed(at, value + sign * (most + 1) * unit)
+    outside = (one_more.outside, one_more.keys_outside)
+    assert not one_more.ok and outside == (0, 1), "a rotated key element one unit past its own band: outside, the band is not doubled"
+    # ... and the same of a rotated QUERY element, the first whose band is a WHOLE unit or more: the most units it admits are then two
+    # or more, so that a band which is narrower than the twin's admits fewer and a band which is wider admits one more -- held on both sides
+    units = torch_ref.bf16_unit(ref[0].double())
+    tells = (twin.terms.q_band >= units) & (ref[0].double().abs() > (3 + torch.floor(twin.terms.q_band / units)) * units)
+    assert tells[..., 64:].sum() == 0 and tells.any(), "a rotated query element whose band is a whole unit or more"
+    at = tuple(int(i) for i in tells.nonzero()[0])
+    value, unit, band = ref[0][at].double(), float(units[at]), float(twin.terms.q_band[at])
+    most, sign = 1 + int(band // unit), -1.0 if float(ref[0][at]) > 0 else 1.0
+    assert most >= 2 and 1 + int(band / 2 // unit) < most, "half that band admits fewer units: a judge that halves it fails the next line"
+    moved = ref[0].clone()
+    moved[at] = float(value + sign * most * unit)
+    assert judged(q=moved, pool=ref_after).ok, "a rotated query element moved by the most units its band admits: inside"
+    moved[at] = float(value + sign * (most + 1) * unit)
+    one_more = judged(q=moved, pool=ref_after)
+    outside = (one_more.outside, one_more.keys_outside)
+    assert not one_more.ok and outside == (1, 0), "a rotated query element one unit past its own band: outside, the band is not doubled"
+    bit = out[1].clone()
+    bit.view(torch.int16)[5, 6143] ^= 1
+    stats = judged(gate=bit)
+    assert not stats.ok and not stats.gates_equal and (stats.outside, stats.keys_outside, stats.values_equal, stats.state_equal) == (0, 0, True, True)
+    assert "gate rows DIFFER" in stats.line()
+    paged = after.clone().view(2, 3, 4, 64, 512)
+    paged.view(torch.int16)[1, 1, 3, 0, 511] ^= 1  # a value bit of sequence 1 at position 64
+    stats = judged(pool=paged.view(6, 4, 64, 512))
+    assert not stats.ok and not stats.values_equal and (stats.outside, stats.keys_outside, stats.gates_equal, stats.state_equal) == (0, 0, True, True)
+    assert "value rows DIFFER" in stats.line()
+    paged = after.clone().view(2, 3, 4, 64, 512)
+    held = paged[0, 0, :, 62, :256].clone()  # the key rows of positions 62 and 63 of sequence 0: two neighbouring slots, exchanged
+    paged[0, 0, :, 62, :256] = paged[0, 0, :, 63, :256]
+    paged[0, 0, :, 63, :256] = held
+    stats = judged(pool=paged.view(6, 4, 64, 512))
+    assert not stats.ok and stats.keys_outside > 1000 and (stats.outside, stats.gates_equal, stats.values_equal, stats.state_equal) == (0, True, True, True)
+    for half in (0, 256):  # a row no position of the call names: its key half, its value half
+        paged = after.clone().view(2, 3, 4, 64, 512)
+        paged[1, 2, 0, 5, half] = 1.0
+        stats = judged(pool=paged.view(6, 4, 64, 512))
+        assert not stats.ok and not stats.state_equal and (stats.outside, stats.keys_outside, stats.gates_equal, stats.values_equal) == (0, 0, True, True), half
+        assert "the rest of the pool WRITTEN" in stats.line()
+    nan = out[0].clone()
+    nan[2, 3, 100] = float("nan")
+    stats = judged(q=nan)
+    assert not stats.ok and not stats.finite and stats.outside == 1 and "NON-FINITE VALUES" in stats.line()
+    paged = after.clone().view(2, 3, 4, 64, 512)
+    paged[0, 1, 2, 0, 17] = float("inf")  # in a key row of the call
+    stats = judged(pool=paged.view(6, 4, 64, 512))
+    assert not stats.ok and not stats.finite and stats.keys_outside == 1
+    # a gate element and a written value element that are not finite on the entry's side alone: another byte than the twin's, and not finite
+    nan = out[1].clone()
+    nan[5, 6143] = float("nan")
+    stats = judged(gate=nan)
+    assert not stats.ok and not stats.gates_equal and not stats.finite, stats.line()
+    assert stats.line().endswith("; gate rows DIFFER; value rows equal; the rest of the pool untouched; NON-FINITE VALUES")
+    paged = after.clone().view(2, 3, 4, 64, 512)
+    paged[1, 1, 3, 0, 511] = float("inf")  # the last value element of sequence 1 at position 64
+    stats = judged(pool=paged.view(6, 4, 64, 512))
+    assert not stats.ok and not stats.values_equal and not stats.finite, stats.line()
+    assert stats.line().endswith("; gate rows equal; value rows DIFFER; the rest of the pool untouched; NON-FINITE VALUES")
+    with pytest.raises(ValueError, match="the band attention_prepare is judged against the preparation at the kernel's rounding points"):
+        judged(against=reference)
+    assert "attention_prepare" in tie_out.BANDS and "one bf16 unit" in tie_out.BANDS["attention_prepare"] and "bitwise" in tie_out.BANDS["attention_prepare"]
+
+
+@pytest.mark.parametrize(
+    "where, value",
+    [("gate", float("nan")), ("value", float("inf")), ("value", float("nan")), ("unwritten", float("inf"))],
+    ids=[
+        "the same NaN in a gate row",
+        "the same infinity in a written value row",
+        "the same NaN in a written value row",
+        "an infinity in a row no position names",
+    ],
+)
+def test_a_copied_value_that_is_not_finite_is_outside_the_attention_preparations_band(monkeypatch, where, value):
+    """The gate rows and the value rows of the attention preparation are bit copies of the call's operand, and the entry
+    and its twin copy the same operand: a NaN or an infinity in it is the same byte on both sides, and equal bytes do
+    not say that a value is finite.  The judge holds the gate rows and the value rows a call wrote finite, as it holds
+    the queries and the key rows: such a call is not ok and not finite, on a line that still reads the rows equal and
+    ends in ``NON-FINITE VALUES``.  What a call wrote are the rows of the pool at its positions -- for every row of the
+    step the page and the slot of its position, formed from host integers.  A value that is not finite in a row no
+    position of the call names, there before the call on both sides, is no value of this call: the call that wrote
+    that row was judged with it.  One token on a page of 64 slots, and two sequences of three tokens across a page
+    boundary; the value stands in the last row of the step."""
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import configs
+
+    for sequences, tokens, position in ((1, 1, 5), (2, 3, 62)):
+        block, cache, qkv, params, _, model = _prepare_block(monkeypatch, [], sequences=sequences, tokens=tokens)
+        g, row = model.geometry, sequences * tokens - 1  # the last row of the step: the last token of the last sequence
+        heads, kv_heads, width = g.attn_heads, g.attn_kv_heads, g.attn_head_dim
+        twin = block.twin(torch_ref.AttentionPrepare(configs.PROVIDERS["attention.prepare"][1], model, block.facts, block.options))
+        own = (sequences - 1) * (cache.pool.shape[0] // sequences)  # the first page of the last sequence
+        page, slot = own + (position + tokens - 1) // 64, (position + tokens - 1) % 64  # the row of the pool that row's position names
+        beyond = (own + (position + tokens) // 64, 2, (position + tokens) % 64)  # value head 2 at the next position: no row of this step
+        operand, before = qkv.clone(), cache.pool.clone()
+        if where == "gate":  # head 3, element 17 of its gate row, which stands behind the head's query elements
+            operand[row, 3 * 2 * width + width + 17] = value
+        elif where == "value":  # value head 2, element 40: behind the queries with their gates and the keys
+            operand[row, (2 * heads + kv_heads) * width + 2 * width + 40] = value
+        else:  # in the pool before the call: a key element and a value element of that row
+            before[beyond + (40,)] = before[beyond + (width + 40,)] = value
+        results = []
+        for call in (block, twin):  # the entry's stand-in and the twin, each from the same pool
+            cache.pool.copy_(before)
+            results.append((tuple(t.clone() for t in call(operand, cache, position, params)), cache.pool.clone()))
+        (out, after), (ref, ref_after) = results
+        stats = tie_out.BlockStats("attention_prepare")
+        tie_out.BlockTap._judge(stats, out, ref, [(after,)], [(ref_after,)], 1, twin)
+        # both sides hold the value in the same bytes, and nothing else of the call is not finite
+        strays = [int((~torch.isfinite(t)).sum()) for t in (out[0], out[1], after[page, :, slot], after)]  # queries, gates, the row written, the pool
+        assert strays == {"gate": [0, 1, 0, 0], "value": [0, 0, 1, 1], "unwritten": [0, 0, 0, 2]}[where], (sequences, strays)
+        assert tie_out.bytes_equal(out[1], ref[1]) and tie_out.bytes_equal(after[..., width:], ref_after[..., width:]), sequences
+        assert (stats.outside, stats.keys_outside, stats.gates_equal, stats.values_equal, stats.state_equal) == (0, 0, True, True, True), stats.line()
+        equal = "; 0 query and 0 key elements outside their band; gate rows equal; value rows equal; the rest of the pool untouched"
+        if where == "unwritten":
+            assert stats.ok and stats.finite and stats.line().endswith(equal), (sequences, stats.line())
+        else:
+            assert not stats.ok and not stats.finite and stats.line().endswith(equal + "; NON-FINITE VALUES"), (sequences, stats.line())
+
+
+def _attention_layers(count=16, form=None, symbol=None):
+    """The sites of a step of ``count`` attention layers between a gather and the host path, as ``native`` plans them: the
+    in-projection and the attention preparation on their entries (exact, each with its entry's stated symbol and launch
+    shape), the attention core on its reference chain, the gate on its entry.  ``(sites, the preparation's symbol)``."""
+    from cudnn.attention_prepare import AttentionPrepareGeometry
+
+    from model_samples.census import Facts, Kernel, Site
+    from model_samples.qwen_dense import configs
+
+    row = configs.PROVIDERS["attention.prepare"][0]
+    form = row.form if form is None else form
+    built = dict(
+        geometry=AttentionPrepareGeometry(24, 4, 256, 64), positions="3d", mrope_section=(11, 11, 10), page_size=64, position_dtype="int64", slot_dtype="int64"
+    )
+    symbol = symbol or _prepare_symbol(dict(built, pdl=False, pdl_release=False))
+    stated = {**dict(row.form), "EPS": 1e-6}
+    projection = Facts((_projection_symbol({"OUT_FEATURES": 14336, "IN_FEATURES": 5120}),), {"SPLIT_K": 1}, PROJECTION_SHAPE[14336])
+    sites = [Site("embedding", -1, (Kernel("embedding_gather", "PyTorch", "exact", launches=1),), "torch.index_select")]
+    prepared, gate = Facts((symbol,), stated, _prepare_shape(1)), Facts((GATE_SYMBOL,), {"THREADS": 256}, GATE_SHAPE)
+
+    def exact(name):
+        return (Kernel(name, "cuDNN FE", "exact", launches=1, shape="entry"),)
+
+    for layer in range(count):
+        sites.append(Site("projection.fp8.in", layer, exact("fp8_projection"), "cudnn.Fp8ProjectionDecode", (("SPLIT_K", 1),), projection))
+        sites.append(Site("attention.prepare", layer, exact("attention_prepare"), "cudnn.AttentionPrepareDecode", tuple(form), prepared))
+        sites.append(Site("attention.core", layer, (Kernel("pytorch", "PyTorch"), Kernel("cublas", "cuBLAS")), "torch_ref.attention"))
+        sites.append(Site("attention.gate_quantize", layer, exact("gate_quant"), "cudnn.AttentionGateQuantDecode", (("THREADS", 256),), gate))
+    sites.append(Site("token_choice", -1, (Kernel("pytorch", "PyTorch", "host"),), "torch.argmax"))
+    return sites, symbol
+
+
+def test_the_kernel_check_of_the_attention_preparation_on_constructed_records():
+    """The 16 launches of the attention preparation's entry in a step of 16 attention layers: in the wiring order, under the
+    entry's symbol and in its launch shape, with nothing between an in-projection and the entry, the check holds, and
+    the launches of the chain that reads the pool behind the entry are its families'.  A launch between the
+    in-projection and the entry, a missing launch, another launch shape, a call served in another form and a gather
+    launched by the chain behind the entry each fail with their own sentence.  The entry's kernel has a pattern of its
+    own, in front of the one for any other cuDNN Frontend kernel."""
+    from model_samples import census
+    from model_samples.census import Call, Launch
+    from model_samples.providers import factories
+
+    sites, symbol = _attention_layers()
+    record = Launch(symbol, "kernel", 0.0, 0.5, *_prepare_shape(1), 32)
+    assert census.canonical(record) == "attention_prepare" and [kernel_id for kernel_id, _ in census.FAMILIES].index("attention_prepare") < [
+        kernel_id for kernel_id, _ in census.FAMILIES
+    ].index("cudnn_fe"), "a pattern of its own, in front of the pattern for any other kernel of cuDNN Frontend"
+    assert census.canonical(record._replace(name="cudnn_kernel_frost_attention_gate_quant_x")) == "gate_quant"
+    exact = {kernel.id for factory in factories().values() for kernel in factory.kernels if kernel.relation == "exact"}
+    assert "attention_prepare" in exact and exact <= {kernel_id for kernel_id, _ in census.FAMILIES}, "every exactly judged kernel id has a pattern of its own"
+    for kernel_id in exact:
+        named = [name for name, _ in census.FAMILIES]
+        assert named.count(kernel_id) == 1, kernel_id
+
+    def step(defect="", layer=5):
+        layer = 15 if defect in ("missing", "gather") else layer  # a launch more or less of a kernel is placed by aligning two repeating sequences
+        at = _Clock()
+        records = [at(GATHER, GATHER_SHAPE)]
+        for index in range(16):
+            here = defect if index == layer else ""
+            records.append(at(_projection_symbol({"OUT_FEATURES": 14336, "IN_FEATURES": 5120}), PROJECTION_SHAPE[14336]))
+            if here == "between":
+                records.append(at(ELEMENTWISE))
+            if here != "missing":
+                records.append(at(symbol, ((1, 28, 1), (256, 1, 1), 16) if here == "shape" else _prepare_shape(1)))
+            records += [at(ELEMENTWISE), at(GEMV), at(SOFTMAX), at(GEMM_FP64)]  # the chain that reads the pool: a cast, the two multiplies, the softmax
+            if here == "gather":
+                records.append(at(GATHER, GATHER_SHAPE))
+            records.append(at(GATE_SYMBOL, GATE_SHAPE))
+        return [*records, at(ARGMAX), at(HOST_READ, kind="copy")]
+
+    clean = census.compare([step(), step()], sites)
+    assert clean.ok and clean.exact == 49 and clean.launches == [114, 114], clean.sentences()
+    assert [(row.blocks, row.relation, len(row.sites)) for row in clean.table if "attention.prepare" in row.blocks or "attention.core" in row.blocks] == [
+        (("attention.prepare",), "exact", 16),
+        (("attention.core",), "fallback", 16),
+    ], "an exact row of its own, and the chain behind it as the row of its place in the wiring"
+    assert census.check_forms(sites, _log(sites, 2)) == []
+    sentences = {
+        "between": f"launched {census._short(ELEMENTWISE)} between projection.fp8.in (layer 5) and attention.prepare (layer 5): a kernel of the fallback "
+        "family pytorch, which no row there declares; nothing may sit between two exact rows",
+        "missing": "attention.prepare (layer 15) did not launch attention_prepare: the step has 15 launch(es) of attention_prepare, the plan 16 = 16 call(s) "
+        "x 1 per call",
+        "shape": "attention.prepare (layer 5) launched attention_prepare with grid (1, 28, 1), block (256, 1, 1), shared memory 16 B; "
+        "cudnn.AttentionPrepareDecode states grid (1, 28, 1), block (128, 1, 1), shared memory 16 B",
+        "gather": f"launched embedding_gather ({census._short(GATHER)}) after attention.prepare (layer 15), where the plan has no such launch: the step has "
+        "2 launch(es) of embedding_gather, the plan 1 = 1 call(s) x 1 per call",
+    }
+    for defect, sentence in sentences.items():
+        found = census.compare([step(), step(defect)], sites)
+        assert [text for _, text in found.failures] == [sentence] and found.failures[0][0] == 1, defect
+    # another form in the call log: the same symbol and the same launch shape would not show it
+    log = _log(sites, 2)
+    one_row = (("POSITIONS", "1d"), ("SECTION", None), *sites[2].form[2:])
+    log[1][2] = Call("attention.prepare", 0, 1, "cudnn.AttentionPrepareDecode #2", one_row)
+    assert census.check_forms(sites, log) == [
+        f"attention.prepare (layer 0): the adapter served the call with the form{census.form_text(one_row)} (cudnn.AttentionPrepareDecode #2); "
+        f"the row says {PREPARE_FORM}"
+    ]
+    # a row that names another form than its entry states fails on the objects, field by field
+    other, _ = _attention_layers(form=one_row)
+    assert census.check_forms(other)[:2] == [
+        "attention.prepare: the row's form says POSITIONS '1d', cudnn.AttentionPrepareDecode states POSITIONS '3d' for this run",
+        "attention.prepare: the row's form says SECTION None, cudnn.AttentionPrepareDecode states SECTION (11, 11, 10) for this run",
+    ]
+
+
+def _shifted_tables(monkeypatch, which):
+    """Every page table a state builds from now on with one of its tables a row late: row ``p`` of ``which`` (``"slots"`` or
+    ``"positions"``) holds what belongs to the step that starts at ``p - 1`` (row 0: the last row's)."""
+    from model_samples import state
+
+    build = state.PageTable.build.__func__
+
+    def late(cls, *arguments):
+        table = build(cls, *arguments)
+        for each in (table, *(() if table.single is None else (table.single,))):
+            setattr(each, which, torch.roll(getattr(each, which), 1, 0))
+        return table
+
+    monkeypatch.setattr(state.PageTable, "build", classmethod(late))
+
+
+def test_a_wrong_table_a_wrong_twin_and_a_wrong_accessor_each_fail_the_run(monkeypatch, capsys):
+    """Control arms through the sample's ``main()`` on the stack ``fe-entries``, on the stand-in entry of the attention
+    preparation: the clean run passes with the block judged in its band and its launch held; a slot table that is one
+    row late, a position table that is one row late, a twin whose two rotary halves are exchanged and an accessor that
+    exchanges two pages each end in ``FAIL``, by the line that sees them."""
+    from model_samples import state
+    from model_samples.providers import torch_ref
+
+    arguments = ["--stack", "fe-entries", "--sequences", "1"]
+
+    def run(*more, **stand_in):
+        code, lines = _sample_run(monkeypatch, capsys, [*arguments, *more], **stand_in)
+        block = next((line for line in lines if line.strip().startswith("attention.prepare ") and "calls" in line), "")
+        return code, lines, block
+
+    code, lines, block = run()
+    assert code == 0 and lines[-1] == "[00] PASS" and block.endswith("[band: attention_prepare]  PASS") and _kernel_lines(lines)[0].endswith("    PASS"), lines[
+        -6:
+    ]
+    assert "; 0 query and 0 key elements outside their band; gate rows equal; value rows equal; the rest of the pool untouched" in block
+    stated = [line.strip() for line in lines if line.strip().startswith("attention.prepare: ")]
+    assert any(
+        line.startswith(
+            f"attention.prepare: cudnn.AttentionPrepareDecode {PREPARE_FORM}, 1 launch per step (1 call x 1 per call); the entry states grid (1, 28, 1), "
+        )
+        for line in stated
+    ), "\n".join(stated)
+    for which in ("slots", "positions"):
+        with monkeypatch.context() as patched:
+            _shifted_tables(patched, which)
+            code, lines, block = run()
+        assert code == 1 and lines[-1] == "[00] FAIL" and block.endswith("[band: attention_prepare]  FAIL"), (which, block)
+        outside = block.split("; ")[1]
+        if which == "slots":  # the keys and the values stand one row away: the queries and the gates are what they must be
+            assert (
+                outside.startswith("0 query and ")
+                and not outside.startswith("0 query and 0 key")
+                and "value rows DIFFER; the rest of the pool WRITTEN" in block
+            )
+        else:  # rotated by the angle of another position, and written where they belong
+            assert not outside.startswith("0 query") and " and 0 key" not in outside and "value rows equal; the rest of the pool untouched" in block, block
+        assert "gate rows equal" in block and _kernel_lines(lines)[0].endswith("    PASS"), "the launch is the planned one: the kernel check cannot see a table"
+    with monkeypatch.context() as patched:  # the twin's two rotary halves exchanged
+        rows = torch_ref.prepare_rows
+
+        def exchanged(x, weight, cos, sin, eps, order="3d"):
+            out, band = rows(x, weight, cos, sin, eps, order)
+            half = cos.shape[-1]
+            return torch.cat((out[..., half : 2 * half], out[..., :half], out[..., 2 * half :]), dim=-1), band
+
+        patched.setattr(torch_ref, "prepare_rows", exchanged)
+        code, lines, block = run()
+    assert code == 1 and lines[-1] == "[00] FAIL" and block.endswith("[band: attention_prepare]  FAIL"), block
+    assert not block.split("; ")[1].startswith("0 query") and "gate rows equal; value rows equal; the rest of the pool untouched" in block, block
+    # an accessor that exchanges two pages: the write of the twin, in a run whose state has two pages -- then the read of the chain.
+    # 26 prompt tokens and 45 new ones: 70 steps, across position 64 (the logits band of the tiny geometry holds that long on these stand-ins)
+    longer = ["--force-tokens", "45"]
+    code, lines, block = run(*longer)
+    assert code == 0 and lines[-1] == "[00] PASS" and block.endswith("[band: attention_prepare]  PASS"), "the clean run across position 64"
+    assert block.split()[1:3] == ["70", "calls"], block
+    with monkeypatch.context() as patched:
+        write = state.PagedKvCache.write
+
+        def other_page(self, position, k, v):
+            page, row = divmod(position, self.page)
+            return write(self, (page ^ 1 if self.pages > 1 else page) * self.page + row, k, v)
+
+        patched.setattr(state.PagedKvCache, "write", other_page)
+        code, lines, block = run(*longer)
+    assert code == 1 and lines[-1] == "[00] FAIL" and block.endswith("[band: attention_prepare]  FAIL") and "the rest of the pool WRITTEN" in block, block
+    with monkeypatch.context() as patched:
+        read = state.PagedKvCache._read
+
+        def exchanged_pages(self, half, count, dtype):  # every pair of pages of a sequence the other way round
+            if self.pages < 2:
+                return read(self, half, count, dtype)
+            whole = read(self, half, -(-count // (2 * self.page)) * 2 * self.page, dtype)
+            return whole.unflatten(2, (-1, 2, self.page)).flip(3).flatten(2, 4)[:, :, :count]
+
+        patched.setattr(state.PagedKvCache, "_read", exchanged_pages)
+        code, lines, block = run(*longer)
+    tokens = next(line for line in lines if line.startswith("  tokens "))
+    assert code == 1 and lines[-1] == "[00] FAIL" and tokens.endswith("FAIL") and block.endswith("[band: attention_prepare]  PASS"), (tokens, block)
+
+
+def test_the_source_hash_covers_what_the_hashed_files_import():
+    """The list of hashed files is closed under its rule, to the fixed point: every module under ``frost/``,
+    ``_torch_stream.py`` and ``_cutlass_*`` that a file of the list imports at module level is in the list, and so is
+    the ``__init__.py`` of every package such an import runs.  The fixed point is formed again here, from the files and
+    with ``ast``: a module a listed file starts to import turns this red until it is hashed, so the hash of a run
+    covers the modules its kernels are built from.  The two modules that ``frost/init_order.py`` imports are among
+    them, once each."""
+    import ast
+
+    import cudnn
+
+    from model_samples.providers import fe
+
+    package = Path(cudnn.__file__).parent
+
+    def module_file(dotted):  # cudnn.x.y -> x/y.py or x/y/__init__.py of the package, or None
+        parts = dotted.split(".")
+        if parts[0] != "cudnn":
+            return None
+        inner = "/".join(parts[1:])
+        return next((name for name in (f"{inner}.py" if inner else "__init__.py", f"{inner}/__init__.py") if (package / name).is_file()), None)
+
+    def run_at_import(body):  # every statement an import of the module runs: not the body of a function
+        for node in body:
+            yield node
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for field in ("body", "orelse", "finalbody", "handlers"):
+                    yield from run_at_import([inner for inner in getattr(node, field, []) if isinstance(inner, ast.AST)])
+
+    def imported(name):
+        """The files of the package the module ``name`` imports at module level, the ``__init__.py`` of every package on the way included."""
+        found, inside = set(), ["cudnn", *name.split("/")[:-1]]
+
+        def add(dotted):
+            parts = dotted.split(".")
+            found.update(filter(None, (module_file(".".join(parts[:depth])) for depth in range(2, len(parts) + 1))))
+
+        for node in run_at_import(ast.parse((package / name).read_text()).body):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                base = inside[: len(inside) - (node.level - 1)] if node.level else []
+                dotted = ".".join([*base, *(node.module.split(".") if node.module else [])])
+                add(dotted)
+                for alias in node.names:  # ``from package import module``
+                    add(f"{dotted}.{alias.name}")
+        return found
+
+    def under(name):
+        return name.startswith("frost/") or name == "_torch_stream.py" or name.startswith("_cutlass")
+
+    def fixed_point(listed):
+        closed, new = set(listed), list(listed)
+        while new:
+            new = sorted({name for each in new for name in imported(each) if under(name)} - closed)
+            closed.update(new)
+        return closed
+
+    listed = fe.SOURCE_FILES
+    assert len(listed) == len(set(listed)) == 45 and all((package / name).is_file() for name in listed), "every file once, and a file of the package"
+    assert fixed_point(listed) == set(listed), f"imported by a hashed file and not hashed: {sorted(fixed_point(listed) - set(listed))}"
+    # the rule finds a module that is left out, at the first level and behind it, and a package's own file
+    for name in ("frost/capture.py", "_torch_stream.py", "frost/tile_dsl/swizzle.py", "frost/buffers.py", "frost/__init__.py", "_cutlass_helpers/__init__.py"):
+        assert name in fixed_point([each for each in listed if each != name]), f"{name}: a listed file imports it"
+    assert not under("__init__.py") and "_device.py" not in listed, "outside the rule: the package's entry point, and a module imported inside a function"
+    source = (package / "frost/init_order.py").read_text()
+    assert re.search(r"^from cudnn\._torch_stream import ", source, re.M) and re.search(r"^from \. import capture\b", source, re.M)
+    at = listed.index("frost/init_order.py")
+    assert listed[at + 1 : at + 3] == ("frost/capture.py", "_torch_stream.py"), "what a call of an entry runs in front of its launch, with what that imports"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# The twin of a library attention kernel that documents no numerics contract (``torch_ref.AttentionBound``): the reference
+# chain itself, which also keeps the operand terms of a bound.  No row of a table names it, so nothing here runs a session:
+# the twin is called as the tie-out calls it, and its terms are held to the definition written out here.
+# ---------------------------------------------------------------------------------------------------------------------------
+#: query heads, key / value heads and head width of the published model's attention layers
+ATTENTION_WIDTHS = (24, 4, 256)
+
+
+def _attention_weights(query, keys, scale=None):
+    """The softmax weights of one row's attended rows, written out from the definition, head by head: per query head the
+    weights BEFORE they are normalised (``exp`` of every scaled score less the largest) and their sum, in fp64.  ``query``
+    ``[heads, D]``, ``keys`` ``[kv heads, attended rows, D]``; a query head reads the key / value head of its group; the
+    scores are ``(q . k_j) * D**-0.5`` unless ``scale`` says otherwise."""
+    heads, width = query.shape
+    group = heads // keys.shape[0]
+    scale = width**-0.5 if scale is None else scale
+    weights = []
+    for head in range(heads):
+        scores = (keys[head // group].double() @ query[head].double()) * scale
+        raw = torch.exp(scores - scores.max())
+        weights.append((raw, raw.sum()))
+    return weights
+
+
+def _attention_terms(query, keys, values, scale=None):
+    """``(chain, spread)`` of one row, ``[heads * D]`` each in fp64, from the definition: per query head and element the sum
+    of the attended values, and of their magnitudes, under the softmax weights of :func:`_attention_weights`."""
+    group = query.shape[0] // keys.shape[0]
+    chain, spread = [], []
+    for head, (raw, total) in enumerate(_attention_weights(query, keys, scale)):
+        held = values[head // group].double()
+        chain.append((raw / total) @ held)
+        spread.append((raw / total) @ held.abs())
+    return torch.stack(chain).flatten(), torch.stack(spread).flatten()
+
+
+def test_the_twin_of_a_library_attention_kernel_is_the_reference_chain_and_keeps_the_terms_of_its_bound():
+    """The twin of an attention kernel that documents no numerics contract is the reference chain itself: its bytes are the
+    chain's on a plain and on a paged cache, at one token per sequence and at several, in both precisions a run can ask of
+    its reference.  And it keeps the two operand terms of the band -- the chain before its rounding to bf16 and the
+    weighted magnitude of the attended values -- always in fp64, equal to the terms written out from the definition row by
+    row and head by head: token ``t`` of a sequence attends to the positions up to its own, never to a later token's or to a
+    row behind the step.  It reads the cache through its accessors with the host integer it is handed: a state whose
+    tables are shifted -- the positions and the slots, the page table and the lengths -- leaves its bytes and its terms
+    as they were, and it writes nothing.  The terms it keeps are those of its LAST call: one twin serves every call here."""
+    from model_samples.providers import torch_ref
+    from model_samples.qwen_dense import QwenDense
+    from model_samples.state import DecodeState, KvCache, PagedKvCache
+
+    model = QwenDense.reduced(2)
+    g = model.geometry
+    heads, kv_heads, width = g.attn_heads, g.attn_kv_heads, g.attn_head_dim
+    assert (heads, kv_heads, width) == ATTENTION_WIDTHS
+    layer = g.layer_kinds.index("full_attention")
+    fresh = torch_ref.AttentionBound(None, None, None, {})
+    assert fresh.entry == "torch_ref.attention with the operand terms of its bound" and fresh.bound is None and fresh.per_row == (0, 1)
+    assert fresh.state_args == () and fresh.cache_page is None, "it writes nothing and reaches the cache through its accessors, in either layout"
+
+    def bits(tensor):
+        return tensor.view(torch.int16)
+
+    twins = {precision: torch_ref.AttentionBound(None, None, None, {"reference_precision": precision}) for precision in ("fp64", "ieee-fp32")}
+    generator = torch.Generator().manual_seed(11)
+    capacity, moved = 130, {False: 0, True: 0}  # elements that are another byte in fp32 than in fp64: at one token per sequence, at several
+    for sequences, tokens, position in ((1, 1, 0), (1, 1, 36), (3, 1, 64), (2, 3, 62), (1, 6, 0), (2, 2, 128)):
+        rows = sequences * tokens
+        keys = torch.randn(sequences, kv_heads, capacity, width, generator=generator).bfloat16()
+        values = torch.randn(sequences, kv_heads, capacity, width, generator=generator).bfloat16()
+        query = torch.randn(rows, heads, width, generator=generator).bfloat16()
+        # the terms from the definition: row (sequence, token) attends to the positions 0 .. position + token of its sequence
+        defined = [
+            _attention_terms(query[row], keys[row // tokens, :, : position + row % tokens + 1], values[row // tokens, :, : position + row % tokens + 1])
+            for row in range(rows)
+        ]
+        chain, spread = (torch.stack([terms[part] for terms in defined]) for part in (0, 1))
+        kept = {}
+        for layout, page in (("plain", None), ("paged", 64)):
+            state = DecodeState(g.layer_kinds, sequences, capacity, model.state_shapes(), "cpu", tokens, page=page, max_model_len=capacity if page else None)
+            cache = state.layers[layer]
+            assert isinstance(cache, PagedKvCache if page else KvCache) and cache.tokens == tokens
+            for at in range(capacity):  # every position holds a drawn row: also the later tokens' of the step and the rows behind it
+                cache.write(at, keys[:, :, at], values[:, :, at])
+            before = [tensor.clone() for tensor in cache.tensors()]
+            for precision, acc in (("fp64", torch.float64), ("ieee-fp32", torch.float32)):
+                twin = twins[precision]
+                out = twin(query, cache, position)
+                where = f"{sequences} x {tokens} rows at position {position}, a {layout} cache, {precision}"
+                want = torch_ref.attention_tokens(query, cache, position, tokens, acc) if tokens > 1 else torch_ref.attention(query, cache, position, acc)
+                assert (
+                    out.dtype == torch.bfloat16 and tuple(out.shape) == (rows, heads * width) and torch.equal(bits(out), bits(want))
+                ), f"{where}: the chain's bytes"
+                got_chain, got_spread = twin.bound
+                assert got_chain.dtype == got_spread.dtype == torch.float64 and got_chain.shape == got_spread.shape == out.shape, f"{where}: both terms in fp64"
+                # held to the definition far below any rounding of the run: a term in fp32 is 1e-7 of its magnitude off, a rounded chain 1e-3
+                assert bool(((got_chain - chain).abs() <= 1e-12 * spread).all()) and bool(((got_spread - spread).abs() <= 1e-12 * spread).all()), where
+                if position + tokens > 1:  # a row that attends to two rows or more: the spread is of magnitudes, never the chain's own
+                    assert bool((got_spread >= got_chain.abs() * (1 - 1e-12)).all()) and bool((got_spread > got_chain.abs() * 1.5).any()), where
+                else:  # one attended row: its weight is 1
+                    assert torch.equal(got_spread, got_chain.abs()) and torch.equal(
+                        got_chain, values[:, :, 0].repeat_interleave(heads // kv_heads, 1).flatten(1).double()
+                    )
+                kept[layout, precision] = (out, got_chain, got_spread)
+                assert all(torch.equal(bits(a), bits(b)) for a, b in zip(cache.tensors(), before)), f"{where}: the twin writes nothing"
+            for term in (1, 2):  # the terms do not follow the run's precision: bit for bit the same in both
+                assert torch.equal(kept[layout, "fp64"][term], kept[layout, "ieee-fp32"][term]), (sequences, tokens, position, layout)
+            assert torch.equal(bits(kept[layout, "fp64"][0]), bits(kept[layout, "fp64"][1].bfloat16())), "in fp64 the bytes are the kept chain, rounded once"
+            moved[tokens > 1] += int((bits(kept[layout, "fp64"][0]) != bits(kept[layout, "ieee-fp32"][0])).sum())
+            if page:  # a state whose tables are shifted, its page table and its lengths among them: the twin never reads them
+                state.table.positions += 1
+                state.table.slots += 1
+                state.table.blocks += 1  # every entry names the next page
+                state.table.lengths -= 1  # every sequence one position short
+                shifted = torch_ref.AttentionBound(None, None, None, {})
+                again = shifted(query, cache, position)
+                assert torch.equal(bits(again), bits(kept[layout, "fp64"][0])) and all(
+                    torch.equal(a, b) for a, b in zip(shifted.bound, kept[layout, "fp64"][1:])
+                )
+        for part in (0, 1, 2):  # either layout hands the chain the same rows
+            assert torch.equal(kept["plain", "fp64"][part].double(), kept["paged", "fp64"][part].double()), (sequences, tokens, position, part)
+    assert moved[False] > 0 and moved[True] > 0, "the bytes DO follow the run's precision, at one token and at several: some element is another byte in fp32"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# The band of such a kernel (``attention_bf16_weights``), declared before any row names it: the three constants and the
+# band's text, the judge on the model's own cases and on each defect alone, and the control arms.  The judge is called as
+# the tie-out calls it, on built operands (whose figures follow from plain arithmetic) and on drawn ones.
+# ---------------------------------------------------------------------------------------------------------------------------
+#: the largest relative error of one rounding to nearest at eight significant bits: what the band's model allows a weight and the divisor
+ROUNDING = 2.0**-8 / (1 + 2.0**-8)
+
+
+def _drawn_attention(pages, pool_seed, rows, query_seed, query_scale=1.0):
+    """Drawn operands of an attention core at the published widths, bf16: ``(queries [rows, 24, 256], keys, values)`` -- a
+    pool of ``pages`` pages of 64 rows drawn as ONE tensor ``[pages, 4, 64, 512]`` (the keys in the first half of the last
+    axis, the values in the second) and read page by page as one run of rows, ``[4, pages * 64, 256]`` each; the queries
+    times ``query_scale``.  Each from a generator of its own seed, on the CPU."""
+    heads, kv_heads, width = ATTENTION_WIDTHS
+    pool = torch.randn(pages, kv_heads, 64, 2 * width, generator=torch.Generator("cpu").manual_seed(pool_seed)).bfloat16()
+    queries = (torch.randn(rows, heads, width, generator=torch.Generator("cpu").manual_seed(query_seed)) * query_scale).bfloat16()
+    run = pool.permute(1, 0, 2, 3).reshape(kv_heads, pages * 64, 2 * width)
+    return queries, run[..., :width].contiguous(), run[..., width:].contiguous()
+
+
+def _kernel_like_attention(query, keys, values, scale=None, divisor=False):
+    """One row of a kernel-like chain of the band's model, ``[heads * D]`` bf16: every softmax weight carries one rounding to
+    bf16 and the output one.  ``divisor=False``: the NORMALISED weights are each rounded and the divisor is exact;
+    ``divisor=True``: the weights are rounded before they are normalised and their sum is rounded apart from them."""
+    group = query.shape[0] // keys.shape[0]
+    rows = []
+    for head, (raw, total) in enumerate(_attention_weights(query, keys, scale)):
+        held = values[head // group].double()
+        if divisor:
+            rows.append((raw.bfloat16().double() @ held) / total.bfloat16().double())
+        else:
+            rows.append((raw / total).bfloat16().double() @ held)
+    return torch.stack(rows).flatten().bfloat16()
+
+
+def _judged_attention(out, twin, ref=None, state=(), ref_state=()):
+    """One call judged in the band ``attention_bf16_weights`` as the tie-out judges it: the output ``out`` against the twin
+    ``twin`` (anything that keeps ``bound``), ``ref`` the reference chain's bytes (the output's own where none is given)."""
+    from model_samples import tie_out
+
+    stats = tie_out.BlockStats("attention_bf16_weights")
+    tie_out.BlockTap._judge(stats, (out,), (out if ref is None else ref,), list(state), list(ref_state), 0, twin)
+    return stats
+
+
+def _built_attention(first_key, first_value, second_value):
+    """BUILT operands of one row that attends to two rows, at two query heads on one key / value head of width 256, and
+    their twin after its call: ``(twin, the chain's bytes)``.  The query is 4 in its first element and zero elsewhere, the
+    first key ``first_key`` there and zero elsewhere, the second key zero: the scaled scores are ``first_key / 4`` and 0.
+    Every element of the first value row is ``first_value``, of the second ``second_value``: every element of the output is
+    the same judged element."""
+    from model_samples.providers import torch_ref
+    from model_samples.state import KvCache
+
+    query, keys, values = torch.zeros(1, 2, 256), torch.zeros(1, 1, 2, 256), torch.zeros(1, 1, 2, 256)
+    query[0, :, 0], keys[0, 0, 0, 0], values[0, 0, 0], values[0, 0, 1] = 4.0, first_key, first_value, second_value
+    twin = torch_ref.AttentionBound(None, None, None, {})
+    return twin, twin(query.bfloat16(), KvCache(keys.bfloat16(), values.bfloat16()), 1)
+
+
+def _model_extreme(share):
+    """The output of the band's model at its extreme, ``share`` of the largest rounding error it allows, on the built operands
+    of equal scores and the values +1 and -1 (chain 0, spread 1): the weight of +1 rounded up, the weight of -1 rounded
+    down, the divisor rounded down; then the output's own rounding.  ``[1, 512]`` bf16."""
+    error = share * ROUNDING
+    return torch.full((1, 512), (0.5 * (1 + error) * 1.0 + 0.5 * (1 - error) * -1.0) / (1 - error), dtype=torch.float64).bfloat16()
+
+
+def test_the_band_of_a_library_attention_kernel_is_the_bound_of_a_stated_model_and_its_judge_holds_it():
+    """The band ``attention_bf16_weights``: three constants and a text that a run prints, declared before any row names them,
+    and a docstring that states the model the band is the bound of -- and does not say that the band cannot be left.  The
+    judge, on the model's own cases, INSIDE: the chain itself; on drawn operands a chain whose normalised weights are each
+    rounded to bf16 with the divisor exact, and one whose weights are rounded before they are normalised with the
+    divisor rounded apart from them; on built operands the model's extreme at 0.9 of its largest rounding error (0.898 of
+    the bound) and at all of it (the bound itself).  OUTSIDE, each alone and by its own count: the extreme at 1.5 of that
+    error; the bf16 value next above the bound of a chain of zero, which says that the spacing is the chain's and not the
+    output's; one element one spacing beyond its bound among elements of larger chains, which says that the spacing is
+    not the tensor's largest value's; a NaN; an infinite value; a byte of the cache the call changed.  A twin that keeps
+    no terms is refused, other outputs than the one tensor are not compared, and the same output is NOT within one bf16
+    unit of the chain: the precedent band could not hold it."""
+    import math
+    from types import SimpleNamespace
+
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.state import KvCache
+
+    assert (tie_out.ATTENTION_BAND_COEFFICIENT, tie_out.ATTENTION_WEIGHT_TERM, tie_out.ATTENTION_SPACINGS) == (1.0, 2.0**-8, 1.0), "as declared"
+    assert tie_out.BANDS["attention_bf16_weights"] == (
+        "against the reference chain before its rounding to bf16 (chain = sum p v over the attended rows under their softmax weights p, spread = sum p |v|, "
+        "both in fp64): every element finite and within 1 x [2**-8 x (spread + |chain|) + 1 spacing of bf16 values at |chain|] -- the bound of a stated model "
+        "of the kernel's arithmetic (every weight one rounding at eight significant bits, the divisor one of its own, the output one), declared before any "
+        "run and never taken from a measured distance; the cache bitwise"
+    ), "the text a run prints for the band"
+    stated = " ".join((tie_out.__doc__ or "").split())
+    for sentence in (
+        "it is the bound of a stated model of the kernel's arithmetic, declared here before any run of a row that names it.",
+        "Which values such a kernel rounds is not established, so no twin can be written at its rounding points.",
+        "The model: every softmax weight carries one rounding to nearest at eight significant bits, ``p_j (1 + d_j)`` with ``|d_j| <= u`` and "
+        "``u = 2**-8 / (1 + 2**-8)``; the number the weighted sum is divided by carries one of its own, ``1 + e`` with ``|e| <= u``; and the output is "
+        "rounded to bf16 once.",
+        "-- and ``u / (1 - u)`` is exactly ``2**-8``.",
+        "out is finite and |out - chain| <= 1 x [ 2**-8 x (spread + |chain|) + 1 x spacing ]",
+        "the chain's alone, neither the output's nor the tensor's largest value's.",
+        "It is derived from a model and from no measured distance, and it states nothing about what the kernel rounds.",
+        "there an output of the model itself can use up to ``1 + 2**-8`` of its bound.",
+        "So an element outside is a finding, read with its share, its chain and its spread; it is never a reason for another coefficient, a further "
+        "term or a shape left out.",
+        "A block in this band is not within one bf16 unit of the chain",
+        "one wrong, missing or extra attended row whose softmax weight is below the band's term.",
+    ):
+        assert sentence in stated, sentence
+    for never in ("cannot leave", "cannot be left", "never leaves its band", "rounds its weights to bf16", "derived from its arithmetic"):
+        assert never not in stated, f"the docstring claims more than the model gives: {never!r}"
+    assert ROUNDING / (1 - ROUNDING) == 2.0**-8, "the weight term is the model's own figure: u / (1 - u)"
+
+    # ---- BUILT operands, the model's extreme: equal scores, the values +1 and -1: chain 0, spread 1 in every element
+    twin, ref = _built_attention(0.0, 1.0, -1.0)
+    chain, spread = twin.bound
+    assert not chain.any() and bool((spread == 1.0).all()) and not ref.any() and tuple(chain.shape) == (1, 512)
+    inside = _judged_attention(_model_extreme(0.9), twin, ref)
+    assert inside.ok and inside.finite and (inside.elements, inside.outside, inside.other_value) == (512, 0, 512)
+    assert inside.worst_share == 0.8984375 and inside.worst_at == (0.0, 1.0), "0.9 of the model's largest rounding error: 0.898 of the bound"
+    assert inside.line() == (
+        "512 elements, 512 of them not the reference chain's byte; 0 outside their bound; the largest distance 0.898 of its bound, at a chain of 0 with a "
+        "spread of 1 (printed, not gated); the cache untouched"
+    )
+    whole = _judged_attention(_model_extreme(1.0), twin, ref)
+    assert whole.ok and whole.worst_share == 1.0 and float(_model_extreme(1.0)[0, 0]) == 2.0**-8, "all of it: the bound itself, and inside"
+    beyond = _judged_attention(_model_extreme(1.5), twin, ref)
+    assert not beyond.ok and beyond.finite and beyond.outside == 512 and beyond.worst_share == 1.5, "1.5 of it: outside"
+    assert beyond.line().split("; ")[1:3] == [
+        "512 outside their bound",
+        "the largest distance 1.500 of its bound, at a chain of 0 with a spread of 1 (printed, not gated)",
+    ]
+    # ... the spacing is the CHAIN's: at a chain of zero it is that of the smallest normal fp32 value, far below fp64's own
+    # spacing at the bound.  The bf16 value next above the bound is outside; with one spacing at the OUTPUT it would be the bound
+    above = torch.full((1, 512), 2.0**-8 * (1 + 2.0**-7), dtype=torch.float64).bfloat16()
+    assert float(above[0, 0]) == 2.0**-8 + 2.0**-15, "the next bf16 value above 2**-8"
+    next_value = _judged_attention(above, twin, ref)
+    assert (
+        not next_value.ok and next_value.outside == 512 and next_value.worst_share == 1.0078125
+    ), "one spacing of the output beyond a bound whose chain is zero"
+
+    # ---- BUILT operands, the chain's own term: the values +1 and +1 (chain 1, spread 1): the bound is 2**-8 x (1 + 1) + one
+    # spacing at 1 = 2**-6, on either side of the chain -- above 1 two bf16 values, below it four
+    twin_one, ref_one = _built_attention(0.0, 1.0, 1.0)
+    assert bool((twin_one.bound[0] == 1.0).all()) and bool((twin_one.bound[1] == 1.0).all()) and bool((ref_one == 1.0).all())
+    for value, share in ((1 + 2.0**-6, 1.0), (1 + 2.0**-6 + 2.0**-7, 1.5), (1 - 2.0**-6, 1.0), (1 - 2.0**-6 - 2.0**-8, 1.25)):
+        stats = _judged_attention(torch.full((1, 512), value, dtype=torch.float64).bfloat16(), twin_one, ref_one)
+        assert (stats.ok, stats.outside, stats.worst_share, stats.worst_at) == (share == 1.0, 0 if share == 1.0 else 512, share, (1.0, 1.0)), value
+    # ... and an element whose chain is not finite holds nothing: it is outside, whatever the output is
+    twin_inf, ref_inf = _built_attention(0.0, float("inf"), 1.0)
+    assert bool(torch.isinf(twin_inf.bound[0]).all()) and bool(torch.isinf(ref_inf).all())
+    stats = _judged_attention(torch.ones(1, 512).bfloat16(), twin_inf, ref_inf)
+    assert not stats.ok and stats.finite and stats.outside == 512, "a finite output against a chain that is not finite"
+
+    # ---- BUILT operands, weights rounded to bf16: the scaled scores 1 and 0, the values 0.375 and -1
+    twin_w, ref_w = _built_attention(4.0, 0.375, -1.0)
+    weight = 1.0 / (1.0 + math.exp(-1.0))  # of the first row; the second has the rest
+    chain_w, spread_w = twin_w.bound
+    assert abs(float(chain_w[0, 0]) - (weight * 0.375 - (1 - weight))) < 1e-15 and abs(float(spread_w[0, 0]) - (weight * 0.375 + (1 - weight))) < 1e-15
+    rounded = [float(torch.tensor(value, dtype=torch.float64).bfloat16()) for value in (weight, 1 - weight)]
+    assert rounded == [0.73046875, 0.26953125], "the two weights, each rounded to bf16"
+    out_w = torch.full((1, 512), rounded[0] * 0.375 + rounded[1] * -1.0, dtype=torch.float64).bfloat16()
+    held = _judged_attention(out_w, twin_w, ref_w)
+    assert held.ok and held.outside == 0 and abs(held.worst_share - 0.3733452) < 1e-6, "inside: 0.373 of the bound"
+
+    # ---- DRAWN operands at the published widths: a pool of three pages, one sequence, one row per step
+    queries, keys, values = _drawn_attention(3, 7001, 1, 9001)
+    cache = KvCache(keys[None], values[None])
+    for live in (2, 37, 100):
+        twin = torch_ref.AttentionBound(None, None, None, {})
+        ref = twin(queries, cache, live - 1)
+        chain, spread = twin.bound
+        itself = _judged_attention(ref, twin, ref)
+        assert (
+            itself.ok and (itself.elements, itself.outside, itself.other_value) == (6144, 0, 0) and 0.0 < itself.worst_share < 0.5
+        ), "the chain itself: its one rounding"
+        for divisor in (False, True):
+            out = _kernel_like_attention(queries[0], keys[:, :live], values[:, :live], divisor=divisor)[None]
+            stats = _judged_attention(out, twin, ref)
+            assert stats.ok and stats.finite and stats.outside == 0 and 0.25 < stats.worst_share < 0.75, (live, divisor, stats.line())
+            assert 1000 < stats.other_value < 6144, "a kernel-like chain: a share of its elements is another byte than the chain's, every one inside"
+            units = tie_out.BlockStats("bf16_unit")
+            tie_out.BlockTap._judge(units, (out,), (ref,), [], [], 0, twin)
+            assert (
+                not units.ok and units.worst_units > 4.0
+            ), "and it is NOT within one bf16 unit of the chain: the band's term is the attended values', not the output's"
+    # (the twin of the last pass, at 100 live rows, and its chain's bytes)
+    spacing = torch_ref.bf16_unit(chain.abs())
+    bound = 2.0**-8 * (spread + chain.abs()) + spacing
+    assert float(chain.abs().amin()) > float(torch.finfo(torch.float32).tiny), "no chain of zero among the drawn elements"
+    # one element one spacing beyond its bound -- an element whose chain is two binades or more below the tensor's largest, and
+    # whose bound ends inside its own binade, so that one spacing is one bf16 step there; one spacing INSIDE the bound first
+    eligible = (4 * spacing <= torch_ref.bf16_unit(chain.abs().amax())) & (torch_ref.bf16_unit(chain.abs() + bound + 2 * spacing) == spacing)
+    assert int(eligible.sum()) > 100, "the drawn operands have such elements"
+    at = tuple(int(i) for i in eligible.nonzero()[0])
+    away = 1.0 if float(chain[at]) > 0 else -1.0
+    for step, outside in ((-1.0, 0), (1.0, 1)):
+        moved = ref.clone()
+        moved[at] = float(chain[at] + away * (bound[at] + step * spacing[at]))
+        stats = _judged_attention(moved, twin, ref)
+        assert (stats.ok, stats.outside, stats.other_value) == (
+            not outside,
+            outside,
+            1,
+        ) and stats.finite, f"one spacing {'beyond' if outside else 'inside'} the bound"
+        assert (stats.worst_share > 1.0) == bool(outside) and abs(stats.worst_share - 1.0) < 2 * float(spacing[at] / bound[at]), stats.line()
+        assert stats.worst_at == (float(chain[at]), float(spread[at])), "the line names the chain and the spread of the element with the largest share"
+    for value, name in ((float("nan"), "a NaN"), (float("inf"), "an infinite value"), (float("-inf"), "an infinite value")):
+        not_finite = ref.clone()
+        not_finite[0, 4321] = value
+        stats = _judged_attention(not_finite, twin, ref)
+        assert not stats.ok and not stats.finite and stats.outside == 1 and stats.line().endswith("the cache untouched; NON-FINITE VALUES"), name
+        assert math.isnan(stats.worst_share) if name == "a NaN" else stats.worst_share == float("inf"), name
+        stats_after = tie_out.BlockStats("attention_bf16_weights")  # ... and a later clean call does not take it back
+        for out in (not_finite, ref):
+            tie_out.BlockTap._judge(stats_after, (out,), (ref,), [], [], 0, twin)
+        assert not stats_after.ok and not stats_after.finite and (stats_after.elements, stats_after.outside) == (12288, 1), name
+        assert math.isnan(stats_after.worst_share) if name == "a NaN" else stats_after.worst_share == float("inf"), name
+    # the call writes nothing: the cache it read is held byte for byte
+    pool = torch.cat((keys, values), dim=-1)
+    written = pool.clone()
+    written.view(torch.int16)[3, 150, 300] ^= 1  # one bit of a value row behind the live rows
+    untouched = _judged_attention(ref, twin, ref, state=[(pool,)], ref_state=[(pool.clone(),)])
+    assert untouched.ok and untouched.state_equal
+    stats = _judged_attention(ref, twin, ref, state=[(written,)], ref_state=[(pool,)])
+    assert (
+        not stats.ok and not stats.state_equal and stats.finite and stats.outside == 0 and stats.line().endswith("the cache WRITTEN")
+    ), "a byte of the cache the call changed"
+    # over several calls the counts add up and the largest share stays, with the element it is of
+    both = tie_out.BlockStats("attention_bf16_weights")
+    worse = _kernel_like_attention(queries[0], keys[:, :100], values[:, :100])[None]
+    for out in (worse, ref):
+        tie_out.BlockTap._judge(both, (out,), (ref,), [], [], 0, twin)
+    alone = _judged_attention(worse, twin, ref)
+    assert both.ok and (both.elements, both.other_value, both.worst_share, both.worst_at) == (12288, alone.other_value, alone.worst_share, alone.worst_at)
+    # what cannot be compared, and a twin that keeps no terms
+    for name, out in (("two outputs", (ref, ref)), ("another shape", (ref[:, :100],)), ("another dtype", (ref.float(),))):
+        stats = tie_out.BlockStats("attention_bf16_weights")
+        tie_out.BlockTap._judge(stats, out, (ref,), [], [], 0, twin)
+        assert not stats.ok and (stats.outside, stats.elements) == (1, 0), f"{name}: nothing is compared"
+    chain_row = SimpleNamespace(key="torch_ref.attention")  # the reference chain's own block: it keeps nothing
+    for other in (SimpleNamespace(), torch_ref.Attention(chain_row, None, None, {}), torch_ref.AttentionBound(None, None, None, {})):
+        with pytest.raises(ValueError, match="the band attention_bf16_weights is judged against the reference chain with the operand terms of its bound"):
+            _judged_attention(ref, other, ref)
+
+
+def test_a_cache_a_library_attention_kernel_wrote_in_one_call_is_not_taken_back_by_a_later_clean_call():
+    """The band ``attention_bf16_weights`` holds the cache a call reads byte for byte in EVERY call of a run: a block whose
+    cache was written in one call stays failed, with ``the cache WRITTEN`` in its line, whatever a later clean call finds --
+    as a NaN and an element outside stay.  The output is the chain's own bytes in both calls: the cache alone fails it."""
+    from model_samples import tie_out
+
+    twin, ref = _built_attention(4.0, 0.375, -1.0)
+    pool = torch.zeros(2, 4).bfloat16()
+    written = pool.clone()
+    written.view(torch.int16)[1, 2] ^= 1  # one bit of the cache the first call read
+    clean = _judged_attention(ref, twin, ref, state=[(pool,)], ref_state=[(pool.clone(),)])
+    assert clean.ok and clean.state_equal and clean.line().endswith("the cache untouched"), "the clean call alone passes"
+    stats = tie_out.BlockStats("attention_bf16_weights")
+    for state, ref_state in (([(written,)], [(pool,)]), ([(pool,)], [(pool.clone(),)])):
+        tie_out.BlockTap._judge(stats, (ref,), (ref,), state, ref_state, 0, twin)
+    assert (
+        not stats.ok and not stats.state_equal and stats.finite and (stats.elements, stats.outside) == (1024, 0) and stats.line().endswith("the cache WRITTEN")
+    ), "a later clean call does not take it back"
+
+
+def test_the_line_of_the_library_attention_band_is_pinned_whole_on_figures_that_are_not_round():
+    """The line a block in the band ``attention_bf16_weights`` prints, whole, on the built operands of weights rounded to
+    bf16 (scaled scores 1 and 0, the values 0.375 and -1): the share at three decimals, the chain and the spread of that
+    element at four significant digits each -- figures that are not 0 and 1, so that a digit less in either shows."""
+    twin, ref = _built_attention(4.0, 0.375, -1.0)
+    out = torch.full((1, 512), 0.73046875 * 0.375 + 0.26953125 * -1.0, dtype=torch.float64).bfloat16()
+    assert _judged_attention(out, twin, ref).line() == (
+        "512 elements, 512 of them not the reference chain's byte; 0 outside their bound; the largest distance 0.373 of its bound, at a chain of 0.005206 with "
+        "a spread of 0.5431 (printed, not gated); the cache untouched"
+    )
+
+
+def test_the_line_of_the_library_attention_band_prints_its_counts_with_the_thousands_separator():
+    """The three counts of the band's line above 999, each with its separator: twelve rows of the built operands and an
+    output of ones, every element of which is another byte than the chain's and outside its bound."""
+    from types import SimpleNamespace
+
+    twin, ref = _built_attention(4.0, 0.375, -1.0)
+    twelve = SimpleNamespace(bound=tuple(term.repeat(12, 1) for term in twin.bound))
+    line = _judged_attention(torch.ones(12, 512).bfloat16(), twelve, ref.repeat(12, 1)).line()
+    assert line.startswith("6,144 elements, 6,144 of them not the reference chain's byte; 6,144 outside their bound; "), line
+
+
+def test_terms_of_another_shape_than_the_output_are_not_compared_in_the_library_attention_band():
+    """Terms of another shape than the output are not compared in the band ``attention_bf16_weights``, also where they would
+    broadcast against it: one column of the terms against the 512 elements of the chain's own bytes is one thing outside
+    and no element judged, never 512 elements inside.  The same output against its own terms is compared, and inside."""
+    from types import SimpleNamespace
+
+    twin, ref = _built_attention(4.0, 0.375, -1.0)
+    other = SimpleNamespace(bound=tuple(term[:, :1] for term in twin.bound))  # terms that would broadcast against the output
+    stats = _judged_attention(ref, other, ref)
+    assert not stats.ok and (stats.outside, stats.elements) == (1, 0), "terms of another shape: nothing is compared"
+    whole = _judged_attention(ref, twin, ref)
+    assert whole.ok and (whole.outside, whole.elements) == (0, 512), "its own terms: every element compared"
+
+
+def test_the_line_of_the_library_attention_band_names_an_element_where_every_element_is_on_its_chain():
+    """Where every element of a step is exactly on its chain, no element has used any of its bound: a step with ONE
+    attended row, whose chain is that row's value and whose output is the chain's bytes.  The line of the band
+    ``attention_bf16_weights`` then names the chain and the spread of an element of the first judged call -- its first --
+    and never figures that belong to no element.  A later call that is on its chain too leaves them; the first call that
+    is off its chain takes their place, and a later call on its chain does not take that back.  A call that cannot be
+    compared is no judged call: it keeps nothing, and the call behind it is the first.  An element whose chain and
+    spread are both zero is an element like any other: kept as the first judged call's, and kept with the largest share."""
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.state import KvCache
+
+    def one_row(first):
+        """One row that attends to ONE row, at two query heads on one key / value head of width 256, and its twin after
+        its call: ``(twin, the chain's bytes)``.  The attended row's value is ``first`` in its first element and 0.5 in
+        every other: its weight is 1, so every element of the chain is that value, and of the spread its magnitude."""
+        values = torch.full((1, 1, 1, 256), 0.5)
+        values[0, 0, 0, 0] = first
+        twin = torch_ref.AttentionBound(None, None, None, {})
+        return twin, twin(torch.ones(1, 2, 256).bfloat16(), KvCache(torch.zeros(1, 1, 1, 256).bfloat16(), values.bfloat16()), 0)
+
+    twin, ref = one_row(-0.75)
+    chain, spread = twin.bound
+    assert torch.equal(ref.double(), chain) and torch.equal(spread, chain.abs()), "one attended row: the output is exactly its chain"
+    assert (float(chain[0, 0]), float(spread[0, 0]), float(chain[0, 1]), float(chain[0, 256])) == (-0.75, 0.75, 0.5, -0.75)
+    stats = _judged_attention(ref, twin, ref)
+    assert stats.ok and (stats.elements, stats.outside, stats.other_value, stats.worst_share) == (512, 0, 0, 0.0)
+    assert stats.worst_at == (-0.75, 0.75), "no element is off its chain: the first element of the first judged call, never the figures of no element"
+    assert stats.line() == (
+        "512 elements, 0 of them not the reference chain's byte; 0 outside their bound; the largest distance 0.000 of its bound, at a chain of -0.75 with a "
+        "spread of 0.75 (printed, not gated); the cache untouched"
+    )
+    # over the calls of a run: a second call that is on its chain too leaves the kept element ...
+    other_twin, other_ref = one_row(0.25)
+    assert float(other_twin.bound[0][0, 0]) == 0.25
+    tie_out.BlockTap._judge(stats, (other_ref,), (other_ref,), [], [], 0, other_twin)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (1024, 0.0, (-0.75, 0.75)), "a later call on its chain: the kept element stays"
+    # ... the first call that is off its chain takes its place (the model's extreme at 0.9 of its largest rounding error) ...
+    extreme_twin, extreme_ref = _built_attention(0.0, 1.0, -1.0)
+    tie_out.BlockTap._judge(stats, (_model_extreme(0.9),), (extreme_ref,), [], [], 0, extreme_twin)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (1536, 0.8984375, (0.0, 1.0)), "a larger share: its element"
+    # ... and a later call on its chain does not take that back
+    tie_out.BlockTap._judge(stats, (ref,), (ref,), [], [], 0, twin)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (2048, 0.8984375, (0.0, 1.0)), "the largest share stays with its element"
+    # a call that cannot be compared is no judged call: nothing is kept, and the call behind it is the first judged one
+    behind = tie_out.BlockStats("attention_bf16_weights")
+    tie_out.BlockTap._judge(behind, (other_ref, other_ref), (other_ref,), [], [], 0, other_twin)
+    assert not behind.ok and (behind.elements, behind.outside, behind.worst_at) == (0, 1, (0.0, 0.0)), "two outputs: nothing is compared and nothing kept"
+    tie_out.BlockTap._judge(behind, (ref,), (ref,), [], [], 0, twin)
+    assert not behind.ok and (behind.elements, behind.outside, behind.worst_share, behind.worst_at) == (512, 1, 0.0, (-0.75, 0.75)), "the first judged call"
+    # an element whose chain and spread are both zero (its attended value is zero) is kept like any other: as the first judged call's ...
+    null_twin, null_ref = one_row(0.0)
+    stats = _judged_attention(null_ref, null_twin, null_ref)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (512, 0.0, (0.0, 0.0)), "the first judged call's first element: a chain of zero"
+    tie_out.BlockTap._judge(stats, (ref,), (ref,), [], [], 0, twin)
+    assert stats.ok and (stats.elements, stats.worst_share, stats.worst_at) == (1024, 0.0, (0.0, 0.0)), "a later call on its chain: a chain of zero stays too"
+    # ... and with the largest share: a later call with a smaller share does not take its place
+    off = null_ref.clone()
+    off[0, 0] = 2.0**-10  # an output that is not zero where every attended value is: its bound is one spacing at the smallest normal fp32 value
+    stats = _judged_attention(off, null_twin, null_ref)
+    assert not stats.ok and (stats.outside, stats.worst_share, stats.worst_at) == (1, 2.0**123, (0.0, 0.0)), "outside, with its share, at a chain of zero"
+    tie_out.BlockTap._judge(stats, (_model_extreme(0.9),), (extreme_ref,), [], [], 0, extreme_twin)
+    kept = (stats.elements, stats.outside, stats.worst_share, stats.worst_at)
+    assert not stats.ok and kept == (1024, 1, 2.0**123, (0.0, 0.0)), "a later call with a smaller share does not take its place"
+    # the count beside the share is of BYTES: an output of -0 where the chain's byte is +0 is on its chain, and another byte
+    signed = null_ref.clone()
+    signed[0, 0] = -0.0
+    stats = _judged_attention(signed, null_twin, null_ref)
+    assert stats.ok and (stats.other_value, stats.worst_share) == (1, 0.0), "an output of -0 at a chain of +0: inside, and another byte than the chain's"
+
+
+def test_every_control_arm_of_the_library_attention_band_fails_and_what_the_band_cannot_see_is_pinned(monkeypatch):
+    """The control arms of the band ``attention_bf16_weights`` through the judge; each must FAIL.  Two say that the band is
+    not slack, and are derived on built operands: at a coefficient of 0.5 the model's own extreme at 0.9 of its largest
+    rounding error is outside, and with the weight term of weights held at fp32 (``2**-24``) a chain whose weights are
+    rounded to bf16 is outside.  The others are defects of an operand, on drawn operands at 100 live rows -- one full page
+    and 36 rows of a second -- with a kernel-like chain of the model in the kernel's place.  In the CALL, judged against the
+    correct twin: the lengths one too long (a masked row let in), one too short (the newest attended row dropped), the
+    page-table entry of the last attended page exchanged with the entry of a full page, the scores scaled by 1.  In the
+    TWIN, with the call's bytes correct: the value row of the newest attended position read from the next slot, of
+    position 0 from slot 1, and in a step of six rows every row attending to all rows after the step.  What an arm needs
+    is pinned with it: two full pages exchanged are the same rows.  And what the band cannot see is pinned as that: a
+    value row off by one slot among 2,051 drawn rows, where the softmax weight of that row is below the band's term."""
+    from types import SimpleNamespace
+
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+    from model_samples.state import KvCache
+
+    # ---- derived, on the built operands: the band is not slack by a factor of two, and its weight term is what the model needs
+    twin, ref = _built_attention(0.0, 1.0, -1.0)
+    twin_w, ref_w = _built_attention(4.0, 0.375, -1.0)
+    out_w = torch.full((1, 512), 0.73046875 * 0.375 + 0.26953125 * -1.0, dtype=torch.float64).bfloat16()
+    assert _judged_attention(_model_extreme(0.9), twin, ref).ok and _judged_attention(out_w, twin_w, ref_w).ok, "both inside the band as declared"
+    with monkeypatch.context() as arm:
+        arm.setattr(tie_out, "ATTENTION_BAND_COEFFICIENT", 0.5)
+        half = _judged_attention(_model_extreme(0.9), twin, ref)
+    assert not half.ok and half.outside == 512 and half.worst_share == 2 * 0.8984375, "at a coefficient of 0.5 the model's extreme at 0.9 is outside"
+    with monkeypatch.context() as arm:
+        arm.setattr(tie_out, "ATTENTION_WEIGHT_TERM", 2.0**-24)
+        narrow = _judged_attention(out_w, twin_w, ref_w)
+    assert (
+        not narrow.ok and narrow.outside == 512 and abs(narrow.worst_share - 26.5469) < 1e-3
+    ), "with the weight term 2**-24, weights rounded to bf16 are outside"
+
+    # ---- defects of an operand, on drawn operands: a pool of three pages of one sequence, 100 live rows
+    queries, keys, values = _drawn_attention(3, 7001, 6, 9001)
+    live = 100
+
+    def call(rows, lengths=None, table=(0, 1, 2), scale=None):
+        """What a kernel-like chain of the model returns for a step of ``rows`` rows that it is handed as a kernel is: the
+        length of the sequence AFTER the step (the live rows, where none is given), a page table and a scale.  Row ``t``
+        attends to ``lengths - (rows - 1 - t)`` positions; position ``j`` is the row ``j % 64`` of the page ``table[j // 64]``."""
+        out, lengths = [], live if lengths is None else lengths
+        for row in range(rows):
+            read = [table[at // 64] * 64 + at % 64 for at in range(lengths - (rows - 1 - row))]
+            out.append(_kernel_like_attention(queries[row], keys[:, read], values[:, read], scale))
+        return torch.stack(out)
+
+    def twin_with(rows, every=False, newest=False, oldest=False):
+        """A twin written from the definition for a step of ``rows`` rows that ends at ``live`` live rows, with one thing
+        wrong: every row attends to all rows after the step; the value row of the newest attended position is read from
+        the next slot; the value row of position 0 from slot 1."""
+        terms = []
+        for row in range(rows):
+            attended = live if every else live - (rows - 1 - row)
+            read = values[:, :attended].clone()
+            if newest:
+                read[:, attended - 1] = values[:, attended]
+            if oldest:
+                read[:, 0] = values[:, 1]
+            terms.append(_attention_terms(queries[row], keys[:, :attended], read))
+        return SimpleNamespace(bound=tuple(torch.stack([term[part] for term in terms]) for part in (0, 1)))
+
+    def correct(rows):
+        twin = torch_ref.AttentionBound(None, None, None, {})
+        return twin, twin(queries[:rows], KvCache(keys[None], values[None], rows), live - rows)
+
+    twin, ref = correct(1)
+    clean = _judged_attention(call(1), twin, ref)
+    assert clean.ok and clean.outside == 0 and 0.25 < clean.worst_share < 0.75, clean.line()
+    assert torch.equal(twin_with(1).bound[0], twin.bound[0]) or bool(((twin_with(1).bound[0] - twin.bound[0]).abs() <= 1e-12 * twin.bound[1]).all())
+    in_the_call = (
+        ("the lengths one too long: a masked row let in", dict(lengths=live + 1)),
+        ("the lengths one too short: the newest attended row dropped", dict(lengths=live - 1)),
+        ("the entry of the last attended page exchanged with the entry of a full page", dict(table=(1, 0, 2))),
+        ("the scores scaled by 1, a library's default, in place of the chain's scale", dict(scale=1.0)),
+    )
+    for name, defect in in_the_call:
+        stats = _judged_attention(call(1, **defect), twin, ref)
+        assert not stats.ok and stats.finite and stats.outside > 6144 // 10 and stats.worst_share > 10, f"{name}: {stats.line()}"
+    in_the_twin = (
+        ("the value row of the newest attended position read from the next slot", dict(newest=True)),
+        ("the value row of position 0 read from slot 1", dict(oldest=True)),
+    )
+    for name, defect in in_the_twin:
+        stats = _judged_attention(call(1), twin_with(1, **defect), ref)
+        assert not stats.ok and stats.finite and stats.outside > 6144 // 10 and stats.worst_share > 10, f"{name}: {stats.line()}"
+    twin6, ref6 = correct(6)
+    step = call(6)
+    clean = _judged_attention(step, twin6, ref6)
+    assert clean.ok and clean.elements == 6 * 6144 and clean.outside == 0, "a step of six rows, each attending to the rows up to its own"
+    stats = _judged_attention(step, twin_with(6, every=True), ref6)
+    assert not stats.ok and stats.outside > 36864 // 10, f"every row of the step attends to all rows after the step: {stats.line()}"
+    last = _judged_attention(step[5:], SimpleNamespace(bound=tuple(term[5:] for term in twin_with(6, every=True).bound)), ref6[5:])
+    assert last.ok, "the last row of the step attends to all of them either way: the arm is the five rows in front of it"
+    # what the page-table arm needs: a last page that is not full.  Two wholly live pages exchanged are the same attended rows
+    assert torch.equal(call(1, lengths=128, table=(1, 0, 2)).view(torch.int16), call(1, lengths=128).view(torch.int16)), "two full pages: no byte changes"
+    # with the weight term of fp32 weights the drawn kernel-like chain is outside too
+    with monkeypatch.context() as arm:
+        arm.setattr(tie_out, "ATTENTION_WEIGHT_TERM", 2.0**-24)
+        assert _judged_attention(call(1), twin, ref).outside > 100
+
+    # ---- what the band cannot see, pinned as that: one value row off by one slot among 2,051 attended rows
+    queries, keys, values = _drawn_attention(39, 5051, 1, 8051, query_scale=4.0)
+    live = 2051
+    twin, ref = correct(1)
+    out = call(1, table=tuple(range(39)))
+    assert _judged_attention(out, twin, ref).ok
+    for name, defect, at in (("the newest attended position", dict(newest=True), live - 1), ("position 0", dict(oldest=True), 0)):
+        stats = _judged_attention(out, twin_with(1, **defect), ref)
+        assert stats.ok and stats.outside == 0 and stats.worst_share < 1.0, f"the value row of {name} off by one slot, among 2,051: inside"
+        weight = max(float((raw / total)[at]) for raw, total in _attention_weights(queries[0], keys[:, :live]))
+        assert weight < tie_out.ATTENTION_WEIGHT_TERM / 4, f"{name}: the softmax weight of that row is below the band's term in every head"
+
+
+def test_rule_8_states_its_one_exception_word_for_word_and_so_do_the_places_that_state_the_rule():
+    """Rule 8 of the area's guide says that a band is the kernel's own contract against a twin at the kernel's rounding points.
+    The band of a library kernel that documents no contract is the one exception, and the guide states it in one
+    sentence, word for word and once, directly behind the sentence it is the exception to and in front of the bullet
+    that follows it.  The two places of the helper layer that state the rule state the exception too, and each says
+    what the band is derived from: a stated model of the kernel's arithmetic, never the kernel's arithmetic itself."""
+    from model_samples import providers, tie_out
+
+    guide = " ".join((MODELS / "AGENTS.md").read_text().split())
+    rule = (
+        "8. **Bands are never widened in place.** The band of a block against the reference is named in its provider row (`tie_out.BANDS`). - A provider "
+        "that rounds at other points than the reference chain is compared with its twin (`Block.twin`): a reference written at the kernel's rounding "
+        "points, in the reference's accumulation precision. The band is the kernel's documented contract, never a width covering the distance between "
+        "two chains."
+    )
+    exception = (
+        "The one exception is a library kernel that documents no numerics contract and whose rounding points are not established: its twin is the "
+        "reference chain itself, which also keeps the operand terms of a bound, and its band is that bound -- derived from a stated model of the kernel's "
+        "arithmetic, declared with that model before any run of the row, held by control arms that must fail, and never taken from a measured distance; "
+        "an element outside it is a finding, and the family README says beside the row that the row is not within one bf16 unit of the chain."
+    )
+    behind = "- A band names the outputs it applies to; an unnamed output is judged by its dtype, and updated state byte for byte."
+    assert f"{rule} {exception} {behind}" in guide, "rule 8 up to the sentence of the twin, its one exception word for word, and the bullet behind it"
+    assert guide.count("The one exception is a library kernel") == 1 and guide.count("never a width covering the distance between two chains.") == 1
+    for name, text in (("tie_out", tie_out.__doc__), ("BlockBase.twin", providers.BlockBase.twin.__doc__)):
+        stated = " ".join((text or "").split())
+        assert "a band is never widened to cover a chain that rounds elsewhere." in stated, f"{name}: the rule"
+        assert (
+            "a library kernel that documents no numerics contract and whose rounding points are not established: its twin is the reference chain itself, "
+            in stated
+        ), name
+        assert (
+            "which also keeps the operand terms of a bound, and its band is that bound" in stated
+            and "derived from a stated model of the kernel's arithmetic" in stated
+        ), name
+    assert "(``attention_bf16_weights`` below)" in " ".join(tie_out.__doc__.split()) and "(``torch_ref.AttentionBound``)" in " ".join(
+        providers.BlockBase.twin.__doc__.split()
+    )
+    assert (
+        "attention_bf16_weights" in tie_out.BANDS and providers.BlockBase.twin(providers.BlockBase, "the chain") == "the chain"
+    ), "the default twin is the reference block"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# The row of the attention core on a library: the real adapter of the paged decode attention over the stand-in of the
+# library, on the CPU -- what it hands the library, what it declines, its first use, and the kernel check on its kernel.
+# ---------------------------------------------------------------------------------------------------------------------------
+def _attention_plans(monkeypatch, **stand_in):
+    """``planned(sequences, tokens, max_model_len, table, cc)``: the attention core's block in a plan of the stack ``native``
+    on compute capability ``cc`` (10.0 where none is named), for the tiny geometry and ONE set of stand-ins (``stand_in``:
+    its options): every block it returns is an adapter of the same process."""
+    from model_samples import blocks
+
+    model, build = _tiny_model(), _stand_ins(monkeypatch, **stand_in)
+
+    def planned(sequences=1, tokens=1, max_model_len=DEFAULT_LENGTH, table=None, cc=(10, 0)):
+        facts = blocks.DeviceFacts(cc, "stated device", 148, 180 * GIB, 80 * GIB)
+        options = {"reference_precision": "fp64", "device": "cpu", "max_model_len": max_model_len}
+        plan = blocks.plan(table or model.provider_table, model.regimes, facts, sequences, tokens, "native", model=model, options=options, factories=build)
+        return plan["attention.core"]
+
+    return planned
+
+
+def _attention_step(sequences=1, tokens=1, live=100, max_model_len=DEFAULT_LENGTH):
+    """Drawn operands of one step of an attention core at the published widths, on the CPU: ``(queries [rows, 24, 256], a
+    paged cache of ``live`` positions per sequence whose every row is drawn, the position the step starts at)``."""
+    from model_samples.state import DecodeState
+
+    heads, kv_heads, width = ATTENTION_WIDTHS
+    shapes = {"conv": (1, 1), "kv": (kv_heads, width), "rotary": (4, 10000.0)}
+    cache = DecodeState(("full_attention",), sequences, live, shapes, torch.device("cpu"), tokens=tokens, page=64, max_model_len=max_model_len).layers[0]
+    generator = torch.Generator().manual_seed(11)
+    cache.pool.copy_(torch.randn(cache.pool.shape, generator=generator).bfloat16())
+    return torch.randn(sequences * tokens, heads, width, generator=generator).bfloat16(), cache, live - tokens
+
+
+def test_the_attention_adapter_hands_the_library_the_state_as_it_is(monkeypatch):
+    """What the library's paged decode attention is handed for a step of two sequences of six tokens: the query as the
+    block got it; the two halves of the pool and the rows of the state's page table and lengths, each the state's own
+    memory; the run's maximum length, the chain's scale and the tokens per sequence as Python numbers; the field of
+    the row's form, and the library's own backend for these GPU classes named in every call; one workspace per device,
+    in every call and every adapter; a zero counter buffer of the library's size per sequence count; an output buffer
+    of the call's own, which is what the block returns.  The library's launch option, its window and its other outputs
+    are left at its defaults.  A row that leaves out the field of the form is a wrong table, and a checkpoint with
+    another count of query heads, of key / value heads or another head width keeps the reference chain."""
+    from dataclasses import replace
+
+    from model_samples.providers import flashinfer_calls
+
+    planned = _attention_plans(monkeypatch)
+    block = planned(2, 6)
+    assert type(block).__name__ == "DecodeAttentionBlock" and (block.provider, block.stored_weights) == ("FlashInfer", False), "the block has no weight"
+    queries, cache, position = _attention_step(2, 6)
+    assert block.reserve_bytes() == 394 * 2**20, "the memory sentence of a plan counts the workspace while the device does not hold it"
+    del ATTENTION_CALLS[:]
+    first, second = block(queries, cache, position), block(queries, cache, position)
+    assert block.reserve_bytes() == planned(1, 1).reserve_bytes() == 0, "and no plan of the device counts it once it is built"
+    handed, again = ATTENTION_CALLS
+    width = ATTENTION_WIDTHS[2]
+    keys, values = handed["kv_cache"]
+    assert handed["query"] is queries and type(handed["kv_cache"]) is tuple and keys.shape == values.shape == (*cache.pool.shape[:3], width)
+    assert keys.data_ptr() == cache.pool.data_ptr() and values.data_ptr() == cache.pool[..., width:].data_ptr(), "the two halves of the pool, its own memory"
+    blocks, lengths = cache.attended(position)
+    assert handed["block_tables"].data_ptr() == blocks.data_ptr() == cache.table.blocks.data_ptr() and tuple(handed["block_tables"].shape) == (2, 36)
+    assert handed["seq_lens"].data_ptr() == lengths.data_ptr() and handed["seq_lens"].tolist() == [100, 100], "what each sequence holds after the step"
+    numbers = [handed[name] for name in ("max_seq_len", "bmm1_scale", "bmm2_scale", "q_len_per_req")]
+    assert numbers == [DEFAULT_LENGTH, 0.0625, 1.0, 6] and [type(number) for number in numbers] == [int, float, float, int], "numbers of the host"
+    assert handed["kv_layout"] == "HND" and block.serving() == (ATTENTION_ENTRY, (("KV_LAYOUT", "HND"),))
+    assert handed["backend"] == flashinfer_calls.DECODE_ATTENTION_BACKEND != "auto", "the backend is named in the call: not the library's choice by the GPU"
+    assert handed["enable_pdl"] is None and handed["window_left"] == -1 and handed["more"] == {}, "no launch option, no window, no further output"
+    planned(1, 1)(*_attention_step(1, 1))  # another adapter of the same device, at another sequence count
+    workspace, counter = handed["workspace_buffer"], handed["multi_ctas_kv_counter_buffer"]
+    assert workspace is again["workspace_buffer"] is ATTENTION_CALLS[2]["workspace_buffer"] and (workspace.dtype, workspace.numel()) == (
+        torch.uint8,
+        394 * 2**20,
+    )
+    assert counter is again["multi_ctas_kv_counter_buffer"] and counter is not ATTENTION_CALLS[2]["multi_ctas_kv_counter_buffer"]
+    assert (counter.dtype, counter.numel()) == (torch.uint8, 608) and not counter.any(), "of the library's size for this count on 148 SMs, zero"
+    assert first.shape == (12, 24 * 256) and first.data_ptr() == handed["out"].data_ptr() != second.data_ptr() == again["out"].data_ptr()
+    assert handed["out"].shape == queries.shape and handed["out"].is_contiguous() and torch.equal(first.view(torch.int16), second.view(torch.int16))
+    assert handed["out"].untyped_storage().nbytes() == 2 * queries.numel(), "the whole of a buffer, not a view inside a larger one"
+    table = dict(_tiny_model().provider_table)
+    table["attention.core"] = [replace(row, form=()) if row.key == "flashinfer.decode_attention" else row for row in table["attention.core"]]
+    with pytest.raises(ValueError, match="provider row flashinfer.decode_attention: its form does not name KV_LAYOUT; this adapter's rows name KV_LAYOUT for"):
+        planned(table=table)
+    # the row names the three attention widths its call was run with: a checkpoint with another of any of them keeps the chain
+    from model_samples import blocks
+    from model_samples.qwen_dense import QwenDense
+
+    stated = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
+    for field, value in (("attn_heads", 16), ("attn_kv_heads", 2), ("attn_head_dim", 128)):
+        other = QwenDense(replace(QwenDense.reduced(2).geometry, **{field: value}), (f"another {field}",))
+        rows = blocks.plan(other.provider_table, other.regimes, stated, 1, 1, "native", model=other, options={"device": "cpu"}).rows
+        assert rows["attention.core"].key == "torch_ref.attention", f"{field}: the chain's row"
+
+
+def test_the_attention_adapter_declines_what_the_library_would_misread(monkeypatch):
+    """The library checks neither the dtype, the layout nor the place of the tables it reads, so the adapter does, and each
+    is a ``ValueError`` that names the operand: lengths or a page table of 64-bit words, a strided view of either, a
+    page table narrower than the width of the run's maximum length, one off a 16-byte boundary, one on another device;
+    a strided output; a pool half, either one, whose last axis is strided; a step past the maximum length, where the step
+    that ends at it is made; a cache that is no pool of pages; a plan that names no maximum length.  Why the tables are held at two sequences of two pages is pinned
+    with them: read as 32-bit words, tables of 64-bit words give other bytes there and the same bytes at one sequence
+    of one page."""
+    from model_samples.state import KvCache, PagedKvCache
+
+    planned = _attention_plans(monkeypatch)
+    block = planned(2, 1)
+    queries, cache, position = _attention_step(2, 1)
+    table = cache.table
+    good = block(queries, cache, position).clone()
+
+    def declined(match, **wrong):
+        kept = {name: getattr(table, name) for name in wrong}
+        vars(table).update(wrong)
+        with pytest.raises(ValueError, match=f"{ATTENTION_ENTRY}: {match}"):
+            block(queries, cache, position)
+        vars(table).update(kept)
+
+    declined("the lengths of this step is of dtype torch.int64: the kernel reads 32-bit words", lengths=table.lengths.long())
+    declined("the page table of this step is of dtype torch.int64: the kernel reads 32-bit words", blocks=table.blocks.long())
+    declined("the lengths of this step is a strided view: the kernel reads adjacent words", lengths=table.lengths.repeat_interleave(2, dim=1)[:, ::2])
+    declined("the page table of this step is a strided view: the kernel reads adjacent words", blocks=table.blocks.repeat_interleave(2, dim=1)[:, ::2])
+    declined(r"the page table of this step is of shape \(2, 2\): this call reads \(2, 36\)", blocks=table.blocks[:, :2].contiguous())
+    shifted = torch.zeros(table.blocks.numel() + 1, dtype=torch.int32)[1:].view(table.blocks.shape).copy_(table.blocks)
+    declined("the page table of this step is not 16 bytes aligned", blocks=shifted)
+    declined("the page table of this step is on meta, the query on cpu", blocks=table.blocks.to("meta"))
+    with monkeypatch.context() as scoped:
+        scoped.setattr(type(block), "_output", lambda self, q: torch.empty((*q.shape[:2], 2 * q.shape[2]), dtype=torch.bfloat16)[..., ::2])
+        with pytest.raises(ValueError, match="the output buffer of this call is a strided view: the kernel writes adjacent rows"):
+            block(queries, cache, position)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(PagedKvCache, "k_pool", property(lambda self: self.pool[..., ::2]))
+        with pytest.raises(ValueError, match="the key half of the pool has stride 2 on its last axis: the kernel reads adjacent elements"):
+            block(queries, cache, position)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(PagedKvCache, "v_pool", property(lambda self: self.pool[..., 1::2]))
+        with pytest.raises(ValueError, match="the value half of the pool has stride 2 on its last axis: the kernel reads adjacent elements"):
+            block(queries, cache, position)
+    with pytest.raises(ValueError, match="a step of 1 token at position 99 passes the run's maximum length 99"):
+        planned(2, 1, max_model_len=99)(queries, cache, position)
+    full = _attention_step(2, 1, max_model_len=100)  # the same step in a run of 100 positions ends at the maximum length: the last step of that run
+    assert torch.equal(planned(2, 1, max_model_len=100)(*full).view(torch.int16), good.view(torch.int16)), "a step that ends at the maximum length is made"
+    with pytest.raises(ValueError, match="reads an attention cache that is a pool of pages of 64 positions; this block is handed KvCache"):
+        block(queries, KvCache(cache.keys(100, torch.bfloat16), cache.values(100, torch.bfloat16)), position)
+    with pytest.raises(ValueError, match="a whole number of positions; the plan of this block names max_model_len=None"):
+        planned(2, 1, max_model_len=None)(queries, cache, position)
+    # with the adapter's own check out of the way, a kernel reads the first 32-bit words of whatever it is handed
+    monkeypatch.setattr(type(block), "_held", lambda self, *operands: None)
+    vars(table).update(lengths=table.lengths.long(), blocks=table.blocks.long())
+    assert not torch.equal(block(queries, cache, position).view(torch.int16), good.view(torch.int16)), "two sequences of two pages: other bytes"
+    one, small, start = _attention_step(1, 1, live=37)
+    right = planned(1, 1)(one, small, start).clone()
+    vars(small.table).update(lengths=small.table.lengths.long(), blocks=small.table.blocks.long())
+    assert torch.equal(planned(1, 1)(one, small, start).view(torch.int16), right.view(torch.int16)), "one sequence of one page: the defect, and the right bytes"
+
+
+def test_the_first_use_of_the_librarys_attention_and_the_kernel_binaries_it_never_fetches(monkeypatch, tmp_path, capsys):
+    """The first use of the paged decode attention: one scratch call per form the run calls -- its sequences and one
+    sequence alone, at each plan's tokens per sequence -- at the run's maximum length.  In front of the first call the
+    adapter holds every kernel binary the library's table names for the call's data types, head width, paging and page
+    on the GPU's class to the manifest of the kernel set: a
+    binary that is missing -- the one a step launches or the one its selection reads first --, one changed byte, a
+    line the manifest lacks, a header that is not the manifest's, no manifest or a manifest that is not the file the
+    library names is a ``SKIP`` with the library not called, and a library that would print a path and launch another kernel is never reached in that state.  The set
+    is the class's own and is held once per process.  A file the library itself does not
+    find with its download refused is a ``SKIP`` in the sample's words, by what the installation holds, with no path
+    of the library's text; the states of the package in
+    which the library's import would print a path are declined at plan time, before the library is reached.  A check
+    of the library on the operands is the adapter's fault, any other failure the installation's by its type alone, and
+    a fault of the adapter's own code is raised as it is.  The interpreter's report of the missing file inside the
+    library's loader stays off the streams during the first use; every other report reaches the hook that was there."""
+    from types import SimpleNamespace
+
+    from model_samples import census
+    from model_samples.providers import flashinfer_calls
+
+    planned = _attention_plans(monkeypatch)
+    del ATTENTION_CALLS[:]
+    for tokens in (1, 6):  # the plan of a prompt's decode steps and the plan of the verify steps of one session
+        block = planned(2, tokens)
+        block.first_use(2, tokens)
+        assert block.serving() == (ATTENTION_ENTRY, ()), "a first use is no call of a step"
+    made = [(call["query"].shape[0], call["q_len_per_req"], call["max_seq_len"], tuple(call["block_tables"].shape)) for call in ATTENTION_CALLS]
+    assert made == [(2, 1, 2051, (2, 36)), (1, 1, 2051, (1, 36)), (12, 6, 2051, (2, 36)), (6, 6, 2051, (1, 36))], "four forms, each at the maximum length"
+
+    # the kernel binaries, held before the first call: what the set's header names for the GPU's class, each as the manifest lists it
+    install = "pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt"
+    without = "--stack fe-entries runs the cuDNN Frontend rows of this stack without the package"
+    filled = 'fill it (the family README, "What the first run does") or install the package'
+    anew = 'install it anew (the family README, "What the first run does")'
+    lacks = (
+        "does not hold the kernel binaries the library's table names for this call's data types, head width, paging and page on this GPU's class "
+        "as their manifest lists them"
+    )
+    one, header = "1 of 3 missing or changed", "include/flashInferMetaInfo.h"
+    held = (
+        ("the binary a step launches is missing", {"without": [FI_ATTENTION]}, one),
+        ("the binary the selection reads first is missing", {"without": [FI_ATTENTION_OTHER]}, one),
+        ("one byte of a binary differs", {"changed": [FI_ATTENTION]}, one),
+        ("the manifest has no line for a binary", {"unlisted": [FI_ATTENTION]}, one),
+        ("the header names another SHA-256 than the binary's", {"misnamed": [FI_ATTENTION]}, one),
+        ("a binary of this class that no step of the run reads is missing", {"without": [ATTENTION_SET[2][1]]}, one),
+        ("no manifest", {"manifest": False}, "their manifest is not there"),
+        ("one byte of the header differs", {"changed": [header]}, "the header of the kernel set is not the file their manifest lists"),
+        ("a header without the table", {"header": "#pragma once\n"}, "the header of the kernel set is not the table of kernels this adapter reads"),
+        ("a table without a kernel of this call", {"kernels": ATTENTION_SET[4:]}, "the header of the kernel set names no kernel of this call for this GPU"),
+    )
+    reports = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda unraisable: reports.append(type(unraisable.exc_value).__name__))
+    for number, (case, defect, found) in enumerate(held):
+        directory = _kernel_binaries(tmp_path / f"held_{number}", **defect)
+        block = _attention_plans(monkeypatch, kernel_binaries=directory)(2, 6)
+        capsys.readouterr()
+        with pytest.raises(NotImplementedError) as skipped:
+            block.first_use(2, 6)
+        assert str(skipped.value) == f"{ATTENTION_ENTRY}: the installed flashinfer-cubin 0.7.2.post1 {lacks} ({found}); {anew}; {without}", case
+        assert ATTENTION_CALLS == [] and capsys.readouterr() == ("", ""), f"{case}: the library was not called and nothing was printed"
+        if FI_ATTENTION_OTHER in defect.get("without", ()):  # behind a hold that skipped, a step is a step: the library's error is raised as it is
+            with pytest.raises(RuntimeError, match="Failed to load cubin for"):
+                block(*next(block._scratches(torch.device("cpu"), 1, 1)))
+            assert reports == ["RuntimeError"], "and the interpreter's report is the interpreter's"
+            del reports[:], ATTENTION_CALLS[:]
+    # the set is the class's own, and it is held once per process: a kernel of another 10.x class alone is not held on
+    # this one and is on that one; what a process held of a class it does not read again
+    other_class = _kernel_binaries(tmp_path / "other_class", without=[ATTENTION_SET[3][1]])
+    planned = _attention_plans(monkeypatch, kernel_binaries=other_class)
+    planned(2, 6).first_use(2, 6)
+    with pytest.raises(NotImplementedError, match=re.escape(f"{lacks} ({one})")):
+        planned(2, 6, cc=(10, 3)).first_use(2, 6)
+    (other_class / "2d6a" / "fmha" / flashinfer_calls.DECODE_ATTENTION_BACKEND / "checksums.txt").unlink()
+    planned(1, 1).first_use(1, 1)
+    with pytest.raises(NotImplementedError, match="their manifest is not there"):
+        _attention_plans(monkeypatch, kernel_binaries=other_class)(1, 1).first_use(1, 1)
+    # the manifest is held as well, to the SHA-256 the library names for it: one that lists every binary of the set as it
+    # is and is another file than the library's -- a line more, of a file of another kernel set -- is the SKIP, with the
+    # library not called (the library would say so itself, at its first read, in a line that holds a local path)
+    other_manifest = _kernel_binaries(tmp_path / "other_manifest")
+    block = _attention_plans(monkeypatch, kernel_binaries=other_manifest)(2, 6)
+    with (other_manifest / "2d6a" / "fmha" / flashinfer_calls.DECODE_ATTENTION_BACKEND / "checksums.txt").open("a") as manifest:
+        manifest.write(f"{'0' * 64}  a_binary_of_another_kernel_set.cubin\n")
+    capsys.readouterr()
+    with pytest.raises(NotImplementedError, match=re.escape(f"{lacks} (their manifest is not the file the library names); {anew}; {without}")):
+        block.first_use(2, 6)
+    assert ATTENTION_CALLS == [] and capsys.readouterr() == ("", ""), "the library was not called and nothing was printed"
+    # the sentence by what the installation holds: (the package's metadata and module, the directory variable)
+    launched_missing = _kernel_binaries(tmp_path / "by_installation", without=[FI_ATTENTION])
+    for binaries, variable, sentence in (
+        ((None, False), False, f" needs the kernel-binary package flashinfer-cubin 0.7.2.post1, which is not installed: {install}; {without}"),
+        ((None, False), True, f": the directory FLASHINFER_CUBIN_DIR names {lacks} ({one}); {filled}: {install}; {without}"),
+    ):
+        planned = _attention_plans(monkeypatch, library_binaries=binaries, kernel_binaries=launched_missing)
+        if variable:
+            monkeypatch.setenv(flashinfer_calls.BINARIES_DIRECTORY, "/a/local/path/cubins")
+        block = planned(2, 6)  # without the package the directory variable declines nothing at the plan: the directory is the library's to read
+        with pytest.raises(NotImplementedError) as skipped:
+            block.first_use(2, 6)
+        assert str(skipped.value) == ATTENTION_ENTRY + sentence and ATTENTION_CALLS == []
+    # one verdict per folder of a process: a folder that holds is not the answer for one that does not
+    folders = [
+        str(directory / "2d6a" / "fmha" / flashinfer_calls.DECODE_ATTENTION_BACKEND) for directory in (_kernel_binaries(tmp_path / "whole"), launched_missing)
+    ]
+    family = dict(census.FAMILIES)["fi_decode_attention"]
+    assert [flashinfer_calls.hold_binaries(folder, family, (10, 0)) for folder in folders] == ["", one]
+    # what the hold stands in front of: with it out of the way, a library that lacks the binary it would launch raises
+    # nothing, writes a line of its own with a local path and launches the kernel its selection read first
+    block = _attention_plans(monkeypatch, kernel_binaries=launched_missing)(1, 1)
+    monkeypatch.setattr(type(block), "_hold", lambda self: None)
+    capsys.readouterr()
+    block.first_use(1, 1)
+    assert len(ATTENTION_CALLS) == 1 and "/a/local/path" in capsys.readouterr().err, "no error: a path on standard error, and another kernel"
+    # a library the hold cannot ask -- it cannot be imported, its artifact paths name no such kernel set, or its checksums no
+    # manifest of that set -- is the installation's
+    for defect in ("import", "paths", "checksums"):
+        with pytest.raises(
+            NotImplementedError, match=rf"{ATTENTION_ENTRY}: FlashInfer could not make its first use on this installation \((Import|Lookup)Error\); "
+        ):
+            _attention_plans(monkeypatch, library_defect=defect)().first_use(1, 1)
+        assert ATTENTION_CALLS == []
+    # the table of a header: a record that has not the fields of its type is no such table
+    family = re.compile("^a_kernel")
+    table = 'struct Meta\n{\n    int mSM;\n    const char* mFuncName;\n    const char* sha256;\n};\nstatic const Meta all[] = {\n{ kSM_100f, "a_kernel", "00"},\n%s};\n'
+    assert flashinfer_calls.kernel_set(table % "", family, (10, 0)) == {"a_kernel": "00"} and flashinfer_calls.kernel_set(table % "", family, (12, 0)) == {}
+    with pytest.raises(ValueError, match="a record of the header's table has 2 values, its type 3 fields"):
+        flashinfer_calls.kernel_set(table % '{ kSM_100f, "a_kernel_of_two_values"},\n', family, (10, 0))
+
+    # a file the library itself did not find, by what the installation holds
+    missing = (
+        ((None, False), False, "manifest", f" needs the kernel-binary package flashinfer-cubin 0.7.2.post1, which is not installed: {install}; {without}"),
+        (
+            (VALIDATED_LIBRARY, True),
+            False,
+            "binary",
+            f": the installed flashinfer-cubin 0.7.2.post1 {lacks} (the library found a file missing at 2 x 6 rows at maximum length 2051); {anew}; {without}",
+        ),
+    )
+    for binaries, directory, defect, sentence in missing:
+        block = _attention_plans(monkeypatch, attention_defect=defect, library_binaries=binaries)(2, 6)
+        if directory:
+            monkeypatch.setenv(flashinfer_calls.BINARIES_DIRECTORY, "/a/local/path/cubins")
+        with pytest.raises(NotImplementedError) as skipped:
+            block.first_use(2, 6)
+        assert str(skipped.value) == ATTENTION_ENTRY + sentence and reports == [], defect
+    with pytest.raises(RuntimeError, match="Failed to load cubin for"):  # in a step nothing is renamed, and the report is the interpreter's
+        block(*next(block._scratches(torch.device("cpu"), 1, 1)))
+    assert reports == ["RuntimeError"]
+    # during a first use every other report reaches the hook that was there: another module, another type, another text
+    hook, loader = sys.unraisablehook, flashinfer_calls.LOADER
+    with flashinfer_calls._first_use_reports():
+        for error, module in ((RuntimeError("Artifact not found locally: a file"), "elsewhere"), (OSError("Artifact not found locally: a file"), loader)):
+            sys.unraisablehook(SimpleNamespace(exc_value=error, object=SimpleNamespace(__module__=module)))
+        sys.unraisablehook(SimpleNamespace(exc_value=RuntimeError("another failure"), object=SimpleNamespace(__module__=loader)))
+    assert reports == ["RuntimeError", "RuntimeError", "OSError", "RuntimeError"] and sys.unraisablehook is hook
+
+    # at plan time: the states of the package in which the library's import would print a path.  The library is not reached
+    declined = (
+        (
+            (VALIDATED_LIBRARY, True),
+            True,
+            ": FLASHINFER_CUBIN_DIR is set and the kernel-binary package flashinfer-cubin is installed, and the library would read the directory",
+        ),
+        (
+            (None, True),
+            False,
+            ": the module flashinfer_cubin can be imported and no distribution flashinfer-cubin is installed, so the version of the kernel binaries",
+        ),
+        (
+            (VALIDATED_LIBRARY, False),
+            False,
+            ": the distribution flashinfer-cubin 0.7.2.post1 is installed and its module flashinfer_cubin cannot be found; install the package again: ",
+        ),
+        (
+            ("0.7.1", True),
+            False,
+            " needs the kernel-binary package flashinfer-cubin at the library's version, 0.7.2.post1; this is 0.7.1, which the library ignores: ",
+        ),
+    )
+    for binaries, directory, sentence in declined:
+        planned = _attention_plans(monkeypatch, library_binaries=binaries, library_defect="import")
+        if directory:
+            monkeypatch.setenv(flashinfer_calls.BINARIES_DIRECTORY, "/a/local/path/cubins")
+        with pytest.raises(NotImplementedError) as skipped:
+            planned()
+        assert str(skipped.value).startswith(ATTENTION_ENTRY + sentence) and str(skipped.value).endswith(without) and "/a/local" not in str(skipped.value)
+    assert (
+        _attention_plans(monkeypatch, library_binaries=(None, False))().entry == ATTENTION_ENTRY
+    ), "neither metadata nor module: nothing is declined at the plan"
+
+    # the library's own check of the operands, any other failure, and a fault of the adapter's own code
+    for defect in ("refuses", "mistyped"):
+        with pytest.raises(ValueError, match=f"{ATTENTION_ENTRY} declined the operands this adapter built for its first use: Invalid shape of out$"):
+            _attention_plans(monkeypatch, attention_defect=defect)().first_use(1, 1)
+    with pytest.raises(
+        NotImplementedError, match=rf"{ATTENTION_ENTRY}: FlashInfer could not make its first use on this installation \(RuntimeError\); it builds"
+    ):
+        _attention_plans(monkeypatch, attention_defect="build")().first_use(1, 1)
+    faulty = _attention_plans(monkeypatch)()
+    monkeypatch.setattr(type(faulty), "_workspace", lambda self, device: [].missing)
+    with pytest.raises(AttributeError, match="'list' object has no attribute 'missing'"):
+        faulty.first_use(1, 1)
+
+
+def test_the_kernel_check_holds_the_librarys_attention_kernel_and_every_control_arm_of_a_run_fails(monkeypatch, capsys):
+    """The attention core's kernel through a session on constructed launch records.  Which variant of its kernel the library
+    launches, and in which grid, is the library's: another variant and another grid pass, at either maximum length and on
+    another 10.x class, and the line of the row names what was launched.  A kernel of another head width or of another
+    page is no member of the family; a fill or a multiply in front of the kernel and a kernel behind it each fail with
+    their own sentence; a pool byte the call changed fails the block.  Then the
+    control arms of a run, through ``main()``, in a run of more than one page per sequence: the lengths one too long
+    and one too short, the first two page-table columns exchanged, the scores at the library's default scale -- each
+    must FAIL; in a run of one page per sequence the two columns name the same page and that arm cannot fail."""
+    from model_samples import census, tie_out
+    from model_samples.providers import flashinfer_calls
+    from model_samples.state import PagedKvCache
+
+    def run(max_model_len=DEFAULT_LENGTH, **stand_in):
+        session = _recorded_run(monkeypatch, sequences=1, stack="native", max_model_len=max_model_len, **stand_in)[0]
+        session.trace(4)
+        return tie_out.run_checks(session, prompt_tokens=3)
+
+    in_front = "between attention.prepare (layer 1) and attention.core (layer 1): a kernel of the fallback family"
+    between = "which no row there declares; nothing may sit between two exact rows"
+    failing = {
+        "width": "attention.core (layer 1) did not launch fi_decode_attention: the step has 0 launch(es) of fi_decode_attention, the plan 1 = 1 call(s) x 1 per call",
+        "page": "attention.core (layer 1) did not launch fi_decode_attention: the step has 0 launch(es) of fi_decode_attention, the plan 1 = 1 call(s) x 1 per call",
+        "fill": f"launched {ELEMENTWISE[:93] + '...'!r} {in_front} pytorch, {between}",
+        "multiply": f"launched {NVJET!r} {in_front} cublas, {between}",
+        "behind": "launched 'flashinfer::ComputeLSEFromMDKernel(float*, float const*, int, int)' between attention.core (layer 1) and "
+        "attention.gate_quantize (layer 1); no block of the plan launches it",
+    }
+    for defect, sentence in failing.items():
+        checks = run(attention_defect=defect)
+        assert not checks.ok and checks.kernels == census.FAIL, defect
+        assert [line.strip().split(": ", 2)[2] for line in checks.lines if line.strip().startswith("kernels: ")] == [sentence], defect
+        assert _line(checks, "attention.core ").endswith("[band: attention_bf16_weights]  PASS"), "its bytes are the chain's: the kernel check alone sees it"
+    checks = run(attention_defect="writes")
+    assert (
+        not checks.ok and checks.kernels == census.PASS and _line(checks, "attention.core ").endswith("the cache WRITTEN  [band: attention_bf16_weights]  FAIL")
+    )
+    # which variant the library launches, and in which grid, is its own choice: named on the row's line, never gated
+    launched = {"": FI_ATTENTION, "variant": FI_ATTENTION_OTHER, "shape": FI_ATTENTION}
+    named = "1 launch per step (1 call x 1 per call); fi_decode_attention by name; the library launched {} x 4 over the traced steps"
+    for defect, kernel in launched.items():
+        checks = run(attention_defect=defect)
+        assert checks.ok and checks.kernels == census.PASS and _line(checks, "attention.core: ").endswith(named.format(kernel)), defect
+        longer = run(max_model_len=4096, attention_defect=defect)  # at another maximum length the stand-in library launches its other variant
+        assert longer.ok and longer.kernels == census.PASS, defect
+        assert _line(longer, "attention.core: ").endswith((named.format(FI_ATTENTION), named.format(FI_ATTENTION_OTHER))), defect
+    # the row's class says where the table selects it: on another 10.x class a run judges the block in its band and holds the
+    # kernel by its family's name -- either variant, named on the row's line
+    for defect in ("", "variant"):
+        code, lines = _sample_run(monkeypatch, capsys, ["--stack", "native", "--sequences", "1"], cc=(10, 3), attention_defect=defect)
+        assert code == 0 and lines[-1] == "[00] PASS", defect
+        assert any(line.strip().startswith("attention.core ") and line.endswith("[band: attention_bf16_weights]  PASS") for line in lines), defect
+        assert any(f"fi_decode_attention by name; the library launched {launched[defect]} x " in line for line in lines), defect
+
+    # the control arms of a run: 26 prompt tokens and 48 new ones, 74 positions -- a full page and ten rows of a second
+    attended, call = PagedKvCache.attended, flashinfer_calls.LibraryBlock._call
+
+    def lengths(by):
+        return lambda self, position: (attended(self, position)[0], attended(self, position)[1] + by)
+
+    def exchanged(self, position):
+        blocks, held = attended(self, position)
+        return blocks[:, [1, 0, *range(2, blocks.shape[1])]].contiguous(), held
+
+    def unscaled(self, name, *operands, **passed):
+        return call(self, name, *operands, **{field: value for field, value in passed.items() if field != "bmm1_scale"})
+
+    arms = (
+        ("the lengths one too long", PagedKvCache, "attended", lengths(1)),
+        ("the lengths one too short", PagedKvCache, "attended", lengths(-1)),
+        ("the first two columns of the page table exchanged", PagedKvCache, "attended", exchanged),
+        ("the scores at the library's default scale", flashinfer_calls.LibraryBlock, "_call", unscaled),
+    )
+    long_run = ["--stack", "native", "--sequences", "1", "--force-tokens", "48"]
+    for name, owner, method, wrong in arms:
+        with monkeypatch.context() as arm:
+            arm.setattr(owner, method, wrong)
+            code, lines = _sample_run(arm, capsys, long_run)
+        core = next(line for line in lines if line.strip().startswith("attention.core ") and "calls" in line)
+        assert code == 1 and lines[-1] == "[00] FAIL" and core.endswith("[band: attention_bf16_weights]  FAIL"), f"{name}: {core}"
+    with monkeypatch.context() as arm:
+        arm.setattr(PagedKvCache, "attended", exchanged)
+        code, lines = _sample_run(arm, capsys, ["--stack", "native", "--sequences", "1"])
+    assert code == 0 and lines[-1] == "[00] PASS", "one page per sequence: both columns name it, and the arm cannot fail"
+    code, lines = _sample_run(monkeypatch, capsys, long_run)
+    assert code == 0 and lines[-1] == "[00] PASS", "the same run with nothing wrong"
+
+
+# --------------------------------------------------------------------------- the output head's quantise on its entry
+
+
+def test_the_row_quantise_entrys_adapter_over_a_stand_in_entry(monkeypatch):
+    """``fe.row_quantize_fp4_decode`` over a stand-in entry.  The row's form is the entry's whole config: the constructor is
+    handed the device, the row width and the two launch knobs, each knob by name, and a row that leaves one out, names
+    another field or names a width that is not the model's hidden width is a wrong table.  A call converts nothing: the
+    rows are the tensor it was handed, the scale is one fp32 element -- the fp32 reciprocal of the consumer's static
+    scale, one tensor per value -- and the outputs are buffers of the call's own, whole bands of 128 rows for the block
+    scales, handed on as the entry wrote them; nothing but the entry is launched.  A quantisation it does not write, an
+    entry that declines the row count its row claims, and a package without the entry are each named."""
+    from dataclasses import replace
+
+    import cudnn
+
+    from model_samples import census
+    from model_samples.blocks import DeviceFacts
+    from model_samples.providers import Quant, fe
+    from model_samples.qwen_dense import QwenDense, configs
+    from model_samples.weights import TiledBlockScaledTensor
+
+    calls, launched = [], []
+    entry = _row_quantize_entry(calls, lambda name, shape=None, kind="kernel": launched.append((name, shape, kind)))
+    monkeypatch.setattr(cudnn, "RowQuantizeFp4Decode", entry, raising=False)
+    monkeypatch.setattr(fe, "_ENTRIES", {})
+    model = QwenDense.reduced(2)
+    row = configs.PROVIDERS["output_head.quantize"][0]
+    stated = DeviceFacts((10, 0), "stated device", 148, 0, 0)
+    options = {"device": "cpu", "check_kernels": True}
+    block = fe.RowQuantizeFp4DecodeBlock(row, model, stated, options)
+    block.check_support(1, 1)
+    assert fe._ENTRIES == {} and block.serving() == ("cudnn.RowQuantizeFp4Decode", ()), "on stated facts nothing is built; before a call nothing has served"
+    assert block.kernels == (census.Kernel("row_quantize_fp4", "cuDNN FE", "exact", launches=1, shape="entry"),)
+    assert block.per_row == (0,) and block.state_args == () and not block.stored_weights and block.entry == "cudnn.RowQuantizeFp4Decode"
+    facts = block.launch_facts(1)
+    (built,) = fe._ENTRIES.values()
+    assert built.built == dict(device="cpu", width=5120, pdl=True, pdl_release=True), "the device, the row width and both knobs: nothing left to the entry"
+    assert facts.form == dict(row.form) == {"WIDTH": 5120, "PDL": True, "PDL_RELEASE": True} and facts.shape == _row_quantize_shape(1)
+    assert facts.symbols == ("cudnn_kernel_frost_row_quantize_fp4_w5120_wait_release_0",), "the form is in the symbol"
+    assert block.launch_facts(1024).shape == ((1024, 1, 1), (320, 1, 1), 0) and len(fe._ENTRIES) == 1, "one instance, whatever the row count"
+
+    generator = torch.Generator().manual_seed(11)
+    x = torch.randn((3, 5120), generator=generator).to(torch.bfloat16)
+    seeded, other = Quant("nvfp4", 8.0 / (448.0 * 6.0)), Quant("nvfp4", 0.0205544)  # the seeded model's head scale; one of no such round reciprocal
+    out = block(x, seeded)
+    kind, handed = calls[-1]
+    assert kind == "row quantize launch" and handed["x"] is x, "the rows are the tensor it was handed: no copy, no cast"
+    for quant in (seeded, other):
+        block(x, quant)
+        scale = calls[-1][1]["scale"]
+        divided = torch.ones(1, dtype=torch.float32) / torch.tensor([quant.scale], dtype=torch.float32)
+        assert scale.dtype == torch.float32 and scale.numel() == 1 and scale.view(torch.int32).item() == divided.view(torch.int32).item(), quant
+        block(x, quant)
+        assert calls[-1][1]["scale"] is scale, "one tensor per value: formed once, never inside a later step"
+    assert float(calls[-1][1]["scale"]) * float(torch.tensor(other.scale, dtype=torch.float32)) != 1.0, "the second reciprocal is rounded: not exact in fp32"
+    first, second = block(x, seeded), block(x, seeded)
+    one, two = calls[-2][1], calls[-1][1]
+    assert isinstance(first, TiledBlockScaledTensor) and first.scale == seeded.scale and isinstance(out, TiledBlockScaledTensor)
+    assert first.codes is one["codes"] and first.codes.dtype == torch.uint8 and tuple(first.codes.shape) == (3, 2560)
+    assert one["scales"].dtype == torch.float8_e4m3fn and tuple(one["scales"].shape) == (128, 320), "one band of 128 rows for three rows"
+    assert (
+        first.tiled_scales.dtype == torch.uint8
+        and first.tiled_scales.data_ptr() == one["scales"].data_ptr()
+        and first.tiled_scales.shape == one["scales"].shape
+    )
+    pointers = {tensor.data_ptr() for tensor in (first.codes, second.codes, one["scales"], two["scales"])}
+    own = built.outputs(3)
+    assert len(pointers) == 4 and not pointers & {own["codes"].data_ptr(), own["scales"].data_ptr()}, "buffers of each call's own, never the entry's pair"
+    block.compile(129, 1)
+    assert [call[0] for call in calls[-2:]] == ["row quantize compile", "row quantize launch"] and calls[-2][1] is None
+    assert tuple(calls[-1][1]["codes"].shape) == (129, 2560) and tuple(calls[-1][1]["scales"].shape) == (256, 320), "129 rows: two whole bands"
+    block.compile(128, 1)
+    assert tuple(calls[-1][1]["codes"].shape) == (128, 2560) and tuple(calls[-1][1]["scales"].shape) == (128, 320), "128 rows: one whole band, none behind it"
+    symbol = "cudnn_kernel_frost_row_quantize_fp4_w5120_wait_release_0"
+    assert launched == [(symbol, _row_quantize_shape(3), "kernel")] * 7 + [
+        (symbol, _row_quantize_shape(rows), "kernel") for rows in (129, 128)
+    ], "one kernel per call, nothing else"
+    assert block.serving() == ("cudnn.RowQuantizeFp4Decode #1", row.form), "the instance that was called, and the row's fields as it states them"
+
+    # what it does not write is named: another quantisation, and none
+    with pytest.raises(ValueError, match=r"^cudnn.RowQuantizeFp4Decode writes 4-bit codes under a static global scale; this block is asked for 'fp8'$"):
+        block(x, Quant("fp8", 0.0625))
+    with pytest.raises(ValueError, match=r"this block is asked for no quantised operand$"):
+        block(x, None)
+    # a wrong table: a field left to the entry, a field this adapter cannot pass, a row width that is not the model's
+    for form, said in (
+        (tuple(field for field in row.form if field[0] != "PDL_RELEASE"), "does not name PDL_RELEASE"),
+        (tuple(field for field in row.form if field[0] != "PDL"), "does not name PDL"),
+        (tuple(field for field in row.form if field[0] != "WIDTH"), "does not name WIDTH"),
+        ((*row.form, ("THREADS", 320)), "names THREADS"),
+        ((("WIDTH", 4096), *row.form[1:]), "names WIDTH 4096; the rows this block quantises have the model's hidden width, 5120"),
+    ):
+        with pytest.raises(ValueError) as wrong:
+            fe.RowQuantizeFp4DecodeBlock(replace(row, form=form), model, stated, options).check_support(1, 1)
+        assert str(wrong.value).startswith("provider row fe.row_quantize_fp4_decode: its form ") and said in str(wrong.value), form
+    # on a real device the row's claim is held while the run is planned: an entry that declines the row count is a wrong table
+    real = DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+    with pytest.raises(
+        ValueError, match=r"^the provider table is wrong: the row of fe.row_quantize_fp4_decode claims this run \(1025 rows on compute capability 10.0\)"
+    ):
+        fe.RowQuantizeFp4DecodeBlock(replace(row, rows=(1, 1025)), model, real, options).check_support(1025, 1)
+    # the row of the family's table claims the row counts the entry serves and none beyond them: 1,024 rows of a step are the
+    # entry's at one token per sequence and at several, 1,025 and more the reference chain's however the step reaches them
+    from model_samples.blocks import select_row
+
+    for stack in configs.CHECKED_STACKS:
+        for sequences, tokens, key in (
+            (1024, 1, row.key),
+            (512, 2, row.key),
+            (170, 6, row.key),
+            (1025, 1, "torch_ref.quantize"),
+            (205, 5, "torch_ref.quantize"),
+            (171, 6, "torch_ref.quantize"),
+        ):
+            served = select_row("output_head.quantize", configs.PROVIDERS["output_head.quantize"], real, sequences, tokens, stack, model=model)
+            assert served.key == key, (stack, sequences, tokens)
+    # a package without the entry: a SKIP that names the first version that carries it
+    from types import SimpleNamespace
+
+    class Older(fe.RowQuantizeFp4DecodeBlock):
+        def _cudnn(self):
+            return SimpleNamespace(__version__="1.33.0")
+
+    with pytest.raises(NotImplementedError, match=r"^needs nvidia-cudnn-frontend with the 4-bit row quantise decode step \(>= 1\.34\.0\); this is 1\.33\.0"):
+        Older(row, model, stated, options).check_support(1, 1)
+
+
+def _e4m3_byte(value: float) -> int:
+    """The E4M3 code byte of a non-negative fp64 value, from the format's definition: the nearest of its 127 finite codes,
+    a tie to the even byte, saturating at 448."""
+    codes = [(m / 8.0) * 2.0**-6 if e == 0 else (1.0 + m / 8.0) * 2.0 ** (e - 7) for e in range(16) for m in range(8)][:127]
+    if value >= codes[-1]:
+        return 126
+    high = next(index for index, code in enumerate(codes) if code >= value)
+    low = max(high - 1, 0)
+    below, above = value - codes[low], codes[high] - value
+    return high if above < below or (above == below and high % 2 == 0) else low
+
+
+def _e2m1_nibble(value: float, negative: bool) -> int:
+    """The E2M1 code of an fp64 magnitude with its sign bit, from the format's definition: the nearest of 0, 0.5, 1, 1.5, 2, 3,
+    4, 6, a tie to the even code, saturating at 6, the sign kept on a zero."""
+    grid = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+    index = 0
+    for i in range(7):
+        middle = (grid[i] + grid[i + 1]) / 2
+        index += (value >= middle) if i % 2 else (value > middle)
+    return index + 8 * negative
+
+
+def _row_quantise_judged(codes, scales, twin, expected):
+    """One call judged in the band ``row_quantize_fp4`` as the tie-out judges it: the packed ``codes`` and the row-major block
+    ``scales`` against the twin's output ``expected`` and the bracket the twin kept of that call."""
+    from model_samples import tie_out
+
+    stats = tie_out.BlockStats("row_quantize_fp4")
+    tie_out.BlockTap._judge(stats, (codes, scales), expected.tensors(), [], [], 0, twin)
+    return stats
+
+
+def test_the_twin_and_the_band_of_the_row_quantise_entry():
+    """The twin of the head's quantise writes the block-scale bytes of the kernel's rule -- two fp32 multiplications in the
+    stated association, the constant by its bits, one nearest-even rounding to E4M3 -- and keeps per element the two
+    adjacent codes the reciprocals' bound admits; the band holds every block scale to the twin's byte and every code to
+    its bracket.  Inside: the twin's own bytes; a chain in fp32 whose reciprocals are IEEE divisions, some of whose codes
+    are the second code of their bracket; and, under a power-of-two scale and power-of-two block scales, the code of
+    the exact quotient with ties to the even code -- on rows that hold every rounding tie, where that code is the high
+    one of its bracket at three of the seven midpoints.  Outside, each by its own count: a block scale one step off, a
+    code two steps off, the reference quantiser's own codes (by the sign of a zero, and by nothing else), a block scale
+    formed in another association, the two nibbles of a byte exchanged, the block scales at their row-major places of
+    a buffer that is read as the 128 x 4 layout, and a scale byte that is no finite value."""
+    from model_samples import tie_out
+    from model_samples.blocks import DeviceFacts
+    from model_samples.providers import Quant, torch_ref
+    from model_samples.qwen_dense import QwenDense, configs
+    from model_samples.weights import BLOCK, TiledBlockScaledTensor, quantize_nvfp4, tile_scale_index
+
+    model = QwenDense.reduced(2)
+    row = configs.PROVIDERS["output_head.quantize"][-1]
+    twin = torch_ref.QuantizeBracket(row, model, DeviceFacts((10, 0), "stated device", 148, 0, 0), {"device": "cpu"})
+    quant = Quant("nvfp4", 0.0205544)
+    generator = torch.Generator().manual_seed(5)
+    x = (torch.randn((6, 5120), generator=generator) * 1.7).to(torch.bfloat16)
+    x[0, :16] = 0.0  # a zero block
+    x[0, 16:32] = -0.0  # a block of negative zeros
+    x[1, :16] = torch.tensor(1.0e-6)  # a block whose scale rounds to the zero code though the block is not zero
+    x[1, 16:32] = torch.tensor(-3.0e4)  # a block that saturates
+    expected = twin(x, quant)
+    low, high = twin.bracket
+    reciprocal = float(torch.ones(1, dtype=torch.float32) / torch.tensor([quant.scale], dtype=torch.float32))
+    sixth = struct.unpack("<f", struct.pack("<I", 0x3E2AAAAB))[0]
+    fp32 = lambda value: struct.unpack("<f", struct.pack("<f", value))[0]  # noqa: E731 -- one rounding to fp32
+    bound = 5 * 2.0**-23
+    for at in [(0, 0), (0, 1), (1, 0), (1, 1), *((r, b) for r in range(6) for b in (7, 160, 319))]:  # the built blocks, and drawn ones
+        values = x[at[0], at[1] * BLOCK : (at[1] + 1) * BLOCK].double().tolist()
+        byte = _e4m3_byte(fp32(reciprocal * fp32(max(abs(v) for v in values) * sixth)))
+        assert int(expected.block_scales[at]) == byte, f"block {at}: e4m3(global x (largest x fp32(1/6))), written out"
+        stored = [(m / 8.0) * 2.0**-6 if e == 0 else (1.0 + m / 8.0) * 2.0 ** (e - 7) for e in range(16) for m in range(8)][byte]
+        for j, value in enumerate(values):
+            exact = abs(value) * reciprocal / stored if stored else 0.0
+            sign = math.copysign(1.0, value) < 0
+            element = (at[0], at[1] * BLOCK + j)
+            assert (int(low[element]), int(high[element])) == (_e2m1_nibble(exact * (1 - bound), sign), _e2m1_nibble(exact * (1 + bound), sign)), element
+    assert expected.block_scales[0, 0] == 0 and expected.block_scales[0, 1] == 0 and expected.block_scales[1, 0] == 0 and expected.block_scales[1, 1] == 126
+    assert set(low[0, :16].tolist()) == {0} and set(low[0, 16:32].tolist()) == {8} and set(low[1, :16].tolist()) == {0} and set(low[1, 16:32].tolist()) == {15}
+    packed = low[..., 0::2] | (low[..., 1::2] << 4)
+    assert torch.equal(expected.codes, packed) and expected.scale == quant.scale, "the twin writes the low code of every bracket"
+
+    # inside: the twin's own bytes; and a chain in fp32 with IEEE divisions for the kernel's two reciprocals
+    own = _row_quantise_judged(expected.codes, expected.block_scales, twin, expected)
+    assert own.ok and (own.blocks, own.blocks_equal, own.total_bytes, own.second_codes, own.outside) == (6 * 320, 6 * 320, 6 * 5120, 0, 0)
+    chain = _row_quantize_entry([])("cpu", 5120, pdl=True, pdl_release=True)
+    codes, scales = chain(x, torch.ones(1, dtype=torch.float32) / torch.tensor([quant.scale], dtype=torch.float32))
+    kernel_like = TiledBlockScaledTensor(codes, scales.view(torch.uint8), quant.scale)
+    inside = _row_quantise_judged(*kernel_like.tensors(), twin, expected)
+    assert inside.ok and inside.outside == 0 and inside.blocks_equal == inside.blocks, inside.line()
+    assert (
+        inside.line()
+        == f"1,920 block scales, 0 of them not the twin's byte; 30,720 codes, {inside.second_codes:,} of them the second code of their bracket (printed, not gated); 0 outside"
+    )
+    assert "%" not in inside.line() and "%" not in tie_out.BANDS["row_quantize_fp4"], "a contract: no share"
+
+    # the exact cells: a power-of-two scale, every block scale a power of two, and elements on every rounding tie of the code grid
+    exact_quant = Quant("nvfp4", 2.0**-5)
+    midpoints = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+    even = {0.25: 0, 0.75: 2, 1.25: 2, 1.75: 4, 2.5: 4, 3.5: 6, 5.0: 6}  # the even code of the two around each midpoint
+    rows = torch.zeros((4, 5120), dtype=torch.float32)
+    want = torch.zeros((4, 5120), dtype=torch.uint8)
+    ties = []
+    for r in range(4):
+        for block in range(320):
+            unit = 2.0 ** ((block + r) % 9 - 6)  # the step of the block: its scale times the model's scale, a power of two
+            first = block * BLOCK
+            rows[r, first], want[r, first] = 6.0 * unit, 7  # the block's largest magnitude: its scale is exactly unit x 32
+            rows[r, first + 1], want[r, first + 1] = 3.0 * unit, 5  # no tie: one code
+            for j, middle in enumerate(midpoints):
+                for sign, offset in ((1.0, 2 + 2 * j), (-1.0, 3 + 2 * j)):
+                    rows[r, first + offset], want[r, first + offset] = sign * middle * unit, even[middle] + (8 if sign < 0 else 0)
+                    ties.append((r, first + offset, middle))
+    rows = rows.to(torch.bfloat16)
+    assert torch.equal(rows.float(), rows.to(torch.bfloat16).float()) and len(ties) == 4 * 320 * 14, "every built value is a bf16 value"
+    tied = twin(rows, exact_quant)
+    low, high = twin.bracket
+    assert torch.equal(tied.codes, low[..., 0::2] | (low[..., 1::2] << 4)), "on rows that hold ties too, the twin's own bytes are the low codes"
+    assert all(int(tied.block_scales[r, b]) == _e4m3_byte(2.0 ** ((b + r) % 9 - 6) * 32.0) for r in range(4) for b in range(320)), "powers of two"
+    assert torch.equal(low[:, 0::16], high[:, 0::16]) and torch.equal(low[:, 1::16], high[:, 1::16]), "off a midpoint the bracket holds one code"
+    assert bool(((want == low) | (want == high)).all()), "the code of the exact quotient, ties to even, is inside every bracket"
+    for r, column, middle in ties:
+        assert int(high[r, column]) == int(low[r, column]) + 1, "on a tie the bracket holds the two codes around the midpoint"
+        assert (int(want[r, column]) == int(high[r, column])) == (middle in (0.75, 1.75, 3.5)), "the even code is the high one at three midpoints"
+    judged = _row_quantise_judged(want[..., 0::2] | (want[..., 1::2] << 4), tied.block_scales, twin, tied)
+    assert (
+        judged.ok and judged.second_codes == 4 * 320 * 2 * 3
+    ), "the exact codes are inside; at three midpoints of seven, both signs, they are not the twin's byte"
+    # ... and they are the codes of the fp32 chain with IEEE divisions, whose reciprocals are exact under these scales
+    codes, scales = chain(rows, torch.ones(1, dtype=torch.float32) / torch.tensor([exact_quant.scale], dtype=torch.float32))
+    exact_chain = TiledBlockScaledTensor(codes, scales.view(torch.uint8), exact_quant.scale)
+    assert torch.equal(exact_chain.tensors()[0], want[..., 0::2] | (want[..., 1::2] << 4)) and torch.equal(exact_chain.tensors()[1], tied.block_scales)
+    assert (
+        _row_quantise_judged(*exact_chain.tensors(), twin, tied).second_codes == judged.second_codes > 0
+    ), "some codes of a correct chain are the second of their bracket"
+
+    # outside, each alone and by its own count (judged against the twin of the drawn rows)
+    expected = twin(x, quant)
+    low, high = twin.bracket
+
+    def outside(codes=None, scales=None):
+        return _row_quantise_judged(expected.codes if codes is None else codes, expected.block_scales if scales is None else scales, twin, expected)
+
+    step = expected.block_scales.clone()
+    step[2, 5] += 1
+    assert (outside(scales=step).outside, outside(scales=step).ok) == (1, False), "a block scale one step off"
+    two = low.clone()
+    at = next((r, c) for r in range(2, 6) for c in range(5120) if 1 <= int(low[r, c]) <= 4 and int(low[r, c]) == int(high[r, c]))
+    two[at] += 2
+    assert (outside(codes=two[..., 0::2] | (two[..., 1::2] << 4)).outside, outside(codes=two[..., 0::2] | (two[..., 1::2] << 4)).ok) == (
+        1,
+        False,
+    ), "a code two steps off"
+    reference = quantize_nvfp4(x, quant.scale)  # the reference chain's own bytes
+    nibbles = torch.stack((reference.codes & 0xF, reference.codes >> 4), dim=-1).flatten(-2)
+    off = (nibbles != low) & (nibbles != high)
+    chain_judged = outside(codes=reference.codes, scales=reference.block_scales)
+    assert torch.equal(reference.block_scales, expected.block_scales) and chain_judged.blocks_equal == chain_judged.blocks, "its block scales are the rule's"
+    assert chain_judged.outside == int(off.sum()) > 0 and not chain_judged.ok, "its codes are not inside the entry's contract"
+    assert set(nibbles[off].tolist()) == {0} and set(low[off].tolist()) == {8}, "by the sign of a zero, and by nothing else"
+    # the block scale in another association -- (global x largest) x fp32(1/6) -- on a (largest, scale) pair found by search
+    maxima = torch.arange(0, 0x7F80, dtype=torch.int16).view(torch.bfloat16)  # every finite non-negative bf16 value
+    sixth32 = torch.tensor(0x3E2AAAAB, dtype=torch.int32).view(torch.float32)
+    found = None
+    for bits in (0x41BFFFFF, 0x4219999A, 0x41DB6DB6, 0x42429B39):
+        scale = float(torch.ones(1, dtype=torch.float32) / torch.tensor([bits], dtype=torch.int32).view(torch.float32))
+        global_scale = torch_ref.nvfp4_global_scale(scale, "cpu")
+        other = (global_scale * maxima.float()) * sixth32
+        differing = (torch_ref.nvfp4_block_scales(maxima.float(), scale) != other.clamp(max=448.0).to(torch.float8_e4m3fn).view(torch.uint8)).nonzero()
+        if len(differing):
+            found = (scale, maxima[int(differing[0])], other.clamp(max=448.0).to(torch.float8_e4m3fn).view(torch.uint8)[int(differing[0])])
+            break
+    assert found is not None, "a block maximum and a scale under which the two associations round to two bytes"
+    scale, largest, other_byte = found
+    one_block = torch.zeros((1, 5120), dtype=torch.bfloat16)
+    one_block[0, 3] = largest
+    associated = twin(one_block, Quant("nvfp4", scale))
+    wrong = associated.block_scales.clone()
+    wrong[0, 0] = other_byte
+    assert int(associated.block_scales[0, 0]) != int(other_byte)
+    assert _row_quantise_judged(associated.codes, wrong, twin, associated).outside == 1, "the other association's byte is another byte: outside"
+    expected = twin(x, quant)
+    low, high = twin.bracket
+    swapped = expected.codes.clone()
+    pair = next((r, c) for r in range(2, 6) for c in range(2560) if abs((int(low[r, 2 * c]) & 7) - (int(low[r, 2 * c + 1]) & 7)) >= 3)
+    swapped[pair] = (swapped[pair] >> 4) | ((swapped[pair] & 0xF) << 4)
+    assert outside(codes=swapped).outside == 2, "the two nibbles of a byte exchanged: both elements outside"
+    buffer = torch.zeros((128, 320), dtype=torch.uint8)
+    buffer[:6] = expected.block_scales  # row-major, in a buffer that is read as the 128 x 4 layout
+    misplaced = TiledBlockScaledTensor(expected.codes, buffer, quant.scale)
+    laid_out = torch.zeros((128, 320), dtype=torch.uint8)
+    laid_out.view(-1)[tile_scale_index(6, 320, "cpu")] = expected.block_scales
+    assert _row_quantise_judged(*TiledBlockScaledTensor(expected.codes, laid_out, quant.scale).tensors(), twin, expected).ok, "in the layout: inside"
+    read = _row_quantise_judged(*misplaced.tensors(), twin, expected)
+    assert not read.ok and read.outside == read.blocks - read.blocks_equal > 1000, "another place of the layout is another byte"
+    nan = expected.block_scales.clone()
+    nan[3, 9] = 0x7F
+    assert (outside(scales=nan).finite, outside(scales=nan).ok, outside(scales=nan).outside) == (False, False, 1), "a scale byte that is no finite value"
+    with pytest.raises(ValueError, match="the block's twin keeps no bracket"):
+        _row_quantise_judged(
+            expected.codes, expected.block_scales, torch_ref.Quantize(row, model, DeviceFacts((10, 0), "stated device", 148, 0, 0), {}), expected
+        )
+
+
+def test_the_head_quantise_row_through_a_session_and_what_fails_its_kernel_check(monkeypatch):
+    """The head's quantise on its entry through a session, on ``native`` and on ``fe-entries``: the final norm, the quantise
+    and the head are three calls in wiring order, the quantise is served by its one entry instance in the row's form, and
+    its block is inside its band.  What fails the kernel check: the entry's kernel in a grid of whole bands,
+    by ONE sentence, the entry's own; an entry instance in another launch arm, by the form on the objects; a launch of
+    PyTorch between the final norm and the quantise, and between the quantise and the library's head -- nothing may
+    sit between two exact rows; a fill of the scale buffer in front of the entry, as a kernel of PyTorch's and as a
+    record of the fill category; a missing launch; a chain in the entry's place.  A wrong code and a wrong block scale
+    fail the block and leave the kernel check alone."""
+    from model_samples import census, tie_out
+
+    def run(stack="native", **stand_in):
+        session, _, _ = _recorded_run(monkeypatch, sequences=1, stack=stack, **stand_in)
+        session.trace(4)
+        return session, tie_out.run_checks(session, prompt_tokens=3)
+
+    def sentences(checks):
+        return [line.strip() for line in checks.lines if line.strip().startswith("kernels: ")]
+
+    def block_line(checks):
+        return next(line for line in checks.lines if line.strip().startswith("output_head.quantize ") and "calls" in line)
+
+    every = "kernels: step 0 (and 3 more of the 4 traced steps): "
+    form = (("WIDTH", 64), ("PDL", True), ("PDL_RELEASE", True))
+    for stack, exact in (("native", 20), ("fe-entries", 14)):
+        session, checks = run(stack)
+        assert checks.ok and checks.kernels == census.PASS, checks.text()
+        calls = session.traced.call_log[0]
+        at = [call.block for call in calls].index("output_head.quantize")
+        assert [(call.block, call.layer) for call in calls[at - 1 : at + 2]] == [("add_norm_quantize", 2), ("output_head.quantize", -1), ("output_head", -1)]
+        assert (calls[at].instance, calls[at].form, calls[at].rows) == ("cudnn.RowQuantizeFp4Decode #1", form, 1), "the one instance, in the row's form"
+        assert block_line(checks).endswith("; 0 outside  [band: row_quantize_fp4]  PASS"), block_line(checks)
+        assert f"{exact} on exact rows, in the wiring order" in _line(checks, "kernels "), stack
+        stated = next(line.strip() for line in checks.lines if line.strip().startswith("output_head.quantize: cudnn.RowQuantizeFp4Decode "))
+        assert "the entry states grid (1, 1, 1), block (4, 1, 1), shared memory 0 B" in stated and "the library launched" not in stated, stated
+    quantise, final, head = "output_head.quantize", "add_norm_quantize (layer 2)", "output_head"
+
+    # the entry's kernel in the grid of whole bands, where the entry states one thread block per row: one sentence, the entry's
+    _, checks = run(quantize_defect="bands")
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks)
+        == [
+            f"{every}{quantise} launched row_quantize_fp4 with grid (128, 1, 1), block (4, 1, 1), shared memory 0 B; cudnn.RowQuantizeFp4Decode states "
+            "grid (1, 1, 1), block (4, 1, 1), shared memory 0 B"
+        ]
+    ), checks.text()
+    assert block_line(checks).endswith("PASS"), "its bytes are the kernel's: only the kernel check sees it"
+    # an entry instance built in another launch arm: the form on the objects
+    _, checks = run(quantize_serves=("cudnn.RowQuantizeFp4Decode #1", (("WIDTH", 64), ("PDL", True), ("PDL_RELEASE", False))))
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks)
+        == [
+            f"kernels: form: {quantise}: the adapter served the call with the form [WIDTH 64, PDL True, PDL_RELEASE False] (cudnn.RowQuantizeFp4Decode #1); "
+            "the row says [WIDTH 64, PDL True, PDL_RELEASE True]"
+        ]
+    ), checks.text()
+    # no fallback row stands between the final norm, the quantise and the library's head: a launch of PyTorch there is undeclared
+    undeclared = "a kernel of the fallback family pytorch, which no row there declares; nothing may sit between two exact rows"
+    for defect, where in (
+        ("extra", f"between {final} and {quantise}"),
+        ("behind", f"between {quantise} and {head}"),
+        ("fill", f"between {final} and {quantise}"),
+    ):
+        _, checks = run(quantize_defect=defect)
+        (sentence,) = sentences(checks)
+        assert (
+            not checks.ok and checks.kernels == census.FAIL and sentence.startswith(f"{every}launched ") and sentence.endswith(f" {where}: {undeclared}")
+        ), sentence
+        assert ("FillFunctor" in sentence) == (defect == "fill")
+    # ... and the same fill as a record of the profiler's fill category: a copy between two exact rows
+    _, checks = run(quantize_defect="memset")
+    assert not checks.ok and sentences(checks) == [
+        f"{every}an undeclared copy 'Memset (Device)' between {final} and {quantise}: declared are the one host read of a step and the copies of a fallback row"
+    ], checks.text()
+    _, checks = run(quantize_defect="missing")
+    assert not checks.ok and sentences(checks) == [
+        f"{every}{quantise} did not launch row_quantize_fp4: the step has 0 launch(es) of row_quantize_fp4, the plan 1 = 1 call(s) x 1 per call"
+    ], checks.text()
+    _, checks = run(quantize_defect="chain")
+    assert not checks.ok and checks.kernels == census.FAIL and f"{every}{quantise} did not launch row_quantize_fp4" in sentences(checks)[0], checks.text()
+    # on fe-entries the head's row is a multiply over a copy: its launches behind the quantise are its row's own, and a fill in front is not
+    _, checks = run("fe-entries", quantize_defect="behind")
+    assert checks.kernels == census.PASS, "behind the quantise the fallback row of the head declares PyTorch's family"
+    _, checks = run("fe-entries", quantize_defect="fill")
+    assert checks.kernels == census.FAIL and sentences(checks)[0].endswith(f"between {final} and {quantise}: {undeclared}")
+    # a wrong byte fails the block by its own line, and the kernel check holds
+    for defect in ("code", "scale", "unsigned"):  # (block scales at their row-major places: the judge's own case; one row of four blocks cannot show it)
+        _, checks = run(quantize_defect=defect)
+        assert not checks.ok and checks.kernels == census.PASS and block_line(checks).endswith("[band: row_quantize_fp4]  FAIL"), (defect, block_line(checks))
+        assert "; 0 outside" not in block_line(checks), defect
+
+
+def test_the_head_reads_what_the_quantise_wrote_on_native_and_fe_entries(monkeypatch):
+    """What the head's multiply is handed behind the entry.  On ``native`` the library is handed the two tensors of the entry
+    as they are -- the same memory, nothing gathered, nothing copied.  On ``fe-entries`` the multiply over a copy reads the
+    entry's container and gathers the block scales out of the layout: its result is the result on the same codes with
+    row-major scales.  And a load of every stack's plan keeps the forms of the weights it kept: the block multiplies no
+    weight."""
+    from model_samples.providers import library
+    from model_samples.weights import BlockScaledTensor, TiledBlockScaledTensor
+
+    session, _, _ = _recorded_run(monkeypatch, sequences=1, stack="native")
+    seen = {}
+
+    def tap(name, layer, block, operands):
+        out = block(*operands)
+        if name == "output_head.quantize":
+            seen["quantised"] = out
+        elif name == "output_head":
+            seen["head read"], seen["weight"], seen["logits"] = operands[0], operands[1], out
+        return out
+
+    before = len(LIBRARY_CALLS)
+    session.tap = tap
+    ids = session.step(torch.zeros(1, dtype=torch.int32))
+    session.read(ids)
+    quantised = seen["quantised"]
+    assert isinstance(quantised, TiledBlockScaledTensor) and seen["head read"] is quantised
+    codes, scales = ROW_QUANTIZE_CALLS[-1][1]["codes"], ROW_QUANTIZE_CALLS[-1][1]["scales"]
+    assert quantised.codes is codes and quantised.tiled_scales.data_ptr() == scales.data_ptr(), "what the block returned is what the entry wrote"
+    head_calls = [call for call in LIBRARY_CALLS[before:] if call[0] == "mm_fp4" and call[3][1] == session.model.geometry.vocab]
+    assert len(head_calls) == 1, "one call of the library for the head"
+    handed = session.plan["output_head"]._operand(quantised)
+    assert handed[0] is quantised.codes and handed[1] is quantised.tiled_scales and handed[2] == quantised.scale, "the two tensors as they are"
+    # the multiply over a copy (the head's row of fe-entries): the gather out of the layout is its own, and gives the row-major result
+    row_major = BlockScaledTensor(quantised.codes, quantised.row_major().block_scales, quantised.scale)
+    other, _, _ = _recorded_run(monkeypatch, sequences=1, stack="fe-entries")
+    weight = other.weights.head
+    assert torch.equal(library.matmul_bf16(quantised, weight), library.matmul_bf16(row_major, weight)), "the same codes with row-major scales"
+    # the forms a load keeps: the block multiplies no weight, so both loads keep the forms they kept without its row
+    assert set(session.weights.stored) == set(session.weights.uncopied) == set(FIVE), "native: every multiplied weight on its stored codes, no copy"
+    assert set(other.weights.stored) == set(KEPT) == set(other.weights.uncopied), "fe-entries: the two weights its entries multiply on"
+    assert not session.plan["output_head.quantize"].stored_weights and not other.plan["output_head.quantize"].stored_weights
+
+
+def test_the_reference_stack_writes_the_bytes_of_the_wiring_that_quantised_inside_the_norm():
+    """The quantise of the head's operand as a block of its own moves no byte of the reference stack: the chain quantises the
+    same bf16 rows with the same function, one call later.  Held against the wiring written out as it was -- the final
+    norm handed the head's ``Quant``, the head its first result -- through the session's tap: the ids and the logits of
+    a plain step, of the prompt's decode step of a session with draft tokens, and of a verify step are byte for byte the
+    same."""
+    from model_samples import Session, TextIO
+    from model_samples.tie_out import bytes_equal
+
+    def run(old_wiring, draft_tokens=None):
+        model = _tiny_model()
+        text = TextIO.synthetic(model.geometry.vocab)
+        more = {} if draft_tokens is None else {"draft_tokens": draft_tokens}
+        session = Session(model, text, sequences=2, stack="reference", device="cpu", capacity=32, **more)
+        session.plan_table()
+        session.load()
+        held = {}
+
+        def tap(name, layer, block, operands):
+            if name == "add_norm_quantize" and operands[-1] == "output_head":  # the norm handed the head's Quant, as the wiring was
+                held["quantised"], normed, residual = block(*operands[:3], session.weights.head_quant, operands[-1])
+                return None, normed, residual
+            if name == "output_head.quantize":  # no call of its own: the head reads the norm's first result
+                return held.pop("quantised")
+            return block(*operands)
+
+        if old_wiring:
+            session.tap = tap
+        ids = session.prefill([text.encode("ab" + str(s)) for s in range(2)])
+        session.read(ids)
+        if draft_tokens is None:
+            for _ in range(3):
+                ids = session.step(ids)
+                session.read(ids)
+        else:
+            drafted = torch.arange(2 * draft_tokens, dtype=torch.int32).view(2, draft_tokens) % 7 + 1
+            session.read(session.verify(torch.cat((ids.view(2, 1), drafted), dim=1)))
+        record = session.record
+        return record.outputs[: record.count].clone(), record.logits[: record.count].clone(), record.count
+
+    for draft_tokens in (None, 3):
+        new, old = run(False, draft_tokens), run(True, draft_tokens)
+        assert new[2] == old[2] > 0 and bytes_equal(new[0], old[0]) and bytes_equal(new[1], old[1]), f"draft_tokens={draft_tokens}: the ids and the logits"

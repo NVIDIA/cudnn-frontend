@@ -23,6 +23,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from determinism_utils import assert_bitwise, assert_replays
+
 import cudnn.moe_ep.cutemok as public
 from cudnn._tupledict import TupleDict
 from cudnn.moe_ep._cutemok import functional
@@ -371,7 +373,10 @@ def test_cuda_graph(group, precision, gated):
         grads = cutemok_backward(d_output, x, router_weights, *shared, *backward_routed, schedule, saved, plan=plan, config=config, **gate)
         return [output, *list(grads)[: 9 if gated else 8]]
 
+    names = ("output", *GRADIENT_NAMES, *(("d_w_output_gate",) if gated else ()))
     step()  # warm-up
+    if precision == "mxfp8":
+        assert_replays(lambda: dict(zip(names, step(), strict=True)))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = step()
@@ -381,8 +386,9 @@ def test_cuda_graph(group, precision, gated):
             static.copy_(value)
         eager = [t.clone() for t in step()]
         graph.replay()
-        for index, (expected, actual) in enumerate(zip(eager, captured, strict=True)):
-            assert torch.equal(expected, actual), f"{precision}{' gated' if gated else ''}: seed {seed}, result {index} differs from eager"
+        assert_bitwise(
+            dict(zip(names, captured, strict=True)), dict(zip(names, eager, strict=True)), f"{precision}{' gated' if gated else ''}: seed {seed} vs eager"
+        )
     del graph
     dist.barrier()
 

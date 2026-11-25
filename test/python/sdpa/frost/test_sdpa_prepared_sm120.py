@@ -47,7 +47,8 @@ def _case(dq=128, dv=128, dtype=torch.bfloat16, *, stats=True, padded=False, ove
     if (chosen.knobs.split_kv or 1) != split:
         from dataclasses import replace
 
-        g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split))
+        scheduler = 0 if split > 1 else chosen.knobs.sched_policy
+        g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split, sched_policy=scheduler))
         g.select_plan(len(g.plans) - 1)
     assert (g.plans[g._plan_index].knobs.split_kv or 1) == split
     g.check_support()

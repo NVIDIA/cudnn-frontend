@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Providers of model blocks: adapters to cuDNN Frontend entries (``fe``), to library kernels (``library``; FlashInfer's
-multiplies on the stored formats: ``flashinfer_calls``) and the plain-PyTorch reference of every block (``torch_ref``).
+multiplies on the stored formats and its attention over the paged cache: ``flashinfer_calls``) and the plain-PyTorch
+reference of every block (``torch_ref``).
 
 ``KEYS`` is the closed list of provider keys a provider table may name; it changes only together with a kernel, with the
 reference chain of a block that a kernel is to serve, or with a declared library entry.  The operand containers below are
@@ -21,7 +22,14 @@ copy of that weight only where another block of the run's plans reads one.  An a
 layout of its own also says how the layout is made (``stored_layout(merged)``, its entry's own load-time helper): the
 loader then keeps the weight in that layout and in no other stored form.  An adapter to an entry of a step that feeds
 several tokens per sequence takes the step's slot table where the decode step's adapter takes slot ids
-(``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).
+(``state.TokenSlots``), and its row names the tokens per sequence as a field of the form (``TOKENS``).  An adapter whose
+entry reads or writes the attention cache as a pool of pages says so (``cache_page``): the session then builds its state
+in that layout, and the adapter takes the pool's two halves and the rows of the state's tables from the cache it is handed
+(``state.PagedKvCache.at``), never from the position.  An adapter whose kernel READS such a pool through a page table
+says so as well (``attended_tables``): the session then builds its state with the page table and the lengths of the
+run's maximum length -- the constant every block is handed in its options (``max_model_len``) -- and the adapter takes
+its rows of both from the cache (``state.PagedKvCache.attended``).  An adapter whose call a recorded launch sequence
+can hold says so (``captures``): a plan every block of which says it can have its step recorded once and replayed.
 """
 
 from __future__ import annotations
@@ -35,13 +43,16 @@ from ..census import Kernel
 ENTRY_NAMES: Dict[str, str] = {
     "fe.gdn_decode_fused": "cudnn.GdnDecodeFused",
     "fe.gdn_verify_fused": "cudnn.GdnVerifyFused",
+    "fe.attention_prepare_decode": "cudnn.AttentionPrepareDecode",
     "fe.attention_gate_quant_decode": "cudnn.AttentionGateQuantDecode",
     "fe.add_norm_quant_decode": "cudnn.AddNormQuantDecode",
     "fe.fp8_projection_decode": "cudnn.Fp8ProjectionDecode",
     "fe.swiglu_fp4_decode": "cudnn.SwigluFp4Decode",
+    "fe.row_quantize_fp4_decode": "cudnn.RowQuantizeFp4Decode",
     "flashinfer.mm_fp4": "flashinfer.gemm.mm_fp4",
-    "torch_ref.quantize+flashinfer.mm_fp4": "torch_ref.quantize + flashinfer.gemm.mm_fp4",
+    "flashinfer.mm_fp4_head": "flashinfer.gemm.mm_fp4",
     "flashinfer.bmm_fp8": "flashinfer.gemm.bmm_fp8",
+    "flashinfer.decode_attention": "flashinfer.decode.trtllm_batch_decode_with_kv_cache",
     "cublas.bf16_dequantized": "torch.matmul over a bf16 copy",
     "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": "torch.matmul over a bf16 copy + torch_ref.silu_mul_quantize",
     "torch.index_select": "torch.index_select",
@@ -157,6 +168,18 @@ class BlockBase:
     #: that name two pages are a wrong table.  ``None``: the block reaches the cache through its accessors alone, in
     #: either layout -- every reference chain
     cache_page = None
+    #: for a block whose kernel reads a pool of pages through a page table and the positions each sequence holds: True.
+    #: A session whose plans have such a block builds its state with those two tables, for the run's maximum length
+    #: (``options["max_model_len"]``), and the block takes its rows of them from the cache it is handed
+    #: (``state.PagedKvCache.attended``).  Such a block names the page too (``cache_page``): the tables are a pool's
+    attended_tables = False
+    #: whether a recorded launch sequence can hold a call of the block (a step recorded once and replayed for every token:
+    #: ``Plan.recordable``).  It can where a call is launches alone, on operands at addresses that do not move from step
+    #: to step: an adapter to an entry or to a library call, the lookup, the token choice.  It cannot where a call forms
+    #: a table or a scalar on the host and copies it to the device, or shapes its launches by the position -- every
+    #: reference chain and every multiply over a copy: such a call is refused inside a recording, or replays the one
+    #: position it was recorded at.  Data of the adapter, never a test at run time
+    captures = False
     #: for a block whose first use does more than build an entry's kernel -- a library that builds kernels of its own with
     #: the installed compiler: the sentence a sample prints before the plan makes that first use.  Empty: nothing to announce
     first_use_note = ""
@@ -191,7 +214,11 @@ class BlockBase:
         """The block the tie-out compares this block with, given the reference stack's block of the same name: that block,
         unless the provider's kernel rounds at other points than the reference chain -- then a reference block written at
         the kernel's rounding points.  The reference is matched to the kernel's documented arithmetic; a band is never
-        widened to cover a chain that rounds elsewhere.  The reference stack itself never asks."""
+        widened to cover a chain that rounds elsewhere.  The reference stack itself never asks.
+
+        The one exception is a library kernel that documents no numerics contract and whose rounding points are not
+        established: its twin is the reference chain itself, which also keeps the operand terms of a bound, and its band
+        is that bound, derived from a stated model of the kernel's arithmetic (``torch_ref.AttentionBound``)."""
         return reference
 
     def serving(self) -> Tuple[str, tuple]:
@@ -214,13 +241,16 @@ def factories() -> Dict[str, Callable]:
     return {
         "fe.gdn_decode_fused": fe.GdnDecodeFusedBlock,
         "fe.gdn_verify_fused": fe.GdnVerifyFusedBlock,
+        "fe.attention_prepare_decode": fe.AttentionPrepareDecodeBlock,
         "fe.attention_gate_quant_decode": fe.AttentionGateQuantDecodeBlock,
         "fe.add_norm_quant_decode": fe.AddNormQuantDecodeBlock,
         "fe.fp8_projection_decode": fe.Fp8ProjectionDecodeBlock,
         "fe.swiglu_fp4_decode": fe.SwigluFp4DecodeBlock,
+        "fe.row_quantize_fp4_decode": fe.RowQuantizeFp4DecodeBlock,
         "flashinfer.mm_fp4": flashinfer_calls.MmFp4Block,
-        "torch_ref.quantize+flashinfer.mm_fp4": flashinfer_calls.QuantizeMmFp4Block,
+        "flashinfer.mm_fp4_head": flashinfer_calls.MmFp4HeadBlock,
         "flashinfer.bmm_fp8": flashinfer_calls.BmmFp8Block,
+        "flashinfer.decode_attention": flashinfer_calls.DecodeAttentionBlock,
         "cublas.bf16_dequantized": library.CublasLinear,
         "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": library.CublasGateUp,
         "torch.index_select": torch_ref.Embedding,

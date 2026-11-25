@@ -1,0 +1,62 @@
+{
+  "inputs": {
+    "a": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "1e2472f7b269279c90ad7508b2c0c7d383a91cc918941b81817f7a052561cc74",
+      "shape": [
+        2,
+        7,
+        256
+      ]
+    },
+    "b": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "4bd84d59f2d479f9f935a4f0c04fbc5b3f576bef4e5a9ff9b63131e14b26e522",
+      "shape": [
+        2,
+        256,
+        136
+      ]
+    },
+    "sa": {
+      "dtype": "torch.float32",
+      "sha256": "9a8208635e00348ab64aac2b759e76391fd47089e9a749bbcec770d9eb5c6421",
+      "shape": [
+        1
+      ]
+    },
+    "sb": {
+      "dtype": "torch.float32",
+      "sha256": "d99e58435243d9fef9c88273b8d553b4fba4d0baf8009d29eae74fa99e0d9f57",
+      "shape": [
+        1
+      ]
+    }
+  },
+  "outputs": {
+    "out": {
+      "dtype": "torch.float16",
+      "sha256": "8b1521030befc9f3370df310f38616893612172509e47b142e0b69c453aab74a",
+      "shape": [
+        2,
+        7,
+        136
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.2",
+    "cuda_driver": 13040,
+    "cudnn": 92900,
+    "cutlass": "4.8.1",
+    "gpu": "NVIDIA DRIVE P2021",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 68,
+    "torch": "2.15.0+cu132",
+    "tvm_ffi": "0.1.15.post2"
+  },
+  "schema": 1
+}

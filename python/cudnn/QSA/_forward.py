@@ -99,14 +99,14 @@ def _launch(
 
 
 @lru_cache(maxsize=None)
-def _compile_args(hq, hkv, gated):
+def _compile_args(dtype, hq, hkv, gated):
     total, blocks, scratch_elements = (cute.sym_int64() for _ in range(3))
 
     def tensor(dtype, shape, alignment=4):
         return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=alignment)
 
-    q = tensor(cutlass.BFloat16, (total, hq, 256), 16)
-    kv = tensor(cutlass.BFloat16, (total, hkv, 256), 16)
+    q = tensor(dtype, (total, hq, 256), 16)
+    kv = tensor(dtype, (total, hkv, 256), 16)
     rows, spans = tensor(Int32, (total,)), tensor(Int32, (blocks,))
     return (
         q,
@@ -129,7 +129,7 @@ def _compile_args(hq, hkv, gated):
 
 
 @lru_cache(maxsize=None)
-def _compile_key(hq, hkv, arch, gated, n64=False):
+def _compile_key(dtype, hq, hkv, arch, gated, n64=False):
     return template_key(
         globals(),
         {
@@ -142,10 +142,17 @@ def _compile_key(hq, hkv, arch, gated, n64=False):
     )
 
 
-def compile_kernel(hq, hkv, arch, gated, n64=False):
-    key = _compile_key(hq, hkv, arch, gated, n64)
+def compile_kernel(dtype, hq, hkv, arch, gated, n64=False):
+    key = _compile_key(dtype, hq, hkv, arch, gated, n64)
     return compile_cached(
-        _launch, *_compile_args(hq, hkv, gated), arch, gated, n64, cache_key=key, symbol="qsa_forward_host", options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a"
+        _launch,
+        *_compile_args(dtype, hq, hkv, gated),
+        arch,
+        gated,
+        n64,
+        cache_key=key,
+        symbol="qsa_forward_host",
+        options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a",
     )
 
 
@@ -155,7 +162,8 @@ def launch(impl, arch, q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_fi
     n64 = arch == 107 and hq == 12 * k.shape[1] and total >= 32768
     # Each query tile takes the dense or the gathered kernel on the device. The 64-key forward reads no tile modes.
     gated = total > 512 and not n64
-    compiled = compile_kernel(hq, k.shape[1], arch, gated, n64)
+    dtype = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}[q.dtype]
+    compiled = compile_kernel(dtype, hq, k.shape[1], arch, gated, n64)
     align4 = lambda value: (value + 3) // 4 * 4
     scratch_elements = align4(total * sel_blocks.shape[1]) + total
     if gated:

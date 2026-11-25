@@ -42,6 +42,7 @@ from ._compile import PreparedMxfp8Kernel
 from ._fingerprint import canonical_json_sha256, source_tree_sha256
 from ._overflow import apply_overflow_policy
 from ._training_stage import Mxfp8TrainingStager
+from ._wgrad_compile import PreparedMxfp8Wgrad
 
 _DATA_DTYPE = torch.float8_e4m3fn
 _SCALE_DTYPE = torch.float8_e8m0fnu
@@ -110,6 +111,7 @@ def _add_phase_regions(
 def build_training_workspace_requirements(
     forward: PreparedMxfp8Kernel,
     backward: PreparedMxfp8BackwardKernel,
+    wgrad: PreparedMxfp8Wgrad | None = None,
 ) -> WorkspaceRequirements:
     """Build one deterministic root layout for private instance resources."""
 
@@ -239,6 +241,16 @@ def build_training_workspace_requirements(
             alignment=16,
         )
     )
+    if wgrad is not None:
+        if wgrad.pool_rows != backward.pool_token_capacity:
+            raise ValueError("WGrad pool rows must match the backward pool capacity, got " f"{wgrad.pool_rows} and {backward.pool_token_capacity}")
+        local_regions.append(
+            BufferRegion(
+                _resource_name("wgrad", "local", "kernel_local_workspace"),
+                wgrad.local_workspace_bytes,
+                alignment=128,
+            )
+        )
     return WorkspaceRequirements(
         max_tokens_per_rank=forward_config.max_tokens_per_rank,
         symmetric_regions=tuple(symmetric_regions),
@@ -371,6 +383,7 @@ def _build_training_abi_facts(
     requirements: WorkspaceRequirements,
     *,
     source_tree_digest: str | None = None,
+    wgrad: PreparedMxfp8Wgrad | None = None,
 ) -> dict[str, object]:
     """Return rank-independent JSON-safe facts for the stateless training ABI."""
 
@@ -381,7 +394,7 @@ def _build_training_abi_facts(
     topology = config.topology
     capacity = config.receive_capacity
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "source_tree_sha256": source_tree_digest,
         "ep": {
             "size": topology.ep_size,
@@ -415,6 +428,7 @@ def _build_training_abi_facts(
         "native_weight_layouts": [layout.value for layout in MoeEpNativeWeightLayout],
         "forward_kernel": _prepared_kernel_abi(forward),
         "backward_kernel": _prepared_kernel_abi(backward),
+        "wgrad_kernel": None if wgrad is None else wgrad.abi(),
     }
 
 
@@ -464,6 +478,7 @@ class Mxfp8TrainingExecutionViews:
     forward: PreparedResources
     backward: PreparedResources
     forward_expert_size_snapshot: torch.Tensor
+    wgrad_workspace: torch.Tensor | None = None
 
 
 class _Mxfp8TrainingState:
@@ -479,11 +494,15 @@ class _Mxfp8TrainingState:
         runtime_manager: Optional[RuntimeManager] = None,
         symmetric_provider: Optional[SymmetricMemoryProvider] = None,
         local_provider: Optional[LocalMemoryProvider] = None,
+        wgrad: PreparedMxfp8Wgrad | None = None,
+        wgrad_unavailable_reason: str | None = None,
     ) -> None:
         self.resolved_config = config
         self.device = torch.device(device)
         self.forward_prepared = forward
         self.backward_prepared = backward
+        self.wgrad_prepared = wgrad
+        self.wgrad_unavailable_reason = None if wgrad is not None else (wgrad_unavailable_reason or "MoeEp training WGrad was not prepared")
         if forward.config.weight_storage_mode != backward.config.weight_storage_mode:
             raise ValueError(
                 "forward/backward native weight storage modes must match, got "
@@ -504,6 +523,7 @@ class _Mxfp8TrainingState:
         self.requirements = build_training_workspace_requirements(
             forward,
             backward,
+            wgrad,
         )
         self._runtime_manager = runtime_manager or get_runtime_manager()
         self._symmetric_provider = symmetric_provider
@@ -559,6 +579,7 @@ class _Mxfp8TrainingState:
                             self.forward_prepared,
                             self.backward_prepared,
                             self.requirements,
+                            wgrad=self.wgrad_prepared,
                         )
                         abi_fingerprint = _verify_training_abi_across_ranks(
                             abi_facts,
@@ -920,6 +941,9 @@ class _Mxfp8TrainingState:
                 (self.resolved_config.topology.experts_per_rank,),
             )
             assert self._runtime is not None
+            wgrad_workspace = None
+            if self.wgrad_prepared is not None:
+                wgrad_workspace = flat.local[_resource_name("wgrad", "local", "kernel_local_workspace")]
             return Mxfp8TrainingExecutionViews(
                 scratch=self._scratch_views(flat),
                 forward=PreparedResources(
@@ -931,6 +955,7 @@ class _Mxfp8TrainingState:
                     workspace=backward_workspace,
                 ),
                 forward_expert_size_snapshot=snapshot,
+                wgrad_workspace=wgrad_workspace,
             )
 
     def close(self) -> None:

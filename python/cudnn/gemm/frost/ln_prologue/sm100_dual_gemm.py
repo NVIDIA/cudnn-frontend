@@ -352,12 +352,19 @@ def _item_tile(item_n, sub):
 
 
 @cute.jit
+def _preferred_grid_tiles(gridx, gridy):
+    if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+        nt_m, nt_n, _ = cute.arch.cluster_dim()
+        return nt_m, nt_n
+    return gridx >> _preferred_cluster_m_shift, gridy >> _preferred_cluster_n_shift
+
+
+@cute.jit
 def _item_decode(m_idx, n_idx, gridx, gridy, swizzle_w):
     """Decode a CLC work item."""
     raw_m = m_idx >> _preferred_cluster_m_shift
     raw_n = n_idx >> _preferred_cluster_n_shift
-    nt_m = gridx >> _preferred_cluster_m_shift
-    nt_n = gridy >> _preferred_cluster_n_shift
+    nt_m, nt_n = _preferred_grid_tiles(gridx, gridy)
     tile_m, item_n = _l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=tile_swizzle_n == 1)
     return tile_m, item_n
 
@@ -399,6 +406,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     mask: Optional[cute.Tensor],  # [bn * n_res] bf16 per-row mask; None iff not HAS_MASK (every valid row counts as 1)
     stats: Optional[cute.Tensor],  # [bn * n_res * 2] fp32 (mean, rstd) of operand 0's LayerNorm; None iff not WANT_STATS
     resid: Optional[cute.Tensor],  # [bn * n_res * c_out] bf16 pair-major residual added before the rounding (accumulators arm, fuse_residual); else None
+    host_swizzle_w: Optional[cutlass.Int32],
 ) -> None:
     tma_a_descs = [tma_a_desc_0, tma_a_desc_1][:num_a_operands]
     tma_b_descs = [tma_b_desc_0, tma_b_desc_1][:num_b_operands]
@@ -480,15 +488,17 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
 
     init_raw_m = bidx >> _preferred_cluster_m_shift
     init_raw_n = bidy >> _preferred_cluster_n_shift
-    init_nt_m = gridx >> _preferred_cluster_m_shift
-    init_nt_n = gridy >> _preferred_cluster_n_shift
+    init_nt_m, init_nt_n = _preferred_grid_tiles(gridx, gridy)
     if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
         if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
             init_raw_m = bidx >> _fallback_cluster_m_shift
             init_raw_n = bidy >> _fallback_cluster_n_shift
             init_nt_m = gridx >> _fallback_cluster_m_shift
             init_nt_n = gridy >> _fallback_cluster_n_shift
-    swizzle_w = _auto_swizzle_w(m, n, k, init_nt_n)
+    if cutlass.const_expr(host_swizzle_w is None):
+        swizzle_w = _auto_swizzle_w(m, n, k, init_nt_n)
+    else:
+        swizzle_w = host_swizzle_w
     init_tile_m, init_tile_n = _l2_swizzle_tile(
         init_raw_m,
         init_raw_n,
@@ -1110,8 +1120,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 is_valid = vld
                 tma_raw_m = m_idx >> _preferred_cluster_m_shift
                 tma_raw_n = n_idx >> _preferred_cluster_n_shift
-                tma_nt_m = gridx >> _preferred_cluster_m_shift
-                tma_nt_n = gridy >> _preferred_cluster_n_shift
+                tma_nt_m, tma_nt_n = _preferred_grid_tiles(gridx, gridy)
                 if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
                     if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
                         tma_raw_m = m_idx >> _fallback_cluster_m_shift
@@ -1729,8 +1738,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 is_valid = vld
                 epi_raw_m = m_idx >> _preferred_cluster_m_shift
                 epi_raw_n = n_idx >> _preferred_cluster_n_shift
-                epi_nt_m = gridx >> _preferred_cluster_m_shift
-                epi_nt_n = gridy >> _preferred_cluster_n_shift
+                epi_nt_m, epi_nt_n = _preferred_grid_tiles(gridx, gridy)
                 if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
                     if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
                         epi_raw_m = m_idx >> _fallback_cluster_m_shift
@@ -2331,8 +2339,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             is_valid = vld
             ln_raw_m = m_idx >> _preferred_cluster_m_shift
             ln_raw_n = n_idx >> _preferred_cluster_n_shift
-            ln_nt_m = gridx >> _preferred_cluster_m_shift
-            ln_nt_n = gridy >> _preferred_cluster_n_shift
+            ln_nt_m, ln_nt_n = _preferred_grid_tiles(gridx, gridy)
             tile_m, tile_n = _l2_swizzle_tile(
                 ln_raw_m,
                 ln_raw_n,
@@ -2472,6 +2479,11 @@ def _host(
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
     grid_shape = (grid_x, grid_y, grid_z)
+    # Resolve automatic rasterization once per launch for a fixed cluster shape.
+    # A runtime fallback still needs the dimensions of the cluster it received.
+    host_swizzle_w = None
+    if cutlass.const_expr(tile_swizzle_n <= 0 and fallback_cluster_shape_mnk is None):
+        host_swizzle_w = _auto_swizzle_w(m, n, k_sym, num_tile_n_host)
     launch = frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         m,
         n,
@@ -2494,6 +2506,7 @@ def _host(
         mask,
         stats,
         resid,
+        host_swizzle_w,
     )
     launch.launch(
         grid=grid_shape,

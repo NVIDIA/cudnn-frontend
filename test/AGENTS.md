@@ -132,7 +132,7 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **A regression test must be seen RED.** Restore the old line, confirm the test fails, restore the fix.
 - Gate on capability: skip via `check_support()` failures, `cudnn.backend_version()`, `torch.cuda.get_device_capability()`. Architecture-specific adjustments use device capability, not engine-name suffixes.
 - **Family checks compare a range.** CI `sm120` lanes include GB10 (SM 12.1). In `gemm/frost`, branch on `active_family() == "sm120"` (or `120 <= arch < 130`). Detector: `git grep -nE '_current_arch\(\) *== *12[0-9]' test/python/gemm`. A helper that looks for one engine's plan must catch `cudnnGraphNotSupportedError` from `create_execution_plans` (raised when no engine proposes a plan).
-- If an optional import's `except ImportError` ends before the test body, use `return pytest.skip(...)` (CodeQL otherwise reports the name as possibly uninitialized). Check the CodeQL alert result as well as the workflow.
+- When a test uses a local after a guarded import or allocation, raise `pytest.skip.Exception(reason) from None` in the exception handler. Check CodeQL's uninitialized-variable and mixed-returns alerts as well as the workflow.
 - Compare against an independent reference (`*_ref.py` / `*_reference.py`) with dtype-appropriate tolerances.
 - **Scale the tolerance to the tensor:** `TOL * max(|ref|.max(), 1.0)`. GQA dK/dV sum over `h_q/h_kv` heads, so absolute bounds break at larger group sizes.
 - **Build the reference in fp64 when the bound is tighter than ~1e-3.** CI containers run fp32 matmul as TF32 (`TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`). Use `sdpa/fp8_ref.compute_ref(dtype=torch.float64)`; in a hand-rolled reference `.double()` the operands before the matmul.

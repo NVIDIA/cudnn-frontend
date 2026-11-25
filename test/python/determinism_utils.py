@@ -87,14 +87,19 @@ def runtime():
     }
 
 
-def assert_golden(name, inputs, outputs, *, allowed_inf=None):
-    """Compare committed bytes; recording requires an explicit, new destination."""
+def assert_golden(name, inputs, outputs, *, allowed_inf=None, baseline_dir=None):
+    """Compare committed bytes. A suite can keep its baselines alongside its tests."""
     environment = runtime()
     key = hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest()[:16]
     record_dir = os.environ.get("CUDNN_DETERMINISM_RECORD")
     check_dir = os.environ.get("CUDNN_DETERMINISM_GOLDENS")
     assert not (record_dir and check_dir), "choose recording or comparison"
-    root = Path(record_dir or check_dir or Path(__file__).with_name("determinism_goldens"))
+    shared_dir = Path(__file__).with_name("determinism_goldens")
+    root = Path(record_dir or check_dir or shared_dir)
+    # A strict check of the repository's goldens also covers suite-local baselines.
+    # Explicit recording and external comparison directories retain their usual layout.
+    if baseline_dir is not None and not record_dir and root.resolve() == shared_dir.resolve():
+        root = Path(baseline_dir)
     path = root / key / f"{name}.json"
     record = {
         "schema": 1,

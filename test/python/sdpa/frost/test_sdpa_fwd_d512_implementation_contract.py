@@ -85,7 +85,8 @@ def test_explicit_lowering_never_reselects_the_main_body(monkeypatch, name, sq):
     calls = []
     monkeypatch.setattr(engines, "lower_dsl_prefill", lambda spec, f, k, *, selected_kernel: calls.append((spec, f, k, selected_kernel)))
     f = facts(s_q=sq)
-    SPECS[name].lower(SPECS[name], f, None)
+    spec = next(s for s in engines._sm100_d512_specs() if s.name == name)
+    spec.lower(spec, f, None)
     assert len(calls) == 1
     _, _, knobs, geometry = calls[0]
     assert geometry.implementation == name
