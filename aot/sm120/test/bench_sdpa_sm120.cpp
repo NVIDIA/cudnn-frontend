@@ -9,6 +9,7 @@
 // after the build and the steady-state host time per execute() (batches of 100 calls, below the launch-queue depth, so
 // the CPU never waits on the GPU), and the kernel time per execute() (CUDA events around back-to-back calls).
 
+#include "sm120_family.h"
 #include "cudnn_frontend/experimental/sm120_aot_attention.h"
 
 #include "decode_problem.h"
@@ -116,9 +117,11 @@ main(int argc, char** argv) {
     }
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
-    if (prop.major != 12 || prop.minor != 0) {
-        std::printf(
-            "SKIPPED: device 0 is %s (%d.%d), not compute capability 12.0\n", prop.name, prop.major, prop.minor);
+    if (!cudnn_frontend::aot_sm120::supports_device(10 * prop.major + prop.minor)) {
+        std::printf("SKIPPED: device 0 is %s (%d.%d), not compute capability 12.0 or 12.1\n",
+                    prop.name,
+                    prop.major,
+                    prop.minor);
         return 0;
     }
     std::printf("# %s (%d SMs); %s\n", prop.name, prop.multiProcessorCount, lib.build_info());

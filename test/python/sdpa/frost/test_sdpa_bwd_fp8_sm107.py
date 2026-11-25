@@ -66,13 +66,13 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
 
 
 _ENGINE = "sdpa_bwd_sm107_fp8"
-_HALF_ENGINE = "sdpa_bwd_sm107"
+_HALF_ENGINE = "sdpa_bwd_sm107_d256_f16_4x1"
 _FAMILY_NAME = "frost_sdpa_bwd"
 _SLOT = 5  # engines/manifest.py: EngineSlot(5, opt_in=True) -> FROST_SDPA_BWD_ID_BASE + 5
 _ENGINE_ID = 20_605
 _D = 256
 _RUBIN_CC = (10, 7)
-_SM_RANGE = (107, 119)
+_SM_RANGE = (107, 109)
 _FP8 = cudnn.data_type.FP8_E4M3
 _E5M2 = cudnn.data_type.FP8_E5M2
 _BF16 = cudnn.data_type.BFLOAT16
@@ -209,10 +209,13 @@ def _build_graph(*args, **kw):
 
 @requires_rubin
 def test_graph_admits_d256_fp8_backward_on_rubin(monkeypatch):
-    """Classic eager C++ validation (FROST off, the real device query -> cc 10.7):
+    """Classic eager C++ validation (no Python candidate, real device query -> cc 10.7):
     the node no longer raises the ``hidden_dim`` not-supported at d=256."""
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     g = _build_graph()
+    # Disabling opt-in does not remove default Python engines. Pin the classic
+    # validation path, as in the host-side C++ admission matrix.
+    monkeypatch.setattr(g, "_candidate_engines", lambda: [])
     g.validate()
     assert g._lowered_graph is not None, "classic path: the C++ graph validated the node"
 
@@ -240,15 +243,18 @@ def test_graph_declines_cleanly_until_a_row_serves_it():
 # =========================================================================== registration / capabilities (host)
 
 
-def test_engine_is_registered_and_opt_in():
+def test_engine_is_registered_and_offered_by_default():
     from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
     from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.bwd.heuristics import TRAIL_ONLY_ROWS
 
     _spec()
     fam = next(f for f in MANIFEST if f.name == _FAMILY_NAME)
     assert _ENGINE in fam.slots, f"{_ENGINE} has no manifest slot (never reuse a retired slot; plan s7 says slot {_SLOT})"
     slot = fam.slots[_ENGINE]
-    assert slot.slot == _SLOT and slot.opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # Default since 2026-11-16, behind the backend (cudnn.sdpa.bwd.heuristics.TRAIL_ONLY_ROWS).
+    assert slot.slot == _SLOT and not slot.opt_in
+    assert _ENGINE in TRAIL_ONLY_ROWS
     assert FROST_SDPA_BWD_ID_BASE + slot.slot == _ENGINE_ID
 
 
@@ -260,7 +266,8 @@ def test_engine_name_grammar():
 
     if "fp8" in inspect.signature(engine_name).parameters:
         assert engine_name("sm107", fp8=True) == _ENGINE
-        assert engine_name("sm107") == _HALF_ENGINE
+        assert engine_name("sm107") == "sdpa_bwd_sm107"  # legacy delegated row
+        assert _HALF_ENGINE == "sdpa_bwd_sm107_d256_f16_4x1"
     assert _spec().name == _ENGINE
 
 
@@ -705,6 +712,7 @@ def _run_fp8(
     ws_poison=None,
     attn_scale=None,
     d_v=None,
+    record=None,
 ):
     """Quantize unit-normal operands per tensor, run the oracle (forward for O / Stats, then backward with the oracle's
     Stats injected -- the kernel recomputes P from the forward's exact LSE), build the graph with the contract's twelve
@@ -827,8 +835,12 @@ def _run_fp8(
     )
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, _ENGINE)
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+        select_engine(g, _ENGINE)
+    else:
+        g.create_execution_plan(*record)
+        g.select_plan(0)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)

@@ -17,7 +17,7 @@ import torch
 import cudnn
 import cudnn.sdpa  # noqa: F401 — the SM80 capability tables live here
 from cudnn.engines import MANIFEST, is_python_engine
-from frost_test_utils import select_engine
+from frost_test_utils import SM80_BWD_OWNERS, half_engine_names, select_engine, sm80_owner
 
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.bwd import engines as engines_bwd_sm80
@@ -26,7 +26,10 @@ from cudnn.sdpa.fwd import engines as engines_fwd
 _FWD = "sdpa_fwd_prefill_sm80"
 _BWD = "sdpa_bwd_sm80"
 _BWD_SPEC = next(sp for sp in engines_bwd_sm80.ENGINE_SPECS if sp.name == _BWD)
-_FWD_CAPS = next(sp for sp in engines_fwd.ENGINE_SPECS if sp.name == _FWD).capabilities
+
+
+def _fwd_caps(facts):
+    return next(sp for sp in engines_fwd.ENGINE_SPECS if sp.name == sm80_owner(facts.d_qk, facts.d_v)).capabilities
 
 
 def _is_sm80() -> bool:
@@ -125,7 +128,7 @@ def test_probe_rejects_unsupported_features():
     assert facts is not None and not facts.invalid
     assert facts.has_dropout
     facts = dataclasses.replace(facts, device_cc=(8, 0))
-    reason = engines_fwd.mismatch(_FWD_CAPS, facts)
+    reason = engines_fwd.mismatch(_fwd_caps(facts), facts)
     assert reason is not None and "dropout" in reason
 
 
@@ -134,7 +137,7 @@ def test_direction_cross_rejection():
     """The fwd engine must reject sdpa_backward graphs and vice versa."""
     g, *_ = _build_fwd_graph()
     facts = dataclasses.replace(ga.analyze(g), device_cc=(8, 0))
-    assert engines_fwd.mismatch(_FWD_CAPS, facts) is None
+    assert engines_fwd.mismatch(_fwd_caps(facts), facts) is None
     assert "sdpa_backward" in engines_bwd_sm80.mismatch(_BWD_SPEC.capabilities, facts)
 
 
@@ -142,7 +145,7 @@ def test_direction_cross_rejection():
 @pytest.mark.L0
 def test_fwd_engine_end_to_end():
     g, q, k, v, o, stats = _build_fwd_graph()
-    _native_then_pin(g, _FWD)
+    _native_then_pin(g, half_engine_names("sm80"))
 
     torch.manual_seed(0)
     q_buf, k_buf, v_buf = _buf(), _buf(), _buf()
@@ -163,14 +166,14 @@ def _check_fwd_engine_strided_stats(d, stats_use_log2=False):
     compact_stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
     compact_graph = _build_fwd_graph(d=d, stats_stride=compact_stats_buf.stride(), stats_use_log2=stats_use_log2)
     strided_graph = _build_fwd_graph(d=d, stats_stride=strided_stats_buf.stride(), stats_use_log2=stats_use_log2)
-    _native_then_pin(compact_graph[0], _FWD)
-    _native_then_pin(strided_graph[0], _FWD)
+    _native_then_pin(compact_graph[0], half_engine_names("sm80"))
+    _native_then_pin(strided_graph[0], half_engine_names("sm80"))
 
     torch.manual_seed(0)
     q_buf, k_buf, v_buf = _buf(d), _buf(d), _buf(d)
     for graph_tensors, stats_buf in ((compact_graph, compact_stats_buf), (strided_graph, strided_stats_buf)):
         graph, q, k, v, o, stats = graph_tensors
-        graph.execute({q: q_buf, k: k_buf, v: v_buf, o: torch.empty_like(q_buf), stats: stats_buf}, None)
+        graph.execute({q: q_buf, k: k_buf, v: v_buf, o: torch.empty_like(q_buf), stats: stats_buf}, _ws(graph))
     torch.cuda.synchronize()
 
     scale = 1.0 / math.sqrt(d)
@@ -208,7 +211,7 @@ def _check_bwd_engine_end_to_end(d):
     scale = 1.0 / math.sqrt(d)
     # Forward via the SM80 engine to produce O / stats.
     g, q, k, v, o, stats = _build_fwd_graph(d=d)
-    _native_then_pin(g, _FWD)
+    _native_then_pin(g, half_engine_names("sm80"))
     torch.manual_seed(0)
     q_buf, k_buf, v_buf = _buf(d), _buf(d), _buf(d)
     o_buf = torch.empty_like(q_buf)
@@ -228,7 +231,7 @@ def _check_bwd_engine_end_to_end(d):
     # IR-inferred output strides are provisional) — bind BSHD-physical.
     for t in (dq, dk, dv):
         t.set_output(True).set_data_type(_HALF).set_stride(st)
-    _native_then_pin(gb, _BWD)
+    _native_then_pin(gb, SM80_BWD_OWNERS)
 
     do_buf = _buf(d)
     dq_buf, dk_buf, dv_buf = torch.empty_like(q_buf), torch.empty_like(k_buf), torch.empty_like(v_buf)
@@ -287,7 +290,7 @@ def test_fwd_engine_bhsd_contiguous_layout(gqa):
     o, stats = g.sdpa(q=q, k=k, v=v, attn_scale=_SCALE, use_causal_mask=True, generate_stats=True)
     o.set_output(True).set_data_type(_HALF)
     stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-    _native_then_pin(g, _FWD)
+    _native_then_pin(g, half_engine_names("sm80"))
 
     torch.manual_seed(0)
     q_buf = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda")
@@ -333,7 +336,7 @@ def test_bwd_engine_bhsd_contiguous_layout():
     dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=_SCALE, use_causal_mask=True)
     for t in (dq, dk, dv):
         t.set_output(True).set_data_type(_HALF)
-    _native_then_pin(gb, _BWD)
+    _native_then_pin(gb, SM80_BWD_OWNERS)
 
     dq_buf, dk_buf, dv_buf = (torch.empty(dims, dtype=torch.float16, device="cuda") for _ in range(3))
     gb.execute(
@@ -361,8 +364,8 @@ def test_engine_execute_does_not_allocate():
     allocator's cumulative allocation COUNTER, which any torch.empty/zeros/
     clone/contiguous on the execute path would advance.  The geometry is
     chosen to cover native forward GQA/strided Stats and the backward's
-    remaining staging. Forward must now report zero workspace: its prepared
-    kernel addresses both layouts directly."""
+    remaining staging. Forward addresses both layouts directly; any workspace it
+    reports is the split-KV partials of the selected plan."""
     H_KV = H // 2
     st_kv = _bshd_stride(B, H_KV, S, D)
     # Strided stats: (B, H, S, 1) declared with a 2-element row gap — the
@@ -377,8 +380,7 @@ def test_engine_execute_does_not_allocate():
     o, stats = g.sdpa(q=q, k=k, v=v, attn_scale=_SCALE, use_causal_mask=True, generate_stats=True)
     o.set_output(True).set_data_type(_HALF)
     stats.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_stride(stats_stride)
-    _native_then_pin(g, _FWD)
-    assert g.get_workspace_size() == 0, "prepared forward must address GQA and strided Stats without staging"
+    _native_then_pin(g, half_engine_names("sm80"))
     torch.manual_seed(0)
     q_buf = _buf()
     k_buf = torch.randn(B, S, H_KV, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
@@ -401,7 +403,7 @@ def test_engine_execute_does_not_allocate():
     dq.set_output(True).set_data_type(_HALF).set_stride(st)
     dk.set_output(True).set_data_type(_HALF).set_stride(st_kv)
     dv.set_output(True).set_data_type(_HALF).set_stride(st_kv)
-    _native_then_pin(gb, _BWD)
+    _native_then_pin(gb, SM80_BWD_OWNERS)
     assert gb.get_workspace_size() > 0, "the SM80 bwd executor must report its carved scratch"
     do_buf = _buf()
     dq_buf = torch.empty_like(q_buf)

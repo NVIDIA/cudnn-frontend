@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry point for grouped GEMM quant, built on
-:func:`cudnn.jax.call`.
+:func:`cudnn._jax.call`.
 
 ``grouped_gemm_quant_jax_forward`` is the canonical block-scaled grouped GEMM with
 dense weights: MXFP8 or packed FP4 A ``(m, k)``, B ``(experts, n, k)`` or column-wise
@@ -22,7 +22,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cudnn.api_base import TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import detect_framework, get_compute_capability
-from cudnn.jax import neg_inf_init
+from cudnn._jax import neg_inf_init
 from ..canonical import kernel_facing_fp4
 from ..canonical_jax import check_block_scaled_operands, check_packed_sf_size, check_rubin_dsl, fp8_dtypes, grouped_call, output_type, sf_array, sf_shape
 from ..moe_utils import MoEWeightMode

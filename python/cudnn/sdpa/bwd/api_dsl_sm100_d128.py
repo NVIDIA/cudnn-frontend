@@ -10,10 +10,10 @@ import torch
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
 from .d128_contract import (
     ACCUMULATION,
+    DENSE_PARTS,
     DENSE_SM_RANGE,
     PAIR,
-    PAIR_CCS,
-    RECOMPUTE,
+    dense_part_admitted,
     pair_split,
     pair_workspace_layout,
     select_implementation,
@@ -34,7 +34,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # reaches it, and the compiled-plan cache keys the armed build apart.  Not a knob (it changes the function), never shipped armed.
     diag_delete_dq_reduce_add: bool = False
     # The per-S selector of the grouped THD route: which body serves a BF16 grouped THD request -- the one-CTA body
-    # (the grouped bodies of ``kernels/sm100/bprop_d128_f16.py``, implementation ``accumulation_grouped_thd``) or the cta_group::2 PAIR body
+    # (the grouped bodies of ``kernels/sm100/d128_f16_accum/kernel.py``, implementation ``accumulation_grouped_thd``) or the cta_group::2 PAIR body
     # (the pair body of the same module, implementation ``accumulation_grouped_thd_2cta``; five launches either way).  A typed op-level
     # field (``d128_grouped_2cta_contract.CTA_PAIR_MODES``): "auto" = THE default = the per-S rule -- the pair iff both declared S_q and S_kv >=
     # ``CTA_PAIR_MIN_SEQ[cc]`` (PART-KEYED; 8192 on every admitted part today: the smallest S where the pair body won the measured backward step
@@ -67,7 +67,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # values straight; measured neutral against "fsel" on GB200 at 16K / 32K, kept selectable) | "diag_mask_off" (DIAGNOSTIC: the mask body
     # skipped on EVERY tile = the lever's ceiling; OUTPUT WRONG BY DESIGN on the diagonal / edge tiles, set on the adapter INSTANCE by a probe
     # driver, never a knob, never shipped armed, refused by the driver's `--validate`).  Bitwise on dQ / dK / dV between fsel and predicated (a
-    # masked P / dS cell is exactly 0 in both forms).  Typed (``config_sm100_d128_accum_2cta_stail.CFG.MASK_FORMS``); read only on the 2-CTA
+    # masked P / dS cell is exactly 0 in both forms).  Typed (``d128_f16_accum_2cta.config.CFG.MASK_FORMS``); read only on the 2-CTA
     # route; the compile key carries it.
     mask_form: "str | None" = None
     # How the GQA group's dK / dV are accumulated on the grouped THD chain -- "bf16_partials" (``None`` = the same, THE default: one bf16 partial
@@ -85,7 +85,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # straight from its registers and its lead warp ships; warps 8-11 become the REDUCE group (dQ readout + the fp32 slice rounds + the item-end
     # dV / dK staging); two barrier rows deleted, one added; measured slower on GB200 at 8K-64K).  Perf-only on dK / dV (bitwise under both
     # values: the same accumulation chain per GEMM); dQ by the fp64 gate.  Under "16w_fa4" ``debug_clk`` and ``dkv_accum = "fp32_reduce"``
-    # decline by name.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.WARP_ROLES``); read only on the 2-CTA route; the compile key carries it.
+    # decline by name.  Typed (``d128_f16_accum_2cta.config.CFG.WARP_ROLES``); read only on the 2-CTA route; the compile key carries it.
     warp_roles: "str | None" = None
     # The pair body's STATS FORM -- how the softmax gets each q tile's LSE / delta rows: "tma_ring" (``None`` = the same under the default role
     # shape; THE default since the day-4 measurement, +1.8 / +1.9 % at the step at 16K / 32K and +3.3 % on the graph replay against "ldg": the
@@ -94,7 +94,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # between the forms; the workspace carries the q-tile-padded pre-scaled stats for the LSE copy) | "ldg" (the previous default, selectable;
     # the form "16w_fa4" resolves to when unset: the softmax fetches them per tile with one global load per lane, scales, stores them into one
     # SMEM slab and fences the 8 warps with a named-barrier pair).  Perf-only; "tma_ring" NAMED declines by name under "16w_fa4"; served
-    # together with ``debug_clk``.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.STATS_FORMS``); read only on the 2-CTA route; the compile
+    # together with ``debug_clk``.  Typed (``d128_f16_accum_2cta.config.CFG.STATS_FORMS``); read only on the 2-CTA route; the compile
     # key carries it.
     stats_form: "str | None" = None
     # The pair body's TMEM MAP, PART-KEYED -- "s_tail" (the dQ image in S^T's dead TMEM tail behind two LEADER barrier rows; the 512-column parts'
@@ -104,7 +104,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # so the map is a neutral structural base for the two-stage staging arm and ``None`` = "s_tail" on every part until that arm's own row lands).
     # Perf-only (dK / dV bitwise between the maps: the same accumulation chain per GEMM; dQ by the fp64 gate); SMEM and the
     # workspace unchanged.  "dq_576" NAMED on a 512-column part is the engine's typed decline (NotImplementedError by name); under "16w_fa4" and
-    # with the three S-tail WAIT probes it declines by name too.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.TMEM_MAPS``); read only on the
+    # with the three S-tail WAIT probes it declines by name too.  Typed (``d128_f16_accum_2cta.config.CFG.TMEM_MAPS``); read only on the
     # 2-CTA route; the compile key carries it.
     tmem_map: "str | None" = None
     # The pair body's SMEM MAP, PART-KEYED -- "sm100" (the slab chain of the 232448-B opt-in cap: every part's rendering and default; ``None`` = the
@@ -114,7 +114,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # "sm100" on that part measured a LOSS (2026-11-03, a Rubin class node: -2.5..-5.0 % step at 8K / 16K / 32K) -- no default flips).  Perf-only (dK / dV bitwise between the maps: the same
     # accumulation chain per GEMM; dQ by the fp64 gate); the workspace unchanged.  "rubin_b2" NAMED on a 512-column part is the engine's typed decline
     # (NotImplementedError by name); under "s_tail", "16w_fa4" or stats_form "ldg" it declines by name too.  Typed
-    # (``config_sm100_d128_accum_2cta_stail.CFG.SMEM_MAPS``); read only on the 2-CTA route; the compile key carries it.
+    # (``d128_f16_accum_2cta.config.CFG.SMEM_MAPS``); read only on the 2-CTA route; the compile key carries it.
     smem_map: "str | None" = None
 
     def __init__(
@@ -195,9 +195,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
 
     def check_support(self):
         if self._uses_grouped_heads() and not self._pair_grouped():
-            from .prepared_sm100_d128_grouped_2cta import check_support_selected
-
-            return check_support_selected(self)
+            return self._check_grouped_implementation()
         from .d128_grouped_contract import DKV_ACCUM_DEFAULT, resolve_dkv_accum
         from .prepared_sm100_d128_grouped_2cta import cta_pair
 
@@ -228,7 +226,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         require(installed and not cutedsl_too_old(version), f"requires nvidia-cutlass-dsl >= {'.'.join(map(str, CUTEDSL_MIN_VERSION))}; found {version}")
         require(self.q_desc.device.type == "cuda", "Q must reside on CUDA")
         cc = compute_capability(resolve_device(self.q_desc.device))
-        require(DENSE_SM_RANGE[0] <= cc[0] * 10 + cc[1] <= DENSE_SM_RANGE[1], f"requires SM{DENSE_SM_RANGE[0]}-{DENSE_SM_RANGE[1]}; got {cc}")
+        require(dense_part_admitted(cc), f"requires {DENSE_PARTS}; got {cc}")
         arch_error = cutedsl_arch_requirement_error(cc)
         require(arch_error is None, arch_error)
         binder = getattr(_pybind_module, "_SdpaBwdBinder", None)
@@ -276,30 +274,47 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         self.head_dim_qk = self.head_dim_v = d
         self.scale_softmax = d**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax != 0, "attn_scale must be finite and nonzero")
-        window_bounded = self.window_size_left is None or self.window_size_left + 1 + int(sk) + 2 * 128 <= 2**31 - 1
-        window_in_envelope = self.window_size_left is None or (d == 64 and window_bounded)
-        natural = select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=int(d), d_v=int(d))
-        if self.deterministic:
-            # Each kernel of the pair owns its output tiles; outside the accumulation envelope and off the pair's measured parts the
-            # recompute body serves dense MHA.
-            pair_part = natural == ACCUMULATION and window_bounded and tuple(cc) in PAIR_CCS
-            require(h == hk or pair_part, "grouped deterministic backward requires the accumulation envelope on a measured part")
-            self._implementation = PAIR if pair_part else RECOMPUTE
-            if self._implementation == PAIR:
-                masked = self.is_causal or self.window_size_left is not None
-                sms = 0 if masked else multiprocessor_count(resolve_device(self.q_desc.device))
-                self._pair_split = pair_split(int(b), int(hk), int(sk), int(sq), int(h) // int(hk), sms, masked)
-        else:
-            self._implementation = natural if window_in_envelope else RECOMPUTE
+        self._implementation = self._choose_dense_implementation(cc, version)
+        require(h == hk or self._implementation == PAIR, "grouped deterministic backward requires the accumulation envelope on a measured part")
+        if self._implementation == PAIR:
+            masked = self.is_causal or self.window_size_left is not None
+            sms = 0 if masked else multiprocessor_count(resolve_device(self.q_desc.device))
+            self._pair_split = pair_split(int(b), int(hk), int(sk), int(sq), int(h) // int(hk), sms, masked)
         self._is_supported = True
         return True
 
+    def _choose_dense_implementation(self, cc, version):
+        from .d128_selection import default_dense_implementation
+
+        natural = select_implementation(
+            cc,
+            version,
+            int(self.batch_size),
+            int(self.h_q),
+            int(self.s_q_max),
+            int(self.s_k_max),
+            self.scale_softmax,
+            d_qk=int(self.head_dim_qk),
+            d_v=int(self.head_dim_v),
+        )
+        # Each kernel of the deterministic pair owns its output tiles. Outside
+        # its admitted parts and accumulation envelope, dense MHA uses recompute.
+        return default_dense_implementation(natural, cc, self.head_dim_qk, int(self.s_k_max), self.window_size_left, self.deterministic)
+
+    def _check_grouped_implementation(self):
+        from .prepared_sm100_d128_grouped_2cta import check_support_selected
+
+        return check_support_selected(self)
+
+    def _compile_grouped_implementation(self):
+        from .prepared_sm100_d128_grouped_2cta import compile_plan_selected
+
+        return compile_plan_selected(self)
+
     def compile(self):
         if self._uses_grouped_heads() and not self._pair_grouped():
-            from .prepared_sm100_d128_grouped_2cta import compile_plan_selected
-
-            self._ensure_support_checked()  # resolves cta_pair and records the chosen body first
-            self._prepared = compile_plan_selected(self)
+            self._ensure_support_checked()
+            self._prepared = self._compile_grouped_implementation()
             self._compiled_kernel = self._prepared.artifact
             return
         if self.thd:

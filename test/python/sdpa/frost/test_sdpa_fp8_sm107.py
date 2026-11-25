@@ -4,7 +4,7 @@
 """SM107 (Rubin) routing of the per-tensor FP8 d128 SDPA kernel.
 
 The adapter routes cc10.7 per-tensor-FP8 graphs to the SM107 sibling module
-(``sm107/prefill_d128_fp8.py``), which bakes the Rubin dense-FP8 K=64 MMA
+(``sm107/d128_fp8_multi_q/kernel.py``), which bakes the Rubin dense-FP8 K=64 MMA
 geometry; Blackwell keeps the untouched SM100 module. These tests pin the
 routing and both modules' derived constants — device-independent (everything
 here happens before any compile). End-to-end coverage rides the existing
@@ -26,6 +26,14 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestRaggedBackwardMetadata:
+    """Keep the shared backward metadata regression in the SM107 CI selection."""
+
+    from sdpa.graph.test_ragged_offset_multiplier import test_fp8_ragged_sm107_existing_route as _ragged
+
+    test_offset_units_and_declared_totals = staticmethod(_ragged)
+
+
 class TestServiceRegisterRelease:
     from service_register_release_checks import test_sm107_service_register_release as _release
 
@@ -38,6 +46,71 @@ class TestNativeHalfRegisterRelease:
     from sm107_register_release_checks import test_service_warpgroup_has_one_register_release as _release
 
     test_service_warpgroup_has_one_register_release = staticmethod(_release)
+
+
+@requires_rubin
+@pytest.mark.L0
+class TestBiasForwardRegressions:
+    """Keep explicit-loader and native-layout regressions in the CI selection."""
+
+    from sdpa.frost import test_sdpa_bias_max_form_sm107 as _max_form
+    from sdpa.frost import test_sdpa_bias_tile_n_additive_sm107 as _tile_n
+
+    test_default_loader = staticmethod(_max_form.test_the_default_pick_runs_the_hardware_form_on_the_kv_mask_only_plan_and_the_software_tree_with_a_bias)
+    test_tile_n_reference = staticmethod(_tile_n.test_tile_n_64_cells_match_the_fp64_oracle_and_the_128_wide_rendering)
+    test_bhsd_strides = staticmethod(_tile_n.test_bhsd_contiguous_activations_use_the_declared_strides)
+    test_strided_outer_axes = staticmethod(_tile_n.test_strided_outer_axes_are_addressed_through_the_declared_strides)
+    test_alignment_declines = staticmethod(_tile_n.test_non_16_byte_outer_strides_are_typed_declines_on_real_graphs)
+
+
+@requires_rubin
+@pytest.mark.L0
+class TestHalfForwardOwnerRegressions:
+    """Pin native half bodies without relying on standalone selection switches."""
+
+    from sdpa.frost import test_sdpa_fwd_dsl_sm107 as _half
+    from sdpa.frost import native_d128_dense_paged_sm107_checks as _small_paged
+    from sdpa.frost import native_d512_paged_sm107_checks as _wide_paged
+    from sdpa.frost import test_sdpa_fwd_d512_2x2_sm107 as _two_by_two
+    from sdpa.frost import test_sdpa_single_sequence_setup_sm107 as _single
+
+    _d512_role_split = staticmethod(_half._d512_role_split)
+    test_role_split_reference = staticmethod(_half.test_d512_half_prefolded_scale_matches_the_oracle)
+    test_role_split_dead_rows = staticmethod(_half.test_d512_half_prefolded_scale_keyless_and_dead_rows)
+    test_role_split_masked_leading_tile = staticmethod(_half.test_d512_half_masked_leading_tile_keeps_rows_with_later_keys_finite)
+    test_role_split_thd = staticmethod(_half.test_d512_half_prefolded_scale_thd)
+    test_role_split_sink_stats = staticmethod(_half.test_d512_half_prefolded_scale_sink_and_stats)
+    test_explicit_role_split = staticmethod(_two_by_two.test_two_by_two_role_split_untouched_when_twin_off)
+    test_small_paged_boundaries = staticmethod(_small_paged.test_page_boundaries)
+    test_wide_paged_boundaries = staticmethod(_wide_paged.test_boundaries)
+    test_single_sequence_batch_bytes = staticmethod(_single.test_single_sequence_batch_bytes)
+
+
+@requires_rubin
+@pytest.mark.L0
+class TestSparseDecodeForwardRegressions:
+    """Exercise the reference ABI and explicit decode body through the CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_sparse_sm107 as _sparse
+    from sdpa.frost import test_sdpa_fwd_decode_d256_sm107 as _decode
+
+    test_sparse_dense_reference = staticmethod(_sparse.test_identity_vs_the_dense_kernel_below_the_bound)
+    test_decode_qwen_token_tile = staticmethod(_decode.test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units)
+    test_decode_independent_pool_layouts = staticmethod(_decode.test_paged_decode_independent_pool_layouts)
+    test_decode_wide_output_replay = staticmethod(_decode.test_decode_64_column_tile_wide_output_replays)
+    test_wide_tile_no_spill = staticmethod(_decode.test_sm107_decode_wide_tile_renderings_carry_no_spill)
+    test_column_groups = staticmethod(_decode.test_decode_kernel_four_column_groups)
+    test_source_twin = staticmethod(_decode.test_sm107_decode_body_matches_the_sm100_body)
+
+
+@requires_rubin
+class TestD256HalfSplitOrigins:
+    """Keep the shared half D256 origin regression in the selected SM107 CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_d256_split_origins_determinism as _origins
+
+    test_matching_extension = staticmethod(_origins.test_split_origins_require_matching_extension)
+    test_reference_replay_batch_and_golden = staticmethod(_origins.test_origins_reference_replay_batch_and_golden)
 
 
 @requires_rubin
@@ -67,7 +140,7 @@ class TestWideFp8PhysicalOrigins:
 
     from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
 
-    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [(256, 1), (512, 2)])
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [(256, 1), (512, 4)])
 
 
 @requires_rubin
@@ -102,9 +175,9 @@ def test_sm107_missing_dsl_target_declines_before_compile(monkeypatch, dsl_versi
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
     caps = {spec.name: spec.capabilities for spec in engines.ENGINE_SPECS}
-    error = engines.mismatch(caps[engines.engine_name(arch="sm107", fp8=True)], _fp8_facts(device_cc=(10, 7)))
+    error = engines.mismatch(caps["sdpa_fwd_sm107_d128_fp8_multi_q"], _fp8_facts(device_cc=(10, 7)))
     assert "sm_107a" in error and dsl_version in error
-    assert engines.mismatch(caps[engines.engine_name(arch="sm100", fp8=True)], _fp8_facts()) is None
+    assert engines.mismatch(caps["sdpa_fwd_sm100_d128_fp8_multi_q"], _fp8_facts()) is None
     with pytest.raises(NotImplementedError, match="sm_107a") as exc:
         _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=None).check_support()
     assert dsl_version in str(exc.value)
@@ -140,10 +213,11 @@ def test_sm100_module_unchanged():
 
 
 def test_sm107_per_tensor_fp8_native_shapes():
-    """Both architecture lines provide native per-tensor D64 geometry."""
-    shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == shapes
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0)) == shapes
+    """Blackwell and Rubin share the D64 through D512 flavors. Blackwell also serves absorbed MLA."""
+    shared = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == shared
+    for cc in ((10, 0), (10, 3)):
+        assert _sm100_fp8_shapes(pertensor=True, device_cc=cc) == shared | {(576, 512)}
 
 
 @pytest.mark.parametrize("cga", [1, 2])
@@ -167,23 +241,24 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     from cudnn.sdpa.fwd import engines
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(fp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
+    sm100_envelopes = caps[engines.engine_name(arch="sm100", fp8=True)]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
-    assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    assert sm100.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert (sm107.sm_lo, sm107.sm_hi) == (107, 109)
+    assert sm100.d_shapes == frozenset({(64, 64), (128, 128)})
+    assert sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert sm100_envelopes.d_shapes == sm107.d_shapes | {(576, 512)}
     assert dict(sm107.cgas_by_d_shape)[(64, 64)] == frozenset({1, 2})
     assert (64, 64) in sm107.split_d_shapes and (64, 64) in sm107.pack_gqa_d_shapes
     assert (64, 64) not in sm107.thd_d_shapes
-    # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
-    # so a row that gains a flavor must gain its floor in the same commit --
-    # otherwise mismatch() admits a graph check_support kills (contract 8b').
-    assert dict(sm107.d_envelope_floors) == dict(sm100.d_envelope_floors)
-    # Both rows keep the D512 role-split floor; smaller flavors serve their
-    # qualified aligned dense envelopes through bounded TMA descriptors.
-    assert sm100.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
+    # Both rows share the D512 floor. On Blackwell, the D576 floor prevents narrower
+    # pairs from selecting the exact MLA flavor through the envelope matcher.
+    assert dict(sm107.d_envelope_floors) == {(512, 512): 256}
+    assert dict(sm100_envelopes.d_envelope_floors) == {(512, 512): 256, (576, 512): 512}
+    assert sm100.d_envelope_floors == ()
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -251,7 +326,7 @@ def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(fp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, under the SM100 d128 /
@@ -295,8 +370,8 @@ def test_softmax_half_declines_by_row_domain():
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(fp8=True)]
-    sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
+    sm107 = caps["sdpa_fwd_sm107_d128_fp8_multi_q"]
     half = _c.data_type.HALF
 
     assert "softmax_precision" in engines.mismatch(sm100, facts((10, 0), half), None)
@@ -304,8 +379,8 @@ def test_softmax_half_declines_by_row_domain():
     # It is not a tuning knob: the knob vocabulary has no such axis.
     assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
     # And the rows keep their arch lanes regardless of the attribute.
-    assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
-    assert "SM100-106" in engines.mismatch(sm100, facts((10, 7)), None)
+    assert "on SM107" in engines.mismatch(sm107, facts((10, 0)), None)
+    assert "SM100-106" in engines.mismatch(caps[engines.engine_name(fp8=True)], facts((10, 7)), None)
 
 
 @pytest.mark.parametrize("rubin", [True, False], ids=["sm107", "sm100"])
@@ -560,7 +635,7 @@ def _run_fp8_d128_leading_tile(q8, k8, v8, *, precision, scale, bottom_right, wi
     )
     assert api.check_support()
     api.compile()
-    assert api._k_mod.__file__.endswith("sm107/prefill_d128_fp8.py"), api._k_mod.__file__
+    assert api._k_mod.__file__.endswith("sm107/d128_fp8_multi_q/kernel.py"), api._k_mod.__file__
     unit = torch.ones(1, device="cuda", dtype=torch.float32)
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
     kw = dict(descale_q=unit, descale_k=unit, descale_v=unit, workspace=ws)
@@ -701,7 +776,7 @@ def test_sm107_mxfp8_thd_shapes_match_the_row():
     from cudnn.sdpa.fwd.config_sm107 import _MXFP8_THD_FLAVORS, SM107_MXFP8_THD_SHAPES
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    rubin = caps[engines.engine_name(arch="sm107", mxfp8=True)]
+    rubin = engines.sm100_legacy_policy_spec(engines.engine_name(arch="sm107", mxfp8=True)).capabilities
     assert rubin.thd and rubin.cu_seq_len and rubin.thd_padded_stats
     assert rubin.thd_d_shapes is SM107_MXFP8_THD_SHAPES
     assert _SM107_MXFP8_THD_SHAPES is SM107_MXFP8_THD_SHAPES
@@ -789,57 +864,71 @@ def test_fp8_envelope_mismatch_rules():
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     sm100 = caps[engines.engine_name(fp8=True)]
-    assert engines.mismatch(sm100, _fp8_facts()) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
+    d192 = caps["sdpa_fwd_sm100_d192_fp8_multi_q"]
+    small = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
+    d256 = caps["sdpa_fwd_sm100_d256_fp8_single_q"]
+    d512 = caps["sdpa_fwd_sm100_d512_fp8_role_split"]
+    assert engines.mismatch(small, _fp8_facts()) is None
+    assert engines.mismatch(small, _fp8_facts(d_qk=96, d_v=64)) is None
     # D192 and D256 serve their aligned dense head envelopes.
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128)) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256)) is None
+    assert engines.mismatch(d192, _fp8_facts(d_qk=192, d_v=128)) is None
+    assert "owned by" in engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128))
+    assert engines.mismatch(d256, _fp8_facts(d_qk=256, d_v=256)) is None
     for dq, dv in ((16, 144), (224, 16), (160, 160), (224, 208)):
         for arch, cc in (("sm100", (10, 0)), ("sm107", (10, 7))):
-            row = caps[engines.engine_name(arch=arch, fp8=True)]
+            row = caps[f"sdpa_fwd_{arch}_d256_fp8_single_q"]
             facts = _fp8_facts(device_cc=cc, d_qk=dq, d_v=dv)
             assert engines.mismatch(row, facts) is None, (arch, dq, dv)
             assert engines._selected_d_shape(row, facts) == (256, 256)
     for dq, dv in ((160, 96), (176, 128), (192, 96)):
-        assert engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)) is None
+        assert engines.mismatch(d192, _fp8_facts(d_qk=dq, d_v=dv)) is None
     assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=192, d_v=128)) == (192, 128)
     assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=256, d_v=256)) == (256, 256)
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=256))
-    assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
-    assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
+    assert engines.mismatch(small, _fp8_facts(d_qk=88, d_v=88)) is not None
+    assert "dense-only" in engines.mismatch(small, _fp8_facts(thd=True, padded=True))
+    assert engines.mismatch(small, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
+    for d in (64, 128):
+        assert "owned by" in engines.mismatch(sm100, _fp8_facts(d_qk=d, d_v=d))
     # SM100 carries THD at each native per-tensor FP8 shape.
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True)) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256)) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256, thd=True, padded=True)) is None
+    assert engines.mismatch(d192, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True)) is None
+    assert engines.mismatch(d256, _fp8_facts(d_qk=256, d_v=256)) is None
+    assert engines.mismatch(d256, _fp8_facts(d_qk=256, d_v=256, thd=True, padded=True)) is None
     # d512 is a NATIVE shape (accepted exactly, dense and THD) and serves the
     # (256, 512] envelope band on BOTH head dims -- at most 2x zero-padding.
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=512)) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=512, thd=True, padded=True)) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=448)) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=464, d_v=368)) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=272)) is None
+    assert engines.mismatch(d512, _fp8_facts(d_qk=512, d_v=512)) is None
+    assert engines.mismatch(d512, _fp8_facts(d_qk=512, d_v=512, thd=True, padded=True)) is None
+    for d in (256, 512):
+        assert "owned by" in engines.mismatch(sm100, _fp8_facts(d_qk=d, d_v=d))
+    assert engines.mismatch(d512, _fp8_facts(d_qk=384, d_v=448)) is None
+    assert engines.mismatch(d512, _fp8_facts(d_qk=464, d_v=368)) is None
+    assert engines.mismatch(d512, _fp8_facts(d_qk=272, d_v=272)) is None
     # Straddling the d512 floor declines rather than routing onto that kernel.
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=128))
     # THD stays native-tile: the (256, 512] envelope band is dense-only.
-    assert "dense-only" in engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=448, thd=True, padded=True))
+    assert "dense-only" in engines.mismatch(d512, _fp8_facts(d_qk=384, d_v=448, thd=True, padded=True))
     # d % 16 still applies inside the band (TMA 16-byte global-stride rule).
-    assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=392, d_v=392))
+    assert engines.mismatch(d512, _fp8_facts(d_qk=392, d_v=392)) is not None
     # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case).
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
+    native_small = caps["sdpa_fwd_sm107_d128_fp8_multi_q"]
+    assert engines.mismatch(native_small, _fp8_facts(device_cc=(10, 7))) is None
     # Native SM107 serves the same aligned dense D192 envelope.
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
+    native192 = caps["sdpa_fwd_sm107_d192_fp8_multi_q"]
+    assert engines.mismatch(native192, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
+    assert "owned by" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128))
     assert engines._selected_d_shape(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) == (192, 128)
     for dq, dv in ((160, 96), (176, 128), (192, 96)):
-        assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)) is None, (dq, dv)
-    assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
+        assert engines.mismatch(native192, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)) is None, (dq, dv)
+    assert "dense-only" in engines.mismatch(native_small, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
     # INVERTED: the Rubin line gained a d512 per-tensor FP8 kernel, so the
     # native d512 shape is now SERVED rather than declined, and the (256, 512]
     # floor applies here exactly as on the SM100 row.
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=384, d_v=448)) is None
+    native512 = caps["sdpa_fwd_sm107_d512_fp8_role_split"]
+    assert engines.mismatch(native512, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
+    assert "owned by" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512))
+    assert engines.mismatch(native512, _fp8_facts(device_cc=(10, 7), d_qk=384, d_v=448)) is None
     # ...and straddling the floor declines on BOTH rows, identically.
     assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256))
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))
@@ -1210,7 +1299,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 
 # Fused epilogue gate on the per-tensor FP8 d256 kernel (PR-A, 2026-09-15)
 #
-# ``sm107/prefill_d256_fp8.py`` carries O := O * sigmoid(G) behind
+# ``sm107/d256_fp8_single_q/kernel.py`` carries O := O * sigmoid(G) behind
 # ``TemplateParams.epilogue_gate`` with a bf16 G (``GATE_STORAGE_DTYPE``), and
 # ``Amax_O`` became a COMPILE-TIME fact (``compile(has_amax=False)`` folds the
 # |o| tree and the atomic out) and, when requested, is the amax of the UNGATED
@@ -2178,6 +2267,67 @@ class TestNativeD256Fp8Split:
     test_omitted_scales = staticmethod(_scales)
 
     test_scalar_kv_tail = staticmethod(_tail)
+
+
+@requires_rubin
+class TestSmallFp8Implementation:
+    """Native and shared-decode public records through current bindings."""
+
+    from sm107_small_fp8_engine_checks import (
+        test_public_record_rebuild_rebind_and_retained_capture as _record,
+        test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
+        test_native_small_fp8_refilled_stage_warm_stress as _warm,
+    )
+
+    test_public_record = staticmethod(_record)
+    test_retired_record = staticmethod(_retired)
+    test_warm_stress = staticmethod(_warm)
+
+
+@requires_rubin
+class TestMidFp8Implementation:
+    """Public recipes retain native D192/D256 owners through binding/capture."""
+
+    from sm107_mid_fp8_engine_checks import (
+        test_public_record_rebuild_rebind_and_retained_capture as _record,
+        test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
+        test_mid_fp8_refilled_stage_warm_stress as _warm,
+        test_d256_pair_admission as _pair_admission,
+        test_d256_pair_body_reference_and_replay as _pair_replay,
+        test_d256_pair_refilled_stage_warm_stress as _pair_warm,
+        test_d256_pair_release_dependence as _pair_release,
+        test_d256_pair_batch_invariance as _pair_batch,
+        test_d192_cga1_causal_public_record as _cga1,
+        test_wide_envelopes_keep_the_adapter_block_output_decline as _block_output,
+    )
+
+    test_public_record = staticmethod(_record)
+    test_retired_record = staticmethod(_retired)
+    test_warm_stress = staticmethod(_warm)
+    test_d256_pair_admission = staticmethod(_pair_admission)
+    test_d256_pair_replay = staticmethod(_pair_replay)
+    test_d256_pair_warm_stress = staticmethod(_pair_warm)
+    test_d256_pair_release_dependence = staticmethod(_pair_release)
+    test_d256_pair_batch_invariance = staticmethod(_pair_batch)
+    test_cga1 = staticmethod(_cga1)
+    test_block_output_decline = staticmethod(_block_output)
+
+
+@requires_rubin
+class TestD512Fp8Implementation:
+    """A public recipe fixes the role-split body through binding and capture."""
+
+    from sm107_d512_fp8_engine_checks import (
+        test_public_record_rebuild_rebind_and_retained_capture as _record,
+        test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
+        test_independent_thd_origins as _origins,
+        test_d512_fp8_refilled_stage_warm_stress as _warm,
+    )
+
+    test_public_record = staticmethod(_record)
+    test_retired_record = staticmethod(_retired)
+    test_thd_origins = staticmethod(_origins)
+    test_warm_stress = staticmethod(_warm)
 
 
 @requires_rubin

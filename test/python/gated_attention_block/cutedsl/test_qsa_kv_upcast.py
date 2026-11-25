@@ -412,12 +412,11 @@ def _oracle(q, kd, vd, ids, lens, kv_lens, S_q, scale, top_k, *, per_token):
 
 
 def _rubin_engine():
-    from cudnn.sdpa.fwd.engines import engine_name
+    # D256 decode has its own implementation row; the broad prefill row no longer owns this shape.
+    return "sdpa_fwd_sm107_d256_swap_ab"
 
-    return engine_name(arch="sm107")
 
-
-def _dense_core(q, scratch, kv_len_t, *, B, S_q, scale):
+def _dense_core(q, scratch, kv_len_t, *, B, S_q, scale, pack_gqa):
     """The bf16 d256 DECODE tile over the scratch as a plain PADDED dense SDPA: one 'batch' per item, the item's packed
     query-head group as the Q rows (``S_q' = 1``), ``seq_len_kv = kv_len_t``; the Rubin FROST engine pinned and the serving
     template asserted.  Returns ``(O [B, S_q, H_q, D] bf16, LSE [B, H_q, S_q] fp32)``."""
@@ -444,11 +443,17 @@ def _dense_core(q, scratch, kv_len_t, *, B, S_q, scale):
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     index = next((i for i, n in enumerate(names) if n == engine or n.startswith(engine + "[")), None)
     assert index is not None, f"no plan for the Rubin engine {engine!r}; plans={names}"
+    engine_id, knobs = g.get_engine_and_knobs_at_index(index)
+    # Exercise both legal packings independently of which one heuristics ranks or offers.
+    knobs[cudnn.knob_type.PACK_GQA] = pack_gqa
+    g.create_execution_plan(engine_id, knobs)
+    index = g.get_execution_plan_count() - 1
     g.select_plan(index)
     g.check_support()
     g.build_plans()
     served = g._compiled_plans[g._plan_index]._compiled.kernel_template
-    assert served == "decode_d256_f16", f"the dense core over the scratch must be the d256 decode tile, got {served} ({names[index]})"
+    assert served == "decode_d256_f16", f"the dense core over the scratch must be the d256 decode tile, got {served} ({g.get_plan_name_at_index(index)})"
+    assert g.get_engine_and_knobs_at_index(index)[1][cudnn.knob_type.PACK_GQA] == pack_gqa
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -582,7 +587,8 @@ def test_run_form_declines_are_typed():
         pytest.param(2, 2, [3000, 1030], 48, True, 64, True, id="pertoken-sq2-B2-page48-top64"),
     ],
 )
-def test_cast_then_dense_decode_tile_matches_the_oracle_on_the_dequantized_pool(B, S_q, kv_lens, P, hnd, top_k, per_token):
+@pytest.mark.parametrize("pack_gqa", [0, 1], ids=["unpacked", "packed"])
+def test_cast_then_dense_decode_tile_matches_the_oracle_on_the_dequantized_pool(B, S_q, kv_lens, P, hnd, top_k, per_token, pack_gqa):
     q, k, v, gen = _inputs(B, S_q, kv_lens, seed=5)
     scale = 1.0 / math.sqrt(D)
     pk, kd, k_scale = _quantize(k)
@@ -592,7 +598,7 @@ def test_cast_then_dense_decode_tile_matches_the_oracle_on_the_dequantized_pool(
     outs = _run_cast(k_pool, v_pool, table, ids, lens, kv_lens, k_scale, v_scale, B=B, S_q=S_q, top_k=top_k, P=P, per_token=per_token, launches=1)
     scratch, kv_len_t = outs[0]
     _check_cast(outs, kd, vd, ids, lens, kv_lens, B=B, S_q=S_q, top_k=top_k, per_token=per_token)
-    o, lse = _dense_core(q, scratch, kv_len_t, B=B, S_q=S_q, scale=scale)
+    o, lse = _dense_core(q, scratch, kv_len_t, B=B, S_q=S_q, scale=scale, pack_gqa=pack_gqa)
     ref_o, ref_lse = _oracle(q, kd, vd, ids, lens, kv_lens, S_q, scale, top_k, per_token=per_token)
     of = o.float()
     dead = torch.isinf(ref_lse)  # [B, H, S]

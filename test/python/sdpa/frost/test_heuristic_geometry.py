@@ -14,11 +14,34 @@ from frost_test_utils import requires_dsl
 import cudnn
 from cudnn.sdpa.fwd import heuristics as heur
 from cudnn.sdpa.fwd.config_sm100 import CfgD512, cga_ctas
-from cudnn.sdpa.fwd.engines import ENGINE_SPECS, effective_cgas, mismatch
+from cudnn.sdpa.fwd.engines import ENGINE_SPECS, effective_cgas, mismatch, sm100_legacy_policy_spec
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 pytestmark = pytest.mark.L0
-SPEC = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+# Geometry-model tests exercise the shared union policy. Public exact-head
+# admission belongs to the explicit owners, covered by their record tests.
+SPEC = sm100_legacy_policy_spec()
+
+
+def _d192_owner(facts, knobs, fallback=SPEC):
+    if facts.device_cc in ((10, 0), (10, 3)) and (facts.d_qk, facts.d_v) == (192, 128):
+        name = "sdpa_fwd_sm100_d128_single_q" if facts.thd and not facts.has_paged_kv and knobs.cga == 1 else "sdpa_fwd_sm100_d192_multi_q"
+        return next(s for s in ENGINE_SPECS if s.name == name)
+    if facts.device_cc == (10, 7) and (facts.d_qk, facts.d_v) == (192, 128):
+        name = "sdpa_fwd_sm107_shared_single_q" if facts.thd and not facts.has_paged_kv and knobs.cga == 1 else "sdpa_fwd_sm107_d192_multi_q"
+        return next(s for s in ENGINE_SPECS if s.name == name)
+    return fallback
+
+
+def _rubin_offered():
+    from cudnn.engines.manifest import MANIFEST
+
+    return next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()
+
+
+def _rubin_record(facts, knobs):
+    geometry = heur.select_sm107_half_geometry(facts, knobs)
+    return next(s for s in ENGINE_SPECS if s.name == geometry.implementation), geometry.canonical_knobs(knobs)
 
 
 def _facts(**kw):
@@ -92,7 +115,9 @@ def test_d512_model_counts_all_roles_in_split_and_unsplit(monkeypatch):
         return real(**kw)
 
     monkeypatch.setattr(heur, "choose_split_kv", recording)
-    plans = heur.recommend("A", _facts(h_kv=1, s_q=1, s_kv=131072, d_qk=512, d_v=512), {SPEC.name: 20500})
+    plans = heur.recommend(
+        "A", _facts(h_kv=1, s_q=1, s_kv=131072, d_qk=512, d_v=512), {"sdpa_fwd_sm100_d512_role_split": 20521, "sdpa_fwd_sm100_d512_2x2": 20522}
+    )
     assert plans and seen
     # D512 is scored twice per leg: with the physical 4-CTA cluster and with the
     # MMA width the constants were fitted with; the physical count may only
@@ -118,8 +143,7 @@ def test_each_geometry_runner_recomputes_split_and_obeys_cap(monkeypatch):
 
     monkeypatch.setattr(heur, "_split_points", recording)
     facts = _facts(h_q=32, h_kv=4, s_q=17, s_kv=8192)
-    plans = heur.recommend("A", facts, {SPEC.name: 20500})
-    knobs = [p.knobs for p in plans]
+    knobs = heur._knob_sets(SPEC, facts)
     assert len(knobs) == len(set(knobs)) <= heur._MAX_SETS_PER_ENGINE
     assert {k.pack_gqa for k in knobs} == {False, True}
     # 17 unpacked rows fit one 128-row decode tile (cga 1); the 17 * 8 packed rows overflow it, so both widths serve
@@ -186,13 +210,15 @@ def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, ba
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107") if d == 256 else SPEC
+    spec = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107") if d == 256 else SPEC
     facts = _paged_split_facts(b=batch, h_q=h_q, h_kv=h_kv, d_qk=d, d_v=d, device_cc=device_cc, wants_stats=wants_stats)
     monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts, **_: (3, packed), raising=False)
     selected = heur._knob_sets(spec, facts)[0]
     assert (selected.cga, selected.split_kv, selected.pack_gqa) == (cga, 3, packed)
+    if device_cc == (10, 7):
+        spec, selected = _rubin_record(facts, selected)
     assert mismatch(spec.capabilities, facts, selected) is None
-    assert placement.place(spec, facts) == placement.LEAD
+    assert placement.place(spec, facts, selected) == placement.LEAD
 
 
 @requires_dsl
@@ -255,16 +281,17 @@ def test_nonpaged_split_choice_transport_and_native_fallback(monkeypatch, wants_
     from cudnn.sdpa.fwd import placement
 
     facts = _mla_split_facts(wants_stats=wants_stats, device_cc=device_cc, d_qk=d, **({"h_q": 8, "h_kv": 2} if packed else {}))
+    policy = heur.sm100_legacy_policy_spec()
     with monkeypatch.context() as m:
         m.setattr(heur, "nonpaged_thd_split_choice", lambda caps, facts: (3, packed))
-        selected = heur._knob_sets(SPEC, facts)[0]
+        selected = heur._knob_sets(policy, facts)[0]
         assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, packed)
-        assert mismatch(SPEC.capabilities, facts, selected) is None
-        assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
+        assert mismatch(_d192_owner(facts, selected).capabilities, facts, selected) is None
+        assert placement._place_sm100_f16(policy.capabilities, facts) == placement.LEAD
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", type("PreviousNativeBinder", (), {}))
-    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, facts) == (1, False)
-    assert all(k.split_kv in (None, 1) for k in heur._knob_sets(SPEC, facts))
-    assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.TRAIL
+    assert heur.nonpaged_thd_split_choice(policy.capabilities, facts) == (1, False)
+    assert all(k.split_kv in (None, 1) for k in heur._knob_sets(policy, facts))
+    assert placement._place_sm100_f16(policy.capabilities, facts) == placement.TRAIL
 
 
 @requires_dsl
@@ -288,7 +315,8 @@ def test_nonpaged_split_choice_obeys_physical_launch_bounds(batch, heads, q, kv,
         tiles = min(batch * len(range(0, q, 128 // g)), (tokens + batch * (128 // g - 1)) // (128 // g))
         assert tiles * (heads // g) * splits <= sm_count * (2 if d == 128 else 1)
         assert len(range(0, kv, 128)) // splits >= 4
-        assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
+        knobs = heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)
+        assert mismatch(_d192_owner(facts, knobs).capabilities, facts, knobs) is None
     elif not sm_count:
         assert (splits, packed) == (1, False)
 
@@ -299,7 +327,7 @@ def test_nonpaged_split_choice_obeys_physical_launch_bounds(batch, heads, q, kv,
 def test_packed_split_override_requires_bounded_workspace(capacity, paged, d):
     facts = _paged_split_facts(shape_overrides=True, max_total_seq_len_q=capacity, has_paged_kv=paged, d_qk=d)
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)
-    assert (mismatch(SPEC.capabilities, facts, knobs) is None) == (capacity in (64, 128))
+    assert (mismatch(_d192_owner(facts, knobs).capabilities, facts, knobs) is None) == (capacity in (64, 128))
 
 
 @requires_dsl
@@ -348,23 +376,26 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
+    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_sm107_shared_single_q" if device_cc == (10, 7) else "sdpa_fwd_sm100_d128_single_q"))
     facts = _mla_split_facts(d_qk=128, h_q=8, h_kv=2, device_cc=device_cc)
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=3, pack_gqa=pack_gqa)
     assert mismatch(spec.capabilities, facts, knobs) is None
     unsplit = mismatch(spec.capabilities, facts, replace(knobs, split_kv=1))
     if device_cc == (10, 7):
-        assert unsplit is None  # Native D128 THD prefill also admits explicit CGA1.
+        assert unsplit is not None
+        native = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d128_multi_q")
+        assert mismatch(native.capabilities, facts, replace(knobs, split_kv=1)) is None
     else:
         assert unsplit is not None
     for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True), replace(facts, d_qk=256, d_v=256)):
         assert mismatch(spec.capabilities, invalid, knobs) is not None
     mla = replace(facts, d_qk=192)
-    assert mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False)) is None
+    mla_spec = _d192_owner(mla, knobs, spec)
+    assert mismatch(mla_spec.capabilities, mla, replace(knobs, pack_gqa=False)) is None
     previous = type("PreviousNativeBinder", (), {"supports_nonpaged_packed_split": True, "supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
     assert "matching native" in mismatch(spec.capabilities, facts, knobs)
-    assert "matching native" in mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False))
+    assert "matching native" in mismatch(mla_spec.capabilities, mla, replace(knobs, pack_gqa=False))
 
 
 @requires_dsl
@@ -471,7 +502,7 @@ def test_nonpaged_d128_rubin_split_obeys_physical_wave_budget(monkeypatch, batch
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    spec = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107")
     total = q + batch - 1 if bounded_total else None
     facts = _mla_split_facts(d_qk=128, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, device_cc=(10, 7), device_sm_count=204, max_total_seq_len_q=total)
     splits, packed = heur.nonpaged_thd_split_choice(spec.capabilities, facts)
@@ -491,7 +522,8 @@ def test_nonpaged_d128_rubin_split_obeys_physical_wave_budget(monkeypatch, batch
         # Rubin's budget: two waves.
         assert tiles * (h_q // group) * splits <= 2 * 204
         assert len(range(0, kv, 128)) // splits >= 4
-        assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
+        owner, record = _rubin_record(facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed))
+        assert mismatch(owner.capabilities, facts, record) is None
 
 
 @requires_dsl
@@ -559,13 +591,14 @@ def test_nonpaged_d128_rubin_short_kv_split_needs_the_cache_ratio(monkeypatch):
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    rubin = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    rubin = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107")
     kv = (heur._SM107_THD_SPLIT_MIN_KV + 2048) // 2
     fits = kv // heur._SM107_THD_SPLIT_SHORT_KV_RATIO
     facts = lambda q, cc, sms: _mla_split_facts(d_qk=128, b=1, h_q=8, h_kv=2, s_q=q, s_kv=kv, device_cc=cc, device_sm_count=sms)
     splits, packed = heur.nonpaged_thd_split_choice(rubin.capabilities, facts(fits, (10, 7), 204))
     assert splits > 1, "an underfilled short-cache launch inside the ratio splits"
-    assert mismatch(rubin.capabilities, facts(fits, (10, 7), 204), heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
+    owner, record = _rubin_record(facts(fits, (10, 7), 204), heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed))
+    assert mismatch(owner.capabilities, facts(fits, (10, 7), 204), record) is None
     assert heur.nonpaged_thd_split_choice(rubin.capabilities, facts(fits * 2, (10, 7), 204)) == (1, False), "past the ratio it does not"
     assert heur.nonpaged_thd_split_choice(SPEC.capabilities, facts(fits, (10, 0), 148)) == (1, False), "SM100 keeps 2048"
 
@@ -597,7 +630,9 @@ def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatc
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
     facts = _paged_split_facts(device_cc=(10, 7), device_sm_count=204)
     for packing in (False, True):
-        assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packing)) is None
+        owner, record = _rubin_record(facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packing))
+        assert owner.name == "sdpa_fwd_sm107_d128_multi_q"
+        assert mismatch(owner.capabilities, facts, record) is None
     assert effective_cgas(spec.capabilities, replace(facts, has_paged_kv=False, page_size=0), 1) == frozenset({1, 2})
     for other in (replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
         assert 1 not in effective_cgas(spec.capabilities, other, 1)
@@ -617,7 +652,7 @@ def test_d256_thd_split_explicit_contract(monkeypatch, splits, cga, device_cc, p
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
+    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_sm107_shared_d256_lookahead" if device_cc == (10, 7) else "sdpa_fwd_sm100_d256_lookahead"))
     facts = _paged_split_facts(device_cc=device_cc, d_qk=256, d_v=256, has_paged_kv=paged, page_size=16 if paged else 0)
     knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
     assert mismatch(spec.capabilities, facts, knobs) is None
@@ -639,7 +674,8 @@ def test_d256_thd_split_explicit_contract(monkeypatch, splits, cga, device_cc, p
     previous = type("PreviousNativeBinder", (), {"supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
     assert "matching native" in mismatch(spec.capabilities, facts, knobs)
-    assert mismatch(spec.capabilities, facts, replace(knobs, split_kv=1)) is None
+    unsplit_spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d256_lookahead") if device_cc == (10, 7) and not paged else spec
+    assert mismatch(unsplit_spec.capabilities, facts, replace(knobs, split_kv=1)) is None
 
 
 @requires_dsl
@@ -782,6 +818,36 @@ def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc
 
 
 @requires_dsl
+@pytest.mark.parametrize(
+    "s_q,causal,window,sink,d,sm90",
+    [
+        (1, False, None, False, 128, True),  # a single-row graph's facts drop its no-op causal mask
+        (4, True, None, False, 128, True),
+        (16, True, None, False, 256, True),
+        (4, True, 128, False, 128, False),
+        (4, True, None, True, 128, False),
+        (32, True, None, False, 128, False),
+        (4, True, None, False, 64, False),
+    ],
+)
+def test_sm90_decode_split_uses_its_own_constants(monkeypatch, s_q, causal, window, sink, d, sm90):
+    """SM90 half decode (S_q <= 16, no window or sink, the calibrated head dims) hands the chooser SM90's constants; the rest of the
+    row keeps the shared ones."""
+    from cudnn.sdpa.fwd.engines import _sm90_spec
+
+    spec = _sm90_spec()
+    seen = []
+    real = heur.choose_split_kv
+    monkeypatch.setattr(heur, "choose_split_kv", lambda **kw: seen.append(kw) or real(**kw))
+    facts = _facts(b=1, h_q=16, h_kv=2, s_q=s_q, s_kv=32768, d_qk=d, d_v=d, causal=causal, bottom_right=True, window_left=window, has_sink=sink)
+    heur._knob_sets(spec, replace(facts, device_cc=(9, 0), device_sm_count=132))
+    want = (heur._SM90_SPLIT_KV_CTA_COST, heur._SM90_SPLIT_KV_COMBINE_COST, heur._SM90_SPLIT_KV_COMBINE_FLOOR) if sm90 else (None, None, None)
+    assert seen or not sm90
+    for kw in seen:
+        assert (kw.get("cta_cost"), kw.get("combine_cost"), kw.get("combine_floor")) == want
+
+
+@requires_dsl
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("s_q,window", [(1, None), (1, 128), (4, None), (4, 128)])
 @pytest.mark.parametrize("sink", [True, False])
@@ -812,21 +878,25 @@ def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, 
         device_cc=(10, 7),
         device_sm_count=204,
     )
-    plans = heur.recommend("A", facts, {spec.name: 20505})
+    offered = _rubin_offered()
+    plans = heur.recommend("A", facts, offered)
     assert plans
     packed = heur.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=True, split_kv=1, sched_policy=0)
-    assert mismatch(spec.capabilities, facts, packed) is None
+    owner, record = _rubin_record(facts, packed)
+    assert mismatch(owner.capabilities, facts, record) is None
     assert _selected_d_shape(spec.capabilities, facts, packed) == ((64, 64) if d == 64 else (128, 128))
     if d == 128:
         assert any(p.knobs.pack_gqa for p in plans)
     split_packed = replace(packed, split_kv=2)
-    assert mismatch(spec.capabilities, facts, split_packed) is None
+    owner, record = _rubin_record(facts, split_packed)
+    assert mismatch(owner.capabilities, facts, record) is None
     assert _selected_d_shape(spec.capabilities, facts, split_packed) == (d, d)
     if sink and window is not None:
         assert all(p.knobs.split_kv == 1 for p in plans)  # a window bounds the KV walk; the sink split is not proposed
     else:
         assert any((p.knobs.split_kv or 1) > 1 for p in plans)
-    assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    by_id = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
+    assert all(mismatch(by_id[p.engine_id].capabilities, facts, p.knobs) is None for p in plans)
 
 
 @requires_dsl
@@ -860,7 +930,7 @@ def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s
         device_cc=(10, 7),
         device_sm_count=216,
     )
-    plans = heur.recommend("A", facts, {spec.name: 20505})
+    plans = heur.recommend("A", facts, _rubin_offered())
     one_wave = b * facts.h_q <= facts.device_sm_count
     packed_splits = any(p.knobs.pack_gqa and (p.knobs.split_kv or 1) > 1 for p in plans)
     assert plans[0].knobs.pack_gqa == (window is not None or not one_wave or packed_splits)

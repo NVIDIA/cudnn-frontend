@@ -3,9 +3,9 @@
 
 """End-to-end tests for the FROST SM100 DSL per-tensor FP8 SDPA-forward engine.
 
-Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) routed to
-the unified SM100 engine, which selects the d128/d128, d192/d128, or d256/d256
-kernel flavor. The d128 flavor also serves the dense d<=128 head-dim envelope via
+Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) through
+the architecture's per-tensor FP8 owners. Exact SM100/SM103 D192/V128, D256 and
+D512 use explicit implementation engines. The d128 flavor also serves the dense d<=128 head-dim envelope via
 TMA zero-padding. O is validated against an fp32-dequant reference, and ``Amax_O``
 is checked against pre-cast fp32 values.
 
@@ -31,6 +31,7 @@ from test_utils import torch_fork_set_rng
 from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import (
     _SM,
+    fp8_engine_names,
     assert_no_new_spills,
     make_dense_stats,
     requires_blackwell,
@@ -53,9 +54,9 @@ _ref_kwargs = fp8_reference._ref_kwargs
 
 pytestmark = [requires_blackwell, requires_dsl]
 
-# ONE per-tensor FP8 engine per arch line (sm100 = pre-Rubin Blackwell
-# 100-106, sm107 = the Rubin line): pin the engine that serves the device
-# under test.  Both lines carry all four native flavors -- d128, d192xd128,
+# The owner helper follows the device's architecture line and its migrated
+# implementation engines. Routing tests below additionally pin the exact body.
+# Both lines carry all four native flavors -- d128, d192xd128,
 # d256 and d512 (api_dsl._SM107_FP8_KERNEL_FILES mirrors _SM100_FP8_KERNEL_FILES)
 # -- so every flavor test below runs on both. Rubin D64/D128/D192x128 now
 # serve PackGQA, as does the native D256 pipeline. D512 remains unpacked.
@@ -302,7 +303,7 @@ def _run(
     g.create_execution_plans([cudnn.heur_mode.A])
     # ONE fp8 engine per arch line — kernel-flavor choice (d128 vs d192xd128,
     # and the head-dim envelope) happens inside the lowering.
-    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True), pack_gqa=pack_gqa)
+    _select_engine(g, fp8_engine_names(_D128_ARCH), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     if not stats:
@@ -680,10 +681,11 @@ def test_fp8_d256_dense_envelope_matches_adapter():
     from cudnn.sdpa.fwd import engines as eng
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, _SM100_FP8_ENVELOPE_FLOORS, _fp8_envelope_covers
 
-    assert _SM100_FP8_ENVELOPE_FLOORS == {(512, 512): 256}
+    assert _SM100_FP8_ENVELOPE_FLOORS == {(512, 512): 256, (576, 512): 512}
     for arch in ("sm100", "sm107"):
         spec = next(sp for sp in eng.ENGINE_SPECS if sp.name == f"sdpa_fwd_prefill_{arch}_fp8")
-        assert dict(spec.capabilities.d_envelope_floors) == {(512, 512): 256}, arch
+        expected_floors = {shape: floor for shape, floor in _SM100_FP8_ENVELOPE_FLOORS.items() if shape in spec.capabilities.d_shapes}
+        assert dict(spec.capabilities.d_envelope_floors) == expected_floors, arch
     shapes = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
@@ -1438,7 +1440,7 @@ def _run_thd(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True))
+    _select_engine(g, fp8_engine_names(_D128_ARCH))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amx_o: amax_o})
@@ -1816,7 +1818,7 @@ def test_fp8_sm100_device_scales_execute_reads_no_device_memory():
 #
 # Same cga4x1 role-split kernel family as the d512 f16 sibling; the FP8 fork
 # runs STAGES_KV = XFER_STAGES = 3 with a 128-column TMEM-resident Q and the
-# Blackwell K=32 QMMA step (the Rubin sibling sm107/prefill_d512_fp8.py takes
+# Blackwell K=32 QMMA step (the Rubin sibling sm107/d512_fp8_role_split/kernel.py takes
 # the K=64 form).  Both arch lines serve the flavor, so this section runs on
 # both; the MXFP8 d512 kernels have their own suites.
 # ===========================================================================
@@ -2141,7 +2143,7 @@ def test_fp8_gate_tail_graph_api(out_key):
 
 
 # ============================================================================ sm100 d128 per-tensor FP8: the exp2 MUFU / FMA split, pinned on the SASS per arch
-# The split (`sm100/prefill_d128_fp8.py`, the `_E2E_*` block) is invisible to every numerics test (O within the fp8 budget,
+# The split (`sm100/d128_fp8_multi_q/kernel.py`, the `_E2E_*` block) is invisible to every numerics test (O within the fp8 budget,
 # the fp32 row-sum moves by ~1e-5) and worth +4.5 % at S=8K on the llama chart layer on B200, so its only tripwire is the
 # SASS.  Two arms per specialization, one per cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds
 # (exp2_fma_split=True: 32 of the 128 columns per row on the FMA pipe) and sm_103a with the cc 10.3 record
@@ -2341,7 +2343,7 @@ def test_fp8_d192_final_p1_reuse_under_mma_skew(monkeypatch, mask, s_kv):
     loaded = {}
 
     def load_skewed(path, params, tag="template", extra_key=None):
-        if Path(path).name != "prefill_d192_d128_fp8.py" or Path(path).parent.name != "sm100":
+        if not Path(path).as_posix().endswith("sm100/d192_fp8_multi_q/kernel.py"):
             return original_loader(path, params, tag=tag, extra_key=extra_key)
         key = (path, params, extra_key)
         if key not in loaded:

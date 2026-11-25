@@ -22,6 +22,7 @@ def frost_qsa_fast_compact(
     g_last: cute.Tensor,
     g_ids: cute.Tensor,
     g_counts: cute.Tensor,
+    mode,
     T: I32,
     NB: I32,
 ):
@@ -30,7 +31,11 @@ def frost_qsa_fast_compact(
     warp = tidx // 32
     lane = tidx % 32
     row = bid * WARPS + warp
-    if row < T:
+    active = row < T
+    if cutlass.const_expr(mode is not None):
+        if active:
+            active = mode[I64(row // 128)] != 0
+    if active:
         p_sel = g_sel.iterator.raw_ptr()
         p_lo = g_lo.iterator.raw_ptr()
         p_hi = g_hi.iterator.raw_ptr()
@@ -114,11 +119,12 @@ def frost_qsa_fast_compact_host(
     last: cute.Tensor,
     ids: cute.Tensor,
     counts: cute.Tensor,
+    mode,
     stream: cuda_driver.CUstream,
 ):
     total = sel.shape[0]
     blocks = sel.shape[1]
-    frost_qsa_fast_compact(sel, lo, hi, first, last, ids, counts, I32(total), I32(blocks)).launch(
+    frost_qsa_fast_compact(sel, lo, hi, first, last, ids, counts, mode, I32(total), I32(blocks)).launch(
         grid=(cute.ceil_div(total, WARPS), 1, 1),
         block=(WARPS * 32, 1, 1),
         stream=stream,

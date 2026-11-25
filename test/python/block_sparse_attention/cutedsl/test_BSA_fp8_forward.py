@@ -1221,17 +1221,17 @@ def test_sm120_blk128_graph_replay_uses_runtime_metadata(monkeypatch):
         raise AssertionError("warmed native FP8 must reuse its compile cache")
 
     monkeypatch.setattr(interface.cute, "compile", forbid_compile)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        actual = run()
-    graph.replay()
-    first = actual.clone()
-    indices.fill_(1)
-    graph.replay()
-    expected = run()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    assert not torch.equal(actual, first)
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph, stream=stream):
+            actual = run()
+        graph.replay()
+        first = actual.clone()
+        indices.fill_(1)
+        graph.replay()
+        expected = run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert not torch.equal(actual, first)
 
 
 @pytest.mark.L0
@@ -1268,28 +1268,28 @@ def test_sm120_blk128_producer_replay_with_mixed_counts(v_block_size):
             run()
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        actual, lse = run()
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph, stream=stream):
+            actual, lse = run()
 
-    for iteration in range(4):
-        counts.copy_(counts.flip(-1))
-        for _ in range(5):
-            graph.replay()
-        expected = torch.zeros_like(actual, dtype=torch.float32)
-        expected_lse = torch.full_like(lse, -torch.inf)
-        for head in range(heads):
-            for qb in range(4):
-                count = int(counts[0, head, qb])
-                if count:
-                    blocks = indices[0, head, qb, :count].long()
-                    tokens = (blocks[:, None] * 128 + torch.arange(128, device="cuda")).flatten()
-                    tokens = tokens[tokens < sk]
-                    expected[0, head, qb * 128 : (qb + 1) * 128] = v8[0, head].float()[tokens].mean(dim=0) * vs[head]
-                    expected_lse[0, head, qb * 128 : (qb + 1) * 128] = torch.log(torch.tensor(tokens.numel(), device="cuda", dtype=torch.float32))
-        torch.cuda.synchronize()
-        torch.testing.assert_close(actual.float(), expected, atol=1e-4, rtol=5e-3)
-        torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
+        for iteration in range(4):
+            counts.copy_(counts.flip(-1))
+            for _ in range(5):
+                graph.replay()
+            expected = torch.zeros_like(actual, dtype=torch.float32)
+            expected_lse = torch.full_like(lse, -torch.inf)
+            for head in range(heads):
+                for qb in range(4):
+                    count = int(counts[0, head, qb])
+                    if count:
+                        blocks = indices[0, head, qb, :count].long()
+                        tokens = (blocks[:, None] * 128 + torch.arange(128, device="cuda")).flatten()
+                        tokens = tokens[tokens < sk]
+                        expected[0, head, qb * 128 : (qb + 1) * 128] = v8[0, head].float()[tokens].mean(dim=0) * vs[head]
+                        expected_lse[0, head, qb * 128 : (qb + 1) * 128] = torch.log(torch.tensor(tokens.numel(), device="cuda", dtype=torch.float32))
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual.float(), expected, atol=1e-4, rtol=5e-3)
+            torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
 
 
 @pytest.mark.L0

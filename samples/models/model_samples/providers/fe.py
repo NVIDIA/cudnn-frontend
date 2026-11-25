@@ -13,25 +13,251 @@ The entry compiles once per (rows, operand strides) per process; ``compile`` bui
 (``split_qkvz`` and ``state.RecurrentSlots``) and launches the compiled form once on them, so the first step of a run finds the
 kernel compiled and launched.  That first launch is measured: on some GPU classes it reserves device memory outside PyTorch's
 allocator (``first_launch``), which the plan's memory sentence allows for per class before anything is loaded.
+
+``fe.gdn_verify_fused`` calls ``cudnn.GdnVerifyFused``, the fused VERIFY step of the same layer (the same page): one launch
+per layer and step for ``T`` tokens per sequence at once, the recurrent state after every token written to a slot of its
+own.  The step shape is the entry's compile-time fact, so the row names the tokens per sequence as a field of the form
+(``TOKENS``) beside the two launch knobs, one row per count; the adapter passes the knobs to the entry and holds the slot
+table of every call to the row's ``TOKENS`` (a table of another count is a ``ValueError``: the wiring hands the block a
+step its row does not name), and the call log states the form for the step shape of the table the call handed the entry,
+never for the row's.  It is handed the step's slot table (``state.TokenSlots``: the slot of every (sequence,
+token), the first row of every sequence, the tokens the last step kept) and the pools in the layout of
+``state.RecurrentSlots`` at that many tokens.  The output is a buffer of the call's own.  The entry's facts take the step
+shape ``(sequences, tokens)``; the name of its kernel carries neither the launch knobs nor the tokens (they sit behind
+the cut of the symbol), so the form on the objects is what shows them.  Its determinism row says that one sequence alone
+is not byte-equal to the same sequence among several (``batch_note``): a run prints it, and gates no batch invariance
+on this row.
+
+``fe.attention_gate_quant_decode`` calls ``cudnn.AttentionGateQuantDecode``, the output gate of an attention layer fused with
+the static 8-bit quantisation of the out-projection's input (``docs/operations/attention/gate_quant_decode.md``): one launch
+per attention layer and step.  One compiled kernel serves every row count and layer.  The adapter hands the entry an output
+buffer of its own per call: the entry's own buffer is one for every row count and is overwritten by its next call.  Its
+kernel rounds the gated value at other points than the reference chain does, so the adapter names the reference block it is
+compared with (``twin``): the gate written at the kernel's rounding points.
+
+``fe.add_norm_quant_decode`` calls ``cudnn.AddNormQuantDecode``, the residual add, the RMSNorm and the quantisation of the
+next block's operand in one launch (``docs/operations/normalizations/add_norm_quant_decode.md``): one launch per call of the
+norm block.  The entry is one compiled kernel per FORM -- which residual mode, which outputs -- and a step calls the block
+at several sites, each in a form of its own: the row names them (``ProviderRow.sites``), the family's step hands the site
+over as the block's last operand, and the adapter holds one entry instance per form and serves each call with the instance
+of its site.  It decides nothing: a call whose operands do not fit the form the table names for its site (a residual where
+the form starts the stream, codes of another format than the consumer reads) is a ``ValueError``.  The kernel updates the
+residual stream in place, as the form says; the adapter hands it buffers of its own for everything else it writes, per
+call.  What a consumer on a fallback row needs beyond the kernel's bytes is that consumer's to launch: the block scales
+stay in the kernel's 128 x 4 layout (``weights.TiledBlockScaledTensor``).  Where the form of a site ends at the bf16 rows
+the call returns no quantised operand, and a step that asks for one there is a ``ValueError``.  The kernel normalises in
+fp32 and rounds once, so the adapter names its twin: the norm at the kernel's rounding points.
+
+``fe.fp8_projection_decode`` calls ``cudnn.Fp8ProjectionDecode``, the multiply of an 8-bit activation by an 8-bit weight on
+the stored codes of both (``docs/operations/gemm_fusions/fp8_projection_decode.md``): one launch per call.  An entry is one
+weight shape at one split, and the in-projection of a layer has another shape in each kind of layer: the row names the
+shape per call site, and the adapter holds one entry instance per site.  A row of it may serve one call site of its
+block and hand the other on (the out-projection of a step of several tokens per sequence: the linear-attention layers'
+call is this entry's, the attention layers' the next row's): the adapter then builds and serves the sites its row
+serves, and is never called at the other.  The split is fixed per entry instance and the token tile follows the row
+count, so a block whose kernel changes its split with the rows of a step has one row per range, each an adapter and an
+entry of its own; a row that names the token tile passes it as the entry's floor, which is the tile of every row count
+in its range.  The row's form is the whole kernel -- the split,
+the weight tile, the ring depth, the tensor-memory columns and their release, the launch knobs -- and the adapter passes
+it as given, so the entry never runs on its own pick.  The weight is the merged codes the loader kept for this block
+(``weights.Dequantized.stored``; ``stored_weights`` asks the loader for them, and where no other block of the run reads
+the weight's bf16 copy the loader makes none), the scale the fp32 product of the two static scales as one element on the
+device, formed on the host once per pair of values, and the output a buffer of the call's own.  The kernel accumulates
+in fp32 in a fixed order and rounds once, as the reference multiply does in its own precision: the reference block of
+the same name is its twin.
+
+``fe.swiglu_fp4_decode`` calls ``cudnn.SwigluFp4Decode``, the merged gate / up multiply of an MLP on the packed 4-bit codes
+of both operands with ``SiLU(gate) * up`` and the 4-bit quantisation of the result in its epilogue
+(``docs/operations/gemm_fusions/swiglu_fp4_decode.md``): one launch per call, and nothing of the product is stored.  The
+row's form is the whole kernel -- the token tile of its row count, the weight stages issued ahead of the wait, the L2
+policy of the weight stream, the cap of the persistent grid, the launch attribute -- and the adapter passes it as one
+config, so the entry never runs on its own default; the token tile follows the row count, so the table has one row per
+tile and the adapter one entry instance per row.  The kernel reads the weight in a layout of its own, the rows in tiles
+of 64 gate + 64 up channels with the block scales in the 128 x 4 layout: the adapter builds it once per weight at load
+with the entry's own helper (``stored_layout``, which the loader calls for a block that says ``stored_weights``), and
+that tensor is the one form of the stored weight the load keeps.  The operand is the norm's 4-bit output: from the
+norm's kernel it comes in the layout this kernel reads and is handed over as it is; from a block that is not a kernel
+(a reference chain, or one row of a batch in a check) the block scales come row by row, and bringing them into the
+layout is this block's own launch, made when it reads its operand.  The two scalars are one fp32 element each on the
+device, formed on the host once per value: the fp32 product of the two static scales, and the global scale of the
+output (the fp32 reciprocal of the consumer's static scale).  The outputs are buffers of the call's own and stay in the
+kernel's layout (``weights.TiledBlockScaledTensor``): a consumer on a fallback row gathers when it reads them.  The
+kernel accumulates in fp32 over the whole input width and rounds three times, so the adapter names its twin: the
+reference pair of the block evaluated in fp64 with the entry's error bound.
+
+``fe.attention_prepare_decode`` calls ``cudnn.AttentionPrepareDecode``, the preparation of an attention layer's operands for
+the rows of a step in one launch (``docs/operations/attention/attention_prepare_decode.md``): the RMSNorm of every query
+and key head row, the rotation of its rotary part by the row's position, the gate rows copied beside the queries, and the
+keys and values written into the layer's cache -- a POOL OF PAGES, at the slot of each row.  The adapter says which
+layout it needs (``cache_page``), and a session whose plan has this row builds its state that way
+(``state.PagedKvCache``).  A call converts nothing: the entry reads four views of the in-projection's row, the layer's two
+norm weights as the loader holds them, the cos / sin table and the position and slot rows of the step -- taken from the
+cache it is handed (``cache.at(position)``) and from nowhere else, so the position reaches the kernel as device memory
+that was built with the state -- and writes the two halves of the cache's pool and two output buffers of the call's own.
+The row's form is the whole statement of the kernel -- the position form with its sections, the page, the two integer
+dtypes, the two launch knobs -- and the adapter refuses a row that leaves one of them out; the norm's epsilon is the
+model's and a compile key of the entry, so an entry instance is one (device, geometry, epsilon, form).  The kernel
+normalises in fp32 and rounds a rotated value once where the reference chain rounds it three times, so the adapter names
+its twin: the preparation at the kernel's rounding points.  Its first use has two steps: the build, which is handed
+nothing of this adapter's (a typed decline there is the entry's answer about the installation), and one call on scratch
+operands, where the entry imports the contract of the paged pools and launches its kernel once.
+
+``fe.row_quantize_fp4_decode`` calls ``cudnn.RowQuantizeFp4Decode``, the 4-bit quantisation of bf16 rows under a static
+global scale (``docs/operations/block_scaling/row_quantize_fp4_decode.md``): the packed codes and the block scales a
+block-scaled 4-bit multiply reads next, in that multiply's 128 x 4 layout, in one launch per call.  The row's form is the
+entry's whole config -- the row width, which the adapter holds to the model's hidden width, and the two launch knobs, each
+passed by name -- and the adapter refuses a row that leaves one of them out.  A call converts nothing: the rows are the
+tensor it is handed, the scale is one fp32 element on the device -- the fp32 reciprocal of the consumer's static scale,
+formed on the host once per value -- and the outputs are buffers of the call's own (the entry's own pair is one per row
+count and is overwritten by its next call), handed on as the kernel wrote them (``weights.TiledBlockScaledTensor``).  The
+scale buffer takes whole bands of 128 rows and is not initialised: the kernel writes the bytes of the live rows, a fill
+would be a launch of its own between two kernels, and nothing reads the other rows.  The entry's build takes no operand,
+so every typed decline of it is the entry's answer about the installation where this adapter can name an unmet
+requirement, and a fault of the table otherwise.  The reference chain divides where the kernel multiplies by reciprocals
+and drops the sign of a zero the kernel keeps, so the adapter names its twin: the quantisation at the kernel's rounding
+points.
+
+A provider row says in which form its entry is called (``row.form``: fields of the entry's own form, under the entry's names).
+An adapter passes exactly those to the entry and nothing else that fixes the kernel, so the row is the whole statement;
+``launch_facts`` hands the kernel check the entry's own answers for a row count -- the symbols of the kernels it compiled, its
+form and its launch shape (the entry's ``kernel_symbols_for`` / ``form_for`` / ``launch_shape_for``).  ``serving`` says what
+served the last call: the entry instance ``__call__`` launched and the row's fields as that instance states them.  On a real
+device an adapter asks its entry, while the run is planned, for the launch of the run's row count: an entry that declines what its row claims is a
+``ValueError`` -- the provider table is wrong, which a sample reports as an ``ERROR``, never as a ``SKIP``.
+
+**First use is part of the plan.**  An entry gates the installed toolchain where it builds its kernel (the CuTe DSL's target
+list, on some GPU classes its compiler), not where it is constructed.  So on a CUDA device an adapter builds the kernel of
+the run's row count on scratch operands while the run is planned (``first_use``), before anything is loaded: what the
+entry needs of the installation is then a ``SKIP`` that names the fix, in the entry's own words, and the build after the
+load finds its kernel built.  A decline at that point is the installation's only where this adapter can name a
+requirement the installation does not meet (``_unmet``: the part's target by cuDNN Frontend's public probe, and what the
+entry's page states beyond it); any other decline is of the operands this adapter built -- a ``ValueError``, an ``ERROR``
+before the load, because a faulty adapter must not read as an unsupported GPU.  The fused gate / up entry is built from
+the row count alone, and its row count is held in front of the build (the entry states a launch for it, or the table
+is wrong): there the adapter has built nothing a decline could be about, and one of that entry's requirements -- the
+names its kernel is written on -- has no public probe this adapter could ask.  Every typed decline of that build is
+therefore the entry's answer about the installation, and the ``SKIP``.
+
+**The memory sentence comes first.**  The scratch operands of a first use are as large as the run's own (rows + 1 slots of
+recurrent state for the fused step), so the first use is not made where a block is asked whether it serves
+(``check_support`` allocates nothing): a plan makes it as a step of its own (``Plan.first_use``), after the memory
+sentence has said that the run fits and before anything is loaded.  A run that does not fit is a ``SKIP`` with its
+estimate, and nothing was allocated for it.
 """
 
 from __future__ import annotations
 
 import re
 
-from ..state import RecurrentSlots
-from ..weights import ScaledTensor
+from ..census import Facts, Kernel
+from ..state import PagedKvCache, RecurrentSlots, TokenSlots
+from ..weights import BLOCK, TILE_COLUMNS, TILE_ROWS, BlockScaledTensor, InterleavedBlockScaledTensor, ScaledTensor, TiledBlockScaledTensor, tile_scales
 from . import BlockBase, GdnParams, split_qkvz
 
-#: the files of the package this adapter runs, relative to the ``cudnn`` package: the source hash of ``check_environment``
+#: the files of the package this adapter runs, relative to the ``cudnn`` package: the source hash of ``check_environment``.
+#: The list is closed under one rule, to its fixed point: a module under ``frost/``, ``_torch_stream.py`` or ``_cutlass_*``
+#: that a file of the list imports at module level is in the list, and so is the ``__init__.py`` of every package such an
+#: import runs.  The kernels are built from those modules: an edit of one of them changes what a run launches, and the
+#: hash a run prints says so.  A host test forms the fixed point again from the files
 SOURCE_FILES = (
     "__init__.py",
     "linear_attention/frost/gdn_decode_fused.py",
     "linear_attention/frost/kernel/gdn_decode_fused_config.py",
     "linear_attention/frost/kernel/gdn_decode_fused_f16.py",
     "linear_attention/frost/kernel/gdn_geometry.py",
+    "linear_attention/frost/gdn_verify_fused.py",
+    "linear_attention/frost/kernel/gdn_verify_fused_config.py",
+    "linear_attention/frost/kernel/gdn_verify_fused_f16.py",
+    "frost/launch_facts.py",
+    "frost/init_order.py",  # what a call of the gate, the preparation and the norm entry runs in front of its launch
+    "frost/capture.py",  # what that module asks in front of a launch: whether the stream is being captured into a CUDA graph
+    "_torch_stream.py",  # ... and the stream and the device context it puts the launch behind
+    "attention_gate/frost/gate_quant_decode.py",
+    "attention_gate/frost/kernel/gate_quant_decode_config.py",
+    "attention_gate/frost/kernel/gate_quant_decode_f16.py",
+    "attention_prepare/frost/prepare_decode.py",
+    "attention_prepare/frost/kernel/prepare_decode_config.py",
+    "attention_prepare/frost/kernel/prepare_decode_f16.py",
+    "gated_attention_block/cache_write_contract.py",  # the contract of the paged pools, which a call of the attention preparation runs
+    "norm/frost/add_norm_quant_decode.py",
+    "norm/frost/kernel/add_norm_quant_decode_config.py",
+    "norm/frost/kernel/add_norm_quant_decode_f16.py",
+    "gemm/frost/projection_decode/fp8_projection_decode.py",
+    "gemm/frost/projection_decode/kernel/fp8_projection_decode_config.py",
+    "gemm/frost/projection_decode/kernel/fp8_projection_decode_e4m3.py",
+    "gemm/frost/swiglu_decode/swiglu_fp4_decode.py",
+    "gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_config.py",
+    "gemm/frost/swiglu_decode/kernel/swiglu_fp4_decode_nvfp4.py",
+    "row_quantize/frost/row_quantize_fp4_decode.py",
+    "row_quantize/frost/kernel/row_quantize_fp4_decode_config.py",
+    "row_quantize/frost/kernel/row_quantize_fp4_decode_f16.py",
+    # what the files above import at module level, to the fixed point: the package with its probe of the installed CuTe DSL,
+    # the buffers an entry exchanges with its kernel, the tile primitives the kernels are written on, and the two helpers of
+    # the multiply kernels
+    "frost/__init__.py",
+    "frost/buffers.py",
+    "frost/tile_dsl/__init__.py",
+    "frost/tile_dsl/barrier.py",
+    "frost/tile_dsl/pointwise.py",
+    "frost/tile_dsl/regtile.py",
+    "frost/tile_dsl/requirements.py",
+    "frost/tile_dsl/rowwise.py",
+    "frost/tile_dsl/sf_layout.py",
+    "frost/tile_dsl/swizzle.py",
+    "frost/tile_dsl/tma.py",
+    "_cutlass_compat.py",
+    "_cutlass_helpers/__init__.py",
+    "_cutlass_helpers/static_persistent_tile_scheduler.py",
 )
-#: the first cuDNN Frontend version that carries the fused decode step, and the CuTe DSL floor its page states
+#: a field of the entry's form a provider row may name -> the constructor argument of ``cudnn.GdnDecodeFused`` that sets it
+FORM_ARGUMENTS = {"PDL": "pdl", "PDL_RELEASE": "pdl_release"}
+#: the field of the form of ``cudnn.GdnVerifyFused`` that is the step's shape and no constructor argument: the tokens per
+#: sequence.  A row of that entry names it (the entry compiles one kernel per count, and the kernel's name does not say
+#: which); the adapter holds every call's slot table to it
+VERIFY_TOKENS = "TOKENS"
+#: the fields of the form of ``cudnn.AttentionGateQuantDecode`` a provider row may name: ``THREADS`` goes into the entry's
+#: config (``cfg=Cfg(THREADS=...)``), ``PDL_RELEASE`` is its launch knob ``pdl_release=``
+GATE_FORM_FIELDS = ("THREADS", "PDL_RELEASE")
+#: a field of the form of ``cudnn.AddNormQuantDecode`` a provider row may name -> the constructor argument that sets it; the
+#: entry has no default for the first three (its forms are peers), so every call site of a row names them
+NORM_FORM_ARGUMENTS = {"ADD": "add", "BF16_OUT": "bf16", "QUANT": "quant", "STORE_RESIDUAL": "store_residual", "PDL": "pdl", "PDL_RELEASE": "pdl_release"}
+NORM_FORM_REQUIRED = ("ADD", "BF16_OUT", "QUANT")
+#: the quantisation of a consumer's operand (``providers.Quant.fmt``) -> the entry's name for the codes that serve it
+NORM_QUANT = {"fp8": "e4m3_static", "nvfp4": "nvfp4"}
+#: the fields of the form of ``cudnn.Fp8ProjectionDecode`` a provider row may name, by how the adapter passes them: the
+#: constructor arguments (``SPLIT_K`` is a numerics attribute of the entry, the other two its launch knobs), the fields of
+#: its performance form (``form=ProjectionForm(...)``, passed as a whole: the entry then never takes its own pick) and the
+#: weight's shape (``geometry=ProjectionGeometry(...)``), which a row names per call site.  A row names at least the split,
+#: the weight tile, the ring depth and the shape: the entry is called on an explicit kernel, never on a default
+PROJECTION_ARGUMENTS = {"SPLIT_K": "split_k", "PDL": "pdl", "PDL_RELEASE": "pdl_release"}
+PROJECTION_FORM_FIELDS = ("MMA_M", "STAGES", "TMEM_COLS", "TOKEN_TILE", "PREWAIT_WEIGHTS", "HOLD_TMEM")
+PROJECTION_GEOMETRY = ("OUT_FEATURES", "IN_FEATURES")
+PROJECTION_REQUIRED = ("SPLIT_K", "MMA_M", "STAGES", *PROJECTION_GEOMETRY)
+#: the fields of the form of ``cudnn.SwigluFp4Decode`` a provider row names, by how the adapter passes them: the fields of
+#: its config (``cfg=Cfg(...)``, passed as a whole: the entry then never takes a default of its own) and its launch knob
+#: (``pdl=``).  A row names every one of them: the token tile of its row count, the weight stages ahead of the wait, the
+#: L2 policy of the weight stream, the cap of the persistent grid, the launch attribute
+SWIGLU_CONFIG_FIELDS = ("TOKEN_TILE", "PREWAIT_STAGES", "L2_EVICT_FIRST", "MAX_CLUSTERS")
+SWIGLU_ARGUMENTS = {"PDL": "pdl"}
+SWIGLU_REQUIRED = (*SWIGLU_CONFIG_FIELDS, *SWIGLU_ARGUMENTS)
+#: a field of the form of ``cudnn.AttentionPrepareDecode`` a provider row names -> the constructor argument that sets it.  A row
+#: names every one of them: the entry has no default for the first five, and its two launch knobs are stated, never left
+PREPARE_ARGUMENTS = {
+    "POSITIONS": "positions",
+    "SECTION": "mrope_section",
+    "PAGE_SIZE": "page_size",
+    "POSITION_DTYPE": "position_dtype",
+    "SLOT_DTYPE": "slot_dtype",
+    "PDL": "pdl",
+    "PDL_RELEASE": "pdl_release",
+}
+#: a field of the form of ``cudnn.RowQuantizeFp4Decode`` a provider row names -> the constructor argument that sets it.  A row
+#: names all three: the row width, and the two launch knobs each by itself -- the release is never left to follow the wait
+ROW_QUANTIZE_ARGUMENTS = {"WIDTH": "width", "PDL": "pdl", "PDL_RELEASE": "pdl_release"}
+#: the entry's three launch facts: what the kernel check reads
+LAUNCH_FACTS = ("kernel_symbols_for", "form_for", "launch_shape_for")
+#: the first cuDNN Frontend version that carries an entry of this module, unless its adapter names a later one
+#: (``EntryBlock.first_version``), and the CuTe DSL floor their pages state
 FIRST_VERSION = "1.33.0"
 DSL_FLOOR = (4, 8, 0)
 
@@ -47,10 +273,12 @@ def serves_floor(installed: str, floor: tuple) -> bool:
     return release > tuple(floor) or (release == tuple(floor) and not before)
 
 
-#: one entry per (device, geometry, epsilon) of the process: the entry compiles once per rows count, and every session shares it
+#: the entries of the process, one per (entry, device, geometry, form): an entry compiles once per form, and every session shares it
 _ENTRIES: dict = {}
 #: rows -> device bytes the first launch of that form took outside PyTorch's allocator in this process, as measured
 _FIRST_LAUNCH: dict = {}
+#: the (sequences, tokens) step shapes of the fused verify step that were launched in this process
+_VERIFY_LAUNCHED: set = set()
 
 
 def _outside_pool(device, launch) -> int:
@@ -65,29 +293,43 @@ def _outside_pool(device, launch) -> int:
     return (free - torch.cuda.mem_get_info(device)[0]) - (torch.cuda.memory_reserved(device) - pool)
 
 
-class GdnDecodeFusedBlock(BlockBase):
+class EntryBlock(BlockBase):
+    """An adapter to a cuDNN Frontend entry that states its launch: what such adapters share.  A subclass names the entry
+    (``name``), builds it from the row's form (``_build``) and notes in ``__call__`` the entry object it launched and the
+    row count (``_served``); the call log and the kernel check read the rest from here."""
+
     provider = "cuDNN FE"
-    kernels = ("gdn_decode_fused",)
-    per_row = (0, 1, 2, 3)
-    state_args = (5,)
     compiles = True
+    captures = True  # one launch per call on the operands it is handed: a recorded launch sequence holds it
+    name = ""  # the entry, as ``cudnn`` exports it
+    what = ""  # what the entry is, for the sentence of an older package
+    first_version = FIRST_VERSION  # the first cuDNN Frontend version that carries the entry, for that sentence
+    _served = None  # (entry instance, rows) of the last call -- in place of ``rows`` the step shape, where an entry's form follows one
+    _answer = None  # (entry instance, rows, what ``serving`` says of them): asked of an instance once, not once per call
 
     def _cudnn(self):
         import cudnn  # before torch in a sample's own imports; here torch is already loaded by the sample
 
         return cudnn
 
-    def check_support(self, sequences: int, tokens: int) -> None:
+    def _build(self, device, site: str = ""):  # ``site``: the call site, for an entry that has one form per site
+        raise NotImplementedError
+
+    def _check_package(self) -> None:
+        """The declines of the installed packages, each a ``NotImplementedError`` (a SKIP) that names the fix: a cuDNN
+        Frontend without the entry, one whose entry states no launch facts where the run checks its kernels, a CuTe DSL
+        below the entry's floor."""
         cudnn = self._cudnn()
-        try:
-            cudnn.GdnDecodeFused
-        except AttributeError:
+        entry = getattr(cudnn, self.name, None)
+        if entry is None:
             raise NotImplementedError(
-                f"needs nvidia-cudnn-frontend with the fused linear-attention decode step (>= {FIRST_VERSION}); this is {cudnn.__version__}: "
-                "install from the checkout (see README)"
-            ) from None
-        if tokens != 1:
-            raise NotImplementedError(f"cudnn.GdnDecodeFused is the one-token decode step; this run has {tokens} tokens per sequence")
+                f"needs nvidia-cudnn-frontend with {self.what} (>= {self.first_version}); this is {cudnn.__version__}: install from the checkout (see README)"
+            )
+        if self.options.get("check_kernels") and not all(hasattr(entry, fact) for fact in LAUNCH_FACTS):
+            raise NotImplementedError(
+                f"the kernel check needs the launch facts of {self.entry} ({', '.join(LAUNCH_FACTS)}); this nvidia-cudnn-frontend "
+                f"{cudnn.__version__} has none: install from the checkout (see README), or run without --check-kernels"
+            )
         import importlib.metadata as metadata
 
         try:
@@ -96,9 +338,156 @@ class GdnDecodeFusedBlock(BlockBase):
             installed = None
         floor = ".".join(str(n) for n in DSL_FLOOR)
         if installed is None or not serves_floor(installed, DSL_FLOOR):
-            raise NotImplementedError(f"cudnn.GdnDecodeFused needs nvidia-cutlass-dsl >= {floor}; this is {installed or 'not installed'}")
+            raise NotImplementedError(f"{self.entry} needs nvidia-cutlass-dsl >= {floor}; this is {installed or 'not installed'}")
+
+    def _check_claim(self, entry, rows: int) -> None:
+        """On a real device: the row claims this run, so the entry must state a launch for its row count.  One that declines
+        is a wrong table -- a ``ValueError``, which a sample reports as an ``ERROR`` and never as a ``SKIP``."""
+        if not hasattr(entry, "launch_shape_for"):
+            return
+        try:
+            entry.launch_shape_for(*self._step_of(rows))
+        except (ValueError, NotImplementedError) as error:
+            cc = self.facts.cc
+            raise ValueError(
+                f"the provider table is wrong: the row of {self.row.key} claims this run ({rows} row{'s' if rows != 1 else ''} on compute "
+                f"capability {cc[0]}.{cc[1]}), and {self.entry} declines it: {error}"
+            ) from None
+
+    def _step_of(self, rows: int) -> tuple:
+        """What the entry's launch facts are asked with for a run of ``rows`` rows: the row count.  An adapter whose entry
+        states its launch per step shape says which shape that is."""
+        return (rows,)
+
+    #: the device types on which the plan makes the entry's first use: a kernel can be built for a CUDA device only (a host
+    #: test names its own device here to run the step on a stand-in entry)
+    first_use_devices = ("cuda",)
+
+    def _scratch(self, sequences: int, tokens: int):
+        """``(entry, operands)``: the entry of this row and scratch operands in the layout a step hands it."""
+        raise NotImplementedError
+
+    def _unmet(self) -> bool:
+        """Whether the installation lacks something the entry needs on this GPU class, as far as this adapter can tell without
+        the entry: the CuTe DSL's target of the part, by cuDNN Frontend's public probe.  A subclass adds what its entry's
+        page states beyond that."""
+        from cudnn.frost import cutedsl_runtime_available
+
+        return not cutedsl_runtime_available(tuple(self.facts.cc))
+
+    def _sites(self) -> tuple:
+        """The call sites the row serves that the model's wiring has (every such site for a model that names none): the
+        forms a run builds.  A row without sites is called in its one form."""
+        named = getattr(self.model, "sites", None)
+        called = set(named()) if callable(named) else None
+        return tuple(site for site in self.row.served if called is None or site in called) if self.row.sites else ("",)
+
+    def _named(self) -> list:
+        """The call sites the row serves (``ProviderRow.served``: not those it hands on to the next row), or the one
+        unnamed site of a row that names none: every form the table states for this adapter."""
+        return list(self.row.served) or [""]
+
+    def _stated(self, entry, rows: int) -> dict:
+        """The form an entry instance states for ``rows``, as the row's fields are looked up in it: the entry's own
+        ``form_for``.  An adapter whose row names fields the entry states one level down says where."""
+        return entry.form_for(*self._step_of(rows))
+
+    def _declined(self, error, what: str) -> str:
+        """The sentence for a typed decline of the entry at ``what``: the installation's where this adapter can name an unmet
+        requirement, else the operands this adapter built."""
+        if self._unmet():
+            return f"{self.entry} declines this installation at {what}: {error}"
+        return f"{self.entry} declined the operands this adapter built for {what}: {error}"
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device: build the entry's kernel for the run's row count on scratch operands.
+        The entry gates the installed toolchain there, so its decline comes before the load: a ``NotImplementedError`` (a
+        SKIP, in the entry's own words) where the installation does not meet a requirement this adapter can name
+        (``_unmet``), a ``ValueError`` (an ERROR) for any other decline -- then the operands are this adapter's.
+
+        The scratch operands are the size of the run (the fused step's recurrent state at 65,535 rows is 192 GiB), so this
+        is not part of ``check_support``: a plan makes it after its memory sentence has held (``Plan.first_use``), and a
+        run that does not fit the GPU is a SKIP with its estimate before anything is allocated for it."""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        entry, operands = self._scratch(sequences, tokens)
+        try:
+            entry.compile(*operands)
+        except NotImplementedError as error:
+            if self._unmet():
+                raise
+            raise ValueError(self._declined(error, "its first use")) from None
+
+    def serving(self):
+        """What served the last call of this block: the entry instance ``__call__`` launched (its place among the entries of
+        its kind in this process: one per device, geometry and form) and the fields of the row's form as THAT instance states
+        them for the call's row count (its ``form_for``; for the call's step shape, where its form follows one).  Read from
+        the object that was called, never from the row: an entry built without the row's knobs, or a call served from
+        another instance, shows here.  Before the first call nothing has served and nothing was passed."""
+        if self._served is None:
+            return self.entry, ()
+        entry, rows = self._served
+        if self._answer is None or self._answer[0] is not entry or self._answer[1] != rows:
+            place = next((n for n, built in enumerate((e for e in _ENTRIES.values() if type(e) is type(entry)), 1) if built is entry), 0)
+            try:
+                stated = self._served_stated(entry, rows)
+            except (ValueError, NotImplementedError):  # no form stated for rows it has just served: the log shows none
+                stated = {}
+            form = tuple((name, stated[name]) for name, _ in self._served_form() if name in stated)
+            self._answer = (entry, rows, (f"{self.entry} #{place}" if place else self.entry, form))
+        return self._answer[2]
+
+    def _served_stated(self, entry, call) -> dict:
+        """The form the instance that served the last call states for THAT call, as the call log reads it: asked with what
+        ``__call__`` kept of the call beside the instance (``_served``) -- its row count.  An adapter whose entry states its
+        form per step shape keeps the shape of the operands it handed the entry and asks with that: what the log then
+        shows is the call, whatever the row says."""
+        return self._stated(entry, call)
+
+    def _served_form(self) -> tuple:
+        """The fields the call log reads from the instance that served the last call: those of the row's form.  An adapter
+        whose row names call sites answers with the form of the last call's site."""
+        return tuple(self.row.form)
+
+    def launch_facts(self, rows: int, site: str = "") -> Facts:
+        """The entry's own answers for ``rows``: the symbols of the kernels it has compiled for that row count, its form as plain
+        data and its launch shape.  The entry's typed declines pass through: a row that claims a row count the entry does not
+        serve is a wrong table."""
+        entry = self._build(self.options.get("device", "cuda"))
+        step = self._step_of(rows)
+        return Facts(tuple(entry.kernel_symbols_for(*step)), self._stated(entry, rows), tuple(entry.launch_shape_for(*step)))
+
+
+class GdnDecodeFusedBlock(EntryBlock):
+    name = "GdnDecodeFused"
+    what = "the fused linear-attention decode step"
+    kernels = (Kernel("gdn_decode_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per layer and step
+    per_row = (0, 1, 2, 3)
+    state_args = (5,)
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass is a wrong table."""
+        unknown = [name for name, _ in self.row.form if name not in FORM_ARGUMENTS]
+        if unknown:
+            raise ValueError(
+                f"provider row {self.row.key}: its form names {', '.join(unknown)}; this adapter passes {', '.join(FORM_ARGUMENTS)} to cudnn.GdnDecodeFused"
+            )
+        return {FORM_ARGUMENTS[name]: value for name, value in self.row.form}
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if tokens != 1:
+            raise NotImplementedError(f"cudnn.GdnDecodeFused is the one-token decode step; this run has {tokens} tokens per sequence")
         if self.facts.total_bytes and "device" in self.options:
-            self._build(self.options["device"])  # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP
+            # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP; once it is built, a row
+            # count it does not serve is a wrong table.  Its first use, where it gates the installed toolchain, allocates
+            # scratch operands of the run's size and is made after the memory sentence has held (``first_use``)
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)
 
     def reserve_bytes(self) -> int:
         """Device memory the kernel's first launch reserves outside PyTorch's allocator: the family's allowance for the GPU
@@ -116,15 +505,16 @@ class GdnDecodeFusedBlock(BlockBase):
 
         g = self.model.geometry
         device = torch.device(device)
-        key = (str(device), g.la_key_heads, g.la_value_heads, g.hidden, self.model.norm_eps)
+        key = (str(device), g.la_key_heads, g.la_value_heads, g.hidden, self.model.norm_eps, tuple(self.row.form))
         if key not in _ENTRIES:
             cudnn = self._cudnn()
             from cudnn.linear_attention.frost import GdnGeometry
 
-            _ENTRIES[key] = cudnn.GdnDecodeFused(device, eps=self.model.norm_eps, geometry=GdnGeometry(g.la_key_heads, g.la_value_heads, g.hidden))
+            geometry = GdnGeometry(g.la_key_heads, g.la_value_heads, g.hidden)
+            _ENTRIES[key] = cudnn.GdnDecodeFused(device, eps=self.model.norm_eps, geometry=geometry, **self._arguments())
         return _ENTRIES[key]
 
-    def compile(self, sequences: int, tokens: int) -> None:
+    def _scratch(self, sequences: int, tokens: int):
         import torch
 
         g = self.model.geometry
@@ -133,7 +523,11 @@ class GdnDecodeFusedBlock(BlockBase):
         qkv = (2 * g.la_key_heads + NV) * D
         bf16 = dict(dtype=torch.bfloat16, device=device)
         x, z = split_qkvz(torch.zeros((rows, qkv + NV * D), **bf16), qkv, NV, D)
-        slots = RecurrentSlots(torch.zeros((rows + 1, NV, D, D), dtype=torch.float32, device=device), torch.zeros((rows + 1, g.la_conv_width - 1, qkv), **bf16))
+        several = self._state_tokens()
+        pool = torch.zeros((rows * several + 1, NV, D, D), dtype=torch.float32, device=device)
+        slots = RecurrentSlots(pool, torch.zeros((rows + 1, g.la_conv_width - 2 + several, qkv), **bf16), several)
+        if several > 1:  # the prompt of a session that verifies behind it: token 0 of a pool of several tokens, as the state hands it out
+            slots = slots.first_token()
         params = GdnParams(
             g.la_key_heads,
             NV,
@@ -147,13 +541,28 @@ class GdnDecodeFusedBlock(BlockBase):
             1.0,
         )
         slot_ids = torch.arange(1, rows + 1, dtype=torch.int32, device=device)
-        entry, operands = self._build(device), self._operands(x, z, torch.zeros((rows, g.hidden), **bf16), slot_ids, params, slots)
+        return self._build(device), self._operands(x, z, torch.zeros((rows, g.hidden), **bf16), slot_ids, params, slots)
+
+    def _state_tokens(self) -> int:
+        """The tokens per sequence of the state this plan's steps run on (the plan's option ``state_tokens``; 1 where it
+        names none).  More than one: the steps of this plan are the decode steps of a prompt on token 0 of a state of
+        several tokens per sequence -- the history operand then has that pool's slot stride, which is another compiled
+        form of the entry, so the scratch operands are built in that layout."""
+        return int(self.options.get("state_tokens", 1))
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device, rows = torch.device(self.options.get("device", "cuda")), sequences * tokens
+        entry, operands = self._scratch(sequences, tokens)
         try:
-            entry.compile(*operands)
+            entry.compile(*operands)  # built while the run was planned (``first_use``): the entry finds its kernel
             if rows not in _FIRST_LAUNCH:
                 _FIRST_LAUNCH[rows] = _outside_pool(device, lambda: entry(*operands))
-        except NotImplementedError as error:  # the plan found the part and the versions served: what is left is this adapter's own layout
-            raise RuntimeError(f"cudnn.GdnDecodeFused declined the operands this adapter built: {error}") from error
+            elif self._state_tokens() > 1:  # the form of another layout at a row count that has launched: launched once here too
+                entry(*operands)
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
 
     @staticmethod
     def _operands(x, z, hidden, slot_ids, p, slots):
@@ -164,8 +573,1118 @@ class GdnDecodeFusedBlock(BlockBase):
     def __call__(self, x, z, hidden, slot_ids, params, slots):
         import torch
 
+        entry = self._build(x.device)
+        self._served = (entry, int(x.shape[0]))  # what the call log of a traced step reads back (``serving``)
         try:
-            qout = self._build(x.device)(*self._operands(x, z, hidden, slot_ids, params, slots))
+            qout = entry(*self._operands(x, z, hidden, slot_ids, params, slots))
         except NotImplementedError as error:
             raise RuntimeError(f"cudnn.GdnDecodeFused declined the operands of this step: {error}") from error
         return ScaledTensor(qout.view(torch.uint8).view(x.shape[0], -1), params.out_scale_value)
+
+
+class GdnVerifyFusedBlock(EntryBlock):
+    """``cudnn.GdnVerifyFused``: the fused linear-attention step for ``T`` tokens per sequence in one launch per layer -- the
+    conv, the recurrence and the gated norm of every token in turn, the state after token ``t`` written to the slot of
+    (sequence, ``t``), the conv history shifted by the step's rows; in the form the row names, ``TOKENS`` included."""
+
+    name = "GdnVerifyFused"
+    what = "the fused linear-attention verify step"
+    kernels = (Kernel("gdn_verify_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per layer and step
+    per_row = (0, 1, 2, 3)
+    state_args = (5,)
+    batch_note = (
+        "cudnn.GdnVerifyFused states replay-identical bytes and no batch invariance between one sequence and several: one sequence takes "
+        "another association of the gated norm's sum than two and more, so the last bits of its output differ by design "
+        '(docs/operations/determinism.md: "Replay only")'
+    )
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass, or a form that does not
+        name the tokens per sequence, is a wrong table."""
+        unknown = [name for name, _ in self.row.form if name not in FORM_ARGUMENTS and name != VERIFY_TOKENS]
+        if unknown or VERIFY_TOKENS not in dict(self.row.form):
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {VERIFY_TOKENS}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form {what}; this adapter passes {', '.join(FORM_ARGUMENTS)} to cudnn.GdnVerifyFused "
+                f"and holds every step to the row's {VERIFY_TOKENS}, the tokens per sequence"
+            )
+        return {FORM_ARGUMENTS[name]: value for name, value in self.row.form if name in FORM_ARGUMENTS}
+
+    def _tokens(self) -> int:
+        return int(dict(self.row.form)[VERIFY_TOKENS])
+
+    def _step_of(self, rows: int) -> tuple:
+        """The step shape the entry's facts take: ``(sequences, tokens)`` of a run of ``rows`` rows at the row's tokens."""
+        return (rows // self._tokens(), self._tokens())
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if tokens != self._tokens():  # the row's tokens range selected a run its form does not name
+            raise ValueError(
+                f"the provider table is wrong: the row of {self.row.key} says {VERIFY_TOKENS} {self._tokens()} and was selected for a run of {tokens} tokens per sequence"
+            )
+        if self.facts.total_bytes and "device" in self.options:
+            # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP; once it is built, a step
+            # shape it does not serve is a wrong table.  Its first use follows the memory sentence (``first_use``)
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)
+
+    def reserve_bytes(self) -> int:
+        """Device memory the kernel's first launch reserves outside PyTorch's allocator: the family's allowance for the GPU
+        class, until a fused step was launched in this process."""
+        if _FIRST_LAUNCH or _VERIFY_LAUNCHED:
+            return 0
+        reserve = getattr(self.model, "first_launch_reserve", {})
+        return int(reserve.get(f"cc{self.facts.cc[0]}.x", 0))
+
+    def _build(self, device, site: str = ""):  # one form per row: the call site is not read
+        import torch
+
+        g = self.model.geometry
+        device = torch.device(device)
+        key = ("gdn_verify_fused", str(device), g.la_key_heads, g.la_value_heads, g.hidden, self.model.norm_eps, tuple(self.row.form))
+        if key not in _ENTRIES:
+            cudnn = self._cudnn()
+            from cudnn.linear_attention.frost import GdnGeometry
+
+            geometry = GdnGeometry(g.la_key_heads, g.la_value_heads, g.hidden)
+            _ENTRIES[key] = cudnn.GdnVerifyFused(device, eps=self.model.norm_eps, geometry=geometry, **self._arguments())
+        return _ENTRIES[key]
+
+    def _scratch(self, sequences: int, tokens: int):
+        import torch
+
+        g = self.model.geometry
+        device = torch.device(self.options.get("device", "cuda"))
+        rows, D, NV = sequences * tokens, g.la_head_dim, g.la_value_heads
+        qkv = (2 * g.la_key_heads + NV) * D
+        bf16 = dict(dtype=torch.bfloat16, device=device)
+        x, z = split_qkvz(torch.zeros((rows, qkv + NV * D), **bf16), qkv, NV, D)
+        slots = RecurrentSlots(
+            torch.zeros((rows + 1, NV, D, D), dtype=torch.float32, device=device),
+            torch.zeros((sequences + 1, g.la_conv_width - 2 + tokens, qkv), **bf16),
+            tokens,
+        )
+        params = GdnParams(
+            g.la_key_heads,
+            NV,
+            D,
+            torch.zeros((qkv, g.la_conv_width), **bf16),
+            torch.zeros(NV, dtype=torch.float32, device=device),
+            torch.zeros(NV, **bf16),
+            torch.ones(D, **bf16),
+            torch.zeros((2 * NV, g.hidden), **bf16),
+            torch.ones(1, dtype=torch.float32, device=device),
+            1.0,
+        )
+        table = TokenSlots.build(sequences, tokens, device)
+        return self._build(device), self._operands(x, z, torch.zeros((rows, g.hidden), **bf16), table, params, slots)
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        entry, operands = self._scratch(sequences, tokens)
+        try:
+            entry.compile(*operands)  # built while the run was planned (``first_use``): the entry finds its kernel
+            entry(*operands)  # the first launch of the compiled kernel, before the first step
+            _VERIFY_LAUNCHED.add((sequences, tokens))
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    @staticmethod
+    def _operands(x, z, hidden, table, p, slots):
+        """The entry's positional operands: ``(qkv, z, hidden, ba_weight, A_log, dt_bias, ssm_state, state_indices, cu_seqlens,
+        num_accepted_tokens, norm_weight, out_scale, conv_state, conv_weight)``."""
+        return (
+            x,
+            z,
+            hidden,
+            p.ba_weight,
+            p.a_log,
+            p.dt_bias,
+            slots.state,
+            table.indices,
+            table.cu_seqlens,
+            table.accepted,
+            p.norm_weight,
+            p.out_scale,
+            slots.conv,
+            p.conv_weight,
+        )
+
+    def _served_stated(self, entry, call) -> dict:
+        """The form the instance states for the step shape of the slot table the last call handed it (``_served``): the
+        ``TOKENS`` of the call log is the tokens per sequence of that table -- read from the call, where the row's own
+        field asked back would say nothing about it."""
+        return entry.form_for(*call)
+
+    def _held(self, table) -> None:
+        """A call's slot table against the row, before anything is launched: the table of a step of several tokens per
+        sequence, at the row's ``TOKENS``.  Anything else is a ``ValueError``: the wiring hands the block a step its row
+        does not name."""
+        if not isinstance(table, TokenSlots):
+            raise ValueError(
+                f"cudnn.GdnVerifyFused takes the slot table of a step of several tokens per sequence; this block is handed {type(table).__name__}: "
+                "the session's state was built for one token per sequence"
+            )
+        if table.tokens != self._tokens():
+            raise ValueError(
+                f"provider row {self.row.key}: its form says {VERIFY_TOKENS} {self._tokens()}; the step hands it a slot table of {table.tokens} tokens per sequence"
+            )
+
+    def __call__(self, x, z, hidden, table, params, slots):
+        import torch
+
+        self._held(table)
+        entry, rows = self._build(x.device), int(x.shape[0])
+        # what the call log of a traced step reads back (``serving``): the instance, and the step shape of the slot table it is
+        # handed with this call -- its ``state_indices`` operand, [sequences, tokens] -- not the row's
+        self._served = (entry, tuple(int(n) for n in table.indices.shape))
+        out = torch.empty((rows, params.value_heads, params.head_dim), dtype=torch.float8_e4m3fn, device=x.device)  # this call's own
+        try:
+            entry(*self._operands(x, z, hidden, table, params, slots), out)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.GdnVerifyFused declined the operands of this step: {error}") from error
+        return ScaledTensor(out.view(torch.uint8).view(rows, -1), params.out_scale_value)
+
+
+class AttentionPrepareDecodeBlock(EntryBlock):
+    """``cudnn.AttentionPrepareDecode``: per row of a step ``q_out = rot(n(q, q_weight))``, the gate rows copied, and ``rot(n(k,
+    k_weight))`` and the value row written into the two halves of the cache's pool at the row's slot -- ``n`` the RMSNorm of
+    a head row rounded once to bf16, ``rot`` the rotation of its rotary part by the row's position; one launch per
+    attention layer and step, in the form the row names."""
+
+    name = "AttentionPrepareDecode"
+    what = "the attention preparation decode step"
+    kernels = (Kernel("attention_prepare", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per attention layer and step
+    per_row = (0, 1)
+    state_args = (1,)  # the layer's cache: the kernel writes the keys and values of the step's rows into its pool
+    cache_page = 64  # the positions of a page of the pool this adapter hands its entry: the session builds its state in that layout
+    _twin = None
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass, or a form that leaves one
+        of them to the entry, is a wrong table."""
+        form = dict(self.row.form)
+        unknown = [name for name in form if name not in PREPARE_ARGUMENTS]
+        missing = [name for name in PREPARE_ARGUMENTS if name not in form]
+        if unknown or missing:
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {', '.join(missing)}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form {what}; this adapter passes {', '.join(PREPARE_ARGUMENTS)} to cudnn.AttentionPrepareDecode, "
+                "and never leaves one of them to the entry's own default"
+            )
+        return {PREPARE_ARGUMENTS[name]: value for name, value in form.items()}
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if self.facts.total_bytes and "device" in self.options:
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)  # the first use follows the memory sentence
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: on compute capability 10.7 the entry's page asks for a CuTe DSL whose compiler is CUDA 13.4
+        or later (the CUDA 12 flavour lists the target and cannot assemble it)."""
+        if super()._unmet():
+            return True
+        if tuple(self.facts.cc) != (10, 7):
+            return False
+        from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound
+
+        return (int(CUDA_VERSION.major), int(CUDA_VERSION.minor)) < (13, 4)
+
+    def _build(self, device, site: str = ""):  # one form per row: the call site is not read
+        import torch
+
+        device, g, eps = torch.device(device), self.model.geometry, self.model.norm_eps
+        widths = (g.attn_heads, g.attn_kv_heads, g.attn_head_dim, g.rotary_dim)
+        key = ("attention_prepare_decode", str(device), widths, eps, tuple(self.row.form))
+        if key not in _ENTRIES:
+            arguments = self._arguments()
+            cudnn = self._cudnn()
+            from cudnn.attention_prepare import AttentionPrepareGeometry
+
+            try:
+                _ENTRIES[key] = cudnn.AttentionPrepareDecode(device, AttentionPrepareGeometry(*widths), eps, **arguments)
+            except (NotImplementedError, TypeError, ValueError) as error:  # the entry declines the widths or the form the table hands it
+                raise ValueError(f"the provider table is wrong: {self.entry} declines the geometry or the form of the row of {self.row.key}: {error}") from None
+        return _ENTRIES[key]
+
+    def twin(self, reference):
+        """The reference block this adapter is compared with: the preparation at the kernel's rounding points, in the position
+        form of the row."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.AttentionPrepareRounded(reference.row, self.model, self.facts, self.options)
+            self._twin.order = dict(self.row.form)["POSITIONS"]
+        return self._twin
+
+    def _operands(self, qkv, q_weight, k_weight, cos_sin, positions, k_pool, v_pool, slots) -> tuple:
+        """The entry's operands for the rows ``qkv`` ``[rows, 2 heads x D + 2 key / value heads x D]`` of an in-projection --
+        per query head its row and its gate row side by side, then the key rows, then the value rows: four VIEWS of
+        them, nothing copied -- and the outputs of this call, which are its own: never the entry's pair, which its next
+        call of that row count overwrites.  A row of one position row is handed the first of the table's three."""
+        import torch
+
+        g = self.model.geometry
+        rows, H, HK, D = int(qkv.shape[0]), g.attn_heads, g.attn_kv_heads, g.attn_head_dim
+        pairs = qkv[:, : 2 * H * D].view(rows, H, 2 * D)
+        k = qkv[:, 2 * H * D : (2 * H + HK) * D].view(rows, HK, D)
+        v = qkv[:, (2 * H + HK) * D :].view(rows, HK, D)
+        if dict(self.row.form)["POSITIONS"] != "3d":
+            positions = positions[0]
+        q_out = torch.empty((rows, H, D), dtype=torch.bfloat16, device=qkv.device)
+        gate_out = torch.empty((rows, H, D), dtype=torch.bfloat16, device=qkv.device)
+        return (pairs[..., :D], pairs[..., D:], k, v, q_weight, k_weight, cos_sin, positions, k_pool, v_pool, slots, q_out, gate_out)
+
+    def _scratch(self, sequences: int, tokens: int):
+        """``(entry, operands)`` on scratch tensors of the run's row count: rows of zeros, a pool of ONE page, the table of one
+        position.  Row ``n`` has slot ``n``: the rows past the page name no row of the pool, and write none."""
+        import torch
+
+        g, device = self.model.geometry, torch.device(self.options.get("device", "cuda"))
+        rows, bf16 = sequences * tokens, dict(dtype=torch.bfloat16, device=device)
+        qkv = torch.zeros((rows, 2 * g.attn_out + 2 * g.attn_kv_heads * g.attn_head_dim), **bf16)
+        weight = torch.zeros(g.attn_head_dim, **bf16)
+        pool = torch.zeros((1, g.attn_kv_heads, self.cache_page, 2 * g.attn_head_dim), **bf16)
+        cos_sin = torch.zeros((1, g.rotary_dim), **bf16)
+        positions = torch.zeros((3, rows), dtype=torch.int64, device=device)
+        slots = torch.arange(rows, dtype=torch.int64, device=device)
+        halves = (pool[..., : g.attn_head_dim], pool[..., g.attn_head_dim :])
+        return self._build(device), self._operands(qkv, weight, weight, cos_sin, positions, *halves, slots)
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device, in two steps.  The entry's build is handed nothing of this
+        adapter's -- its compile key is its construction -- so every typed decline of it is the entry's answer about the
+        installation and passes through as it is: a ``NotImplementedError``, the SKIP in the entry's own words.  Then ONE
+        call on scratch operands of the run's row count: the entry imports the contract of the paged pools and launches
+        its kernel there, not in the first step.  A decline of that call is of the operands this adapter built -- a
+        ``ValueError``, an ERROR -- unless it was raised from an ``ImportError``: what the call needs of the installation
+        could not be imported, which is the installation's again."""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        self._build(self.options["device"]).compile()  # handed nothing: a decline is the entry's own sentence, before an operand is made
+        entry, operands = self._scratch(sequences, tokens)
+        try:
+            entry(*operands)
+        except NotImplementedError as error:
+            if isinstance(error.__cause__, ImportError):
+                raise
+            raise ValueError(f"{self.entry} declined the operands this adapter built for its first use: {error}") from None
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{self.entry} declined the operands this adapter built for its first use: {error}") from None
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        entry, operands = self._scratch(sequences, tokens)
+        try:
+            entry.compile()  # built while the run was planned (``first_use``): the entry finds its kernel
+            entry(*operands)  # a launch of the compiled kernel at the run's row count, before the first step
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    def __call__(self, qkv, cache, position, params):
+        if not isinstance(cache, PagedKvCache) or cache.page != self.cache_page:
+            has = f"pages of {cache.page} positions" if isinstance(cache, PagedKvCache) else type(cache).__name__
+            raise ValueError(
+                f"cudnn.AttentionPrepareDecode writes an attention cache that is a pool of pages of {self.cache_page} positions; this block is handed {has}: "
+                "the session's state was built for another plan"
+            )
+        entry, rows = self._build(qkv.device), int(qkv.shape[0])
+        self._served = (entry, rows)  # what the call log of a traced step reads back (``serving``)
+        cos_sin, positions, slots = cache.at(position)  # the position reaches the kernel as rows of the state's tables, through the cache alone
+        operands = self._operands(qkv, params.q_norm, params.k_norm, cos_sin, positions, cache.k_pool, cache.v_pool, slots)
+        try:
+            entry(*operands)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.AttentionPrepareDecode declined the operands of this step: {error}") from error
+        q_out, gate_out = operands[-2:]
+        return q_out, gate_out.view(rows, -1)  # the tensors the entry wrote: the gates as the rows the gate block reads
+
+
+class AttentionGateQuantDecodeBlock(EntryBlock):
+    """``cudnn.AttentionGateQuantDecode``: ``code = e4m3(bf16(attn / (1 + exp(-gate))) * (1 / scale))`` per element of the
+    attention output, one launch per attention layer and step."""
+
+    name = "AttentionGateQuantDecode"
+    what = "the attention gate + quantise decode step"
+    kernels = (Kernel("gate_quant", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per attention layer and step
+    per_row = (0, 1)
+    _twin = None
+    _scales = None  # scale value -> the one-element fp32 tensor the kernel reads: built once per value, never inside a later step
+
+    def _width(self) -> int:
+        g = self.model.geometry
+        return g.attn_heads * g.attn_head_dim
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass is a wrong table."""
+        unknown = [name for name, _ in self.row.form if name not in GATE_FORM_FIELDS]
+        if unknown:
+            raise ValueError(
+                f"provider row {self.row.key}: its form names {', '.join(unknown)}; this adapter passes {', '.join(GATE_FORM_FIELDS)} "
+                "to cudnn.AttentionGateQuantDecode"
+            )
+        form, arguments = dict(self.row.form), {}
+        if "THREADS" in form:
+            from cudnn.attention_gate.frost import Cfg
+
+            arguments["cfg"] = Cfg(THREADS=form["THREADS"])
+        if "PDL_RELEASE" in form:
+            arguments["pdl_release"] = form["PDL_RELEASE"]
+        return arguments
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if self.facts.total_bytes and "device" in self.options:
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)  # the first use follows the memory sentence
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: on compute capability 10.7 the entry's page asks for the CUDA 13 flavour of the CuTe DSL
+        (the CUDA 12 flavour lists the target and cannot assemble it)."""
+        if super()._unmet():
+            return True
+        if tuple(self.facts.cc) != (10, 7):
+            return False
+        from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound; the entry has imported the DSL by now
+
+        return int(CUDA_VERSION.major) < 13
+
+    def _build(self, device):
+        import torch
+
+        device = torch.device(device)
+        key = ("attention_gate_quant_decode", str(device), self._width(), tuple(self.row.form))
+        if key not in _ENTRIES:
+            try:
+                _ENTRIES[key] = self._cudnn().AttentionGateQuantDecode(device, self._width(), **self._arguments())
+            except NotImplementedError as error:  # the entry declines the width the family's table hands it
+                raise ValueError(f"the provider table is wrong: {self.entry} declines the geometry of the row of {self.row.key}: {error}") from None
+        return _ENTRIES[key]
+
+    def _scale(self, value: float, device):
+        import torch
+
+        if self._scales is None:
+            self._scales = {}
+        key = (float(value), str(device))
+        if key not in self._scales:
+            self._scales[key] = torch.tensor([float(value)], dtype=torch.float32, device=device)
+        return self._scales[key]
+
+    def twin(self, reference):
+        """The reference block this adapter is compared with: the gate at the kernel's rounding points (the gated value as a
+        quotient, rounded once to bf16), not the reference chain's product of a rounded sigmoid."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.GateQuantizeQuotient(reference.row, self.model, self.facts, self.options)
+        return self._twin
+
+    def _scratch(self, sequences: int, tokens: int):
+        import torch
+
+        device = torch.device(self.options.get("device", "cuda"))
+        rows, width = sequences * tokens, self._width()
+        attn = torch.zeros((rows, width), dtype=torch.bfloat16, device=device)
+        out = torch.empty((rows, width), dtype=torch.float8_e4m3fn, device=device)
+        return self._build(device), (attn, torch.zeros_like(attn), self._scale(1.0, device), out)
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        entry, operands = self._scratch(sequences, tokens)
+        try:
+            entry.compile(*operands)  # built while the run was planned (``first_use``): the entry finds its kernel
+            entry(*operands)  # the first launch of the compiled kernel, before the first step
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    def __call__(self, o, gate, quant):
+        import torch
+
+        if quant.fmt != "fp8":
+            raise ValueError(f"cudnn.AttentionGateQuantDecode writes static 8-bit codes; this block is asked for {quant.fmt!r}")
+        entry, rows = self._build(o.device), int(o.shape[0])
+        self._served = (entry, rows)  # what the call log of a traced step reads back (``serving``)
+        out = torch.empty((rows, o.shape[1]), dtype=torch.float8_e4m3fn, device=o.device)  # this call's own: never the entry's one buffer
+        try:
+            entry(o, gate, self._scale(quant.scale, o.device), out)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.AttentionGateQuantDecode declined the operands of this step: {error}") from error
+        return ScaledTensor(out.view(torch.uint8), float(quant.scale))
+
+
+class AddNormQuantDecodeBlock(EntryBlock):
+    """``cudnn.AddNormQuantDecode``: per row ``y = bf16(v * rsqrt(mean(v^2) + eps) * (1 + weight))`` with ``v = branch +
+    residual`` (the residual updated in place) or ``v = branch`` (the residual stream started from it), and the codes of
+    quantising ``y``; one launch per call, in the form the row names for the call's site."""
+
+    name = "AddNormQuantDecode"
+    what = "the add + RMSNorm + quantise decode step"
+    kernels = (Kernel("add_norm_quant", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per call of the block
+    per_row = (0, 1)
+    state_args = (1,)  # the residual stream: updated in place where the form adds to it
+    _twin = None
+    _scales = None  # (value, reciprocal, device) -> the one-element fp32 tensor the kernel reads: built once, never inside a later step
+    _site = ""  # of the last call
+
+    def _arguments(self, site: str) -> dict:
+        """The constructor arguments the form of ``site`` stands for.  A field this adapter cannot pass, or a form without
+        one the entry has no default for, is a wrong table."""
+        form = self.row.site_form(site)
+        unknown = [name for name, _ in form if name not in NORM_FORM_ARGUMENTS]
+        missing = [name for name in NORM_FORM_REQUIRED if name not in dict(form)]
+        if unknown or missing:
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {', '.join(missing)}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form at {site or 'its one call site'} {what}; this adapter passes "
+                f"{', '.join(NORM_FORM_ARGUMENTS)} to cudnn.AddNormQuantDecode, which has no default for {', '.join(NORM_FORM_REQUIRED)}"
+            )
+        return {NORM_FORM_ARGUMENTS[name]: value for name, value in form}
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        for site in self._named():
+            self._arguments(site)
+        if self.facts.total_bytes and "device" in self.options:
+            for site in self._sites():  # the first use, where the entry gates the toolchain, follows the memory sentence
+                self._check_claim(self._build(self.options["device"], site), sequences * tokens)
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: on compute capability 10.7 the entry's page asks for a CuTe DSL whose compiler is CUDA 13.4
+        or later (the CUDA 12 flavour lists the target and cannot assemble it)."""
+        if super()._unmet():
+            return True
+        if tuple(self.facts.cc) != (10, 7):
+            return False
+        from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound
+
+        return (int(CUDA_VERSION.major), int(CUDA_VERSION.minor)) < (13, 4)
+
+    def _build(self, device, site: str = ""):
+        import torch
+
+        device = torch.device(device)
+        hidden, eps = self.model.geometry.hidden, self.model.norm_eps
+        key = ("add_norm_quant_decode", str(device), hidden, eps, tuple(self.row.site_form(site)))
+        if key not in _ENTRIES:
+            arguments = self._arguments(site)
+            try:
+                _ENTRIES[key] = self._cudnn().AddNormQuantDecode(device, hidden, eps, **arguments)
+            except (NotImplementedError, TypeError, ValueError) as error:  # the entry declines the width or the form the table hands it
+                where = f" at {site}" if site else ""
+                raise ValueError(
+                    f"the provider table is wrong: {self.entry} declines the geometry or the form of the row of {self.row.key}{where}: {error}"
+                ) from None
+        return _ENTRIES[key]
+
+    def _scale(self, value: float, device, reciprocal: bool = False):
+        """The one-element fp32 tensor the kernel reads its scale from: ``value``, or -- for 4-bit codes, whose kernel takes
+        the global scale a consumer divides by -- its fp32 reciprocal, correctly rounded.  Formed on the host."""
+        import torch
+
+        if self._scales is None:
+            self._scales = {}
+        key = (float(value), reciprocal, str(device))
+        if key not in self._scales:
+            scale = torch.tensor([float(value)], dtype=torch.float32)
+            self._scales[key] = (torch.ones(1, dtype=torch.float32) / scale if reciprocal else scale).to(device)
+        return self._scales[key]
+
+    def _outputs(self, form: dict, rows: int, device) -> dict:
+        """This call's own buffers for what the form writes: never the entry's, which are one set per row count and are
+        overwritten by its next call.  The block scales of 4-bit codes take whole tiles of 128 rows; the kernel writes
+        the bytes of the live rows, and nothing else of that buffer is read."""
+        import torch
+
+        from ..weights import BLOCK, TILE_ROWS
+
+        hidden, outputs = self.model.geometry.hidden, {}
+        if form.get("BF16_OUT"):
+            outputs["out"] = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+        if form.get("QUANT") == "e4m3_static":
+            outputs["codes"] = torch.empty((rows, hidden), dtype=torch.float8_e4m3fn, device=device)
+        elif form.get("QUANT") == "nvfp4":
+            outputs["codes"] = torch.empty((rows, hidden // 2), dtype=torch.uint8, device=device)
+            outputs["scales"] = torch.empty((-(-rows // TILE_ROWS) * TILE_ROWS, hidden // BLOCK), dtype=torch.float8_e4m3fn, device=device)
+        return outputs
+
+    def twin(self, reference):
+        """The reference block this adapter is compared with: the norm at the kernel's rounding points, writing what the
+        form of each call site writes."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.AddNormQuantizeBracket(reference.row, self.model, self.facts, self.options)
+            self._twin.forms = {site: dict(self.row.site_form(site)) for site in self._named()}
+        return self._twin
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device: build the kernel of every form the run calls (the entry's build
+        takes no operand).  Declines as ``EntryBlock.first_use``."""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        for site in self._sites():
+            try:
+                self._build(self.options["device"], site).compile()
+            except NotImplementedError as error:
+                if self._unmet():
+                    raise
+                raise ValueError(self._declined(error, "its first use")) from None
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device, rows, hidden = torch.device(self.options.get("device", "cuda")), sequences * tokens, self.model.geometry.hidden
+        for site in self._sites():
+            entry, form = self._build(device, site), dict(self.row.site_form(site))
+            x = torch.zeros((rows, hidden), dtype=torch.bfloat16, device=device)
+            residual = torch.zeros_like(x) if form.get("ADD") or form.get("STORE_RESIDUAL") else None
+            scale = self._scale(1.0, device) if form.get("QUANT") else None
+            try:
+                entry.compile()  # built while the run was planned (``first_use``): the entry finds its kernel
+                entry(x, residual, torch.zeros(hidden, dtype=torch.bfloat16, device=device), scale, **self._outputs(form, rows, device))
+            except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+                raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    def launch_facts(self, rows: int, site: str = "") -> Facts:
+        """The answers of the entry instance of ``site`` for ``rows``: the symbol of the kernel of that form (one per form,
+        whatever the row count), the form and the launch shape."""
+        entry = self._build(self.options.get("device", "cuda"), site)
+        return Facts(tuple(entry.kernel_symbols_for(rows)), entry.form_for(rows), tuple(entry.launch_shape_for(rows)))
+
+    def _served_form(self) -> tuple:
+        return tuple(self.row.site_form(self._site))
+
+    def __call__(self, branch, residual, weight, quant, site=""):
+        import torch
+
+        from ..weights import TiledBlockScaledTensor
+
+        entry, form = self._build(branch.device, site), dict(self.row.site_form(site))
+        rows, device, where = int(branch.shape[0]), branch.device, f" at {site}" if site else ""
+        self._served, self._site = (entry, rows), site  # what the call log of a traced step reads back (``serving``)
+        if quant is not None and quant.fmt not in NORM_QUANT:
+            raise ValueError(f"cudnn.AddNormQuantDecode writes static 8-bit or 4-bit codes; this block is asked for {quant.fmt!r}")
+        if (form["QUANT"] is None) != (quant is None) or (quant is not None and NORM_QUANT[quant.fmt] != form["QUANT"]):
+            asked = "no quantised operand" if quant is None else f"a {quant.fmt} operand"
+            writes = f"{form['QUANT']} codes" if form["QUANT"] is not None else "no codes"
+            raise ValueError(f"provider row {self.row.key}: its form{where} writes {writes}; the step asks for {asked} there")
+        starts = residual is None
+        if bool(form["ADD"]) == starts or (starts and not form.get("STORE_RESIDUAL")):
+            has = "no residual stream yet" if starts else "a residual stream"
+            raise ValueError(
+                f"provider row {self.row.key}: its form{where} is ADD {form['ADD']}, STORE_RESIDUAL {form.get('STORE_RESIDUAL', False)}; the step has {has} there"
+            )
+        if starts:
+            residual = torch.empty_like(branch)  # the stream starts here: the kernel writes the branch into it
+        scale = None
+        if form["QUANT"] is not None:
+            scale = self._scale(quant.scale, device, reciprocal=form["QUANT"] == "nvfp4")
+        try:
+            out, codes, scales = entry(branch, residual, weight, scale, **self._outputs(form, rows, device))
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.AddNormQuantDecode declined the operands of this step: {error}") from error
+        if form["QUANT"] == "e4m3_static":
+            q = ScaledTensor(codes.view(torch.uint8), float(quant.scale))
+        elif form["QUANT"] == "nvfp4":
+            q = TiledBlockScaledTensor(codes, scales.view(torch.uint8), float(quant.scale))
+        else:  # the form ends at the bf16 rows: no quantised operand
+            q = None
+        return q, out, residual
+
+
+class RowQuantizeFp4DecodeBlock(EntryBlock):
+    """``cudnn.RowQuantizeFp4Decode``: per block of sixteen elements of a bf16 row the E4M3 block scale ``e4m3(global * (max |x|
+    * fp32(1 / 6)))`` and the E2M1 codes of its elements under that scale, ``global`` the fp32 reciprocal of the consumer's
+    static scale; one launch per call, in the form the row names."""
+
+    name = "RowQuantizeFp4Decode"
+    what = "the 4-bit row quantise decode step"
+    first_version = "1.34.0"
+    kernels = (Kernel("row_quantize_fp4", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per call of the block
+    _twin = None
+    _scales = None  # (value, device) -> the one-element fp32 tensor the kernel reads: built once per value, never inside a later step
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass, a form that leaves one of
+        the three to the entry, or a row width that is not the model's hidden width is a wrong table."""
+        form = dict(self.row.form)
+        unknown = [name for name in form if name not in ROW_QUANTIZE_ARGUMENTS]
+        missing = [name for name in ROW_QUANTIZE_ARGUMENTS if name not in form]
+        if unknown or missing:
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {', '.join(missing)}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form {what}; this adapter passes {', '.join(ROW_QUANTIZE_ARGUMENTS)} to cudnn.RowQuantizeFp4Decode, "
+                "and never leaves one of them to the entry's own default"
+            )
+        hidden = self.model.geometry.hidden
+        if form["WIDTH"] != hidden:
+            raise ValueError(
+                f"provider row {self.row.key}: its form names WIDTH {form['WIDTH']}; the rows this block quantises have the model's hidden width, {hidden}"
+            )
+        return {ROW_QUANTIZE_ARGUMENTS[name]: value for name, value in form.items()}
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if self.facts.total_bytes and "device" in self.options:
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)  # the first use follows the memory sentence
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: on compute capability 10.7 the entry's page asks for a CuTe DSL whose compiler is CUDA 13.4
+        or later (the CUDA 12 flavour lists the target and cannot assemble it)."""
+        if super()._unmet():
+            return True
+        if tuple(self.facts.cc) != (10, 7):
+            return False
+        from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound
+
+        return (int(CUDA_VERSION.major), int(CUDA_VERSION.minor)) < (13, 4)
+
+    def _build(self, device, site: str = ""):  # one form per row: the call site is not read
+        import torch
+
+        device = torch.device(device)
+        key = ("row_quantize_fp4_decode", str(device), tuple(self.row.form))
+        if key not in _ENTRIES:
+            arguments = self._arguments()
+            try:
+                _ENTRIES[key] = self._cudnn().RowQuantizeFp4Decode(device, arguments.pop("width"), **arguments)
+            except (NotImplementedError, TypeError, ValueError) as error:  # the entry declines the width or the form the table hands it
+                raise ValueError(f"the provider table is wrong: {self.entry} declines the width or the form of the row of {self.row.key}: {error}") from None
+        return _ENTRIES[key]
+
+    def _scale(self, value: float, device):
+        """The one-element fp32 tensor the kernel reads its global scale from: the fp32 reciprocal of the consumer's static
+        scale ``value``, correctly rounded.  Formed on the host, once per value and device: a constant no launch writes."""
+        import torch
+
+        if self._scales is None:
+            self._scales = {}
+        key = (float(value), str(device))
+        if key not in self._scales:
+            self._scales[key] = (torch.ones(1, dtype=torch.float32) / torch.tensor([float(value)], dtype=torch.float32)).to(device)
+        return self._scales[key]
+
+    def _outputs(self, rows: int, device) -> tuple:
+        """This call's own buffers for the packed codes and the block scales: never the entry's pair, which is one per row
+        count and is overwritten by its next call.  The block scales take whole bands of 128 rows; the kernel writes the
+        bytes of the live rows, and nothing else of that buffer is read."""
+        import torch
+
+        hidden = self.model.geometry.hidden
+        codes = torch.empty((rows, hidden // 2), dtype=torch.uint8, device=device)
+        scales = torch.empty((-(-rows // TILE_ROWS) * TILE_ROWS, hidden // BLOCK), dtype=torch.float8_e4m3fn, device=device)
+        return codes, scales
+
+    def twin(self, reference):
+        """The reference block this adapter is compared with: the quantisation at the kernel's rounding points."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.QuantizeBracket(reference.row, self.model, self.facts, self.options)
+        return self._twin
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device: build the entry's kernel (the build takes no operand).  Declines
+        as ``EntryBlock.first_use``."""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        try:
+            self._build(self.options["device"]).compile()
+        except NotImplementedError as error:
+            if self._unmet():
+                raise
+            raise ValueError(self._declined(error, "its first use")) from None
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device, rows = torch.device(self.options.get("device", "cuda")), sequences * tokens
+        entry = self._build(device)
+        x = torch.zeros((rows, self.model.geometry.hidden), dtype=torch.bfloat16, device=device)
+        try:
+            entry.compile()  # built while the run was planned (``first_use``): the entry finds its kernel
+            entry(x, self._scale(1.0, device), *self._outputs(rows, device))  # a launch at the run's row count, before the first step
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    def __call__(self, rows, quant):
+        import torch
+
+        if quant is None or quant.fmt != "nvfp4":
+            asked = "no quantised operand" if quant is None else f"{quant.fmt!r}"
+            raise ValueError(f"cudnn.RowQuantizeFp4Decode writes 4-bit codes under a static global scale; this block is asked for {asked}")
+        entry, count = self._build(rows.device), int(rows.shape[0])
+        self._served = (entry, count)  # what the call log of a traced step reads back (``serving``)
+        codes, scales = self._outputs(count, rows.device)
+        try:
+            entry(rows, self._scale(quant.scale, rows.device), codes, scales)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.RowQuantizeFp4Decode declined the operands of this step: {error}") from error
+        return TiledBlockScaledTensor(codes, scales.view(torch.uint8), float(quant.scale))  # what the entry wrote, in its layout
+
+
+class Fp8ProjectionDecodeBlock(EntryBlock):
+    """``cudnn.Fp8ProjectionDecode``: ``out[t, n] = bf16(scale * sum_k activation[t, k] * weight[n, k])`` on the 8-bit codes
+    of both operands, fp32 accumulation in a fixed order; one launch per call, from the entry instance of the call's site
+    (one per weight shape), in the form the row names."""
+
+    name = "Fp8ProjectionDecode"
+    what = "the FP8 projection decode step at these weight shapes"
+    kernels = (Kernel("fp8_projection", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per call of the block
+    stored_weights = True  # the weight is multiplied on its stored 8-bit codes: the loader keeps them for this block
+    _scales = None  # (activation scale, weight scale, device) -> the one-element fp32 tensor the kernel reads: built once per pair
+    _site = ""  # of the last call
+
+    def _arguments(self, site: str) -> dict:
+        """The constructor arguments the form of ``site`` stands for.  A field this adapter cannot pass, or a form that
+        leaves the split, the weight tile, the ring depth or the weight's shape to the entry, is a wrong table."""
+        form = self.row.site_form(site)
+        known = (*PROJECTION_ARGUMENTS, *PROJECTION_FORM_FIELDS, *PROJECTION_GEOMETRY)
+        unknown = [name for name, _ in form if name not in known]
+        missing = [name for name in PROJECTION_REQUIRED if name not in dict(form)]
+        if unknown or missing:
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {', '.join(missing)}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form at {site or 'its one call site'} {what}; this adapter passes {', '.join(known)} to "
+                f"cudnn.Fp8ProjectionDecode, and never leaves {', '.join(PROJECTION_REQUIRED)} to the entry's own pick"
+            )
+        from cudnn.gemm import ProjectionForm, ProjectionGeometry
+
+        fields = dict(form)
+        arguments = {PROJECTION_ARGUMENTS[name]: value for name, value in form if name in PROJECTION_ARGUMENTS}
+        arguments["geometry"] = ProjectionGeometry(*(fields[name] for name in PROJECTION_GEOMETRY))
+        arguments["form"] = ProjectionForm(**{name: fields[name] for name in PROJECTION_FORM_FIELDS if name in fields})
+        return arguments
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        for site in self._named():
+            self._arguments(site)
+        rule = self.options.get("merge_rule", "largest_scale")
+        # the entry reads ONE scale element per call: a weight merged with a scale per row is not its operand.  Which weights
+        # a merge rule gives one scale per row is the family's to say, per call site (``scale_per_row``): a weight that is
+        # one stored tensor has one scale under every rule.  A family that does not say is asked for the default rule
+        per_row = getattr(self.model, "scale_per_row", None)
+        if rule != "largest_scale" and (not callable(per_row) or any(per_row(site, rule) for site in self._named())):
+            raise NotImplementedError(
+                f"cudnn.Fp8ProjectionDecode takes one scale per weight; the merge rule {rule!r} keeps one per weight row: load with the merge "
+                f'rule "largest_scale", or select another declared row of the block with --provider'
+            )
+        if self.facts.total_bytes and "device" in self.options:
+            for site in self._sites():  # the first use, where the entry gates the toolchain, follows the memory sentence
+                self._check_claim(self._build(self.options["device"], site), sequences * tokens)
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: the entry's page asks for a CuTe DSL that has the layer its kernel is written on."""
+        if super()._unmet():
+            return True
+        import importlib.util
+
+        try:
+            return importlib.util.find_spec("cutlass.cute.experimental") is None
+        except (ImportError, ValueError):
+            return True
+
+    def _build(self, device, site: str = ""):
+        import torch
+
+        device = torch.device(device)
+        key = ("fp8_projection_decode", str(device), tuple(self.row.site_form(site)))
+        if key not in _ENTRIES:
+            arguments = self._arguments(site)
+            try:
+                _ENTRIES[key] = self._cudnn().Fp8ProjectionDecode(device, **arguments)
+            except (NotImplementedError, TypeError, ValueError) as error:  # the entry declines the shape, the split or the form the table hands it
+                where = f" at {site}" if site else ""
+                raise ValueError(
+                    f"the provider table is wrong: {self.entry} declines the weight shape or the form of the row of {self.row.key}{where}: {error}"
+                ) from None
+        return _ENTRIES[key]
+
+    def _stated(self, entry, rows: int) -> dict:
+        """The entry's form for ``rows`` with the two fields of its geometry beside the others: a row names the weight's
+        shape per call site (``OUT_FEATURES``, ``IN_FEATURES``), and the entry states them one level down (``GEOM``)."""
+        form = entry.form_for(rows)
+        return {**form, **form.get("GEOM", {})}
+
+    def _served_form(self) -> tuple:
+        return tuple(self.row.site_form(self._site))
+
+    def launch_facts(self, rows: int, site: str = "") -> Facts:
+        """The answers of the entry instance of ``site`` for ``rows``: the symbol of the kernel it compiled for that row
+        count, its form and its launch shape (one thread block per weight tile: the grid follows the weight's shape)."""
+        entry = self._build(self.options.get("device", "cuda"), site)
+        return Facts(tuple(entry.kernel_symbols_for(rows)), self._stated(entry, rows), tuple(entry.launch_shape_for(rows)))
+
+    def _scale(self, activation: float, weight: float, device):
+        """The one fp32 element the kernel reads its scale from: the fp32 product of the activation's static scale and the
+        weight's scale, formed on the host once per pair of values and never inside a later step."""
+        import torch
+
+        if self._scales is None:
+            self._scales = {}
+        key = (float(activation), float(weight), str(device))
+        if key not in self._scales:
+            product = torch.tensor([float(activation)], dtype=torch.float32) * torch.tensor([float(weight)], dtype=torch.float32)
+            self._scales[key] = product.to(device)
+        return self._scales[key]
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device: build the kernel of the run's row count at every weight shape
+        the run calls (the entry's build takes no operand).  Declines as ``EntryBlock.first_use``."""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        for site in self._sites():
+            try:
+                self._build(self.options["device"], site).compile(sequences * tokens)
+            except NotImplementedError as error:
+                if self._unmet():
+                    raise
+                raise ValueError(self._declined(error, "its first use")) from None
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device, rows = torch.device(self.options.get("device", "cuda")), sequences * tokens
+        for site in self._sites():
+            entry, fields = self._build(device, site), dict(self.row.site_form(site))
+            n, k = (fields[name] for name in PROJECTION_GEOMETRY)
+            weight = torch.zeros((n, k), dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
+            activation = torch.zeros((rows, k), dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
+            out = torch.empty((rows, n), dtype=torch.bfloat16, device=device)
+            try:
+                entry.compile(rows)  # built while the run was planned (``first_use``): the entry finds its kernel
+                entry(weight, activation, self._scale(1.0, 1.0, device), out)  # the first launch of the compiled kernel, before the first step
+            except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+                raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    def __call__(self, qx, weight, site=""):
+        import torch
+
+        stored = getattr(weight, "stored", None)
+        if not isinstance(stored, ScaledTensor) or isinstance(stored.scale, torch.Tensor):
+            has = "one scale per weight row" if isinstance(stored, ScaledTensor) else "no stored 8-bit codes"
+            raise ValueError(
+                f"cudnn.Fp8ProjectionDecode multiplies on the stored 8-bit weight with its one scale; the weight of this call has {has}: "
+                "the weights of this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
+            )
+        if not isinstance(qx, ScaledTensor):
+            raise ValueError(f"cudnn.Fp8ProjectionDecode multiplies static 8-bit codes; this block is handed {type(qx).__name__}")
+        device, rows = qx.codes.device, int(qx.codes.shape[0])
+        entry = self._build(device, site)
+        self._served, self._site = (entry, rows), site  # what the call log of a traced step reads back (``serving``)
+        out = torch.empty((rows, stored.codes.shape[0]), dtype=torch.bfloat16, device=device)  # this call's own
+        scale = self._scale(qx.scale, stored.scale, device)
+        try:
+            entry(stored.codes.view(torch.float8_e4m3fn), qx.codes.view(torch.float8_e4m3fn), scale, out)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.Fp8ProjectionDecode declined the operands of this step: {error}") from error
+        return out
+
+
+class SwigluFp4DecodeBlock(EntryBlock):
+    """``cudnn.SwigluFp4Decode``: ``gate`` and ``up`` = ``bf16(alpha * sum_k activation[t, k] * weight[row, k])`` on the packed
+    4-bit codes of both operands, ``v = bf16(silu(gate) * up)``, and per block of 16 channels the block scale and the
+    4-bit codes of ``v``; one launch per call, in the form the row names, on the weight in the kernel's own layout."""
+
+    name = "SwigluFp4Decode"
+    what = "the fused 4-bit gate / up decode step"
+    kernels = (Kernel("swiglu_fp4", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per call of the block
+    stored_weights = True  # the weight is multiplied on its stored 4-bit codes: the loader keeps them for this block, in ``stored_layout``
+    _twin = None
+    _scalars = None  # (kind, values, device) -> the one-element fp32 tensor the kernel reads: built once per value, never inside a later step
+
+    def _geometry(self):
+        from cudnn.gemm import SwigluGeometry
+
+        return SwigluGeometry(self.model.geometry.hidden, self.model.geometry.mlp)
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for: the config as a whole and the launch knob.  A field this
+        adapter cannot pass, or a form that leaves one of them to the entry's default, is a wrong table."""
+        form = dict(self.row.form)
+        unknown = [name for name in form if name not in SWIGLU_REQUIRED]
+        missing = [name for name in SWIGLU_REQUIRED if name not in form]
+        if unknown or missing:
+            what = f"names {', '.join(unknown)}" if unknown else f"does not name {', '.join(missing)}"
+            raise ValueError(
+                f"provider row {self.row.key}: its form {what}; this adapter passes {', '.join(SWIGLU_REQUIRED)} to cudnn.SwigluFp4Decode, "
+                "and never leaves one of them to the entry's own default"
+            )
+        from cudnn.gemm.frost.swiglu_decode import Cfg
+
+        cfg = Cfg(GEOM=self._geometry(), **{name: form[name] for name in SWIGLU_CONFIG_FIELDS})
+        return {"cfg": cfg, **{SWIGLU_ARGUMENTS[name]: form[name] for name in SWIGLU_ARGUMENTS}}
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if self.facts.total_bytes and "device" in self.options:
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)  # the first use follows the memory sentence
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: the entry's page asks for a CuTe DSL whose compiler is CUDA 13.4 or later, on every
+        class it serves (its bytes were qualified with that compiler).  A CuTe DSL that does not say which compiler it
+        bound is not unmet by that: the entry declines nothing on a value it could not read, and neither does this."""
+        if super()._unmet():
+            return True
+        try:
+            from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound; the entry has imported the DSL by now
+
+            compiler = (int(CUDA_VERSION.major), int(CUDA_VERSION.minor))
+        except Exception:  # noqa: BLE001 -- whatever keeps the value from being read: no statement about the compiler
+            return False
+        return compiler < (13, 4)
+
+    def _build(self, device):
+        import torch
+
+        device = torch.device(device)
+        g = self.model.geometry
+        key = ("swiglu_fp4_decode", str(device), g.hidden, g.mlp, tuple(self.row.form))
+        if key not in _ENTRIES:
+            arguments = self._arguments()
+            try:
+                _ENTRIES[key] = self._cudnn().SwigluFp4Decode(device, self._geometry(), **arguments)
+            except (NotImplementedError, TypeError, ValueError) as error:  # the entry declines the widths or the form the table hands it
+                raise ValueError(f"the provider table is wrong: {self.entry} declines the geometry or the form of the row of {self.row.key}: {error}") from None
+        return _ENTRIES[key]
+
+    def stored_layout(self, merged):
+        """The merged gate / up weight (every gate row, then every up row; block scales row by row) in the layout the
+        kernel multiplies on, built once per weight at load by the entry's own helper: the rows in tiles of 64 gate + 64 up
+        channels, the block scales of those rows in the 128 x 4 layout.  A permutation of bytes: nothing is requantised.
+        The loader keeps what this returns as the stored form of the weight, and nothing else of it."""
+        from cudnn.gemm.frost.swiglu_decode import interleave_gate_up
+
+        if not isinstance(merged, BlockScaledTensor):
+            raise ValueError(f"cudnn.SwigluFp4Decode multiplies on a merged 4-bit gate / up weight; the loader handed its layout {type(merged).__name__}")
+        try:
+            codes, scales = interleave_gate_up(merged.codes, tile_scales(merged.block_scales))
+        except (TypeError, ValueError) as error:  # a weight whose shape the kernel's layout cannot hold
+            raise ValueError(f"the provider table is wrong: {self.entry} cannot lay out the weight of the row of {self.row.key}: {error}") from None
+        return InterleavedBlockScaledTensor(codes, scales.view(merged.block_scales.shape), float(merged.scale))
+
+    def twin(self, reference):
+        """The reference block this adapter is compared with: the block's reference pair evaluated in fp64 with the error
+        bound of the entry's contract, not the pair's own bf16 product."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.GateUpFp4Bound(reference.row, self.model, self.facts, self.options)
+        return self._twin
+
+    def _scalar(self, device, product=None, reciprocal=None):
+        """One fp32 element the kernel reads, formed on the host once per value: the fp32 product of two static scales
+        (``product``: the pair), or the fp32 reciprocal of one, correctly rounded (``reciprocal``: the global scale of 4-bit
+        codes whose consumer reads ``code * block scale * scale``)."""
+        import torch
+
+        from .torch_ref import fp32_product
+
+        if self._scalars is None:
+            self._scalars = {}
+        key = ("product", *(float(v) for v in product), str(device)) if product is not None else ("reciprocal", float(reciprocal), str(device))
+        if key not in self._scalars:
+            if product is not None:
+                value = fp32_product(*product)
+            else:
+                value = torch.ones(1, dtype=torch.float32) / torch.tensor([float(reciprocal)], dtype=torch.float32)
+            self._scalars[key] = value.to(device)
+        return self._scalars[key]
+
+    def _outputs(self, rows: int, device):
+        """This call's own buffers: the packed codes of the rows, and whole bands and tiles of the 128 x 4 layout for their
+        block scales (the kernel writes the bytes of the live rows; nothing else of that buffer is read)."""
+        import torch
+
+        width = self.model.geometry.mlp
+        out = torch.empty((rows, width // 2), dtype=torch.uint8, device=device)
+        scales = torch.empty((-(-rows // TILE_ROWS) * TILE_ROWS, -(-(width // BLOCK) // TILE_COLUMNS) * TILE_COLUMNS), dtype=torch.uint8, device=device)
+        return out, scales
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device: build the kernel of the run's row count.  The entry's build is
+        handed that row count and nothing else, and the row count is held in front of it (``_check_claim``: an entry that
+        states no launch for it is a wrong table).  Nothing of this adapter's is then left for the build to decline, so
+        every typed decline of it is the entry's answer about the installation -- its compiler, the part's target, the
+        names the kernel is written on -- and passes through as it is: a ``NotImplementedError``, the SKIP in the entry's
+        own words.  (``EntryBlock.first_use`` turns a decline no requirement explains into an ERROR about the operands
+        the adapter built; this adapter builds none here, and one of this entry's requirements has no public probe.)"""
+        import torch
+
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        entry, rows = self._build(self.options["device"]), sequences * tokens
+        self._check_claim(entry, rows)
+        entry.compile(rows)
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device, rows, g = torch.device(self.options.get("device", "cuda")), sequences * tokens, self.model.geometry
+        entry = self._build(device)
+        weight = torch.zeros((2 * g.mlp, g.hidden // 2), dtype=torch.uint8, device=device)
+        weight_scale = torch.zeros((2 * g.mlp, g.hidden // BLOCK), dtype=torch.uint8, device=device)
+        activation = torch.zeros((rows, g.hidden // 2), dtype=torch.uint8, device=device)
+        activation_scale = torch.zeros((-(-rows // TILE_ROWS) * TILE_ROWS, g.hidden // BLOCK), dtype=torch.uint8, device=device)
+        one = self._scalar(device, product=(1.0, 1.0))
+        try:
+            entry.compile(rows)  # built while the run was planned (``first_use``): the entry finds its kernel
+            entry(weight, weight_scale, activation, activation_scale, one, one, *self._outputs(rows, device))  # the first launch, before the first step
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
+
+    @staticmethod
+    def _operand(qx):
+        """The 4-bit operand as the kernel reads it: ``(packed codes, block scales in the 128 x 4 layout)``.  From a kernel
+        on the stored formats it comes that way and is handed over as it is.  From a block that is not a kernel -- a
+        reference chain, or one row of a batch in a check -- the block scales come row by row, and this block brings
+        them into the layout when it reads them: its own launch, never the producer's."""
+        if isinstance(qx, TiledBlockScaledTensor):
+            return qx.codes, qx.tiled_scales
+        if isinstance(qx, BlockScaledTensor):
+            return qx.codes, tile_scales(qx.block_scales)
+        raise ValueError(f"cudnn.SwigluFp4Decode multiplies packed 4-bit codes with their block scales; this block is handed {type(qx).__name__}")
+
+    def __call__(self, qx, weight, quant):
+        stored = getattr(weight, "stored", None)
+        if not isinstance(stored, InterleavedBlockScaledTensor):
+            has = "it in the checkpoint's row order" if isinstance(stored, BlockScaledTensor) else "no stored 4-bit codes"
+            raise ValueError(
+                f"cudnn.SwigluFp4Decode multiplies on the stored 4-bit gate / up weight in its own row order; the weight of this call has {has}: "
+                "the weights of this session were loaded for another plan (plan every session of a run before the first load: Session.plan_table)"
+            )
+        if quant is None or quant.fmt != "nvfp4":
+            asked = "no quantised operand" if quant is None else repr(quant.fmt)
+            raise ValueError(f"cudnn.SwigluFp4Decode writes 4-bit codes with their block scales; this block is asked for {asked}")
+        codes, scales = self._operand(qx)
+        device, rows = codes.device, int(codes.shape[0])
+        entry = self._build(device)
+        self._served = (entry, rows)  # what the call log of a traced step reads back (``serving``)
+        out, out_scales = self._outputs(rows, device)
+        alpha, scale = self._scalar(device, product=(qx.scale, stored.scale)), self._scalar(device, reciprocal=quant.scale)
+        try:
+            entry(stored.codes, stored.tiled_scales, codes, scales, alpha, scale, out, out_scales)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.SwigluFp4Decode declined the operands of this step: {error}") from error
+        return TiledBlockScaledTensor(out, out_scales, float(quant.scale))

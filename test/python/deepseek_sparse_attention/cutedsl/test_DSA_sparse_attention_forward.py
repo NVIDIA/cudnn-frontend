@@ -9,6 +9,8 @@ another pytest-xdist CUDA context can produce nondeterministic NaNs.
 """
 
 import math
+from dataclasses import dataclass
+from typing import Optional
 
 import pytest
 import torch
@@ -387,6 +389,91 @@ def test_DSA_sparse_attention_forward_executes_all_frozen_instances(num_heads, h
         torch.testing.assert_close(result["lse_indexer"], ref_lse_indexer, atol=1e-6, rtol=2.01 / 65536)
     else:
         assert result["lse_indexer"] is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "head_dim,indexer_topk",
+    [(512, 0), (576, 0), (512, 512)],
+    ids=["D512", "D576", "D512-indexer512"],
+)
+def test_DSA_sparse_attention_forward_head64_persistent_queries_match_isolated_launches(head_dim, indexer_topk):
+    """A persistent H64 launch (several queries per CTA) equals, byte for byte, launches of one query per CTA."""
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family GPU required")
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    tma_gather4 = pytest.importorskip(
+        "cudnn.deepseek_sparse_attention.sparse_attention_forward._tma_gather4",
+        reason="Environment not supported: cudnn[cutedsl] not installed",
+    )
+    if not tma_gather4.TMA_GATHER4_AVAILABLE:
+        pytest.skip("The persistent schedule needs the gather4 bridge; this DSL runs one query per CTA")
+
+    torch.manual_seed(179)
+    device = torch.device("cuda")
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    total_s_q = 4 * sm_count + 17
+    num_heads = 64
+    if indexer_topk:
+        total_s_kv, logical_topk = 701, 576
+        length_values = [0, 1, 65, 448, 511, 512, 513, 576, 7]
+    else:
+        total_s_kv, logical_topk = 301, 256
+        length_values = [0, 1, 63, 64, 65, 128, 129, 192, 200, 256, 7]
+    q = (torch.randn(total_s_q, num_heads, head_dim, device=device) / math.sqrt(head_dim)).to(torch.bfloat16)
+    kv = (torch.randn(total_s_kv, head_dim, device=device) / math.sqrt(head_dim)).to(torch.bfloat16)
+    topk_idxs = torch.randint(0, total_s_kv, (total_s_q, logical_topk), dtype=torch.int32, device=device)
+    topk_idxs[:, 3] = -1
+    topk_idxs[:, 70] = total_s_kv + 5
+    length_pattern = torch.tensor(length_values, dtype=torch.int32, device=device)
+    topk_length = length_pattern.repeat((total_s_q + length_pattern.numel() - 1) // length_pattern.numel())[:total_s_q]
+    topk_length = topk_length[torch.randperm(total_s_q, device=device)].contiguous()
+    attn_sink = torch.linspace(-0.5, 0.5, num_heads, dtype=torch.float32, device=device)
+    scale = 1.0 / math.sqrt(head_dim)
+    names = ("out", "max_logits", "lse", "lse_indexer") if indexer_topk else ("out", "max_logits", "lse")
+
+    def run(rows):
+        return DSA.sparse_attention_forward_wrapper(
+            q[rows],
+            kv,
+            topk_idxs[rows],
+            attn_sink=attn_sink,
+            topk_length=topk_length[rows],
+            softmax_scale=scale,
+            indexer_topk=indexer_topk,
+        )
+
+    batched = run(slice(None))
+    torch.cuda.synchronize()
+    chunk = 7
+    for begin in range(0, total_s_q, chunk):
+        rows = slice(begin, min(begin + chunk, total_s_q))
+        isolated = run(rows)
+        torch.cuda.synchronize()
+        for name in names:
+            assert torch.equal(batched[name][rows].view(torch.uint8), isolated[name].view(torch.uint8)), (name, begin)
+
+    ref_out, ref_max, ref_lse, ref_lse_indexer = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=scale,
+        indexer_topk=indexer_topk,
+        return_full=True,
+    )
+    torch.testing.assert_close(batched["out"].float(), ref_out.float(), atol=8e-4, rtol=3.01 / 128)
+    torch.testing.assert_close(batched["max_logits"], ref_max, atol=1e-6, rtol=2.01 / 65536)
+    torch.testing.assert_close(batched["lse"], ref_lse, atol=1e-6, rtol=2.01 / 65536)
+    if indexer_topk:
+        # Rows shorter than the prefix are outside the forward contract.
+        full_prefix = topk_length >= indexer_topk
+        torch.testing.assert_close(batched["lse_indexer"][full_prefix], ref_lse_indexer[full_prefix], atol=1e-6, rtol=2.01 / 65536)
 
 
 @pytest.mark.L2
@@ -830,6 +917,275 @@ def test_DSA_sparse_attention_forward_compile_cache_separates_structural_special
     run(512)
     assert len(compiled_callables) == len(interface_sm100._compile_cache) == len(specializations)
     assert next(iter(interface_sm100._compile_cache.values())) is first_compiled
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_forward_packed_kv_declarations(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family GPU required")
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_forward._kv_formats import KV_FORMATS
+    except ImportError:
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    queries = {d: torch.empty((1, 64, d), dtype=torch.bfloat16, device=device) for d in (512, 576)}
+    q = queries[512]
+    kv = torch.empty((2, 512), dtype=torch.bfloat16, device=device)
+    topk = torch.zeros((1, 640), dtype=torch.int32, device=device)
+
+    # Every format: its byte rows, also as the view of a padded buffer, are validated, then declined until a kernel serves them.
+    for fmt in KV_FORMATS.values():
+        q_fmt = queries[fmt.head_dim_qk]
+        rows = torch.empty((2, fmt.record_bytes), dtype=torch.uint8, device=device)
+        padded = torch.empty((2, fmt.record_bytes + 32), dtype=torch.uint8, device=device)[:, : fmt.record_bytes]
+        for pool in (rows, padded):
+            with pytest.raises(NotImplementedError, match=f"does not serve kv_format='{fmt.name}' on SM10"):
+                DSA.SparseAttentionForward(q_fmt, pool, topk, kv_format=fmt.name).check_support()
+        with pytest.raises(NotImplementedError, match=f"does not serve kv_format='{fmt.name}'"):
+            DSA.sparse_attention_forward_wrapper(q_fmt, rows, topk, kv_format=fmt.name)
+        with pytest.raises(ValueError, match=f"must be the \\(total_S_kv, {fmt.record_bytes}\\) byte rows"):
+            DSA.SparseAttentionForward(q_fmt, rows[:, :-1], topk, kv_format=fmt.name).check_support()
+        other_d = 576 if fmt.head_dim_qk == 512 else 512
+        with pytest.raises(ValueError, match=f"{fmt.name} rows hold D_qk={fmt.head_dim_qk} channels, but Q has D_qk={other_d}"):
+            DSA.SparseAttentionForward(queries[other_d], rows, topk, kv_format=fmt.name).check_support()
+        with pytest.raises(ValueError, match="KV dtype mismatch: expected torch.uint8"):
+            DSA.SparseAttentionForward(q_fmt, rows.view(torch.float8_e4m3fn), topk, kv_format=fmt.name).check_support()
+
+    # Unknown names, scattered row bytes, and a uint8 cache without its format.
+    rows = torch.empty((2, 528), dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match="unknown kv_format 'mxfp8'; the packed KV cache formats are"):
+        DSA.SparseAttentionForward(q, rows, topk, kv_format="mxfp8").check_support()
+    with pytest.raises(ValueError, match="each row's bytes contiguous"):
+        DSA.SparseAttentionForward(q, torch.empty((528, 2), dtype=torch.uint8, device=device).t(), topk, kv_format="mxfp8_528").check_support()
+    for pool, pitch in (
+        (torch.empty((528,), dtype=torch.uint8, device=device).expand(2, 528), 0),  # rows overlap
+        (torch.empty((2, 529), dtype=torch.uint8, device=device)[:, :528], 529),  # rows not 16-byte apart
+    ):
+        with pytest.raises(ValueError, match=f"KV row pitch stride\\(0\\) must be a multiple of 16 bytes and at least 528, got {pitch}"):
+            DSA.SparseAttentionForward(q, pool, topk, kv_format="mxfp8_528").check_support()
+    with pytest.raises(ValueError, match="unknown kv_format \\['mxfp8_528'\\]"):
+        DSA.sparse_attention_forward_wrapper(q, rows, topk, kv_format=["mxfp8_528"])
+    with pytest.raises(ValueError, match="KV must have same dtype as Q; a packed torch.uint8 cache also needs kv_format"):
+        DSA.SparseAttentionForward(q, rows, topk).check_support()
+
+    # A per-tensor-scaled FP8 pool: float8_e4m3fn channels with an FP32 (1,) descale, declined until a kernel serves it.
+    kv_fp8 = torch.empty((2, 512), dtype=torch.float8_e4m3fn, device=device)
+    descale = torch.ones((1,), dtype=torch.float32, device=device)
+    with pytest.raises(NotImplementedError, match="does not serve a per-tensor-scaled FP8 KV pool \\(descale_kv\\) on SM10"):
+        DSA.SparseAttentionForward(q, kv_fp8, topk, sample_descale_kv=descale).check_support()
+    with pytest.raises(NotImplementedError, match="per-tensor-scaled FP8 KV pool"):
+        DSA.sparse_attention_forward_wrapper(q, kv_fp8, topk, descale_kv=descale)
+    for kv_case, descale_case, message in (
+        (kv_fp8, None, "a float8_e4m3fn KV pool needs descale_kv"),
+        (kv_fp8, descale.double(), "descale_kv dtype mismatch: expected torch.float32"),
+        (kv_fp8, descale.new_ones((2,)), "descale_kv must have shape \\(1,\\)"),
+        (kv, descale, "descale_kv is the descale of a float8_e4m3fn KV pool, but KV is torch.bfloat16"),
+        (kv_fp8[:, :500], descale, "KV head dimension \\(500\\) must match Q \\(512\\)"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            DSA.SparseAttentionForward(q, kv_case, topk, sample_descale_kv=descale_case).check_support()
+    with pytest.raises(ValueError, match="descale_kv does not apply to a mxfp8_528 cache, which carries its own scales"):
+        DSA.SparseAttentionForward(q, rows, topk, kv_format="mxfp8_528", sample_descale_kv=descale).check_support()
+
+    # A second pool with its own token ids: validated like kv, then declined until a kernel serves it.
+    extra = torch.empty((3, 288), dtype=torch.uint8, device=device)
+    extra_bf16 = torch.empty((3, 512), dtype=torch.bfloat16, device=device)
+    extra_idxs = torch.zeros((1, 512), dtype=torch.int32, device=device)
+    extra_len = torch.zeros((1,), dtype=torch.int32, device=device)
+    packed_extra = dict(sample_extra_kv=extra, extra_kv_format="nvfp4_288", sample_extra_topk_idxs=extra_idxs)
+    with pytest.raises(NotImplementedError, match="does not serve a second KV pool \\(extra_kv\\) on SM10"):
+        DSA.SparseAttentionForward(q, kv, topk, **packed_extra, sample_extra_topk_length=extra_len).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve a second KV pool"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra_bf16, sample_extra_topk_idxs=extra_idxs).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve a second KV pool"):
+        DSA.sparse_attention_forward_wrapper(q, kv, topk, extra_kv=extra, extra_kv_format="nvfp4_288", extra_topk_idxs=extra_idxs, extra_topk_length=extra_len)
+    with pytest.raises(NotImplementedError, match="does not serve kv_format='mxfp8_528'"):
+        DSA.sparse_attention_forward_wrapper(q, rows, topk, kv_format="mxfp8_528", extra_kv=extra, extra_kv_format="nvfp4_288", extra_topk_idxs=extra_idxs)
+    with pytest.raises(NotImplementedError, match="indexer_topk > 0 \\(lse_indexer\\) with a second KV pool"):
+        DSA.SparseAttentionForward(q, kv, topk, indexer_topk=512, **packed_extra).check_support()
+
+    # The pool's token ids and format travel with it.
+    with pytest.raises(ValueError, match="extra_kv needs extra_topk_idxs"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra, extra_kv_format="nvfp4_288").check_support()
+    for orphan in (
+        dict(extra_kv_format="nvfp4_288"),
+        dict(sample_extra_topk_idxs=extra_idxs),
+        dict(sample_extra_topk_length=extra_len),
+        dict(sample_descale_extra_kv=descale),
+    ):
+        with pytest.raises(ValueError, match="describe a second KV pool, but extra_kv is not given"):
+            DSA.SparseAttentionForward(q, kv, topk, **orphan).check_support()
+    with pytest.raises(ValueError, match="a float8_e4m3fn extra_kv pool needs descale_extra_kv"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=kv_fp8, sample_extra_topk_idxs=extra_idxs).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve a second KV pool"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=kv_fp8, sample_extra_topk_idxs=extra_idxs, sample_descale_extra_kv=descale).check_support()
+    with pytest.raises(ValueError, match="unknown extra_kv_format 'nvfp4'"):
+        DSA.SparseAttentionForward(q, kv, topk, **{**packed_extra, "extra_kv_format": "nvfp4"}).check_support()
+    with pytest.raises(ValueError, match="extra_kv in format nvfp4_288 must be the \\(total_S_extra_kv, 288\\) byte rows"):
+        DSA.SparseAttentionForward(q, kv, topk, **{**packed_extra, "sample_extra_kv": extra[:, :-1]}).check_support()
+    with pytest.raises(ValueError, match="extra_kv must have same dtype as Q; a packed torch.uint8 cache also needs extra_kv_format"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra, sample_extra_topk_idxs=extra_idxs).check_support()
+    with pytest.raises(ValueError, match="extra_kv head dimension \\(576\\) must match Q \\(512\\)"):
+        DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra_bf16.new_empty((3, 576)), sample_extra_topk_idxs=extra_idxs).check_support()
+    for bad_idxs, message in (
+        (extra_idxs.long(), "extra_topk_idxs dtype mismatch: expected torch.int32"),
+        (extra_idxs[0], "extra_topk_idxs must be 2-D"),
+        (extra_idxs.new_zeros((2, 512)), "extra_topk_idxs first dimension \\(2\\) must match Q \\(1\\)"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            DSA.SparseAttentionForward(q, kv, topk, **{**packed_extra, "sample_extra_topk_idxs": bad_idxs}).check_support()
+    with pytest.raises(ValueError, match="extra_topk_length must have shape \\(1,\\)"):
+        DSA.SparseAttentionForward(q, kv, topk, **packed_extra, sample_extra_topk_length=extra_len.new_zeros((2,))).check_support()
+
+    # A plan declared without a second pool or a descale refuses them at execute rather than ignoring them.
+    plan = DSA.SparseAttentionForward(q, kv, topk)
+    assert plan.check_support()
+    plan.compile()
+    for name, value in (
+        ("extra_kv", extra_bf16),
+        ("extra_topk_idxs", extra_idxs),
+        ("extra_topk_length", extra_len),
+        ("descale_kv", descale),
+        ("descale_extra_kv", descale),
+    ):
+        with pytest.raises(ValueError, match=f"{name} must be given exactly when"):
+            plan.execute(q, kv, topk, **{name: value})
+
+    # The new parameters are keyword-only, so positional callers keep their meaning.
+    with pytest.raises(TypeError):
+        DSA.SparseAttentionForward(q, rows, topk, None, None, None, 0, "mxfp8_528")
+
+    # The architecture gate runs before the packed-cache decline.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (12, 0))
+    with pytest.raises(RuntimeError, match="requires an SM90 or SM100-family GPU"):
+        DSA.SparseAttentionForward(q, rows, topk, kv_format="mxfp8_528").check_support()
+
+
+@dataclass(frozen=True)
+class _Pool:
+    """One KV pool of a model's attention call: how it is stored and how wide its index table is."""
+
+    form: str  # "bf16" (Q's dtype), "fp8" (float8_e4m3fn with a per-tensor descale), or a kv_format name
+    slots: int
+
+
+@dataclass(frozen=True)
+class _ModelCall:
+    """One attention call of a model, as the forward's arguments express it."""
+
+    model: str
+    layer: str
+    heads: int  # published query heads on one GPU
+    d_qk: int
+    kv: _Pool
+    extra: Optional[_Pool] = None
+    indexer_topk: int = 0
+    sink: bool = False
+    served: bool = False  # a kernel serves this call today
+
+
+# How sparse-attention models express their attention calls, by layer kind and by how their caches are stored. One-pool
+# calls are today's form (a window folded into the index row after the indexer prefix); two-pool calls keep the window
+# cache (kv) and the compressed cache (extra_kv) apart, each with its own token ids.
+_MODEL_CALLS = (
+    # DeepSeek-V3.2 and GLM-5.3: a 512-channel latent plus 64 RoPE channels, indexer top-2048 tokens, one pool.
+    *(
+        _ModelCall(model, "sparse", heads, 576, _Pool(form, 2048), served=form == "bf16")
+        for model, heads in (("deepseek-v3.2", 128), ("glm-5.3", 64))
+        for form in ("bf16", "fp8_bf16rope_656", "nvfp4_fp8rope_352", "fp8")
+    ),
+    # GLM-5.3-Flash: a 512-channel latent without RoPE channels, 512 indexer-selected pools of 4 tokens. Its FP8 cache is
+    # fp8_528, or fp8_bf16rope_656 with a zero RoPE slot read by a Q zero-padded to 576 channels.
+    _ModelCall("glm-5.3-flash", "sparse", 64, 512, _Pool("bf16", 2048), served=True),
+    _ModelCall("glm-5.3-flash", "sparse", 64, 512, _Pool("fp8_528", 2048)),
+    _ModelCall("glm-5.3-flash", "sparse", 64, 576, _Pool("fp8_bf16rope_656", 2048)),
+    # DeepSeek-V4-Flash and V4-Pro: a 512-channel K = V record, a 128-token window and a per-head sink. Compressed layers
+    # attend to indexer-selected entries (CSA: top-512 / top-1024) or to every causal compressed block (HCA).
+    _ModelCall("deepseek-v4-flash", "window", 64, 512, _Pool("bf16", 128), sink=True, served=True),
+    _ModelCall("deepseek-v4-flash", "window", 64, 512, _Pool("fp8", 128), sink=True),
+    _ModelCall("deepseek-v4-flash", "csa", 64, 512, _Pool("bf16", 640), indexer_topk=512, sink=True, served=True),
+    _ModelCall("deepseek-v4-flash", "csa", 64, 512, _Pool("bf16", 128), _Pool("bf16", 512), sink=True),
+    _ModelCall("deepseek-v4-flash", "csa", 64, 512, _Pool("fp8", 128), _Pool("fp8", 512), sink=True),
+    _ModelCall("deepseek-v4-flash", "hca", 64, 512, _Pool("bf16", 128), _Pool("bf16", 128), sink=True),
+    _ModelCall("deepseek-v4-pro", "csa", 128, 512, _Pool("bf16", 1152), indexer_topk=1024, sink=True, served=True),
+    _ModelCall("deepseek-v4-pro", "csa", 128, 512, _Pool("bf16", 128), _Pool("bf16", 1024), sink=True),
+    _ModelCall("deepseek-v4-pro", "csa", 128, 512, _Pool("fp8", 128), _Pool("fp8", 1024), sink=True),
+    # DeepSeek-V4.1-Flash: as V4-Flash, with window-only layers and compressed layers (ratio 1 or 2) whose indexer picks
+    # 512 entries. Its window cache is mxfp8_528 or per-tensor FP8, and its compressed cache nvfp4_288.
+    _ModelCall("deepseek-v4.1-flash", "window", 64, 512, _Pool("mxfp8_528", 128), sink=True),
+    _ModelCall("deepseek-v4.1-flash", "window", 64, 512, _Pool("fp8", 128), sink=True),
+    _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("bf16", 640), indexer_topk=512, sink=True, served=True),
+    _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("bf16", 128), _Pool("bf16", 512), sink=True),
+    _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("mxfp8_528", 128), _Pool("nvfp4_288", 512), sink=True),
+    _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("fp8", 128), _Pool("nvfp4_288", 512), sink=True),
+)
+
+
+def _model_call_id(call: _ModelCall) -> str:
+    pools = call.kv.form if call.extra is None else f"{call.kv.form}+{call.extra.form}"
+    return f"{call.model}-{call.layer}-{pools}"
+
+
+def _model_pool(pool: _Pool, d_qk: int, device: torch.device):
+    """``(tensor, kv_format, descale)`` of one pool; 64 rows stand for a cache of any size."""
+    if pool.form == "bf16":
+        return torch.empty((64, d_qk), dtype=torch.bfloat16, device=device), None, None
+    if pool.form == "fp8":
+        return torch.empty((64, d_qk), dtype=torch.float8_e4m3fn, device=device), None, torch.ones((1,), dtype=torch.float32, device=device)
+    from cudnn.deepseek_sparse_attention.sparse_attention_forward._kv_formats import KV_FORMATS
+
+    return torch.empty((64, KV_FORMATS[pool.form].record_bytes), dtype=torch.uint8, device=device), pool.form, None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("call", _MODEL_CALLS, ids=_model_call_id)
+def test_DSA_sparse_attention_forward_model_calls(call):
+    """Each model's attention call is a valid declaration: a served call passes ``check_support``, and every other call
+    passes all validation and reaches the decline of the part no kernel serves yet."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family GPU required")
+    try:
+        from cudnn import DSA
+    except ImportError:
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    total_s_q = 2
+
+    def token_ids(slots):
+        return torch.zeros((total_s_q, slots), dtype=torch.int32, device=device)
+
+    def lengths(slots):
+        return torch.full((total_s_q,), slots, dtype=torch.int32, device=device)
+
+    q = torch.empty((total_s_q, call.heads, call.d_qk), dtype=torch.bfloat16, device=device)
+    kv, kv_format, descale_kv = _model_pool(call.kv, call.d_qk, device)
+    pool_args = dict(kv_format=kv_format, sample_descale_kv=descale_kv)
+    if call.extra is not None:
+        extra_kv, extra_kv_format, descale_extra_kv = _model_pool(call.extra, call.d_qk, device)
+        pool_args.update(
+            sample_extra_kv=extra_kv,
+            extra_kv_format=extra_kv_format,
+            sample_descale_extra_kv=descale_extra_kv,
+            sample_extra_topk_idxs=token_ids(call.extra.slots),
+            sample_extra_topk_length=lengths(call.extra.slots),
+        )
+    plan = DSA.SparseAttentionForward(
+        q,
+        kv,
+        token_ids(call.kv.slots),
+        sample_attn_sink=torch.zeros((call.heads,), dtype=torch.float32, device=device) if call.sink else None,
+        sample_topk_length=lengths(call.kv.slots),
+        indexer_topk=call.indexer_topk,
+        **pool_args,
+    )
+    if call.served:
+        assert plan.check_support()
+    else:
+        with pytest.raises(NotImplementedError, match="SparseAttentionForward does not serve"):
+            plan.check_support()
 
 
 @pytest.mark.L1

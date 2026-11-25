@@ -50,11 +50,11 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
                 raise NotImplementedError(f"{engine}: the composed summaries' {port} must be fp32 (the summary ops' output), got {got}")
 
 
-def context_gate(engine: str, facts, *, b_t: int, expand_num: int = 1, min_tokens: int = 0) -> None:
+def context_gate(engine: str, facts, *, b_t: int, expand_num: int = 1) -> None:
     """Decline a one-sequence backward whose context's per-piece tables were cut by its summary differently from the
-    way this backward cuts the same tokens: the summary chains with ``compose_tail`` and no floor, the backward with
-    ``min_tokens``; both cut alike whenever both get the same ``checkpoint_every_n_tokens``.  An uncut backward has no
-    leaf pass and ignores the tables, and so does a multi-sequence slab."""
+    way this backward cuts the same tokens: the summary chains with ``compose_tail``; both cut alike whenever both get
+    the same ``checkpoint_every_n_tokens``.  An uncut backward has no leaf pass and ignores the tables, and so does a
+    multi-sequence slab."""
     if not facts.is_bwd or facts.op.endswith("_SUMMARY") or not facts.input_context or facts.n_seq != 1:
         return
     from cudnn.frost.device import current_device, multiprocessor_count
@@ -72,7 +72,7 @@ def context_gate(engine: str, facts, *, b_t: int, expand_num: int = 1, min_token
         expand_num=int(expand_num),
         reverse=True,
     )
-    backward = choose_pieces(**geometry, min_tokens=min_tokens)
+    backward = choose_pieces(**geometry)
     summary = choose_pieces(**geometry, compose_tail=True)
     if backward[0] and summary != backward:
         raise NotImplementedError(
@@ -88,6 +88,8 @@ def summary_support_gates(engine: str, facts, graph) -> None:
     beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
     if facts.beta_dtype not in beta_wants + (None,):
         raise NotImplementedError(f"{engine}: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
+    if facts.do_dtype not in (facts.io_dtype, None):
+        raise NotImplementedError(f"{engine}: 'dO' must match the io dtype ({facts.io_dtype}), got {facts.do_dtype}")
     gate_param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
         if got not in gate_param_dtypes + (None,):

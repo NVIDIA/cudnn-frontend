@@ -20,9 +20,11 @@ Example (pass torch tensors directly):
 """
 
 import atexit
+from contextlib import nullcontext
 import ctypes
 from dataclasses import dataclass
 import logging
+import numbers
 import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -30,8 +32,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import cudnn
 from cudnn import _pybind_module
 
-from ._device import ensure_current_context
-from ._handle import Handle, to_backend_handle
+from ._device import ensure_current_context, execution_context, execution_context_matches
+from ._handle import Handle, ThreadHandlePool, to_backend_handle
+from ._torch_stream import caller_stream as _current_stream
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _dlpack_lanes, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
@@ -43,33 +46,40 @@ _LOG = logging.getLogger("cudnn.pygraph")
 # A handle-less graph used to let the C++ PyGraph cudnnCreate a handle of its own
 # at lowering and cudnnDestroy it from the destructor: a GC-timed backend release
 # that, inside someone else's stream capture, poisons every later launch (Rule 8,
-# #1151). Lend it a process default instead: one per (thread, device) -- cuDNN
-# forbids sharing a handle across threads -- never re-streamed (a fresh handle
-# runs on stream 0, exactly like the owned one did), destroyed at interpreter exit.
-_DEFAULT_HANDLES = threading.local()
-_DEFAULT_HANDLE_REGISTRY: List[Handle] = []
-_DEFAULT_HANDLE_LOCK = threading.Lock()
+# #1151). Lend it a process default instead: one per (live thread, device), set to
+# the caller's current stream by each execute that names no handle, destroyed at
+# interpreter exit.
+_DEFAULT_HANDLES = ThreadHandlePool()
+
+
+def _default_handle(device: int) -> Handle:
+    def create() -> Handle:
+        from .frost.device import ambient_device, device_context
+
+        with nullcontext() if ambient_device() == device else device_context(device):
+            return cudnn.create_handle()
+
+    return _DEFAULT_HANDLES.get(device, create)
 
 
 def _default_backend_handle() -> int:
     from .frost.device import ambient_device
 
-    device = ambient_device()
-    by_device = getattr(_DEFAULT_HANDLES, "by_device", None)
-    if by_device is None:
-        by_device = _DEFAULT_HANDLES.by_device = {}
-    handle = by_device.get(device)
-    if handle is None:
-        handle = by_device[device] = cudnn.create_handle()
-        with _DEFAULT_HANDLE_LOCK:
-            _DEFAULT_HANDLE_REGISTRY.append(handle)
-    return to_backend_handle(handle)
+    return to_backend_handle(_default_handle(ambient_device()))
+
+
+def _device_scope(handle: Any):
+    """Scope device facts and JIT builds to ``handle``'s GPU; no scope without a handle."""
+    device = getattr(handle, "device", None)
+    if device is None:
+        return nullcontext()
+    from .frost.device import build_device
+
+    return build_device(device.ordinal)
 
 
 def _destroy_default_handles() -> None:
-    with _DEFAULT_HANDLE_LOCK:
-        handles, _DEFAULT_HANDLE_REGISTRY[:] = list(_DEFAULT_HANDLE_REGISTRY), []
-    for handle in handles:
+    for handle in _DEFAULT_HANDLES.clear():
         try:
             cudnn.destroy_handle(handle)
         except Exception:  # noqa: BLE001 -- CUDA may already be torn down at exit
@@ -80,6 +90,8 @@ atexit.register(_destroy_default_handles)
 
 
 _PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded", "adaptive"})
+# Integer python-only attributes whose 0 is the default (off): ``causal_exclude_own_block=0`` is plain causal.
+_PYTHON_ONLY_ZERO_OFF_ATTRS = frozenset({"causal_exclude_own_block"})
 
 
 def _python_only_attr_is_set(attr: str, value) -> bool:
@@ -92,6 +104,8 @@ def _python_only_attr_is_set(attr: str, value) -> bool:
         return False
     if attr in _PYTHON_ONLY_BOOL_ATTRS:
         return bool(value)
+    if attr in _PYTHON_ONLY_ZERO_OFF_ATTRS and isinstance(value, numbers.Integral) and not isinstance(value, bool):
+        return int(value) != 0
     return True
 
 
@@ -325,6 +339,8 @@ class pygraph:
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
         self._compiled_plans: Dict[int, Any] = {}  # plan_index -> CompiledPlan (python plans)
         self._plan_kernel_entries: Dict[int, List[Any]] = {}  # plan_index -> compiled_cache entries its build used (serialize)
+        self._plan_devices: Dict[int, Optional[int]] = {}  # plan_index -> ordinal the python plan was built for
+        self._default_handle_device: Optional[int] = None  # set when the C++ graph was lowered with a default handle
         self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
@@ -389,7 +405,7 @@ class pygraph:
             # recorded (engine_id, knobs) on a fresh graph.
             from .engines import manifest
 
-            engine = manifest.engine_for_id(engine_id)
+            engine = manifest.engine_for_id(engine_id, self)
             if engine is not None:
                 out.append(engine)
         return out
@@ -421,8 +437,9 @@ class pygraph:
         cuDNN backend serves the selected entry; otherwise ``.name`` is the
         engine's manifest name (``sdpa_fwd_prefill_sm100`` /
         ``sdpa_fwd_prefill_sm107`` / ``sdpa_fwd_prefill_sm120``, ...), a stable
-        identifier -- manifest names and slots are append-only, never renamed
-        or reused -- so a caller may compare against one.
+        identifier for diagnostics and explicit selection. Execution capabilities
+        belong to the selected plan's ``get_behavior_notes()``; names do not
+        establish which runtime layouts or overrides a plan accepts.
         ``get_plan_name_at_index`` reports the same name with the plan's
         public knobs appended in brackets.
 
@@ -1116,6 +1133,25 @@ class pygraph:
         facts = self._facts_for(analyzer)
         return {} if facts is None else dict(guard(self, facts))
 
+    def _backend_plan_guard(self):
+        """Bind a family-declared backend-plan guard to this graph and its facts.
+
+        Consulted during enumeration and explicit replay, including backend-resolved default knobs.
+        The delegating sentinel is checked too: it must not restore a refused native configuration.
+        """
+        from functools import partial
+
+        from .engines import manifest
+
+        family = manifest.family_for(self) if self._nodes else None
+        if family is None:
+            return None
+        guard, analyzer = manifest.resolve_backend_plan_guard(family), manifest.resolve_analyzer(family)
+        if guard is None or analyzer is None:
+            return None
+        facts = self._facts_for(analyzer)
+        return None if facts is None else partial(guard, self, facts)
+
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
 
@@ -1204,9 +1240,9 @@ class pygraph:
         # set of facts describing a graph that can no longer change.
         self._finalize_backend_layout()
         self._freeze()
-        self._attach_facts()
-
-        plans = list(rank(self, self._candidate_engines(), self.backend_plan_entries(), self._backend_heuristics))
+        with self._planning_scope():
+            self._attach_facts()
+            plans = list(rank(self, self._candidate_engines(), self.backend_plan_entries(), self._backend_heuristics))
         # Validate the FINAL router output: every entry must name an engine this
         # graph can actually dispatch to.
         from .engines.engine_ids import is_python_engine
@@ -1233,6 +1269,15 @@ class pygraph:
         self._plans = plans
         self._planning_done = True
         self._plan_index = 0
+
+    def _planning_scope(self):
+        """The graph handle's device scope for planning, unless a caller already scoped one
+        (an execute-supplied handle)."""
+        from .frost.device import build_scope_device
+
+        if self._handle is None or build_scope_device() is not None:
+            return nullcontext()
+        return _device_scope(self._handle)
 
     def _candidate_engines(self) -> List["BaseEngine"]:
         """The python engines this graph may dispatch to: the in-tree manifest
@@ -1289,7 +1334,7 @@ class pygraph:
         from .engines import manifest
 
         family = manifest.family_for(self)
-        if family is not None and family.offered_ids():
+        if family is not None and family.offered_ids(self):
             analyzer = manifest.resolve_analyzer(family)
             if analyzer is not None:
                 self._facts_for(analyzer)
@@ -1455,8 +1500,21 @@ class pygraph:
         for engine in dropped:
             _LOG.info("backend engine %d is not offered for this graph: %s", engine, excluded[engine])
         entries = [e for e in entries if int(e.engine_id) not in excluded]
-        if dropped and not entries:
-            self._backend_declined = cudnn_graph_not_supported(excluded[dropped[0]])
+        plan_guard = self._backend_plan_guard()
+        kept, plan_declines = [], []
+        for entry in entries:
+            reason = None if plan_guard is None else plan_guard(entry.engine_id, entry.knobs)
+            if reason is None:
+                kept.append(entry)
+            else:
+                plan_declines.append(reason)
+                _LOG.info("backend plan (%d, %s) is not offered for this graph: %s", entry.engine_id, entry.knobs, reason)
+        entries = kept
+        if not entries:
+            if dropped:
+                self._backend_declined = cudnn_graph_not_supported(excluded[dropped[0]])
+            elif plan_declines:
+                self._backend_declined = cudnn_graph_not_supported(plan_declines[0])
         import cudnn
 
         asked_oss = any(h == cudnn.heur_mode.OPENSOURCE for h in (self._backend_heuristics or []))
@@ -1464,7 +1522,12 @@ class pygraph:
         # withheld whenever the guard dropped one.
         if dropped and asked_oss:
             _LOG.info("the OPENSOURCE delegating entry is withheld: its fallback list holds excluded engines %s", dropped)
-        if not dropped and (asked_oss or (not entries and self._lowered_graph.get_engine_count())):
+        delegation_reason = None if plan_guard is None else plan_guard(BACKEND_HEURISTIC_ENGINE_ID, None)
+        if plan_declines or delegation_reason is not None:
+            _LOG.info("the backend delegating entry is withheld: %s", delegation_reason or plan_declines[0])
+            if not entries and delegation_reason is not None:
+                self._backend_declined = cudnn_graph_not_supported(delegation_reason)
+        if not dropped and not plan_declines and delegation_reason is None and (asked_oss or (not entries and self._lowered_graph.get_engine_count())):
             # OSS candidates are registered in the backend's CANDIDATE space and
             # never surface as plans, so they cannot be enumerated: one
             # delegating entry, built and run by C++ itself. FIRST, because
@@ -1600,20 +1663,64 @@ class pygraph:
         """The declared notes of a python plan; () for a backend entry, whose
         notes the backend owns and filters itself."""
         eng = self._engine_for(cfg)
-        return tuple(getattr(eng, f"{kind}_notes", ()) or ()) if eng is not None else ()
+        if eng is None:
+            return ()
+        if kind == "behavior":
+            return tuple(eng.get_behavior_notes(self, cfg) or ())
+        return tuple(getattr(eng, f"{kind}_notes", ()) or ())
 
-    def _resolve_stream(self, handle: Any) -> Any:
-        """Stream for a supplied handle (classic set_stream semantics). A failed
-        query on a SUPPLIED handle is a correctness error and raises — never a
-        silent fall-back to another stream. No handle -> None (kernel wrappers
-        fall back to the default stream)."""
+    def _resolve_stream(self, handle: Any, device: Optional[int] = None) -> int:
+        """The stream every engine launches on: a supplied handle's (classic set_stream
+        semantics; a failed query on it raises, never a silent fall-back), else the caller's
+        current stream on ``device``. Resolved here once so no engine picks its own."""
         if handle is None:
-            return None
+            return _current_stream(device)
         return cudnn.get_stream(handle)
 
     def _build_context(self, handle: Any = None) -> Any:
         h = handle if handle is not None else self._handle
-        return ExecutionContext(handle=h, stream=self._resolve_stream(h))
+        return ExecutionContext(handle=h, stream=self._resolve_stream(h, self._python_plan_device(h)))
+
+    @staticmethod
+    def _python_plan_device(handle: Any) -> Optional[int]:
+        """The ordinal a python plan built now targets: the handle's, else the current device
+        (None without a visible device)."""
+        device = getattr(handle, "device", None)
+        if device is not None:
+            return device.ordinal
+        from .frost.device import current_device
+
+        try:
+            return current_device()
+        except (NotImplementedError, RuntimeError):
+            return None
+
+    def _handleless_device(self, index: Optional[int]) -> Optional[int]:
+        """The GPU a handle-less execute of plan ``index`` (the selected plan when None) runs on: its
+        python build device, else the backend lowering device; None before either is known. A
+        planned graph not built yet builds lazily in this call, on the lowering device."""
+        if self._planning_done and index is None:
+            if not self._is_built:
+                return self._default_handle_device
+            index = self._plan_index
+        device = self._plan_devices.get(index) if index is not None else None
+        return self._default_handle_device if device is None else device
+
+    def _backend_exec_handle(self, handle: Any) -> Optional[int]:
+        """The backend handle an execute passes to C++, or None to let the lowering handle run.
+
+        With no handle anywhere, the per-thread default handle for the lowering device, set to the
+        caller's current stream (set_stream skips the backend call when the stream is unchanged)."""
+        if handle is not None:
+            return to_backend_handle(handle)
+        device = self._default_handle_device
+        if device is None:
+            return None
+        default = _default_handle(device)
+        stream = _current_stream(device)
+        if default.stream != stream:
+            cudnn.set_stream(default, stream)
+        return default.backend_handle
 
     def _backend_handle_for_lowering(self, cpp_kwargs: Dict[str, Any]) -> Optional[int]:
         """The raw handle the C++ graph is constructed with: the caller's, else the
@@ -1625,7 +1732,10 @@ class pygraph:
             return to_backend_handle(self._handle)
         if cpp_kwargs.get("device_property") is not None:
             return None
-        return _default_backend_handle()
+        from .frost.device import ambient_device
+
+        self._default_handle_device = ambient_device()
+        return to_backend_handle(_default_handle(self._default_handle_device))
 
     def _reset_lowered_state(self) -> None:
         """Drop every artifact of a C++ lowering (graph, tensors, BOG/plan flags,
@@ -1785,11 +1895,21 @@ class pygraph:
         address it BY INDEX — which is why this returns one."""
         self._refuse_guarded_backend()  # a backend record replayed onto a guarded graph: a decline, not a crash
         reason = self._backend_engine_exclusions().get(int(engine_id))
+        plan_guard = self._backend_plan_guard()
+        if reason is None and plan_guard is not None:
+            reason = plan_guard(engine_id, knobs)
         if reason is not None:
             raise cudnn_graph_not_supported(reason)
         self._lower_backend_graph()  # heuristics would only add plans nobody asked for
         at = self._lowered_graph.get_execution_plan_count()
         self._lowered_graph.create_execution_plan(engine_id, knobs or {})
+        # A partial/empty replay record lets the backend choose missing knobs.
+        # Check that concrete configuration before exposing it as a public plan.
+        if plan_guard is not None:
+            resolved_engine, resolved_knobs = self._lowered_graph.get_engine_and_knobs_at_index(at)
+            reason = plan_guard(resolved_engine, resolved_knobs)
+            if reason is not None:
+                raise cudnn_graph_not_supported(reason)
         self._forward_note_filters()  # an explicitly appended config is filterable too
         return at
 
@@ -1811,7 +1931,8 @@ class pygraph:
 
         eng = self.selected_engine
         if eng is not None:
-            eng.check_support(self)
+            with self._planning_scope():
+                eng.check_support(self)
             return
         if self._plans and self._plans[self._plan_index].cpp_index is None:
             self._materialize_backend_plan(self._plan_index)  # else C++ is asked about a plan it has never seen
@@ -1909,14 +2030,18 @@ class pygraph:
         eng = self._engine_for(cfg)
         if eng is not None:
             if index not in self._compiled_plans:
-                from .frost import compiled_cache
-
-                with compiled_cache.record_entries() as entries:
-                    self._compiled_plans[index] = eng.build_plan(self, cfg, ctx or self._build_context())
-                self._plan_kernel_entries[index] = entries
+                self._compile_python_plan(index, eng, ctx)
             self._prepare_ordered_binding_schema()
             return
         cfg = self._materialize_backend_plan(index)
+        # Custom ranking may inject a concrete record or an opaque delegator.
+        # Recheck at build time, when its resolved native configuration is known.
+        plan_guard = self._backend_plan_guard()
+        if plan_guard is not None:
+            record = (cfg.engine_id, cfg.knobs) if cfg.cpp_index is None else self._lowered_graph.get_engine_and_knobs_at_index(cfg.cpp_index)
+            reason = plan_guard(*record)
+            if reason is not None:
+                raise cudnn_graph_not_supported(reason)
         if cfg.cpp_index is None:  # delegating entry: the backend picks
             self._lower_backend_plan()
             self._lowered_graph.build_plans(*args, **kwargs)
@@ -1924,6 +2049,24 @@ class pygraph:
             self._lower_backend_plan()
             self._lowered_graph.build_plan_at_index(cfg.cpp_index)
         self._prepare_ordered_binding_schema()
+
+    def _compile_python_plan(self, index: int, eng: Any, ctx: Any = None) -> Any:
+        """JIT-build python plan ``index`` for the GPU of the handle it will run with: every
+        device fact and compile target read during the build follows that handle, not the
+        ambient device."""
+        from .frost import compiled_cache
+
+        handle = ctx.handle if ctx is not None else self._handle
+        with _device_scope(handle):
+            device = self._python_plan_device(handle)
+            if ctx is None:
+                ctx = ExecutionContext(handle=handle, stream=self._resolve_stream(handle, device))
+            with compiled_cache.record_entries() as entries:
+                plan = eng.build_plan(self, self._plans[index], ctx)
+        self._compiled_plans[index] = plan
+        self._plan_kernel_entries[index] = entries
+        self._plan_devices[index] = device
+        return plan
 
     def build(self, heuristics: Optional[List] = None, ctx: Any = None) -> None:
         """Convenience: validate -> build_operation_graph -> create_execution_plans
@@ -1966,8 +2109,9 @@ class pygraph:
         return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
     def get_context_size(self) -> int:
-        """Bytes of the selected plan's context: what a summary plan writes for the apply of the same tokens, or what an
-        apply plan reads; the caller allocates it like the workspace and passes it to ``execute(context=...)`` of both.
+        """Bytes of the selected plan's context: what a summary plan writes for the apply of the same tokens (a forward plan
+        for the backward), or what an apply plan reads; the caller allocates it like the workspace and passes it to
+        ``execute(context=...)`` of both.
         0 for a plan without one (every backend plan)."""
         if not self._is_built:
             raise RuntimeError("Call build() first")
@@ -2047,11 +2191,11 @@ class pygraph:
         return (cfg.engine_id, dict(cfg.knobs) if cfg.knobs else {})
 
     def get_behavior_notes_for_plan_at_index(self, index: int, *args, **kwargs):
-        """Classic backend behaviour notes for the plan at ``index``.
+        """Declared behavior notes for this backend or Python plan.
 
-        Backend-only by construction: a python plan has no ``BehaviorNote_t``.
-        Saying so is better than forwarding the index and returning some other
-        plan's notes."""
+        Python engines answer for the graph and the indexed configuration;
+        capabilities are not inferred from an engine's name or provider.
+        """
         if not self._planning_done:
             return self._lowered_graph.get_behavior_notes_for_plan_at_index(index, *args, **kwargs)
         cfg = self._plans[self._check_plan_index(index)]
@@ -2063,8 +2207,11 @@ class pygraph:
         return self._lowered_graph.get_behavior_notes_for_plan_at_index(cfg.cpp_index, *args, **kwargs)
 
     def get_behavior_notes(self, *args, **kwargs):
-        """Classic behaviour notes for the SELECTED plan — backend-only, for the
-        same reason as the at-index query."""
+        """Declared behavior notes for the selected backend or Python plan.
+
+        Query after final plan selection when choosing an execution layout.
+        Absence of a capability note means the plan makes no such guarantee.
+        """
         eng = self.selected_engine
         if eng is not None:
             return list(self._notes_of(self._selected_plan_config, "behavior"))
@@ -2147,14 +2294,26 @@ class pygraph:
     def execute_plan_at_index(self, tensor_dict, workspace=None, index: int = 0, handle=None, *args, tensor_uids=None, **kwargs) -> None:
         """Execute one ranked plan without changing the graph's selected plan."""
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
-            if tensor_uids is not None:
-                pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
-                return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index)
-            uid_to_data = self._uid_to_data(tensor_dict)
-            var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
-            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, **kwargs)
+            h = handle if handle is not None else self._handle
+            device = h.device.ordinal if isinstance(h, Handle) else self._default_handle_device if h is None else None
+            if device is not None:
+                stream = self._resolve_stream(h, device)
+                if not execution_context_matches(stream, device):
+                    # Same contract as _execute(): run in the handle's context, then restore the caller's.
+                    with execution_context(stream, device):
+                        return self._execute_native_plan_at_index(tensor_dict, workspace, index, handle, *args, tensor_uids=tensor_uids, **kwargs)
+            return self._execute_native_plan_at_index(tensor_dict, workspace, index, handle, *args, tensor_uids=tensor_uids, **kwargs)
         self._reject_if_barred(self._check_plan_index(index))
         return self._execute(tensor_dict, workspace, handle, *args, tensor_uids=tensor_uids, index=index, **kwargs)
+
+    def _execute_native_plan_at_index(self, tensor_dict, workspace, index, handle, *args, tensor_uids=None, **kwargs):
+        if tensor_uids is not None:
+            pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
+            return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, self._backend_exec_handle(handle) or 0, index, pack.workspace_bytes)
+        uid_to_data = self._uid_to_data(tensor_dict)
+        var_pack, _ = self._native_var_pack(uid_to_data, None)
+        ws_ptr, ws_bytes = self._workspace_extent(workspace)
+        return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, self._backend_exec_handle(handle), *args, workspace_bytes=ws_bytes, **kwargs)
 
     def execute(
         self,
@@ -2178,10 +2337,14 @@ class pygraph:
                          Must include both input and output tensors.
                          With ``tensor_uids``, a tuple/list of buffers instead.
                          No additional preparation call is required.
-            workspace: Workspace buffer (python engines receive it via the
-                       ExecutionContext; plans that need one require it)
+            workspace: Caller-owned contiguous scratch buffer. Its observed byte
+                       capacity must cover the selected plan's requirement for
+                       this call's shapes. Integer addresses have unknown capacity
+                       and remain the caller's responsibility.
             handle: cuDNN handle; kernels launch on its stream (classic
-                    ``set_stream`` semantics, both python engines and backend)
+                    ``set_stream`` semantics, both python engines and backend).
+                    Without one (here or on the graph) they launch on the
+                    caller's current torch stream, 0 when torch is not loaded
             override_uids/shapes/strides: runtime geometry for the backend or a
                          compatible VariantPack plan; legacy uid-map plans raise
                          rather than ignoring these arguments
@@ -2193,9 +2356,10 @@ class pygraph:
                          is cached internally by value, while buffer observations,
                          workspace and the handle's stream remain per call.
             context: the buffer of ``get_context_size()`` bytes a summary plan
-                     writes for the apply plan of the same tokens, or the one an
-                     apply plan reads; sized and owned like the workspace, kept
-                     between the two calls.  Python plans with one require it;
+                     writes for the apply plan of the same tokens (a forward plan
+                     for the backward), or the one an apply plan reads; sized and
+                     owned like the workspace, kept between the two calls.  Python
+                     plans with one require it;
                      every other plan rejects it.
         """
         return self._execute(tensor_dict, workspace, handle, override_uids, override_shapes, override_strides, tensor_uids, context=context)
@@ -2212,7 +2376,34 @@ class pygraph:
         *,
         index=None,
         context=None,
+        _context_bound=False,
     ):
+        h = handle if handle is not None else self._handle
+        if not _context_bound and (h is None or isinstance(h, Handle)):
+            if h is None:
+                # No handle: the plan's build/lowering device and the caller's stream there.
+                device = self._handleless_device(index)
+                stream = None if device is None else _current_stream(device)
+            else:
+                stream, device = self._resolve_stream(h), h.device.ordinal
+            if device is not None and not execution_context_matches(stream, device):
+                # Backend plans and Python plans share the handle's device and
+                # stream contract. Only a foreign/cold context takes this path;
+                # ordinary same-context calls keep their existing launch path.
+                with execution_context(stream, device):
+                    return self._execute(
+                        tensor_dict,
+                        workspace,
+                        handle,
+                        override_uids,
+                        override_shapes,
+                        override_strides,
+                        tensor_uids,
+                        index=index,
+                        context=context,
+                        _context_bound=True,
+                    )
+            _context_bound = device is not None
         # Keep the caller's choice local across binding and launch. Temporarily
         # selecting/restoring an index lets overlapping callers run each other's
         # plan and can corrupt the selection left for ordinary execute().
@@ -2223,9 +2414,10 @@ class pygraph:
             # otherwise discarded this (a cudnnGetStream round-trip + an
             # ExecutionContext alloc) on every already-built call.
             caller_ctx = self._build_context(handle) if handle is not None else None
-            if not self._planning_done:
-                self.create_execution_plans()
-            self.build(ctx=caller_ctx)
+            with _device_scope(h):
+                if not self._planning_done:
+                    self.create_execution_plans()
+                self.build(ctx=caller_ctx)
 
         if not explicit_index:
             index = self._plan_index
@@ -2239,16 +2431,20 @@ class pygraph:
 
         if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
-            stream = self._resolve_stream(h)
+            if h is not None:
+                stream = self._resolve_stream(h)
+            else:
+                device = self._plan_devices.get(index)
+                stream = self._resolve_stream(None, device if device is not None else self._python_plan_device(None))
             # A JIT engine launches through the driver, which reads the calling
             # thread's context stack; an autograd worker has none. The handle's
             # device decides when the stream names no context.
-            ensure_current_context(stream, h.device.ordinal if h is not None else None)
+            if not _context_bound:
+                ensure_current_context(stream if h is not None else None, h.device.ordinal if h is not None else None)
             if index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
-                ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context)
-                self._compiled_plans[index] = eng.build_plan(self, self._plans[index], ctx)
+                self._compile_python_plan(index, eng, ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context))
                 if not explicit_index:
                     self._is_built = True
             plan = self._compiled_plans[index]
@@ -2296,6 +2492,7 @@ class pygraph:
         # selection: they differ once the walk has skipped an entry.
         cfg = self._materialize_backend_plan(index) if self._plans else None
         cpp_index = cfg.cpp_index if cfg is not None else None
+        exec_handle = self._backend_exec_handle(handle)
 
         if ordered:
             schema = self._prepare_ordered_binding_schema()
@@ -2310,14 +2507,18 @@ class pygraph:
                 override_uids,
                 override_shapes,
                 override_strides,
-                to_backend_handle(handle) or 0,
+                exec_handle or 0,
                 -1 if cpp_index is None else cpp_index,
             )
             if result is None:
                 return
             variant_pack = self._finish_ordered(schema, result, workspace, override_uids)
             self._lowered_graph._execute_ordered_pack(
-                variant_pack.native, variant_pack.workspace, to_backend_handle(handle) or 0, -1 if cpp_index is None else cpp_index
+                variant_pack.native,
+                variant_pack.workspace,
+                exec_handle or 0,
+                -1 if cpp_index is None else cpp_index,
+                variant_pack.workspace_bytes,
             )
             return
 
@@ -2331,16 +2532,18 @@ class pygraph:
                 variant_pack.address,
                 len(variant_pack),
                 variant_pack.workspace,
-                to_backend_handle(handle) or 0,
+                exec_handle or 0,
                 -1 if cpp_index is None else cpp_index,
+                variant_pack.workspace_bytes,
             )
             return
 
-        var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
+        var_pack, _ = self._native_var_pack(uid_to_data, None)
+        ws_ptr, ws_bytes = self._workspace_extent(workspace)
         if cpp_index is not None:
-            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
+            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, exec_handle, override_uids, override_shapes, override_strides, ws_bytes)
             return
-        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides)
+        self._lowered_graph._execute(var_pack, ws_ptr, exec_handle, override_uids, override_shapes, override_strides, ws_bytes)
 
     def _variant_pack_uids(self) -> Optional[List[int]]:
         """The graph's caller-filled variant_pack, ASCENDING by uid.
@@ -2431,6 +2634,14 @@ class pygraph:
             raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
         return workspace_ptr, _byte_size(workspace_tensor)
 
+    def _workspace_extent(self, workspace):
+        if workspace is None:
+            return 0, 0
+        extent = _pybind_module.read_buffer_extent(workspace)
+        # A byte count is a byte range only for dense storage. Fallback also
+        # preserves the unknown extent of a caller-sized integer pointer.
+        return self._workspace_extent_fallback(workspace) if extent is None else extent
+
     def _normalize_ordered(self, buffers, tensor_uids, workspace, override_uids=None, override_shapes=None, override_strides=None):
         schema = self._prepare_ordered_binding_schema()
         if schema is None:
@@ -2520,15 +2731,7 @@ class pygraph:
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
-        workspace_ptr, workspace_bytes = 0, 0
-        if workspace is not None:
-            extent = _pybind_module.read_buffer_extent(workspace)
-            if extent is None:  # a bare address, a non-dense buffer, or no vtable
-                # An engine carves the workspace by byte offset, so a byte
-                # COUNT is only a byte RANGE when the buffer is dense.
-                workspace_ptr, workspace_bytes = self._workspace_extent_fallback(workspace)
-            else:
-                workspace_ptr, workspace_bytes = extent
+        workspace_ptr, workspace_bytes = self._workspace_extent(workspace)
         return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph), tuple(indices) if override_uids else ())
 
     def _declared_layout(self, order: List[int]):
@@ -3305,7 +3508,9 @@ def _linear_attention_state_checkpoints_dims(node):
     cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
     if not n or not q or not v or not cu:
         return None
-    return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + (cu[0] - 1), 1), max(q[-2], v[-2]), v[-1], q[-1]]
+    # capacity: ceil(L / n) rows per sequence for the pre-state series, floor(L / n) for the after-block series
+    slack = 0 if node.params.get("checkpoint_after_block") else cu[0] - 1
+    return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + slack, 1), max(q[-2], v[-2]), v[-1], q[-1]]
 
 
 def _linear_attention_composed_state_dims(node):
@@ -3576,6 +3781,7 @@ _STRUCTURED_OPS = {
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3583,6 +3789,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "output_context",
         ),
         outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
@@ -3621,6 +3828,7 @@ _STRUCTURED_OPS = {
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3628,6 +3836,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3692,6 +3901,7 @@ _STRUCTURED_OPS = {
         attrs=(
             "output_final_state",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "dt_softplus",
             "dt_min",
             "dt_max",
@@ -3738,6 +3948,7 @@ _STRUCTURED_OPS = {
         ),
         attrs=(
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "dt_softplus",
             "dt_min",
             "dt_max",
@@ -3805,6 +4016,7 @@ _STRUCTURED_OPS = {
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3812,6 +4024,8 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "output_context",
+            "qk_l2norm_eps",
         ),
         outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
@@ -3851,6 +4065,7 @@ _STRUCTURED_OPS = {
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3858,6 +4073,8 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "context_from_forward",
+            "qk_l2norm_eps",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3891,6 +4108,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "batch_invariant",
             "output_context",
+            "qk_l2norm_eps",
         ),
         outputs=("final_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
@@ -3912,6 +4130,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "output_context",
             "checkpoint_every_n_tokens",
+            "qk_l2norm_eps",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
@@ -3939,6 +4158,7 @@ _STRUCTURED_OPS = {
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3946,6 +4166,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "output_context",
         ),
         outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
@@ -3984,6 +4205,7 @@ _STRUCTURED_OPS = {
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3992,6 +4214,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -4073,6 +4296,7 @@ _STRUCTURED_OPS = {
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "beta_guard",
@@ -4081,6 +4305,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "output_context",
         ),
         outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
@@ -4120,6 +4345,7 @@ _STRUCTURED_OPS = {
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "beta_guard",
@@ -4129,6 +4355,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -4582,13 +4809,23 @@ _CAPTURED_OPS = {
         # The same two op attributes as "sdpa".  Without this entry a SET
         # softmax_precision would be forwarded to the C++ sdpa_mxfp8 (which has
         # no such argument) instead of keeping the node on the python engines.
-        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),
+        # ``causal_exclude_own_block`` (int block size, None = off): the causal
+        # mask also drops the query's own aligned block of that many keys, so
+        # query i reads keys j < B * floor(i / B) only (rows 0 .. B-1 read none:
+        # O = 0, Stats = -inf, the FROST empty-row contract).  With B = 32, the
+        # MXFP8 V scale block, every V scale the kernel reads covers fully
+        # visible tokens only: the completed-block half of causal MXFP8
+        # attention whose PV stays MXFP8 (NVIDIA/TransformerEngine#3248); the
+        # caller adds the query's own block separately.  Numerics-changing,
+        # hence an op attribute; the backend has no field for it.
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded", "causal_exclude_own_block"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_O": _AMAX},
     ),
     "sdpa_mxfp8_backward": dict(
         node_type=NodeType.SDPA_MXFP8_BWD,
-        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),  # forward-only, see "sdpa_backward"
+        # forward-only, see "sdpa_backward" and "sdpa_mxfp8"
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded", "causal_exclude_own_block"),
         pos=(
             "q",
             "q_T",

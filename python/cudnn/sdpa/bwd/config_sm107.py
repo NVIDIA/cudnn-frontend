@@ -6,14 +6,14 @@
 Three kernel BODIES share this module, one per dtype family, and each is its
 own pipeline rather than a dtype arm of the other:
 
-* ``kernels/sm107/bprop_d256_f16.py`` (bf16 / fp16): natural MMA order
+* ``kernels/sm107/d256_f16_4x1/kernel.py`` (bf16 / fp16): natural MMA order
   ``Q.K -> dO.V -> P.dO``, P written back INTO the S accumulator (no P ring, no
   ``s_acc_empty``), BMM1 K-split (the K back-half is UTCCP'd into the spare
   TMEM columns and the freed SMEM hosts the second ``dO_dv`` stage).
-* ``kernels/sm107/bprop_d256_fp8.py`` (per-tensor FP8 E4M3): lookahead MMA
+* ``kernels/sm107/d256_fp8/kernel.py`` (per-tensor FP8 E4M3): lookahead MMA
   order ``Q.K[i+1]`` ahead of ``S.dO[i]``, a 2-stage fp8 P ring in TMEM, three
   3-deep Q / dO rings.
-* ``kernels/sm107/bprop_d256_mxfp8.py`` (MXFP8: E4M3 payloads + E8M0 block scale
+* ``kernels/sm107/d256_mxfp8/kernel.py`` (MXFP8: E4M3 payloads + E8M0 block scale
   factors, ``FAMILY_MXFP8``): the fp8 body's pipeline -- the 2-stage e4m3 P ring
   in TMEM [512, 576), BMM2 = ``mma_ts`` -- with every UTCCP'd scale-factor atom
   ALIASED into the P-ring slot that is dead in the current q iteration (no
@@ -232,7 +232,7 @@ _FLAVOR = {FAMILY_F16: "sm107 bwd d256 f16", FAMILY_FP8: "sm107 bwd d256 fp8", F
 MX_BLOCK = 32
 # A scale-factor ATOM covers 128 operand rows x 4 K-groups (= 128 K elements):
 # 512 B in SMEM (the TMA box / UTCCP source unit), 4 TMEM columns once UTCCP'd
-# (``SF_REGISTERS_PER_BLOCK`` in ``sm107/prefill_d256_mxfp8.py``: 16 swizzled
+# (``SF_REGISTERS_PER_BLOCK`` in ``sm107/d256_mxfp8_single_q/kernel.py``: 16 swizzled
 # K bytes x 8 bit / 32).
 SF_ATOM_ROWS = 128
 SF_ATOM_K = 4 * MX_BLOCK
@@ -283,7 +283,7 @@ def sf_smem_bytes(rows: int, k: int) -> int:
     """Bytes of one scale-factor slab (one ring stage) for a ``rows x k`` MMA
     operand: whole F8_128x4 atoms, ``ceil(rows/128) * ceil(k/128) * 512`` (=
     ``ceil128(rows) * ceil128(k) / 32``, the forward's ``SF_SMEM_SIZE_*`` in
-    ``sm107/prefill_d256_mxfp8.py`` / ``fwd/config_sm107._d256_mxfp8_sf_sizes``).
+    ``sm107/d256_mxfp8_single_q/kernel.py`` / ``fwd/config_sm107._d256_mxfp8_sf_sizes``).
     Full-size regardless of CTA_MMA: the cga2 peers multicast their halves into
     the same slab."""
     return _ceil_div(rows, SF_ATOM_ROWS) * _ceil_div(k, SF_ATOM_K) * SF_ATOM_BYTES
@@ -315,8 +315,8 @@ class TemplateParams(_BwdTemplateParams):
     body threads a per-batch Q length on the DENSE path); ``thd_varlen`` is
     served by all three bodies (packed ``[1, T, H, D]`` operands, a kv-blocked
     dS workspace, per-sequence lengths from the metadata buffer -- the module
-    docs of ``sm107/bprop_d256_f16.py`` / ``bprop_d256_fp8.py`` /
-    ``bprop_d256_mxfp8.py``; the MXFP8 body over packed per-sequence-tile-padded
+    docs of ``sm107/d256_f16_4x1/kernel.py`` / ``sm107/d256_fp8/kernel.py`` /
+    ``sm107/d256_mxfp8/kernel.py``; the MXFP8 body over packed per-sequence-tile-padded
     scale factors).
 
     A plain :class:`cudnn.sdpa.bwd.config_sm100.TemplateParams` is also
@@ -360,7 +360,7 @@ class TemplateParams(_BwdTemplateParams):
     # under P-c), the dS ring depth and the payload / SF staging slabs.
     # Numerics-changing: a per-graph compile-time constant, never a knob.
     ds_sf_policy: int = -1
-    # --- the 2x2-datapath body (``kernels/bprop_d256_2x2_f16.py``, config ``bwd/config_d256_2x2``) ---------------
+    # --- the 2x2-datapath body (``kernels/sm100/d256_f16_2x2/kernel.py``, config ``bwd/config_d256_2x2``) ---------------
     # 0 = the shipped 4x1 bodies (this module's ``make_cfg_d256_bwd``; REJECTED != 0 there -- a 4x1 body never
     # reads it, so a non-zero value would be a claim it cannot honour); 1 = the SM100 profile (one 64-row sub-block per
     # CTA, the ``sdpa_bwd_sm100_d256`` row); 2 = the Rubin interleaved profile (two sub-blocks per CTA, the

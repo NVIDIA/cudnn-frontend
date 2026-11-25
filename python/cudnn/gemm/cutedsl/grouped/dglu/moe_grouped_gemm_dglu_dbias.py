@@ -32,6 +32,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import vector
 
 from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
+from ..glu_layout import interleaved_glu_view, validate_glu_layout
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -137,6 +138,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         glu_clamp_max: float = 7.0,
         glu_clamp_min: float = -7.0,
         round_dgrad_to_input_dtype: bool = False,
+        glu_layout: str = "interleaved_32",
+        deterministic: bool = False,
     ):
         # Validate FIX_PAD_SIZE compatibility with tile size
         mma_tile_m = mma_tiler_mn[0]
@@ -151,6 +154,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         if act_func not in ["dswiglu", "dgeglu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
 
+        self.glu_layout = validate_glu_layout(glu_layout)
         self.expert_cnt = expert_cnt
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -217,6 +221,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         self.glu_clamp_max = glu_clamp_max
         self.glu_clamp_min = glu_clamp_min
         self.round_dgrad_to_input_dtype = round_dgrad_to_input_dtype
+        # dprob is (valid_m, n_slots, 1), one slot per N-tile, which the caller reduces in a fixed order.
+        self.deterministic = deterministic
 
     def _setup_attributes(self):
         """Set up input-dependent BF16 GEMM attributes."""
@@ -469,8 +475,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.generate_activation = activation is not None
         if cutlass.const_expr(self.generate_activation):
-            if cutlass.const_expr(self.act_func != "dgeglu" or self.c_dtype != cutlass.BFloat16 or self.d_dtype != cutlass.BFloat16):
-                raise ValueError("activation output requires BF16 C/D and dgeglu")
+            if cutlass.const_expr(self.c_dtype != cutlass.BFloat16 or self.d_dtype != cutlass.BFloat16):
+                raise ValueError("activation output requires BF16 C/D")
             if cutlass.const_expr(activation.element_type != cutlass.BFloat16):
                 raise ValueError("activation output must be BF16")
         self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
@@ -548,6 +554,10 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
+
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            c = interleaved_glu_view(c, axis=1)
+            d = interleaved_glu_view(d, axis=1)
 
         # Setup TMA load for C
         c_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
@@ -761,6 +771,9 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                 sum_b = sum_b + rDst_b[i]
 
         n_offset = (n_base_d1 + 2 * lane_idx) if lane_idx < 16 else (n_base_d2 + 2 * (lane_idx - 16))
+        valid_n_offset = n_offset < dbias_n_total
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            n_offset = (n_offset // 64) * 32 + n_offset % 32 + ((n_offset // 32) % 2) * (dbias_n_total // 2)
 
         if cutlass.const_expr(self.dbias_cross_warp_reduce):
             reduce_base = sDbias.iterator
@@ -783,11 +796,11 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     cute.copy_atom_call(copy_64bit_atom, sSrc_w, rDst_w)
                     cta_sum_a = cta_sum_a + rDst_w[0]
                     cta_sum_b = cta_sum_b + rDst_w[1]
-                if n_offset < dbias_n_total:
+                if valid_n_offset:
                     gmem_ptr = dbias_gmem_2d[(expert_idx, n_offset, None)].iterator.llvm_ptr
                     atomic_add_bf16x2(gmem_ptr, cta_sum_a, cta_sum_b)
         else:
-            if n_offset < dbias_n_total:
+            if valid_n_offset:
                 gmem_ptr = dbias_gmem_2d[(expert_idx, n_offset, None)].iterator.llvm_ptr
                 atomic_add_bf16x2(gmem_ptr, sum_a, sum_b)
 
@@ -801,6 +814,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         beta_val: Float32,
         square_alpha: Float32,
         dprob_swiglu: Optional[cute.Tensor] = None,
+        activation_vec: Optional[cute.Tensor] = None,
     ):
         LOG2_E = cutlass.Float32(1.4426950408889634)
         if cutlass.const_expr(self.vectorized_f32):
@@ -863,6 +877,10 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     rnd="rn",
                     ftz=False,
                 )
+                if cutlass.const_expr(activation_vec is not None):
+                    # The forward GLU order: (silu(gate) * up) * prob.
+                    primal = cute.arch.mul_packed_f32x2(swish, ab2_vec_acc_type, rnd="rn", ftz=False)
+                    activation_vec[i], activation_vec[i + 1] = cute.arch.mul_packed_f32x2(primal, (mProb, mProb), rnd="rn", ftz=False)
                 # calculate dprob
                 if cutlass.const_expr(self.generate_dprob):
                     (
@@ -944,7 +962,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             d2_vec = d2_vec.load()
             if cutlass.const_expr(self.generate_dprob):
                 dprob_swiglu = dprob_swiglu.load()
-            return d1_vec, d2_vec, dprob_swiglu
+            primal = activation_vec.load() if cutlass.const_expr(activation_vec is not None) else None
+            return d1_vec, d2_vec, dprob_swiglu, primal
         else:
             acc_vec = acc_vec.load()
             ab1_vec_load = ab1_vec_load.load()
@@ -972,7 +991,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             # calculate dswiglu
             d1_vec = acc_vec * mProb * ab2_vec_load * sig * (1 + ab1_vec_load * (1 - sig))
             d2_vec = acc_vec * mProb * swish
-            return d1_vec, d2_vec, dprob_swiglu
+            primal = ab2_vec_load * swish * mProb if cutlass.const_expr(activation_vec is not None) else None
+            return d1_vec, d2_vec, dprob_swiglu, primal
 
     @cute.jit
     def dgeglu(
@@ -1853,10 +1873,12 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     # Apply alpha, act, and prob
                     #
                     square_alpha = alpha_val * alpha_val
+                    activation_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32) if cutlass.const_expr(self.generate_activation) else None
                     if cutlass.const_expr(self.act_func == "dswiglu"):
-                        d1_vec, d2_vec, dprob_swiglu = self.dswiglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu)
+                        d1_vec, d2_vec, dprob_swiglu, primal = self.dswiglu(
+                            acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu, activation_vec
+                        )
                     elif cutlass.const_expr(self.act_func == "dgeglu"):
-                        activation_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32) if cutlass.const_expr(self.generate_activation) else None
                         d1_vec, d2_vec, dprob_swiglu, primal = self.dgeglu(
                             acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, linear_offset, dprob_swiglu, activation_vec
                         )
@@ -2015,8 +2037,13 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
 
                 if cutlass.const_expr(self.generate_dprob):
                     real_dprob, _ = epi_ext.get_gmem_tensor("dprob", dprob, padded_offsets, epi_work_tile_info)
+                    if cutlass.const_expr(self.deterministic):
+                        # One writer per (token, tile_n) slot; the atomic is uncontended, kept for one store path.
+                        dprob_slot = real_dprob[(mPosition, epi_work_tile_info.tile_n_idx, None)]
+                    else:
+                        dprob_slot = real_dprob[(mPosition, None, None)]
                     _ = atomic_add_float32(
-                        ptr=real_dprob[(mPosition, None, None)].iterator.llvm_ptr,
+                        ptr=dprob_slot.iterator.llvm_ptr,
                         value=dProbVal,
                     )
 

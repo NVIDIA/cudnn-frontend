@@ -84,6 +84,23 @@ def test_native_fp8_matches_actual_host_and_python(d, dv, split, dtype, output):
             assert combined.pop() == combine
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d_qk,d_v,block_output",
+    [
+        (568, 512, None),
+        (576, 504, None),
+        (576, 512, prep.BlockOutputSpec((1, 1, 1, 1), 128, 1, False)),
+    ],
+)
+def test_native_fp8_wide_binding_rejects_unsupported_contracts(d_qk, d_v, block_output):
+    spec, _, _, _ = _fixture(128, 128, 1, "float8_e4m3fn", "bfloat16")
+    spec.d_qk, spec.d_v = d_qk, d_v
+    spec.quant = spec.quant._replace(block_output=block_output)
+    with pytest.raises(ValueError, match="supported quantized attention head dimension pair"):
+        cudnn._pybind_module._SdpaDenseBinder(spec)
+
+
 @pytest.mark.parametrize(
     "role,kind", [(r, k) for r in prep._QUANT_ROLES for k in ("dtype", "device", "null", "alignment", "shape", "span", "workspace")] + [("amax_o", "q_alias")]
 )

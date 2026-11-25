@@ -349,16 +349,58 @@ def test_split_domains_match_the_wired_lowerings():
     advertising = {sp.name for sp in ENGINE_SPECS if sp.capabilities.split_kv_supported}
     assert advertising == {
         "sdpa_fwd_prefill_sm80",
-        "sdpa_fwd_prefill_sm90",
+        "sdpa_fwd_sm90_f16_three_wg",
         "sdpa_fwd_prefill_sm100",
+        "sdpa_fwd_sm100_d128_multi_q",
+        "sdpa_fwd_sm100_d64_quadrant",
+        "sdpa_fwd_sm100_d192_multi_q",
+        "sdpa_fwd_sm100_d128_single_q",
+        "sdpa_fwd_sm100_d256_lookahead",
+        "sdpa_fwd_sm100_d256_swap_ab",
+        "sdpa_fwd_sm100_d512_role_split",
+        "sdpa_fwd_sm100_d512_2x2",
+        "sdpa_fwd_sm100_d512_fp8_role_split",
+        "sdpa_fwd_sm107_d512_fp8_role_split",
+        "sdpa_fwd_sm107_d192_fp8_multi_q",
+        "sdpa_fwd_sm107_d128_fp8_multi_q",
+        "sdpa_fwd_sm107_d128_fp8_swap_ab",
+        "sdpa_fwd_sm107_d256_fp8_single_q",
+        "sdpa_fwd_sm100_d256_fp8_single_q",
+        "sdpa_fwd_sm100_d192_fp8_multi_q",
+        "sdpa_fwd_sm100_d128_fp8_multi_q",
+        "sdpa_fwd_sm100_d128_fp8_dual_kv",
+        "sdpa_fwd_sm100_d128_fp8_swap_ab",
         "sdpa_fwd_prefill_sm100_mxfp8",
+        "sdpa_fwd_sm100_d256_mxfp8_single_q",
+        "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+        "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+        "sdpa_fwd_sm100_d512_mxfp8_slice_recompute",
         "sdpa_fwd_prefill_sm100_fp8",
         "sdpa_fwd_prefill_sm107",
+        "sdpa_fwd_sm107_d128_multi_q",
+        "sdpa_fwd_sm107_d192_multi_q",
+        "sdpa_fwd_sm107_d256_lookahead",
+        "sdpa_fwd_sm107_d256_swap_ab",
+        "sdpa_fwd_sm107_shared_single_q",
+        "sdpa_fwd_sm107_shared_d256_lookahead",
+        "sdpa_fwd_sm107_d512_2x2",
         "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm107_mxfp8",
+        "sdpa_fwd_sm107_d128_mxfp8_multi_q",
         "sdpa_fwd_prefill_sm120",
         "sdpa_fwd_prefill_sm120_fp8",
         "sdpa_fwd_prefill_sm120_mxfp8",
+        "sdpa_fwd_sm120_d512_paired",
+        "sdpa_fwd_sm120_d512_fp8_paired",
+        "sdpa_fwd_sm120_d512_mxfp8_paired",
+        "sdpa_fwd_sm120_d256_all_compute",
+        "sdpa_fwd_sm120_decode_key_group",
+        "sdpa_fwd_sm120_fp8_general",
+        "sdpa_fwd_sm120_mxfp8_general",
+        "sdpa_fwd_sm120_f16_general",
+        "sdpa_fwd_sm80_f16_k_prefetch",
+        "sdpa_fwd_sm80_d256_kv_prefetch",
+        "sdpa_fwd_sm80_wide_cooperative",
     }, f"split domains drifted from the wired lowerings: {sorted(advertising)}"
 
 
@@ -606,7 +648,7 @@ def test_serial_combine_threshold_matches_the_kernel_routing():
 
 # --- the d256 decode tile's own model ----------------------------------------
 #
-# sm100/decode_d256_f16.py runs one cta_group::1 CTA per (KV-head group, batch,
+# sm100/d256_f16_swap_ab/kernel.py runs one cta_group::1 CTA per (KV-head group, batch,
 # split) unit and is HBM-bound, so its split trades the device's idle SMs
 # against the split path's second launch.  The model has TWO LINES, two fits of
 # two sibling kernels: the Blackwell line (``device_cc=(10, 0)``: the B200 / B300
@@ -1173,7 +1215,7 @@ def test_decode_tile_lines_are_named_by_the_device_cc_and_the_row():
 def _fp8_caps():
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
-    return next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm100_fp8").capabilities
+    return next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_sm100_d128_fp8_multi_q").capabilities
 
 
 def _fp8_facts(dtype_o, *, mx=False):
@@ -1302,7 +1344,7 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
     _fp32_partial_split() is unconditional for SM100, so a kernel that wires
     make_split_helpers WITHOUT the slot gets handed an argument it never
     declares -- a launch-time arity error on whatever shape happens to split.
-    That is exactly how sm100/prefill_d512_mxfp8 arrived: split-capable from the
+    That is exactly how the SM100 D512 MXFP8 body arrived: split-capable from the
     day it landed, written against the staged epilogue. Scanning the directory
     means the NEXT such kernel fails here instead of in production.
 
@@ -1314,7 +1356,7 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
     from cudnn.sdpa.fwd import api_dsl
 
     # (mxfp8, d_shape) pairs the adapter deliberately keeps on half partials.
-    _SLOTLESS_FLAVORS = {"prefill_d512_mxfp8.py"}
+    _SLOTLESS_FLAVORS = {"d512_mxfp8_slice_recompute/kernel.py", "d512_mxfp8_retained_p/kernel.py"}
 
     kdir = pathlib.Path(api_dsl.__file__).parent / "kernels" / "sm100"
     assert kdir.is_dir(), f"kernel directory moved: {kdir}"
@@ -1329,15 +1371,17 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
             return "o_partial_ptr" in sig
         return "o_partial_f32" in src
 
-    for f in sorted(kdir.glob("prefill_*.py")):
+    # Explicit implementations keep their body in <implementation>/kernel.py.
+    for f in sorted([*kdir.glob("prefill_*.py"), *kdir.glob("*/kernel.py")]):
         src = f.read_text()
+        name = f.relative_to(kdir).as_posix()
         if "make_split_helpers" not in src:
             continue  # not split-capable, nothing to carry
         if has_slot(src):
             continue  # wired
-        if f.name in _SLOTLESS_FLAVORS:
+        if name in _SLOTLESS_FLAVORS:
             continue  # known, and excluded by _fp32_partial_split
-        offenders.append(f.name)
+        offenders.append(name)
 
     assert not offenders, (
         f"split-capable SM100 kernels with no o_partial_f32 slot: {offenders}. "
@@ -1399,3 +1443,181 @@ def test_decode_combine_form_rule_holds_on_the_cc_10_7_line_only(device_cc):
     assert all(walk(*cell) is rule_line for cell in ((32, 24, 1, 2), (128, 24, 1, 2), (32, 24, 4, 3), (128, 24, 4, 2), (32, 32, 4, 3)))
     assert not any(walk(*grid, s) for grid in ((1, 24, 1), (4, 24, 4), (4, 32, 1)) for s in (2, 4, 8, 16, 32, 128))
     assert heur.DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS == heur.DECODE_COMBINE_MAX_LEAN_BLOCKS + 1
+
+
+@pytest.mark.parametrize(
+    "b,h_q,h_kv,s_q,s_kv,split",
+    [
+        # 128-row query tile, SM80 constants. A100 80GB PCIe ms by split (study sm80_d128_gqa_split_cal_20261117):
+        (4, 28, 4, 256, 65536, 8),  # 1: 7.86, 4: 6.15, 8: 5.95, 16: 6.05
+        (8, 14, 2, 256, 32768, 8),  # 1: 3.92, 4: 3.12, 8: 3.02, 16: 3.10
+        (1, 16, 8, 2048, 16385, 2),  # 1: 1.87, 2: 1.74, 4: 1.73
+        # 64-row query tile (S_q <= 128): the shared model's choice stands.
+        (8, 14, 2, 17, 131072, 4),
+    ],
+)
+def test_sm80_d128_chunks_split_on_the_adapter_grid(b, h_q, h_kv, s_q, s_kv, split):
+    """The SM80 split model reads the adapter's 128-row x 64-key grid, not the SM100 512-row cluster tile."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    spec = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm80")
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        device_sm_count=108,
+        device_cc=(8, 0),
+    )
+    assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
+
+
+@pytest.mark.parametrize(
+    "layout,b,h_q,h_kv,s_q,s_kv,split,window",
+    [
+        # Paged short-d256 tile: >= 8 KV tiles per split, <= 16 waves. A100 80GB PCIe ms by split
+        # (study sm80_d256_decode_split_cal_20261118; the shared model chose the first split listed):
+        ("paged", 8, 36, 4, 1, 131073, 32, None),  # 16: 3.14, 32: 2.71, 64: 2.76
+        ("paged", 4, 6, 1, 16, 32769, 64, None),  # 16: 0.285, 32: 0.305, 64: 0.272
+        ("paged", 64, 16, 1, 2, 16385, 16, None),  # 1: 1.55, 8: 0.825, 16: 0.740, 32: 0.781
+        ("paged", 64, 40, 4, 8, 1025, 2, None),  # 1: 0.411, 2: 0.410, 4: 0.444
+        # One CTA of single-row decode splits to 128 (sm80_d256_split128_q1_20261118; of the backend: 64: 1.11, 128: 0.81).
+        ("paged", 1, 8, 1, 1, 131072, 128, None),
+        ("paged", 1, 8, 1, 4, 131072, 64, None),  # S_q 4 keeps the 64 cap
+        # Past the calibrated S_q 1-16 the shared model's choice stands.
+        ("paged", 4, 32, 2, 64, 32768, 2, None),
+        # A window caps the keys each row reads; the rule would count the whole cache (gemma4: 1.35-1.94x slower), so it is outside.
+        ("paged", 1, 16, 8, 1, 131072, 8, 1024),
+        # Dense single-row decode takes the same rule.
+        ("dense", 8, 40, 4, 1, 32768, 32, None),
+        ("dense", 1, 10, 1, 1, 16384, 64, None),
+        ("dense", 128, 10, 1, 1, 1025, 4, None),
+        # Dense S_q 2-16 keeps the shared model's choice.
+        ("dense", 8, 40, 4, 4, 32768, 2, None),
+    ],
+)
+def test_sm80_d256_decode_split_rule(layout, b, h_q, h_kv, s_q, s_kv, split, window):
+    """SM80 d256 decode on the short tile (paged S_q <= 16, dense S_q 1) takes a direct split rule; the wave model mis-split it both ways."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    spec = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm80")
+    paged = layout == "paged"
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_paged_kv=paged,
+        page_size=16 if paged else 0,
+        padded=paged,
+        window_left=window,
+        device_sm_count=108,
+        device_cc=(8, 0),
+    )
+    assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
+
+
+@pytest.mark.parametrize(
+    "layout,d,b,h_q,h_kv,s_q,s_kv,window,split",
+    [
+        # The cap binds on small grids over long caches. A100 80GB PCIe, new / old split time
+        # (study sm80_window_decode_split_cap_pcie_20261118; the nightly's rows):
+        ("paged", 128, 1, 10, 1, 1, 131072, 1024, 32),  # 64 -> 32: 0.908
+        ("paged", 128, 1, 16, 2, 4, 131072, 512, 16),  # 32 -> 16: 0.847
+        ("dense", 256, 1, 6, 1, 1, 90973, 384, 16),  # 32 -> 16: 0.847 (holdout)
+        # Not binding: large grids already split less, and a 2048-key window holds 34 tiles.
+        ("paged", 128, 128, 10, 1, 1, 131072, 1024, 4),
+        ("paged", 64, 1, 16, 2, 1, 131072, 2048, 32),
+    ],
+)
+def test_sm80_window_decode_split_cap(layout, d, b, h_q, h_kv, s_q, s_kv, window, split):
+    """SM80 windowed decode never splits past the smallest power of two covering the window's KV tiles: the kernels partition only
+    the clipped window, while the shared model counts the whole cache."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    spec = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm80")
+    paged = layout == "paged"
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=d,
+        d_v=d,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_paged_kv=paged,
+        page_size=16 if paged else 0,
+        padded=paged,
+        window_left=window,
+        device_sm_count=108,
+        device_cc=(8, 0),
+    )
+    assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
+
+
+@pytest.mark.parametrize(
+    "d,b,h_q,h_kv,s_q,s_kv,window,split",
+    [
+        # Rubin, new / shipped split time (study sm107_swa_split_v3_20261118; v2's forced-split sweep and the vr200 run-561 rows):
+        (128, 1, 16, 2, 1, 131072, 512, 32),  # 64 -> 32, capped at 4x the window's tiles: 0.982
+        (128, 128, 16, 2, 8, 131072, 512, 1),  # 4 -> 1, a wide grid: 0.573
+        (64, 128, 16, 2, 1, 131072, 2048, 1),  # 4 -> 1, a wide grid: 0.758
+        (128, 16, 128, 16, 1, 42752, 256, 1),  # 4 -> 1, a 256-key window (holdout): 0.647
+        (128, 1, 16, 2, 1, 8192, 128, 1),  # 16 -> 1, a 128-key window: 0.71
+        # Not binding: a 2048-key window on a small grid keeps the shipped split.
+        (128, 1, 16, 2, 1, 8192, 2048, 16),
+        (64, 1, 16, 2, 4, 131072, 2048, 64),
+    ],
+)
+def test_sm107_window_decode_split(d, b, h_q, h_kv, s_q, s_kv, window, split):
+    """Rubin windowed paged decode runs unsplit over a narrow window or a wide grid and otherwise caps the shared model's split at 4x
+    the window's KV tiles: the kernels cut only the clipped window, and any split pays a fixed combine cost."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    spec = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_sm107_d128_multi_q")
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=d,
+        d_v=d,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_paged_kv=True,
+        page_size=16,
+        padded=True,
+        window_left=window - 1,
+        device_sm_count=224,
+        device_cc=(10, 7),
+    )
+    assert (_knob_sets(spec, facts)[0].split_kv or 1) == split

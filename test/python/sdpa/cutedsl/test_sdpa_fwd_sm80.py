@@ -212,7 +212,7 @@ def test_sdpa_fwd_sm80_native_gqa_matches_expanded_bitwise(case, scheduler, d):
     offset, so every tile runs the same MMA/softmax sequence and only which
     CTA serves which tile changes.  Every scheduler is pinned, since LPT_L2
     packs H_q // H_kv Q heads into each (batch, KV head) group; d=128 and
-    d=256 cover both kernel files (prefill_f16 / prefill_d256_f16)."""
+    d=256 cover both kernel files (f16_k_prefetch / d256_kv_prefetch)."""
     name, b, h_q, h_kv, s_q, s_kv, feat = case
     if s_q is None:
         s_q = s_kv = _L2_SHORT_LAST_BLOCK_S[d]

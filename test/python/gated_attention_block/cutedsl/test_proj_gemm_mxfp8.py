@@ -633,7 +633,7 @@ def mx_fused_oracle(inp: dict, p: NormRopeFusionParams) -> dict:
     ROWWISE (the ``_d`` triple: blocks along D); V: the fp32 projection ``quantize_to_mxfp8`` COLUMNWISE
     (the ``_s`` triple: blocks along S, D-plane-major SF); GATE: the fp32 projection (rounded to bf16 by
     the test).  Codes come back in the fork's COMPACT ``[m, h*d]`` layout, the SF blobs flat -- byte
-    for byte what ``kernels/quantize_mxfp8.py`` writes and ``sm107/prefill_d256_mxfp8.py`` reads.
+    for byte what ``kernels/quantize_mxfp8.py`` writes and ``sm107/d256_mxfp8_single_q/kernel.py`` reads.
     """
     mq = mxfp8_quant()
     b, s = inp["batch"], inp["seq_len"]

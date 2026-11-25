@@ -370,7 +370,10 @@ def install_sdpa_overrides() -> SdpaOverrides:
     and its backward, and of ``torch_attn::_varlen_attn``,
     ``_varlen_attn_out`` and ``_varlen_attn_backward``. Where the varlen ops
     take a ``backend`` argument, their overrides serve only calls that
-    selected cuDNN. Returns the handle that removes them.
+    selected cuDNN. A transitional Flash-only out op stays with Torch even
+    when the forward/backward ops already select a backend. This does not
+    widen the public varlen selector's capability rules.
+    Returns the handle that removes the installed overrides.
     """
     lib = torch.library.Library("aten", "IMPL")
     lib.impl("_scaled_dot_product_cudnn_attention", _fwd, "CUDA")
@@ -378,10 +381,16 @@ def install_sdpa_overrides() -> SdpaOverrides:
     vlib = torch.library.Library("torch_attn", "IMPL")
     from torch.nn.attention import varlen as _varlen_mod  # noqa: F401 — ensure torch_attn ops are defined
 
+    selects_backend = _has_backend_arg(torch.ops.torch_attn._varlen_attn.default)
     for name, serve, serves, counter in _VARLEN_OVERRIDES:
         op = getattr(torch.ops.torch_attn, name).default
         if _has_backend_arg(op):
             vlib.impl(name, _honoring_backend(op, serve, serves, counter), "CUDA", with_keyset=True)
+        elif name == "_varlen_attn_out" and selects_backend:
+            # Transitional Torch versions select a backend for forward/backward
+            # but their out API is still Flash-only. Keep its original body:
+            # a legacy override here would steal an explicitly selected Flash call.
+            continue
         else:
             vlib.impl(name, serve, "CUDA")
     return SdpaOverrides(lib, vlib)

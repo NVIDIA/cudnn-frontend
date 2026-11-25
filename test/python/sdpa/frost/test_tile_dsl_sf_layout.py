@@ -13,7 +13,16 @@ import sys
 import pytest
 import torch
 
-from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_COLS, SF_ATOM_LINE_BYTES, SF_ATOM_LINE_ROWS, SF_ATOM_ROWS, sf_atom_byte, sf_atom_offset
+from cudnn.frost.tile_dsl.sf_layout import (
+    SF_ATOM_BYTES,
+    SF_ATOM_COLS,
+    SF_ATOM_LINE_BYTES,
+    SF_ATOM_LINE_ROWS,
+    SF_ATOM_ROWS,
+    sf_atom_byte,
+    sf_atom_offset,
+    sf_band_offset,
+)
 from frost_test_utils import _dsl_installed, requires_dsl
 
 pytestmark = pytest.mark.L0
@@ -43,6 +52,22 @@ if _dsl_installed():
         (base + cutlass.Int32(1)).store(sf_atom_byte(r % cutlass.Int32(SF_ATOM_LINE_ROWS * 4), c % cutlass.Int32(SF_ATOM_COLS)), alignment=4)
 
     _probe_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+    @cute.kernel
+    def _band_probe_kernel(out_t: cute.Tensor, n_cols: cutlass.Constexpr[int]):
+        """One thread per (row, column) of a matrix with ``n_cols`` scale columns: out[row * n_cols + column] = sf_band_offset."""
+        bx, _, _ = cute.arch.block_idx()  # row
+        tidx, _, _ = cute.arch.thread_idx()  # column
+        row = cutlass.Int32(bx)
+        column = cutlass.Int32(tidx)
+        base = Pointer(out_t.iterator.raw_ptr(), dtype=cutlass.Int32) + (row * cutlass.Int32(n_cols) + column)
+        base.store(sf_band_offset(row, column, (n_cols + SF_ATOM_COLS - 1) // SF_ATOM_COLS), alignment=4)
+
+    _band_probe_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+    @cute.jit
+    def _band_probe_host(out_t, n_cols: cutlass.Constexpr[int], rows: cutlass.Int32, stream):
+        _band_probe_kernel(out_t, n_cols).launch(grid=(rows, 1, 1), block=(n_cols, 1, 1), stream=stream)
 
     @cute.jit
     def _probe_host(out_t, n_cols: cutlass.Constexpr[int], stream):
@@ -115,3 +140,52 @@ def test_helper_traces_on_int32_and_matches_the_host(n_cols):
         for c in range(n_cols):
             assert int(got[r, c, 0]) == sf_atom_offset(r, c), (r, c)
             assert int(got[r, c, 1]) == sf_atom_byte(r, c % SF_ATOM_COLS), (r, c)
+
+
+def _band_rule(row, column, columns):
+    """The band rule written out from the layout's definition (bands of 128 rows; per band one 512-byte atom per four scale
+    columns; in an atom 32 lines of 16 bytes, line = ``row % 32``; in a line the four quarters of the band, quarter =
+    ``(row // 32) % 4``, four scale columns each) -- not through the helpers under test."""
+    atoms = (columns + 3) // 4
+    return ((row // 128) * atoms + column // 4) * 512 + (row % 32) * 16 + ((row // 32) % 4) * 4 + column % 4
+
+
+@pytest.mark.parametrize("columns", [4, 8, 320, 322])
+def test_band_offset_is_the_written_out_rule(columns):
+    """``sf_band_offset`` on host ints for rows 0 .. 300 (three bands) x every column: the rule written out; distinct bytes; and
+    a bijection onto the padded buffer's bytes where the matrix has whole bands and whole atoms."""
+    atoms = (columns + 3) // 4
+    got = [sf_band_offset(row, column, atoms) for row in range(301) for column in range(columns)]
+    assert got == [_band_rule(row, column, columns) for row in range(301) for column in range(columns)]
+    assert len(set(got)) == len(got)
+    if columns % 4 == 0:
+        whole = sorted(sf_band_offset(row, column, atoms) for row in range(256) for column in range(columns))
+        assert whole == list(range(256 * columns))
+
+
+@pytest.mark.parametrize("rows, cols", [(128, 4), (384, 8), (256, 32)])
+def test_band_offset_matches_the_oracle_swizzle(rows, cols):
+    """The oracle's swizzle of a ``rows x cols`` byte matrix holds byte ``(row, column)`` at ``sf_band_offset``."""
+    g = torch.Generator().manual_seed(2)
+    m = torch.randint(0, 256, (rows, cols), dtype=torch.uint8, generator=g)
+    sw = _swizzle_128x4(m).reshape(-1)
+    index = torch.tensor([[sf_band_offset(row, column, cols // 4) for column in range(cols)] for row in range(rows)])
+    assert torch.equal(sw[index], m)
+
+
+@requires_dsl
+@pytest.mark.parametrize("n_cols", [8, 320])
+def test_band_offset_traces_on_int32_and_matches_the_host(n_cols):
+    """The same plain-Python body on traced ``cutlass.Int32`` equals the host evaluation for rows 0 .. 300 x every column."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device to launch the probe")
+    dev = torch.device("cuda")
+    rows = 301
+    out = torch.full((rows * n_cols,), -7, dtype=torch.int32, device=dev)
+    stream = _cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
+    view = from_dlpack(out, assumed_align=16)
+    cute.compile(_band_probe_host, view, n_cols, cutlass.Int32(rows), stream)(view, cutlass.Int32(rows), stream)
+    torch.cuda.synchronize()
+    got = out.cpu().view(rows, n_cols)
+    want = torch.tensor([[_band_rule(row, column, n_cols) for column in range(n_cols)] for row in range(rows)], dtype=torch.int32)
+    assert torch.equal(got, want)

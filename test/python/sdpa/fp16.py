@@ -132,11 +132,14 @@ def validate_config(cfg):
         print("@@@@ Overall result: WAIVED, mixed-form sequence lengths require cuDNN 9.25.0 or higher.")
         pytest.skip("mixed-form sequence lengths (cumulative on one side only) require cuDNN 9.25.0 or higher")
 
-    # Same gate as test_sdpa_edge_cases.py: the random sweeps draw zero-length
-    # sequences (~10% per batch), which older engines answer with NaN rows.
-    if cudnn_version < "9.25.0" and (0 in cfg.seq_len_q or 0 in cfg.seq_len_kv):
-        print("@@@@ Overall result: WAIVED, zero sequence length SDPA requires cuDNN 9.25.0 or higher.")
-        pytest.skip("zero sequence length SDPA requires cuDNN 9.25.0 or higher")
+    # Forward empty-sequence handling is qualified on 9.24 with FE's backend
+    # guards. Keep the training qualification floor separate; a forward guard
+    # does not establish backward support. These are test floors, not the
+    # versions where the underlying backend defects were introduced.
+    zero_seqlen_floor = "9.25.0" if cfg.is_train else "9.24.0"
+    if cudnn_version < zero_seqlen_floor and (0 in cfg.seq_len_q or 0 in cfg.seq_len_kv):
+        print(f"@@@@ Overall result: WAIVED, zero sequence length SDPA requires cuDNN {zero_seqlen_floor} or higher.")
+        pytest.skip(f"zero sequence length SDPA requires cuDNN {zero_seqlen_floor} or higher")
 
 
 def kv_packed(cfg) -> bool:
@@ -378,6 +381,32 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
     return allocs, tensors, max_t_q, max_t_kv
 
 
+def _sm107_half_plan_record(graph, overrides):
+    """Translate a historical test-line pin to one explicit implementation record.
+
+    The production selector determines the owner before create_execution_plan;
+    the execution API still rejects retired records rather than translating them.
+    """
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+    from cudnn.sdpa.fwd.heuristics import select_sm107_d512_geometry, select_sm107_half_geometry
+    from cudnn.sdpa.graph_analyzer import analyze
+    from sdpa.frost.frost_test_utils import half_engine_names
+
+    names = half_engine_names("sm107")
+    base = {}
+    for i in range(graph.get_execution_plan_count()):
+        if graph.get_plan_name_at_index(i).split("[", 1)[0] in names:
+            _, base = graph.get_engine_and_knobs_at_index(i)
+            break
+    facts = analyze(graph)
+    requested = SdpaFwdKnobs.from_public({**base, **overrides})
+    selector = select_sm107_d512_geometry if facts.d_qk in (512, 576) else select_sm107_half_geometry
+    geometry = selector(facts, requested)
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
+    return family.offered_ids()[geometry.implementation], geometry.canonical_knobs(requested).to_public()
+
+
 def _apply_plan_pin(graph, cfg):
     """``cfg.plan_pin`` (ExecConfig): select the first backend plan, or append ONE explicit FROST knob set
     through graph.create_execution_plan and select it.  select_plan is strict, so a decline of the pinned plan
@@ -409,6 +438,8 @@ def _apply_plan_pin(graph, cfg):
         raise ValueError(f"FROST engine {pin['engine']!r} is not offered here (an opt-in row needs CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)")
     base = next((knobs for _, eid, knobs in pairs if eid == engine_id), {})
     knobs = {**base, **{getattr(cudnn.knob_type, name): int(value) for name, value in (pin.get("knobs") or {}).items()}}
+    if pin["engine"] == "sdpa_fwd_prefill_sm107" and (cfg.d_qk, cfg.d_v) in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256), (512, 512), (576, 512)):
+        engine_id, knobs = _sm107_half_plan_record(graph, knobs)
     graph.create_execution_plan(engine_id, knobs)
     graph.select_plan(graph.get_execution_plan_count() - 1)
     print(f"@@@@ plan pin: {graph.get_plan_name_at_index(graph.get_execution_plan_count() - 1)}")
@@ -728,6 +759,11 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         dK.set_ragged_offset(k_ragged_offset)
         dV.set_ragged_offset(v_ragged_offset)
         dO.set_ragged_offset(o_ragged_offset)
+        if cfg.with_ragged_offset_multiplier:
+            for tensor in (q, k, dQ, dK):
+                tensor.set_ragged_offset_multiplier(cfg.d_qk)
+            for tensor in (v, o, dV, dO):
+                tensor.set_ragged_offset_multiplier(cfg.d_v)
 
     try:
         graph.validate()

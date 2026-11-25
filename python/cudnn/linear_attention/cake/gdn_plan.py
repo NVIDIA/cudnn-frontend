@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 
+from cudnn.engines.base import require_stream
 from cudnn.frost import buffers
 from cudnn.frost.device import current_device, device_context
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
@@ -93,7 +94,7 @@ class GdnCakePlan(CakeLinearPlan):
         def launch(stage, grid, *args):
             self.entries[stage](*args, *grid)
 
-        with device_context(self.device), tvm_ffi.use_raw_stream(tvm_ffi.device("cuda", self.device), int(stream or 0)):
+        with device_context(self.device), tvm_ffi.use_raw_stream(tvm_ffi.device("cuda", self.device), require_stream(stream, "gdn_cake")):
             launch(
                 "meta", (1, 1, 1), x["cu_seqlens"], s["cs"], s["cl"], s["sc"], s["fs"], s["fi"], s["fx"], s["bs"], s["bi"], s["bx"], n, nc, self.t, 0, 0, n, n
             )

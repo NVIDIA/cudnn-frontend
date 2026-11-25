@@ -116,9 +116,10 @@ def _validate_dense_block_scaled_inputs(
     per_head_name: str,
     q_scale: Optional[torch.Tensor],
     k_scale: Optional[torch.Tensor],
-    sf_vec_size: int,
-) -> None:
-    """Check the dtype, device and sf_vec_size contract of a block-scaled dense score's Q/K, per-head tensor and scales.
+    sf_vec_size: Optional[int],
+) -> int:
+    """Check the dtype, device and sf_vec_size contract of a block-scaled dense score's Q/K, per-head tensor and scales,
+    and return the format's resolved sf_vec_size.
 
     ``precision`` is a validated block-scaled precision. Run it before any shape check, so Q/K of another format
     are reported as a dtype mismatch rather than as a wrong head_dim.
@@ -137,7 +138,7 @@ def _validate_dense_block_scaled_inputs(
     for scale, reference, name in ((q_scale, q, "q_scale"), (k_scale, k, "k_scale")):
         if scale.device != reference.device:
             raise ValueError(f"{name} must be on the same device as its data tensor")
-    validate_sf_vec_size(precision, sf_vec_size)
+    return validate_sf_vec_size(precision, sf_vec_size)
 
 
 def _validate_dense_block_scaled_contract(
@@ -900,7 +901,7 @@ def _dense_indexer_score_recompute(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -946,7 +947,7 @@ def _dense_indexer_score_recompute(
     )
     is_block_scaled = precision in BLOCK_SCALED_FORMATS
     if is_block_scaled:
-        _validate_dense_block_scaled_inputs(
+        sf_vec_size = _validate_dense_block_scaled_inputs(
             precision=precision,
             q=q,
             k=k,
@@ -1266,7 +1267,7 @@ def _dense_attn_score_recompute(
         cu_seqlens_k_scale_padded,
     )
     if precision == "mxfp8":
-        _validate_dense_block_scaled_inputs(
+        sf_vec_size = _validate_dense_block_scaled_inputs(
             precision=precision,
             q=q,
             k=k,
@@ -1535,7 +1536,7 @@ def dense_indexer_score_recompute(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     k_block_size: Optional[int] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1561,10 +1562,11 @@ def dense_indexer_score_recompute(
         denom_out: required, contiguous. BSHD ``(bs, seqlen_q)`` ; THD ``(total_q,)`` [FP32]
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0
         ratio, cu_seqlens_*, max_seqlen_*: see causal mask + THD docs.
-        precision: ``"bf16"``, ``"mxfp8"`` (E4M3 Q/K) or ``"mxfp4"`` (packed
-            E2M1 Q/K), the block-scaled two with one E8M0 scale per 32
-            elements. Block-scaled precisions need packed ``q_scale`` /
-            ``k_scale`` (and, for THD, ``cu_seqlens_*_scale_padded``).
+        precision: ``"bf16"``, ``"mxfp8"`` (E4M3 Q/K), ``"mxfp4"`` (packed
+            E2M1 Q/K), both with one E8M0 scale per 32 elements, or ``"nvfp4"``
+            (packed E2M1 Q/K, one E4M3 scale per 16 elements). Block-scaled
+            precisions need packed ``q_scale`` / ``k_scale`` (and, for THD,
+            ``cu_seqlens_*_scale_padded``).
 
     Returns:
         (out, denom_out)

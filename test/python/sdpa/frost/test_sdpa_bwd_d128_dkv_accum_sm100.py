@@ -9,7 +9,7 @@ the ``dkv_reduce_thd_origins`` fold launch sums the group in fp32 (five launches
 fold launch gone, the bf16 convert folded into ``cast_dq_thd`` (four launches).  A ROUNDING CHANGE (the group accumulates in fp32 in a
 non-deterministic order instead of 8 bf16-rounded partials summed in a fixed order): an op ATTRIBUTE the caller sets, never a knob; dQ is
 untouched by the field.  Both bodies carry it: the 1-CTA body (the grouped THD kernel through the THD body, sections 7 / 5 of
-``kernels/sm100/bprop_d128_f16.py``) and the cta_group::2 pair body (section 8 of the same module).
+``kernels/sm100/d128_f16_accum/kernel.py``) and the cta_group::2 pair body (section 8 of the same module).
 
 Host rows (no GPU): the typed domain, config = truth (the fp32 staging slots of both bodies), the default renderings of BOTH chains equal to
 their committed records with the field unset AND with ``bf16_partials`` named, the fp32 renderings' census (the reduce-adds up by the eight
@@ -47,7 +47,7 @@ FORMS = ("bf16_partials", "fp32_reduce")
 _FP32 = {FIELD: "fp32_reduce"}
 _GEOMETRY = {"1cta": (4, 32, 4), "pair": (2, 8, 2)}  # the record geometries of the two chains' md5 pins
 # PTX census per chain: the fp32 form adds the 8 dK / dV reduce-add slices (4 -> 12), deletes the 4 bf16 tile stores, drops the fold entry
-# (5 -> 4 kernels); the store warp credits the ring after the dV slices' source reads (the dK staging's WAR edge: +4 arrives on the 1-CTA body's
+# (6 -> 4 compiled entries, still 5 -> 4 launches); the store warp credits the ring after the dV slices' source reads (the dK staging's WAR edge: +4 arrives on the 1-CTA body's
 # bootstrapped 4-slot ring; the pair's pre-armed ring is untouched); wait SITES: the 1-CTA epilogue's dK round waits the 4 slots where the bf16 form waited 2 (one per
 # tensor's half 0) -> 45 - 2 + 4 = 47, the pair adds ONE new row dvk_stage_empty (store -> epilogue, between its two rounds): +1 arrive / +1 wait (68 -> 69); the P7 bulk groups: per-slice commits (1-CTA 5 -> 13,
 # waits 5 -> 9), the pair's one commit per tensor (5 -> 6, waits 5 -> 6).  No local memory, no nanosleep under either form.
@@ -83,10 +83,10 @@ _PROBE = textwrap.dedent(r"""
     specs = tuple((i, 1, H if p == "stats" else (HK if p in kv else H) * 128, "int32") for i, p in enumerate(ports))
     dtypes = tuple("int32" for _ in ports)
     if chain == "pair":
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
         compile_host((B, H, HK, True), specs, dtypes, cutlass.BFloat16, True, 100, **fields)
     else:
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_thd as compile_host
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum.prepared_host import compile_host_grouped_thd as compile_host
         compile_host((B, H, HK, True), specs, dtypes, cutlass.BFloat16, True, 100, **fields)
     ptxs = sorted(glob.glob(os.path.join(dump, "*.ptx")), key=os.path.getmtime)
     if not ptxs:
@@ -165,7 +165,7 @@ def test_dkv_accum_config_is_the_truth():
     """Every number the fp32 store path uses is a config field: the 1-CTA body's four [M x DQ_BOX] fp32 slices fill exactly the 64 KiB ALIAS slab
     (= one fp32 [M x D] tile); the pair body's four slots are the dV / dK bf16 staging bytes re-cut (K2's two halves + ds_own(rank) + XCHG),
     1024-B aligned, disjoint, 16 KiB each; the fp32 workspace per KV head fits inside the bf16 per-Q-head partial region on every grouped ratio."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as stail
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as stail
     from cudnn.sdpa.bwd.config_sm100_d128_accum import CFG
     from cudnn.sdpa.bwd.d128_grouped_contract import ACCUM_ITEMSIZE, PARTIAL_ITEMSIZE, thd_fp32_accum_bytes
 
@@ -205,7 +205,7 @@ def test_dkv_accum_default_renderings_are_unchanged_and_bf16_partials_named_is_t
     token, variant, _path = _RECORDS[chain]
     assert_kernel_record(kernels_default, want, token=token, variant=variant, excluded=D128_THD_SHARED_KERNELS, what=f"{chain}: the DEFAULT rendering")
     assert md5_named == md5_default and census_named == census_default, f"{chain}: bf16_partials named must render the default bytes"
-    assert census_default["ENTRY_FOLD"] == 1 and census_default["ENTRIES"] == 5
+    assert census_default["ENTRY_FOLD"] == 2 and census_default["ENTRIES"] == 6
 
 
 @pytest.mark.parametrize("chain", ["1cta", "pair"])
@@ -220,14 +220,14 @@ def test_dkv_accum_fp32_renders_for_sm_100a_with_the_documented_census(tmp_path,
     for key, (want_default, want_fp32) in _EXPECTED_FP32_DELTA[chain].items():
         assert default[key] == want_default, f"{chain} default {key}: {default[key]} != {want_default}"
         assert fp32[key] == want_fp32, f"{chain} fp32_reduce {key}: {fp32[key]} != {want_fp32}"
-    assert fp32["ENTRY_FOLD"] == 0 and fp32["ENTRIES"] == 4 and default["ENTRIES"] == 5
+    assert fp32["ENTRY_FOLD"] == 0 and fp32["ENTRIES"] == 4 and default["ENTRY_FOLD"] == 2 and default["ENTRIES"] == 6
     assert fp32["LOCAL"] == 0 and fp32["NANOSLEEP"] == 0
 
 
 def test_dkv_accum_declines_by_name_at_the_pair_chain_entry():
     """A value outside the domain and the one unbuilt combination (``fp32_reduce`` under ``warp_roles = "16w_fa4"``) decline BY NAME at the pair
     chain's compile_host before any trace."""
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
 
     with pytest.raises(ValueError, match="dkv_accum must be one of"):
         compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, dkv_accum="fp32")
@@ -248,9 +248,8 @@ def test_dkv_accum_fp32_store_path_credits_the_ring_after_the_dv_reads():
     releases BEFORE the dk_full wait (its bootstrapped ring carries the dK staging's WAR edge) and its epilogue's dK round waits them before it
     stores; the pair's rounds go through the NEW row ``dvk_stage_empty`` (commit -> drain -> arrive -> the dk_full wait; the epilogue waits it
     between dv_full and dk_full) and never touch the pre-armed dq_empty ring; the pair's new row is initialised only under the field."""
-    import cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 as pair_body  # one module: the THD body's helpers carry the `_thd` suffix, the pair body's are bare
-
-    one_body = pair_body
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum import kernel as one_body
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import kernel as pair_body
 
     one = pathlib.Path(one_body.__file__).read_text()
     store = "\n".join(_code_lines(one[one.index("def _store_loop_thd(") : one.index("def _scheduler_loop_thd(")]))

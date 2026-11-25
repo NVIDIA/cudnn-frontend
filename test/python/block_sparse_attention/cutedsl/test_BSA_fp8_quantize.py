@@ -15,7 +15,7 @@ import torch
 
 from test_utils import torch_fork_set_rng
 from block_sparse_attention.cutedsl.bsa_reference import assert_fp8_quantization_matches_fp32
-from block_sparse_attention.cutedsl.bsa_utils import import_bsa, require_sm90_fp8, require_sm120_fp8
+from block_sparse_attention.cutedsl.bsa_utils import cuda_graph, import_bsa, require_sm90_fp8, require_sm120_fp8
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -210,15 +210,15 @@ def test_sm120_blk128_fused_v_quantization_exact(batch, heads, sq, sk):
     # Reuse both compiled layouts under capture with no post-quantization copy.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            replayed = _quantize_sage_bhsd(q, k, v, v_block_size=128)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph.replay()
-    torch.cuda.synchronize()
-    for a, b in zip(actual, replayed):
-        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    with cuda_graph() as graph:
+        with torch.cuda.stream(stream):
+            with torch.cuda.graph(graph):
+                replayed = _quantize_sage_bhsd(q, k, v, v_block_size=128)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph.replay()
+        torch.cuda.synchronize()
+        for a, b in zip(actual, replayed):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
 @pytest.mark.L0

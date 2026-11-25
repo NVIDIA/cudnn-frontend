@@ -32,9 +32,6 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     v_entry = utils.tensor_entry(tensors, inputs.get("V"))
     o_entry = utils.tensor_entry(tensors, outputs.get("O"))
 
-    seq_q_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_Q"))
-    seq_kv_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_KV"))
-
     shape_q = utils.shape(q_entry)
     shape_k = utils.shape(k_entry)
     shape_v = utils.shape(v_entry)
@@ -45,14 +42,12 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     stride_v = utils.stride(v_entry)
     stride_o = utils.stride(o_entry)
 
-    # Convert K from KT [B,H,D,S] to BHSD [B,H,S,D] when detected by strides.
-    if shape_k and stride_k and len(shape_k) == 4 and len(stride_k) == 4:
-        if int(stride_k[2]) == 1 and int(stride_k[3]) != 1:
-            shape_k = (shape_k[0], shape_k[1], shape_k[3], shape_k[2])
-            stride_k = (stride_k[0], stride_k[1], stride_k[3], stride_k[2])
+    paged_geometry = utils.paged_kv_geometry(node, tensors, shape_k, shape_v)
+    is_paged = paged_geometry is not None
+    if not is_paged:
+        shape_k, stride_k = utils.normalize_k_layout(shape_k, stride_k)
 
-    seq_len_q = utils.seq_len(seq_q_entry)
-    seq_len_kv = utils.seq_len(seq_kv_entry)
+    seq_len_q, seq_len_kv, cu_sides = utils.forward_seq_lengths(tensors, inputs)
 
     batches = next((shape[0] for shape in (shape_q, shape_k, shape_v, shape_o) if shape), None)
     d_qk = shape_q[3] if shape_q and len(shape_q) > 3 else (shape_k[3] if shape_k and len(shape_k) > 3 else None)
@@ -62,6 +57,14 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     h_q = shape_q[1] if shape_q and len(shape_q) > 1 else (shape_o[1] if shape_o and len(shape_o) > 1 else None)
     h_k = shape_k[1] if shape_k and len(shape_k) > 1 else (shape_v[1] if shape_v and len(shape_v) > 1 else None)
     h_v = shape_v[1] if shape_v and len(shape_v) > 1 else None
+
+    block_size = None
+    if is_paged:
+        block_size, s_kv = paged_geometry
+        # The runner builds page pools from logical BHSD tensors.
+        shape_k = (batches, h_k, s_kv, d_qk)
+        shape_v = (batches, h_v, s_kv, d_v)
+        stride_k = stride_v = None
 
     diag_align_map = {"TOP_LEFT": 0, "BOTTOM_RIGHT": 1}
     diag_align = diag_align_map.get(node.get("diagonal_alignment", "TOP_LEFT"), 0)
@@ -73,11 +76,16 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     cfg["data_type"] = utils.torch_dtype(payload.get("context", {}).get("io_data_type"))
     cfg["rng_data_seed"] = seed if seed is not None else utils.sha1_seed(raw_line)
     cfg["is_alibi"] = node.get("alibi_mask")
-    cfg["is_infer"] = not node.get("generate_stats", False)
-    cfg["is_paged"] = any("PAGED_ATTENTION" in key for key in inputs)
-    cfg["is_bias"] = utils.bool_from_inputs(inputs, "BIAS")
+    cfg["is_infer"] = True if cu_sides else not node.get("generate_stats", False)
+    if cu_sides:
+        # The cumulative ports are forward-only. Stats are an optional forward output.
+        cfg["is_cu_seq_len"] = True
+        cfg["cu_seq_len_sides"] = cu_sides
+        cfg["fwd_stats"] = bool(node.get("generate_stats", False))
+    cfg["is_paged"] = is_paged
+    cfg["is_bias"] = (is_paged and "Bias" in inputs) or utils.bool_from_inputs(inputs, "BIAS")
     cfg["is_block_mask"] = utils.bool_from_inputs(inputs, "BLOCK_MASK")
-    cfg["is_padding"] = is_ragged or node.get("padding_mask") or bool(seq_len_q or seq_len_kv)
+    cfg["is_padding"] = is_ragged or node.get("padding_mask") or bool(seq_len_q or seq_len_kv or cu_sides)
     cfg["is_ragged"] = is_ragged
     cfg["is_dropout"] = dropout_prob > 0.0
     cfg["is_determin"] = None
@@ -109,7 +117,7 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     cfg["h_q"] = h_q
     cfg["h_k"] = h_k
     cfg["h_v"] = h_v
-    cfg["block_size"] = None
+    cfg["block_size"] = block_size
     cfg["shape_q"] = shape_q
     cfg["stride_q"] = stride_q
     cfg["shape_k"] = shape_k
@@ -152,8 +160,7 @@ def extract_seq_and_ragged(payload: dict, seed: int) -> dict:
     tensors = payload.get("tensors", [])
     inputs = node.get("inputs", {})
 
-    seq_q_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_Q"))
-    seq_kv_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_KV"))
+    seq_len_q, seq_len_kv, _ = utils.forward_seq_lengths(tensors, inputs)
     ragged_q_entry = utils.tensor_entry(tensors, inputs.get("RAGGED_OFFSET_Q"))
     ragged_kv_entry = utils.tensor_entry(tensors, inputs.get("RAGGED_OFFSET_KV"))
 
@@ -170,8 +177,8 @@ def extract_seq_and_ragged(payload: dict, seed: int) -> dict:
         ragged_kv_entry = utils.ragged_offset_entry(tensors, k_entry, v_entry)
 
     return {
-        "seq_len_q": utils.seq_len(seq_q_entry),
-        "seq_len_kv": utils.seq_len(seq_kv_entry),
+        "seq_len_q": seq_len_q,
+        "seq_len_kv": seq_len_kv,
         "ragged_offset_q": utils.seq_len(ragged_q_entry),
         "ragged_offset_kv": utils.seq_len(ragged_kv_entry),
         "rng_data_seed": seed,

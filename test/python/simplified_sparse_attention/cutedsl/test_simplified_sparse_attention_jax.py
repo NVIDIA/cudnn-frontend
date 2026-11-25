@@ -10,7 +10,7 @@ import torch
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
-from cudnn.ops import simplified_sparse_attention_jax
+from cudnn.ops import simplified_sparse_attention_forward_jax
 from ssa_reference import check_reference, pack, sample
 from test_simplified_sparse_attention import supported_gpu
 
@@ -18,13 +18,16 @@ pytestmark = [pytest.mark.L0, pytest.mark.usefixtures("supported_gpu")]
 
 
 def test_public_jax_export():
-    from cudnn.simplified_sparse_attention import simplified_sparse_attention_jax as package_export
+    from cudnn.simplified_sparse_attention import simplified_sparse_attention_forward_jax as package_export
 
-    assert package_export is simplified_sparse_attention_jax
+    assert package_export is simplified_sparse_attention_forward_jax
 
 
 def jax_inputs(inputs):
     tensors, metadata, upstream = inputs
+    # Initialize XLA before a DLPack export selects its tensor's CUDA device.
+    with torch.cuda.device(tensors[0].device):
+        jax.local_devices(backend="gpu")
 
     def convert(t):
         with torch.cuda.device(t.device):
@@ -47,7 +50,7 @@ def runner(topk=512, coefficient=0.1, triangular=False, backward=True):
         tensors, metadata, upstream = arrays[:5], arrays[5:9], arrays[9]
 
         def operation(*values):
-            return simplified_sparse_attention_jax(*values, *metadata, topk=topk, loss_coeff=coefficient, triangular_scores=triangular)
+            return simplified_sparse_attention_forward_jax(*values, *metadata, topk=topk, loss_coeff=coefficient, triangular_scores=triangular)
 
         if not backward:
             return operation(*tensors)
@@ -59,9 +62,10 @@ def runner(topk=512, coefficient=0.1, triangular=False, backward=True):
 
 
 def execute(inputs, topk=512, coefficient=0.1, triangular=False, backward=True):
-    tensors, metadata, upstream = jax_inputs(inputs)
-    result = jax.block_until_ready(runner(topk, coefficient, triangular, backward)(*tensors, *metadata, upstream))
-    return dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), torch_outputs(result, inputs[0][0].device)))
+    with torch.cuda.device(inputs[0][0].device):
+        tensors, metadata, upstream = jax_inputs(inputs)
+        result = jax.block_until_ready(runner(topk, coefficient, triangular, backward)(*tensors, *metadata, upstream))
+        return dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), torch_outputs(result, inputs[0][0].device)))
 
 
 @pytest.mark.parametrize("heads", [16, 32, 96], ids=lambda n: f"bf16-h{n}")
@@ -109,7 +113,7 @@ def test_invalid_inputs(change):
     else:
         tensors[0] = tensors[0][:0]
     with pytest.raises((ValueError, TypeError)):
-        jax.jit(lambda *x: simplified_sparse_attention_jax(*x, *metadata, topk=topk))(*tensors)
+        jax.jit(lambda *x: simplified_sparse_attention_forward_jax(*x, *metadata, topk=topk))(*tensors)
 
 
 @pytest.mark.parametrize("captured", [False, True])
@@ -126,9 +130,9 @@ def test_mixed_architecture_rejected_before_launch(monkeypatch, captured):
     monkeypatch.setattr(jax_api, "_attention", forbidden)
     with pytest.raises(ValueError, match="only SM100 or only SM103"):
         if captured:
-            jax.jit(lambda: simplified_sparse_attention_jax(*tensors, *metadata))()
+            jax.jit(lambda: simplified_sparse_attention_forward_jax(*tensors, *metadata))()
         else:
-            jax.jit(lambda *x: simplified_sparse_attention_jax(*x, *metadata))(*tensors)
+            jax.jit(lambda *x: simplified_sparse_attention_forward_jax(*x, *metadata))(*tensors)
 
 
 def test_captured_jit_uses_native_buffers(monkeypatch):
@@ -141,7 +145,7 @@ def test_captured_jit_uses_native_buffers(monkeypatch):
     with monkeypatch.context() as patch:
         for name in ("empty", "zeros", "empty_like", "zeros_like"):
             patch.setattr(torch, name, forbidden)
-        result = jax.block_until_ready(jax.jit(lambda: simplified_sparse_attention_jax(*tensors, *metadata))())
+        result = jax.block_until_ready(jax.jit(lambda: simplified_sparse_attention_forward_jax(*tensors, *metadata))())
     actual = dict(zip(("output", "indexer_loss"), torch_outputs(result, inputs[0][0].device)))
     check_reference(inputs, actual, False)
 
@@ -151,7 +155,7 @@ def test_dense_workspace_index_limit():
     dtypes = (jnp.bfloat16,) * 5 + (jnp.int32, jnp.int32, jnp.bool_, jnp.float32)
     inputs = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in zip(shapes, dtypes)]
     with pytest.raises(ValueError, match="Dense score workspace exceeds"):
-        jax.eval_shape(lambda *x: simplified_sparse_attention_jax(*x, triangular_scores=True), *inputs)
+        jax.eval_shape(lambda *x: simplified_sparse_attention_forward_jax(*x, triangular_scores=True), *inputs)
 
 
 def test_dlpack_device_context(monkeypatch):
@@ -183,6 +187,66 @@ def test_dlpack_device_context(monkeypatch):
     torch_outputs((*values, *bounds, upstream), inputs[0][0].device)
     assert len(seen) == 20
     assert not active
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["success", "error"])
+@pytest.mark.parametrize("entry_point", [jax_inputs, execute], ids=["convert", "execute"])
+def test_jax_initialization_restores_caller_device(monkeypatch, fail, entry_point):
+    from contextlib import contextmanager
+
+    inputs = pack([sample(3)])
+    caller = torch.device("cuda:1")
+    current = caller
+    initialized = False
+
+    @contextmanager
+    def device_guard(device):
+        nonlocal current
+        previous, current = current, device
+        try:
+            yield
+        finally:
+            current = previous
+
+    def initialize(*, backend):
+        nonlocal current, initialized
+        assert backend == "gpu"
+        initialized = True
+        current = torch.device("cuda:3")
+        if fail and entry_point is jax_inputs:
+            raise RuntimeError("JAX initialization failed")
+        return ()
+
+    def convert(tensor):
+        if not initialized:
+            initialize(backend="gpu")
+        assert current == tensor.device, "JAX initialization changed the DLPack device"
+        return tensor
+
+    def invoke(*arrays):
+        nonlocal current
+        current = torch.device("cuda:2")
+        if fail:
+            raise RuntimeError("JAX execution failed")
+        return arrays[:2]
+
+    monkeypatch.setattr(torch.cuda, "device", device_guard)
+    monkeypatch.setattr(jax, "local_devices", initialize)
+    monkeypatch.setattr(jax.dlpack, "from_dlpack", convert)
+    monkeypatch.setattr(torch, "from_dlpack", convert)
+    monkeypatch.setattr(jax, "block_until_ready", lambda x: x)
+    monkeypatch.setitem(execute.__globals__, "runner", lambda *args: invoke)
+    if fail:
+        with pytest.raises(RuntimeError, match="JAX (?:initialization|execution) failed"):
+            entry_point(inputs)
+    else:
+        actual = entry_point(inputs)
+        if entry_point is execute:
+            assert actual["output"] is inputs[0][0]
+        else:
+            assert actual[0][0] is inputs[0][0]
+    assert initialized
+    assert current == caller
 
 
 def test_dlpack_with_another_gpu_current():

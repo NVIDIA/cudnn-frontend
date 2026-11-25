@@ -20,9 +20,11 @@ spelled.  Constants are Python ints, not ``cutlass.Int32(...)``, so the host pat
 sm_107a cubins of ``quantize_mxfp8.py`` (both arms) are byte-identical to the pre-hoist inlines --
 the PTX only reorders two independent ops, ptxas emits the same SASS.
 
-Who computes the ATOM index is the caller's business -- it differs per consumer (the SDPA's Q/K
-SF is per-``(b, h, s_tile)`` contiguous, its V SF is D-plane-major, the GEMM's blob is a padded
-``rows x K/block`` matrix), which is why only the two atom-local pieces live here.
+Who computes the ATOM index depends on the consumer.  The SDPA's Q/K SF is per-``(b, h, s_tile)``
+contiguous and its V SF is D-plane-major: those indices stay the caller's, on top of the two
+atom-local pieces.  The third consumer's rule is fixed -- the scale factors of a padded
+``rows x K/block`` matrix (the operand of a block-scale GEMM) are bands of 128 rows one after the
+other, each a row of atoms -- and :func:`sf_band_offset` spells it once.
 """
 
 SF_ATOM_ROWS = 128  # rows of one F8_128x4 atom (== the SDPA's Q / KV tile height)
@@ -55,3 +57,15 @@ def sf_atom_offset(r, c):
     inline the rowwise ``quantize_mxfp8`` arm used to spell out, hoisted so the FP4 quantizer shares it; the
     host twin is ``quantize_mxfp8.sf_byte_rowwise`` (which adds the per-``(b, h, s_tile)`` tile base)."""
     return sf_atom_byte(r, c % SF_ATOM_COLS, base=(c // SF_ATOM_COLS) * SF_ATOM_BYTES)
+
+
+def sf_band_offset(row, column, atoms_per_band):
+    """Byte of scale ``(row, column)`` of a padded ``rows x columns`` scale matrix:
+    ``(row // 128) * (atoms_per_band * 512) + sf_atom_offset(row % 128, column)``.
+
+    The matrix is laid out as BANDS of 128 rows one after the other; a band is ``atoms_per_band`` atoms long
+    (``ceil(columns / 4)``: the caller's constant, a Python int), so its bytes are ``atoms_per_band * 512``.  ``row`` is the
+    row across the whole matrix (any ``row >= 0``), ``column`` the scale column across the whole row.  Rows past the last
+    live row of the last band and columns past the last live column of the last atom are padding: no ``(row, column)``
+    addresses them.  Host ints or traced ``cutlass.Int32`` alike, as the two helpers above."""
+    return (row // SF_ATOM_ROWS) * (atoms_per_band * SF_ATOM_BYTES) + sf_atom_offset(row % SF_ATOM_ROWS, column)

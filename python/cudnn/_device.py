@@ -17,10 +17,12 @@ concept, not a per-engine introspection stack.
 from __future__ import annotations
 
 import functools
+from contextlib import contextmanager
 
 from . import _pybind_module
 
 _native_context = getattr(_pybind_module, "_try_ensure_current_context", None)
+_native_context_matches = getattr(_pybind_module, "_try_execution_context_matches", None)
 
 
 @functools.lru_cache(maxsize=1)
@@ -106,6 +108,39 @@ def ensure_current_context(stream=None, device=None) -> None:
     _ensure_current_context_python(stream, device)
 
 
+def execution_context_matches(stream, device) -> bool:
+    """Whether a known handle can execute without changing the calling context."""
+    if _native_context_matches is not None:
+        matches = _native_context_matches(None if stream is None else int(stream), int(device))
+        if matches is not None:
+            return matches
+    drv = _driver()
+    if drv is None:
+        return True  # Keep the underlying operation's no-device diagnostic.
+    current = _ck(*drv.cuCtxGetCurrent())
+    if not int(current):
+        return False
+    stream = 0 if stream is None else int(stream)
+    if stream not in _default_streams():
+        return int(_ck(*drv.cuStreamGetCtx(stream))) == int(current)
+    return int(_ck(*drv.cuCtxGetDevice())) == int(device)
+
+
+@contextmanager
+def execution_context(stream, device):
+    """Temporarily enter the handle's context, including on cold worker threads."""
+    drv = _driver()
+    if drv is None:
+        yield
+        return
+    previous = _ck(*drv.cuCtxGetCurrent())
+    try:
+        ensure_current_context(stream, device)
+        yield
+    finally:
+        _ck(*drv.cuCtxSetCurrent(previous))
+
+
 def _ensure_current_context_python(stream=None, device=None) -> None:
     """Bind the context this work runs in to the calling thread.
 
@@ -149,7 +184,7 @@ class DeviceInfo:
 
     Exposes both forms of compute capability that callers consume — the
     ``(major, minor)`` tuple and the packed ``sm_version`` int — plus the SM
-    count, the opt-in / oversized per-CTA SMEM ceilings, the L2 size and the name.
+    count, the per-SM and opt-in / oversized per-CTA SMEM ceilings, the L2 size and the name.
     """
 
     def __init__(self, ordinal: int):
@@ -179,6 +214,13 @@ class DeviceInfo:
     def shared_memory_per_block_optin(self) -> int:
         drv = _driver()
         return int(_ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, _device_handle(self.ordinal))))
+
+    @functools.cached_property
+    def shared_memory_per_multiprocessor(self) -> int:
+        drv = _driver()
+        return int(
+            _ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, _device_handle(self.ordinal)))
+        )
 
     @functools.cached_property
     def oversized_shared_memory_per_block(self) -> int:

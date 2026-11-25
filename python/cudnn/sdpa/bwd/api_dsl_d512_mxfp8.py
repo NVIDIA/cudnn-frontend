@@ -4,7 +4,7 @@
 
 from .api_dsl_mxfp8_sm100 import SdpaBwdDslSm100Mxfp8, _ROLES
 from .d128_contract import validate_dense_bounds, validate_accumulation_scale
-from .d512_fp8_contract import environment_error
+from .d512_fp8_contract import environment_error, launch_error
 
 
 class SdpaBwdDslD512Mxfp8(SdpaBwdDslSm100Mxfp8):
@@ -30,10 +30,8 @@ class SdpaBwdDslD512Mxfp8(SdpaBwdDslSm100Mxfp8):
         b, h, hk, sq, sk = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max
         validate_dense_bounds(b, h, sq, sk, self.window_size_left)
         validate_accumulation_scale(self.scale_softmax)
-        require(max(b, h, hk) <= 65535, "batch/head grid dimensions exceed CUDA limits")
-        require(4 * ((max(sq, sk) + 127) // 128) <= 2**31 - 1, "gradient tile grid exceeds CUDA limits")
-        require(b * h * ((sq + 127) // 128 * 128) <= 2**31 - 1, "rounded delta index exceeds Int32")
-        require(max(sq, sk) * h * 512 * 2 < 2**40, "TMA byte strides exceed supported range")
+        error = launch_error(b, h, hk, sq, sk)
+        require(error is None, error)
         for role in _ROLES[:13]:
             desc = getattr(self, role + "_desc")
             kv = role in ("k", "v", "dk", "dv", "k_T")

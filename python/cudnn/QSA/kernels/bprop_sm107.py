@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM107 (Rubin) query-major, key-major and dense pair kernels of the Qwen Sparse Attention (QSA) backward.
+"""SM107 (Rubin) key-major and dense pair kernels of the Qwen Sparse Attention (QSA) backward.
 
 ``cudnn.QSA._backward`` compiles them in place of the SM100 kernels on SM107 when ``supported``. Each kernel is its
 SM100 twin in ``bprop_sm100``, which documents the shared logic, with these changes:
@@ -22,8 +22,6 @@ from cudnn._device import device_info
 
 from .bprop_sm100 import (
     BF16,
-    BLK_SMEM,
-    CHB,
     D,
     DP_CM,
     DP_G,
@@ -44,7 +42,6 @@ from .bprop_sm100 import (
     DP_SMEM,
     DP_ST_W,
     DP_SYNC,
-    DP_SYNC_DQ,
     DP_THREADS,
     DP_TM_A,
     DP_TM_DQ,
@@ -53,66 +50,30 @@ from .bprop_sm100 import (
     DP_TM_SD,
     DP_TT,
     F32,
-    GAP12,
     GQ,
-    HALF_BLK,
     I32,
-    K_STAGE,
     L2_EVICT_FIRST,
     LOG2E,
-    NTHREADS,
-    OFF_K,
-    PART_W,
     PB_THREADS,
-    POS,
-    Q_BYTES,
-    QSLAB,
-    SLAB,
-    TM_COLS,
     _PbLayout as _PbLayout100,
     _active_key,
     _band_groups,
-    _chunk_bytes,
-    _chunk_valid,
     _delta_rows,
     _dense_rows_load,
     _dense_sel,
     _dense_ticket,
     _desc,
-    _dq_done,
-    _dq_turn,
-    _item_meta,
+    _dq_issue,
+    _dq_issuers,
     _kv_done,
     _kv_order,
     _kv_turn,
-    _lane_meta,
-    _load_block,
     _lse_rows,
-    _pair_meta,
-    _prefetch_block,
-    _rec_w,
     _rot,
     _st_async16,
     _tile_groups,
     _wait,
 )
-
-# The SM100 query kernel has moved on (K^T in TMEM for dQ^T, a 48-column TMEM pitch, one dS^T row group per slot, no
-# pad between its first two K stages). This flavor keeps the layout it was built with.
-GAP01 = 1024  # the zero pad between K stages 0 and 1
-DS_BYTES = 2 * CHB * 384  # bf16 dS^T: two row groups per slot
-TM_S = 0
-TM_DP = 32
-TM_DQ = 128
-TM_KA = 192
-TM_VA = 320
-
-
-@cute.jit
-def _koff(st):
-    # byte offset of K stage st from OFF_K: the regions between the stages differ in size
-    return st * K_STAGE + ((st + 1) >> 1) * GAP01 + (st >> 1) * GAP12
-
 
 # the dense pair kernel's K^T half follows the 512 columns of the SM100 TMEM map
 DP_TM_KT = 512
@@ -123,736 +84,6 @@ def supported(device_index: int) -> bool:
     """Whether the device's driver offers the oversized shared memory carveout these kernels need (CUDA 13.4+)."""
     # the largest layout plus barriers and static storage
     return device_info(device_index).oversized_shared_memory_per_block >= _PbLayout(2).smem + 2048
-
-
-def _query_layout():
-    # [K0][pad][K1][dO][K2][Q][dS][V]
-    off_do = OFF_K + 2 * K_STAGE + GAP01
-    off_q = off_do + GAP12 + K_STAGE
-    off_ds = off_q + Q_BYTES
-    off_v = off_ds + DS_BYTES
-    return 3, off_do, off_q, off_v, off_ds
-
-
-@cute.kernel
-def qsa_bwd_sparse_query_sm107_kernel(
-    tma_q: cutlass.GridConstant[cuda.TensorMap],
-    tma_do: cutlass.GridConstant[cuda.TensorMap],
-    tma_k: cutlass.GridConstant[cuda.TensorMap],
-    tma_v: cutlass.GridConstant[cuda.TensorMap],
-    g_lse: cute.Tensor,
-    g_delta: cute.Tensor,
-    g_dq: cute.Tensor,
-    g_sparse_blocks: cute.Tensor,
-    g_sparse_pass_offsets: cute.Tensor,
-    g_sparse_block_slots: cute.Tensor,
-    g_pair_records: cute.Tensor,
-    g_sparse_queries: cute.Tensor,
-    g_lo: cute.Tensor,
-    g_hi: cute.Tensor,
-    g_sparse_count: cute.Tensor,
-    nctas: I32,
-    NP: I32,
-    scale: F32,
-    HKV: cutlass.Constexpr[int],
-    GH: cutlass.Constexpr[int],
-):
-    NKS, OFF_DO, OFF_Q, OFF_V, OFF_DS = _query_layout()
-    HQ = GH * HKV
-    PAIR = HKV == 1
-    QSTEP = 2 if PAIR else 1
-    REC_W = _rec_w(HKV)
-    nsq = g_sparse_count.iterator.raw_ptr().load()
-    p_sparse_queries = g_sparse_queries.iterator.raw_ptr()
-    p_lo = g_lo.iterator.raw_ptr()
-    p_hi = g_hi.iterator.raw_ptr()
-    hint_q = cutlass.Int64(L2_EVICT_FIRST)
-    tidx, _, _ = cute.arch.thread_idx()
-    bid, _, _ = cute.arch.block_idx()
-    warp = cute.arch.warp_idx()
-    lane = tidx % 32
-
-    smem = cutlass.Array(I32, (OFF_V + K_STAGE) // 4, space=cutlass.AddressSpace.smem, alignment=1024)
-    b_qf = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    b_qe = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    b_kf = cutlass.Array(cutlass.Int64, NKS, space=cutlass.AddressSpace.smem, alignment=8)
-    b_ke = cutlass.Array(cutlass.Int64, NKS, space=cutlass.AddressSpace.smem, alignment=8)
-    b_vf = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    b_ve = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    b_sf = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
-    b_pf = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
-    b_dqf = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    b_dqe = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    b_sde = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
-    b_dsf = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    b_ktf = cutlass.Array(cutlass.Int64, 4, space=cutlass.AddressSpace.smem, alignment=8)
-    b_kte = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    b_vtf = cutlass.Array(cutlass.Int64, 4, space=cutlass.AddressSpace.smem, alignment=8)
-    b_vte = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    tmem_slot = cutlass.Array(I32, 1, space=cutlass.AddressSpace.smem, alignment=4)
-
-    zero4 = cutlass.Vector.from_elements([I32(0), I32(0), I32(0), I32(0)], I32)
-    sbase = smem.data_ptr()
-    for it in cutlass.range(tidx, (OFF_V + K_STAGE) // 16, NTHREADS, unroll=1):
-        (sbase + it * 4).store(zero4, alignment=16)
-
-    if warp == 0:
-        if prims.elect_sync():
-            prims.prefetch_tensormap(tma_q.get_ptr())
-            prims.prefetch_tensormap(tma_do.get_ptr())
-            prims.prefetch_tensormap(tma_k.get_ptr())
-            prims.prefetch_tensormap(tma_v.get_ptr())
-            prims.mbarrier_init(b_qf, 1)
-            prims.mbarrier_init(b_qe, 1)
-            for s in cutlass.range_constexpr(NKS):
-                prims.mbarrier_init(b_kf.subview(s), 1)
-                prims.mbarrier_init(b_ke.subview(s), 1)
-            for s in cutlass.range_constexpr(2):
-                prims.mbarrier_init(b_pf.subview(s), 4)
-            prims.mbarrier_init(b_sf.subview(0), 1)
-            prims.mbarrier_init(b_sf.subview(1), 1)
-            prims.mbarrier_init(b_vf, 1)
-            prims.mbarrier_init(b_ve, 8)
-            prims.mbarrier_init(b_dqf, 1)
-            prims.mbarrier_init(b_dqe, 4)
-            for s in cutlass.range_constexpr(2):
-                prims.mbarrier_init(b_sde.subview(s), 4)
-            prims.mbarrier_init(b_dsf, 1)
-            for s in cutlass.range_constexpr(4):
-                prims.mbarrier_init(b_ktf.subview(s), 8)
-                prims.mbarrier_init(b_vtf.subview(s), 8)
-            prims.mbarrier_init(b_kte, 1)
-            prims.mbarrier_init(b_vte, 1)
-    if warp == 2:
-        prims.tcgen05_alloc(tmem_slot, TM_COLS, group="cta_1")
-        prims.tcgen05_relinquish_alloc_permit(group="cta_1")
-    prims.fence_mbarrier_init()
-    prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    prims.barrier_cta_sync(0)
-
-    tmem_raw = tmem_slot.load()
-    tmem_col0 = tmem_raw & I32(0xFFFF)
-    tmem_row0 = tmem_raw >> I32(16)
-
-    p_delta = g_delta.iterator.raw_ptr()
-    p_dq = g_dq.iterator.raw_ptr()
-    p_sparse_blocks = g_sparse_blocks.iterator.raw_ptr()
-    p_sparse_pass_offsets = g_sparse_pass_offsets.iterator.raw_ptr()
-    p_sparse_block_slots = g_sparse_block_slots.iterator.raw_ptr()
-    p_pair_records = g_pair_records.iterator.raw_ptr()
-
-    wg = warp // 4
-    if wg == 0:
-        if cutlass.const_expr(PAIR):
-            jl = lane >> 1
-            hl = lane & 1
-            lane_ok = lane < 2 * CHB
-        else:
-            jl = lane
-            hl = I32(0)
-            lane_ok = lane < CHB
-        if warp == 0:
-            gc = I32(0)
-            nq = I32(0)
-            for pp in cutlass.range(NP, unroll=1):
-                for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
-                    o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
-                    o0_1, nblk_1 = _pair_meta(p_sparse_pass_offsets, j, pp, nsq, PAIR)
-                    nblk, o0_l, nblk_l = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, hl)
-                    if nblk > 0:
-                        lrow = p_sparse_blocks + ((j + hl) * PART_W + o0_l)
-                        nchunks = (nblk + (CHB - 1)) // CHB
-                        _wait(b_qe, (nq & 1) ^ 1)
-                        if prims.elect_sync():
-                            nqq = I32(1)
-                            if cutlass.const_expr(PAIR):
-                                if j + 1 < nsq:
-                                    nqq = I32(2)
-                            prims.mbarrier_arrive_expect_tx(b_qf, nqq * (2 * 4 * GH * HKV * 128))
-                            for h in cutlass.range_constexpr(QSTEP):
-                                if h < nqq:
-                                    qh = (p_sparse_queries + (j + h)).load()
-                                    for s in cutlass.range_constexpr(4):
-                                        prims.cp_async_bulk_tensor_shared_cta_global(
-                                            sbase + (OFF_Q + s * QSLAB + h * (QSLAB // 2)) // 4,
-                                            tma_q.get_ptr(),
-                                            (s * 64, 0, qh),
-                                            b_qf,
-                                            l2_cache_hint=hint_q,
-                                        )
-                                        prims.cp_async_bulk_tensor_shared_cta_global(
-                                            sbase + (OFF_DO + s * QSLAB + h * (QSLAB // 2)) // 4,
-                                            tma_do.get_ptr(),
-                                            (s * 64, 0, qh),
-                                            b_qf,
-                                            l2_cache_hint=hint_q,
-                                        )
-                        m0 = jl
-                        if m0 >= nblk_l:
-                            m0 = I32(0)
-                        xnext = (lrow + m0).load()
-                        for c in cutlass.range(nchunks, unroll=1):
-                            cgc = gc + c
-                            st = cgc % NKS
-                            kpar = (cgc // NKS) & 1
-                            xcur = xnext
-                            if c + 1 < nchunks:
-                                m1 = (c + 1) * CHB + jl
-                                if m1 >= nblk_l:
-                                    m1 = I32(0)
-                                xnext = (lrow + m1).load()
-                            m = c * CHB + jl
-                            ok = (m < nblk_l) & lane_ok
-                            tbytes = _chunk_bytes(nblk_0, nblk_1, c, PAIR)
-                            _wait(b_ke.subview(st), kpar ^ 1)
-                            if prims.elect_sync():
-                                prims.mbarrier_arrive_expect_tx(b_kf.subview(st), tbytes)
-                            prims.bar_warp_sync(0xFFFFFFFF)
-                            if ok:
-                                _load_block(tma_k, sbase + (OFF_K + _koff(st) + jl * BLK_SMEM + hl * HALF_BLK) // 4, xcur, b_kf.subview(st), PAIR)
-                            if c + 1 < nchunks:
-                                okn = ((c + 1) * CHB + jl < nblk_l) & lane_ok
-                                if okn:
-                                    _prefetch_block(tma_k, xnext, PAIR)
-                        gc = gc + nchunks
-                        nq = nq + 1
-
-        if warp == 1:
-            gc = I32(0)
-            for pp in cutlass.range(NP, unroll=1):
-                for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
-                    o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
-                    o0_1, nblk_1 = _pair_meta(p_sparse_pass_offsets, j, pp, nsq, PAIR)
-                    nblk, o0_l, nblk_l = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, hl)
-                    if nblk > 0:
-                        lrow = p_sparse_blocks + ((j + hl) * PART_W + o0_l)
-                        nchunks = (nblk + (CHB - 1)) // CHB
-                        m0 = jl
-                        if m0 >= nblk_l:
-                            m0 = I32(0)
-                        xnext = (lrow + m0).load()
-                        for c in cutlass.range(nchunks, unroll=1):
-                            cgc = gc + c
-                            xcur = xnext
-                            if c + 1 < nchunks:
-                                m1 = (c + 1) * CHB + jl
-                                if m1 >= nblk_l:
-                                    m1 = I32(0)
-                                xnext = (lrow + m1).load()
-                            m = c * CHB + jl
-                            ok = (m < nblk_l) & lane_ok
-                            tbytes = _chunk_bytes(nblk_0, nblk_1, c, PAIR)
-                            _wait(b_ve, (cgc & 1) ^ 1)
-                            if prims.elect_sync():
-                                prims.mbarrier_arrive_expect_tx(b_vf, tbytes)
-                            prims.bar_warp_sync(0xFFFFFFFF)
-                            if ok:
-                                _load_block(tma_v, sbase + (OFF_V + jl * BLK_SMEM + hl * HALF_BLK) // 4, xcur, b_vf, PAIR)
-                            if c + 1 < nchunks:
-                                okn = ((c + 1) * CHB + jl < nblk_l) & lane_ok
-                                if okn:
-                                    _prefetch_block(tma_v, xnext, PAIR)
-                        gc = gc + nchunks
-
-        if warp == 2:
-            idesc_s = prims.Tcgen05InstrDesc.build(
-                c_dtype=F32,
-                a_dtype=BF16,
-                b_dtype=BF16,
-                n_dim=24,
-                m_dim=128,
-                a_major=0,
-                b_major=0,
-            )
-            SW128 = prims.Tcgen05SmemSwizzle.SWIZZLE_128B
-            d_q_kmaj = _desc(sbase + OFF_Q // 4, 16, 1024, SW128)
-            d_do_kmaj = _desc(sbase + OFF_DO // 4, 16, 1024, SW128)
-
-            gc = I32(0)
-            nq = I32(0)
-            for pp in cutlass.range(NP, unroll=1):
-                for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
-                    o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
-                    o0_1, nblk_1 = _pair_meta(p_sparse_pass_offsets, j, pp, nsq, PAIR)
-                    nblk, _, _ = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, I32(0))
-                    if nblk > 0:
-                        nchunks = (nblk + (CHB - 1)) // CHB
-                        _wait(b_qf, nq & 1)
-                        for c in cutlass.range(nchunks + 1, unroll=1):
-                            cgc = gc + c
-                            st = cgc % NKS
-                            if c < nchunks:
-                                _wait(b_kf.subview(st), (cgc // NKS) & 1)
-                                _wait(b_sde.subview(cgc & 1), ((cgc >> 1) & 1) ^ 1)
-                                prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                                for pub in cutlass.range_constexpr(2):
-                                    _wait(b_ktf.subview(pub), cgc & 1)
-                                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                                    stop = 1 if pub == 0 else 4
-                                    for sl4 in cutlass.range(pub, stop, unroll=1):
-                                        for k4 in cutlass.range_constexpr(4):
-                                            if prims.elect_sync():
-                                                prims.tcgen05_mma(
-                                                    prims.Tcgen05MMAKind.F16,
-                                                    prims.CTAGroup.CTA_1,
-                                                    prims.make_tmem_ptr(tmem_raw + (TM_S + (cgc & 1) * 64), F32),
-                                                    prims.make_tmem_ptr(tmem_raw + (TM_KA + sl4 * 32 + k4 * 8), BF16),
-                                                    d_q_kmaj.advance_start_address(sl4 * QSLAB + k4 * 32),
-                                                    idesc_s,
-                                                    (sl4 * 4 + k4) > 0,
-                                                )
-                                if prims.elect_sync():
-                                    prims.tcgen05_commit(b_kte, group=prims.CTAGroup.CTA_1)
-                            if c < nchunks:
-                                for pub in cutlass.range_constexpr(2):
-                                    _wait(b_vtf.subview(pub), cgc & 1)
-                                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                                    stop = 1 if pub == 0 else 4
-                                    for sl4 in cutlass.range(pub, stop, unroll=1):
-                                        for k4 in cutlass.range_constexpr(4):
-                                            if prims.elect_sync():
-                                                prims.tcgen05_mma(
-                                                    prims.Tcgen05MMAKind.F16,
-                                                    prims.CTAGroup.CTA_1,
-                                                    prims.make_tmem_ptr(tmem_raw + (TM_DP + (cgc & 1) * 64), F32),
-                                                    prims.make_tmem_ptr(tmem_raw + (TM_VA + sl4 * 32 + k4 * 8), BF16),
-                                                    d_do_kmaj.advance_start_address(sl4 * QSLAB + k4 * 32),
-                                                    idesc_s,
-                                                    (sl4 * 4 + k4) > 0,
-                                                )
-                                if prims.elect_sync():
-                                    prims.tcgen05_commit(b_vte, group=prims.CTAGroup.CTA_1)
-                                    prims.tcgen05_commit(b_sf.subview(cgc & 1), group=prims.CTAGroup.CTA_1)
-                                    if c == nchunks - 1:
-                                        prims.tcgen05_commit(b_qe, group=prims.CTAGroup.CTA_1)
-                        gc = gc + nchunks
-                        nq = nq + 1
-
-        if warp == 3:
-            idesc_q3 = prims.Tcgen05InstrDesc.build(
-                c_dtype=F32,
-                a_dtype=BF16,
-                b_dtype=BF16,
-                n_dim=24,
-                m_dim=128,
-                a_major=1,
-                b_major=1,
-            )
-            if cutlass.const_expr(PAIR):
-                d_k_mn3 = _desc(sbase + OFF_K // 4, 512, HALF_BLK, prims.Tcgen05SmemSwizzle.SWIZZLE_128B)
-            else:
-                d_k_mn3 = _desc(sbase + OFF_K // 4, SLAB, BLK_SMEM, prims.Tcgen05SmemSwizzle.SWIZZLE_128B)
-            d_ds_mn3 = _desc(sbase + OFF_DS // 4, 384, 128, prims.Tcgen05SmemSwizzle.NONE)
-            gc = I32(0)
-            nq = I32(0)
-            for pp in cutlass.range(NP, unroll=1):
-                for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
-                    o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
-                    o0_1, nblk_1 = _pair_meta(p_sparse_pass_offsets, j, pp, nsq, PAIR)
-                    nblk, _, _ = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, I32(0))
-                    if nblk > 0:
-                        nchunks = (nblk + (CHB - 1)) // CHB
-                        for c in cutlass.range(nchunks, unroll=1):
-                            cgb = gc + c
-                            pb = cgb & 1
-                            kb = cgb % NKS
-                            nv3 = _chunk_valid(nblk, c)
-                            _wait(b_pf.subview(pb), (cgb >> 1) & 1)
-                            prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-                            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                            if c == 0:
-                                _wait(b_dqe, (nq & 1) ^ 1)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                            acc_q = c > 0
-                            dk_mn = d_k_mn3.advance_start_address(_koff(kb))
-                            if cutlass.const_expr(PAIR):
-                                nkk = nv3
-                            else:
-                                nkk = (nv3 + 1) >> 1
-                            for hh in cutlass.range_constexpr(2):
-                                for kk in cutlass.range(nkk, unroll=1):
-                                    if cutlass.const_expr(PAIR):
-                                        a_k = dk_mn.advance_start_address(hh * 2 * 512 + kk * BLK_SMEM)
-                                    else:
-                                        a_k = dk_mn.advance_start_address(hh * 2 * SLAB + kk * 2 * BLK_SMEM)
-                                    if prims.elect_sync():
-                                        prims.tcgen05_mma(
-                                            prims.Tcgen05MMAKind.F16,
-                                            prims.CTAGroup.CTA_1,
-                                            prims.make_tmem_ptr(tmem_raw + (TM_DQ + hh * 32), F32),
-                                            a_k,
-                                            d_ds_mn3.advance_start_address(kk * 768),
-                                            idesc_q3,
-                                            acc_q | (kk > 0),
-                                        )
-                            if prims.elect_sync():
-                                prims.tcgen05_commit(b_ke.subview(kb), group=prims.CTAGroup.CTA_1)
-                                prims.tcgen05_commit(b_dsf, group=prims.CTAGroup.CTA_1)
-                                if c == nchunks - 1:
-                                    prims.tcgen05_commit(b_dqf, group=prims.CTAGroup.CTA_1)
-                            prims.bar_warp_sync(0xFFFFFFFF)
-                        gc = gc + nchunks
-                        nq = nq + 1
-
-    elif wg == 1:
-        qd = warp % 4
-        row = qd * 32 + lane
-        if cutlass.const_expr(PAIR):
-            hrow = (lane >> 2) & 1
-            trow = lane & 3
-        else:
-            hrow = lane & 1
-            trow = (lane & 7) >> 1
-        jrow = row >> 3
-        c_s = scale * F32(LOG2E)
-        gc = I32(0)
-        nq = I32(0)
-        if cutlass.const_expr(PAIR):
-            ds_off = (OFF_DS + (2 * jrow + hrow) * 384 + trow * 16) // 4
-        else:
-            ds_off = (OFF_DS + jrow * 384 + (row & 7) * 16) // 4
-        for pp in cutlass.range(NP, unroll=1):
-            for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
-                o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
-                o0_1, nblk_1 = _pair_meta(p_sparse_pass_offsets, j, pp, nsq, PAIR)
-                if cutlass.const_expr(PAIR):
-                    nblk, o0, nblk_r = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, hrow)
-                else:
-                    nblk, o0, nblk_r = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, I32(0))
-                if nblk > 0:
-                    jr = j
-                    row_ok = jrow < CHB
-                    if cutlass.const_expr(PAIR):
-                        jr = j + hrow
-                        row_ok = row_ok & (jr < nsq)
-                        if jr >= nsq:
-                            jr = j
-                    qr = (p_sparse_queries + jr).load()
-                    h0 = I32(0)
-                    if cutlass.const_expr(not PAIR):
-                        h0 = hrow * GH
-                    lbase = qr * HQ + h0
-                    lo_q = (p_lo + qr).load()
-                    hi_q = (p_hi + qr).load()
-                    nchunks = (nblk + (CHB - 1)) // CHB
-                    prow_pp = p_sparse_block_slots + (jr * PART_W + o0)
-                    trow_pp = p_sparse_blocks + (jr * PART_W + o0)
-                    mpf = jrow
-                    if mpf >= nblk_r:
-                        mpf = I32(0)
-                    pnx = (prow_pp + mpf).load()
-                    tnx = (trow_pp + mpf).load()
-                    lse_v = _lse_rows(g_lse, qr, h0, GH)
-                    del_v = _delta_rows(p_delta, lbase, GH)
-                    zero12 = cutlass.Vector.from_elements([F32(0.0)] * GQ, F32)
-                    for c in cutlass.range(nchunks, unroll=1):
-                        cgc = gc + c
-                        st = cgc & 1
-                        _wait(b_sf.subview(cgc & 1), (cgc >> 1) & 1)
-                        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                        t_s = prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_S + (cgc & 1) * 64).as_ptr(F32)
-                        t_dp = prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_DP + (cgc & 1) * 64).as_ptr(F32)
-                        sv = prims.tcgen05_ld("32x32b", t_s, num=32)
-                        dpv = prims.tcgen05_ld("32x32b", t_dp, num=32)
-                        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                        prims.bar_warp_sync(0xFFFFFFFF)
-                        if prims.elect_sync():
-                            prims.mbarrier_arrive(b_sde.subview(cgc & 1))
-
-                        m = c * CHB + jrow
-                        valid = (m < nblk_r) & row_ok
-                        slot_ok = valid
-                        pcur = pnx
-                        tcur = tnx
-                        if c + 1 < nchunks:
-                            mpf = (c + 1) * CHB + jrow
-                            if mpf >= nblk_r:
-                                mpf = I32(0)
-                            pnx = (prow_pp + mpf).load()
-                            tnx = (trow_pp + mpf).load()
-                        tk = tcur + trow
-                        score_v = sv[0:GQ]
-                        dot_v = dpv[0:GQ]
-                        if hrow == 1:
-                            score_v = sv[GQ : 2 * GQ]
-                            dot_v = dpv[GQ : 2 * GQ]
-                        bad = valid & (~cute.math.isfinite(score_v[0]))
-                        if cute.arch.vote_any_sync(bad):
-                            if bad:
-                                st_k = cgc % NKS
-                                if cutlass.const_expr(PAIR):
-                                    krow = sbase + (OFF_K + _koff(st_k) + jrow * BLK_SMEM + hrow * HALF_BLK + trow * 128) // 4
-                                    for s4 in cutlass.range_constexpr(4):
-                                        for u in cutlass.range_constexpr(8):
-                                            (krow + (s4 * 512) // 4 + u * 4).store(zero4, alignment=16)
-                                else:
-                                    krow = sbase + (OFF_K + _koff(st_k) + jrow * BLK_SMEM + (2 * trow + hrow) * 128) // 4
-                                    for s4 in cutlass.range_constexpr(4):
-                                        for u in cutlass.range_constexpr(8):
-                                            (krow + (s4 * SLAB) // 4 + u * 4).store(zero4, alignment=16)
-                        valid = valid & (tk >= lo_q) & (tk <= hi_q)
-                        prob_v = zero12
-                        ds_v = zero12
-                        if valid:
-                            prob_v = cute.math.exp2(score_v * c_s - lse_v * F32(LOG2E), fastmath=True)
-                            ds_v = prob_v * (dot_v - del_v) * scale
-
-                        prw = prob_v.to(BF16).bitcast(I32)
-                        drw = ds_v.to(BF16).bitcast(I32)
-                        dwords = []
-                        for n in cutlass.range_constexpr(16):
-                            dv_ = I32(0)
-                            if cutlass.const_expr(n < 6):
-                                if hrow == 0:
-                                    dv_ = drw[n]
-                            elif cutlass.const_expr(n < 12):
-                                if hrow == 1:
-                                    dv_ = drw[n - 6]
-                            dwords.append(dv_)
-                        dvec = cutlass.Vector.from_elements(dwords, I32)
-
-                        _wait(b_dsf, (cgc & 1) ^ 1)
-                        if jrow < CHB:
-                            for nc in cutlass.range_constexpr(3):
-                                (sbase + ds_off + nc * 32).store(dvec[nc * 4 : nc * 4 + 4], alignment=16)
-                        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                        prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-                        prims.bar_warp_sync(0xFFFFFFFF)
-                        if prims.elect_sync():
-                            prims.mbarrier_arrive(b_pf.subview(st))
-                        if slot_ok:
-                            if cutlass.const_expr(PAIR):
-                                roff = cutlass.Int64(pcur) * REC_W + cutlass.Int64(trow * 6)
-                            else:
-                                roff = cutlass.Int64(pcur) * REC_W + cutlass.Int64(trow * 12 + hrow * 6)
-                            rbase = p_pair_records + roff
-                            for u in cutlass.range_constexpr(3):
-                                prims.store_ext(prw[2 * u : 2 * u + 2], rbase + 2 * u, cache_modifier=prims.StoreCacheModifier.CS)
-                                prims.store_ext(drw[2 * u : 2 * u + 2], rbase + REC_W // 2 + 2 * u, cache_modifier=prims.StoreCacheModifier.CS)
-
-                    _wait(b_dqf, nq & 1)
-                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                    dqv = []
-                    for hh in cutlass.range_constexpr(2):
-                        t_q = prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_DQ + hh * 32).as_ptr(F32)
-                        dqv.append(prims.tcgen05_ld("32x32b", t_q, num=32))
-                    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    prims.bar_warp_sync(0xFFFFFFFF)
-                    if prims.elect_sync():
-                        prims.mbarrier_arrive(b_dqe)
-                    for h in cutlass.range_constexpr(2 if PAIR else 1):
-                        o0_h = o0_0
-                        write_h = (p_sparse_pass_offsets + (j * POS + NP)).load() > 0
-                        if cutlass.const_expr(h == 1):
-                            o0_h = o0_1
-                            write_h = False
-                            if j + 1 < nsq:
-                                write_h = (p_sparse_pass_offsets + ((j + 1) * POS + NP)).load() > 0
-                        if write_h:
-                            qrow = (p_sparse_queries + (j + h)).load()
-                            for hh in cutlass.range_constexpr(2):
-                                dim = hh * 128 + qd * 32 + lane
-                                qb = p_dq + (qrow * (HQ * D) + dim)
-                                if o0_h == 0:
-                                    for n in cutlass.range_constexpr(GH if PAIR else HQ):
-                                        (qb + n * D).store(dqv[hh][h * GQ + n])
-                                else:
-                                    for n in cutlass.range_constexpr(GH if PAIR else HQ):
-                                        prims.red(
-                                            prims.ReductionOp.ADD,
-                                            prims.ReductionType.F32,
-                                            qb + n * D,
-                                            dqv[hh][h * GQ + n],
-                                            mem_order=prims.MemOrder.RELAXED,
-                                            mem_scope=prims.MemScope.GPU,
-                                            cache_hint=cutlass.Int64(L2_EVICT_FIRST),
-                                        )
-                    gc = gc + nchunks
-                    nq = nq + 1
-
-    else:
-        qd = warp % 4
-        hh = (warp - 8) >> 2
-        r = qd * 32 + lane
-        if cutlass.const_expr(PAIR):
-            yr = r & 3
-            roff = (OFF_K + (r >> 3) * BLK_SMEM + ((r >> 2) & 1) * HALF_BLK + yr * 128) // 4
-            slab_w = 512 // 4
-        else:
-            yr = r & 7
-            roff = (OFF_K + (r >> 3) * BLK_SMEM + yr * 128) // 4
-            slab_w = SLAB // 4
-        zw = []
-        for e in cutlass.range_constexpr(16):
-            zw.append(I32(0))
-        for zb in cutlass.range_constexpr(2):
-            for sl4 in cutlass.range_constexpr(4):
-                prims.tcgen05_st(
-                    "32x32b",
-                    prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KA + zb * 128 + sl4 * 32 + hh * 16).as_ptr(I32),
-                    cutlass.Vector.from_elements(zw, I32),
-                )
-        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-        gc = I32(0)
-        for pp in cutlass.range(NP, unroll=1):
-            for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
-                o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
-                o0_1, nblk_1 = _pair_meta(p_sparse_pass_offsets, j, pp, nsq, PAIR)
-                nblk, _, _ = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, I32(0))
-                if nblk > 0:
-                    nchunks = (nblk + (CHB - 1)) // CHB
-                    for c in cutlass.range(nchunks, unroll=1):
-                        cgc = gc + c
-                        st = cgc % NKS
-                        nval_c = _chunk_valid(nblk, c)
-                        do_cp = qd * 4 < nval_c
-                        _wait(b_kf.subview(st), (cgc // NKS) & 1)
-                        _wait(b_kte, (cgc & 1) ^ 1)
-                        for sl4 in cutlass.range_constexpr(4):
-                            ys = yr
-                            if cutlass.const_expr(PAIR and sl4 % 2 == 1):
-                                ys = yr + 4
-                            if do_cp:
-                                off = roff + _koff(st) // 4 + sl4 * slab_w
-                                wv = []
-                                for i4 in cutlass.range_constexpr(4):
-                                    cc = hh * 4 + i4
-                                    v4 = (sbase + (off + ((ys ^ cc) * 4))).load(count=4, alignment=16)
-                                    for e in cutlass.range_constexpr(4):
-                                        wv.append(v4[e])
-                                prims.tcgen05_st(
-                                    "32x32b",
-                                    prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KA + sl4 * 32 + hh * 16).as_ptr(I32),
-                                    cutlass.Vector.from_elements(wv, I32),
-                                )
-                            if cutlass.const_expr(sl4 == 0):
-                                if do_cp:
-                                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                                prims.bar_warp_sync(0xFFFFFFFF)
-                                if prims.elect_sync():
-                                    prims.mbarrier_arrive(b_ktf.subview(0))
-                            elif cutlass.const_expr(sl4 == 3):
-                                if do_cp:
-                                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                                prims.bar_warp_sync(0xFFFFFFFF)
-                                if prims.elect_sync():
-                                    prims.mbarrier_arrive(b_ktf.subview(1))
-                        _wait(b_vf, cgc & 1)
-                        _wait(b_vte, (cgc & 1) ^ 1)
-                        vb = sbase + (roff - OFF_K // 4 + OFF_V // 4)
-                        for sl4 in cutlass.range_constexpr(4):
-                            ys = yr
-                            if cutlass.const_expr(PAIR and sl4 % 2 == 1):
-                                ys = yr + 4
-                            if do_cp:
-                                wv = []
-                                for i4 in cutlass.range_constexpr(4):
-                                    cc = hh * 4 + i4
-                                    v4 = (vb + (sl4 * slab_w + ((ys ^ cc) * 4))).load(count=4, alignment=16)
-                                    for e in cutlass.range_constexpr(4):
-                                        wv.append(v4[e])
-                                prims.tcgen05_st(
-                                    "32x32b",
-                                    prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_VA + sl4 * 32 + hh * 16).as_ptr(I32),
-                                    cutlass.Vector.from_elements(wv, I32),
-                                )
-                            if cutlass.const_expr(sl4 == 0):
-                                if do_cp:
-                                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                                prims.bar_warp_sync(0xFFFFFFFF)
-                                if prims.elect_sync():
-                                    prims.mbarrier_arrive(b_vtf.subview(0))
-                            elif cutlass.const_expr(sl4 == 3):
-                                if do_cp:
-                                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                                prims.bar_warp_sync(0xFFFFFFFF)
-                                if prims.elect_sync():
-                                    prims.mbarrier_arrive(b_vtf.subview(1))
-                        if prims.elect_sync():
-                            prims.mbarrier_arrive(b_ve)
-                    gc = gc + nchunks
-
-    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-    prims.barrier_cta_sync(0)
-    if warp == 2:
-        prims.tcgen05_dealloc(prims.make_tmem_ptr(tmem_raw, F32), TM_COLS, group="cta_1")
-
-
-qsa_bwd_sparse_query_sm107_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-
-
-@cute.jit
-def _sparse_query_host(
-    q: cute.Tensor,
-    k: cute.Tensor,
-    v: cute.Tensor,
-    do: cute.Tensor,
-    lse: cute.Tensor,
-    delta: cute.Tensor,
-    dq: cute.Tensor,
-    sparse_blocks: cute.Tensor,
-    sparse_pass_offsets: cute.Tensor,
-    sparse_block_slots: cute.Tensor,
-    pair_records: cute.Tensor,
-    sparse_queries: cute.Tensor,
-    lo: cute.Tensor,
-    hi: cute.Tensor,
-    sparse_count: cute.Tensor,
-    nctas: I32,
-    NP: I32,
-    scale: F32,
-    HKV: cutlass.Constexpr[int],
-    GH: cutlass.Constexpr[int],
-    stream: cuda_driver.CUstream,
-):
-    T = q.shape[0]
-    qbox = (1, GH * HKV, 64)
-    tma_q = cuda.create_tensor_map_tiled_from_view(q, box_dims=qbox, stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
-    tma_do = cuda.create_tensor_map_tiled_from_view(do, box_dims=qbox, stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
-    if cutlass.const_expr(HKV == 1):
-        kv_layout = cute.make_layout((T, 4, 64), stride=(D, 64, 1))
-        kv_box = (4, 4, 64)
-        kv_order = (2, 0, 1)
-    else:
-        kv_layout = cute.make_layout((T, HKV, 4, 64), stride=(HKV * D, D, 64, 1))
-        kv_box = (4, HKV, 4, 64)
-        kv_order = (3, 1, 0, 2)
-    tma_k = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(k.iterator, kv_layout), box_dims=kv_box, stride_order=kv_order, swizzle=cuda.TensorMapSwizzle.s128b
-    )
-    tma_v = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(v.iterator, kv_layout), box_dims=kv_box, stride_order=kv_order, swizzle=cuda.TensorMapSwizzle.s128b
-    )
-    qsa_bwd_sparse_query_sm107_kernel(
-        tma_q,
-        tma_do,
-        tma_k,
-        tma_v,
-        lse,
-        delta,
-        dq,
-        sparse_blocks,
-        sparse_pass_offsets,
-        sparse_block_slots,
-        pair_records,
-        sparse_queries,
-        lo,
-        hi,
-        sparse_count,
-        nctas,
-        NP,
-        scale,
-        HKV,
-        GH,
-    ).launch(grid=(nctas, 1, 1), block=(NTHREADS, 1, 1), stream=stream)
 
 
 class _PbLayout(_PbLayout100):
@@ -1046,7 +277,6 @@ def qsa_bwd_sparse_key_sm107_kernel(
             n_nx = (p_key_pair_counts + k_nx).load()
         for i in cutlass.range(bid, Ktot, nctas, unroll=1):
             n = n_nx
-            w = k_nx
             if i + nctas < Ktot:
                 k_nx = _active_key(p_active, n0, KR, i + nctas)
                 n_nx = (p_key_pair_counts + k_nx).load()
@@ -1175,7 +405,6 @@ def qsa_bwd_sparse_key_sm107_kernel(
             n_nx = (p_key_pair_counts + k_nx).load()
         for i in cutlass.range(bid, Ktot, nctas, unroll=1):
             n = n_nx
-            w = k_nx
             if i + nctas < Ktot:
                 k_nx = _active_key(p_active, n0, KR, i + nctas)
                 n_nx = (p_key_pair_counts + k_nx).load()
@@ -1441,6 +670,8 @@ def qsa_bwd_dense_pair_sm107_kernel(
         tmem_slot = cutlass.Array(I32, 1, space=cutlass.AddressSpace.smem, alignment=4)
         if cutlass.const_expr(DET):
             kv_order = cutlass.Array(I32, DP_KV_ORDER, space=cutlass.AddressSpace.smem, alignment=16)
+            b_stg = cutlass.Array(cutlass.Int64, _dq_issuers(GH), space=cutlass.AddressSpace.smem, alignment=8)
+            b_stf = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
 
         sbase = smem.data_ptr()
         if cutlass.const_expr(GH < GQ):
@@ -1451,6 +682,10 @@ def qsa_bwd_dense_pair_sm107_kernel(
             if prims.elect_sync():
                 if cutlass.const_expr(DET):
                     _kv_order(kv_order.data_ptr(), band, tile, hk, rank, pr, g_lo, t_lo, ntiles, HKV)
+                    for s in cutlass.range_constexpr(_dq_issuers(GH)):
+                        prims.mbarrier_init(b_stg.subview(s), 4)
+                    for s in cutlass.range_constexpr(2):
+                        prims.mbarrier_init(b_stf.subview(s), 1)
                 prims.prefetch_tensormap(tma_kd.get_ptr())
                 prims.prefetch_tensormap(tma_qd.get_ptr())
                 prims.prefetch_tensormap(tma_dod.get_ptr())
@@ -1496,6 +731,16 @@ def qsa_bwd_dense_pair_sm107_kernel(
         p_dense_dv_acc = g_dense_dv_acc.iterator.raw_ptr()
         p_k = g_k.iterator.raw_ptr()
         p_v = g_v.iterator.raw_ptr()
+
+        if cutlass.const_expr(DET):
+            par = I32(-1)
+            if warp == 2:
+                par = I32(0)
+            if warp >= DP_THREADS // 32:
+                par = warp - (DP_THREADS // 32 - 1)
+                warp = I32(2)
+            if (par >= 0) & (lane == 0):
+                _dq_issue(tma_dq, p_sync, sbase, b_stg, b_stf, par, rank, hk, pr, tile, nk, g_top, n_lo, n_top, Ut, nparts, ntiles, HKV, GH)
 
         if warp == 0:
             if prims.elect_sync():
@@ -1700,7 +945,6 @@ def qsa_bwd_dense_pair_sm107_kernel(
                     sw_j, bq_j = _dense_sel(p_dense_block_bitmap, p_seq_start, qc, tok, NW)
                     sw_n.append(sw_j)
                     bq_n.append(bq_j)
-                    ab = qc * HQ + hk * GH
                     av_n.append(_lse_rows(g_lse, qc, hk * GH, GH))
                 for k in cutlass.range(nk, unroll=1):
                     g = g_top - 1 - _rot(k, off, nk)
@@ -1721,7 +965,6 @@ def qsa_bwd_dense_pair_sm107_kernel(
                         sw_j, bq_j = _dense_sel(p_dense_block_bitmap, p_seq_start, qc, tok, NW)
                         sw_n.append(sw_j)
                         bq_n.append(bq_j)
-                        ab = qc * HQ + hk * GH
                         av_n.append(_lse_rows(g_lse, qc, hk * GH, GH))
                     _wait(b_sf, k & 1)
                     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -1932,9 +1175,7 @@ def qsa_bwd_dense_pair_sm107_kernel(
             stg0 = sbase + (DP_OFF_ST + qd * DP_ST_W) // 4
             stg1 = sbase + (DP_OFF_DS + qd * DP_ST_W) // 4
             if cutlass.const_expr(DET):
-                dq_slot = rank * 16 + DP_SYNC_DQ + qd
-                nb_seen = I32(-1)
-                np_seen = I32(0)
+                stg1 = stg1 + rank * (DP_CM // 4)
             for k in cutlass.range(nk, unroll=1):
                 g = g_top - 1 - _rot(k, off, nk)
                 _wait(b_dqf, k & 1)
@@ -1947,7 +1188,12 @@ def qsa_bwd_dense_pair_sm107_kernel(
                 if prims.elect_sync():
                     prims.mbarrier_arrive(b_dqe)
                 stg = stg0
-                if rank == 0:
+                if cutlass.const_expr(DET):
+                    if (k & 1) == 1:
+                        stg = stg1
+                    if k >= 2:
+                        _wait(b_stf.subview(k & 1), ((k >> 1) - 1) & 1)
+                elif rank == 0:
                     if (k & 1) == 1:
                         stg = stg1
                     prims.cp_async_bulk_wait_group(1, read=True)
@@ -1962,9 +1208,10 @@ def qsa_bwd_dense_pair_sm107_kernel(
                     (stg + n * 32 + lane).store(prims.mov_b32(val, target_type=I32))
                 prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
                 prims.bar_warp_sync(0xFFFFFFFF)
-                if lane == 0:
-                    if cutlass.const_expr(DET):
-                        nb_seen, np_seen = _dq_turn(p_sync, dq_slot, g, n_lo, n_top, Ut, nparts, tile, hk, pr, nb_seen, np_seen, ntiles, HKV)
+                if cutlass.const_expr(DET):
+                    if prims.elect_sync():
+                        prims.mbarrier_arrive(b_stg.subview(k % _dq_issuers(GH)))
+                elif lane == 0:
                     if cutlass.const_expr(GH == GQ):
                         prims.cp_async_bulk_tensor_reduce(tma_dq.get_ptr(), stg, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GQ, g * DP_G])
                     else:
@@ -1972,9 +1219,8 @@ def qsa_bwd_dense_pair_sm107_kernel(
                             prims.cp_async_bulk_tensor_reduce(
                                 tma_dq.get_ptr(), stg + qq * GQ * 32, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GH, g * DP_G + qq]
                             )
-                prims.cp_async_bulk_commit_group()
-                if cutlass.const_expr(DET):
-                    _dq_done(p_sync, pr, dq_slot, k, lane)
+                if cutlass.const_expr(not DET):
+                    prims.cp_async_bulk_commit_group()
             prims.cp_async_bulk_wait_group(0)
 
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -2075,4 +1321,10 @@ def _dpair_host(
         HKV,
         GH,
         DET,
-    ).launch(grid=(nparts * ntiles * 2 * HKV, 1, 1), block=(DP_THREADS, 1, 1), cluster=(2, 1, 1), stream=stream, use_pdl=(PDL == 1))
+    ).launch(
+        grid=(nparts * ntiles * 2 * HKV, 1, 1),
+        block=(DP_THREADS + 32 * (_dq_issuers(GH) - 1) * DET, 1, 1),
+        cluster=(2, 1, 1),
+        stream=stream,
+        use_pdl=(PDL == 1),
+    )

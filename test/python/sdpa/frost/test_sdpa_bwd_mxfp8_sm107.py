@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The Rubin (SM 10.7) MXFP8 d=256 SDPA backward: the KERNEL BODY ``sdpa/bwd/kernels/sm107/bprop_d256_mxfp8.py`` (static +
+"""The Rubin (SM 10.7) MXFP8 d=256 SDPA backward: the KERNEL BODY ``sdpa/bwd/kernels/sm107/d256_mxfp8/kernel.py`` (static +
 sm_107a SASS pins) and the ENGINE ROW ``sdpa_bwd_sm107_mxfp8`` (registration, the row's ``mismatch()`` on real graphs, the Rubin
 accept matrix against ``sdpa.mxfp8_ref.compute_ref_backward``, ``quantize_ds=False`` for the bf16-dS chain and ``True`` for the
 block-scaled one).
@@ -110,8 +110,8 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
         monkeypatch.setattr(prepared_sm107, "_sm", lambda api: 107)
 
 
-_KERNEL_FILE = "sm107/bprop_d256_mxfp8.py"
-_FP8_FILE = "sm107/bprop_d256_fp8.py"
+_KERNEL_FILE = "sm107/d256_mxfp8/kernel.py"
+_FP8_FILE = "sm107/d256_fp8/kernel.py"
 _TAG = "sdpa_bwd_sm107_main_mxfp8"
 _ENGINE = "sdpa_bwd_sm107_mxfp8"
 _FAMILY_NAME = "frost_sdpa_bwd"
@@ -119,7 +119,7 @@ _SLOT = 6  # engines/manifest.py: EngineSlot(6, opt_in=True) -> FROST_SDPA_BWD_I
 _ENGINE_ID = 20_606
 _D = 256
 _RUBIN_CC = (10, 7)
-_SM_RANGE = (107, 119)
+_SM_RANGE = (107, 109)
 # dV: the fp8 suite's tolerance recipe (test_sdpa_bwd_fp8_sm107.py::_FP8_GRAD_TOL): within atol 0.08 / rtol 0.2 of the oracle under
 # assert_close_fp8_grad's midpoint-flip budget.  dK / dQ: the bf16 row's recipe (test_sdpa_bwd_dsl_sm107.py::_TOL[bf16]), no flip
 # budget -- P-c's dK / dQ see no fp8 rounding.  ONE place each; never widened (report the magnitude instead).
@@ -709,7 +709,7 @@ _SASS_PROBE = textwrap.dedent(r"""
         "pb_dense_fmul": dict(ds_sf_policy=DS_SF_P_B, scaled_fp8_pack=False),
         "pb_causal_fused": dict(ds_sf_policy=DS_SF_P_B, scaled_fp8_pack=True, window_right=0),
     }
-    mod = load_template(_sm100_kernel_path("sm107/bprop_d256_mxfp8.py"), TemplateParams(dtype_qkv=DTYPE_E4M3, **ARMS[arm]), tag="sdpa_bwd_sm107_main_mxfp8")
+    mod = load_template(_sm100_kernel_path("sm107/d256_mxfp8/kernel.py"), TemplateParams(dtype_qkv=DTYPE_E4M3, **ARMS[arm]), tag="sdpa_bwd_sm107_main_mxfp8")
     p_packs = (mod._SMX_CHUNK // mod._P_PACK) * 8  # scaled cvts per lane per iteration on the P path (8 per 16-pack)
     dk_packs = (mod._SMX_CHUNK // mod._DS_PACK) * 8 * int(mod._IS_P_B)  # the same 16-pack shape for the ds_dk payload
     dq_cvts = mod._SMX_CHUNK * int(mod._IS_P_B)  # ds_dq: one LONE scaled cvt per element (its column's byte), fp32_to_fp8x4_scaled_pairs
@@ -1138,15 +1138,18 @@ def _decline_reason(monkeypatch, engine=_ENGINE, cc=_RUBIN_CC, **kw):
     return mismatch(spec.capabilities, facts)
 
 
-def test_row_is_registered_and_opt_in():
+def test_row_is_registered_and_offered_by_default():
     from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
     from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.bwd.heuristics import TRAIL_ONLY_ROWS
 
     _spec()
     fam = next(f for f in MANIFEST if f.name == _FAMILY_NAME)
     assert _ENGINE in fam.slots, f"{_ENGINE} has no manifest slot (append slot {_SLOT}; never reuse or renumber)"
     slot = fam.slots[_ENGINE]
-    assert slot.slot == _SLOT and slot.opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # Default since 2026-11-16, behind the backend (cudnn.sdpa.bwd.heuristics.TRAIL_ONLY_ROWS).
+    assert slot.slot == _SLOT and not slot.opt_in
+    assert _ENGINE in TRAIL_ONLY_ROWS
     assert FROST_SDPA_BWD_ID_BASE + slot.slot == _ENGINE_ID
     # The slot is appended: the sibling rows keep theirs.
     assert fam.slots["sdpa_bwd_sm107"].slot == 4 and fam.slots["sdpa_bwd_sm107_fp8"].slot == 5
@@ -1340,16 +1343,16 @@ def test_reject_missing_sm107a_dsl_target_before_compile(monkeypatch, dsl_versio
     """AGENTS.md Rule 7 (review 2026-09-30): a cc 10.7 box on a DSL that does not know ``sm_107a`` (4.7.x is above FROST's floor
     yet below Rubin's need) gets a TYPED decline at eligibility from every sm107 backward row -- never ``KeyError: 'sm_107a'``
     out of ``Arch.from_string`` inside the template compile after the plan is ranked (fwd/engines.py has had this gate; the
-    bwd copy lacked it).  The SM100 MXFP8 row on a cc 10.0 device is untouched."""
+    bwd copy lacked it).  The SM100 D256 MXFP8 engine, which owns this graph on a cc 10.0 device, is untouched."""
     from cudnn.frost import buffers
 
     dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, (dist, dsl_version)))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
-    for engine in (_ENGINE, "sdpa_bwd_sm107", "sdpa_bwd_sm107_fp8"):
+    for engine in (_ENGINE, "sdpa_bwd_sm107_d256_f16_4x1", "sdpa_bwd_sm107_fp8"):
         reason = _decline_reason(monkeypatch, engine=engine)
         assert reason is not None and "sm_107a" in reason and dsl_version in reason, (engine, reason)
-    assert _decline_reason(monkeypatch, engine="sdpa_bwd_sm100_mxfp8", cc=(10, 0)) is None
+    assert _decline_reason(monkeypatch, engine="sdpa_bwd_sm100_d256_mxfp8", cc=(10, 0)) is None
 
 
 def _facts_of_served_graph(monkeypatch):
@@ -1822,6 +1825,7 @@ def _run_mxfp8(
     k_mult=1.0,
     repeat_outputs=0,
     frost_forward=False,
+    record=None,
 ):
     """Quantize bf16-rounded unit-normal operands (rowwise + columnwise, the producer's F8_128x4 SF), compute the forward in torch over
     the DEQUANTIZED operands under the graph's mask (natural-log LSE = the graph's Stats, O -> o_f16), build the graph, PIN the engine,
@@ -1878,7 +1882,7 @@ def _run_mxfp8(
     dO_f16 = do32.permute(0, 2, 1, 3).contiguous().to(bf16)
     lse_exact = lse
     if frost_forward:
-        # The FROST d256 MXFP8 forward (sm107/prefill_d256_mxfp8.py through the SM100-named adapter, as test_sdpa_fwd_dsl_sm107 drives
+        # The FROST d256 MXFP8 forward (sm107/d256_mxfp8_single_q/kernel.py through the SM100-named adapter, as test_sdpa_fwd_dsl_sm107 drives
         # it) on the SAME rowwise q / k and columnwise v payloads: its Stats must be the exact fp32 log-sum-exp (sdpa-invariants s4,
         # within 1e-4 of the dequantized-input value) and its O the o_f16 this row folds delta from.
         from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -1912,8 +1916,12 @@ def _run_mxfp8(
         o_f16 = out.contiguous()  # [B, H, S_q, D]
 
     g, t, (dq_t, dk_t, dv_t, *_amax) = _mxfp8_graph(b, hq, hkv, sq, skv, causal=causal, bottom_right=bottom_right, left_bound=window, scale=scale)
-    g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, _ENGINE)
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+        select_engine(g, _ENGINE)
+    else:
+        g.create_execution_plan(*record)
+        g.select_plan(0)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -2583,19 +2591,20 @@ def test_stage3_block_scale_dq_single_launch_is_bitwise_the_per_member_launches(
 
 
 @requires_rubin
-def test_graph_routes_to_the_row_when_opted_in_and_declines_typed_otherwise(monkeypatch):
-    """The d256 ``sdpa_mxfp8_backward`` graph on cc 10.7 lists THIS row (bracket-form name) and no other; with FROST opted out the
-    graph is admitted at validate / build and ``create_execution_plans`` raises the typed ``cudnnGraphNotSupportedError`` -- cuDNN
-    9.27 has no MXFP8 d=256 backward kernel on smVersion 1070 (verified 2026-09-29), so the row is the sole provider."""
-    g, _t, _outs = _mxfp8_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    assert any(n == _ENGINE or n.startswith(_ENGINE + "[") for n in names), names
-    assert not any(n.startswith("sdpa_bwd_sm100_mxfp8") for n in names), names
-    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
-    g2, _t, _outs = _mxfp8_graph()
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        g2.create_execution_plans([cudnn.heur_mode.A])
+def test_graph_routes_to_the_row_with_or_without_the_flag(monkeypatch):
+    """The d256 ``sdpa_mxfp8_backward`` graph on cc 10.7 lists THIS row (bracket-form name) and no other, with or without the opt-in
+    flag: cuDNN 9.27 has no MXFP8 d=256 backward kernel on smVersion 1070 (verified 2026-09-29), so the row is the sole provider and is
+    offered by default, behind the backend (#2637)."""
+    for flag in ("1", None):
+        if flag is None:
+            monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        else:
+            monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", flag)
+        g, _t, _outs = _mxfp8_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+        names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+        assert any(n == _ENGINE or n.startswith(_ENGINE + "[") for n in names), (flag, names)
+        assert not any(n.startswith(("sdpa_bwd_sm100_mxfp8", "sdpa_bwd_sm100_d256_mxfp8")) for n in names), (flag, names)
 
 
 @requires_rubin

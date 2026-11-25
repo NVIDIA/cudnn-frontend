@@ -64,8 +64,9 @@ extensions decline those graph plans. Graph plans compute `delta` internally. Se
 Sequence lengths and THD below for the packed contract.
 
 The kernels live in `python/cudnn/sdpa/bwd/kernels/sm107/`
-(`bprop_d256_f16.py`, `bprop_d256_fp8.py`, `bprop_d256_mxfp8.py`; config
-`bwd/config_sm107.py`), the adapters in `python/cudnn/sdpa/bwd/api_dsl_sm107.py`,
+(`d256_f16_4x1/kernel.py`, `d256_fp8/kernel.py`,
+`d256_mxfp8/kernel.py`). Shared configuration lives in
+`python/cudnn/sdpa/bwd/config_sm107.py`, the adapters in `python/cudnn/sdpa/bwd/api_dsl_sm107.py`,
 and the rest of the launch chain is shared with the other Blackwell-line backward
 engines (`kernels/bprop_matmul_blackwell.py`, `kernels/bprop_chain_common.py`).
 
@@ -220,7 +221,7 @@ each way). Rubin's 576 TMEM columns and 327 KiB SMEM
 carveout are what let dV stay resident at d = 256 — the SM100 d512 backward is
 a different, three-stage shape.
 
-### The 2x2-datapath body (`kernels/bprop_d256_2x2_f16.py`; the SM100 row, and the Rubin twin)
+### The 2x2-datapath body (`kernels/sm100/d256_f16_2x2/kernel.py`; the SM100 row, and the Rubin twin)
 
 The same chain has a second main kernel on the **2x2 tcgen05 datapath**:
 `tcgen05.mma.cta_group::2` with the collective M = 128, i.e. 64 kv rows per CTA
@@ -267,7 +268,7 @@ D512 BPROP entry in the FROST support tracker](https://github.com/NVIDIA/cudnn-f
 that writes `S` and `dS` to `[B, H_chunk, S_q, S_kv]` GMEM workspaces (heads
 chunked to a 4 GiB budget) -> `dV = Sᵀ·dO`, `dK = dSᵀ·Q`, `dQ = dS·K` as the
 `bprop_matmul_blackwell` GEMMs at the (512, 512) cluster tile -> the GQA fold --
-with stage 2 ALWAYS the **2x2-datapath** body `kernels/sm107/bprop_d512_f16_2x2.py`
+with stage 2 ALWAYS the **2x2-datapath** body `kernels/sm107/d512_f16_2x2/kernel.py`
 at the cc 10.7 ring arm: two independent `tcgen05.mma.cta_group::2` pairs per
 (4,1,1) cluster, 64 q rows per CTA, both BMMs (`Q·Kᵀ`, `dO·Vᵀ`) as SMEM SS
 operands with d streamed in 64-column chunks, an **8-stage K/V chunk ring** (the
@@ -522,7 +523,7 @@ E4M3 `q / k / v / dO` plus the transposed-quantization payloads `q_T / k_T / dO_
 fp32 `stats`, and the seven `F8_128x4`-reordered E8M0 scale tensors
 (`descale_q / q_T / k / k_T / v / dO / dO_T`; `descale_v` is the **rowwise** V
 scale, as in the C++ node's own reference math) — with `dQ / dK / dV` declared
-bf16. **One kernel plus scale-factor plumbing** (`sm107/bprop_d256_mxfp8.py`, the
+bf16. **One kernel plus scale-factor plumbing** (`sm107/d256_mxfp8/kernel.py`, the
 fp8 body's pipeline): the scale factors ride their operands' TMA barriers into
 TMEM and dequantize inside every tcgen05 block-scale MMA, so `S` and `dP` are in
 TRUE units; `P` is recomputed from the exact fp32 Stats and quantized to E4M3

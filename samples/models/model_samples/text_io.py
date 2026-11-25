@@ -17,6 +17,11 @@ messages, tool schemas and tool results are all text by the time they are encode
 tokenizer encodes the rendered prompt as it is (the template writes the special tokens itself), whole and unpadded
 whatever truncation or padding the ``tokenizer.json`` was saved with.  Text comes back through
 the library's incremental decoder, one per sequence, with special tokens left out.
+
+A chat request is read here for what a chat template is given -- messages, tool schemas, template options
+(``chat_request``, ``load_messages``).  What else a request body carries is not the helper layer's to read: a sample that
+accepts the request body of a chat client parses it beside its script.  ``TextIO.generation_defaults`` holds the
+sampling settings of the checkpoint's ``generation_config.json`` as they stand there; nothing here applies them.
 """
 
 from __future__ import annotations
@@ -30,6 +35,8 @@ from typing import Optional, Sequence
 import torch
 
 REQUIREMENTS = "samples/models/requirements.txt"
+#: the entries of a checkpoint's ``generation_config.json`` that say how its tokens are meant to be chosen
+SAMPLING_SETTINGS = ("do_sample", "temperature", "top_k", "top_p", "min_p", "repetition_penalty")
 
 
 class TextStream:
@@ -73,33 +80,46 @@ class LibraryStream:
         return full[len(pushed) :] if full.startswith(pushed) else ""
 
 
+def read_json(path: str, shown: str):
+    """The JSON value of a file.  A file that cannot be read or is not JSON is a ``ValueError`` that starts with ``shown``
+    (the flag and the file's own name, never its path)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except OSError as error:
+        raise ValueError(f"{shown}: cannot be read ({error.strerror or type(error).__name__})") from None
+    except ValueError as error:  # not JSON, or not UTF-8
+        raise ValueError(f"{shown}: not a JSON file ({error})") from None
+
+
+def chat_request(body, shown: str) -> tuple:
+    """What a chat template is given, out of a parsed chat request: ``(messages, tools, template options)``.  ``body`` is a
+    list of messages, or an object with ``messages`` and optionally ``tools`` (JSON tool schemas) and
+    ``chat_template_kwargs`` (options the checkpoint's template understands); what an object holds beyond these three is
+    not read here.  Another shape is a ``ValueError`` that starts with ``shown``."""
+    if isinstance(body, list):
+        body = {"messages": body}
+    messages = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(messages, list) or not messages or not all(isinstance(m, dict) and "role" in m for m in messages):
+        raise ValueError(f'{shown}: needs a list of messages, or an object with "messages"; every message has a "role"')
+    tools, options = body.get("tools"), body.get("chat_template_kwargs") or {}
+    if tools is not None and not isinstance(tools, list):
+        raise ValueError(f'{shown}: "tools" is a list of JSON tool schemas')
+    if not isinstance(options, dict):
+        raise ValueError(f'{shown}: "chat_template_kwargs" is an object')
+    own = sorted(set(options) & {"messages", "tools"})
+    if own:
+        raise ValueError(f'{shown}: "chat_template_kwargs" may not hold {" or ".join(own)}; each has its own entry in the file')
+    return messages, tools, options
+
+
 def load_messages(path: str) -> tuple:
     """A chat request from a JSON file: ``(messages, tools, template options)``.  The file holds a list of messages, or an
     object with ``messages`` and optionally ``tools`` (JSON tool schemas) and ``chat_template_kwargs`` (options the
     checkpoint's template understands).  A file that cannot be read, is not JSON or has another shape is a ``ValueError``
     that names the file by its own name, never by its path."""
-    shown = os.path.basename(path)
-    try:
-        with open(path, encoding="utf-8") as f:
-            body = json.load(f)
-    except OSError as error:
-        raise ValueError(f"--messages {shown}: cannot be read ({error.strerror or type(error).__name__})") from None
-    except ValueError as error:  # not JSON, or not UTF-8
-        raise ValueError(f"--messages {shown}: not a JSON file ({error})") from None
-    if isinstance(body, list):
-        body = {"messages": body}
-    messages = body.get("messages") if isinstance(body, dict) else None
-    if not isinstance(messages, list) or not messages or not all(isinstance(m, dict) and "role" in m for m in messages):
-        raise ValueError(f'--messages {shown}: needs a list of messages, or an object with "messages"; every message has a "role"')
-    tools, options = body.get("tools"), body.get("chat_template_kwargs") or {}
-    if tools is not None and not isinstance(tools, list):
-        raise ValueError(f'--messages {shown}: "tools" is a list of JSON tool schemas')
-    if not isinstance(options, dict):
-        raise ValueError(f'--messages {shown}: "chat_template_kwargs" is an object')
-    own = sorted(set(options) & {"messages", "tools"})
-    if own:
-        raise ValueError(f'--messages {shown}: "chat_template_kwargs" may not hold {" or ".join(own)}; each has its own entry in the file')
-    return messages, tools, options
+    shown = f"--messages {os.path.basename(path)}"
+    return chat_request(read_json(path, shown), shown)
 
 
 class TextIO:
@@ -113,6 +133,7 @@ class TextIO:
         self._tokenizer = None  # a tokenizers.Tokenizer for a checkpoint
         self._template = None  # its compiled chat template
         self._template_tokens: dict = {}  # the special-token strings a template may name (bos_token, eos_token, ...)
+        self.generation_defaults: dict = {}  # a checkpoint's own sampling settings, as its generation_config.json has them
 
     @property
     def vocab_size(self) -> int:
@@ -218,6 +239,7 @@ class TextIO:
             f"tokenizer and chat template of checkpoint {shown} (tokenizers {tokenizers.__version__}, jinja2 {jinja2.__version__})",
         )
         self.synthetic_text, self._tokenizer, self._template = False, tokenizer, template
+        self.generation_defaults = {name: generation[name] for name in SAMPLING_SETTINGS if generation.get(name) is not None}
         for key, value in settings.items():  # the special tokens a template may refer to by name
             if key.endswith("_token") and isinstance(value, dict):
                 value = value.get("content")

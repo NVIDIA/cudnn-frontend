@@ -109,11 +109,10 @@ static constexpr RmsNormSiluKnobs knob_lut[kNumC][kNumTokens][kNumDtypes] = {
 };
 
 // Compute conservative default knobs for arbitrary problem sizes not in the LUT.
-// Uses safe defaults (WARPS_M=1, BPL=4, occupancy=1) and validates vectorization
-// divisibility constraints before accepting a configuration.
+// Validates vectorization and token divisibility before accepting a configuration.
 // Returns true if a valid configuration was found, false otherwise.
 inline bool
-compute_default_knobs(int C, int num_tokens, RmsNormSiluDtype dtype, RmsNormSiluKnobs& out) {
+compute_default_knobs(int C, int num_tokens, RmsNormSiluDtype dtype, RmsNormSiluKnobs& out, int sm_version = 100) {
     // Conservative defaults:
     //   CTAS_PER_ROW = 1, WARPS_M = 1, WARPS_N = 1, BPL = 4, occupancy = 1, kernel_cfg = 0
     // For block-scale output (NVFP4): WARPS_M = 32
@@ -122,6 +121,11 @@ compute_default_knobs(int C, int num_tokens, RmsNormSiluDtype dtype, RmsNormSilu
 
     // Start with conservative defaults
     int warps_m = (dtype == RmsNormSiluDtype::NVFP4) ? 32 : 1;
+    // On Ada, grouping four rows per CTA improves the measured BF16 and FP8 fallback shapes.
+    if (sm_version == 89 && (dtype == RmsNormSiluDtype::BF16 || dtype == RmsNormSiluDtype::FP8) && C >= 96 &&
+        C <= 1024 && num_tokens >= 1024 && num_tokens % 4 == 0) {
+        warps_m = 4;
+    }
     int warps_n = 1;  // always 1 for our engine
     int bpl     = 4;  // default bytes per load
     int cpr     = 1;  // no column splitting for fallback
@@ -209,7 +213,7 @@ lookup_rms_norm_silu_knobs(int C, int num_tokens, RmsNormSiluDtype dtype, int sm
 
     // Tier 2: fallback heuristic for non-SM100 archs or non-LUT problem sizes
     static thread_local RmsNormSiluKnobs fallback;
-    if (compute_default_knobs(C, num_tokens, dtype, fallback)) {
+    if (compute_default_knobs(C, num_tokens, dtype, fallback, sm_version)) {
         return &fallback;
     }
 

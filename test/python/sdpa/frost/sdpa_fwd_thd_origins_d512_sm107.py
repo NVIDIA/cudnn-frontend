@@ -26,7 +26,7 @@ def _configure(monkeypatch, two_by_two):
 @pytest.mark.parametrize("two_by_two", [False, True], ids=["role-split", "2x2"])
 def test_shared_physical_origins(monkeypatch, two_by_two, request, cudnn_handle):
     _configure(monkeypatch, two_by_two)
-    _check_native_origins("float16", 512, request, cudnn_handle, engine="sdpa_fwd_prefill_sm107")
+    _check_native_origins("float16", 512, request, cudnn_handle, engine="sdpa_fwd_sm107_d512_2x2" if two_by_two else "sdpa_fwd_sm107_d512_role_split")
 
 
 @pytest.mark.parametrize("dtype,two_by_two", _LEGS)
@@ -73,8 +73,8 @@ def _check_case(monkeypatch, dtype, two_by_two, stats, *, total_hints, dims=512,
         total_hints,
         pack,
         1,
-        engine_name="sdpa_fwd_prefill_sm107",
-        cga=2,
+        engine_name="sdpa_fwd_sm107_d512_2x2" if two_by_two else "sdpa_fwd_sm107_d512_role_split",
+        cga=4,
         extra_checks=extra,
         origin_element_unit=8 if isinstance(dims, tuple) else None,
     )

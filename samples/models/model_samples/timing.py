@@ -33,6 +33,17 @@ step.  Per step:
   one.  GPU busy and idle are parts of the traced step, which the profiler stretches, so the line prints the period
   under the profiler first and host-exposed last, with what it is taken against.
 
+A run whose decode step was recorded once and replayed for every token (``Report.replayed``) is one launch and one host
+read per step, and its report says so: the first-token line counts replayed steps, the step line names the replay, and
+the traced pass prints two GPU-busy figures in the place of an idle and a host-exposed time -- of the steps launched
+from Python under the profiler, and of the same steps replayed under it (``Trace.replayed``) -- with the launches of
+each.  Such a report has no note on what bounds a step: the two figures stand beside the period, and nothing is
+asserted.
+
+A session whose step feeds several tokens per sequence (a verify step) reports its step timings and its traced pass, and
+says of three lines that they are not stated: nothing was prefilled through its steps, a step is not one token (how many
+of its tokens a run keeps is the caller's), and the bytes of a step are a family's arithmetic for the decode step.
+
 The **note** under the report says what bounds a step from that share: the launch path where host-exposed time is the
 larger part of the period, the GPU work of the stack where GPU busy is.  Without a traced pass it says that it was not
 measured.
@@ -40,9 +51,14 @@ measured.
 No pair of CUDA events is used for any of these: an event is stamped when the stream reaches it, so a pair spans every gap
 in which the GPU waited for the host.
 
+The same pass can hand over its **launch records** (``trace_steps(..., records=[...])``): the profiler's trace is then exported
+and read record by record (``census.read_trace``), every kernel and copy with its name, grid, block and shared memory, and the
+step facts above are taken from those same records.  The kernel check of a sample reads them (``model_samples.census``).
+
 **Bytes per step** is arithmetic on the model's tensor list, not a measurement: the bytes of the weights a step reads in
 their stored formats plus the state it reads and writes ("model"), against the same with the weights as the running stack
-holds them ("this stack moves").
+reads them ("this stack moves"): bf16 copies, and the stored format for the weights a block of the stack multiplies on
+there.
 
 These are host-side timings and counts for orientation only: no clock is locked, and nothing here is a measurement of
 record.  A run on a reduced model prefixes its times with "reduced model" and prints no rate.
@@ -55,6 +71,8 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
+
+from .census import copy_name, read_trace
 
 
 def now() -> float:
@@ -127,12 +145,15 @@ class Trace:
     kernels: int
     copies: int
     period: float  # the host-side period under the profiler
+    #: of a pass whose last steps were replays of a recorded step: the same facts over those steps alone
+    replayed: Optional["Trace"] = None
 
 
 def step_facts(records: List[Tuple[str, float, float]]) -> List[Tuple[float, float, int, int]]:
     """Per step ``(GPU busy, idle inside the step, kernels, copies)`` from kernel activity records ``(name, start, end)`` on
     one clock.  A step ends with its host read: the record of a device-to-host copy closes it.  Records after the last
-    such copy belong to no step."""
+    such copy belong to no step.  A copy is counted as one in either spelling the profiler has for it
+    (``census.copy_name``: the copy node of a replayed launch graph can come as a kernel record)."""
     steps, current = [], []
     for name, start, end in sorted(records, key=lambda r: r[1]):
         current.append((name, start, end))
@@ -144,17 +165,51 @@ def step_facts(records: List[Tuple[str, float, float]]) -> List[Tuple[float, flo
                 elif b > reach:
                     busy, reach = busy + (b - reach), b
             span = max(b for _, _, b in current) - current[0][1]
-            copies = sum(n.startswith(("Memcpy", "Memset")) for n, _, _ in current)
+            copies = sum(copy_name(n) for n, _, _ in current)
             steps.append((busy, span - busy, len(current) - copies, copies))
             current = []
     return steps
 
 
-def trace_steps(step: Callable[[int], None], count: int, device=None) -> Tuple[Optional[Trace], str]:
+def _exported(profiler) -> Tuple[list, str]:
+    """``(launch records, "")`` of a stopped profiler pass -- its trace exported to a file of this process's temporary folder
+    and read record by record -- or ``([], reason)`` where that trace cannot be exported or read.  The file is this
+    function's own and is gone when it returns, so the reason says what failed and never where: the system's words for an
+    error of the file system (the text of an ``OSError`` carries the file's path), any other error's first line without the
+    folder.  No output of a sample names a local path."""
+    import os
+    import tempfile
+
+    folder, what = "", "exported"
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "trace.json")
+            profiler.export_chrome_trace(path)
+            if not os.path.exists(path):  # the exporter logs what it cannot write and raises nothing
+                return [], "the profiler exported no trace"
+            what = "read"
+            return read_trace(path), ""
+    except OSError as error:  # no temporary folder, no room in it, a file that went away
+        why = os.strerror(error.errno) if error.errno else type(error).__name__
+    except (RuntimeError, ValueError) as error:  # the exporter's refusal; a file that is no trace or ends inside its events
+        why = (str(error).splitlines() or [type(error).__name__])[0]
+        why = (why.replace(folder + os.sep, "") if folder else why)[:120]
+    return [], f"the profiler's trace could not be {what} ({why})"
+
+
+def trace_steps(step: Callable[[int], None], count: int, device=None, records: Optional[list] = None, tail: int = 0) -> Tuple[Optional[Trace], str]:
     """Run ``step(i)`` for ``i`` in ``range(count)`` under the PyTorch profiler with kernel activity records only and return
     ``(Trace, "")``, or ``(None, reason)`` where the records cannot be had.  ``step`` ends in the loop's one host read.
     ``device`` is the device the steps run on, where the caller knows it: there are kernel activity records of a CUDA
-    device only, and no step is run for another."""
+    device only, and no step is run for another.
+
+    ``tail`` runs that many steps more in the same pass, ``step(count)`` onwards, and keeps their facts apart
+    (``Trace.replayed``): the steps of a caller that launches ``count`` steps from Python and then the same steps as
+    replays of a recorded step.  The medians of the ``Trace`` are over the first ``count`` steps alone.
+
+    ``records``, a list, asks for the launch records of the pass: the profiler's trace is exported and every kernel and copy
+    record of it (``census.Launch``: name, grid, block, shared memory) is appended in start order -- also where the step facts
+    cannot be formed from them, so that the caller can say why.  The step facts then come from these records."""
     import torch
     from torch.profiler import ProfilerActivity, profile
 
@@ -173,7 +228,7 @@ def trace_steps(step: Callable[[int], None], count: int, device=None) -> Tuple[O
     except RuntimeError as error:  # the profiler could not start its kernel activity records
         return failed(error)
     try:  # an error of a step is the step's, not the profiler's: it is not caught here
-        for i in range(count):
+        for i in range(count + tail):
             start = now()
             step(i)
             periods.append((now() - start) * 1e3)
@@ -183,32 +238,60 @@ def trace_steps(step: Callable[[int], None], count: int, device=None) -> Tuple[O
         except RuntimeError:
             pass  # the step's error is the one to raise; a profiler that cannot stop adds nothing to it
         raise
+    activity = []  # set on either path below: from the profiler's own events, or from the exported launch records
     try:
         profiler.__exit__(None, None, None)
-        device_type = torch.autograd.DeviceType.CUDA
-        records = [(e.name, e.time_range.start / 1e3, e.time_range.end / 1e3) for e in profiler.events() if e.device_type == device_type]
+        if records is None:
+            device_type = torch.autograd.DeviceType.CUDA
+            activity = [(e.name, e.time_range.start / 1e3, e.time_range.end / 1e3) for e in profiler.events() if e.device_type == device_type]
     except RuntimeError as error:  # the profiler could not stop, or has no records to hand over
         return failed(error)
-    facts = step_facts(records)
-    if not records:
+    if records is not None:  # the profiler stopped: a trace that cannot be exported or read is said as that, not as its failure
+        exported, reason = _exported(profiler)
+        if reason:
+            return None, reason
+        records.extend(exported)
+        activity = [(launch.name, launch.start, launch.end) for launch in records]
+    facts = step_facts(activity)
+    if not activity:
         return None, "the profiler recorded no kernel activity on this GPU"
-    if len(facts) != count:
-        return None, f"the records show {len(facts)} host reads for {count} steps"
+    if len(facts) != count + tail:
+        return None, f"the records show {len(facts)} host reads for {count + tail} steps"
     median = statistics.median
-    return (
-        Trace(
-            count, median(f[0] for f in facts), median(f[1] for f in facts), int(median(f[2] for f in facts)), int(median(f[3] for f in facts)), median(periods)
-        ),
-        "",
-    )
+
+    def over(some, lasted) -> Trace:
+        return Trace(
+            len(some), median(f[0] for f in some), median(f[1] for f in some), int(median(f[2] for f in some)), int(median(f[3] for f in some)), median(lasted)
+        )
+
+    traced = over(facts[:count], periods[:count])
+    if tail:
+        traced.replayed = over(facts[count:], periods[count:])
+    return traced, ""
 
 
 class Report:
     """What a run prints after its loop: the text path, the first-token line with its route, the step timings, the traced
     pass and the bytes of a step."""
 
-    def __init__(self, tag: str, reduced: bool):
-        self.tag, self.reduced = tag, reduced
+    def __init__(self, tag: str, reduced: bool, tokens: int = 1, draft_tokens: Optional[int] = None, drafter: bool = False):
+        """``tokens``: the tokens per sequence a step of the session feeds.  At more than one its steps are verify steps:
+        the first-token line, the rate and the bytes of a step are a decode step's and are not stated.
+
+        ``draft_tokens``: the drafted tokens of a step of a session that feeds its prompt through decode steps and verifies
+        behind it (``Session(draft_tokens=)``).  Its prompt is prefilled, so the first-token line is a decode session's;
+        its rate is not printed, because the drafted tokens of its steps are its caller's; the bytes of a step stay not
+        stated; and the traced-pass line says that the prompt was replayed in front of the traced steps.
+
+        ``drafter``: such a session has a drafter, so its steps are whole steps of speculative decoding.  Its report then
+        has the acceptance lines (from ``accepted``: the count every step kept; ``scheduled``: some step verified drafted
+        tokens of its caller's, so nothing was measured), the bytes of such a step (``bytes`` at the step's tokens and
+        ``pass_bytes``, a draft pass's), and says why no rate is printed while the drafter runs on reference blocks."""
+        self.tag, self.reduced, self.tokens, self.draft_tokens = tag, reduced, tokens, draft_tokens
+        self.drafter = drafter
+        self.accepted: List[int] = []  # of every step: the drafted tokens it kept
+        self.scheduled = False
+        self.pass_bytes: Dict[str, int] = {}  # the drafter's bytes_per_pass
         self.text_path: Dict[str, float] = {}
         self.prompt_tokens = 0
         self.prefill_route = "decode step"
@@ -219,6 +302,10 @@ class Report:
         self.trace_missing = ""  # why there is no traced pass, when one was asked for
         self.bytes: Dict[str, int] = {}  # the model's bytes_per_step, when the family states them
         self.notes: List[str] = []
+        #: whether the steps of the run were replays of a recorded step (one launch and one host read per step), and what
+        #: that sequence holds as the installation states it (``None``: not stated)
+        self.replayed = False
+        self.launches: Optional[int] = None
 
     def text(self) -> str:
         prefix = "reduced model: " if self.reduced else ""
@@ -239,18 +326,42 @@ class Report:
                 f"text path             {render_text} | {tokenize_text} | ids to GPU {tp.get('to_device', 0.0) * 1e3:.3f} ms | "
                 f"text out {tp.get('text_out', 0.0) * 1e6:.2f} us per token"
             )
-        lines.append(
-            f"first token           {prefix}prefill route: {self.prefill_route}, {self.prompt_tokens} tokens x one step; "
-            f"not a time to first token of record ({self.prefill_seconds * 1e3:.1f} ms)"
-        )
+        several = self.tokens > 1  # verify steps: nothing was prefilled through them, and a step is not one token
+        behind_prompt = self.draft_tokens is not None  # ... unless the session fed its prompt through decode steps in front of them
+        if several and not behind_prompt:
+            lines.append(f"first token           not stated: a session of {self.tokens} tokens per sequence prefills nothing (its steps are verify steps)")
+        else:
+            lines.append(
+                f"first token           {prefix}prefill route: {self.prefill_route}, {self.prompt_tokens} tokens x one {'replayed ' if self.replayed else ''}step"
+                + (", each but the first behind one pass of the drafter over the position in front of it" if self.drafter else "")
+                + f"; not a time to first token of record ({self.prefill_seconds * 1e3:.1f} ms)"
+            )
         s = self.clock.summary()
         if s is not None:
+            made = f"{self.calls_per_step} block calls per step"
+            if self.replayed:  # one launch of the recorded sequence: the block calls of a step are inside it
+                made = (
+                    "one replay" + (f" of {self.launches} launches" if self.launches is not None else " of the recorded step") + " and one host read per step"
+                )
             lines.append(
                 f"steps ({len(self.clock.launch)})            {prefix}period {s['period_median']:.3f} ms median / {s['period_mean']:.3f} mean | "
-                f"in the step {s['in_step_median']:.3f} ms | turnaround {s['turnaround_median']:.3f} ms | {self.calls_per_step} block calls per step"
+                f"in the step {s['in_step_median']:.3f} ms | turnaround {s['turnaround_median']:.3f} ms | {made}"
             )
         share = None  # host-exposed time as a share of the period, when a traced pass measured it
-        if self.trace is not None:
+        if self.trace is not None and self.replayed:
+            # two GPU-busy figures, each with its launches, and nothing set against the period: the steps under the profiler
+            # were launched from Python, the run's own were replays
+            t, r = self.trace, self.trace.replayed
+            lines.append(
+                f"traced pass ({t.steps})      {prefix}the first {t.steps} steps again, launched from Python under the profiler: GPU busy {t.busy:.3f} ms | "
+                f"{t.kernels} kernel launches + {t.copies} copies per step"
+            )
+            if r is not None:
+                lines.append(
+                    f"                      {prefix}{r.steps} of them replayed under the profiler: GPU busy {r.busy:.3f} ms | "
+                    f"{r.kernels} kernel launches + {r.copies} copies per step"
+                )
+        elif self.trace is not None:
             t = self.trace
             period = s["period_median"] if s is not None else t.period
             exposed = period - t.busy
@@ -260,11 +371,22 @@ class Report:
             lines.append(  # the traced period first: GPU busy and idle are parts of the traced step, host-exposed is not
                 f"traced pass ({t.steps})      {prefix}period under the profiler {t.period:.3f} ms{stretch} | GPU busy {t.busy:.3f} ms | "
                 f"idle inside the traced step {t.idle:.3f} ms | {t.kernels} kernel launches + {t.copies} copies per step | "
-                f"host-exposed {exposed:.3f} ms = {basis} - GPU busy" + (f" ({share:.0%} of it)" if share is not None else "")
+                f"host-exposed {exposed:.3f} ms = {basis} - GPU busy"
+                + (f" ({share:.0%} of it)" if share is not None else "")
+                + (f" | behind the prompt's {self.prompt_tokens} decode steps, replayed untraced" if behind_prompt else "")
             )
         elif self.trace_missing:
             lines.append(f"traced pass           not available: {self.trace_missing}")
-        if self.reduced:
+        if self.drafter:
+            lines += self.acceptance()
+            lines.append("rate                  not printed while the drafter runs on reference blocks (kept tokens per step: the acceptance line)")
+        elif behind_prompt:  # no drafter runs: what a step keeps follows the tokens its caller drafted
+            lines.append(f"rate                  not printed: the drafted tokens of these steps are their caller's ({self.tokens} tokens per sequence a step)")
+        elif several:  # how many tokens a verify step keeps is its caller's: steps per second would not be tokens per second
+            lines.append(
+                f"rate                  not printed for verify steps ({self.tokens} tokens per sequence a step; how many of them a run keeps is its caller's)"
+            )
+        elif self.reduced:
             lines.append("rate                  not printed for a reduced model")
         elif s is None:
             lines.append("rate                  not printed below three decode steps")
@@ -272,14 +394,28 @@ class Report:
             wall = self.clock.ids[-1] - self.clock.launch[0]
             produced = len(self.clock.ids)
             lines.append(f"rate                  {produced / wall:.1f} tokens per second per sequence = {produced} tokens / {wall:.3f} s of the decode loop")
-        if self.bytes:
+        if self.drafter and self.bytes and self.pass_bytes:  # a step of speculative decoding: one verify step and the drafter's passes
+            gb, k = 1e9, self.draft_tokens
+            model, moved = self.bytes["weights"] + self.bytes["state"], self.bytes["copies"] + self.bytes["state"]
+            lines.append(
+                f"bytes per step        {prefix}model {model / gb:.2f} GB (weights once, {self.tokens} embedding rows, one recurrent state read and "
+                f"{self.tokens} written, 3 history columns read and {self.tokens + 2} written, the caches up to the step's last position) + drafter "
+                f"{k} x {self.pass_bytes['weights'] / gb:.2f} GB; this stack moves {(moved + k * self.pass_bytes['copies']) / gb:.2f} GB "
+                "(arithmetic, not a measurement)"
+            )
+        elif several:  # the family's arithmetic is a decode step's: one embedding row, one state slot, three history columns per sequence
+            lines.append("bytes per step        not stated for a verify step (the arithmetic of a step is the decode step's)")
+        elif self.bytes:
             gb = 1e9
             weights, state = self.bytes["weights"], self.bytes["state"]
             model, moved = weights + state, self.bytes["copies"] + state
             stored = f"weights {weights / gb:.2f} in their stored formats, state and cache {state / gb:.2f}"
+            # what a block of this stack multiplies on the stored format is read there, and its bf16 copy is not read by a step
+            kept = self.bytes.get("stored", 0)
+            reads = "bf16 copies of the weights" + (f", and {kept / gb:.2f} GB of weights in their stored format" if kept else "")
             lines.append(
                 f"bytes per step        {prefix}model {model / gb:.2f} GB ({stored}); "
-                f"this stack moves {moved / gb:.2f} GB ({moved / model:.2f}x): bf16 copies of the weights (arithmetic, not a measurement)"
+                f"this stack moves {moved / gb:.2f} GB ({moved / model:.2f}x): {reads} (arithmetic, not a measurement)"
             )
         # what bounds a step is said from this run's traced pass, not as a constant: the same loop is bound by its launches
         # on one stack and GPU and by its GPU work on another
@@ -289,6 +425,24 @@ class Report:
             bound = f"host-exposed {share:.0%} of the period: the launch path from Python bounds this step, not the GPU"
         else:
             bound = f"GPU busy {1 - share:.0%} of the period: the GPU work of this stack bounds this step, not the launch path"
-        lines.append(f"note                  {bound}; no floor and no speed-of-light figure is printed")
+        if not self.replayed:  # of a replayed run nothing is said about what bounds a step: the two GPU-busy figures stand beside the period
+            lines.append(f"note                  {bound}; no floor and no speed-of-light figure is printed")
         lines.extend(self.notes)
         return "\n".join(lines)
+
+    def acceptance(self) -> List[str]:
+        """The acceptance lines of a session with a drafter.  A step keeps the greedy token of its first row and the drafted
+        tokens the comparison accepted, 1 to ``tokens`` tokens: the mean over the steps, how many steps kept each number,
+        and per drafted token how many of the steps that kept the one before it kept it too.  For a run whose steps
+        verified drafted tokens of the caller's (a schedule) nothing was measured, and the line says that."""
+        steps, total = len(self.accepted), self.tokens
+        if not steps:
+            return ["acceptance            no step ran"]
+        counts = [sum(1 for kept in self.accepted if kept == count) for count in range(total)]
+        by_kept = ", ".join(f"{count + 1}: {steps_at}" for count, steps_at in enumerate(counts))
+        if self.scheduled:
+            return [f"acceptance            scheduled, not measured (reduction): {steps} steps; kept {by_kept}"]
+        reached = [sum(1 for kept in self.accepted if kept >= draft) for draft in range(total)]  # reached[j]: the steps that kept at least j drafted tokens
+        per_draft = ", ".join(f"{draft}: {reached[draft]} of {reached[draft - 1]}" for draft in range(1, total))
+        mean = f"kept tokens per step {1 + sum(self.accepted) / steps:.2f} of {total} (1 + accepted drafted tokens / steps), {steps} steps"
+        return [f"acceptance            {mean}; kept {by_kept}", f"                      accepted per draft: {per_draft}"]

@@ -19,7 +19,7 @@ if requirement_error:
 import cutlass.cute as cute
 from cutlass.cute.typing import BFloat16, Float16, Int32
 
-from cudnn.jax import TensorSpec, call, zeros_init
+from cudnn._jax import TensorSpec, call, zeros_init
 from ._kernels.hstu_bwd import HSTUAttentionBackwardSm100
 from ._kernels.hstu_fwd import HSTUAttentionForwardSm100
 

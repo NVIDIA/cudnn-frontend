@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The STREAMED bias ring of the Rubin (SM107) f16/bf16 small head-dim tiles -- ``TemplateParams.bias_mode = 2`` on
-``sm107/prefill_d128_f16.py``: the fallback above the RESIDENT row-block's budget.
+``sm107/d128_f16_multi_q/kernel.py``: the fallback above the RESIDENT row-block's budget.
 
 Above the resident budget (S_kv 768 / 384 for a batch-broadcast bias at the 32- / 64-wide tile -- the (n, n+1) pair item; 384 / 128 /
 256 for a per-batch bias -- the one-batch-entry item) the bias row-block is no longer held for the item's whole KV range: the TMA-LDG
@@ -40,7 +40,6 @@ import test_sdpa_bias_sm107 as _s13
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107"
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
 _RENDERINGS = Path(__file__).resolve().parent / "renderings"
 # (head-dim tile, cga, pair item?) -> the deepest streamed ring the carveout holds beside the operands (0 = no ring).
 _RING = {(32, 1, False): 3, (32, 1, True): 3, (64, 1, False): 0, (64, 1, True): 3, (64, 2, False): 2}
@@ -173,9 +172,9 @@ def test_row_serves_the_streamed_ring_and_declines_where_no_form_fits(name, fkw,
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
-    caps = _s13._caps()
     f = _s13._facts(**_s13._resolve_dtypes(fkw))
     knobs = SdpaFwdKnobs(**kkw) if kkw else None
+    caps = _s13._caps(f, knobs)
     why = engines.mismatch(caps, f, knobs)
     assert (why is None) == accept, (name, why)
     if not accept and "no ring" in name:
@@ -196,7 +195,7 @@ def test_heuristics_take_the_streamed_width():
         (dict(s_q=2048, s_kv=2048, **_s13._bias_kw(s_q=2048, s_kv=2048)), {1}),
     ):
         plans = heuristics.recommend("A", _s13._facts(device_sm_count=204, **_s13._resolve_dtypes(fkw)), offered)
-        assert {p.knobs.cga for p in plans if offered[_ROW] == p.engine_id} == want, (fkw, [p.knobs for p in plans])
+        assert {p.knobs.cga for p in plans if p.engine_id in {offered[row] for row in _s13._ROWS}} == want, (fkw, [p.knobs for p in plans])
 
 
 def test_config_factory_derives_the_ring_and_raises_on_each_coupling():

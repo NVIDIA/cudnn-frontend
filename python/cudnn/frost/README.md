@@ -304,9 +304,14 @@ python/cudnn/
                                 of its compiled forms, the form as plain data,
                                 the launch shape (kernel_symbols_for /
                                 form_for / launch_shape_for on the entry)
+    init_order.py               the order of a direct-call entry's launches
+                                behind the initialization of the buffers an
+                                entry allocates for itself (pending_of /
+                                record / order_behind)
     tile_dsl/                   shared CuTe-DSL primitives (barriers, TMA,
-                                MMA, softmax pieces, masks). Import by dotted
-                                path: cudnn.frost.tile_dsl.<module>
+                                MMA, softmax pieces, masks, row reductions).
+                                Import by dotted path:
+                                cudnn.frost.tile_dsl.<module>
 
   sdpa/                         ALL sdpa engines, every arch / pass / phase
     graph_analyzer.py           facts extraction: graph.nodes -> SdpaGraphFacts,
@@ -319,33 +324,42 @@ python/cudnn/
       api_dsl.py                DSL adapters (APIBase). Arch-free filename:
                                 APIs differ by PASS (fwd vs bwd), never by
                                 sm version or head dim
-      config_sm90.py            TemplateParams + the D512 envelope check +
-                                raising validation
+      config_sm90.py            TemplateParams + flavor picker + the D512
+                                envelope check + raising validation
       config_sm100.py           TemplateParams + per-geometry Cfg + raising
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
       kernels/                  one package per ARCH LINE; everything below
                                 an arch package is owned by that arch alone
-        sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
-                                      the Hopper line's only flavor: one D512
-                                      tile over three warpgroups
+        sm80/f16_k_prefetch/          SM80 K-prefetch half body (D_QK <= 192,
+                                      D_V <= 128; explicit engine)
+        sm80/d256_kv_prefetch/        SM80 D256 K+V-prefetch body (qwen envelope;
+                                      explicit engine)
+        sm80/wide_cooperative/        SM80 wide-head cooperative body (wide512 /
+                                      mla576 envelopes; explicit engine)
+        sm90/f16_three_wg/            the D512 body: one 64-row tile over
+                                      three warpgroups, every D up to 512 on
+                                      native 128/256/512-column storage
+        sm90/d64_f16_one_wg/          the D512 body's exact dense D64 subset
+        sm90/d128_f16_multi_q/        dedicated exact D128: 128-row tile, two
+                                      64-row compute warpgroups
         sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
-        sm100/prefill_d256_f16.py
-        sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
+        sm100/d256_f16_lookahead/kernel.py
+        sm100/d256_f16_swap_ab/kernel.py      decode-shaped alternate of the d256 flavor
                                       (S_q x packed heads <= 16 rows; swap-AB tile)
-        sm100/prefill_d512_f16.py
+        sm100/d512_f16_role_split/kernel.py
         sm100/split_combine.py        the split-KV reduction pass
-        sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
-        sm107/decode_d256_f16.py      the d256 decode tile's Rubin sibling (same
+        sm107/d128_fp8_multi_q/kernel.py     Rubin siblings (dense K=64 MMA, desc v1)
+        sm107/d256_f16_swap_ab/kernel.py      the d256 decode tile's Rubin sibling (same
                                       swap-AB body; config_sm107.make_cfg_d256_decode)
-        sm120/prefill_f16.py          general SM120 template (d <= 256)
-        sm120/prefill_d256_f16.py     d256 flavor
-        sm120/prefill_d512_f16.py     d512 flavor
-        sm120/prefill_fp8.py          general SM120 FP8 template (d <= 256)
-        sm120/prefill_mxfp8.py        block-scaled MXFP8 template (d <= 256)
-        sm120/prefill_d512_fp8.py     d512 flavor for FP8
-        sm120/prefill_d512_mxfp8.py   d512 flavor for MXFP8
+        sm120/f16_general/            general SM120 template (d <= 256; explicit engine)
+        sm120/d256_f16_all_compute/   d256 flavor (explicit engine)
+        sm120/d512_f16_paired/        d512 / d576 flavors (explicit engine)
+        sm120/fp8_general/            general SM120 FP8 template (d <= 256; explicit engine)
+        sm120/mxfp8_general/          block-scaled MXFP8 template (d <= 256; explicit engine)
+        sm120/d512_fp8_paired/        d512 flavor for FP8 (explicit engine)
+        sm120/d512_mxfp8_paired/      d512 flavor for MXFP8 (explicit engine)
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
@@ -353,15 +367,15 @@ python/cudnn/
     bwd/                        same shape, its own api_dsl.py / engines.py /
                                 config_sm*.py
       kernels/                  one package per ARCH LINE, like fwd/
-        sm80/bprop_f16.py             naming: bprop_d<dim>_<dtype-family>.py
-        sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
-        sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
-                                      _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
-        sm107/bprop_d256_f16.py       Rubin d256 bf16/fp16 main kernel (dV in
+        sm80/f16_two_subgroup/kernel.py  one directory per explicit engine body
+        sm100/d512_f16_role_split/kernel.py       stage 2 of the large-head-dim chain
+        sm100/d256_mxfp8/dq.py        ported MXFP8 kernel classes (+ dkdv,
+                                      masks, common, sf_repack)
+        sm107/d256_f16_4x1/kernel.py       Rubin d256 bf16/fp16 main kernel (dV in
                                       TMEM, dS to a kv-major GMEM workspace)
-        sm107/bprop_d256_fp8.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
+        sm107/d256_fp8/kernel.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
                                       the fp8 K64 GEMM arm; a bf16-dS twin for A/B)
-        sm120/bprop_f16.py            fused SM120 main kernel
+        sm120/f16_fused/kernel.py     fused SM120 main kernel
         sm120/bprop_chain_f16.py      the SM120-only part of its launch chain
                                       (dq2k, converts)
         bprop_chain_common.py     SHARED arch-neutral chain kernels (dot,
@@ -604,7 +618,8 @@ expressible, with one discipline separating them:
   only unmasked graphs, or only a causal diagonal, says so instead of leaving an
   axis to default (one coupling is expressible: `window_right`, the right modes
   a left window pairs with), and the matcher asks every axis in both directions so an
-  unset graph flag cannot bypass a restricted claim. See `sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  unset graph flag cannot bypass a restricted claim. See the
+  [SDPA support reference](../sdpa/frost/support/README.md).
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
   (e.g. `padded_stats: bool` — padding mask + generate_stats needs the
   per-batch LSE trim). The matcher encodes the SHAPE of the interaction once;
@@ -688,7 +703,7 @@ honors" is a `dataclasses.fields()` walk over the spec table.
 The engine-to-kernel mapping is many-to-many by design:
 
 - One engine serves several dtypes through one template: the d512 engine
-  lowers fp16 and bf16 graphs to `sm100/prefill_d512_f16.py` with different
+  lowers fp16 and bf16 graphs to `sm100/d512_f16_role_split/kernel.py` with different
   TemplateParams.
 - One engine can drive several kernels: `EngineSpec.lower` is a hook
   `(spec, facts, knobs) -> executor`. The default (`lower_dsl_prefill`)
@@ -853,7 +868,7 @@ Asserts:
   never a module-level `assert` (stripped under `python -O`, and an
   import-time crash is undebuggable from the frontend).
 - Hardware-invariant geometry checks in a template use a raising helper (see
-  `_require` in `sm100/prefill_d512_f16.py`) and must be unreachable for any
+  `_require` in `sm100/d512_f16_role_split/kernel.py`) and must be unreachable for any
   parameter set the engine's capabilities admit.
 - Never `assert api.check_support()` -- it raises on failure and the assert is
   stripped under `-O`; call it plainly.
@@ -1056,6 +1071,164 @@ Contract:
   shape that refills the stage (`test/AGENTS.md`).
 
 
+## Handing data to another thread block through global memory: `tile_dsl.handover`
+
+One thread block stores data to global memory with ordinary stores and another
+block of the same grid loads it. Two blocks of a 1 x 1 x 1 cluster share no
+mbarrier, so the pair is ordered through a counter word in global memory.
+
+```python
+from cudnn.frost.tile_dsl.handover import acquired_zero, poll_then_acquire, release_add
+
+# writer: every lane that stored, behind its last store
+release_add(word, async_reader=True)                 # async_reader: the reader is a TMA or bulk copy
+# reader: a whole warp in converged control flow
+count = poll_then_acquire(word, WRITING_LANES, warp_uniform=True)
+row = row + acquired_zero(count, WRITING_LANES)      # what the loads are addressed from
+```
+
+| Form | Emits |
+|---|---|
+| `release_add(word, amount=1, async_reader=False)` | one add with release at GPU scope per lane, the previous value unused; with `async_reader`, `fence.proxy.async.global` in front of it |
+| `poll_then_acquire(word, at_least, warp_uniform=False)` | relaxed loads until the word reads `at_least`, then one acquire load, whose value is returned; `warp_uniform` leaves the loop on a warp vote |
+| `acquired_zero(count, adding_lanes)` | `count - adding_lanes`: 0 while exactly `adding_lanes` lanes add |
+
+Contract:
+
+- **The word is a counter.** It is cleared for every launch by a kernel in
+  front on the same stream, every writing lane adds once and the reader waits
+  for the number of writing lanes. No form elects, masks or counts for the
+  caller: SUM(adding lanes) == the value waited for belongs in the barrier
+  table beside the init counts.
+- **The reader's loads take a value from the acquire load.** Add
+  `acquired_zero` (or `tile_dsl.consume.consumed_zero`) to the address, the
+  index or the stored word the loads are formed from; a TMA load is formed
+  from its coordinates. A load whose address does not depend on the acquired
+  value may be scheduled in front of it.
+- **A writer never waits for its reader.** What the reader polls for is
+  reached by its writer on a path without a poll; the poll has no time limit,
+  so a table that names a reader without its writer hangs the launch.
+- **Keep it off per-chunk paths.** The lanes' adds of one warp become one
+  reduction behind one GPU-scope memory barrier, which drains the SM.
+- **Check a new call site** in the disassembly: the last store, the proxy
+  fence where one is asked for, one GPU-scope barrier and one reduction in
+  that order; one acquire load behind the poll and the loads' address computed
+  from it. `test/python/sdpa/frost/test_tile_dsl_handover.py` pins what the
+  forms compile to.
+
+
+## Reducing a row over one thread block: `tile_dsl.rowwise`
+
+A row kernel launches one thread block per row -- a normalization, a per-row
+quantization, a row argmax. Every thread reduces its own elements in
+registers; `block_reduce` turns the one value per thread into one result in
+every thread of the block: warp shuffles, one shared-memory word per warp, one
+thread-block barrier, a second warp level.
+
+```python
+from cudnn.frost.tile_dsl.rowwise import WARP, block_reduce, slot_words
+
+@cute.kernel
+def kernel(cfg: cutlass.Constexpr, x: cute.Tensor, ...):
+    tid, _, _ = cute.arch.thread_idx()
+    lane = tid % WARP                                  # the kernel's own two statements
+    warp = tid // WARP
+    alloc = cutlass.memory.SmemAllocator()             # ONE allocator; one slot array per reduction
+    sum_slots = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(slot_words("sum", cfg.WARPS)), byte_alignment=16)
+    max_slots = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(slot_words("max", cfg.WARPS)), byte_alignment=16)
+    ...
+    total = block_reduce(partial_sum, lane, warp, sum_slots, cfg.WARPS, kind="sum", order="ascending")
+    amax = block_reduce(largest_magnitude, lane, warp, max_slots, cfg.WARPS, kind="max", order=None)
+```
+
+| `kind` | Value per thread | `order` | Result in every thread | Slot words |
+|---|---|---|---|---|
+| `"sum"` | the thread's partial sum | required, one of `SUM_ORDERS` | the row total | `warps` |
+| `"max"` | the thread's maximum (usually of magnitudes) | `None` | the row maximum | `warps` |
+| `"max_index"` | `(best value, its index)`, with `index_limit=` | `None` | the maximum and the lowest index that holds it | `2 * warps` |
+
+Contract:
+
+- **The order of a sum is part of the bytes.** fp32 addition is not
+  associative: the same partial sums paired in another order give a total that
+  differs in the last bit on some rows. `order` has no default.
+  `"ascending"` pairs the lanes of a warp with the shuffle offsets 1, 2, 4, 8,
+  16, and the warp sums the same way with `+0` in the lanes past the warp
+  count; it is defined for every warp count.
+- **`"descending"`** pairs the lanes with the offsets 16, 8, 4, 2, 1; behind
+  the barrier every lane loads the sum of warp `lane mod warps` and adds over
+  the offsets `warps / 2 .. 1` (`5 + log2(warps)` shuffles, no zero is
+  added). It serves a kernel whose bytes follow a reference that reduces in
+  that order, and exists for a power-of-two warp count only: any other count
+  is refused at trace time.
+- **An entry names its order.** A kernel that documents a byte contract states
+  the order in its module text and at the call; moving a landed kernel to the
+  other order is a numerical change with new goldens, never a refactor.
+- **`lane` and `warp` are the caller's.** The kernel computes
+  `thread index % 32` and `thread index // 32` itself and passes them in.
+  Where those two values are computed is part of the caller's rendering: a
+  helper that computed them would emit its lane mask where it is traced, which
+  can be behind a dependent-launch wait the kernel placed in front of the
+  reduction. Measured on the add + RMSNorm + quantize decode kernel
+  (`norm/frost/kernel/add_norm_quant_decode_f16.py`), which takes its row
+  total from `block_reduce(..., kind="sum", order="ascending")`: with its own
+  two statements every form renders the cubin it rendered with the reduction
+  spelled inline (`sm_100a`, `sm_103a`, `sm_107a`, `sm_120a`); with them at
+  the call site 16 of its 45 `sm_100a` forms render another image, with the
+  same output bytes.
+- **Every thread, full warps, no warp-role branch.** A call emits one aligned
+  thread-block barrier that all `32 * warps` threads issue once, and
+  full-mask shuffles. The call sits under compile-time control flow only.
+- **One slot array per call**, from the kernel's one allocator, at least
+  `slot_words(kind, warps)` fp32 words. It is written once (lane 0 of each
+  warp, before the barrier) and read once (behind it), so nothing releases it
+  and `tile_dsl.consume` has no site. A second reduction on the same array
+  would be a refill behind a barrier: give it its own array. A slot tensor of
+  another type, or statically too small, is refused at trace time.
+- **Maxima.** The fp32 warp maximum is one `redux.sync.max.f32` where the
+  compile target is known to assemble it (compute capability 10.x) and five
+  butterfly steps of `max.f32` on every other target; the two arms are
+  bitwise equal on inputs without a NaN, up to the sign of a zero maximum
+  that zeros of both signs hold. A NaN value is outside the contract. The
+  lanes past the warp count hold `-inf`, the identity of a maximum, so a
+  maximum of signed values is exact at every warp count.
+  `"max_index"` returns the lowest index among the positions that hold the
+  maximum; `index_limit` is a Python int above every index.
+- **Refusals are trace-time `ValueError`s** raised in plain Python before any
+  operation is emitted: an unknown kind or order, an order given to a
+  maximum, a warp count outside 1 .. 32, a missing `index_limit`.
+- **Check a new call site** by its rendering (the shuffle offsets in program
+  order, one barrier, one slot store and load per reduction:
+  `test_rendering_of_every_primitive` in
+  `test/python/sdpa/frost/test_tile_dsl_rowwise.py` is the pattern) and by a
+  bitwise reference of the tree it asked for
+  (`test_block_sum_is_the_documented_tree`: three row classes that tell the
+  two levels of the tree apart). A kernel that adopts the primitive without a
+  numerical change renders every form for every target before and after, with
+  one explicit `PYTHONHASHSEED`, and compares the cubin md5.
+
+The module also holds the row helpers of an eight-element-per-thread kernel,
+each a composition of `tile_dsl.pointwise` and `tile_dsl.tma` helpers with the
+element-to-byte order stated once: `row_load8(addr, dtype=)` (one 128-bit load
+of eight 16-bit values, widened exactly; element `j` is the value at
+`addr + 2 j` bytes; `dtype` is required, `BFloat16` or `Float16`: it decides
+the decoded values), `row_store8_bf16(addr, values)` (nearest-even, one 128-bit
+store), `row_store8_e4m3(addr, values, inv, clamp=)` (the E4M3 codes of
+`values[j] * inv`, the code of `values[j]` in the byte at `addr + j`; `clamp`
+adds one `min.xorsign.abs.f32` against 448 per element and changes no code)
+and `fp8_dynamic_row_scale(amax)` (`scale = max(div.rn(amax, 448),
+fp32(1 / (448 * 512)))` and `inv = div.rn(1, scale)`: the per-row FP8 scale
+and its reciprocal, two IEEE divisions). The FP8 row quantization decode
+kernel (`row_quantize/frost/kernel/row_quantize_fp8_decode_f16.py`) is these
+helpers around one `block_reduce(..., kind="max", order=None)`.
+One helper serves a sixteen-element-per-thread kernel:
+`row_store16_e2m1(addr, values, encode)` (the E2M1 codes of
+`values[j] * encode` as one 64-bit store, the code of `values[j]` in nibble
+`j`: the block of a 4-bit row that one block scale covers). The byte of that
+block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
+`tile_dsl.sf_layout.sf_band_offset(row, column, atoms_per_band)`.
+
+
 ## Adding coverage, cheapest first
 
 1. **New dtype an existing template already handles**: add it to the row's
@@ -1117,11 +1290,15 @@ Contract:
 9. **No module-level asserts on anything a user could trip.** Raise
    `ValueError` in validation functions; keep `assert` for programmer
    invariants inside tile_dsl at most.
-10. **Two directory levels under the pass, maximum**, and ARCH is the only
-    coverage axis allowed to be one of them (`kernels/sm107/prefill_d128_fp8.py`).
-    Every other axis -- phase, head dim, dtype family -- goes in the filename and
-    the engine name. A module shared across arch lines stays at `kernels/` level
-    rather than inside one arch package.
+10. **One directory per implementation, under its arch.** ARCH is the only
+    coverage axis that is a directory level of its own; each implementation then
+    gets one directory holding its body (`kernel.py`), its declaration contract
+    (`contract.py`), its fixed host (`host.py`) and, where needed, `config.py`
+    (`kernels/sm107/d128_fp8_multi_q/kernel.py`). Head dim, dtype family and the
+    pipeline shape go in the implementation directory name and the engine name.
+    Contracts and helpers shared by several implementations of one arch stay at
+    the arch level (`kernels/sm100/small_half_contract.py`); a module shared
+    across arch lines stays at `kernels/` level.
 11. **Identifiers are keyed by op geometry, not model names.**
     `make_cfg_d512`, not `make_cfg_dsv4`; model provenance goes in comments
     only.
@@ -1134,17 +1311,55 @@ Contract:
     `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.
-14. **Coverage changes update the support matrix.** A change to any SDPA
+14. **Coverage changes update the architecture support page.** A change to any SDPA
     `Capabilities` field that affects graph eligibility, or adding/retiring
     an `EngineSpec`, updates
-    `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.
-    That tracker is the only arch x pass x head-dim x dtype view of what
-    FROST serves, it is maintained by hand from these rows, and it silently
-    rots otherwise. Knob-domain-only changes are exempt (it does not track
-    knobs). `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the
-    exact scope and is the number to cite in review.
+    the affected section under [SDPA support](../sdpa/frost/support/README.md)
+    in the same commit. Use its template and SM90 example to migrate a section
+    from current source; label unreviewed scopes pending. The old tracker remains
+    historical reference and receives no new development logs. Knob-domain-only
+    changes are exempt; refactors still update moved links and engine identities.
+    `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the exact scope and
+    is the number to cite in review.
 15. **A stage that was read is released through `tile_dsl.consume`.** A bare
     arrive behind shared-memory loads of the stage it frees is not accepted
     in new or changed kernel code, even when every test passes
     (`python/cudnn/AGENTS.md` Rule 11); existing sites move over in follow-up
     changes.
+16. **A direct-call entry orders its launches behind entry-owned allocations.**
+    A buffer an entry allocates for itself (an output, a scratch) is initialized
+    by stream work of torch's current stream at that moment: a zero-fill, a fill
+    torch adds under deterministic algorithms, a write that stream still owes a
+    recycled block. A launch on another stream is not ordered behind it. So an
+    entry that allocates calls `cudnn.frost.init_order.record` right behind the
+    allocation and its fills, before the tensors are stored where a launch
+    finds them; and EVERY direct-call entry -- one that owns nothing too, its
+    output can be another entry's buffer -- keeps `init_order.pending_of(device)`
+    at construction and, in front of every launch and behind the truth test of
+    those records, calls `init_order.order_behind` with the byte ranges the
+    launch writes. A `torch.zeros` or `torch.empty` handed to a launch without
+    it is not accepted in new or changed entry code, even when every test
+    passes: the first launch of a newly compiled kernel has been observed to
+    wait for the other streams and hides the missing order, a warm launch on
+    another stream does not. The ordering makes ONE host wait: a captured
+    launch that writes an allocation whose initialization is still pending
+    waits for that one event before the launch (a capturing stream cannot wait
+    for an event recorded outside the capture); it is set-up, bounded by what
+    the allocating stream had queued, never replayed, and a caller avoids it
+    by allocating before the capture and letting that work finish. An eager
+    launch stream waits for the event whatever its raw handle, the allocating
+    stream's too (a destroyed stream's handle can go to the next new one; on
+    the allocating stream itself the wait is free). An accessor returns a copy
+    of the entry's table. The test is a WARM launch on another stream than the
+    allocation's, with that stream held behind pending work
+    (`test/python/init_order_schedules.py`). On the helper today:
+    `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`,
+    `RowArgmaxDecode`, `RowQuantizeFp8Decode`; `SharedExpertDecode`,
+    `RowQuantizeFp4Decode` (they allocate: record and order);
+    `Fp8ProjectionDecode`, `SwigluFp4Decode` (they own nothing: order).
+    Not yet, to follow in a separate change: `GdnDecodeFused`, `GdnVerifyFused`
+    (they allocate: record and order). Until then the caller orders (allocates
+    on the stream its calls run on, or orders that stream behind the allocating
+    one) every launch of one of `GdnDecodeFused`, `GdnVerifyFused` into an
+    entry-owned buffer, its own or another entry's; and every launch of any
+    other entry into a buffer `GdnDecodeFused` or `GdnVerifyFused` allocated.

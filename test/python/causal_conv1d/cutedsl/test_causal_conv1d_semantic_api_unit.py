@@ -479,7 +479,11 @@ def test_training_cache_keys_every_routed_plan_field_but_not_packed_values(monke
     assert dense_key != biased_key
     assert dense_key != packed_a_key
     assert packed_a_key == packed_b_key
-    assert packed_a_key != packed_more_sequences_key
+    # Packed N is a runtime value: varying sequence counts share one plan.
+    assert packed_a_key == packed_more_sequences_key
+    packed_state_key = module._causal_conv1d_training_key(x_btd, weight, None, packed_a, torch.randn(2, 8, 4, dtype=torch.bfloat16))
+    assert packed_state_key == module._causal_conv1d_training_key(x_btd, weight, None, packed_more_sequences, torch.randn(3, 8, 4, dtype=torch.bfloat16))
+    assert packed_state_key != packed_a_key
     assert dense_key != initial_state_key
     assert initial_state_key != final_state_key
     assert dense_key != strided_weight_key

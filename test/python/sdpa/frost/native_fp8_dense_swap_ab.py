@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Dense FP8 decode through the public SWAP_AB knob on SM100/103/107.
+"""Dense FP8 decode through explicit SM100/103 and SM107 implementation records.
 
 Forward only: this implementation choice adds no backward path. Every plan
 keeps its packing and split count fixed during byte comparisons. AMAX is a
@@ -104,19 +104,39 @@ def _case(
     eid, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
     knobs.update({cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.PACK_GQA: int(pack), cudnn.knob_type.SPLIT_KV: split, cudnn.knob_type.SCHED_POLICY: 0})
     knobs.pop(cudnn.knob_type.SWAP_AB, None)
-    if swap is not None:
+    from cudnn.sdpa import graph_analyzer
+    from cudnn.sdpa.fwd.kernels.sm100.fp8_flavor_contract import padded_shape
+
+    facts = graph_analyzer.analyze(g)
+    explicit = padded_shape(facts) == (128, 128)
+    if explicit:
+        from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        if _arch() == "sm107":
+            from cudnn.sdpa.fwd.heuristics import select_sm107_small_fp8_geometry as select_geometry
+            from cudnn.sdpa.fwd.kernels.sm107.d128_fp8_swap_ab.contract import Geometry as SwapAB
+        else:
+            from cudnn.sdpa.fwd.heuristics import select_sm100_small_fp8_geometry as select_geometry
+            from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
+
+        requested = replace(SdpaFwdKnobs.from_public(knobs), tile_m=128, swap_ab=swap)
+        geometry = SwapAB() if swap == 1 else select_geometry(facts, requested)
+        eid = family_for(g).offered_ids()[geometry.implementation]
+        knobs = geometry.canonical_knobs(requested).to_public()
+    elif swap is not None:
         knobs[cudnn.knob_type.SWAP_AB] = swap
     g.create_execution_plan(eid, knobs)
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
-    original = api_dsl._load_kernel_template
+    original = api_dsl.load_template
     seen = []
 
-    def record(filename, params, tag, part=None):
-        module = original(filename, params, tag, part=part)
+    def record(filename, params, *args, **kwargs):
+        module = original(filename, params, *args, **kwargs)
         seen.append(filename)
-        expected = "sm100/decode_d128_fp8.py" if swap == 1 else _arch() + "/prefill_d128_fp8.py"
-        assert filename == expected
+        expected = geometry.kernel_file if explicit else "sm100/d128_fp8_swap_ab/kernel.py" if swap == 1 else _arch() + "/d128_fp8_multi_q/kernel.py"
+        assert filename.endswith(expected)
         assert params.cta_mma == 1 and module.CFG.SPLIT_KV == split
         assert bool(module.CFG.PACK_GQA) == pack
         if swap == 1:
@@ -125,11 +145,11 @@ def _case(
             assert not params.paged_kv and not params.thd_varlen
         return module
 
-    with patch.object(api_dsl, "_load_kernel_template", record):
+    with patch.object(api_dsl, "load_template", record):
         g.build_plans()
     assert seen
     actual_eid, actual_knobs = g.get_engine_and_knobs_at_index(g._plan_index)
-    assert actual_eid == eid and actual_knobs.get(cudnn.knob_type.SWAP_AB) == swap
+    assert actual_eid == eid and actual_knobs.get(cudnn.knob_type.SWAP_AB) == (None if explicit else swap)
     prepared = g._compiled_plans[g._plan_index]._prepared
     assert prepared.spec.split == split
     assert (prepared.spec.combine is not None) == (split > 1)
@@ -284,7 +304,7 @@ def test_standalone_current_lengths_and_logbase(split, log2):
     )
     api.check_support()
     api.compile()
-    assert api._k_mod.__file__.endswith("sm100/decode_d128_fp8.py")
+    assert api._k_mod.__file__.endswith("sm100/d128_fp8_swap_ab/kernel.py")
 
     for iteration in range(2):
         if iteration:
@@ -346,6 +366,19 @@ def test_domain(cc):
     caps = _caps("sdpa_fwd_prefill_" + ("sm107" if cc == (10, 7) else "sm100") + "_fp8")
     facts = _quant_facts(device_cc=cc, b=1, h_q=16, h_kv=2, s_q=1, s_kv=1024)
     knobs = engines.SdpaFwdKnobs(cga=1, split_kv=3, pack_gqa=True, swap_ab=1)
+
+    def actual_mismatch(f, k):
+        from cudnn.sdpa.fwd.kernels.sm100.fp8_flavor_contract import padded_shape
+
+        if padded_shape(f) == (128, 128):
+            if cc == (10, 7):
+                from cudnn.sdpa.fwd.kernels.sm107.d128_fp8_swap_ab.contract import Geometry
+            else:
+                from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry
+            arch = "sm107" if cc == (10, 7) else "sm100"
+            return engines.mismatch(_caps(f"sdpa_fwd_{arch}_d128_fp8_swap_ab"), f, Geometry().canonical_knobs(k))
+        return engines.mismatch(caps, f, k)
+
     for valid, choice in (
         (facts, knobs),
         (replace(facts, softmax_precision=cudnn.data_type.FLOAT), knobs),
@@ -356,9 +389,9 @@ def test_domain(cc):
         (replace(facts, d_qk=80, d_v=112), knobs),
     ):
         assert engines.effective_swap_abs(caps, valid, choice) == frozenset({0, 1})
-        reason = engines.mismatch(caps, valid, choice)
+        reason = actual_mismatch(valid, choice)
         assert reason is None, reason
-    assert engines.mismatch(caps, replace(facts, b=21846), knobs) is not None, "retain the common batch-times-split grid limit"
+    assert actual_mismatch(replace(facts, b=21846), knobs) is not None, "retain the common batch-times-split grid limit"
     for change in (
         dict(b=65536),
         dict(b=0),
@@ -381,8 +414,8 @@ def test_domain(cc):
         assert engines.effective_swap_abs(caps, replace(facts, **change), knobs) == frozenset(), change
     for change in (dict(cga=2), dict(cga=None), dict(tile_n=64)):
         assert engines.effective_swap_abs(caps, facts, replace(knobs, **change)) == frozenset(), change
-    assert engines.mismatch(caps, replace(facts, h_q=6), knobs) is not None, "G3 remains outside common packing contract"
-    assert engines.mismatch(caps, replace(facts, padded=True), knobs) is not None, "D128 padded splits retain their common decline"
+    assert actual_mismatch(replace(facts, h_q=6), knobs) is not None, "G3 remains outside common packing contract"
+    assert actual_mismatch(replace(facts, padded=True), knobs) is not None, "D128 padded splits retain their common decline"
 
 
 @pytest.mark.L0
@@ -394,7 +427,7 @@ def test_invalid_plan_then_recovery(cudnn_handle):
         value.fill_(11)
     ws.fill_(173)
     before = snapshot(dict(_outputs(bufs), workspace=ws))
-    for change, reason in (({cudnn.knob_type.TILE_CGA_M: 2}, "swap_ab"), ({cudnn.knob_type.TILE_N: 64}, "tile_n=64")):
+    for change, reason in (({cudnn.knob_type.TILE_CGA_M: 2}, "swap[-_]ab"), ({cudnn.knob_type.TILE_N: 64}, "tile_n(?:=64|=128)")):
         with pytest.raises((ValueError, NotImplementedError, RuntimeError), match="(?i)" + reason):
             g.create_execution_plan(eid, {**valid, **change})
             g.select_plan(g.get_execution_plan_count() - 1)

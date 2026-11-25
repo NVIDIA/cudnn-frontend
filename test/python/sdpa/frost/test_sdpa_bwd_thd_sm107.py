@@ -35,7 +35,7 @@ import cudnn
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
-_ENGINE = "sdpa_bwd_sm107"
+_ENGINE = "sdpa_bwd_sm107_d256_f16_4x1"
 _D = 256
 _RUBIN_CC = (10, 7)
 

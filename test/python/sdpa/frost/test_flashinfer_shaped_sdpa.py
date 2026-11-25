@@ -26,12 +26,12 @@ import pytest
 import torch
 
 import cudnn
-from cudnn.engines import is_python_engine
+from cudnn.engines import is_python_engine, MANIFEST
 from frost_test_utils import _SM, requires_dsl
 
 requires_thd_frost_row = pytest.mark.skipif(
-    _SM is None or not (100 <= _SM <= 107 or _SM == 120),
-    reason="needs an arch with a frost THD (ragged) SDPA forward row: SM100-line, SM107 or SM120; have " + ("none" if _SM is None else f"sm_{_SM}"),
+    _SM is None or not (100 <= _SM <= 107 or _SM in (120, 121)),
+    reason="needs an arch with a frost THD (ragged) SDPA forward row: SM100-line, SM107 or SM120-family; have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 pytestmark = [pytest.mark.L0, requires_thd_frost_row, requires_dsl]
 
@@ -39,7 +39,7 @@ pytestmark = [pytest.mark.L0, requires_thd_frost_row, requires_dsl]
 Q_UID, K_UID, V_UID, O_UID, STATS_UID = 0, 1, 2, 3, 4
 RAGGED_Q_UID, RAGGED_K_UID, RAGGED_V_UID, RAGGED_O_UID, RAGGED_STATS_UID = 10, 11, 12, 13, 14
 SEQ_Q_UID, SEQ_KV_UID = 20, 21
-FROST_PREFIX = "sdpa_fwd_prefill_"
+FROST_FAMILY = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
 
 
 def _plan_indices(g):
@@ -47,7 +47,7 @@ def _plan_indices(g):
     for i in range(g.get_execution_plan_count()):
         name = g.get_plan_name_at_index(i)
         engine_id, _ = g.get_engine_and_knobs_at_index(i)
-        if name.startswith(FROST_PREFIX) and frost is None:
+        if engine_id in FROST_FAMILY.offered_ids().values() and frost is None:
             frost = i
         elif backend is None and not is_python_engine(engine_id) and name != "backend_heuristics":
             backend = i

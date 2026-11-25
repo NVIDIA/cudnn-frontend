@@ -86,7 +86,7 @@ def test_pv_bf16_rejects_unsupported_architectures(monkeypatch, api_cls, device_
 @pytest.mark.L0
 def test_d192_hybrid_elides_pv_scale_factor_storage_and_transactions():
     """The hybrid D192 specialization must compile out unused P/V SF traffic."""
-    kernel = Path(__file__).parents[4] / "python/cudnn/sdpa/fwd/kernels/sm100/prefill_d192_d128_mxfp8.py"
+    kernel = Path(__file__).parents[4] / "python/cudnn/sdpa/fwd/kernels/sm100/d192_mxfp8_multi_q/kernel.py"
     source = kernel.read_text()
 
     assert "sP_SF = sQ_SF" in source
@@ -117,8 +117,8 @@ def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy(monkeypatch):
     # ragged-Q decode leg's plan-time facts (defaulted) follow it, then the Rubin decode
     # route's width cap and the programmatic-dependent-launch switch (the public tree's
     # tail), then the score side outputs (sample_score_max / sample_score_sum_exp), then
-    # the Rubin small tiles' resident-block operands and their knobs in landing order --
-    # the newest tail.
+    # the Rubin small tiles' resident-block operands and their knobs in landing order, then
+    # the in-launch reduction of a split (cluster_reduce) -- the newest tail.
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
     i = params.index("sample_scale_o")
     assert params[i : i + 5] == ["sample_scale_o", "ragged_divisors", "ragged_offsets_int64", "decode_q_tile_max", "use_pdl"], params[i : i + 6]
@@ -135,6 +135,8 @@ def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy(monkeypatch):
         "bias_max_form",
         "softmax_wgs",
         "swap_ab",
+        "causal_exclude_own_block",
+        "cluster_reduce",
     ], params[j + 2 :]
 
 
@@ -193,6 +195,8 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
         assert tail[:8] == ["sf_o", "block_table", "block_table_v", "ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_lse"], tail
         for name in tail[1:8]:
             assert params[name].default is None
+        assert tail[8:9] == ["bias_tensor"], tail
+        assert params["bias_tensor"].default is None
     else:
         # SM100 appends ragged-Q offsets, score side outputs and resident-block operands.
         assert tail[:8] == ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"], tail

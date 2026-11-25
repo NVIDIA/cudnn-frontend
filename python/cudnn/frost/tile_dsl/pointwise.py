@@ -721,7 +721,7 @@ def exp2_emul_pair(x_lo, x_hi):
     shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Four sm100
     prefill kernels consume it, each behind the per-(kind, flavor) cc 10.0 gate of
     ``api_dsl._exp2_fma_split_for`` -- MEASURED vs develop, B200, A/B/A x3, CUPTI medians: the
-    d128 MXFP8 kernel (``sm100/prefill_d128_mxfp8.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
+    d128 MXFP8 kernel (``sm100/d128_mxfp8_multi_q/kernel.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
     dense (2.217 -> 2.056 ms, together with its Amax_O fold), the d128 per-tensor FP8 kernel
     +4.48 % at S=8K (llama layer, H=64/8), the d192x128 bf16 kernel +1.89 % at S=8K (DSv3 layer,
     H=128/128), and the d128 bf16 / fp16 kernel on its dense-band builds only (``_E2E_DENSE_BAND``:
@@ -772,7 +772,7 @@ def exp2_mixed(vec, emul_pairs, N: int):
     so an all-MUFU chunk stays IR-identical to the unsplit kernel.  Trace-time helper (plain
     Python over traced values), like :func:`row_max_reduction`.  Which pairs to emulate is a
     ptxas-schedule property of the CONSUMING kernel -- tune it there, per kernel, by A/B
-    (``sm100/prefill_d128_mxfp8.py`` documents its sweep)."""
+    (``sm100/d128_mxfp8_multi_q/kernel.py`` documents its sweep)."""
     assert N % 2 == 0, f"exp2_mixed: N={N} must be even"
     if not emul_pairs:
         return cute.math.exp2(vec, fastmath=True)
@@ -946,9 +946,13 @@ def rope_rotate_half_io(
 
 
 @cute.jit
-def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
-    """Inverse L2 norm, ``rsqrt(sum_sq + L2_NORM_EPS)``; a zero row normalizes to zero."""
-    return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
+def l2norm_inv(sum_sq: cutlass.Float32, eps: cutlass.Float32 = None) -> cutlass.Float32:
+    """Inverse L2 norm, ``rsqrt(sum_sq + eps)``; a zero row normalizes to zero.  Without ``eps`` the constant
+    ``L2_NORM_EPS`` is traced in; a caller that hands its own passes a launch argument, as :func:`rmsnorm_rstd`'s is, so
+    one compiled kernel serves every value."""
+    if cutlass.const_expr(eps is None):
+        return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
+    return cute.math.rsqrt(sum_sq + eps, fastmath=True)
 
 
 @cute.jit
@@ -1368,7 +1372,7 @@ def warp_abs_max_f32_shfl(x: cutlass.Float32) -> cutlass.Float32:
 @cutlass.cute.jit
 def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
     """``slot[0] = max(slot[0], value)`` for a NON-NEGATIVE fp32 ``value`` through ONE int32 ``atomicMax`` of its bit
-    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/bprop_d256_fp8.py``, the gated block's
+    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/d256_fp8/kernel.py``, the gated block's
     gradient amax pass and gate backward).
 
     Non-negative IEEE fp32 patterns order exactly as int32, so the slot ends at the fp32 max of every value folded into
@@ -1537,3 +1541,66 @@ def nvfp4_block_scale_global(amax: cutlass.Float32, global_scale: cutlass.Float3
     if value != cutlass.Float32(0):
         encode_scale = rcp_approx_ftz(value * rcp_approx_ftz(global_scale))
     return byte, encode_scale
+
+
+# ---------------------------------------------------------------------------
+# Four single instructions a kernel NAMES instead of leaving them to a lowering.  Each helper is
+# ONE opaque statement: the DSL's optimizer can neither contract it with a neighbour nor replace
+# it by the routine one of its own math functions resolves to.  A kernel whose bytes follow a
+# reference chain spells that chain through these, instruction by instruction.  The three
+# approximate ones are EXPANDED BY THE ASSEMBLER into short hardware sequences: the statement
+# fixes the instruction, the assembler of the build fixes the result's last bits, so equality
+# with another build of the same chain is measured per target and per assembler, never read off
+# the text.  Every operand must be a traced register (a folded float immediate on an asm operand
+# ICEs libNVVM, :func:`opaque_f32_bits`).
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def div_full_f32(a: cutlass.Float32, b: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``div.full.f32`` -- the full-range APPROXIMATE fp32 division ``a / b``, as ONE opaque op.
+
+    NOT :func:`div_rn_f32` / :func:`rcp_div_rn` (``div.rn.f32``, the IEEE correctly rounded quotient) and not the
+    ``div.approx.f32`` inside :func:`silu_ex2_div_approx` (a reciprocal and a multiply, accurate for divisors of ordinary
+    magnitude only).  By the instruction's specification the result is within 2 units in the last place of the exact
+    quotient over the full range of operands; it does not take a rounding mode.  A chain that is DEFINED with this
+    instruction keeps its bits only with this spelling: the correctly rounded quotient differs from it in the last bit on
+    some operands, and a normalized or gated value then rounds to another 16-bit value on some elements."""
+    return inline_ptx("div.full.f32 $0, $1, $2;", write_only_types=[cutlass.Float32], read_only_args=[a, b])
+
+
+@cute.jit
+def rsqrt_approx_ftz_f32(x: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``rsqrt.approx.ftz.f32`` -- the hardware's approximate fp32 reciprocal square root with flush-to-zero, as ONE
+    opaque op.
+
+    NOT ``cute.math.rsqrt``, which is ``rsqrt.approx.f32`` WITHOUT ``.ftz``: the two agree on every normal operand and
+    differ on a positive subnormal one -- ``.ftz`` reads it as ``+0`` and returns ``+inf``, the plain form returns a large
+    finite value.  By the instruction's specification the relative error is at most ``2^-22.9`` over the positive finite
+    range.  ``+0`` gives ``+inf``, ``-0`` gives ``-inf``, ``+inf`` gives ``+0``, a negative operand a NaN."""
+    return inline_ptx("rsqrt.approx.ftz.f32 $0, $1;", write_only_types=[cutlass.Float32], read_only_args=[x])
+
+
+@cute.jit
+def ex2_approx_f32(x: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``ex2.approx.f32`` -- the hardware's approximate ``2^x`` WITHOUT flush-to-zero, as ONE opaque op.
+
+    NOT the ``ex2.approx.ftz.f32`` inside :func:`silu_ex2_div_approx`: here a result below the smallest normal fp32 is a
+    subnormal value, not a zero (``x`` below about -126), so the two differ exactly where the exponential underflows.  By
+    the instruction's specification the result is within 2 units in the last place of the correctly rounded ``2^x``.  A
+    zero of either sign gives 1, ``-inf`` gives ``+0``, ``+inf`` gives ``+inf``.  ``exp(v)`` in this convention is
+    ``ex2_approx_f32(v * fp32(log2 e))`` with the multiply as its own fp32 operation."""
+    return inline_ptx("ex2.approx.f32 $0, $1;", write_only_types=[cutlass.Float32], read_only_args=[x])
+
+
+@cute.jit
+def min_xorsign_abs_f32(a: cutlass.Float32, b: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``min.xorsign.abs.f32`` -- the magnitude ``min(|a|, |b|)`` with the sign ``sign(a) XOR sign(b)``, as ONE opaque op.
+
+    With a positive bound ``b`` this is the symmetric clamp of ``a`` to ``[-b, b]`` in one instruction: the sign of ``a`` is
+    kept, also on a zero, and an infinity becomes the bound of its sign.  With a negative ``b`` the result carries the
+    opposite sign of ``a``.  Exact: no rounding takes place.  NOT a clamp spelled as two compares or as ``min(max(a, -b),
+    b)``: the same value for every operand that is not a NaN, another instruction stream.  In front of a saturating convert
+    it changes no code; a kernel carries it when its stream follows a reference that clamps.  NaN operands are outside the
+    contract.  The instruction needs PTX ISA 7.2 and a target of compute capability 8.6 or newer."""
+    return inline_ptx("min.xorsign.abs.f32 $0, $1, $2;", write_only_types=[cutlass.Float32], read_only_args=[a, b])

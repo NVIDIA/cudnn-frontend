@@ -25,6 +25,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import cudnn
+from cudnn._device import device_info
 from cudnn._sdpa_tail import GateTail, match_gate_tail
 from cudnn.sdpa import band
 from cudnn.sdpa.layout import dense_layout_ok
@@ -85,51 +86,25 @@ def to_torch_dtype(dt):
 _REQ_STRIDE_ORDER = (3, 1, 2, 0)
 
 
-def _device_props():
-    """The current device as cuDNN describes it, or None without a device.
+def _device_fact(name: str):
+    """``name`` of the GPU the facts describe -- the build scope's (the graph handle's) device,
+    else the current one -- or None without a visible device."""
+    from cudnn.frost.device import current_device
 
-    cudnn.create_device_properties() is the backend's OWN device descriptor —
-    the same object the C++ deviceless-AoT path serializes and replays. Reading
-    it here instead of torch.cuda keeps the facts path framework-neutral, and
-    is the step that makes a deviceless python engine possible at all: facts
-    computed from a serialized descriptor need no live device.
-
-    Cached per device id: the descriptor costs a backend call and the device
-    does not change under a process.
-    """
-    import json
-
-    from cudnn.frost.buffers import current_device_id
-
-    dev = current_device_id()
-    if dev is None:
+    try:
+        return getattr(device_info(current_device()), name)
+    except (NotImplementedError, RuntimeError, ValueError):
         return None
-    cached = _DEVICE_PROPS_CACHE.get(dev)
-    if cached is None:
-        try:
-            cached = json.loads(cudnn.create_device_properties(dev).serialize())
-        except Exception:  # noqa: BLE001 — no device / older backend: facts stay device-less
-            cached = {}
-        _DEVICE_PROPS_CACHE[dev] = cached
-    return cached or None
-
-
-_DEVICE_PROPS_CACHE: dict = {}
 
 
 def _device_cc() -> Optional[tuple]:
-    """Compute capability of the current CUDA device, or None without CUDA."""
-    props = _device_props()
-    if not props or "deviceVer" not in props:
-        return None
-    ver = int(props["deviceVer"])  # 1000 == SM 10.0
-    return (ver // 100, (ver % 100) // 10)
+    """Compute capability of the device the facts describe, or None without CUDA."""
+    return _device_fact("compute_capability")
 
 
 def _device_sm_count() -> Optional[int]:
-    """SM count of the current CUDA device, or None without CUDA."""
-    props = _device_props()
-    return int(props["multiProcessorCount"]) if props and "multiProcessorCount" in props else None
+    """SM count of the device the facts describe, or None without CUDA."""
+    return _device_fact("sm_count")
 
 
 def _stride_order(dim: tuple, stride: tuple) -> tuple:
@@ -310,7 +285,10 @@ class SdpaGraphFacts:
     seq_q_trim: bool = False  # seq_len_q given without a padding mask
 
     padded: bool = False  # per-batch KV lengths present (padding mask or THD)
-    thd: bool = False  # ragged (THD) Q/K/V
+    thd: bool = False  # Q has ragged offsets (THD queries)
+    # Nonpaged Q/K/V do not all use the same ragged-offset form. Some backend
+    # engines support this; FROST rows currently require all dense or all ragged.
+    mixed_qkv_ragged: bool = False
     # Caller-declared packed token totals (sdpa(max_total_seq_len_q/kv=...)).
     # Ragged graphs describe extents as (B, H, S_max, D) plus device ragged
     # offsets, so the packed total is not otherwise expressible; when supplied
@@ -433,6 +411,12 @@ class SdpaGraphFacts:
     # on the raw QK^T.  A fact the capability rows gate on
     # (attn_scale_prefolded_d_shapes); attn_scale must be unset alongside it.
     attn_scale_prefolded: bool = False
+    # The GRAPH's python-only op attribute sdpa_mxfp8(causal_exclude_own_block=B):
+    # the causal bound tightened to keys j < B * floor(i / B), so every V scale
+    # block the kernel reads is fully visible to the query.  0 = off (plain
+    # causal).  A fact the capability rows gate on
+    # (causal_exclude_own_block_d_shapes); requires top-left causal, no window.
+    causal_exclude_own_block: int = 0
 
     # Epilogue gate: the three-node tail ``sdpa(virtual O_v) -> sigmoid(G) ->
     # mul(O_v, s)`` (cudnn._sdpa_tail.match_gate_tail).  A FACT, not a verdict:
@@ -845,8 +829,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid("sdpa_fp8_backward requires " + " / ".join(_FP8_BWD_SCALARS))
 
     def _real_output(t):
-        """The op RETURNS its amax ports unconditionally; only a real
-        (non-virtual, set_output(True)) tensor is a requested output."""
+        """A returned optional port is observable only when marked as a graph output."""
         return t if (t is not None and not getattr(t, "is_virtual", True)) else None
 
     _quant_bwd = is_mxfp8_bwd or is_fp8_bwd
@@ -860,6 +843,11 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     binding_rejects_conflicts = not (is_backward and not is_fp8_bwd and not is_mxfp8_bwd)
     use_causal = bool(rec.get("use_causal_mask", False))
     use_causal_br = bool(rec.get("use_causal_mask_bottom_right", False))
+    from cudnn._sdpa_validate import _causal_alignment_error
+
+    alignment_error = _causal_alignment_error(rec)
+    if alignment_error is not None:
+        return _invalid(alignment_error)
     # Left window (== length; window offset is length-1). The op family uses several
     # spellings for the same knob: sdpa / sdpa_backward → sliding_window_length or
     # diagonal_band_left_bound; sdpa_mxfp8 → diagonal_band_left_bound; sdpa_fp8 →
@@ -905,7 +893,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     # invalid here (invalid means malformed-for-everyone; the backend accepts
     # it with its own precedence) — an engine that serves the cu form must
     # decline the ambiguous combination itself.
-    thd = getattr(q, "ragged_offset", None) is not None
+    ragged_qkv = tuple(getattr(t, "ragged_offset", None) is not None for t in (q, k, v))
+    thd = ragged_qkv[0]
+    mixed_qkv_ragged = not paged and any(ragged_qkv) and not all(ragged_qkv)
     use_padding_mask = bool(rec.get("use_padding_mask", False))
     seq_len_kv = rec.get("seq_len_kv")
     seq_len_q = rec.get("seq_len_q")
@@ -915,8 +905,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     if thd:
         # Paged KV: the pools are addressed through the block tables, so only
         # Q (and O) are ragged — chunked prefill over a paged cache.
-        if not paged and (getattr(k, "ragged_offset", None) is None or getattr(v, "ragged_offset", None) is None):
-            return _invalid("THD (ragged) requires ragged Q, K, and V")
+        # Mixed dense/ragged Q/K/V is provider-specific support, not a malformed
+        # graph. Preserve its facts for backend correctness guards; FROST's
+        # capability matcher declines it independently.
         if not q_lens_given or not kv_lens_given:
             return _invalid("THD (ragged) requires seq_len_q/cu_seq_len_q and seq_len_kv/cu_seq_len_kv")
         padded = True
@@ -961,6 +952,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
             wants_stats = False
         if wants_stats and stats is None:
             return _invalid("generate_stats=True but no Stats tensor was returned")
+        # The recognized forward graphs have no consumer of Stats. A virtual Stats
+        # (e.g. FlashInfer FP8 prefill with return_lse=False) needs no external store.
+        wants_stats = wants_stats and _real_output(stats) is not None
 
     attn_scale = rec.get("attn_scale")
     dynamic_scale = attn_scale is not None and not isinstance(attn_scale, (int, float))
@@ -1022,6 +1016,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         seq_q_trim=seq_q_trim,
         padded=padded,
         thd=thd,
+        mixed_qkv_ragged=mixed_qkv_ragged,
         max_total_seq_len_q=rec.get("max_total_seq_len_q"),
         max_total_seq_len_kv=rec.get("max_total_seq_len_kv"),
         has_cu_seq_len=has_cu_seq_len,
@@ -1119,6 +1114,35 @@ def _as_bool_flag(value):
     return None
 
 
+def _own_block_fact(node, facts: SdpaGraphFacts) -> SdpaGraphFacts:
+    """``sdpa_mxfp8(causal_exclude_own_block=B)``: the python-only op attribute that tightens
+    the causal bound to keys ``j < B * floor(i / B)``.  Validates the request (a malformed
+    one is ``invalid``); whether an engine serves it is the rows' call (mismatch)."""
+    raw = node.params.get("causal_exclude_own_block")
+    if raw is None or (isinstance(raw, numbers.Integral) and not isinstance(raw, bool) and int(raw) == 0):
+        return facts  # 0 = plain causal, as in the kernel's TemplateParams
+    if isinstance(raw, bool) or not isinstance(raw, numbers.Integral) or int(raw) <= 0 or int(raw) & (int(raw) - 1):
+        return replace(facts, invalid=f"cudnn.sdpa_mxfp8: causal_exclude_own_block must be a positive power-of-two block size; got {raw!r}")
+    if not facts.is_mxfp8:
+        # Only sdpa_mxfp8 declares it (python_only_attrs): on another op it would be forwarded to the C++ binding.
+        return replace(facts, invalid="causal_exclude_own_block is an sdpa_mxfp8 op attribute (the MXFP8 V scale block); other SDPA ops do not take it")
+    if facts.is_backward:
+        # The backward recomputes P from the forward's O / Stats; no backward engine carries the bound.
+        return replace(facts, invalid="cudnn.sdpa_mxfp8_backward: causal_exclude_own_block is a forward-only op attribute; leave it unset")
+    # The bound is defined on top of the plain causal diagonal: query i, key j, both zero-based
+    # from the first token.  A widened band, a left window or an offset diagonal has no such block.
+    if not facts.causal or facts.right_band_widening or facts.window_left is not None:
+        return replace(
+            facts,
+            invalid="cudnn.sdpa_mxfp8: causal_exclude_own_block requires a causal mask (use_causal_mask=True or diagonal_band_right_bound=0) without a sliding window",
+        )
+    if facts.bottom_right and facts.s_q != facts.s_kv:
+        return replace(
+            facts, invalid="cudnn.sdpa_mxfp8: causal_exclude_own_block requires a top-left causal diagonal (S_q == S_kv under bottom-right alignment)"
+        )
+    return replace(facts, causal_exclude_own_block=int(raw))
+
+
 def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     """Facts for a single-SDPA graph -- optionally followed by the epilogue-gate
     tail ``O * sigmoid(G)`` -- or None if the graph is anything else.
@@ -1136,6 +1160,9 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
         facts = replace(facts, shape_overrides=True)
     if getattr(graph, "is_cuda_graph_replay_expected", False):
         facts = replace(facts, cuda_graph_replay=True)
+    if facts.invalid is not None:
+        return facts
+    facts = _own_block_fact(node, facts)
     if facts.invalid is not None:
         return facts
     # sdpa(..., softmax_precision=...) is a python-only op attribute (see

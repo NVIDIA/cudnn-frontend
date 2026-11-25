@@ -24,7 +24,7 @@ from cuda.bindings import driver as cuda_driver
 from cudnn.frost.template_loader import load_template
 from cudnn.sdpa.fwd.kernels._common_blackwell import _bshd
 
-EXPORT_OPTIONS = "--gpu-arch sm_120a"
+EXPORT_OPTIONS = "--gpu-arch sm_120f"
 
 
 @cute.jit
@@ -84,7 +84,7 @@ def aot_prefill_host(
 
 
 def _template_path(d: int) -> str:
-    name = "prefill_d256_f16.py" if d == 256 else "prefill_f16.py"
+    name = "d256_f16_all_compute/kernel.py" if d == 256 else "f16_general/kernel.py"
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
 

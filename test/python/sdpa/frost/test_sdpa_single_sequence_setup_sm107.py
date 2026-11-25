@@ -23,7 +23,7 @@ def test_single_sequence_physical_origins(dim, dtype_name, cga, packed, monkeypa
 
     def compile_native(api):
         original(api)
-        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
         observed.append(api.batch_size)
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)
@@ -34,7 +34,7 @@ def test_single_sequence_physical_origins(dim, dtype_name, cga, packed, monkeypa
         True,
         packed,
         1,
-        engine_name="sdpa_fwd_prefill_sm107",
+        engine_name="sdpa_fwd_sm107_d128_multi_q",
         cga=cga,
         batch_override=1,
     )
@@ -50,7 +50,7 @@ def test_single_sequence_physical_origins(dim, dtype_name, cga, packed, monkeypa
         (128, "bfloat16", 1, True, 64),
     ],
 )
-def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engine_name="sdpa_fwd_prefill_sm107", paged=False, splits=1):
+def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engine_name="sdpa_fwd_sm107_d128_multi_q", paged=False, splits=1):
     import cudnn
     from cudnn.engines.manifest import family_for
 
@@ -157,8 +157,14 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
             compiled = graph._compiled_plans[0]
             assert compiled._prepared.spec.origin_specs is not None
             mod = compiled._compiled.kernel_module
-            body = "decode_d128_f16.py" if splits > 1 else "prefill_d128_f16.py"
-            assert mod.__file__.endswith(engine_name.rsplit("_", 1)[1] + "/" + body)
+            body = "d128_f16_single_q/kernel.py" if splits > 1 else "d128_f16_multi_q/kernel.py"
+            owned_path = {
+                "sdpa_fwd_sm100_d128_multi_q": "sm100/d128_f16_multi_q/kernel.py",
+                "sdpa_fwd_sm100_d128_single_q": "sm100/d128_f16_single_q/kernel.py",
+                "sdpa_fwd_sm107_d128_multi_q": "sm107/d128_f16_multi_q/kernel.py",
+            }.get(engine_name)
+            expected_path = owned_path or (engine_name.rsplit("_", 1)[1] + "/" + body)
+            assert mod.__file__.endswith(expected_path)
             assert compiled._prepared.spec.b == declared_batch
             plans["shared"] = graph, nodes
         graph, nodes = plans["shared"]
@@ -230,7 +236,7 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
     source["q"][1].copy_(neighbor)
     preserved = snapshot(source)
     assert_bitwise(run([0]), alone, "single sequence after multi-sequence bindings")
-    arch = engine_name.rsplit("_", 1)[1]
+    arch = "sm100" if "_sm100" in engine_name else engine_name.rsplit("_", 1)[1]
     suffix = ("-paged" if paged else "") + (f"-split{splits}" if splits > 1 else "")
     assert_golden(
         f"sdpa-{arch}-single-sequence-d{dim}-{dtype_name}-cga{cga}-pack{int(packed)}-n{tile_n}{suffix}", source, alone, allowed_inf={"stats": -torch.inf}
@@ -248,9 +254,9 @@ def test_single_sequence_runtime_batch_guard(dim, monkeypatch):
     def compiled(api):
         compile_plan(api)
         assert api.batch_size == 4
-        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
         seen.append(api.batch_size)
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compiled)
-    test_independent_thd_origins_rebind_and_capture(dim, "bfloat16", "token", True, False, 1, engine_name="sdpa_fwd_prefill_sm107", cga=1)
+    test_independent_thd_origins_rebind_and_capture(dim, "bfloat16", "token", True, False, 1, engine_name="sdpa_fwd_sm107_d128_multi_q", cga=1)
     assert seen

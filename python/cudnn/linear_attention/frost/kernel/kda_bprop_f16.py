@@ -95,15 +95,18 @@ Warp assignments (16 warps = 512 threads):
 
 import dataclasses
 from dataclasses import dataclass
-from typing import NamedTuple, Type
+from typing import NamedTuple, Optional, Type
 
 import cuda.bindings.driver as cuda_driver
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
+
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, decode_work_item, order_body
+from ..common.tail import gate_body
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.gdn2_state_grad import pack_dstate_operand, store_steep_keys, add_steep_du, steep_dk_restore_tokens, steep_dk_restore_warp
 from ..common.steep_decay import (
@@ -331,7 +334,9 @@ def make_bars(cfg) -> KdaBpropBars:
         mb_dstate0_acc_stored=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1 + CG2, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15 * cfg.threads_per_warp, producer=Producer.THREAD
+        ),
     )
 
 
@@ -350,12 +355,11 @@ def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, n
 
 
 @cute.jit
-def scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one):
+def scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz):
     """Consumer side: read the TMA-LDG warp's published next tile."""
     bars.mb_scheduler_ready[scheduler_state.idx].wait(scheduler_state.phase)
     next_tile = sScheduler[scheduler_state.idx]
-    if elect_one:
-        bars.mb_scheduler_done[scheduler_state.idx].arrive()
+    consume_then_arrive(bars.mb_scheduler_done[scheduler_state.idx], next_tile, rz)
     return next_tile, advance(scheduler_state, cfg.scheduler_stages)
 
 
@@ -387,6 +391,7 @@ def epilogue_warp(
     desc_dv_base,
     desc_dgate_base,
     bars,
+    rz,
 ) -> None:
     """Epilogue warp role (warp 15): the register-MMA A/dA tiles and the
     dQ/dK/dV/dGate TMA stores, in chunk order with a one-behind store
@@ -677,7 +682,7 @@ def epilogue_warp(
             pend_writes = writes
 
         chunk_serial_base += num_compute_chunks
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
 
 @cute.jit
@@ -701,6 +706,7 @@ def register_mma_warp(
     sSteepCorr_ptr,
     sSteepDadm_ptr,
     bars,
+    rz,
 ) -> None:
     """Register-MMA warp role (warp 12): the blockwise T_inv and dM register MMAs
     plus the dBeta M-term row sums, in chunk order."""
@@ -900,7 +906,7 @@ def register_mma_warp(
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dbeta_m_ready.arrive()
         chunk_serial_base += num_compute_chunks
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
 
 @cute.jit
@@ -927,6 +933,7 @@ def tcgen05_mma_warp(
     sDstate_trans,
     sIntermediate,
     bars,
+    rz,
 ) -> None:
     """tcgen05-MMA warp role (warp 13): issues every tcgen05 GEMM and owns
     the TMEM lifecycle."""
@@ -1476,7 +1483,7 @@ def tcgen05_mma_warp(
             bars.mb_dstate0_acc_stored.wait(dstate0_index.phase)
             dstate0_index = advance(dstate0_index, 1)
         chunk_serial_base += num_compute_chunks
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
     bars.mb_tmem_done[0].wait(0)
     nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
     nvvm.tcgen05_dealloc(
@@ -1648,7 +1655,7 @@ def tmaldg_warp(
                 state_index = advance(state_index, cfg.smem_state_stages)
                 if elect_one:
                     bars.mb_state_ready[state_idx].arrive(n_bytes=cfg.tma_state_bytes)
-                state_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o)
+                state_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o // cfg.checkpoint_head_divisor)
                 tma_load_tile(sState_tma[state_idx], state_slice, bars.mb_state_ready[state_idx].smem_ptr, acquire=False)
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         next_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
@@ -1700,6 +1707,7 @@ def compute0_warp_group(
     mSteepSlot,
     mDstateScratch,
     bars,
+    rz,
 ) -> None:
     """WG0 warp role (warps 0-3): persistent tile-scheduler loop, gate prefix
     scan, and the decay operand materialization into tcgen05 SMEM for every
@@ -2161,7 +2169,7 @@ def compute0_warp_group(
                 state_index = advance(state_index, cfg.smem_state_stages)
             bars.mb_state_input_ready[chunk_serial % 2].arrive()
         chunk_serial_base += num_compute_chunks
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
 
 @cute.jit
@@ -2193,6 +2201,7 @@ def compute1_warp_group(
     sDecay_scale_raw,
     sSteepTile_ptr,
     bars,
+    rz,
 ) -> None:
     """Stage value-side TMEM operands in WG1 (warps 4-7).
 
@@ -2265,7 +2274,7 @@ def compute1_warp_group(
                 row_lo_addr = tmem_row << 16
                 if cutlass.const_expr(cfg.dstate_table):
                     seed_vw = 16 // (mDstate_in.element_type.width // 8)
-                    dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, value_dim, 0))).raw_ptr()
+                    dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx // cfg.state_head_divisor, value_dim, 0))).raw_ptr()
                 if cutlass.const_expr(cfg.has_composed_dstate):
                     is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
                     composed_src = (mDcomposed.iterator + mDcomposed.layout((cutlass.Int32(0), head_idx, value_dim, 0))).raw_ptr()
@@ -2736,20 +2745,22 @@ def compute1_warp_group(
                             kd = key_dim_base + kk_i
                             if cutlass.const_expr(cfg.has_composed_dstate):
                                 if cutlass.const_expr(cfg.dstate_table):
-                                    pass_val = mDstate_in[batch_idx, head_idx, value_dim, kd].to(cutlass.Float32)
+                                    pass_val = mDstate_in[batch_idx, head_idx // cfg.state_head_divisor, value_dim, kd].to(cutlass.Float32)
                                 else:
                                     pass_val = cutlass.Float32(0.0)
                                 composed_val = mDcomposed[cutlass.Int32(0), head_idx, value_dim, kd]
                                 pass_val = composed_val if batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2) else pass_val
                                 mDstate0[dstate_dst, head_idx, value_dim, kd] = pass_val.to(mDstate0.element_type)
                             elif cutlass.const_expr(cfg.use_dstate_in):
-                                mDstate0[dstate_dst, head_idx, value_dim, kd] = mDstate_in[batch_idx, head_idx, value_dim, kd].to(mDstate0.element_type)
+                                mDstate0[dstate_dst, head_idx, value_dim, kd] = mDstate_in[batch_idx, head_idx // cfg.state_head_divisor, value_dim, kd].to(
+                                    mDstate0.element_type
+                                )
                             else:
                                 mDstate0[dstate_dst, head_idx, value_dim, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
         if num_compute_chunks > 0:
             bars.mb_dstate0_acc_stored.arrive()
         chunk_serial_base += num_compute_chunks
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
     bars.mb_tmem_done[0].arrive()
 
@@ -2785,6 +2796,7 @@ def compute2_warp_group(
     sSteepDadm_ptr,
     scale,
     bars,
+    rz,
 ) -> None:
     """WG2 warp role (warps 8-11): the gradient drain.  Each thread owns one
     key channel d for all 16 tokens.  It reads the dQ accumulator and the four
@@ -3550,7 +3562,7 @@ def compute2_warp_group(
             bars.mb_dgate_tmastg_ready[dgate_stage].arrive()
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         chunk_serial_base += num_compute_chunks
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
     bars.mb_tmem_done[0].arrive()
 
@@ -3582,6 +3594,7 @@ def build_descs_body(
     state_checkpoints: cute.Tensor,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
+    checkpoint_row_base=None,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array. Runs inside the
     prologue kernel after its order pass; warps past the array count fall
@@ -3626,7 +3639,7 @@ def build_descs_body(
         emit_seq_descs(base_dgate, sub8, cu_seqlens, dgate, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 9:
-        emit_checkpoint_seq_descs(base_checkpoint, sub9, cu_seqlens, state_checkpoints, n_batch, checkpoint_every_n, 2, lanes=32)
+        emit_checkpoint_seq_descs(base_checkpoint, sub9, cu_seqlens, state_checkpoints, n_batch, checkpoint_every_n, 2, lanes=32, row_base=checkpoint_row_base)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
 
 
@@ -3661,6 +3674,10 @@ def frost_kda_bprop_prologue(
     mScheduler: cute.Tensor | None,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
+    mItemLimit: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
+    gate_chain_pieces: cutlass.Constexpr[int] = 0,
+    gate_tail: cutlass.Constexpr[bool] = True,
 ) -> None:
     """Two-CTA prologue. Under ``run_order`` this kernel is the first
     work-item-table consumer, so block 0 synthesizes and LPT-orders the uncut table and zeroes both
@@ -3679,6 +3696,11 @@ def frost_kda_bprop_prologue(
             sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
             sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
             n_heads_out = cutlass.Int32(gate.shape[1])
+            n_items = n_heads_out * n_batch
+            if cutlass.const_expr(mItemLimit is not None):
+                if cutlass.const_expr(gate_sms > 0):
+                    gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit, gate_chain_pieces, gate_tail)
+                n_items = cutlass.Int32(mItemLimit[1])
             order_body(
                 True,
                 b_t,
@@ -3686,7 +3708,7 @@ def frost_kda_bprop_prologue(
                 ORDER_ELEMENTS,
                 tidx,
                 n_heads_out,
-                n_heads_out * n_batch,
+                n_items,
                 cu_seqlens,
                 None,
                 mCount,
@@ -3810,6 +3832,10 @@ def prologue(
     scheduler_all: cute.Tensor | None,
     tensormap_workspace: cute.Tensor,
     stream: cuda_driver.CUstream,
+    item_limit_word=None,
+    gate_sms: cutlass.Constexpr[int] = 0,
+    gate_chain_pieces: cutlass.Constexpr[int] = 0,
+    gate_tail: cutlass.Constexpr[bool] = True,
 ):
     """One-launch prologue: synthesize and LPT-order the uncut work items (when ``run_order``) and
     build the 10 per-(batch, head) capped TMA-descriptor arrays into
@@ -3849,6 +3875,10 @@ def prologue(
         scheduler_all,
         cutlass.Int32(batch_size),
         cutlass.Int32(b_t),
+        item_limit_word,
+        gate_sms,
+        gate_chain_pieces,
+        gate_tail,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -3908,6 +3938,7 @@ def host(
             scheduler_counter,
             dstate_scratch,
             scale,
+            cutlass.Int32(0),
         ).launch(
             grid=grid_shape,
             block=(cfg.threads_per_cta, 1, 1),
@@ -3940,8 +3971,10 @@ def frost_kda_bprop(
     mScheduler: cute.Tensor,
     mDstateScratch: cute.Tensor,
     scale: cutlass.Float32,
+    rz_arg: cutlass.Int32,
 ) -> None:
     """BT=16 KDA backward kernel (persistent, 16 warps)."""
+    rz = release_zero(rz_arg)
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
     steep_exit_unless_flagged(cfg, mScheduler)
@@ -4258,6 +4291,7 @@ def frost_kda_bprop(
             sSteepCorr_ptr,
             sSteepDadm_ptr,
             bars,
+            rz,
         )
     elif warp_idx == cfg.tcgen05_mma_warp_id:
         tcgen05_mma_warp(
@@ -4283,6 +4317,7 @@ def frost_kda_bprop(
             sDstate_trans,
             sIntermediate,
             bars,
+            rz,
         )
     elif warp_idx == cfg.epilogue_warp_id:
         epilogue_warp(
@@ -4312,6 +4347,7 @@ def frost_kda_bprop(
             desc_dv_base,
             desc_dgate_base,
             bars,
+            rz,
         )
     elif warp_idx >= cfg.compute_group_0_warp_ids[0] and warp_idx <= cfg.compute_group_0_warp_ids[-1]:
         compute0_warp_group(
@@ -4347,6 +4383,7 @@ def frost_kda_bprop(
             mScheduler,
             mDstateScratch,
             bars,
+            rz,
         )
     elif warp_idx >= cfg.compute_group_2_warp_ids[0] and warp_idx <= cfg.compute_group_2_warp_ids[-1]:
         compute2_warp_group(
@@ -4379,6 +4416,7 @@ def frost_kda_bprop(
             sSteepDadm_ptr,
             scale,
             bars,
+            rz,
         )
     elif warp_idx >= cfg.compute_group_1_warp_ids[0] and warp_idx <= cfg.compute_group_1_warp_ids[-1]:
         compute1_warp_group(
@@ -4409,6 +4447,7 @@ def frost_kda_bprop(
             sDecay_scale_raw,
             sSteepTile_ptr,
             bars,
+            rz,
         )
 
 
@@ -4431,6 +4470,8 @@ class KdaBpropCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    state_head_divisor: int = 1
+    checkpoint_head_divisor: int = 1
     dstate_table: bool = True
     has_composed_dstate: bool = False
     scheduler_stages: int = 8

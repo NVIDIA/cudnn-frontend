@@ -12,7 +12,7 @@ from cutlass.experimental import primitives as prims
 import cuda.bindings.driver as cuda
 
 from cudnn.sdpa.fwd.kernels.sm120._common import ceil_div
-from cudnn.sdpa.fwd.kernels.sm120.prefill_f16 import (
+from cudnn.sdpa.fwd.kernels.sm120.f16_general.kernel import (
     SM120FusedMultiHeadAttentionForward,
     fmul2,
 )
@@ -361,6 +361,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 physical_idx * self.kv_tile,
                 is_v=False,
                 envelope=False,
+                pool=mK,
+                page_table=None,
+                seqlen_k=seqlen_k,
             )
             self.load_one_kv_tile(
                 sV,
@@ -371,6 +374,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 physical_idx * self.kv_tile,
                 is_v=True,
                 envelope=False,
+                pool=mV,
+                page_table=None,
+                seqlen_k=seqlen_k,
             )
 
             # Four-fold unrolling reduces loop-control issue overhead while
@@ -393,6 +399,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                     physical_idx * self.kv_tile,
                     is_v=False,
                     envelope=False,
+                    pool=mK,
+                    page_table=None,
+                    seqlen_k=seqlen_k,
                 )
 
                 prims.barrier_cta_sync(
@@ -408,6 +417,9 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                     physical_idx * self.kv_tile,
                     is_v=True,
                     envelope=False,
+                    pool=mV,
+                    page_table=None,
+                    seqlen_k=seqlen_k,
                 )
 
             prims.barrier_cta_sync(
@@ -442,6 +454,7 @@ class BlockSparseAttnForwardSm120Blk128Fa4(SM120FusedMultiHeadAttentionForward):
                 o_regs[i] = 0.0
 
             basic_params = SimpleNamespace(
+                bias=None,
                 phase_base=cutlass.Int32(0),
                 pipeline_threads=pipeline_threads,
                 seqlen_q=seqlen_q,

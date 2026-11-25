@@ -4,7 +4,7 @@
 TILE_N 64, as a measured lever.
 
 With two S / P slots per softmax sub-tile the MMA warp issues BMM1(k + 1) of both sub-tiles into the free slot AHEAD of BMM2(k), so the tensor
-core runs it while the softmax warps are still on S(k) (``sm107/prefill_d128_f16.py`` at ``d_flavor`` 32 / 64; the ``sm100/decode_d128_f16.py``
+core runs it while the softmax warps are still on S(k) (``sm107/d128_f16_multi_q/kernel.py`` at ``d_flavor`` 32 / 64; the ``sm100/d128_f16_single_q/kernel.py``
 two-slot precedent).  Every role walks a depth-2 ``PipelineState`` cursor over the slots, advanced once per non-empty kv tile; the same MMAs and
 softmax steps run in the same order, so O and Stats are BITWISE the one-slot kernel's -- a pure overlap lever.  The switch is a TemplateParams
 FIELD (appended, default 1; the knob-less pick ``config_sm107.sm107_s_slots_pick`` is the MEASURED rule: 2 on the plain body at TILE_N 64, 1 on

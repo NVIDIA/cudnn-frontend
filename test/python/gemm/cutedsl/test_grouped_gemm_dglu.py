@@ -94,6 +94,7 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
     from cudnn.gemm.cutedsl.grouped.dglu import _blockscaled_api as blockscaled_module
 
     api = object.__new__(GroupedGemmDgluBlockScaledAPI)
+    api.glu_layout = "interleaved_32"
     api._logger = Mock()
     api._get_default_stream = lambda stream: stream
     api._runtime_error_if = lambda condition, message: None
@@ -2800,7 +2801,7 @@ def test_grouped_gemm_dglu_deterministic_unsupported(request):
         _run_dglu_case(case, deterministic=True, generate_dbias=True)
 
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=False, b_major="k")
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(NotImplementedError, match="without dbias"):
         cudnn.grouped_gemm_dglu_wrapper_sm100(
             a_tensor=problem["a"],
             c_tensor=problem["c"],
@@ -2812,6 +2813,7 @@ def test_grouped_gemm_dglu_deterministic_unsupported(request):
             dprob_tensor=problem["dprob"],
             b_tensor=problem["b"],
             sfb_tensor=None,
+            generate_dbias=True,
             d_dtype=torch.bfloat16,
             deterministic=True,
         )

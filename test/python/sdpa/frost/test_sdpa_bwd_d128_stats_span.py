@@ -42,8 +42,8 @@ def test_hn_stats_span_graph_and_standalone_boundary(monkeypatch, heads, boundar
     assert value is not None and value.thd
     observed = reason(value)
     assert observed is None if accepted else "Stats span" in observed and "signed pointer" in observed
-    plans = recommend("A", value, {"sdpa_bwd_sm100_d128": 20609})
-    assert (len(plans) == 1 and plans[0].engine_id == 20609) == accepted
+    plans = recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630})
+    assert (len(plans) == 1 and plans[0].engine_id == 20630) == accepted
     geometry = {name.lower(): (dim, stride) for name, dim, stride in value.port_layouts}
     geometry["stats"] = value.stats_t.get_dim(), value.stats_t.get_stride()
     samples = {

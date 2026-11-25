@@ -60,6 +60,31 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
 | Blackwell (Consumer) <br /> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes | d &lt;= 128 |
 
 
+### FROST support matrix (python engines, FP16 / BF16)
+
+FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_*`, `sdpa_bwd_*`) that the frontend ranks beside the cuDNN backend plans; a graph every FROST row declines runs on the backend. The table covers the FP16 / BF16 rows for dense, padded (dense inputs with `use_padding_mask`) and ragged (THD) graphs; the FP8 / MXFP8 rows are documented with their kernels under `docs/operations/attention/`. Head dims are the native tiles; smaller multiples of 8 ride the next envelope. The per-architecture eligibility record is the [FROST support index](https://github.com/NVIDIA/cudnn-frontend/blob/develop/python/cudnn/sdpa/frost/support/README.md) and its pages.
+
+| Arch | Fprop | Bprop | Deterministic bprop⁶ | Padded | Ragged (THD) | Head dim |
+|-----------|-------------|-------------|-------------|-------------|-------------|------|
+| Ampere A100 (cc 8.0) | Yes | Yes | Yes | Fprop, bprop | Fprop, bprop | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 256 (d_qk = 192, d_vo = 128) |
+| Ampere GA10x (cc 8.6)⁷ | Yes | d &lt;= 128 | d &lt;= 128 | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop d &lt;= 128 |
+| Ada AD10x (cc 8.9)⁷ | Yes | Yes | Yes | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop as cc 8.0 (`sdpa_bwd_sm89`) |
+| Hopper (cc 9.0) | Yes | d = 64, 128 (opt-in)¹⁰ | d = 64, 128 (opt-in)¹⁰ | Fprop (d &gt; 64) | Fprop (d &gt; 64) | Fprop d &lt;= 512; bprop d = 64, 128 |
+| Blackwell B200 / B300 (cc 10.0, 10.3)⁸ | Yes | Yes | Yes | Fprop | Fprop; bprop d &gt;= 128 (deterministic: d_qk &gt;= 192) | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 (d_qk = 192, d_vo = 128) |
+| Thor (SM110, cc 11.0)⁹ | Yes | Yes | Yes | Fprop | As cc 10.0 / 10.3 | As cc 10.0 / 10.3 |
+| SM107 (cc 10.7)⁸ | Yes | Yes | d &lt;= 128 (d_qk = 192, d_vo = 128) | Fprop | Fprop; bprop d &lt;= 256 (deterministic: d_qk = 192, d_vo = 128) | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 (d_qk = 192, d_vo = 128) |
+| Blackwell consumer (cc 12.0) | Yes | Yes | Yes (THD: d = 512) | Fprop, bprop | Fprop, bprop | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 |
+
+⁶ `use_deterministic_algorithm=True`: the rows listed produce bitwise identical gradients across runs. FROST fprop plans are bitwise repeatable; FROST bprop plans without the flag are not (atomic dQ accumulation).
+
+⁷ cc 8.6 / 8.9 run the SM80 kernels under their smaller per-CTA shared-memory budget: the d = 256 prefill runs its 32-key tile. On cc 8.6 the d = 128 backward runs single-buffered Q / dO without the dQ staging tile and the (192, 128) and 256 backward envelopes decline; on cc 8.9 backward is served by the `sdpa_bwd_sm89` rows (32x32 tiles above d = 128). The rows rank after the backend plans.
+
+⁸ The cc 10.x FROST bprop rows take BSHD-physical Q / K / V / O / dO / dQ / dK / dV (BHSD-physical only through the d = 512 row) and do not serve `use_padding_mask` with dense inputs. The ragged (192, 128) rows (`sdpa_bwd_sm100_d192`, `sdpa_bwd_sm107_d192`) are opt-in (`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`).
+
+⁹ Thor is served by the SM100-line rows (the kernels compile for `sm_110a`); they rank after the backend plans.
+
+¹⁰ `sdpa_bwd_sm90` is offered only with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`: exact (64, 64) and (128, 128), FP16 / BF16, dense compact BSHD storage, no padding mask or THD. The default and the deterministic request run the same chain and return identical bytes.
+
 ### Glossary
 ¹ Interleaved q,k,v tensors. Generally they have layouts as BS3HD, B3SHD.
 
@@ -113,7 +138,7 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
       ```
 
   - Dimensions: $[B=2, H=1, S=8, D=64]$ (S is still max sequence length)
-  - Strides: $[512, 64, 64, 1]$ (strides unchanged, but ignored for ragged)
+  - Strides: $[512, 64, 64, 1]$ (the batch stride is ignored for ragged; head, sequence and feature strides still address storage)
   - **Ragged offset:** $[0, 2 \times H \times D, 5 \times H \times D] = [0, 128, 320]$
 
   &nbsp;&nbsp;&nbsp;&nbsp; *Partially Packed Layout:*<br />
@@ -380,6 +405,7 @@ graph.sdpa(
 - `unfuse_fma` (Optional[bool]): Use unfused mul/add in the softmax computation.
 - `softmax_precision` (Optional[cudnn.data_type]): Precision of the softmax exponent and probability path. `None` (the default) is the f32 pipeline every engine runs and leaves the engine choice open. `HALF` asks for the f16x2 exponent arm of the FROST FP8 and MXFP8 forward engines on cc 10.7 (head-dim flavors 128, 192x128, 256 and 512): the exponent runs on packed f16 pairs and P is cast from f16 straight to the FP8 pair format, halving the transcendental work of the softmax warps. Numerics-changing (P moves by about one f16 ulp of the exponent), so it is an op attribute rather than a tuning knob: the cuDNN backend has no field for it, a set value keeps the graph on the python engines (`serialize()` and `key()` refuse it), and an engine without the arm declines instead of degrading. An explicit `FLOAT` is also a set value: it selects the f32 pipeline on the python engines only, so omit the attribute unless that is intended. `stats`, when requested, always come from the exact f32 row sum; on the d256 and d512 FP8 / MXFP8 kernels (which normalize O with a register row sum) a HALF forward without `stats` normalizes O with an f16 pair sum of the stored probabilities instead, so on those flavors O under HALF is not bit-identical with and without `generate_stats` (both within the family bound; d128, d192x128 and the FLOAT pipeline are unaffected). Forward only: `sdpa_backward` declines it. The f16 arm rounds the exponent argument to f16 before the FP8 cast of P, so a probability within one f16 rounding step of an FP8 code midpoint can land one code away from the f32 pipeline's (one E5M2 code is a 25 % step, one E4M3 code 12.5 %); on O that is at most one code step of that key's weight times its V -- rare, bounded, and budgeted by the FP8 test harnesses like the f32 pipeline's own midpoint flips.
 - `attn_scale_prefolded` (Optional[bool]): Declares that Q was already multiplied by `attn_scale * log2(e)` (before quantization for FP8 / MXFP8 inputs), so the engine applies no softmax scale; `attn_scale` must stay unset. Served by the FROST MXFP8 and f16/bf16 forward engines on cc 10.7 (head-dim flavors 128, 192x128, 256 and 512; not over paged KV; not on per-tensor FP8, whose kernels fold the descale factors into the softmax scale). `stats` keep their usual form. On a graph without `stats`, `attn_scale_prefolded=True` together with `softmax_precision=HALF` fuses the per-score shift and the f32-to-f16 convert into one instruction per pair (measured 6-7 % faster on the d128 MXFP8 kernel at 32k context). `False` (or `0`) is the default and counts as unset. Forward only: `sdpa_backward` declines it.
+- `causal_exclude_own_block` (Optional[int], `sdpa_mxfp8` only; `None` or `0` = plain causal): Tightens the causal mask so that query `i` reads only keys `j < B * floor(i / B)`, i.e. it also drops the query's own aligned block of `B` keys; rows `0 .. B-1` read no key (`O = 0`, `stats = -inf`). With `B = 32`, the MXFP8 V scale block, every columnwise V scale the kernel reads covers fully visible tokens only, so no later token can change how an earlier visible value is rounded ([TransformerEngine#3248](https://github.com/NVIDIA/TransformerEngine/issues/3248)). This is the completed-block half of causal MXFP8 attention whose P·V stays MXFP8: the caller computes the query's own block separately (for example with token-local V scales) and merges the two partials through their `stats`. Requires a causal mask (`use_causal_mask=True` or `diagonal_band_right_bound=0`, top-left or square bottom-right) without a sliding window. Served by the FROST SM100 MXFP8 forward engine on cc 10.0 / 10.3 at `B = 32` and D = 128, dense, unpadded and unpaged, including its split-KV and PackGQA plans; a top-left graph with `S_q > S_kv` and `S_kv` not a multiple of 128 declines it, as does every other engine. That engine is otherwise opt-in (`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`), but a graph that sets this attribute is offered it without the flag, since nothing else can serve the graph. Numerics-changing, so it is an op attribute: the cuDNN backend has no field for it and a set value keeps the graph on the python engines. Forward only: `sdpa_mxfp8_backward` declines it.
 - `compute_data_type` (Optional[cudnn.data_type]): Data type for internal computation.
 - `name` (Optional[str]): Name for the operation.
 
@@ -414,6 +440,15 @@ graph.sdpa(
   - Causal mask (bottom-right): `diagonal_alignment=BOTTOM_RIGHT`, `right_bound=0`
   - Sliding window: Set `left_bound` to window size
   - Band attention: Set both `left_bound` and `right_bound`
+
+The legacy `use_causal_mask=True` flag selects top-left causal masking. Combining
+it with `diagonal_alignment=BOTTOM_RIGHT` raises an error in every SDPA forward
+and backward API, including FP8 and MXFP8. For bottom-right causal masking, use
+`use_causal_mask_bottom_right=True`, or set the right band bound to zero with
+`diagonal_alignment=BOTTOM_RIGHT`. The bound is named `diagonal_band_right_bound`
+on `sdpa`, `sdpa_backward`, and `sdpa_mxfp8`, and `right_bound` on `sdpa_fp8`,
+`sdpa_fp8_backward`, and `sdpa_mxfp8_backward`. An alignment alone, without a band
+or causal flag, does not enable masking.
 
 - **Paged attention**: Enables non-contiguous K/V caches to reduce memory fragmentation. See the [PagedAttention paper](https://arxiv.org/abs/2309.06180).
   - **Requirements**:
@@ -494,10 +529,10 @@ pair alone, these engines serve any combination of the three. See
 #### Limitations
 
 - Head dimension must be a multiple of 8.
-- Q, K, V and O (and dO, dQ, dK, dV in backward) must meet the tensor's declared alignment, 16 bytes by default. If a non-unit stride is not a whole number of alignments in bytes, the native lowering declines the graph. If a device pointer is misaligned, `execute` refuses it before launching. Without these checks, the native kernels returned wrong output on SM90/SM100 and faulted on SM80/SM89 ([#1571](https://github.com/NVIDIA/cudnn-frontend/issues/1571)).
+- Q, K, V and O (and dO, dQ, dK, dV in backward) must meet the tensor's declared alignment, 16 bytes by default. If an addressed non-unit stride is not a whole number of alignments in bytes, the native lowering declines the graph. For an operand with a ragged-offset tensor, offsets replace the batch stride, so that unused stride is exempt at build time and in runtime shape overrides; its head and sequence strides remain checked. The caller must still provide aligned sequence starts through the ragged offsets. If a device pointer is misaligned, `execute` refuses it before launching. Without these checks, the native kernels returned wrong output on SM90/SM100 and faulted on SM80/SM89 ([#1571](https://github.com/NVIDIA/cudnn-frontend/issues/1571)).
 - ALiBi requires causal masking (`diagonal_band_right_bound=0`).
 - Block masking is only supported with the UNIFIED implementation.
-- Ampere/Ada architectures are limited to head dimensions up to 256 for prefill, 128 for decode and backward.
+- Ampere/Ada architectures are limited to head dimensions up to 256 for prefill, 128 for decode and backward. On SM89 (Ada), the FROST `sdpa_bwd_sm89` engine serves FP16/BF16 backward up to head dimension 256 when the backend declines the graph.
 
 #### Fused epilogue gate (FROST, SM107)
 
@@ -1528,6 +1563,8 @@ Always deterministic on all architectures
 SM100 - Deterministic requires cuDNN backend version 9.19.0 or later.
 SM80 and SM120 do not support deterministic algorithm with ragged input tensor.
 SM90 - Determinism is supported.
+
+FROST plans: fprop is bitwise repeatable on every architecture; `use_deterministic_algorithm=True` selects the FROST bprop rows of the FROST support matrix above.
 
 
 
