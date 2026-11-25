@@ -894,7 +894,7 @@ class MoEGroupedGemmBf16KernelSm90:
                 if ab_producer_state.count < k_tile_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
 
-                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
                     tBgB_k = tBgB_slice[(None, ab_producer_state.count)]
                     tAsA_pipe = tAsA[(None, ab_producer_state.index)]
@@ -1030,7 +1030,7 @@ class MoEGroupedGemmBf16KernelSm90:
                 warpgroup.fence()
 
                 prologue_mma_cnt = cutlass.min(k_pipe_mmas, k_tile_cnt)
-                for _k_tile in cutlass.range(0, prologue_mma_cnt, 1, unroll=1):
+                for _ in cutlass.range(0, prologue_mma_cnt, 1, unroll=1):
                     ab_pipeline.consumer_wait(ab_consumer_read_state)
                     for kblock_idx in cutlass.range_constexpr(num_k_blocks):
                         kblock_coord = (None, None, kblock_idx, ab_consumer_read_state.index)
@@ -1039,7 +1039,7 @@ class MoEGroupedGemmBf16KernelSm90:
                     warpgroup.commit_group()
                     ab_consumer_read_state.advance()
 
-                for _k_tile in cutlass.range(prologue_mma_cnt, k_tile_cnt, 1, unroll=1):
+                for _ in cutlass.range(prologue_mma_cnt, k_tile_cnt, 1, unroll=1):
                     ab_pipeline.consumer_wait(ab_consumer_read_state)
                     for kblock_idx in cutlass.range_constexpr(num_k_blocks):
                         kblock_coord = (None, None, kblock_idx, ab_consumer_read_state.index)
@@ -1054,7 +1054,7 @@ class MoEGroupedGemmBf16KernelSm90:
                     # All of this tile's WGMMAs are issued: the other warp group's mainloop may start.
                     mma_turn_next.arrive()
                 warpgroup.wait_group(0)
-                for _k_tile in cutlass.range(0, prologue_mma_cnt, 1, unroll=1):
+                for _ in cutlass.range(0, prologue_mma_cnt, 1, unroll=1):
                     ab_pipeline.consumer_release(ab_consumer_release_state)
                     ab_consumer_release_state.advance()
 
