@@ -26,8 +26,6 @@ _LAZY_EXPORTS = {
     "ragged_grouped_gemm_backward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_backward"),
     "dense_gemm_forward": ("cudnn.gemm.cake.dense", "dense_gemm_forward"),
     "dense_gemm_backward": ("cudnn.gemm.cake.dense", "dense_gemm_backward"),
-    "gemm_glu_forward": ("cudnn.gemm.cutedsl.dense.glu.api", "gemm_glu_forward"),
-    "gemm_glu_forward_jax": ("cudnn.gemm.cutedsl.dense.glu.jax_api", "gemm_glu_forward_jax"),
     "swiglu_quantize_forward": ("cudnn.gemm.cake.gated_act_mxfp8", "swiglu_quantize_forward"),
     "swiglu_quantize_backward": ("cudnn.gemm.cake.gated_act_mxfp8", "swiglu_quantize_backward"),
     "gated_rmsnorm_forward": ("cudnn.norm.cake.gated_rmsnorm", "gated_rmsnorm_forward"),

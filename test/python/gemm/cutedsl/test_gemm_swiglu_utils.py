@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Utilities and parameterization for GEMM GLU tests.
+Utilities and parameterization for GEMM SwiGLU tests.
 Contains test configuration fixtures, tensor creation, and reference implementations.
 """
 
@@ -22,7 +22,7 @@ from gemm.graph.test_low_precision_matmul import (
     float4_e2m1fn_x2_to_float32,
 )
 
-GEMM_GLU_PARAM_MARKS = [
+GEMM_SWIGLU_PARAM_MARKS = [
     pytest.mark.parametrize("a_major", ["k", "m"]),
     pytest.mark.parametrize("b_major", ["k", "n"]),
     pytest.mark.parametrize("c_major", ["m", "n"]),
@@ -78,13 +78,13 @@ GEMM_GLU_PARAM_MARKS = [
 ]
 
 
-def with_gemm_glu_params(func):
-    for mark in reversed(GEMM_GLU_PARAM_MARKS):
+def with_gemm_swiglu_params(func):
+    for mark in reversed(GEMM_SWIGLU_PARAM_MARKS):
         func = mark(func)
     return func
 
 
-GEMM_GLU_QUANT_PARAM_MARKS_FP4 = [
+GEMM_SWIGLU_QUANT_PARAM_MARKS_FP4 = [
     pytest.mark.parametrize("a_major", ["k"]),
     pytest.mark.parametrize("b_major", ["k"]),
     pytest.mark.parametrize("c_major", ["n"]),
@@ -136,7 +136,7 @@ GEMM_GLU_QUANT_PARAM_MARKS_FP4 = [
     pytest.mark.parametrize("vector_f32", [True, False]),
 ]
 
-GEMM_GLU_QUANT_PARAM_MARKS_FP8 = [
+GEMM_SWIGLU_QUANT_PARAM_MARKS_FP8 = [
     pytest.mark.parametrize("a_major", ["k", "m"]),
     pytest.mark.parametrize("b_major", ["k", "n"]),
     pytest.mark.parametrize("c_major", ["m", "n"]),
@@ -186,19 +186,19 @@ GEMM_GLU_QUANT_PARAM_MARKS_FP8 = [
 ]
 
 
-def with_gemm_glu_quant_params_fp4(func):
-    for mark in reversed(GEMM_GLU_QUANT_PARAM_MARKS_FP4):
+def with_gemm_swiglu_quant_params_fp4(func):
+    for mark in reversed(GEMM_SWIGLU_QUANT_PARAM_MARKS_FP4):
         func = mark(func)
     return func
 
 
-def with_gemm_glu_quant_params_fp8(func):
-    for mark in reversed(GEMM_GLU_QUANT_PARAM_MARKS_FP8):
+def with_gemm_swiglu_quant_params_fp8(func):
+    for mark in reversed(GEMM_SWIGLU_QUANT_PARAM_MARKS_FP8):
         func = mark(func)
     return func
 
 
-def gemm_glu_init(
+def gemm_swiglu_init(
     request,
     a_major,
     b_major,
@@ -221,10 +221,10 @@ def gemm_glu_init(
     if not has_tcgen05(major):
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
 
-    mnkl_str = request.config.getoption("--gemm-glu-mnkl", default=None)
-    mma_tiler_str = request.config.getoption("--gemm-glu-mma-tiler", default=None)
-    cluster_shape_str = request.config.getoption("--gemm-glu-cluster-shape", default=None)
-    alpha_opt = request.config.getoption("--gemm-glu-alpha", default=None)
+    mnkl_str = request.config.getoption("--gemm-swiglu-mnkl", default=None)
+    mma_tiler_str = request.config.getoption("--gemm-swiglu-mma-tiler", default=None)
+    cluster_shape_str = request.config.getoption("--gemm-swiglu-cluster-shape", default=None)
+    alpha_opt = request.config.getoption("--gemm-swiglu-alpha", default=None)
     skip_ref = request.config.getoption("--skip-ref", default=False)
 
     if mnkl_str is not None:
@@ -278,16 +278,7 @@ def get_dtype_rcp_limits(dtype: torch.dtype) -> float:
     return 1.0
 
 
-def glu_ref(up, gate, act_func="swiglu", linear_offset=None, geglu_alpha=1.702, glu_clamp_max=7.0, glu_clamp_min=-7.0):
-    if act_func == "swiglu":
-        return up * (gate * torch.sigmoid(gate))
-    assert act_func == "geglu"
-    gate = gate.clamp(max=glu_clamp_max)
-    up = up.clamp(min=glu_clamp_min, max=glu_clamp_max)
-    return (up + (1.0 if linear_offset is None else linear_offset)) * gate * torch.sigmoid(geglu_alpha * gate)
-
-
-def run_gemm_glu_quant_ref(
+def run_gemm_swiglu_quant_ref(
     a_ref,
     b_ref,
     sfa_ref,
@@ -299,7 +290,6 @@ def run_gemm_glu_quant_ref(
     c_dtype,
     sfc_dtype,
     sf_vec_size,
-    **glu,
 ):
     res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
     res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
@@ -318,7 +308,7 @@ def run_gemm_glu_quant_ref(
     gate_idx = block_cols[1::2].reshape(-1)
     ref_input = ab12_ref.index_select(1, input_idx)
     ref_gate = ab12_ref.index_select(1, gate_idx)
-    c_ref = glu_ref(ref_input, ref_gate, **glu)
+    c_ref = ref_input * (ref_gate * torch.sigmoid(ref_gate))
 
     amax_ref = None
     sfc_ref = None
@@ -369,7 +359,8 @@ def run_gemm_glu_quant_ref(
     return ab12_ref_ret, c_ref, sfc_ref, amax_ref
 
 
-def run_gemm_glu_ref(a_ref, b_ref, alpha, **glu):
+def run_gemm_swiglu_ref(a_ref, b_ref, alpha):
+    ab12_ref, c_ref = None, None
     if a_ref.dtype in {torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2}:
         ab12_ref = alpha * torch.einsum("mkl,nkl->mnl", (a_ref).cpu(), (b_ref).cpu())
     else:
@@ -385,7 +376,7 @@ def run_gemm_glu_ref(a_ref, b_ref, alpha, **glu):
     block_cols = cols.view(num_blocks, group)
     input_idx = block_cols[0::2].reshape(-1)
     gate_idx = block_cols[1::2].reshape(-1)
-    c_ref = glu_ref(ab12_ref.index_select(1, input_idx), ab12_ref.index_select(1, gate_idx), **glu)
+    c_ref = ab12_ref.index_select(1, input_idx) * (ab12_ref.index_select(1, gate_idx) * torch.sigmoid(ab12_ref.index_select(1, gate_idx)))
     c_ref = c_ref.to(torch.float32)
 
     return ab12_ref, c_ref
@@ -474,20 +465,19 @@ def _tf32_reference(enabled: bool):
         setattr(matmul, name, previous)
 
 
-def check_ref_gemm_glu(
+def check_ref_gemm_swiglu(
     a: torch.Tensor,
     b: torch.Tensor,
     ab12: torch.Tensor,
     c: torch.Tensor,
     alpha: float = 1.0,
     skip_ref: bool = False,
-    **glu,
 ):
     if not skip_ref:
         a_ref = a.clone().to(torch.float32)
         b_ref = b.clone().to(torch.float32)
         with _tf32_reference(a.dtype == torch.float32):
-            ab12_ref, c_ref = run_gemm_glu_ref(a_ref, b_ref, alpha, **glu)
+            ab12_ref, c_ref = run_gemm_swiglu_ref(a_ref, b_ref, alpha)
 
         is_ab12_fp8 = ab12.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}
         if is_ab12_fp8:
@@ -512,8 +502,6 @@ def check_ref_gemm_glu(
             else:
                 torch.testing.assert_close(c.cpu(), c_ref.to(c.dtype), atol=0.01, rtol=9e-03)
         except AssertionError:
-            if glu.get("act_func", "swiglu") != "swiglu":
-                raise
             import json
 
             try:
@@ -527,7 +515,7 @@ def check_ref_gemm_glu(
         print("Skipping reference check")
 
 
-def check_ref_gemm_glu_quant(
+def check_ref_gemm_swiglu_quant(
     a: torch.Tensor,
     a_ref: torch.Tensor,
     b: torch.Tensor,
@@ -542,7 +530,6 @@ def check_ref_gemm_glu_quant(
     sf_vec_size: int = 16,
     alpha: float = 1.0,
     skip_ref: bool = False,
-    **glu,
 ):
     if skip_ref:
         print("Skipping reference check")
@@ -557,7 +544,7 @@ def check_ref_gemm_glu_quant(
     sfb_ref = sfb_ref.float().cpu()
     norm_const_ref = norm_const_ref.float().cpu() if norm_const_ref is not None else None
     sfc_dtype = sfc.dtype if sfc is not None else None
-    ab12_ref, c_ref, sfc_ref, amax_ref = run_gemm_glu_quant_ref(
+    ab12_ref, c_ref, sfc_ref, amax_ref = run_gemm_swiglu_quant_ref(
         a_ref,
         b_ref,
         sfa_ref,
@@ -569,7 +556,6 @@ def check_ref_gemm_glu_quant(
         c_dtype,
         sfc_dtype,
         sf_vec_size,
-        **glu,
     )
 
     if ab12.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:

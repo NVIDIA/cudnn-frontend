@@ -190,9 +190,9 @@ navigation:
               - page: GEMM + sReLU (SM100)
                 path: ../../operations/gemm_fusions/gemm_srelu.md
                 slug: gemm_srelu
-              - page: GEMM + GLU (SM100)
-                path: ../../operations/gemm_fusions/gemm_glu.md
-                slug: gemm_glu
+              - page: GEMM + SwiGLU (SM100)
+                path: ../../operations/gemm_fusions/gemm_swiglu.md
+                slug: gemm_swiglu
               - page: Grouped GEMM (SM100 BF16)
                 path: ../../operations/gemm_fusions/grouped_gemm.md
                 slug: grouped_gemm
