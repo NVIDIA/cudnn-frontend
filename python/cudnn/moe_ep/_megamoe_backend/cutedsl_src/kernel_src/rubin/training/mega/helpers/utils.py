@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -50,6 +50,26 @@ def zero_unless_equal(
             ip=ip,
         )
     )
+
+
+def bf16x2_fma_f32x2(
+    a: Tuple[cutlass.BFloat16, cutlass.BFloat16],
+    b: Tuple[Float32, Float32],
+    c: Tuple[Float32, Float32],
+) -> Tuple[Float32, Float32]:
+    """``d = a * b + c`` per lane, ``a`` a bf16 pair, ``b``/``c``/``d`` f32 pairs: one FHFMA2.
+
+    ``fma.rn.f32x2.bf16x2.f32x2.f32x2 d, a, b, c`` (PTX ISA 9.4, sm_107f+) widens the bf16 pair
+    and does the per-lane f32 FMA in a single instruction, replacing the per-element
+    bf16->f32 unpack (PRMT + IMAD.U32 per pair) plus an FMUL2/FFMA2. The widen is exact, so
+    with ``c == (0.0, 0.0)`` the result is bit-identical to cvt + FMUL2 except that an
+    exactly-zero product with negative sign comes out as +0.0.
+
+    Caveats (ptxas 13.4-13.6): a zero ``c`` must be +0.0, not -0.0 -- a -0.0 immediate addend
+    is mis-encoded (Mercury validator failure at assembly); and ``b == 1.0`` is folded back
+    into the two unpack ops, so a plain widen should stay ``.to(Float32)``.
+    """
+    return cute.arch.fma_packed_f32x2_bf16x2_f32x2_f32x2(a, b, c)
 
 
 @cute.jit
@@ -204,12 +224,17 @@ def dswiglu_act(
     """
     dprob_acc = Float32(0.0)
     for i in cutlass.range_constexpr(0, cute.size(t_acc), 2):
-        gate_raw = cute.arch.mul_packed_f32x2(
-            (t_gate[i], t_gate[i + 1]), (beta_val, beta_val), rnd="rn", ftz=False,
-        )
-        up_raw = cute.arch.mul_packed_f32x2(
-            (t_up[i], t_up[i + 1]), (beta_val, beta_val), rnd="rn", ftz=False,
-        )
+        if cutlass.const_expr(t_gate.element_type is cutlass.BFloat16):
+            # c = +0.0 (not -0.0, see bf16x2_fma_f32x2): pure widen + beta scale.
+            gate_raw = bf16x2_fma_f32x2((t_gate[i], t_gate[i + 1]), (beta_val, beta_val), (0.0, 0.0))
+            up_raw = bf16x2_fma_f32x2((t_up[i], t_up[i + 1]), (beta_val, beta_val), (0.0, 0.0))
+        else:
+            gate_raw = cute.arch.mul_packed_f32x2(
+                (t_gate[i], t_gate[i + 1]), (beta_val, beta_val), rnd="rn", ftz=False,
+            )
+            up_raw = cute.arch.mul_packed_f32x2(
+                (t_up[i], t_up[i + 1]), (beta_val, beta_val), rnd="rn", ftz=False,
+            )
         gate_b = gate_raw
         up_b = up_raw
         if cutlass.const_expr(gate_up_clamp is not None):

@@ -3,24 +3,34 @@
 
 """Example 00: plain decode of the dense Qwen 3.5-architecture model in one process: text in, text out.
 
-The default run needs no checkpoint and no extra package: it builds the model at its published layer widths with two layers
-and seeded weights, prints which provider serves every block, feeds one seeded prompt per sequence through the decode step,
-decodes 32 tokens greedily at 1 and at 4 sequences, and checks the whole path against a plain-PyTorch reference that
-accumulates in fp64 (replay, every provider block teacher-forced, the greedy tokens, each sequence alone against the same
-sequence in the batch).  It prints ``[00] PASS``, or ``[00] SKIP <requirement>`` with exit code 0 on a GPU, a library version
-or a free-memory budget it does not serve.  Every sequence count of a run is planned before anything is loaded, so a SKIP
-comes before the first load or not at all.
+The sample's stack is ``native``: every block of a decode step is a kernel entry of cuDNN Frontend or a call of a kernel
+library, FlashInfer, on the stored weights.  It is the default of every run, with or without a checkpoint, and its
+decode step is recorded once as a launch sequence and replayed for every token: one launch and one host read per
+token, with no Python between the blocks.  A package the stack calls that is not installed stops the run before
+anything is loaded -- ``[00] ERROR``, one line that names the package and the command that installs it, exit code 1;
+no other stack takes its place.
+
+The default run needs no checkpoint: it builds the model at its published layer widths with two layers and seeded
+weights, prints which provider serves every block, records the step, feeds one seeded prompt per sequence through it,
+decodes 32 tokens greedily at 1 and at 4 sequences, and checks the whole path: the replayed steps launched again from
+Python, ids and logits byte for byte; then, against a plain-PyTorch reference that accumulates in fp64, every provider
+block teacher-forced, the greedy tokens, each sequence alone against the same sequence in the batch; and the kernels of
+the traced steps against the plan.  It prints ``[00] PASS``, or ``[00] SKIP <requirement>`` with exit code 0 on a GPU, a
+library version or a free-memory budget it does not serve.  Every sequence count of a run is planned before anything
+is loaded, so a SKIP comes before the first load or not at all.
 
 With ``--model DIR`` it runs a checkpoint from local disk (nothing is downloaded): the checkpoint's own tokenizer and chat
 template turn ``--prompt`` or ``--messages`` into token ids, the model decodes greedily to the end token or to
-``--max-tokens``, and the same checks run on the first steps of every prompt.  That needs the packages of
-``samples/models/requirements.txt``, the checkpoint on local disk (your own download) and a GPU with room for a bf16 copy
-of every weight: about 57 GiB free for the 27B checkpoint.
+``--max-tokens``, and the same checks run on the first steps of every prompt: the replayed steps are launched again
+from Python from the first prompt position through the first eight steps that feed on their own token and across the
+first page boundary of the attention cache, and the blocks are judged on the first 16 steps.  That needs the packages
+of ``samples/models/requirements.txt``, the checkpoint on local disk (your own download) and a GPU with room for the
+weights as the stack holds them: about 28 GiB free for the 27B checkpoint on compute capability 10.0.
 
-Coming from a serving engine: ``--messages`` takes the request body a chat client sends, from a file or from standard input
+A request and its options: ``--messages`` takes the request body a chat client sends, from a file or from standard input
 (``-``).  Every field of it is answered -- read, printed, accepted at the value at which it changes nothing, or refused by
 name because it would change the output (``serving_options.py`` beside this script has the rules).  ``--max-tokens`` and
-``--max-model-len`` mean what they mean there: the limit of new tokens of a request, and the positions a prompt and its new
+``--max-model-len`` are the limit of new tokens of a request, and the positions a prompt and its new
 tokens share.  The generated text of sequence 0 goes to standard output as it is generated (``--no-stream``: once, after the
 report; ``--text-out FILE``: into a file); every other line of a run -- the ``[00]`` lines, the tables, the report, the
 checks -- goes to standard error, so the text can be piped.  A request gets one text: with a list of sequence counts it
@@ -30,9 +40,9 @@ and no queue: one process, one fixed set of sequences.
 
     python samples/models/qwen_dense/00_decode.py
     python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
+    python samples/models/qwen_dense/00_decode.py --no-capture             # the same stack, every block launched from Python
+    python samples/models/qwen_dense/00_decode.py --stack fe-entries       # a functional-validation stack: no package beyond cuDNN Frontend and PyTorch
     python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: reports RAN, never PASS
-    python samples/models/qwen_dense/00_decode.py --check-kernels          # also: every launch of the traced steps against the plan
-    python samples/models/qwen_dense/00_decode.py --stack native           # the target kernel set, as far as it is served here
 
     pip install -r samples/models/requirements.txt                         # only for a checkpoint; brings the hf command
     hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4   # your own step: the sample fetches nothing
@@ -40,29 +50,45 @@ and no queue: one process, one fixed set of sequences.
     python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages request.json > answer.txt
     python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages - < request.json 2> report.txt
 
-The stack is explicit and never chosen by what is installed.  ``fe-cublas`` is a reference path, not a fast path: the
-linear-attention step runs on cuDNN Frontend's fused kernel, every multiply on cuBLAS over a bf16 copy of the quantised weights,
-the rest in PyTorch, and every launch is issued from Python.  Timings printed here are for orientation only.
+The stack is never chosen by what is installed.  ``native`` runs every block on a kernel that works on the stored
+weights: seven entries of cuDNN Frontend and four calls of FlashInfer, each in the form its row of the provider table
+names.  A block no kernel serves on this GPU class or at this row count stays on its fallback row, and the tables say so
+with the reason; a step with such a block is not recorded, and the run says so in one line and launches from Python.
+The stack always checks its kernels: every launch of the traced steps against the plan, an entry's kernel by name,
+order, count and the launch shape the entry states, a library's kernel by name, order and count, with the kernel the
+library launched printed on the row's line; and the replayed steps against the traced steps launched from Python.
+Four of its rows are the library's: three multiplies on the stored weights, and the attention core, its paged decode
+attention over the paged attention cache.  FlashInfer is a package of this stack
+(``pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt``), and the kernels of
+its attention are precompiled binaries of its kernel-binary package (``samples/models/requirements-flashinfer-cubin.txt``
+names the command).  Without either, on compute capability 10.x, the run stops with ``[00] ERROR`` and names the
+package; with a version this area has not validated it is a ``SKIP`` before anything is loaded.  The library builds the
+kernels of its multiplies and the launcher of its attention at its first use: the run makes that use while it plans
+and says so.  A run never lets the library fetch a kernel binary: it switches the library's download off before it
+reaches the library.
 
-``--stack native`` is the target kernel set of this model's decode step: per block the kernel a recorded census of that set
-names (``model_samples/qwen_dense/kernel_census.json``), in the form the target calls it in.  A block whose kernel is not
-served here yet stays on its fallback row and is printed as ``not yet``; the run says how many launches of a step are target
-kernels, always as three numbers, and why its GPU class is ``NOT CLAIMED``.  It always checks its kernels, and it holds the
-launch shape of every target launch against the census.  ``--stack fe-entries`` is every cuDNN Frontend row of ``native`` with
-the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  ``native`` has three rows more: the multiplies the
-target runs on a library, FlashInfer, on the stored weights.  FlashInfer is an optional package of that stack alone
-(``pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt``); without it, or with
-a version this area has not validated, on compute capability 10.x ``--stack native`` is a ``SKIP`` before anything is loaded.
-The library builds its kernels at its first use: the run makes that use while it plans and says so.
+``--no-capture`` launches every block of every step from Python, as the checks' own passes and the traced steps always
+are: the same kernels, the same tokens, a host round trip per block.
 
-``--check-kernels`` adds a fifth check, against the plan instead of the reference: the run prints which kernels every block
+The other stacks are for functional validation, and a run takes one only where ``--stack`` names it: they are what
+the checks compare against and how a block is told from its neighbours, launched from Python, with no step recorded and
+no speed to state.  ``--stack fe-entries`` is every cuDNN Frontend row of ``native`` with the rest on fallback rows: no
+package beyond cuDNN Frontend and PyTorch.  ``--stack fe-cublas`` runs the linear-attention step on cuDNN Frontend's
+fused kernel, every multiply on cuBLAS over a bf16 copy of the quantised weights and the rest in PyTorch.  ``--stack
+reference`` is every block in PyTorch.  Each says so in one line of its run.  Timings printed by any run here are for
+orientation only.
+
+``--check-kernels`` adds the kernel check to a run of ``--stack fe-cublas``, which does not make it by itself; ``native``
+and ``fe-entries`` always make it.  It is a check against the plan instead of the reference: the run prints which kernels every block
 launches (the kernel table, before the load) and what the entries state about their launches (after it), keeps the profiler's
 record of every launch of the traced steps, and holds them against each other -- every launch attributed to a block, the
 kernels of an entry by name, order, count, grid, block and shared memory.  Where the profiler cannot run the run ends in
 ``[00] RAN <stack> stack (kernels not observed: <reason>)``, never in ``PASS``.  ``--dump-census FILE`` writes those launch
 records as JSON.
 
-``--perf`` is the performance mode: the decode performance report of this GPU from one process.  One checked request
+``--perf`` is the performance mode: the decode performance report of this GPU from one process, on the steps a run
+runs: replays of the recorded step on the stack ``native``, steps launched from Python with ``--no-capture`` and on a
+functional-validation stack.  One checked request
 with the reference checks on it, also at four positions of the timed steps; a warm-up request (``--perf-warmup`` forced
 steps, default 32); ``--perf-requests`` timed requests (default 3), each the prompt, its first new token and
 ``--perf-steps`` forced decode steps (default 256, the end token ignored) with nothing but the step inside; only then
@@ -76,7 +102,7 @@ the other compute processes on the GPU, its SM clock, the limit reasons -- or th
 ``--perf-clock-lock MHZ`` declares a clock that an operator fixed outside this sample, which sets none: the report
 holds the declaration against the clock it observed.
 
-    python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --stack native --perf
+    python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --perf
 """
 
 from __future__ import annotations
@@ -104,10 +130,14 @@ for _path in (_HELPERS, _HERE):  # and this folder: serving_options, the module 
 import serving_options  # noqa: E402  the standard library only: cudnn and PyTorch are imported in main(), in their order
 
 TAG = "[00]"
-STACKS = ("fe-cublas", "native", "fe-entries", "reference")
+#: the sample's stack, the default of every run; and the stacks an explicit ``--stack`` names, for functional validation
+SAMPLE_STACK = "native"
+VALIDATION_STACKS = ("fe-entries", "fe-cublas", "reference")
+STACKS = (SAMPLE_STACK, *VALIDATION_STACKS)
 DEFAULT_PROMPT = "Why is the sky blue?"
 CHECKED_STEPS = 16  # with a checkpoint the checks cover the first steps of every prompt
 TRACED_STEPS = 32
+SELF_FED_STEPS = 8  # ... and the recomputation of a replayed run reaches this many steps behind the prompt, and the first page boundary
 SPECULATIVE = "02_speculative_decode.py"  # the script of this folder that drafts
 #: its two flags, each with what it takes: declared here so that each is refused by a sentence that names that script
 SPECULATIVE_FLAGS = (("--speculative-config", "JSON"), ("--draft-vocab", "list"))
@@ -158,13 +188,17 @@ def _writable(flag: str, path: str) -> None:
 
 
 EPILOG = """\
-The default run needs no checkpoint and no extra package; it needs a GPU of compute capability 10.x or 12.x.
+The stack of every run is native unless --stack names another: the step is recorded once and replayed for every token.
+On compute capability 10.x its library rows need FlashInfer and its kernel-binary package (pip install -c
+samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt; the README: "The rows a library
+serves"); a run without them stops with an ERROR that names the package.  The default run needs no checkpoint; it
+needs a GPU of compute capability 10.x or 12.x.
 With --model: pip install -r samples/models/requirements.txt first.  The checkpoint is your own download (nothing is
-fetched); the 27B checkpoint needs 22 GB of disk and about 57 GiB of free GPU memory on the stack fe-cublas, which holds a
-bf16 copy of every weight.  The stacks native and fe-entries keep a weight their kernels multiply on its stored format
-without that copy.  fe-entries: about 37 GiB on compute capability 10.0, about 41 GiB on the other 10.x classes, about 57 GiB elsewhere.
-native, whose three library rows need FlashInfer (pip install -c samples/models/constraints-native.txt -r
-samples/models/requirements-flashinfer.txt; the README: "The rows a library serves"): about 28 GiB and about 32 GiB there.
+fetched); the 27B checkpoint needs 22 GB of disk and, on the stack native, about 28 GiB of free GPU memory on compute
+capability 10.0 and about 32 GiB on the other 10.x classes: a weight its kernels multiply is kept on its stored format,
+without a bf16 copy.  The functional-validation stacks, by --stack alone: fe-entries, about 37 GiB on compute capability
+10.0, about 41 GiB on the other 10.x classes, about 57 GiB elsewhere; fe-cublas, which holds a bf16 copy of every
+weight, about 57 GiB.
 The generated text goes to standard output; every other line of a run goes to standard error.
 The checkpoint, the memory, the checks, a request body field by field and every flag: samples/models/qwen_dense/README.md
 """
@@ -240,12 +274,19 @@ def _arguments(argv):
     )
     parser.add_argument(
         "--stack",
-        default="fe-cublas",
+        default=SAMPLE_STACK,
         choices=STACKS,
-        help="fe-cublas (default): cuDNN Frontend + cuBLAS + PyTorch, checked against the reference; native: the target kernel set of the "
-        "decode step, per block the kernel a recorded census names, with the blocks not served yet on fallback rows (printed as not yet) "
-        "and the kernel check always on; fe-entries: the cuDNN Frontend rows of native, everything else on fallback rows; reference: "
-        "every block in PyTorch, on any CUDA GPU, nothing checked.  Explicit: never chosen by what is installed",
+        help="native (default): the sample's stack, every block on a kernel that works on the stored weights (entries of cuDNN Frontend and "
+        "four calls of FlashInfer), its step recorded once and replayed, the kernel check always on; a block no kernel serves on this GPU or "
+        "at this row count is on its fallback row, and a package the stack calls that is not installed stops the run.  The other stacks are "
+        "for functional validation, launched from Python: fe-entries, the cuDNN Frontend rows of native with everything else on fallback "
+        "rows; fe-cublas, cuDNN Frontend's fused step + cuBLAS over bf16 copies + PyTorch; reference, every block in PyTorch, on any CUDA "
+        "GPU, nothing checked.  Never chosen by what is installed",
+    )
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="launch every block of every step from Python instead of recording the step once and replaying it: the same kernels and the " "same tokens",
     )
     parser.add_argument(
         "--provider",
@@ -255,7 +296,7 @@ def _arguments(argv):
         help="select one declared provider row of a block (an unknown block or key prints the declared ones)",
     )
     parser.add_argument("--reference-precision", default="fp64", choices=("fp64", "ieee-fp32"), help="accumulation of the reference blocks (default fp64)")
-    parser.add_argument("--dump-tokens", metavar="FILE", help="write the prompt ids and the produced ids as JSON, for a comparison made elsewhere")
+    parser.add_argument("--dump-tokens", metavar="FILE", help="write the prompt ids and the produced ids as JSON")
     parser.add_argument(
         "--check-kernels",
         action="store_true",
@@ -268,7 +309,7 @@ def _arguments(argv):
         "--dump-census",
         metavar="FILE",
         help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory, start and end per launch), for a "
-        "comparison made elsewhere; implies --check-kernels",
+        "reader outside of the run; implies --check-kernels",
     )
     _perf_flags(parser)
     for flag, takes in SPECULATIVE_FLAGS:
@@ -422,10 +463,36 @@ def _perf_limit(args, request, prompt_tokens: int) -> list:
     return [] if request.max_tokens is None else [f'{request.shown}: its "{request.limit_field}": {request.max_tokens} {beside}']
 
 
-def _record_steps(real: bool, perf: bool):
-    """The steps a session records for its checks: with a checkpoint the first steps an ordinary run checks and traces;
-    every step (``None``) of a seeded run and of the performance mode, whose checked request the checks replay whole."""
-    return max(CHECKED_STEPS, TRACED_STEPS) if real and not perf else None
+def _reach(prompt_tokens: int, page) -> int:
+    """How far the recomputation from Python of a replayed checkpoint run reaches, as a count of steps from position 0:
+    the steps the blocks are judged on; the prompt and the first ``SELF_FED_STEPS`` steps behind it, which feed on their
+    own token; and the positions on either side of the first page boundary of the attention cache (``page``: the
+    positions of a page; ``None``: a cache without pages).  A run that ends earlier is recomputed whole."""
+    return max(CHECKED_STEPS, prompt_tokens + SELF_FED_STEPS, 0 if page is None else page + 2)
+
+
+def _record_steps(real: bool, perf: bool, prompt_tokens: int = 0, page=None):
+    """The steps a session records for its checks: with a checkpoint the first steps an ordinary run checks and traces,
+    and those the recomputation of a replayed run reaches (``_reach``); every step (``None``) of a seeded run and of the
+    performance mode, whose checked request the checks replay whole."""
+    return max(CHECKED_STEPS, TRACED_STEPS, _reach(prompt_tokens, page)) if real and not perf else None
+
+
+def _launch_line(session, args) -> str:
+    """The one line every session of a run prints behind its load: that its step is recorded, with what the recorded
+    sequence holds -- or that its steps are launched from Python, and why: a functional-validation stack, the flag,
+    or what the session says (a block of the plan on a fallback row; a recording the installation declined)."""
+    if session.recorded is not None:
+        return f"{session.recorded.text()} (--no-capture launches every block from Python)"
+    if args.stack in VALIDATION_STACKS:
+        why = "the plain-PyTorch reference blocks" if args.stack == "reference" else session.recordable()
+        return (
+            f"launched from Python: {args.stack} is a functional-validation stack, taken by --stack alone -- what the checks compare against, "
+            f"no step recorded ({why}), no speed stated; the sample's stack is {SAMPLE_STACK}"
+        )
+    if args.no_capture:
+        return "launched from Python: --no-capture"
+    return f"launched from Python: {session.python_reason}"
 
 
 def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str:
@@ -447,7 +514,7 @@ def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str
 def _decode(session, text, rule, prompts, tie_out, check, checked_steps, sink=None):
     """One prompt set: prefill, the decode loop (the one host read of a step is here), the traced pass, the report and the
     checks.  Returns ``(passed, provider blocks judged, tokens per sequence)``.  Whether the kernels are checked is the
-    session's decision (``session.check_kernels``: the flag, or a stack that declares a target kernel set) and is read
+    session's decision (``session.check_kernels``: the flag, or a stack that always checks its kernels) and is read
     there, in one place: the traced pass then keeps its launch records and the checks include the kernel check; its
     outcome stays on the session (``session.traced``).
 
@@ -492,7 +559,10 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps, sink=No
         sink.write(rest + "\n")
     session.report().text_path["text_out"] = text_seconds / max(sum(len(ids) for ids in produced), 1)
     kernels = session.check_kernels
-    session.trace(TRACED_STEPS)  # the first steps again, under the profiler: GPU busy, idle, launches per step; launch records where the kernels are checked
+    session.read_tail()  # of a replayed request: the ids buffer and the position rows as the last replay left them, read before anything replays again
+    # the first steps again, under the profiler: launched from Python (GPU busy, launches per step; launch records where the
+    # kernels are checked) and, of a replayed run, two of them once more as replays
+    session.trace(TRACED_STEPS)
     _say(session.report().text())
     if not language:
         _say(f"text out              sequence 0, {len(produced[0])} tokens (seeded weights: not language): {pieces[0][:48]!r}")
@@ -505,11 +575,14 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps, sink=No
         return True, 0, produced
     steps = "every step" if checked_steps is None else f"the first {checked_steps} steps"
     also = "; the kernels of the traced steps against the plan" if kernels else ""
+    first = "the replayed steps launched again from Python" if session.replays else "replay"
     _say(
-        f"{TAG} checks on {steps} against the {session.reference_precision}-accumulated reference (replay, every provider block, the tokens){also}",
+        f"{TAG} checks on {steps} against the {session.reference_precision}-accumulated reference ({first}, every provider block, the tokens){also}",
         flush=True,
     )
-    checks = tie_out.run_checks(session, prompt_tokens=int(prompts[0].numel()), max_steps=checked_steps, second_reference=checked_steps is not None)
+    fed = int(prompts[0].numel())
+    reach = _reach(fed, session.cache_page()) if session.replays and checked_steps is not None else None
+    checks = tie_out.run_checks(session, prompt_tokens=fed, max_steps=checked_steps, second_reference=checked_steps is not None, reach=reach)
     _say(checks.text())
     return checks.ok, checks.judged, produced
 
@@ -524,8 +597,9 @@ def main(argv=None) -> int:
         return 0
     import model_samples
     from model_samples import census, tie_out
-    from model_samples.blocks import DeviceFacts, parse_overrides
+    from model_samples.blocks import DeviceFacts, MissingPackage, parse_overrides
     from model_samples.qwen_dense import QwenDense
+    from model_samples.qwen_dense.configs import ATTENTION_PAGE
 
     if not torch.cuda.is_available():
         _say(f"{TAG} SKIP needs a CUDA GPU")
@@ -581,7 +655,7 @@ def main(argv=None) -> int:
     counts = ",".join(str(n) for n in args.sequences)
     what = checkpoint.summary() if real else "reduced model: " + "; ".join(model.reductions)
     _say(f"{TAG} {model.name} decode | {what}")
-    _say(f"{TAG} {facts.name} ({facts.class_text}, {facts.sm_count} SMs) | sequences {counts} | stack {args.stack} | launched from Python, not captured")
+    _say(f"{TAG} {facts.name} ({facts.class_text}, {facts.sm_count} SMs) | sequences {counts} | stack {args.stack}")
     if real:
         _say(f"{TAG} {text.name}")
         _say(f"{TAG} {serving_options.greedy_line(text.generation_defaults)}")
@@ -634,12 +708,16 @@ def main(argv=None) -> int:
     except ValueError as error:  # a template that refuses its messages or renders them to nothing; a request beyond the context
         _say(f"{TAG} ERROR {error}")
         return 1
+    # the sample's stack records its step once and replays it, where the plan says it can be (the session decides and says why
+    # not), in an ordinary run and in the performance mode alike
+    replayed = args.stack == SAMPLE_STACK and not args.no_capture
     runs = []  # (session, prompt sets) per sequence count; the later sessions run on the first one's weights
     for index, sequences in enumerate(args.sequences):
         if real:
             prompt_sets = [([ids] * sequences, seconds, rule) for ids, seconds, rule in sets]  # every sequence of a set gets the set's prompt
         else:
             prompt_sets = [seeded[index]]
+        longest = max(int(prompts[0].numel()) for prompts, _, _ in prompt_sets)
         session = model_samples.Session(
             model,
             text,
@@ -649,10 +727,13 @@ def main(argv=None) -> int:
             overrides=overrides,
             reference_precision=args.reference_precision,
             capacity=max(_positions(args, int(prompts[0].numel()), rule) for prompts, _, rule in prompt_sets),
+            max_model_len=args.max_model_len,
             checkpoint=checkpoint,
             share=runs[0][0] if runs else None,
-            record_steps=_record_steps(real, args.perf),
+            # a run that replays its step records as far as the recomputation of its checks reaches
+            record_steps=_record_steps(real, args.perf, longest if replayed else 0, ATTENTION_PAGE if replayed else None),
             check_kernels=args.check_kernels,
+            capture=replayed,
         )
         runs.append((session, prompt_sets))
     # Every sequence count is planned before the first load, and the memory sentence covers the whole run: a GPU class, a
@@ -669,8 +750,10 @@ def main(argv=None) -> int:
         # what a library row of the stack does at its first use beyond an entry's build, said before it is made
         for note in dict.fromkeys(note for session, _ in runs for note in session.resolve().announcements()):
             _say(f"{TAG} planning: {note}", flush=True)
-        tables = [first.plan_table(later)] + [session.resolve().table() for session in later]
-        claims = [session.claim() for session, _ in runs]  # of a stack that declares a target: how each run stands to it
+        tables = [first.plan_table(later, references=2 if real else 1)] + [session.resolve().table() for session in later]
+    except MissingPackage as error:  # a package the stack calls is not installed: the run stops here, and no other stack takes its place
+        _say(f"{TAG} ERROR the stack {args.stack} cannot run: {error}")
+        return 1
     except NotImplementedError as error:
         _say(f"{TAG} SKIP {error}")
         return 0
@@ -696,7 +779,7 @@ def main(argv=None) -> int:
 
     if args.perf:  # before the load: what the mode will run, a rule and counts
         protocol = perf.Protocol(args.perf_warmup, args.perf_steps, args.perf_requests, args.perf_trace_records)
-        _say(f"{TAG} {protocol.line(int(runs[0][1][0][0][0].numel()))}")
+        _say(f"{TAG} {protocol.line(int(runs[0][1][0][0][0].numel()), replayed and not runs[0][0].recordable())}")
         observer = perf.observe.Observer(device, args.perf_clock_lock)  # the GPU and the host before the load: the driver is asked, nothing is set
         observer.read("before the load")
 
@@ -704,20 +787,22 @@ def main(argv=None) -> int:
     outcome = None  # of the performance mode
     unobserved, censuses = "", []  # of the kernel check: why the kernels were not observed; the launch records per prompt set
     sink = serving_options.TextSink(args.text_out, streamed=not args.no_stream and not args.perf)  # where the text of sequence 0 goes
-    for number, ((session, prompt_sets), table, claim) in enumerate(zip(runs, tables, claims)):
+    for number, ((session, prompt_sets), table) in enumerate(zip(runs, tables)):
         text_to = sink.later() if number else sink  # a request gets one text: a later sequence count writes none
         _say()
         _say(table)
         if session.check_kernels:  # the kernel table, first part: from the plan alone, before the load
-            _say(census.table(session.plan, claim))
+            _say(census.table(session.plan))
         session.load()
         _say(f"{TAG} {session.stages.line()}")
+        _say(f"{TAG} {_launch_line(session, args)}")
         if session.check_kernels:  # second part: what the entries, now built, state about their launches
             _say(census.stated(session.plan))
         for index, (prompts, seconds, rule) in enumerate(prompt_sets):
             if index:  # a session keeps nothing between two prompt sets
                 _say()
                 session.reset(fresh=True)
+                session.record_step()  # of a session that replays: the fresh state's step, recorded in front of the request's clock
             if real:
                 each = f"the same prompt for each of the {session.sequences} sequence(s)"
                 _say(f"prompt {index + 1} of {len(prompt_sets)}        {int(prompts[0].numel())} tokens, {each}")
@@ -769,6 +854,8 @@ def main(argv=None) -> int:
                 digest.update(b"".join(int(i).to_bytes(4, "little") for i in ids))
             # one prompt and one list of produced ids per sequence: in the seeded run every sequence has a prompt of its own
             dumped.append({"sequences": session.sequences, "prompt": index, "prompt_ids": [[int(i) for i in p] for p in prompts], "ids": produced})
+    for session, _ in runs:
+        session.close()  # a recorded step and its pool are released now, not when the session is collected
     if checkpoint is not None:
         checkpoint.close()
     sink.close()
@@ -783,6 +870,14 @@ def main(argv=None) -> int:
         "since the plan (PyTorch's pool, CUDA libraries and kernel reservations of this process; other processes' changes included)"
     )
     mib = 2.0**20
+    kept = [(session, max(session.pool_bytes)) for session, _ in runs if session.pool_bytes]
+    if kept:  # of the sessions that recorded their step: what a recording took, beside what the plan counted for it
+        took = " | ".join(f"{session.sequences} sequence{'s' if session.sequences > 1 else ''} {pool / mib:,.0f} MiB" for session, pool in kept)
+        counted = ", ".join(f"{session._recorded_bytes() / mib:,.0f} MiB" for session, _ in kept)
+        _say(
+            f"{TAG} recorded step, memory in a pool of its own: {took} (PyTorch's reservation behind a recording less in front of it; "
+            f"the plan counted {counted})"
+        )
     allowance = getattr(model, "first_launch_reserve", {}).get(f"cc{facts.cc[0]}.x", 0)
     for name, block in first.plan.items():
         launches = block.first_launch()  # measured by the block: rows -> device bytes outside PyTorch's pool
@@ -809,7 +904,7 @@ def main(argv=None) -> int:
         else:
             gpu = {"name": facts.name, "compute_capability": list(facts.cc), "sm_count": facts.sm_count}
             traced_steps = TRACED_STEPS if outcome is None else outcome.data["traced"]["steps"]
-            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=2, gpu=gpu, traced_steps=traced_steps)
+            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=3, gpu=gpu, traced_steps=traced_steps)
         if error:
             unwritten.append(error)
         else:

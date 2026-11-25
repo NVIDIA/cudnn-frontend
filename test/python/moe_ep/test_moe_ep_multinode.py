@@ -281,6 +281,99 @@ def test_stateless_training_multinode_matches_independent_reference(
     )
 
 
+# Mixed-CGA acceptance (G3/G4): upstream CI covers training-GLU mixed CGA only at EP1.
+_MIXED_CGA_PHASE_INTERLEAVE = {"mixed_cga": True, "scheduling": "phase_interleave"}
+
+
+@pytest.mark.parametrize("ep_size", [pytest.param(ep, id=f"ep{ep}") for ep in (8, 12, 16)])
+def test_mxfp8_forward_multinode_mixed_cga_matches_reference(torchrun_world, ep_size):
+    world = torchrun_world
+    if world.world_size != ep_size or world.local_world_size != 4:
+        pytest.skip(
+            f"EP{ep_size} mixed-CGA inference requires torchrun WORLD_SIZE={ep_size}, LOCAL_WORLD_SIZE=4; "
+            f"got WORLD_SIZE={world.world_size}, LOCAL_WORLD_SIZE={world.local_world_size}"
+        )
+    try:
+        _run_forward_output_case(
+            device=world.device,
+            ep_group=dist.group.WORLD,
+            ep_rank=world.rank,
+            ep_size=ep_size,
+            expected_global_ranks=tuple(range(ep_size)),
+            tuning_kwargs=_MIXED_CGA_PHASE_INTERLEAVE,
+        )
+        dist.barrier()
+    finally:
+        from cudnn.moe_ep._megamoe_backend._runtime import (
+            get_runtime_manager,
+        )
+
+        get_runtime_manager().shutdown()
+        dist.barrier()
+
+
+@pytest.mark.parametrize("ep_size", [pytest.param(ep, id=f"ep{ep}") for ep in (8, 16, 32)])
+def test_stateless_training_multinode_mixed_cga_matches_independent_reference(torchrun_world, ep_size):
+    world = torchrun_world
+    if world.world_size != ep_size:
+        pytest.skip(f"EP{ep_size} mixed-CGA training requires torchrun WORLD_SIZE={ep_size}; got WORLD_SIZE={world.world_size}")
+
+    _run_backward_reference_case(
+        device=world.device,
+        ep_group=dist.group.WORLD,
+        ep_rank=world.rank,
+        ep_size=ep_size,
+        combine_format="bf16",
+        forward_tuning_kwargs=_MIXED_CGA_PHASE_INTERLEAVE,
+    )
+
+
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "standalone_warps"])
+def test_mxfp8_forward_multinode_fc2_bulk_store_matches_reference(torchrun_world, token_back_mode):
+    world = torchrun_world
+    if world.world_size != 8 or world.local_world_size != 4:
+        pytest.skip(
+            "EP8 FC2 bulk-store inference requires torchrun WORLD_SIZE=8, LOCAL_WORLD_SIZE=4; "
+            f"got WORLD_SIZE={world.world_size}, LOCAL_WORLD_SIZE={world.local_world_size}"
+        )
+    try:
+        _run_forward_output_case(
+            device=world.device,
+            ep_group=dist.group.WORLD,
+            ep_rank=world.rank,
+            ep_size=8,
+            expected_global_ranks=tuple(range(8)),
+            hidden=256,
+            tuning_kwargs={"fc2_bulk_store": "auto", "token_back_mode": token_back_mode},
+        )
+        dist.barrier()
+    finally:
+        from cudnn.moe_ep._megamoe_backend._runtime import (
+            get_runtime_manager,
+        )
+
+        get_runtime_manager().shutdown()
+        dist.barrier()
+
+
+@pytest.mark.parametrize("combine_format", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "standalone_warps"])
+def test_stateless_training_multinode_fc2_bulk_store_matches_independent_reference(torchrun_world, token_back_mode, combine_format):
+    world = torchrun_world
+    if world.world_size != 8:
+        pytest.skip(f"EP8 FC2 bulk-store training requires torchrun WORLD_SIZE=8; got WORLD_SIZE={world.world_size}")
+
+    _run_backward_reference_case(
+        device=world.device,
+        ep_group=dist.group.WORLD,
+        ep_rank=world.rank,
+        ep_size=8,
+        combine_format=combine_format,
+        forward_tuning_kwargs={"fc2_bulk_store": "auto", "token_back_mode": token_back_mode},
+        hidden=256,
+    )
+
+
 def test_stateless_training_ep32_uneven_tokens_forward_backward_matches_reference(
     torchrun_world,
 ):

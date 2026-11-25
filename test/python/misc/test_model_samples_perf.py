@@ -74,6 +74,8 @@ NVJET = "nvjet_sm100_tst_64x8_64x16_2x1_v_bz_splitK_TNT"
 # two kernels a library launches for a row of the stack native: a cuBLASLt kernel of 8-bit operands, and the library's 4-bit multiply
 NVJET_FP8 = "nvjet_sm100_qqtst_64x8_128x16_4x1_v_bz_TNT"
 FI_MM_FP4 = "kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100_splitkSm100BlockScaledSplitKGemmKernel_object_at__TiledMMA_0"
+FI_ATTENTION = "fmhaSm100fKernel_QkvBfloat16OBfloat16H256PagedKvCausalP64MultiCtasKvCgaVarSeqQ8Kv256StaticGroupedSwapsAbForGen"
+ATTENTION_ENTRY = "flashinfer.decode.trtllm_batch_decode_with_kv_cache"
 HOST_READ = "Memcpy DtoH (Device -> Pageable)"
 NO_PROFILER = "this PyTorch build records no kernel activity"
 
@@ -196,8 +198,7 @@ def test_percentiles_nearest_rank():
     _defines("token_to_token_interval", "pooled over the run's timed requests; percentiles are nearest-rank.")
     _says("area", "pooled over the timed requests: median, p90 and p99 by nearest rank.")
     _defines("token_to_token_interval", "The intervals span a growing attention cache as well as jitter")
-    _says("area", "Not a service's tail latency: the intervals span a growing attention cache as well as jitter")
-    assert perf.DEFINITIONS["token_to_token_interval"][2] == "None: a percentile of this loop is not a service's tail latency."
+    _says("area", "by nearest rank. The intervals span a growing attention cache as well as jitter |")
 
 
 def test_run_value_is_median_over_timed_requests():
@@ -229,12 +230,10 @@ def test_time_to_first_token_starts_at_the_request():
     assert (
         first["value"] == pytest.approx(6000.0) and first["events"] == "t_first - t_request" and first["per_request"] == pytest.approx([5800.0, 6000.0, 7000.0])
     )
-    assert "The load is outside it" in first["definition"] and "without the network" in first["serving_counterpart"]
+    assert "The load is outside it" in first["definition"] and set(first) >= {"definition", "unit", "value", "events"}
     _defines("time_to_first_token", "from the request being handed to the text path to the first new token's ids on the host", "Of a run: the median over")
-    _says("area", "and the host read; the median over the timed requests. The load is outside it.")
-    same = "prefills the prompt in one pass and adds its queue and its network path"
-    assert f"not the same quantity: a serving engine {same}." in first["serving_counterpart"]
-    _says("area", f"A serving engine {same}: the same pair of events, not the same quantity")
+    _says("area", "and the host read; the median over the timed requests. The load is outside it |")
+    _says("area", "the prompt's decode steps (one per prompt token: no stack of this sample has a prefill kernel) and the host read;")
 
 
 def test_step_is_the_median_interval_at_the_traced_positions():
@@ -297,44 +296,78 @@ def test_record_class_reasons_in_the_order_of_the_conditions():
     """A run is a controlled run only when every condition is met; otherwise orientation, with every reason, in order."""
     from model_samples import perf
 
-    kind, reasons = perf.record_class(True, True, "no target kernel set declared", False, "kernels not observed")
+    kind, reasons = perf.record_class(True, True, False, "kernels not observed")
     assert kind == "orientation"
     assert reasons == [
         "reduced model",
         "fallback rows present",
-        "no target kernel set declared",
         "launched from Python",
         "kernels not observed",
         "other processes not observed",
         "clocks not observed",
     ]
-    today = perf.record_class(False, True, "kernel identity not claimed on this GPU class", False, "")
-    assert today == (
-        "orientation",
-        [
-            "fallback rows present",
-            "kernel identity not claimed on this GPU class",
-            "launched from Python",
-            "other processes not observed",
-            "clocks not observed",
-        ],
-    )
-    assert perf.record_class(False, False, "", True, "") == ("orientation", ["other processes not observed", "clocks not observed"])
-    assert perf.record_class(False, False, "", True, "a check did not hold", "", "")[1] == ["a check did not hold"]
-    assert perf.record_class(False, False, "", True, "", "", "") == ("controlled", []), "every condition handed in as met"
-    # the third reason, from the kernel facts of a run: no target declared; a declared target whose census line is not EQUAL
-    census_line = "target census plain / cc 10.0 / 148 SMs (recorded <date>): "
-    assert perf.identity_reason({"declared": False, "census": None}) == "no target kernel set declared"
-    assert perf.identity_reason({"declared": True, "census": census_line + "EQUAL (three numbers, 0 by membership alone)"}) == ""
-    for other in ("NOT CLAIMED (fallback rows present)", "NOT EQUAL (the kernel check did not hold)", "NOT OBSERVED", "not compared"):
-        assert perf.identity_reason({"declared": True, "census": census_line + other}) == "kernel identity not claimed on this GPU class", other
-    _says("area", "A run is a controlled run only when it observed every condition itself: a checkpoint, every block on a claimed target kernel,")
+    today = perf.record_class(False, True, False, "")
+    assert today == ("orientation", ["fallback rows present", "launched from Python", "other processes not observed", "clocks not observed"])
+    assert perf.record_class(False, False, True, "") == ("orientation", ["other processes not observed", "clocks not observed"])
+    assert perf.record_class(False, False, True, "a check did not hold", "", "")[1] == ["a check did not hold"]
+    assert perf.record_class(False, False, True, "", "", "") == ("controlled", []), "every condition handed in as met"
+    _says("area", "A run is a controlled run only when it observed every condition itself: a checkpoint, no block on a fallback row,")
     _says("area", "Otherwise it is `orientation` and the line lists every reason, in that order, and the rate line reads `decode rate (orientation)`.")
     _says("area", "*Record class*: what a run may call its numbers, on the second line of its report: `orientation` with every reason, or a controlled run.")
-    _says("family", "Every run of the mode is `orientation` today and says why on the second line of its report")
-    _says("family", "its blocks are launched from Python, a fallback row is left in every stack, and whatever the run saw of the GPU's other")
+    _says("family", "A run of the mode that is `orientation` says why on the second line of its report")
+    _says("family", "a functional-validation stack), a block on a fallback row is a reason of its own, and whatever the run saw of the")
     _says("family", "whatever the run saw of the GPU's other processes and of its clock that a controlled run may not have is a reason too.")
-    _says("area", "and no stack of this area is captured: every run today is `orientation`.")
+    _says("area", "and the launch sequence is captured where the run replays its recorded step -- the stack `native`, by default:")
+    _says("area", "is `orientation` with the reason `launched from Python`.")
+
+
+def test_the_report_of_a_run_whose_steps_are_replays():
+    """The screen of a run whose steps were replays of the recorded step, from the data its file holds: ``protocol`` reads
+    ``launch sequence captured``; the record class carries no ``launched from Python`` -- with every other condition
+    met the run is a controlled run --; the ``checks`` lines say that the replayed steps are the same steps launched
+    from Python, with their count; the ``step`` line is one replay with the launches of the recorded sequence -- or
+    the recorded step, where the installation states none -- and GPU busy of the replayed traced steps, or why it was
+    not measured; no launch overhead is printed, no note about it and no stretch of tracing.  The per-kernel table and
+    its note stay.  A run launched from Python prints what it printed."""
+    from model_samples import perf
+
+    replayed = {"steps": 16, "first_position": 58, "last_position": 73, "launches": 491, "gpu_busy_ms": 4.25, "reason": None, "per_step": {}}
+    data = _checkpoint_form(
+        record={"class": "controlled", "reasons": []},
+        protocol={**_data()["protocol"], "launch_path": "captured", "launch_path_reason": None},
+        checks={**_data()["checks"], "recorded_step": "PASS", "recomputed_steps": 314},
+    )
+    data["traced"]["replayed"] = replayed
+    data["protocol"]["prompt"]["tokens"] = 58
+    data["statistics"]["launch_overhead"].update(value=None, reason="not formed: a replayed step has no launch path from Python between its blocks")
+    data["statistics"]["gpu_busy_replayed"].update(value=4.25, reason=None)
+    lines = perf.screen(data)
+    assert all(len(line) <= perf.WIDTH for line in lines), [line for line in lines if len(line) > perf.WIDTH]
+    assert lines[1] == "record class          controlled run in one process; a number of record is the median of 3 such runs"
+    assert _line(lines, "protocol").endswith("| launch sequence captured") and not any("not captured" in line for line in lines[:12])
+    held = _flat(" ".join(lines[lines.index(_line(lines, "checks")) : lines.index("")]))
+    assert "the replayed steps are the same steps launched from Python, ids and logits, all 314, and leave the same state: PASS" in held
+    assert "timed requests give the checked request's tokens and state: " in held and "kernels, traced steps: " in held
+    step = lines.index(_line(lines, "step   "))
+    assert lines[step] == "step                  400.000  ms: one replay of 491 launches and one host read"
+    busy = _flat(" ".join(lines[step + 1 : step + 3]))
+    assert busy == "GPU busy 4.250 ms in 16 traced replayed steps, positions 58 to 73 (an upper bound: tracing lengthens kernels)"
+    assert lines[step + 3].startswith("with draft tokens"), "nothing of a launch overhead, of a remainder or of a stretch under it"
+    assert not any("launch overhead" in line or "not resolved" in line or line.startswith("note") for line in lines)
+    assert any(line.strip() == perf.FROM_PYTHON for line in lines), "the per-kernel table is of the traced request, launched from Python, and says so"
+    assert _line(lines, "decode rate").startswith("decode rate           2.5  tokens/s per sequence"), "a controlled run: no label on the rate"
+    data["traced"]["replayed"] = {**replayed, "launches": None, "gpu_busy_ms": None, "reason": "the profiler recorded no kernel activity on this GPU"}
+    lines = perf.screen(data)
+    step = lines.index(_line(lines, "step   "))
+    assert lines[step].endswith("ms: one replay of the recorded step and one host read")
+    assert _flat(" ".join(lines[step + 1 : step + 3])) == "GPU busy of a replayed step not measured (the profiler recorded no kernel activity on this GPU)"
+    # the checks line of a replayed run whose recomputation does not hold; and a run launched from Python, as it printed
+    data["checks"]["recorded_step"] = "FAIL (first at step 61)"
+    assert "all 314, and leave the same state: FAIL (first at step 61)" in _flat(" ".join(perf.screen(data)))
+    python = perf.screen(_checkpoint_form())
+    assert _line(python, "protocol").endswith("| launched from Python, not captured") and not any("the replayed steps are" in line for line in python)
+    assert any("launch overhead" in line for line in python) and perf.SCHEMA == "model-sample-performance/6"
+    assert perf.REPLAYED_TRACED == 16 and "gpu_busy_replayed" in perf.DEFINITIONS
 
 
 # ---------------------------------------------------------------------------------------------- a session on the CPU, stand-in providers
@@ -751,12 +784,12 @@ def test_checks_lines_say_what_was_judged(monkeypatch, tmp_path):
     assert lines[lines.index(_line(lines, "checks      ")) + 1] == both
     (kernel_line,) = [line for line in lines if line.startswith("  kernels           ")]
     assert kernel_line.endswith("    PASS"), "one kernel line, the traced request's, under the checks: none from the checks before"
-    assert _line(lines, "kernels     ") == "kernels     no target kernel set is declared for this stack"
+    assert _line(lines, "kernels     ") == "kernels     2 launches per step on exact rows: PyTorch 1, cuDNN Frontend 1"
     after = lines[lines.index(_line(lines, "kernels     ")) + 1]
-    assert re.fullmatch(r"            \d+ block calls on fallback rows; a step launches \d+ kernels and 1 copy", after), after
+    assert re.fullmatch(r"            \d+ block calls on fallback rows; a step also launches \d+ kernels and 1 copy", after), after
     assert screen["last_line"] == "[00] PASS" and outcome.data["record"]["performance_claim_eligible"] is False
     _says("area", "replay over the whole request, every provider block against the reference at the judged positions, the tokens on the first 16 steps;")
-    _says("area", "The `checks` lines are three statements, each with its own verdict:", "on a stack that declares no target they say so.")
+    _says("area", "The `checks` lines are three statements, each with its own verdict:")
     _says("guide", "The report says at which positions the blocks were held against the reference, that every timed request gave the checked request's")
     _says("guide", "tokens and state, and that the kernels of the traced steps are the plan's;")
     # what is printed as judged is what the checks judged: they hand it back, and a position the run did not record is refused
@@ -764,15 +797,13 @@ def test_checks_lines_say_what_was_judged(monkeypatch, tmp_path):
         _mode(monkeypatch, tmp_path / "short", steps=62, requests=1, warmup=1, record_steps=16)
 
 
-def test_the_kernels_lines_are_three_numbers_from_the_plan_and_the_census(monkeypatch):
+def test_the_kernels_lines_state_the_launches_of_the_plan():
     """Statistic 16 on the family's own tables: the 64-layer model on compute capability 10.0 with 148 SMs, planned on
-    stated facts -- how many launches of a step are on the target kernel set, by provider and as three numbers, and the
-    block calls on fallback rows: on the cuDNN Frontend rows alone (``fe-entries``) and on ``native``, which has the
-    rows a library serves beside them."""
-    from model_samples import Session, TextIO, blocks, census, perf
+    stated facts -- the launches of a step on exact rows, by provider, and the block calls on fallback rows -- on
+    ``native``, on the cuDNN Frontend rows alone (``fe-entries``) and on the stack ``fe-cublas``: two lines in one form."""
+    from model_samples import Session, TextIO, blocks, perf
     from model_samples.qwen_dense import QwenDense
 
-    monkeypatch.setattr(census, "installed_versions", lambda packages: {"torch": "2.14.0+cu130", "nvidia-cutlass-dsl": "4.8.0"})
     model = QwenDense()
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
 
@@ -781,37 +812,40 @@ def test_the_kernels_lines_are_three_numbers_from_the_plan_and_the_census(monkey
         session.plan = blocks.plan(model.provider_table, model.regimes, facts, 1, 1, stack, model=model, options={"device": "cpu"})
         return perf.kernel_facts(session, "PASS")
 
-    kernels, native = planned("fe-entries"), planned("native")
-    assert (native["on_target"], native["launches"]) == (467, 484) and (native["code"], native["port"], native["stand_ins"]) == (178, 289, 0)
-    assert native["by_provider"] == {"cuDNN Frontend": 337, "FlashInfer": 129, "PyTorch": 1}
-    assert (native["fallback_calls"], native["absent"]) == (16, 1) and native["fallback_rows"], "467 + 16 + 1 = 484: the attention core is left"
-    wide = perf.screen(_data(kernels=native))  # a third provider: the line breaks between two of them
-    at = wide.index("kernels     467 of 484 launches per step are on the target kernel set: cuDNN Frontend 337, FlashInfer 129,")
-    assert wide[at + 1 : at + 3] == [
-        " " * 12 + "PyTorch 1",
-        " " * 12 + "= 178 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results",
-    ]
-    assert kernels["declared"] and kernels["stated"] and kernels["fallback_rows"]
-    assert (kernels["on_target"], kernels["launches"]) == (338, 484) and (kernels["code"], kernels["port"], kernels["stand_ins"]) == (49, 289, 0)
-    assert kernels["by_provider"] == {"cuDNN Frontend": 337, "PyTorch": 1}
-    assert (kernels["fallback_calls"], kernels["absent"]) == (145, 1), "338 + 145 + the one launch of the target that no block stands for = 484"
-    assert kernels["kernels_per_step"] is None and "NOT CLAIMED" in kernels["census"], "nothing traced; a fallback row is left"
-    data = _data(kernels={**kernels, "kernels_per_step": 2908, "copies_per_step": 200})
-    shown = perf.screen(data)
-    at = shown.index("kernels     338 of 484 launches per step are on the target kernel set: cuDNN Frontend 337, PyTorch 1")
-    assert shown[at + 1 : at + 5] == [
-        "            = 49 the target's own compiled kernels + 289 cuDNN Frontend entries with byte-equal results",
-        "              + 0 declared stand-ins",
-        "            not yet: 145 block calls on fallback rows + 1 launch of the target that has no block yet",
-        "            a step also launches 2,570 kernels and 200 copies",
-    ]
-    unseen = perf.screen(_data(kernels=kernels))
-    assert "            what a step also launches was not observed" in unseen
-    whole = perf.screen(_data(kernels={**kernels, "absent": 0, "fallback_calls": 0, "kernels_per_step": 501, "copies_per_step": 1}))
-    assert "            not yet: no block calls on fallback rows; a step also launches 163 kernels and 1 copy" in whole
-    three = "the target's own compiled kernels, cuDNN Frontend entries with byte-equal results, declared stand-ins"
-    _defines("launches_per_step", f"the launches of a step that are on the target kernel set, by provider and as three numbers -- {three}.")
-    _says("area", "The `kernels` lines give the launches of a step that are on the target kernel set, by provider and as three numbers, and what else")
+    native, kernels, default = planned("native"), planned("fe-entries"), planned("fe-cublas")
+    unobserved = {"kernels_per_step": None, "copies_per_step": None}  # nothing was traced
+    providers = {"cuDNN Frontend": 338, "FlashInfer": 145, "PyTorch": 1}
+    assert native == {"exact_launches_per_step": 484, "by_provider": providers, "fallback_calls": 0, "fallback_rows": False, **unobserved}
+    assert kernels == {
+        "exact_launches_per_step": 339,
+        "by_provider": {"cuDNN Frontend": 338, "PyTorch": 1},
+        "fallback_calls": 145,
+        "fallback_rows": True,
+        **unobserved,
+    }
+    calls = len(model.wiring()) - 1  # every call of the wiring but the token choice, which is the host path
+    assert default == {
+        "exact_launches_per_step": 49,
+        "by_provider": {"cuDNN Frontend": 48, "PyTorch": 1},
+        "fallback_calls": calls - 49,
+        "fallback_rows": True,
+        **unobserved,
+    }
+    for facts_of in (native, kernels, default):
+        assert facts_of["exact_launches_per_step"] + facts_of["fallback_calls"] == calls == 484, "an exact row launches once per call"
+    wide = perf.screen(_data(kernels={**native, "kernels_per_step": 486, "copies_per_step": 2}))
+    at = wide.index("kernels     484 launches per step on exact rows: cuDNN Frontend 338, FlashInfer 145, PyTorch 1")
+    assert wide[at + 1] == "            no block calls on fallback rows; a step also launches 2 kernels and 2 copies"
+    shown = perf.screen(_data(kernels={**kernels, "kernels_per_step": 2087, "copies_per_step": 197}))
+    at = shown.index("kernels     339 launches per step on exact rows: cuDNN Frontend 338, PyTorch 1")
+    assert shown[at + 1] == "            145 block calls on fallback rows; a step also launches 1,748 kernels and 197 copies"
+    assert "            145 block calls on fallback rows; what a step also launches was not observed" in perf.screen(_data(kernels=kernels))
+    least = {"exact_launches_per_step": 1, "by_provider": {"PyTorch": 1}, "fallback_calls": 1, "kernels_per_step": 2, "copies_per_step": 1}
+    one = perf.screen(_data(kernels={**kernels, **least}))
+    at = one.index("kernels     1 launch per step on exact rows: PyTorch 1")
+    assert one[at + 1] == "            1 block call on fallback rows; a step also launches 1 kernel and 1 copy"
+    _defines("launches_per_step", "the launches of a step on exact rows", "by provider, and the block calls of a step on fallback rows.")
+    _says("area", "The `kernels` lines give the launches of a step on exact rows, by provider, the block calls on fallback rows and what else a step launches.")
 
 
 # ---------------------------------------------------------------------------------------------- the screen and the file
@@ -839,7 +873,7 @@ def _checkpoint_form(**changes):
     and a step of 400 ms -- and are no run's."""
     base = {
         "model": {"name": "Qwen3.8-27B-NVFP4", "layers": 64, "reduced": False},
-        "record": {"reasons": ["fallback rows present", "kernel identity not claimed on this GPU class", "launched from Python"]},
+        "record": {"reasons": ["fallback rows present", "launched from Python"]},
         "traced": {"steps": 51, "first_position": 58, "last_position": 108},
     }
     for section, values in changes.items():
@@ -882,9 +916,8 @@ def test_orientation_stands_in_the_rate_line():
 
     lines = perf.screen(_checkpoint_form())
     assert lines[0] == "cuDNN Frontend model sample: decode performance report"
-    assert lines[1] == "record class          orientation, not a number of record: fallback rows present;"
-    assert lines[2] == "                      kernel identity not claimed on this GPU class; launched from Python", "a line ends where a reason ends"
-    assert lines[3] == "scope       a decode-loop rate, not a served rate: one process, no request queue, no scheduler, no network"
+    assert lines[1] == "record class          orientation, not a number of record: fallback rows present; launched from Python"
+    assert lines[2] == "scope       the decode loop of one process: no request queue, no scheduler, no network"
     rate = _line(lines, "decode rate")
     assert rate.startswith("decode rate (orientation)   2.5  tokens/s per sequence   (") and " ms per token; 2 requests within " in rate
     assert not any(line.startswith("decode rate   ") for line in lines) and not any("reduced model:" in line for line in lines)
@@ -892,10 +925,7 @@ def test_orientation_stands_in_the_rate_line():
     reduced = perf.screen(_data())
     assert "decode rate           not printed for a reduced model" in reduced and not any("tokens/s" in line for line in reduced)
     assert reduced[1] == "record class          orientation, not a number of record: reduced model; fallback rows present;"
-    assert reduced[2:4] == [
-        "                      no target kernel set declared; launched from Python; other processes not observed;",
-        "                      clocks not observed",
-    ]
+    assert reduced[2] == "                      launched from Python; other processes not observed; clocks not observed", "a line ends where a reason ends"
     for start in ("                      token-to-token interval: ", "time to first token   ", "step                  "):
         assert _line(reduced, start).startswith(start + "reduced model: "), start
     _says("area", "every time then carries `reduced model:`, no rate is printed, and the text is written nowhere.")
@@ -955,7 +985,7 @@ def test_the_step_line_says_what_was_not_measured():
 def _wide_row():
     """A row of the per-kernel table whose every value is as wide as a run can make it."""
     row = {
-        "label": "not yet: projection.fp8.out + 123 more (one row)",
+        "label": "fallback: projection.fp8.out + 123 more (one row)",
         "relation": "fallback",
         "launches_per_step": 1234567.5,
         "us_per_launch_added": 1234567.891,
@@ -965,19 +995,20 @@ def _wide_row():
 
 def test_no_line_wider_than_110(monkeypatch, tmp_path):
     """No line of the screen is wider than 110 characters, in every form a run of this version prints: the reduced model,
-    a checkpoint, a target stack with its three numbers, each form of the ``step`` line, the per-kernel table with and
+    a checkpoint, a stack with three providers, each form of the ``step`` line, the per-kernel table with and
     without its ``us/launch`` column and with large values, a failed statement, kernels that were not observed with a
     long reason, long names, six-digit values."""
     from model_samples import perf
 
     long_reason = "the profiler's trace could not be exported (" + "a reason that the exporter words at length " * 3 + ")"
-    target = {"stated": True, "declared": True, "on_target": 338, "launches": 484, "code": 49, "port": 289, "stand_ins": 0}
-    target.update(by_provider={"cuDNN Frontend": 337, "PyTorch": 1}, fallback_calls=146, kernels_per_step=2908, copies_per_step=200)
+    three = {"exact_launches_per_step": 484, "by_provider": {"cuDNN Frontend": 338, "FlashInfer": 145, "PyTorch": 1}, "fallback_calls": 0}
+    three.update(fallback_rows=False, kernels_per_step=486, copies_per_step=2)
+    many = {f"a provider of the name {n}": 123456 for n in range(6)}  # more providers than a line holds: the line breaks between two words
     forms = [
         _data(),
         _checkpoint_form(),
-        _checkpoint_form(kernels=target),
-        _checkpoint_form(kernels={**target, "stated": False, "not_stated": "kernel identity: not stated for this run (" + "no recorded section " * 6 + ")"}),
+        _checkpoint_form(kernels=three),
+        _checkpoint_form(kernels={**three, "exact_launches_per_step": 740736, "by_provider": many, "fallback_calls": 123456, "kernels_per_step": 1234567}),
         _checkpoint_form(traced={"steps": 256, "first_position": 123456, "last_position": 123711}),
         _gpu_side(_checkpoint_form(traced={"steps": 256, "first_position": 123456, "last_position": 123711}), busy=123456.789, term=False, mean=234567.891),
         _gpu_side(_checkpoint_form(traced={"steps": 256, "first_position": 123456, "last_position": 123711}), busy=123456.789, host=1234.567, mean=987654.321),
@@ -994,7 +1025,7 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
         ),
         _checkpoint_form(model={"name": "a-checkpoint-directory-with-a-very-long-name-" * 3, "layers": 64, "reduced": False, "sequences": 64}),
         _checkpoint_form(report_file="a-report-file-with-a-very-long-name-" * 4 + ".json"),
-        _checkpoint_form(record={"reasons": ["reduced model", "fallback rows present", "kernel identity not claimed on this GPU class"] * 4}),
+        _checkpoint_form(record={"reasons": ["reduced model", "fallback rows present", "launched from Python", "other processes not observed"] * 4}),
     ]
     forms[1]["statistics"]["decode_rate"].update(value=None, reason=f"not printed: {perf.NOT_COMPUTED}")
     forms[2]["statistics"]["decode_rate"].update(value=None, reason=f"not printed: {perf.NOT_THE_PLAN}")
@@ -1002,7 +1033,7 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
         lines = perf.screen(data)
         assert max(len(line) for line in lines) <= perf.WIDTH == 110, max(lines, key=len)
         assert lines[0] == "cuDNN Frontend model sample: decode performance report" and lines[-1].startswith(("report file           ", " " * 22))
-        assert sum(line.startswith("scope       a decode-loop rate, not a served rate: ") for line in lines) == 1, "in every form"
+        assert sum(line.startswith("scope       the decode loop of one process: ") for line in lines) == 1, "in every form"
     assert "decode rate           not printed: the timed requests did not compute the checked request's tokens" in perf.screen(forms[1])
     assert "decode rate           not printed: the kernels of the traced steps are not the plan's" in perf.screen(forms[2])
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)  # and the lines a run printed are those of its data
@@ -1013,7 +1044,7 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
     # the step of this run is the host's, GPU busy the stand-in profiler's fixed figure: where the host leaves a remainder larger
     # than GPU busy the screen takes the step apart -- one line more under ``step``, and the note of two lines
     apart = sum(" + launch overhead " in line for line in screen)
-    assert len(screen) == 38 + 3 * apart and sum(line.startswith("note  ") for line in screen) == apart <= 1, "\n".join(screen)
+    assert len(screen) == 37 + 3 * apart and sum(line.startswith("note  ") for line in screen) == apart <= 1, "\n".join(screen)
     assert perf.screen(json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))) == perf.screen(outcome.data), "the file's data and nothing else"
     unwritten = perf.screen(outcome.data, "--perf-report late.json: No space left on device")
     assert (
@@ -1021,13 +1052,12 @@ def test_no_line_wider_than_110(monkeypatch, tmp_path):
     )
     _says("guide", f"The screen is rendered from the data the report file holds and from nothing else, at no more than {perf.WIDTH} characters a line;")
     _says("guide", "a line of it that would be longer breaks at a separator or between two words.")
-    _says("area", "The `scope` line behind it is always there: a decode-loop rate is not a served rate.")
+    _says("area", "The `scope` line behind it is always there: the decode loop of one process, with no request queue, no scheduler and no network.")
 
 
 def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
-    """The report file: strict JSON (no NaN, no infinity), the sections of this version, a definition beside every statistic
-    and the serving counterpart or null, units in the field names, UTC, no local path in any string, and never written
-    over a file that exists."""
+    """The report file: strict JSON (no NaN, no infinity), the sections of this version, a definition beside every statistic,
+    units in the field names, UTC, no local path in any string, and never written over a file that exists."""
     from model_samples import perf
 
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path, steps=6, requests=2, warmup=2)
@@ -1040,7 +1070,7 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     assert data == json.loads(json.dumps(outcome.data)) and outcome.unwritten == ""
     sections = "schema kind written_utc report_file record model environment observation kernels protocol checks statistics raw traced per_kernel memory"
     sections += " startup text_path"
-    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/4" and data["kind"] == "run"
+    assert list(data) == sections.split() and data["schema"] == "model-sample-performance/6" and data["kind"] == "run"
     assert "fingerprints" not in data and "report_text" not in data, "of later versions"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", data["written_utc"]) and data["report_file"] == "report.json"
     assert str(tmp_path) not in text and os.sep + "home" + os.sep not in text and str(MODELS) not in text, "a file is named by its own name"
@@ -1049,7 +1079,6 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
         "reasons": [
             "reduced model",
             "fallback rows present",
-            "no target kernel set declared",
             "launched from Python",
             "other processes not observed",
             "clocks not observed",
@@ -1058,12 +1087,12 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
         "performance_claim_eligible": False,
     }
     assert set(data["statistics"]) == set(perf.DEFINITIONS), "one definition per statistic of the file, and no statistic without one"
-    for key, (unit, definition, counterpart) in perf.DEFINITIONS.items():
+    for key, (unit, definition) in perf.DEFINITIONS.items():
         entry = data["statistics"][key]
-        assert (entry["unit"], entry["definition"], entry["serving_counterpart"]) == (unit, definition, counterpart) and len(definition) > 40, key
+        assert (entry["unit"], entry["definition"]) == (unit, definition) and len(definition) > 40, key
         assert "value" in entry and (entry["value"] is not None or entry["reason"]), f"{key}: a value that does not exist is null with a reason"
     assert data["statistics"]["decode_rate"]["value"] is None and data["statistics"]["decode_rate"]["reason"] == "not printed for a reduced model"
-    sentences = " ".join(f"{definition} {counterpart or ''}" for _, definition, counterpart in perf.DEFINITIONS.values())
+    sentences = " ".join(definition for _, definition in perf.DEFINITIONS.values())
     assert not re.search(
         r"\d\d", sentences.replace("1000 /", "").replace("2^30", "").replace("10^9", "")
     ), "a definition holds no figure of a run or of a record"
@@ -1100,6 +1129,20 @@ def test_file_strict_json_definitions_no_path(monkeypatch, tmp_path):
     _says("guide", "One definition per statistic, written in the report file, with a host test of its arithmetic on constructed time stamps.")
     _says("area", "**The statistics**, each with one definition, which the report file carries beside the number:")
     _says("area", "in GiB (2^30 bytes), where an ordinary run's `bytes per step` line is in GB")
+
+
+def _schema_5(data):
+    """The report file of the same run as the mode wrote it before its steps could be replays of a recorded step, schema
+    ``model-sample-performance/5``: 17 statistics -- none of the GPU busy of replayed steps --, a ``traced`` section
+    without its replayed steps, a ``protocol`` whose launch path has no reason and no recorded step beside it, and
+    ``checks`` without the statement about the replayed steps."""
+    import copy
+
+    older = copy.deepcopy(data)
+    older["schema"] = "model-sample-performance/5"
+    del older["statistics"]["gpu_busy_replayed"], older["traced"]["replayed"], older["protocol"]["launch_path_reason"], older["protocol"]["recorded_step"]
+    del older["checks"]["recorded_step"], older["checks"]["recomputed_steps"]
+    return older
 
 
 def _schema_3(data):
@@ -1174,23 +1217,28 @@ def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_pa
 
     outcome, lines, events, _ = _mode(monkeypatch, tmp_path)
     data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
-    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/4"
+    assert list(data)[0] == "schema" and data["schema"] == perf.SCHEMA == "model-sample-performance/6"
     _says("area", f"The file's first field names its schema, `{perf.SCHEMA}`.")
     assert perf.screen(data) == perf.screen(outcome.data) and perf.screen(data)[0] in lines, "a file of this schema is rendered: the screen of its run"
     _says("area", "The screen is rendered from the data of a file of this schema (`screen` in `model_samples/perf.py`);")
-    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/4'"
+    refusal = "a report file of schema {} is not read by this version of the performance mode, which reads and writes 'model-sample-performance/6'"
 
     def refused(file):
         with pytest.raises(ValueError) as said:  # a KeyError is not one: it would pass through and fail the test
             perf.screen(file)
         return str(said.value)
 
-    # the files of the three versions before, each written and read back as a file: 18 sections and 16 statistics twice, and 17 and 10,
-    # where this version has 18 and 17
-    third = _schema_3(data)
+    # the files of the versions before, each written and read back as a file: 18 sections and 16 statistics twice, and 17 and 10,
+    # where the version before this one had 18 and 17 and this one has 18 and 18
+    fifth = _schema_5(data)
+    third = _schema_3(fifth)
     second = _schema_2(third)
     older = _schema_1(second)
-    assert [(len(file), len(file["statistics"])) for file in (older, second, third, data)] == [(17, 10), (18, 16), (18, 16), (18, 17)]
+    counts = [(len(file), len(file["statistics"])) for file in (older, second, third, fifth, data)]
+    assert counts == [(17, 10), (18, 16), (18, 16), (18, 17), (18, 18)]
+    assert perf.write_report(str(tmp_path / "schema_5.json"), fifth) == ""
+    assert refused(json.loads((tmp_path / "schema_5.json").read_text(encoding="utf-8"))) == refusal.format("'model-sample-performance/5'")
+    assert "gpu_busy_replayed" not in fifth["statistics"] and list(fifth) == list(data)
     assert list(older["traced"])[-2:] == ["gpu_busy_ms", "gpu_busy_reason"] and len(older["traced"]) == 7
     assert list(third) == list(second) == list(data) and len(third["observation"]) == 5 and list(third["protocol"]["in_a_timed_request"])[-1] == "text"
     for number, file in ((1, older), (2, second), (3, third)):
@@ -1202,7 +1250,7 @@ def test_a_file_of_another_schema_is_refused_in_one_sentence(monkeypatch, tmp_pa
     assert "per_kernel" not in older and "gpu_busy" not in older["statistics"], "and what it would look for"
     # the file that took launch overhead from three medians: every section, every statistic and every field name this version reads is
     # there, and the numbers behind three of them are others -- it is refused by its name, not rendered under this version's
-    as_two = _schema_2(data)
+    as_two = _schema_2(_schema_5(data))
     assert (len(as_two), len(as_two["statistics"]), list(as_two)) == (18, 17, list(data)) and perf.write_report(str(tmp_path / "as_two.json"), as_two) == ""
     was, now = as_two["statistics"]["launch_overhead"], data["statistics"]["launch_overhead"]
     assert set(now) - set(was) == {"label", "n", "median", "mean", "minimum", "maximum", "p90", "p99"} and not set(was) - set(now)
@@ -1275,7 +1323,7 @@ def test_a_failed_check_prints_no_rate(monkeypatch, tmp_path):
     assert step.startswith("step                  reduced model: ") and step.endswith(f"ms over every timed step; GPU busy not measured ({NO_PROFILER})")
     assert outcome.data["checks"]["last_line"] == f"[00] RAN (kernels not observed: {NO_PROFILER})" and events.count("profiler") == 1
     assert outcome.data["traced"]["steps"] == 0 and outcome.data["kernels"]["kernels_per_step"] is None
-    assert "what a step launches was not observed" in lines[lines.index(_line(lines, "kernels     ")) + 1]
+    assert "what a step also launches was not observed" in lines[lines.index(_line(lines, "kernels     ")) + 1]
     traced = outcome.data["traced"]
     assert outcome.data["protocol"]["profiler_first_started"] is None and traced["first_position"] is None and traced["last_position"] is None
     # ... and on a model that is not a reduced one the rate stays, as orientation, with that reason on line 2
@@ -1382,7 +1430,9 @@ def _records(sites, start=0.0, us=4.3, period=0.01, also=()):
     from model_samples.census import FAMILIES, Launch
 
     names = {"embedding_gather": GATHER, "gdn_decode_fused": SYMBOL, "pytorch": ELEMENTWISE, "cublas": NVJET}
-    names.update({"cublaslt_fp8_gemm": NVJET_FP8, "fi_mm_fp4": FI_MM_FP4})  # the exact kernels of the rows a library serves
+    names.update(
+        {"cublaslt_fp8_gemm": NVJET_FP8, "fi_mm_fp4": FI_MM_FP4, "fi_decode_attention": FI_ATTENTION}
+    )  # the exact kernels of the rows a library serves
     names.update({kernel: pattern.pattern.lstrip("^") + "Cfg" for kernel, pattern in FAMILIES if pattern.pattern.startswith("^cudnn_kernel_frost_")})
     records = []
 
@@ -1403,12 +1453,12 @@ def _records(sites, start=0.0, us=4.3, period=0.01, also=()):
     return records
 
 
-def _walked(sites, steps, claim=None):
+def _walked(sites, steps):
     """What a session keeps of a traced pass, from constructed records: the kernel check's walk over ``steps`` (each a list
     of launch records that ends in its host read) against ``sites``, and its verdict; and GPU busy of every step."""
     from model_samples import census, timing
 
-    traced = census.Traced(list(sites), [], steps=[list(step) for step in steps], claim=claim)
+    traced = census.Traced(list(sites), [], steps=[list(step) for step in steps])
     traced.result = census.compare(traced.steps, traced.sites)
     traced.status = census.FAIL if traced.result.failures else census.PASS
     return traced, [timing.step_facts([(launch.name, launch.start, launch.end) for launch in step])[0][0] for step in steps]
@@ -1423,19 +1473,18 @@ def _site(block, layer=-1, *kernels):
     return Site(block, layer, tuple(family.get(name) or Kernel(name, "cuDNN FE", "exact", launches=1) for name in kernels), entry=f"entry of {block}")
 
 
-def _planned(monkeypatch, stack="native"):
-    """``(sites, claim)`` of a step of the 64-layer model on ``stack``, compute capability 10.0 with 148 SMs, planned on
-    stated facts: the family's own wiring, each call with the census entries of the row that serves it."""
+def _planned(stack="native"):
+    """The sites of a step of the 64-layer model on ``stack``, compute capability 10.0 with 148 SMs, planned on stated
+    facts: the family's own wiring, each call with the census entries of the row that serves it."""
     from model_samples import Session, TextIO, blocks, census
     from model_samples.qwen_dense import QwenDense
 
-    monkeypatch.setattr(census, "installed_versions", lambda packages: {"torch": "2.14.0+cu130", "nvidia-cutlass-dsl": "4.8.0"})
     model = QwenDense()
     session = Session(model, TextIO.synthetic(272), stack=stack, device="cpu", capacity=8)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
     session.plan = blocks.plan(model.provider_table, model.regimes, facts, 1, 1, stack, model=model, options={"device": "cpu"})
     parts = [(name, layer, at, session.plan.at(name, at)[1]) for (name, layer), at in zip(model.wiring(), census.call_sites(model))]
-    return [census.Site(name, layer, tuple(block.kernels), block.entry, site=at) for name, layer, at, block in parts], session.claim()
+    return [census.Site(name, layer, tuple(block.kernels), block.entry, site=at) for name, layer, at, block in parts]
 
 
 def _fine_stamps(monkeypatch, behind=0):
@@ -1465,17 +1514,6 @@ def _fine_stamps(monkeypatch, behind=0):
         monkeypatch.setattr(loop, "trace_steps", fine)
 
     return install
-
-
-def _corresponds(key, *phrases):
-    """The serving counterpart the report file carries beside the statistic ``key`` holds every one of ``phrases``; with
-    none given, the statistic has no counterpart."""
-    from model_samples import perf
-
-    counterpart = perf.DEFINITIONS[key][2]
-    assert (counterpart is None) == (not phrases), key
-    for phrase in phrases:
-        assert phrase in counterpart, f"{key}: {phrase}"
 
 
 def test_added_time_partitions_the_union():
@@ -1519,11 +1557,8 @@ def test_added_time_partitions_the_union():
     assert (row["launches_per_step"], row["us_per_launch_added"], row["us_per_launch_recorded"]) == (3, pytest.approx(2.0), 2.0), "not their mean, 4 us"
     _defines("gpu_busy", "the length of the union of the intervals of every kernel and copy between two host reads", "the median over the traced steps")
     _defines("gpu_busy", "An upper bound: tracing lengthens kernels.")
-    _corresponds("gpu_busy", "The same method as the kernel-busy sum of a traced serving step.")
     _defines("kernel_time_per_launch", "the median over the row's launches in all traced steps.", "The file also holds the median recorded duration.")
     _says("area", "the latest end of any earlier launch of the step, the median over the row's launches;")
-    _corresponds("kernel_time_per_launch", "The same method as the timeline-exclusive duration of a per-kernel analysis of a traced serving step;")
-    _corresponds("kernel_time_per_launch", "comparable only on one GPU class, SM count, clock and launch path.")
     _says("area", "from kernel activity records, the median over the traced steps (an upper bound: tracing lengthens kernels);")
     _defines("kernel_time_per_launch", "its end minus the later of its start and the latest end of any earlier record of the step, not below zero")
     _defines("kernel_time_per_step", "Within one step the added times of all records sum exactly to that step's GPU busy.")
@@ -1591,8 +1626,6 @@ def test_step_equation_only_where_the_remainder_exceeds_gpu_busy():
     _defines("launch_overhead", "the per-step remainders, and the launch overhead per block call.")
     _defines("tracing_stretch", "in the traced request, divided by the same in the timed requests at the same positions, minus 1.")
     _defines("launch_overhead", "It stands for time inside a step in which the GPU waited for the next launch, or the host for the read,")
-    _corresponds("launch_overhead")
-    _corresponds("tracing_stretch")
     _says("area", "(the remainder as computed is in the file).")
     _says("area", "A line under it says how many steps were traced, at which positions, their median GPU busy, and by how much tracing lengthened a step.")
     # form A: the step, its mean taken apart, the line that calls launch overhead an estimate, the traced steps and the note
@@ -1963,10 +1996,10 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
     assert max(len(line) for line in shown) <= perf.WIDTH, "every row in its columns, no line too wide"
     # the family's plan: 64 layers on the stack native -- the exact rows in the wiring order, each with its planned launches; the row of a block
     # a library serves carries the library's entry as the plan names it, and holds the launches of the library's kernel
-    sites, claim = _planned(monkeypatch)
-    traced, busy = _walked(sites, [_records(sites)], claim)
+    sites = _planned()
+    traced, busy = _walked(sites, [_records(sites)])
     rows = perf.kernel_table(traced, busy)["rows"]
-    exact = [(row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows[:10]]
+    exact = [(row["label"], row["relation"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows[:12]]
     assert exact == [
         ("embedding", "exact", 1, 1),
         ("add_norm_quantize", "exact", 129, 129),
@@ -1976,24 +2009,28 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         ("mlp.gate_up", "exact", 64, 64),
         ("flashinfer.gemm.mm_fp4: mlp.down", "library", 64, 64),
         ("attention.prepare", "exact", 16, 16),
+        (f"{ATTENTION_ENTRY}: attention.core"[: perf.LABEL], "library", 16, 16),  # a name wider than the column: cut there
         ("attention.gate_quantize", "exact", 16, 16),
-        ("torch_ref.quantize + flashinfer.gemm.mm_fp4: output_head", "library", 1, 1),
+        ("output_head.quantize", "exact", 1, 1),
+        ("flashinfer.gemm.mm_fp4: output_head", "library", 1, 1),
     ]
-    assert not [row["label"] for row in rows[10:] if row["relation"] in ("exact", "library")]
-    three = "the target's own compiled kernels + cuDNN Frontend entries with byte-equal results + declared stand-ins"
-    numbers = claim.numbers()
-    assert sum(planned for *_, planned in exact) == traced.result.exact == numbers["target_code"] + numbers["target_port"] == 178 + 289 + 0, three
-    assert sum(planned for _, kind, _, planned in exact if kind == "library") == 64 + 64 + 1, "one launch of the library per call of its three blocks"
-    assert rows[1]["blocks"] == [{"block": "add_norm_quantize", "calls_per_step": 129, "entry": "cudnn.AddNormQuantDecode", "identity": "target"}]
-    assert rows[4]["blocks"] == [{"block": "projection.fp8.out", "calls_per_step": 64, "entry": "flashinfer.gemm.bmm_fp8", "identity": "target"}]
+    assert not [row["label"] for row in rows[12:] if row["relation"] in ("exact", "library")]
+    assert sum(planned for *_, planned in exact) == traced.result.exact == 484, "every launch of the plan on an exact row"
+    assert sum(planned for _, kind, _, planned in exact if kind == "library") == 64 + 64 + 16 + 1, "one launch of the library per call of its four blocks"
+    assert rows[8]["blocks"] == [{"block": "attention.core", "calls_per_step": 16, "entry": ATTENTION_ENTRY}], "the file names the block whole"
+    assert [(shape["symbol"], shape["launches"]) for shape in rows[8]["launch_shapes"]] == [(FI_ATTENTION, 16)]
+    assert rows[1]["blocks"] == [{"block": "add_norm_quantize", "calls_per_step": 129, "entry": "cudnn.AddNormQuantDecode"}]
+    assert rows[4]["blocks"] == [{"block": "projection.fp8.out", "calls_per_step": 64, "entry": "flashinfer.gemm.bmm_fp8"}]
     # the file says which kernel the library launched for its row, by the name the profiler gave it, and how often in a step
     assert [(shape["symbol"], shape["launches"]) for shape in rows[4]["launch_shapes"]] == [(NVJET_FP8, 64)]
-    assert [(shape["symbol"], shape["launches"]) for shape in rows[6]["launch_shapes"]] == [(FI_MM_FP4, 64)] and rows[9]["launch_shapes"][0]["launches"] == 1
+    assert [(shape["symbol"], shape["launches"]) for shape in rows[6]["launch_shapes"]] == [(FI_MM_FP4, 64)] and rows[10]["launch_shapes"][0]["launches"] == 1
     printed = perf._kernel_lines(perf.kernel_table(traced, busy), "")
-    assert printed[9] == f"  {'flashinfer.gemm.mm_fp4: mlp.down':<58}{64:>9}{'4.30':>11}{0.275:>9.3f}{'9.9 %':>9}", "one kernel per launch: its time per launch"
+    assert (
+        printed[9] == f"  {'flashinfer.gemm.mm_fp4: mlp.down':<58}{64:>9}{'4.30':>11}{0.275:>9.3f}{'10.4 %':>9}"
+    ), "one kernel per launch: its time per launch"
     # the stack fe-entries: the cuDNN Frontend rows of native and no library -- no row of that kind, and the exact rows it had before
-    sites, claim = _planned(monkeypatch, "fe-entries")
-    traced, busy = _walked(sites, [_records(sites)], claim)
+    sites = _planned("fe-entries")
+    traced, busy = _walked(sites, [_records(sites)])
     rows = perf.kernel_table(traced, busy)["rows"]
     assert not [row["label"] for row in rows if row["relation"] in ("library", "beside")]
     assert [(row["label"], row["launches_per_step"], row["planned_launches_per_step"]) for row in rows if row["relation"] == "exact"] == [
@@ -2004,11 +2041,11 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
         ("mlp.gate_up", 64, 64),
         ("attention.prepare", 16, 16),
         ("attention.gate_quantize", 16, 16),
+        ("output_head.quantize", 1, 1),
     ]
-    assert traced.result.exact == 49 + 289 + 0, three
+    assert traced.result.exact == 339, "the cuDNN Frontend rows and PyTorch's gather"
     assert rows[-1]["label"] == "host read" and rows[-1]["launches_per_step"] == 1 and rows[-1]["blocks"] == []
     _defines("kernel_launches", "the kernel and copy records of a traced step that the kernel check attributes to the row's blocks; the median per step.")
-    _corresponds("kernel_launches", "The kernel census of a traced serving step.")
     _says("area", "the device time of every block's kernels, from the launch records of the traced request.")
     _says(
         "area", "`launches`: the kernel and copy records of a step the kernel check attributes to the row.", "the host read that ends a step is the last row."
@@ -2022,10 +2059,9 @@ def test_rows_by_wiring_position_not_by_name(monkeypatch):
 
 def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     """The records between two exact kernels belong to the blocks the wiring has there on fallback or host entries: such
-    blocks are one row together and the row says so; the same blocks in another layer are the same row.  A row of a
-    stack that declares a target kernel set says ``not yet`` where the census says so of its block, and what a block
+    blocks are one row together and the row says so; the same blocks in another layer are the same row.  What a block
     launches beside a kernel of its own is a row that says so: no block of it is on a fallback entry."""
-    from model_samples import census, perf
+    from model_samples import perf
 
     sites = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch"), _site("g", 0, "pytorch", "cublas"), _site("y", 0, "swiglu_fp4"), _site("f", 1, "pytorch")]
     sites += [
@@ -2048,7 +2084,7 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     rows = perf.kernel_table(traced, busy)["rows"]
     assert [row["label"] for row in rows] == ["x", "y", "fallback: f + g (one row)", "fallback: f", "host path: choice", "host read"]
     assert [row["relation"] for row in rows] == ["exact", "exact", "fallback", "fallback", "host", "read"], "what the file calls each row"
-    assert [block["identity"] for row in rows for block in row["blocks"]] == [None] * 6, "no census: no identity is stated for a block"
+    assert all(set(block) == {"block", "calls_per_step", "entry"} for row in rows for block in row["blocks"]), "what the file holds of a block"
     assert rows[2]["launches_per_step"] == 2 * (2 + 3) and [block["calls_per_step"] for block in rows[2]["blocks"]] == [2, 2]
     assert rows[3]["launches_per_step"] == 2 and rows[4]["launches_per_step"] == 1 and rows[2]["us_per_launch_added"] == pytest.approx(4.3)
     lines = perf._kernel_lines(perf.kernel_table(traced, busy), "")
@@ -2058,14 +2094,7 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
     )
     _says("area", "the median over the row's launches; not printed for a row of fallback or host blocks nor for one of launches beside a kernel,")
     _says("area", "chains of many kernels.")
-    # with the identities a census states for the calls: a declared stand-in says so, a block the census calls not yet says so
-    relations = ["stand-in", "not yet", "not yet", "target", "not yet", "stand-in", "not yet", "not yet", "target", "host"]
-    stated = census.Claim("a census", "plain", "a device", 1, identities=[census.Identity(relation, reason="a chain") for relation in relations])
-    named = [row["label"] for row in perf.kernel_table(*_walked(sites, [_records(sites)], stated))["rows"]]
-    assert named == ["x (declared stand-in)", "y", "not yet: f + g (one row)", "not yet: f", "host path: choice", "host read"]
-    _says("area", "A row's name says what it is: a row of blocks on fallback entries is marked `not yet:` where the kernel census says so of one of")
-    _says("area", "of one of its blocks and `fallback:` where no kernel identity is stated, a row of host-path blocks alone `host path:`,")
-    _says("area", "and an exact row on a declared stand-in `(declared stand-in)`;")
+    _says("area", "A row's name says what it is: a row of blocks on fallback entries is marked `fallback:`, a row of host-path blocks alone `host path:`;")
     # a list of blocks wider than the label column is shortened; the file holds every block
     many = [_site("exact", 0, "gate_quant")] + [_site(f"a_block_with_a_long_name_{n}", 0, "pytorch") for n in range(4)]
     wide = perf.kernel_table(*_walked(many, [_records(many)]))["rows"][1]
@@ -2081,50 +2110,53 @@ def test_adjacent_fallback_blocks_share_a_row(monkeypatch):
         ("beside its kernel: both", "beside"),
         ("host read", "read"),
     ]
-    # the family's plan: the attention preparation is an exact row, and the attention core behind it a fallback row of its own.  On the stack native
-    # three blocks are a library's: what their calls launch beside the library's kernel -- a further launch of the library's choice behind the
-    # out-projection, the reference quantiser in front of the output head's multiply -- is the row of its place in the wiring, and says so
-    sites, claim = _planned(monkeypatch)
-    table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
+    # the family's plan: the attention preparation is an exact row, and so is the attention core behind it, the library's.  On the stack native
+    # four blocks are a library's: what their calls launch beside the library's kernel -- a further launch of the library's choice behind the
+    # out-projection -- is the row of its place in the wiring, and says so.  The head's quantise is an exact row of its own and the head's
+    # multiply the library's kernel alone: behind it stands the host path
+    sites = _planned()
+    table = perf.kernel_table(*_walked(sites, [_records(sites)]))
     rows = table["rows"]
-    behind = [(row["label"], row["relation"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows[10:]]
+    behind = [(row["label"], row["relation"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows[12:]]
     assert behind == [
         ("beside its kernel: projection.fp8.out", "beside", [64]),
-        ("not yet: attention.core", "fallback", [16]),
-        ("beside its kernel: output_head", "beside", [1]),
-        ("beside its kernel: output_head + token_choice (one row)", "beside", [1, 1]),
+        ("host path: token_choice", "host", [1]),
         ("host read", "read", []),
     ]
-    assert not [label for label, *_ in behind if label.startswith("fallback: ")], "no block of this plan is without a stated identity"
-    assert rows[11]["blocks"][0]["identity"].startswith("not yet (") and rows[13]["blocks"] == [
-        {"block": "output_head", "calls_per_step": 1, "entry": "torch_ref.quantize + flashinfer.gemm.mm_fp4", "identity": "target"},
-        {"block": "token_choice", "calls_per_step": 1, "entry": "torch.argmax", "identity": "host path, not compared"},
-    ]
+    assert not [label for label, *_ in behind if label.startswith("fallback: ")], "no block of this plan is on a fallback row"
+    assert rows[13]["blocks"] == [{"block": "token_choice", "calls_per_step": 1, "entry": "torch.argmax"}]
+    assert [(row["label"], row["relation"], row["blocks"]) for row in rows[10:12]] == [
+        (
+            "output_head.quantize",
+            "exact",
+            [{"block": "output_head.quantize", "calls_per_step": 1, "entry": "cudnn.RowQuantizeFp4Decode"}],
+        ),
+        (
+            "flashinfer.gemm.mm_fp4: output_head",
+            "library",
+            [{"block": "output_head", "calls_per_step": 1, "entry": "flashinfer.gemm.mm_fp4"}],
+        ),
+    ], "behind the last layer: an exact row of the entry, then the library's entry for the head"
     printed = perf._kernel_lines(table, "")
-    assert printed[15] == f"  {'beside its kernel: output_head':<58}{1:>9}{'--':>11}{0.004:>9.3f}{'0.2 %':>9}", "no time per launch: a chain"
+    assert printed[15] == f"  {'beside its kernel: projection.fp8.out':<58}{128:>9}{'--':>11}{0.550:>9.3f}{'20.8 %':>9}", "no time per launch: a chain"
     assert sum(row["launches_per_step"] for row in rows) == len(_records(sites)), "the rows hold every record of the step, the library's among them"
-    # the stack fe-entries: those three blocks are on their fallback rows there, and the census says `not yet` of them
-    sites, claim = _planned(monkeypatch, "fe-entries")
-    rows = perf.kernel_table(*_walked(sites, [_records(sites)], claim))["rows"]
+    # the stack fe-entries: the four blocks a library serves in native are on their fallback rows there, and their rows say so
+    sites = _planned("fe-entries")
+    rows = perf.kernel_table(*_walked(sites, [_records(sites)]))["rows"]
     behind = [(row["label"], [block["calls_per_step"] for block in row["blocks"]]) for row in rows if row["relation"] != "exact"]
     assert behind == [
-        ("not yet: projection.fp8.out", [64]),
-        ("not yet: mlp.down", [64]),
-        ("not yet: attention.core", [16]),
-        ("not yet: output_head + token_choice (one row)", [1, 1]),
+        ("fallback: projection.fp8.out", [64]),
+        ("fallback: mlp.down", [64]),
+        ("fallback: attention.core", [16]),
+        ("fallback: output_head + token_choice (one row)", [1, 1]),
         ("host read", []),
     ]
-    assert rows[9]["blocks"][0]["identity"].startswith("not yet (") and rows[10]["blocks"][1] == {
-        "block": "token_choice",
-        "calls_per_step": 1,
-        "entry": "torch.argmax",
-        "identity": "host path, not compared",
-    }
-    _says("area", "what a block's call launches beside a kernel of its own -- the reference quantiser in front of the output head's multiply,")
-    _says("area", "a further launch of a library's choice -- is the row of its place in the wiring, marked `beside its kernel:` and shared with")
+    assert rows[11]["blocks"][1] == {"block": "token_choice", "calls_per_step": 1, "entry": "torch.argmax"}
+    _says("area", "what a block's call launches beside a kernel of its own -- a further launch of a library's choice -- is the row of its place in")
+    _says("area", "the wiring, marked `beside its kernel:` and shared with")
     _says("area", "whatever else the wiring has there (the records do not tell them apart), and it prints 0 where nothing was launched;")
     _says("guide", "what a block launches beside a kernel of its own is the row of its place in the wiring and says so.")
-    _says("area", "The report file holds every block of every row, with its entry and the identity the census states for it.")
+    _says("area", "The report file holds every block of every row, with its entry.")
     _says("area", "the blocks served by fallback or host entries that no exact kernel separates share one row, and the row says so (`one row`)")
 
 
@@ -2169,7 +2201,6 @@ def test_shares_sum_to_gpu_busy(monkeypatch, tmp_path):
     _defines("kernel_time_per_step", "per traced step the sum of the row's added times, the median over the steps; its share is that over the median GPU busy.")
     _defines("kernel_time_per_step", "The medians of the rows need not sum to the median GPU busy, nor their shares to the whole of it:")
     _defines("kernel_time_per_step", "the file also holds each row's mean, and the means sum to the mean GPU busy.")
-    _corresponds("kernel_time_per_step", "The same shares as in a per-kernel analysis of a traced serving step.")
     _says("area", "`ms/step` and its share of GPU busy: the row's added times of a step, the median over the traced steps,")
     _says("area", "and that median over the median GPU busy, which the line under the `step` line gives.")
     _says("area", "(the medians, and with them the shares, up to the difference between a median of sums and a sum of medians;")
@@ -2300,7 +2331,7 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     )
     labels = [row["label"] for row in data["per_kernel"]["rows"]]
     assert labels == ["embedding", "linear_attention.step", "fallback: add_norm_quantize + projection.fp8.in (one row)", labels[3], "host read"]
-    assert labels[3] == "fallback: projection.fp8.out + 9 more (one row)" and len(data["per_kernel"]["rows"][3]["blocks"]) == 10
+    assert labels[3] == "fallback: projection.fp8.out + 10 more (one row)" and len(data["per_kernel"]["rows"][3]["blocks"]) == 11
     assert [line[2:60].rstrip() for line in lines[head + 3 : head + 8]] == labels and lines[head + 8] == "" and lines[head - 1] == ""
     assert lines[head + 9].startswith("report file           ") and lines[head - 2].startswith(("note   ", " " * 22))
     exact = [row for row in data["per_kernel"]["rows"] if row["relation"] == "exact"]
@@ -2330,7 +2361,13 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     )
     assert data["statistics"]["gpu_busy"]["n"] == data["traced"]["steps"] == len(data["traced"]["per_step"]["gpu_busy_ms"]) == 6, "every traced step"
     _says("area", "It is taken apart with the launch records of the traced request: GPU busy = the union of the intervals")
-    assert list(data["traced"])[-5:] == ["gpu_busy_ms", "gpu_busy_reason", "per_step", "tracing_stretch_percent", "time_resolution_us"]
+    assert list(data["traced"])[-6:] == ["gpu_busy_ms", "gpu_busy_reason", "per_step", "tracing_stretch_percent", "time_resolution_us", "replayed"]
+    # a run launched from Python: nothing of a replayed step, and the file says why its steps are launched from Python
+    assert data["traced"]["replayed"] is None and data["checks"]["recorded_step"] is None and data["checks"]["recomputed_steps"] is None
+    assert data["protocol"]["launch_path"] == "python" and data["protocol"]["recorded_step"] is None
+    assert data["protocol"]["launch_path_reason"] == "recording the step was not asked for (Session(capture=True))"
+    again = data["statistics"]["gpu_busy_replayed"]
+    assert (again["value"], again["n"], again["reason"]) == (None, 0, "not formed: the steps of this run are launched from Python")
     assert list(data["traced"]["per_step"]) == ["gpu_busy_ms", "idle_ms", "kernels", "copies"] and data["traced"]["per_step"]["copies"] == [1] * 6
     _says("area", "GPU busy, idle time, kernels and copies of every traced step; the resolution of the profiler's time stamps as found),")
     assert list(data["per_kernel"]) == ["launch_path", "launch_path_note", "us_per_launch_printed", "reason", "rows"]
@@ -2356,7 +2393,7 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     )
     named = "added_time_partitions_the_union step_equation_only_where_the_remainder_exceeds_gpu_busy rows_by_wiring_position_not_by_name"
     named += " adjacent_fallback_blocks_share_a_row shares_sum_to_gpu_busy undeclared_record_prints_no_table whole_microsecond_stamps_print_no_us_per_launch"
-    assert all(callable(globals()[f"test_{name}"]) for name in [*named.split(), "table_of_a_python_step_carries_its_line", "dump_census_schema_2"])
+    assert all(callable(globals()[f"test_{name}"]) for name in [*named.split(), "table_of_a_python_step_carries_its_line", "dump_census_schema_3"])
     assert callable(test_the_remainder_is_formed_step_by_step_before_it_is_aggregated), "the step taken apart: its second test"
     assert perf.screen(json.loads(json.dumps(data))) == lines[lines.index("cuDNN Frontend model sample: decode performance report") :][: len(perf.screen(data))]
     _says("area", "The table says of itself what it is: its second line says that it is launched from Python:")
@@ -2368,9 +2405,9 @@ def test_table_of_a_python_step_carries_its_line(monkeypatch, tmp_path):
     _says("guide", "The two are never taken from one pass, and a report says which is which.")
 
 
-def test_dump_census_schema_2(monkeypatch, capsys, tmp_path):
+def test_dump_census_schema_3(monkeypatch, capsys, tmp_path):
     """``--dump-census`` writes every launch record with its start and its end, in milliseconds on the profiler's clock, and
-    says ``schema 2``: of an ordinary run and of the traced request of the performance mode."""
+    says ``schema 3``: of an ordinary run and of the traced request of the performance mode."""
     sites = [_site("x", 0, "gate_quant"), _site("f", 0, "pytorch")]
     traced, _ = _walked(sites, [_records(sites), _records(sites, start=1.0)])
     dumped = traced.dump()
@@ -2402,7 +2439,7 @@ def test_dump_census_schema_2(monkeypatch, capsys, tmp_path):
         assert code == 0 and capsys.readouterr().err.splitlines()[-1] == "[00] PASS"
         written = json.loads((tmp_path / "census.json").read_text(encoding="utf-8"))
         (tmp_path / "census.json").unlink()
-        assert (written["schema"], written["traced_steps"]) == (2, steps) and written["runs"][0]["fields"][-2:] == ["start_ms", "end_ms"]
+        assert (written["schema"], written["traced_steps"]) == (3, steps) and written["runs"][0]["fields"][-2:] == ["start_ms", "end_ms"]
         records = [record for step in written["runs"][0]["steps"] for record in step]
         assert records and all(len(record) == 12 and record[-2] <= record[-1] for record in records)
         assert all([record[-2] for record in step] == sorted(record[-2] for record in step) for step in written["runs"][0]["steps"]), "in start order"
@@ -2427,7 +2464,10 @@ def _sample_script(monkeypatch):
 def _sample_on_the_cpu(monkeypatch, events, loads=True, **stand_in):
     """The sample script as a module whose runs stay on the CPU: stated device facts (compute capability 10.0), the tiny
     geometry in the place of the reduced model, every session on the CPU and planned on the stand-ins of
-    :func:`_stand_ins`, the environment check answered.  With ``loads`` false a load is an ``AssertionError``."""
+    :func:`_stand_ins`, the environment check answered.  With ``loads`` false a load is an ``AssertionError``.
+
+    The stand-ins are those of the stack ``fe-cublas``, a functional-validation stack: a run through this module's
+    ``main`` that names no stack is run with ``--stack fe-cublas`` (``VALIDATION_STACK``), never on the sample's own."""
     from model_samples import blocks
     from model_samples.qwen_dense import QwenDense
 
@@ -2457,7 +2497,14 @@ def _sample_on_the_cpu(monkeypatch, events, loads=True, **stand_in):
         monkeypatch.setattr(real_session, "load", no_load)
     monkeypatch.setattr(model_samples, "Session", session)
     monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=None: _tiny_model()))
-    return _sample_script(monkeypatch)
+    script = _sample_script(monkeypatch)
+    main = script.main
+    monkeypatch.setattr(script, "main", lambda arguments: main(list(arguments) if "--stack" in arguments else [*VALIDATION_STACK, *arguments]))
+    return script
+
+
+#: the stack the host runs of this module are planned on: the stand-ins are its rows
+VALIDATION_STACK = ("--stack", "fe-cublas")
 
 
 def test_perf_flags_refused_before_load(monkeypatch, capsys, tmp_path):
@@ -2523,7 +2570,7 @@ def test_perf_flags_refused_before_load(monkeypatch, capsys, tmp_path):
     _says("script", "a file that exists, or that another flag of the run writes, is an error before the load")
     _says("family", "Not with `--stack reference`, `--max-tokens`, `--force-tokens`, a list of sequence counts or several prompts: each is refused before")
     _says("family", "Implies one sequence count and one prompt, the kernel check (as `--check-kernels`), forced steps with the end token ignored,")
-    _says("family", "one token more than a serving request of 256 output tokens. At least 2 |")
+    _says("family", "257 new tokens and 256 intervals at the default. At least 2 |")
     _says("area", "the decode performance report of this GPU: one process, one sequence count, one prompt.")
     _says("script", "Implies one sequence count, the kernel check, forced steps with the end token ignored, and the text written once, after the report;")
     _says("script", "not with --stack reference")
@@ -2627,7 +2674,8 @@ def test_perf_main_on_cpu(monkeypatch, capsys, tmp_path):
     # the GPU cells of the area run this form on the two stacks the repository's tests run, each in a fresh interpreter
     cells = (MODELS.parents[1] / "test" / "python" / "linear_attention" / "frost" / "test_model_sample_qwen_dense.py").read_text(encoding="utf-8")
     cell = cells.split("def test_the_performance_mode_of_the_seeded_run_reports_and_writes_its_file(", 1)
-    assert cell[0].endswith('@pytest.mark.L0\n@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries"])\n') and "_fresh_interpreter(arguments)" in cell[1]
+    stacks = '@pytest.mark.L0\n@pytest.mark.parametrize("stack", ["fe-cublas", "fe-entries", "native"])\n'  # and on the sample's own, where its library is
+    assert cell[0].endswith(stacks) and "_fresh_interpreter(arguments)" in cell[1]
     _says(
         "area", "the performance mode of the seeded model (`--perf`) on both stacks, in a fresh interpreter: `[NN] PASS`, the report in its reduced-model form"
     )
@@ -2795,7 +2843,7 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
     """An ordinary run prints what it printed.  Without ``--perf``: the parser's defaults, no line of the mode, no report
     file, the plain report and the plain checks with their kernel line; ``Session.reset`` records as it did; and
     ``tie_out.run_checks`` without judged positions replays and judges every step, and still refuses to leave the kernel
-    check of a target stack out."""
+    check of the stack ``fe-entries`` out."""
     from model_samples import Session, TextIO, tie_out
 
     events = []
@@ -2814,7 +2862,7 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
     assert "model_samples.perf" not in sys.modules and not hasattr(package, "perf"), "an ordinary run does not import the mode's module"
     assert (sample._record_steps(True, False), sample._record_steps(False, False)) == (32, None), "what an ordinary run records, as before"
     assert sample._record_steps(True, True) is None, "with a checkpoint the mode's checked request is recorded whole: the checks replay all of it"
-    _says("guide", "An ordinary run prints what it printed before the mode existed and does not import the mode's module:")
+    _says("guide", "An ordinary run prints nothing of the mode and does not import the mode's module:")
     _says("guide", "the mode is a branch of its own in the script, and a pull request that touches the loop, the census, the checks or the timing shows")
     assert not any("performance" in line or line.startswith(("record class", "scope ", "decode rate")) for line in lines)
     for start in ("text path ", "first token ", "steps (", "traced pass (", "rate ", "bytes per step ", "note ", "text out "):
@@ -2855,7 +2903,7 @@ def test_plain_report_unchanged(monkeypatch, capsys, tmp_path):
     with pytest.raises(ValueError, match="judged positions are steps of a decode run"):
         tie_out.run_checks(Session(_tiny_model(), TextIO.synthetic(272), stack="reference", device="cpu", draft_tokens=2), prompt_tokens=0, positions=[0])
     target = Session(_tiny_model(), TextIO.synthetic(272), stack="fe-entries", device="cpu")
-    with pytest.raises(ValueError, match="its kernel check cannot be switched off"):
+    with pytest.raises(ValueError, match="always checks its kernels: the check cannot be switched off"):
         tie_out.run_checks(target, prompt_tokens=0, kernels=False)
     assert tie_out.DEFERRED == "DEFERRED", "the word a caller hands in when it traces after the checks"
 
@@ -2874,9 +2922,9 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
     for word in ("*Timed request*", "*Judged position*", "*Token-to-token interval*", "*Record class*"):
         assert word in _flat(area), word
     steps = perf.Protocol().steps  # a timed request: forced steps, one token more than intervals
-    _says("area", "*Timed request*: one prompt from a zero state, its first new token, then a fixed number of forced decode steps --")
-    _says("area", f"with the default of {steps} steps, {steps + 1} new tokens and {steps} intervals, one token more than a serving request of {steps} output")
-    _says("family", f"{steps + 1} new tokens and {steps} intervals at the default, one token more than a serving request of {steps} output tokens.")
+    _says("area", "*Timed request*: one prompt from a zero state, its first new token, then a fixed number of forced decode steps.")
+    _says("area", f"with the default of {steps} steps, {steps + 1} new tokens and {steps} intervals.")
+    _says("family", f"{steps + 1} new tokens and {steps} intervals at the default. At least 2 |")
     _says("script", f"timed decode steps of a request, behind its first new token; at the default {steps + 1} new tokens and {steps} intervals")
     _says("area", "*Judged position*: a position of a request at which every provider block is held against its reference block.")
     written_out = f"--perf-warmup {perf.Protocol().warmup} --perf-steps {steps} --perf-requests {perf.Protocol().requests} --perf-report my_gpu.json"
@@ -2926,13 +2974,13 @@ def test_the_public_text_of_the_mode_says_what_the_code_does(monkeypatch, tmp_pa
     # the section of the area README: its example is the screen, every value a run measures or counts replaced by dots
     section = area.split("## The performance mode\n", 1)[1].split("\n## ", 1)[0]
     example = section.split("```text\n", 1)[1].split("```", 1)[0].splitlines()
-    # the stack the example names, native: its three numbers and its providers with the rows a library serves (the test of the kernels lines)
-    target = {"stated": True, "declared": True, "on_target": 467, "launches": 484, "code": 178, "port": 289, "stand_ins": 0}
-    target.update(by_provider={"cuDNN Frontend": 337, "FlashInfer": 129, "PyTorch": 1}, fallback_calls=16, kernels_per_step=2908, copies_per_step=200)
-    today = ["fallback rows present", "kernel identity not claimed on this GPU class", "launched from Python"]
-    sites, claim = _planned(monkeypatch)  # the family's own plan, 64 layers: the rows of the example's table
-    table = perf.kernel_table(*_walked(sites, [_records(sites)], claim))
-    form = _checkpoint_form(kernels={**target, "absent": 1}, checks={"positions_text": "0-15, 63, 64, 312, 313"}, record={"reasons": today}, per_kernel=table)
+    # the stack the example names, native: its launches by provider, with the rows a library serves (the test of the kernels lines)
+    native = {"exact_launches_per_step": 484, "by_provider": {"cuDNN Frontend": 338, "FlashInfer": 145, "PyTorch": 1}, "fallback_calls": 0}
+    native.update(fallback_rows=False, kernels_per_step=486, copies_per_step=2)
+    today = ["launched from Python"]
+    sites = _planned()  # the family's own plan, 64 layers: the rows of the example's table
+    table = perf.kernel_table(*_walked(sites, [_records(sites)]))
+    form = _checkpoint_form(kernels=native, checks={"positions_text": "0-15, 63, 64, 312, 313"}, record={"reasons": today}, per_kernel=table)
     form["observation"] = _alone()  # the example is a run that had its GPU to itself
     form["memory"].update(weights_gib=37.3, state_gib=0.5, peak_reserved_gib=40.0)
     shown = perf.screen({**form, "report_file": "report-<UTC time>.json"})
@@ -3537,25 +3585,25 @@ def test_the_record_class_takes_what_was_observed(monkeypatch, tmp_path):
 
     alone = _alone()
     assert (observe.others_reason(alone), observe.clock_reasons(alone)) == ("", [])
-    assert perf.record_class(False, False, "", True, "", observe.others_reason(alone), observe.clock_reasons(alone)) == ("controlled", [])
-    assert perf.record_class(False, False, "", False, "", "", []) == ("orientation", ["launched from Python"]), "what every run of this tree is"
+    assert perf.record_class(False, False, True, "", observe.others_reason(alone), observe.clock_reasons(alone)) == ("controlled", [])
+    assert perf.record_class(False, False, False, "", "", []) == ("orientation", ["launched from Python"]), "what every run of this tree is"
     loaded = {**alone, "host": {"load": 999.0, "cores": 1}}  # the host's load is printed and is no condition
-    assert perf.record_class(False, False, "", True, "", observe.others_reason(loaded), observe.clock_reasons(loaded)) == ("controlled", [])
+    assert perf.record_class(False, False, True, "", observe.others_reason(loaded), observe.clock_reasons(loaded)) == ("controlled", [])
     assert observe.host_text(loaded) == "host load 999.0 on 1 core"
     _says("area", "and the cores this process may use: printed, not a condition |")
     several = ["too few clock samples", "SM clock fell to 1000 MHz", "limit reported: sw_power_cap"]
-    assert perf.record_class(False, True, "", False, "", "shared GPU", several)[1] == ["fallback rows present", "launched from Python", "shared GPU", *several]
-    assert perf.record_class(False, False, "", True, "", "other processes not observed", ["clocks not observed"])[1] == [
+    assert perf.record_class(False, True, False, "", "shared GPU", several)[1] == ["fallback rows present", "launched from Python", "shared GPU", *several]
+    assert perf.record_class(False, False, True, "", "other processes not observed", ["clocks not observed"])[1] == [
         "other processes not observed",
         "clocks not observed",
     ]
     # a run that had its GPU to itself: the two reasons of a run that could not look are gone, the others stay
     outcome, lines, _, _ = _observed(monkeypatch, tmp_path / "alone")
-    assert outcome.data["record"]["reasons"] == ["reduced model", "fallback rows present", "no target kernel set declared", "launched from Python"]
+    assert outcome.data["record"]["reasons"] == ["reduced model", "fallback rows present", "launched from Python"]
     assert outcome.data["record"]["class"] == "orientation" and outcome.data["record"]["performance_claim_eligible"] is False
     assert lines[lines.index("cuDNN Frontend model sample: decode performance report") + 1 :][:2] == [
         "record class          orientation, not a number of record: reduced model; fallback rows present;",
-        "                      no target kernel set declared; launched from Python",
+        "                      launched from Python",
     ]
     assert "GPU         stated device, compute capability 10.0, 148 SMs | other compute processes: none seen" in lines
     # another process in the list, in a reading and in the samples: seen, and the reason
@@ -3632,7 +3680,7 @@ def test_the_observer_is_called_outside_every_request(monkeypatch, tmp_path):
     assert list(environment["host"]["load"]) == ["before the warm-up request", "behind the last timed request"]
     entry = outcome.data["statistics"]["gpu_and_host"]
     assert (entry["definition"], entry["unit"], entry["value"]) == (perf.DEFINITIONS["gpu_and_host"][1], "MHz, W, MiB", None)
-    assert entry["reason"] == "see the section observation of this file" and entry["serving_counterpart"].startswith("The same observations as a serving")
+    assert entry["reason"] == "see the section observation of this file" and set(entry) == {"definition", "unit", "value", "reason"}
     # two readings of two queries each, and nothing else: the tool was asked, never told
     assert len(_calls(folder)) == 4 and all(call["argv"][1].startswith("--query-") and len(call["argv"]) == 3 for call in _calls(folder))
     text = (tmp_path / "report.json").read_text(encoding="utf-8")
@@ -3974,7 +4022,7 @@ def test_every_form_of_the_gpu_lines_within_110():
         "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load 5.5 on 70 cores",
     ]
     assert len(screen()[1]) == 110, "one line at the screen's width"
-    _says("area", "(a checkpoint on the stack `native`, on a GPU the run had to itself;")
+    _says("area", "a checkpoint on the stack `native` with `--no-capture`, on a GPU the run had to itself;")
     assert (
         screen(host={"load": None, "cores": 4})[1]
         == "            clocks observed: yes (SM 2000 MHz median, 2000 min; no limit reported) | host load not observed"

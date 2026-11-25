@@ -138,9 +138,8 @@ finally:
             loop.wait()
 """
 
-#: statistic -> (unit, definition, serving counterpart): the one definition of what this module observes, as the report
-#: file carries it
-DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
+#: statistic -> (unit, definition): the one definition of what this module observes, as the report file carries it
+DEFINITIONS: Dict[str, Tuple[str, str]] = {
     "gpu_and_host": (
         "MHz, W, MiB",
         (
@@ -154,7 +153,6 @@ DEFINITIONS: Dict[str, Tuple[str, str, Optional[str]]] = {
             "included, and is stated only when no reading and no timed request's samples showed a list without this process itself; of such a list "
             "no count is stated: not observed, with the reason."
         ),
-        "The same observations as a serving benchmark's sampler makes.",
     ),
 }
 
@@ -538,8 +536,8 @@ def clock_reasons(watched: dict) -> List[str]:
 
 def statistic() -> dict:
     """The entry of the file's ``statistics`` section: the definition, beside the section it defines."""
-    unit, definition, counterpart = DEFINITIONS["gpu_and_host"]
-    entry = {"definition": definition, "serving_counterpart": counterpart, "unit": unit, "value": None, "reason": "see the section observation of this file"}
+    unit, definition = DEFINITIONS["gpu_and_host"]
+    entry = {"definition": definition, "unit": unit, "value": None, "reason": "see the section observation of this file"}
     return {"gpu_and_host": entry}
 
 

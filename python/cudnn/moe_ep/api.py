@@ -44,8 +44,11 @@ from ._types import (
     MoeEpNativeForwardWeights,
     MoeEpNativeWeightStorageMode,
     MoeEpTrainingBackwardOutputs,
+    MoeEpTrainingDiscreteWgradOutputs,
     MoeEpTrainingForwardOutputs,
     MoeEpTrainingWgradOperands,
+    MoeEpTrainingWgradOutputs,
+    MoeEpWgradLayout,
     MoeFormat,
     MoeTensor,
 )
@@ -58,10 +61,13 @@ from ._validation import (
     validate_native_discrete_forward_weights,
     validate_native_forward_weights,
     validate_training_backward_outputs,
+    validate_training_discrete_wgrad_outputs,
     validate_training_forward_outputs,
     validate_training_forward_state,
     validate_training_input,
     validate_training_non_aliasing,
+    validate_training_wgrad_operands,
+    validate_training_wgrad_outputs,
 )
 
 if TYPE_CHECKING:
@@ -344,8 +350,10 @@ class MoeEp:
 
     @staticmethod
     def _discrete_pointer_tables(
-        weights: MoeEpNativeDiscreteForwardWeights | MoeEpNativeDiscreteBackwardWeights,
+        weights: MoeEpNativeDiscreteForwardWeights | MoeEpNativeDiscreteBackwardWeights | MoeEpTrainingDiscreteWgradOutputs,
     ) -> tuple[torch.Tensor, ...]:
+        if isinstance(weights, MoeEpTrainingDiscreteWgradOutputs):
+            return (weights.fc1_ptrs, weights.fc2_ptrs)
         if isinstance(weights, MoeEpNativeDiscreteForwardWeights):
             pair = (weights.fc1, weights.fc2)
         elif isinstance(weights, MoeEpNativeDiscreteBackwardWeights):
@@ -356,7 +364,7 @@ class MoeEp:
 
     def _validate_discrete_pointer_lifetime(
         self,
-        weights: MoeEpNativeDiscreteForwardWeights | MoeEpNativeDiscreteBackwardWeights,
+        weights: MoeEpNativeDiscreteForwardWeights | MoeEpNativeDiscreteBackwardWeights | MoeEpTrainingDiscreteWgradOutputs,
         *,
         validate,
         device: torch.device,
@@ -1468,6 +1476,89 @@ class MoeEp:
                     out=backward_output,
                 )
 
+    def training_wgrad(
+        self,
+        operands: MoeEpTrainingWgradOperands,
+        *,
+        out: MoeEpTrainingWgradOutputs | MoeEpTrainingDiscreteWgradOutputs,
+        accumulate: bool = False,
+    ) -> MoeEpTrainingWgradOutputs | MoeEpTrainingDiscreteWgradOutputs:
+        """Compute dW1 and dW2 from the operands of :meth:`training_backward`.
+
+        The Rubin WGrad kernel reads ``operands`` in place, so they must be
+        the caller-owned buffers in the exact layouts that ``prepare_training``
+        returned. Each expert reduces over its whole padded segment, whose
+        padding rows contribute zero. ``accumulate=False`` overwrites ``out``;
+        ``accumulate=True`` adds to it. Runs on the current CUDA stream after
+        the backward that produced ``operands``. Requires a CUTLASS DSL with
+        Rubin TMA descriptor overrides; other DSL builds raise ``RuntimeError``.
+        """
+
+        with self._lifecycle_lock:
+            self._require_training_prepared()
+            assert self._training_state is not None
+            execution_state = self._execution_state
+            assert execution_state.backend is not None
+            device = execution_state.backend.device
+            if not isinstance(accumulate, bool):
+                raise TypeError(f"accumulate must be a bool, got {type(accumulate).__name__}")
+            if getattr(self._training_state, "wgrad_prepared", None) is None:
+                reason = getattr(self._training_state, "wgrad_unavailable_reason", None)
+                raise RuntimeError(reason or "MoeEp training WGrad is unavailable for this backend")
+            validate_training_wgrad_operands(
+                operands,
+                self._training_requirement_subset(
+                    (
+                        "fc1_a",
+                        "fc1_sfa",
+                        "fc1_b",
+                        "fc1_sfb",
+                        "fc2_a",
+                        "fc2_sfa",
+                        "fc2_b",
+                        "fc2_sfb",
+                        "valid_route_counts",
+                        "expert_offsets",
+                    )
+                ),
+                device=device,
+            )
+            dense_layouts = None
+            if isinstance(out, MoeEpTrainingDiscreteWgradOutputs):
+                self._validate_discrete_pointer_lifetime(
+                    out,
+                    validate=validate_training_discrete_wgrad_outputs,
+                    device=device,
+                )
+                output_tensors = {"out.fc1_ptrs": out.fc1_ptrs, "out.fc2_ptrs": out.fc2_ptrs}
+            else:
+                dense_layouts = validate_training_wgrad_outputs(
+                    execution_state.resolved_config,
+                    out,
+                    device=device,
+                )
+                output_tensors = {"out.fc1": out.fc1, "out.fc2": out.fc2}
+            validate_training_non_aliasing(
+                {
+                    **{f"operands.{name}": getattr(operands, name) for name in operands.__dataclass_fields__},
+                    **output_tensors,
+                }
+            )
+            from ._megamoe_backend.mxfp8._training_execute import (
+                launch_training_wgrad,
+            )
+
+            with torch.cuda.device(device):
+                execution = self._training_state.views(token_count=0)
+                return launch_training_wgrad(
+                    self._training_state,
+                    execution,
+                    operands,
+                    out=out,
+                    dense_layouts=dense_layouts,
+                    accumulate=accumulate,
+                )
+
     def close(self) -> None:
         """Release compiled-backend instance resources; idempotent."""
 
@@ -1533,8 +1624,11 @@ __all__ = [
     "MoeEpNativeForwardWeights",
     "MoeEpNativeWeightStorageMode",
     "MoeEpTrainingBackwardOutputs",
+    "MoeEpTrainingDiscreteWgradOutputs",
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
+    "MoeEpTrainingWgradOutputs",
+    "MoeEpWgradLayout",
     "MoeFormat",
     "MoeTensor",
     "pack_backward_weights",
