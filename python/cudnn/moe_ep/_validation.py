@@ -27,7 +27,11 @@ from ._types import (
     MoeEpNativeWeight,
     MoeEpNativeWeightLayout,
     MoeEpTrainingBackwardOutputs,
+    MoeEpTrainingDiscreteWgradOutputs,
     MoeEpTrainingForwardOutputs,
+    MoeEpTrainingWgradOperands,
+    MoeEpTrainingWgradOutputs,
+    MoeEpWgradLayout,
     MoeFormat,
     MoeTensor,
     _block_scaled_representation,
@@ -623,24 +627,25 @@ def _validate_named_buffers(
     requirements: Mapping[str, tuple[Tuple[int, ...], Tuple[int, ...], torch.dtype, int]],
     *,
     device: torch.device,
+    prefix: str = "out",
 ) -> None:
     ranges: list[tuple[int, int, str]] = []
     for name, requirement in requirements.items():
         tensor = tensors[name]
+        qualified_name = f"{prefix}.{name}"
         if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"out.{name} must be a torch.Tensor")
+            raise TypeError(f"{qualified_name} must be a torch.Tensor")
         shape, stride, dtype, alignment = requirement
         if tuple(tensor.shape) != tuple(shape):
-            raise ValueError(f"out.{name} shape must be {tuple(shape)}, got {tuple(tensor.shape)}")
+            raise ValueError(f"{qualified_name} shape must be {tuple(shape)}, got {tuple(tensor.shape)}")
         if tuple(tensor.stride()) != tuple(stride):
-            raise ValueError(f"out.{name} stride must be {tuple(stride)}, " f"got {tuple(tensor.stride())}")
+            raise ValueError(f"{qualified_name} stride must be {tuple(stride)}, " f"got {tuple(tensor.stride())}")
         if tensor.dtype is not dtype:
-            raise ValueError(f"out.{name} dtype must be {dtype}, got {tensor.dtype}")
+            raise ValueError(f"{qualified_name} dtype must be {dtype}, got {tensor.dtype}")
         if tensor.device != device:
-            raise ValueError(f"out.{name} must be on {device}, got {tensor.device}")
+            raise ValueError(f"{qualified_name} must be on {device}, got {tensor.device}")
         if tensor.data_ptr() % alignment:
-            raise ValueError(f"out.{name} must be {alignment}-byte aligned")
-        qualified_name = f"out.{name}"
+            raise ValueError(f"{qualified_name} must be {alignment}-byte aligned")
         byte_start, byte_end = _tensor_byte_range(tensor)
         _assert_no_overlap(qualified_name, (byte_start, byte_end), ranges)
         ranges.append((byte_start, byte_end, qualified_name))
@@ -718,6 +723,133 @@ def validate_training_backward_outputs(
     _validate_output_buffers(output, requirements, device=device)
 
 
+_WGRAD_OPERAND_NAMES = (
+    "fc1_a",
+    "fc1_sfa",
+    "fc1_b",
+    "fc1_sfb",
+    "fc2_a",
+    "fc2_sfa",
+    "fc2_b",
+    "fc2_sfb",
+    "valid_route_counts",
+    "expert_offsets",
+)
+_WGRAD_OUTPUT_DTYPES = (torch.bfloat16, torch.float32)
+_WGRAD_OUTPUT_ALIGNMENT = 16
+
+
+def validate_training_wgrad_operands(
+    operands: MoeEpTrainingWgradOperands,
+    requirements: Mapping[str, tuple[Tuple[int, ...], Tuple[int, ...], torch.dtype, int]],
+    *,
+    device: torch.device,
+) -> None:
+    """Require the exact producer ABI so the kernel can read every operand in place."""
+
+    if not isinstance(operands, MoeEpTrainingWgradOperands):
+        raise TypeError("operands must be a MoeEpTrainingWgradOperands, " f"got {type(operands).__name__}")
+    _validate_named_buffers(
+        {name: getattr(operands, name) for name in _WGRAD_OPERAND_NAMES},
+        {name: requirements[name] for name in _WGRAD_OPERAND_NAMES},
+        device=device,
+        prefix="operands",
+    )
+
+
+def wgrad_gemm_shapes(config: ResolvedMoeEpConfig) -> dict[str, tuple[int, int, int]]:
+    """Logical ``(E_local, M, N)`` GEMM shapes of dW1 and dW2."""
+
+    model = config.public_config.model
+    experts = config.topology.experts_per_rank
+    return {
+        "fc1": (experts, model.hidden_size, 2 * model.intermediate_size),
+        "fc2": (experts, model.intermediate_size, model.hidden_size),
+    }
+
+
+def _dense_wgrad_layout(name: str, tensor: torch.Tensor, shape: tuple[int, int, int]) -> MoeEpWgradLayout:
+    experts, m, n = shape
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"out.{name} shape must be {shape}, got {tuple(tensor.shape)}")
+    stride = tuple(tensor.stride())
+    if stride == (m * n, n, 1):
+        return MoeEpWgradLayout.GEMM_ROW_MAJOR
+    if stride == (m * n, 1, m):
+        return MoeEpWgradLayout.WEIGHT_ROW_MAJOR
+    raise ValueError(
+        f"out.{name} stride must be {(m * n, n, 1)} (GEMM row-major) or " f"{(m * n, 1, m)} (a transposed contiguous weight-oriented buffer), got {stride}"
+    )
+
+
+def validate_training_wgrad_outputs(
+    config: ResolvedMoeEpConfig,
+    out: MoeEpTrainingWgradOutputs,
+    *,
+    device: torch.device,
+) -> dict[str, tuple[torch.dtype, MoeEpWgradLayout]]:
+    """Validate dense dW destinations and return each one's dtype and layout."""
+
+    if not isinstance(out, MoeEpTrainingWgradOutputs):
+        raise TypeError("out must be a MoeEpTrainingWgradOutputs or " f"MoeEpTrainingDiscreteWgradOutputs, got {type(out).__name__}")
+    resolved: dict[str, tuple[torch.dtype, MoeEpWgradLayout]] = {}
+    for name, shape in wgrad_gemm_shapes(config).items():
+        tensor = getattr(out, name)
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"out.{name} must be a torch.Tensor")
+        if tensor.dtype not in _WGRAD_OUTPUT_DTYPES:
+            raise ValueError(f"out.{name} dtype must be one of {_WGRAD_OUTPUT_DTYPES}, got {tensor.dtype}")
+        if tensor.device != device:
+            raise ValueError(f"out.{name} must be on {device}, got {tensor.device}")
+        if tensor.data_ptr() % _WGRAD_OUTPUT_ALIGNMENT:
+            raise ValueError(f"out.{name} must be {_WGRAD_OUTPUT_ALIGNMENT}-byte aligned")
+        resolved[name] = (tensor.dtype, _dense_wgrad_layout(name, tensor, shape))
+    return resolved
+
+
+def validate_training_discrete_wgrad_outputs(
+    config: ResolvedMoeEpConfig,
+    out: MoeEpTrainingDiscreteWgradOutputs,
+    *,
+    device: torch.device | None = None,
+    validate_pointees: bool = True,
+) -> torch.device:
+    """Validate dW pointer tables; pointee extents remain caller-owned ABI."""
+
+    if not isinstance(out, MoeEpTrainingDiscreteWgradOutputs):
+        raise TypeError("out must be a MoeEpTrainingDiscreteWgradOutputs, " f"got {type(out).__name__}")
+    if out.dtype not in _WGRAD_OUTPUT_DTYPES:
+        raise ValueError(f"out.dtype must be one of {_WGRAD_OUTPUT_DTYPES}, got {out.dtype}")
+    experts = config.topology.experts_per_rank
+    resolved = device
+    for name in ("fc1_ptrs", "fc2_ptrs"):
+        table = getattr(out, name)
+        if not isinstance(table, torch.Tensor):
+            raise TypeError(f"out.{name} must be a torch.Tensor")
+        _validate_strided(f"out.{name}", table)
+        if tuple(table.shape) != (experts,):
+            raise ValueError(f"out.{name} shape must be ({experts},), got {tuple(table.shape)}")
+        if table.dtype is not torch.int64:
+            raise ValueError(f"out.{name} must have dtype torch.int64, got {table.dtype}")
+        if not table.is_contiguous():
+            raise ValueError(f"out.{name} must be contiguous")
+        if table.device.type != "cuda":
+            raise ValueError(f"out.{name} must be a CUDA tensor, got {table.device}")
+        if table.data_ptr() % 8:
+            raise ValueError(f"out.{name} address must be 8-byte aligned")
+        if resolved is not None and table.device != resolved:
+            raise ValueError(f"out.{name} must be on {resolved}, got {table.device}")
+        resolved = table.device
+        if validate_pointees and table.numel():
+            pointees = table.detach()
+            if bool((pointees <= 0).any().item()):
+                raise ValueError(f"out.{name} must contain positive, non-null pointers")
+            if bool((pointees.remainder(_WGRAD_OUTPUT_ALIGNMENT) != 0).any().item()):
+                raise ValueError(f"out.{name} pointees must be {_WGRAD_OUTPUT_ALIGNMENT}-byte aligned")
+    assert resolved is not None
+    return resolved
+
+
 __all__ = [
     "validate_backward_source_weights",
     "validate_forward",
@@ -728,5 +860,9 @@ __all__ = [
     "validate_training_forward_outputs",
     "validate_training_forward_state",
     "validate_training_input",
+    "validate_training_discrete_wgrad_outputs",
     "validate_training_non_aliasing",
+    "validate_training_wgrad_operands",
+    "validate_training_wgrad_outputs",
+    "wgrad_gemm_shapes",
 ]

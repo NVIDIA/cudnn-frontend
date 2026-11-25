@@ -4,6 +4,78 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### MoeEp.training_wgrad: replay, expert invariance and warm stress (2026-11-23)
+
+`MoeEp.training_wgrad` runs the vendored Rubin WGrad kernel. Each output tile is reduced by one CTA over its expert's
+whole padded segment, with no split-K and no atomics. Its L0 determinism cells are in
+`test/python/moe_ep/test_moe_ep_wgrad.py`. Synthetic operands are placed in the producer layout, and every check
+compares raw bytes.
+
+Two shapes are used:
+
+| Shape | Experts | dW1 / dW2 per expert | Token rows per expert | What it reaches |
+|---|---|---|---|---|
+| Small | 4 | 512 × 512 / 256 × 512 | 300, 0, 128, 129 | Partial and empty segments |
+| Multi-wave | 8 | 2048 × 2048 / 1024 × 2048 | 2048, 1500, 1024, 0, 1, 1793, 640, 2047 | Up to 16 K tiles of 128 rows. Each GEMM launches more 2-CTA clusters than one wave holds (512 thread blocks on 200 SMs) |
+
+The cells:
+
+| Cell | Shape | What it checks |
+|---|---|---|
+| `test_training_wgrad_replays_bitwise` (BF16, FP32) | small | Eight replays with fresh outputs under concurrent work give identical bytes. A separate tolerance check against an independent PyTorch MXFP8 reference |
+| `test_training_wgrad_replays_bitwise_across_waves` (BF16, FP32) | multi-wave | The same, plus that the operands are unchanged after the calls |
+| `test_training_wgrad_expert_results_do_not_depend_on_neighbors` | small | An expert's bytes are unchanged with new neighbors, after reordering, and when duplicated |
+| `test_training_wgrad_expert_results_do_not_depend_on_neighbors_across_waves` (BF16) | multi-wave | The same: new neighbors that move the expert's segment, reversed order, and duplication into every slot |
+| `test_training_wgrad_discrete_and_accumulate_replay_bitwise` | small | Replay for discrete destinations (BF16, overwrite), dense FP32 with `accumulate=True`, and discrete FP32 with `accumulate=True`. Every replay starts from the same destination value |
+| `test_training_wgrad_layouts_store_the_same_accumulator` | small | Every FP32 layout and storage form stores identical bytes |
+| `test_training_wgrad_warm_stress` | multi-wave, dense BF16 | `warm_stress.assert_warm_stress` against FE grouped WGrad (`cudnn.grouped_gemm_wgrad_wrapper_sm100`, 128 × 128 tiles), an independent kernel with byte-identical results. The A/B pipeline stages refill at least 1296 times per launch, with 2.56 thread blocks per SM |
+
+Results:
+
+| Item | Result |
+|---|---|
+| GPU | NVIDIA VR NVL72, cc 10.7, 200 SMs, driver 610.47.04 |
+| Container | `nvcr.io/nvidia/pytorch:26.05-py3`: PyTorch 2.12.0a0 (nv26.05), CUDA 13.2 |
+| CuTe DSL | public `nvidia-cutlass-dsl` 4.8.0 and 4.8.1 |
+| pytest | **44 passed**, 0 skipped, on each DSL. This is all of `test_moe_ep_wgrad.py` at L0 and L1 |
+| warm stress | On each DSL: the cold launches agree and equal the independent reference; warm 0 of 16384 launches wrong, poisoned 0 of 16384; per-launch rate below 0.0183 % (95 %) |
+| Positive control | The unsafe ring twin failed 200 of 200 launches (600 thread blocks, cluster 2), so the stress is validated on this GPU |
+
+No golden files are recorded. On SM90, SM100/103 and SM120 the WGrad path is declined by the capability check.
+
+Command, run from the cudnn-frontend checkout's `test/python`:
+
+```bash
+pytest moe_ep/test_moe_ep_wgrad.py -m "L0 or L1" -q -rs
+```
+
+### MoeEp forward and backward: no determinism suite (2026-11-23)
+
+`MoeEp.__call__`, `MoeEp.training_forward` and `MoeEp.training_backward`
+(the Rubin SM107 MXFP8 MegaMoE kernels behind `cudnn.moe_ep`) have no
+determinism suite. The status page lists them as unverified on SM107. The gap
+covers these kernel paths:
+
+- Forward: `scheduling="static"` (the default), `"atomic"` and
+  `"phase_interleave"`; `fc2_bulk_store` off, `"auto"` and explicit stage
+  counts; `mixed_cga`. Each combines with the `epi_warps`, `standalone_warps`
+  and `reuse_dispatch_warps` token-back modes.
+- Backward: the `dgrad_optimization` profiles `baseline`, `rolling` (M16
+  traversal, scaled FP8 conversion) and `ds3_ep4_pattern` (rank input dedup,
+  asynchronous token-in flags).
+
+Known order-dependent operations: training backward adds per-tile dprob
+partials with FP32 atomics, and inference does not fix the order of token
+communication.
+
+The functionality tests do some raw-byte checks, but none of them is a
+determinism cell. `test_moe_ep_forward.py::test_forward_kernel_tuning_inference_matches_reference_and_replays`
+and `test_moe_ep_backward.py::test_training_forward_kernel_tuning_does_not_accumulate_across_calls`
+check each tuned forward output against an independent reference, and against
+the default tuning's output bytes over repeated calls. These checks do not
+cover replay under concurrent work, batch invariance, warm stress or goldens,
+and no golden files are recorded.
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution

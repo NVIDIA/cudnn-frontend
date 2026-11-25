@@ -13,7 +13,7 @@ from typing import Literal
 
 import torch.distributed as dist
 
-from ._tuning import MoeEpTuningConfig
+from ._tuning import _FORWARD_KERNEL_TUNING_DEFAULTS, MoeEpTuningConfig
 from ._types import MoeEpNativeWeightStorageMode, MoeFormat
 
 _PHYSICAL_RECV_POOL_ALIGNMENT = 128
@@ -169,15 +169,15 @@ class MoeEpConfig:
                 raise ValueError(
                     f"{name}.dgrad_optimization must be 'baseline'; " "dgrad optimization profiles are supported only by " "training_backward_tuning"
                 )
-            if tuning.reduce_topk_in_kernel and (
-                data_path.combine_format is not MoeFormat.BF16 or data_path.output_format is not MoeFormat.BF16 or not data_path.apply_topk_in_fc1
-            ):
-                raise ValueError(f"{name}.reduce_topk_in_kernel requires BF16 " "combine/output and apply_topk_in_fc1=True")
         backward = self.training_backward_tuning
         if backward.token_back_mode != "epi_warps":
             raise ValueError("training_backward_tuning requires " "token_back_mode='epi_warps'")
-        if backward.reduce_topk_in_kernel:
-            raise ValueError("training_backward_tuning does not support " "reduce_topk_in_kernel=True")
+        for name, default in _FORWARD_KERNEL_TUNING_DEFAULTS:
+            if getattr(backward, name) != default:
+                raise ValueError(
+                    f"training_backward_tuning does not support {name}={getattr(backward, name)!r}; "
+                    "forward kernel knobs are supported only by inference_tuning and training_forward_tuning"
+                )
 
 
 @dataclass(frozen=True)
