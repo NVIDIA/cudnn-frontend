@@ -26,7 +26,7 @@ documented in the parent backend `README.md`.
 - **Raw exported source files**: 58 (plus 20 generated package markers).
 - **Expected vendored Python files**: 78 after the local overlay.
 - **Expected vendored Python tree SHA256**:
-  `cf22bf4f46515d848f52b55d87627a59326e2b331f351b0df8d81a266e0f264e`.
+  `c758e5c99de9ee985409209c023a2e606ed3cd1874856e409ed10d7ed9991d70`.
   This uses the same relative-path-and-content algorithm as
   `_megamoe_backend.mxfp8._fingerprint.source_tree_sha256`.
 
@@ -58,10 +58,10 @@ modules.
   upstream, for example to keep them self-contained. Such wording-only
   differences are not listed below.
 - Temporary exception: the MoeEP `data_token_capacity` and row-major
-  column-requantization overlays below are carried in both the Rubin and the
-  Blackwell kernel copies instead of going upstream first. Once upstream
-  provides equivalent options, remove both copies of these overlays and this
-  exception.
+  column-requantization overlays and the token-back write drain below are
+  carried in the Rubin and the Blackwell kernel copies instead of going
+  upstream first. Once upstream provides equivalent options and the drain,
+  remove every copy of these overlays and this exception.
 
 The synchronized Python sources use BSD-3-Clause SPDX identifiers.
 `LICENSE.Apache-2.0` is retained as historical snapshot metadata.
@@ -89,6 +89,15 @@ The synchronized Python sources use BSD-3-Clause SPDX identifiers.
   while MoeEP always supplies its exact caller-prescribed pool rows. Upstream
   topology clamps remain intact, and the component rejects physical capacity
   below the padded requirement for the clamped logical limit.
+- The Rubin forward, Rubin backward and Blackwell forward MegaMoE kernels call
+  `cp_async_bulk_wait_group(0)` after `token_back`, on the transfer warps and
+  on the standalone token-back warps, before the CTA tail barrier.
+  `TokenCommDeterministic.token_back` waits only until its bulk copies have
+  read shared memory, and the cross-rank barrier in `reset_tail` does not
+  complete pending bulk writes. Without the wait, a peer can leave that
+  barrier while rows or scales sent to it are still being written. Upstream's
+  Blackwell backward kernel already waits this way, so all four kernels now
+  match.
 - Repository-required copyright and BSD-3-Clause SPDX headers are added to
   generated empty package markers and to the Blackwell
   `kernel_src/blackwell/training/mega/bwd_dglu/dgrad_config.py`, which
@@ -96,8 +105,10 @@ The synchronized Python sources use BSD-3-Clause SPDX identifiers.
 
 No other vendored Python code differences are expected.
 
-Except for the Blackwell retired-row clearing removal, the overlay hunks in
-each Rubin and Blackwell MegaMoE kernel pair are textually identical.
+Except for the Blackwell retired-row clearing removal and the Rubin backward
+token-back drain, which upstream's Blackwell backward kernel already has, the
+overlay hunks in each Rubin and Blackwell MegaMoE kernel pair are textually
+identical.
 
 The group-consistent overflow policy, previously a local difference, is
 upstream as of this snapshot: every rank derives the same group-wide overflow
@@ -116,7 +127,9 @@ Blackwell training MegaMoE closure.
    and error messages from the previously vendored tree.
 3. For each forward and backward MegaMoE kernel, diff the Rubin and Blackwell
    overlay hunks against the export. They must match, except for the
-   Blackwell retired-row clearing removal.
+   Blackwell retired-row clearing removal and the Rubin backward token-back
+   drain. After the overlay, the token-comm hooks of each Rubin and Blackwell
+   kernel pair are identical.
 4. Run `test_vendored_mega_kernels_keep_data_token_capacity_overlay` in
    `test/python/moe_ep/test_moe_ep_forward.py`.
 5. Update the upstream commit, file counts and tree SHA256 in this file.

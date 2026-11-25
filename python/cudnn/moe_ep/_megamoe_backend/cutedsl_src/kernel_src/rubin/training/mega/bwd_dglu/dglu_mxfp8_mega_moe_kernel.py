@@ -1043,11 +1043,17 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         self.token_comm.token_in(self.tc_smem_ws, token_comm_storage.buffer.data_ptr())
         if cutlass.const_expr(self.token_comm.token_back_enabled and not self.token_back_standalone):
             self.token_comm.token_back(self.tc_smem_ws, token_comm_storage.buffer.data_ptr())
+            # token_back only drains SMEM reads; finish peer writes before
+            # the CTA tail barrier and cross-rank workspace reset.
+            cute.arch.cp_async_bulk_wait_group(0)
 
     @cute.jit
     def token_comm_hook_token_back_warp_body(self, token_comm_args, token_comm_storage, *, warp_idx, lane_idx, tidx):
         """Standalone token-back warps (12-15): push grad_x back to source ranks."""
         self.token_comm.token_back(self.tc_smem_ws, token_comm_storage.buffer.data_ptr())
+        # These warps issue their own bulk groups, so they must drain them
+        # before handing completion to the dispatch warps at the tail barrier.
+        cute.arch.cp_async_bulk_wait_group(0)
 
     @cute.jit
     def token_comm_hook_kernel_tail(self, token_comm_args, *, warp_idx, lane_idx, tidx):
