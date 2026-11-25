@@ -326,6 +326,8 @@ def sparse_attention_backward_jax(
         _sparse_bwd_kernels[key] = kernel
     workspace_lse_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(total_q, 512, 64, 1, cutlass.Float32)
     workspace_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(total_kv, 512, 1, cutlass.Float32)
+    # Outputs 1-4 (dKV, dsink, workspaces) are accumulated into; dQ (0) is fully written unless the kernel reduces into it.
+    initialized_outputs = {i: zeros_init for i in range(0 if kernel.reduce_dq else 1, 5)}
     scale = 1.0 / math.sqrt(512) if softmax_scale is None else float(softmax_scale)
     results = call(
         _sparse_bwd_adapter,
@@ -336,7 +338,7 @@ def sparse_attention_backward_jax(
             jax.ShapeDtypeStruct(workspace_lse_shape, jnp.uint8),
             jax.ShapeDtypeStruct(workspace_dkv_shape, jnp.uint8),
         ),
-        initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init, 3: zeros_init, 4: zeros_init},
+        initialized_outputs=initialized_outputs,
         kernel=kernel,
         softmax_scale=scale,
         total_q=total_q,
