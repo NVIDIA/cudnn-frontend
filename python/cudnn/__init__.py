@@ -64,6 +64,8 @@ for _optional_symbol in [
     "gnn_mha_gat_backward",
     "gnn_mha_gat_v2_forward",
     "gnn_mha_gat_v2_backward",
+    "gnn_mha_simple_forward",
+    "gnn_mha_simple_backward",
     "fft_causal_conv1d_forward",
     "fft_causal_conv1d_backward",
     "long_fft_causal_conv1d_get_buffer_sizes",
@@ -170,7 +172,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.33.0"
+__version__ = "1.34.0"
 # Keep in sync with the JAX dependency minimum in pyproject.toml.
 CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
 CUTEDSL_MIN_JAX_VERSION_STR = ".".join(map(str, CUTEDSL_MIN_JAX_VERSION))
@@ -245,6 +247,22 @@ def load_cudnn():
     _pybind_module._set_dlhandle_cudnn(handle)
 
 
+def _cudnn_wheel_lib_on_sys_path():
+    """The nvidia-cudnn-cuXX (or nvidia-cudnn-jit) wheel's libcudnn.so.x in any
+    sys.path entry, for wheels installed outside purelib: ``pip install --user``,
+    ``pip install --target`` plus PYTHONPATH, or the base environment of a
+    ``--system-site-packages`` venv."""
+    for sub in ("nvidia/cudnn/lib", "nvidia/cudnn_jit/lib"):
+        for base in sys.path:
+            # The import system only looks at str entries, so skip the rest too.
+            if not base or not isinstance(base, str):
+                continue
+            lib_path = glob.glob(os.path.join(base, sub, "libcudnn.so.*[0-9]"))
+            if lib_path:
+                return lib_path
+    return []
+
+
 def _dlopen_cudnn():
     # Honor the dynamic linker search path before packaged cuDNN so local backend
     # builds can override the wheel dependency during development.
@@ -265,6 +283,9 @@ def _dlopen_cudnn():
 
     if not lib_path:
         lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"))
+
+    if not lib_path:
+        lib_path = _cudnn_wheel_lib_on_sys_path()
 
     if lib_path:
         assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
@@ -321,6 +342,8 @@ _EAGER_PUBLIC_NAMES = (
             "gnn_mha_gat_backward",
             "gnn_mha_gat_v2_forward",
             "gnn_mha_gat_v2_backward",
+            "gnn_mha_simple_forward",
+            "gnn_mha_simple_backward",
         )
         if symbol in globals()
     ),
@@ -372,9 +395,12 @@ _MOE_EP_OPTIONAL_IMPORTS = {
     "MoeEpNativeWeightLayout",
     "MoeEpNativeWeightStorageMode",
     "MoeEpTrainingBackwardOutputs",
+    "MoeEpTrainingDiscreteWgradOutputs",
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
+    "MoeEpTrainingWgradOutputs",
     "MoeEpTuningConfig",
+    "MoeEpWgradLayout",
     "MoeFormat",
     "MoeTensor",
     "pack_backward_weights",
@@ -401,6 +427,10 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "Fp8ProjectionDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "AddNormQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "SwigluFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "AttentionPrepareDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "RowQuantizeFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "RowQuantizeFp8Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "RowArgmaxDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -433,6 +463,22 @@ _LAZY_OPTIONAL_IMPORTS = {
     # in and out, 1 .. 64 rows, SM100-class parts): a direct-call entry like the steps above (also `cudnn.gemm.SwigluFp4Decode`, with
     # its `SwigluGeometry`)
     "SwigluFp4Decode": (".gemm.frost.swiglu_decode.swiglu_fp4_decode", "SwigluFp4Decode"),
+    # the attention preparation decode step (per token the RMSNorm and the rotation of the query and key head rows, the gate rows copied
+    # and the keys and values written into paged pools, in one launch, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.attention_prepare.frost.AttentionPrepareDecode`, with its `AttentionPrepareGeometry`)
+    "AttentionPrepareDecode": (".attention_prepare.frost.prepare_decode", "AttentionPrepareDecode"),
+    # the FP4 row quantization decode step (the block-scaled FP4 quantization of bf16 rows under a global scale -- E2M1 codes, one E4M3
+    # block scale per sixteen elements in the 128 x 4 scale layout -- in one launch, SM100-class parts): a direct-call entry like the
+    # steps above (also `cudnn.row_quantize.frost.RowQuantizeFp4Decode`)
+    "RowQuantizeFp4Decode": (".row_quantize.frost.row_quantize_fp4_decode", "RowQuantizeFp4Decode"),
+    # the FP8 row quantization decode step (the dynamic FP8 quantization of bf16 rows, each under its own scale -- E4M3 codes, one fp32
+    # scale per row: the row maximum over 448 with a floor -- in one launch, SM100-class parts): a direct-call entry like the steps
+    # above (also `cudnn.row_quantize.frost.RowQuantizeFp8Decode`)
+    "RowQuantizeFp8Decode": (".row_quantize.frost.row_quantize_fp8_decode", "RowQuantizeFp8Decode"),
+    # the row argmax decode step (per row of a bf16 slab the lowest column of the row maximum, or the entry of an id table at that
+    # column, in one launch, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.row_argmax.frost.RowArgmaxDecode`)
+    "RowArgmaxDecode": (".row_argmax.frost.row_argmax_decode", "RowArgmaxDecode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
@@ -484,12 +530,18 @@ _LAZY_OPTIONAL_IMPORTS = {
         "MoeEpNativeWeightStorageMode",
     ),
     "MoeEpTrainingBackwardOutputs": (".moe_ep", "MoeEpTrainingBackwardOutputs"),
+    "MoeEpTrainingDiscreteWgradOutputs": (
+        ".moe_ep",
+        "MoeEpTrainingDiscreteWgradOutputs",
+    ),
     "MoeEpTrainingForwardOutputs": (".moe_ep", "MoeEpTrainingForwardOutputs"),
     "MoeEpTrainingWgradOperands": (
         ".moe_ep",
         "MoeEpTrainingWgradOperands",
     ),
+    "MoeEpTrainingWgradOutputs": (".moe_ep", "MoeEpTrainingWgradOutputs"),
     "MoeEpTuningConfig": (".moe_ep", "MoeEpTuningConfig"),
+    "MoeEpWgradLayout": (".moe_ep", "MoeEpWgradLayout"),
     "MoeFormat": (".moe_ep", "MoeFormat"),
     "MoeTensor": (".moe_ep", "MoeTensor"),
     "pack_backward_weights": (".moe_ep", "pack_backward_weights"),

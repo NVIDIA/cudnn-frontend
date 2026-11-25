@@ -9,10 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import cudnn
 from cudnn.api_base import TensorDesc
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
 from cudnn.sdpa.bwd.engines import _sm100_dense_layout_mismatch
 from cudnn.sdpa.bwd.prepared_sm100 import native_io_layout, native_io_strides
+from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 pytestmark = pytest.mark.L0
 ROLES = ("q", "k", "v", "o", "do", "dq", "dk", "dv")
@@ -40,20 +42,32 @@ def test_singleton_tma_addresses(axis, unused, order):
 
 @pytest.mark.parametrize("role", ROLES)
 @pytest.mark.parametrize("unaligned", [False, True])
-def test_each_dense_port_has_one_admission_rule(role, unaligned, monkeypatch):
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)], ids=["sm100", "sm103"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_each_dense_port_has_one_admission_rule(role, unaligned, cc, dtype, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: cc)
     shape = (2, 4, 32, 264)
-    desc = TensorDesc(
-        dtype=torch.bfloat16, shape=shape, stride=(32 * 4 * 272, 272, 4 * 272, 1), stride_order=(3, 1, 2, 0), device=torch.device("cuda:0"), name="data"
-    )
+    desc = TensorDesc(dtype=dtype, shape=shape, stride=(32 * 4 * 272, 272, 4 * 272, 1), stride_order=(3, 1, 2, 0), device=torch.device("cuda:0"), name="data")
     descs = {name: replace(desc, name=name) for name in ROLES}
     if unaligned:
         descs[role] = replace(descs[role], stride=(32 * 4 * 273, 273, 4 * 273, 1))
     descs["stats"] = replace(desc, dtype=torch.float32, shape=(2, 4, 32), stride=(128, 32, 1), stride_order=(2, 1, 0), name="stats")
     # Graph facts spell the gradient ports with a capital O/Q/K/V.
-    facts = SimpleNamespace(thd=False, port_layouts=tuple((n if len(n) == 1 else n[0] + n[1:].upper(), descs[n].shape, descs[n].stride) for n in ROLES))
+    facts = SdpaGraphFacts(
+        is_backward=True,
+        b=shape[0],
+        h_q=shape[1],
+        h_kv=shape[1],
+        s_q=shape[2],
+        s_kv=shape[2],
+        d_qk=shape[3],
+        d_v=shape[3],
+        dtype=cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16,
+        device_cc=cc,
+        port_layouts=tuple((n if len(n) == 1 else n[0] + n[1:].upper(), descs[n].shape, descs[n].stride) for n in ROLES),
+    )
     reason = _sm100_dense_layout_mismatch(facts, None)
     api = SdpaBwdDslSm100(**{"sample_" + n: t for n, t in descs.items()})
     if unaligned:

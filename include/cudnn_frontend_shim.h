@@ -1069,6 +1069,10 @@ get_compiled_version(void) {
 // Version-neutral ABI definitions for direct-call GNN APIs. The Python extension
 // dynamically resolves these APIs, so its exported bindings must not depend on
 // the cuDNN headers that happened to be installed when the extension was built.
+// Keep shim parameter types identical to the backend C ABI: NV_FE_CALL_TO_BACKEND
+// casts symbols using decltype(shim). In particular, backend int flags must not
+// be declared bool here; even an int argument expression is narrowed back to bool,
+// which can leave the upper bytes of an ARM64 stack argument uninitialized.
 enum class gnn_activation_op_t : std::int32_t {
     LINEAR     = 0,
     RELU       = 1,
@@ -1550,6 +1554,184 @@ gnn_mha_gat_v2_backward(cudaStream_t stream,
     (void)grad_workspace_features;
     (void)grad_workspace_weights;
     (void)node_feat_dim;
+    (void)params;
+    (void)data_type;
+    (void)grad_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+inline cudnnStatus_t
+gnn_mha_simple_forward(cudaStream_t stream,
+                       const gnn_csc_graph_t *graph,
+                       const void *key_features,
+                       const void *query_features,
+                       const void *value_features,
+                       const void *edge_features,
+                       const float *score_bias,
+                       const float *score_weight,
+                       const float *dropout_mask,
+                       void *output,
+                       void *sm_scores,
+                       int node_feat_dim,
+                       int norm_by_dim,
+                       const gnn_mha_params_t *params,
+                       cudnnDataType_t data_type) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    if (get_backend_version() < 92900) return CUDNN_STATUS_NOT_SUPPORTED;
+    NV_FE_CALL_TO_BACKEND(gnn_mha_simple_forward,
+                          cudnnGnnMhaSimpleForward,
+                          stream,
+                          graph,
+                          key_features,
+                          query_features,
+                          value_features,
+                          edge_features,
+                          score_bias,
+                          score_weight,
+                          dropout_mask,
+                          output,
+                          sm_scores,
+                          node_feat_dim,
+                          norm_by_dim ? 1 : 0,
+                          params,
+                          data_type);
+#elif CUDNN_VERSION >= 92900
+    return cudnnGnnMhaSimpleForward(stream,
+                                    reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                    key_features,
+                                    query_features,
+                                    value_features,
+                                    edge_features,
+                                    score_bias,
+                                    score_weight,
+                                    dropout_mask,
+                                    output,
+                                    sm_scores,
+                                    node_feat_dim,
+                                    norm_by_dim ? 1 : 0,
+                                    reinterpret_cast<const cudnnGnnMhaParams_t *>(params),
+                                    data_type);
+#else
+    (void)stream;
+    (void)graph;
+    (void)key_features;
+    (void)query_features;
+    (void)value_features;
+    (void)edge_features;
+    (void)score_bias;
+    (void)score_weight;
+    (void)dropout_mask;
+    (void)output;
+    (void)sm_scores;
+    (void)node_feat_dim;
+    (void)norm_by_dim;
+    (void)params;
+    (void)data_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+inline cudnnStatus_t
+gnn_mha_simple_backward(cudaStream_t stream,
+                        const gnn_csc_graph_t *graph,
+                        const void *grad_output,
+                        const void *key_features,
+                        const void *query_features,
+                        const void *value_features,
+                        const void *edge_features,
+                        const float *score_weight,
+                        const void *sm_scores,
+                        const float *dropout_mask,
+                        const float *grad_attention,
+                        void *grad_key_features,
+                        void *grad_query_features,
+                        void *grad_value_features,
+                        void *grad_edge_features,
+                        void *grad_workspace,
+                        void *grad_sm_scores,
+                        void *grad_score_bias,
+                        void *grad_score_weight,
+                        int node_feat_dim,
+                        int norm_by_dim,
+                        const gnn_mha_params_t *params,
+                        cudnnDataType_t data_type,
+                        cudnnDataType_t grad_type) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    if (get_backend_version() < 92900) return CUDNN_STATUS_NOT_SUPPORTED;
+    NV_FE_CALL_TO_BACKEND(gnn_mha_simple_backward,
+                          cudnnGnnMhaSimpleBackward,
+                          stream,
+                          graph,
+                          grad_output,
+                          key_features,
+                          query_features,
+                          value_features,
+                          edge_features,
+                          score_weight,
+                          sm_scores,
+                          dropout_mask,
+                          grad_attention,
+                          grad_key_features,
+                          grad_query_features,
+                          grad_value_features,
+                          grad_edge_features,
+                          grad_workspace,
+                          grad_sm_scores,
+                          grad_score_bias,
+                          grad_score_weight,
+                          node_feat_dim,
+                          norm_by_dim ? 1 : 0,
+                          params,
+                          data_type,
+                          grad_type);
+#elif CUDNN_VERSION >= 92900
+    return cudnnGnnMhaSimpleBackward(stream,
+                                     reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                     grad_output,
+                                     key_features,
+                                     query_features,
+                                     value_features,
+                                     edge_features,
+                                     score_weight,
+                                     sm_scores,
+                                     dropout_mask,
+                                     grad_attention,
+                                     grad_key_features,
+                                     grad_query_features,
+                                     grad_value_features,
+                                     grad_edge_features,
+                                     grad_workspace,
+                                     grad_sm_scores,
+                                     grad_score_bias,
+                                     grad_score_weight,
+                                     node_feat_dim,
+                                     norm_by_dim ? 1 : 0,
+                                     reinterpret_cast<const cudnnGnnMhaParams_t *>(params),
+                                     data_type,
+                                     grad_type);
+#else
+    (void)stream;
+    (void)graph;
+    (void)grad_output;
+    (void)key_features;
+    (void)query_features;
+    (void)value_features;
+    (void)edge_features;
+    (void)score_weight;
+    (void)sm_scores;
+    (void)dropout_mask;
+    (void)grad_attention;
+    (void)grad_key_features;
+    (void)grad_query_features;
+    (void)grad_value_features;
+    (void)grad_edge_features;
+    (void)grad_workspace;
+    (void)grad_sm_scores;
+    (void)grad_score_bias;
+    (void)grad_score_weight;
+    (void)node_feat_dim;
+    (void)norm_by_dim;
     (void)params;
     (void)data_type;
     (void)grad_type;

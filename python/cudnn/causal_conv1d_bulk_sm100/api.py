@@ -10,6 +10,7 @@ correctness-first scalar schedule. Model code should use
 ``cudnn.ops.causal_conv1d`` rather than this lifecycle API.
 """
 
+from collections import OrderedDict
 from contextlib import contextmanager
 import threading
 from typing import Iterator, Optional, Union
@@ -30,7 +31,7 @@ from cudnn._causal_conv1d_arch import (
 )
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 
-_API_CACHE = {}
+_API_CACHE = OrderedDict()
 _API_CACHE_LOCK = threading.Lock()
 _API_CACHE_CAPACITY = 128
 _INT32_MAX = 2**31 - 1
@@ -81,6 +82,61 @@ def _require_storage_alignment(tensor: torch.Tensor, alignment: int, name: str) 
     remainder = tensor.data_ptr() % alignment
     if remainder:
         raise ValueError(f"{name} data pointer must be {alignment}-byte aligned, " f"got address modulo {alignment} = {remainder}")
+
+
+def _packed_num_sequences(cu_seqlens: torch.Tensor, total_tokens: int) -> int:
+    """Return the runtime packed N; compiled plans do not specialize on it."""
+
+    if not isinstance(cu_seqlens, torch.Tensor):
+        raise TypeError(f"cu_seqlens must be a torch.Tensor, got {type(cu_seqlens).__name__}")
+    if cu_seqlens.ndim != 1:
+        raise ValueError(f"cu_seqlens must be 1D, got shape {tuple(cu_seqlens.shape)}")
+    if cu_seqlens.shape[0] < 2:
+        raise ValueError("Packed cu_seqlens must contain at least a start and end offset")
+    num_sequences = cu_seqlens.shape[0] - 1
+    if num_sequences > _MAX_PACKED_SEQUENCES:
+        raise ValueError(f"Packed N exceeds the safe Int32 search limit: {num_sequences}")
+    if num_sequences > total_tokens:
+        raise ValueError(f"Packed N={num_sequences} cannot exceed total_T={total_tokens} " "when every sequence must be non-empty")
+    return num_sequences
+
+
+def _validate_runtime_leading_extent_tensor(tensor: torch.Tensor, desc: TensorDesc, leading_extent: int, name: str) -> None:
+    """Validate a per-sequence operand whose leading extent is the runtime N."""
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
+    expected_shape = (leading_extent, *desc.shape[1:])
+    if tuple(tensor.shape) != expected_shape:
+        raise ValueError(f"{name} shape mismatch: expected {expected_shape}, got {tuple(tensor.shape)}")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous, got stride {tuple(tensor.stride())}")
+    if tensor.dtype != desc.dtype:
+        raise TypeError(f"{name} dtype mismatch: expected {desc.dtype}, got {tensor.dtype}")
+    if tensor.device != desc.device:
+        raise ValueError(f"{name} device mismatch: expected {desc.device}, got {tensor.device}")
+
+
+def _make_packed_fake_operands(api: APIBase, cu_seqlens_desc, state_descs, assumed_align: int):
+    """Fake packed metadata and ``[N, D, 4]`` states with a symbolic N."""
+
+    fake_cu_seqlens = api._make_fake_cute_tensor(dtype=torch.int32, shape=(cute.sym_int(divisibility=1),), stride=(1,), assumed_align=4)
+    num_sequences = cute.sym_int(divisibility=1)
+    fake_states = []
+    for desc in state_descs:
+        if desc is None:
+            fake_states.append(None)
+            continue
+        n_channels, width = desc.shape[1:]
+        fake_states.append(
+            api._make_fake_cute_tensor(
+                dtype=desc.dtype,
+                shape=(num_sequences, n_channels, width),
+                stride=(n_channels * width, width, 1),
+                assumed_align=assumed_align,
+            )
+        )
+    return fake_cu_seqlens, fake_states
 
 
 def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
@@ -377,15 +433,20 @@ class CausalConv1dBulkFwdSm100(APIBase):
         )
         fake_weight = self._make_fake_cute_tensor_from_desc(self.weight_desc, assumed_align=16)
         fake_bias = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
-        fake_initial_state = self._make_fake_cute_tensor_from_desc(self.initial_state_desc, assumed_align=16)
-        fake_cu_seqlens = self._make_fake_cute_tensor_from_desc(self.cu_seqlens_desc, assumed_align=4)
+        if self.is_packed:
+            fake_cu_seqlens, (fake_initial_state, fake_final_state) = _make_packed_fake_operands(
+                self, self.cu_seqlens_desc, (self.initial_state_desc, self.final_state_desc), assumed_align=16
+            )
+        else:
+            fake_cu_seqlens = None
+            fake_initial_state = self._make_fake_cute_tensor_from_desc(self.initial_state_desc, assumed_align=16)
+            fake_final_state = self._make_fake_cute_tensor_from_desc(self.final_state_desc, assumed_align=16)
         fake_output = self._make_fake_cute_tensor(
             dtype=self.output_desc.dtype,
             shape=(valid_tokens, self.n_channels),
             stride=(self.n_channels, 1),
             assumed_align=16,
         )
-        fake_final_state = self._make_fake_cute_tensor_from_desc(self.final_state_desc, assumed_align=16)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         kernel = CausalConv1dBulkForwardKernel(use_vec8=self.use_vec8_schedule)
@@ -464,10 +525,9 @@ class CausalConv1dBulkFwdSm100(APIBase):
         output_sequence_length = self._validate_runtime_x_or_output(output_tensor, "Output")
         if output_sequence_length != sequence_length:
             raise ValueError(f"Output T must match X T={sequence_length}, got {output_sequence_length}")
-        if self.is_packed and self.num_sequences > self.batch_size * sequence_length:
-            raise ValueError(
-                f"Packed N={self.num_sequences} cannot exceed runtime total_T={self.batch_size * sequence_length} " "when every sequence must be non-empty"
-            )
+        num_sequences = self.batch_size
+        if self.is_packed and cu_seqlens_tensor is not None:
+            num_sequences = _packed_num_sequences(cu_seqlens_tensor, self.batch_size * sequence_length)
         self._validate_runtime_static_tensor(weight_tensor, self.weight_desc, "Weight")
 
         optional_tensors = (
@@ -479,8 +539,20 @@ class CausalConv1dBulkFwdSm100(APIBase):
         for name, tensor, desc in optional_tensors:
             if (tensor is None) != (desc is None):
                 raise ValueError(f"{name} presence must match the compiled signature")
-            if tensor is not None:
+            if tensor is None:
+                continue
+            if self.is_packed and name == "cu_seqlens":
+                _validate_runtime_leading_extent_tensor(tensor, desc, num_sequences + 1, name)
+            elif self.is_packed and name in ("Initial state", "Final state"):
+                _validate_runtime_leading_extent_tensor(tensor, desc, num_sequences, name)
+            else:
                 self._validate_runtime_static_tensor(tensor, desc, name)
+        if (
+            not self.use_vec8_schedule
+            and (initial_state_tensor is not None or final_state_tensor is not None)
+            and num_sequences * self.n_channels * 4 > _INT32_MAX
+        ):
+            raise ValueError(f"The scalar schedule requires each state tensor to contain at most {_INT32_MAX} elements")
 
         for name, tensor, alignment in (
             ("X", x_tensor, 16),
@@ -535,7 +607,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
             cu_seqlens_tensor,
             flat_output,
             final_state_tensor,
-            cutlass.Int32(self.num_sequences),
+            cutlass.Int32(num_sequences),
             cutlass.Int32(dense_tokens_per_sequence),
             cutlass.Int32(self.n_channels),
             launch_stream,
@@ -605,7 +677,7 @@ def _cache_key(
         use_vec8_schedule,
         weight_tensor.dtype,
         batch_size,
-        num_sequences,
+        num_sequences if cu_seqlens_tensor is None else None,
         n_channels,
         bias_tensor is not None,
         cu_seqlens_tensor is not None,
@@ -678,7 +750,11 @@ def causal_conv1d_bulk_fwd_wrapper_sm100(
             final_state_tensor = torch.empty((0,), dtype=torch.bfloat16, device=x_tensor.device)
 
         api = _API_CACHE.get(key)
-        if api is None:
+        if api is not None:
+            with _API_CACHE_LOCK:
+                if key in _API_CACHE:
+                    _API_CACHE.move_to_end(key)
+        else:
             with _API_CACHE_LOCK:
                 api = _API_CACHE.get(key)
                 if api is None:
@@ -694,7 +770,7 @@ def causal_conv1d_bulk_fwd_wrapper_sm100(
                     api.check_support()
                     api.compile()
                     if len(_API_CACHE) >= _API_CACHE_CAPACITY:
-                        _API_CACHE.pop(next(iter(_API_CACHE)))
+                        _API_CACHE.popitem(last=False)
                     _API_CACHE[key] = api
 
         result = api.execute(

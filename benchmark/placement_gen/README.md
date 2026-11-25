@@ -11,6 +11,7 @@
    - the `train` / `holdout` JSONL paths (each one path or a list; records join on file and `idx`, so separately run supplements can be listed as they are).
    Count the holdout's on- and off-tile cells from its final lengths before timing: a transform applied after aligning S_kv (e.g. unequal per-request lengths) moves the cell off the tile.
 2. **Sweep on the target part.** Run the `cudnn` (backend only), `cudnn_oss` (FROST first) and `cudnn_auto` (default dispatch) legs. Write one JSON line per (case, leg) with `ms`, `plan` and the `case` dict. Use a full-power board, and record co-tenant GPU processes at start and end. Where the backend's first plan fails to finalize, the backend-only reference is the first backend plan that builds (the default leg, when it ran a backend plan); otherwise `load` drops those cells from the fit.
+   Time every kernel the call launches. Before #2519 the inference harness counted only kernels whose name *starts* with `cudnn`, which drops the backend's split-KV `void cudnn::fusion::lean_reduction_kernel<...>`. FROST's kernels were always counted. So a study timed before 2026-11-12 under-states the backend wherever it split KV (up to 1.94x on SM100 d256 decode), and its backend leg has to be re-timed before its entries are trusted. When a harness or driver changes, profile one call and list `key_averages()` before timing a grid.
 3. **Fit:** `python benchmark/placement_gen/gen.py study.json`. Every case becomes graph facts, classified with `placement_table.class_key`, the same code the runtime uses. Per class, every scalar in `placement_table.FEATURES` is fit (today: `cost`, the roofline proxy; `tiles`, the parallel tiles before a KV split; `rows`, the query rows b * h_q * s_q; `kv`, the KV tokens per request; `q`, the query tokens per request). Each fit is:
    - `always`;
    - `never`;
@@ -24,5 +25,23 @@
 5. **Score.** The tool prints generated vs measured-default vs backend-only regret on train and holdout. The holdout must show no case where the generated choice is slower than the measured default beyond noise.
    A bounded declaration (`shape_overrides`, e.g. FlashInfer's ragged envelope) is classified on what it declares (layout `*_bounded`), so one entry answers every live shape under the declaration and some cells will trail the default by construction. Write its per-class bar (geomean vs the measured default, worst-cell cap) into the study record before the holdout is read, and score it on the realized shapes.
 6. **Emit:** `gen.py study.json --emit` prints the entries. Paste them as one block under a comment naming the study, part, cuDNN version and case counts.
+
+## Criterion-constrained fit (`--constrained`)
+
+The margin fit above trades the worst cell for the geomean, and holdouts then fail their worst <= 1.10 (Rule S12). `--constrained` fits under the criterion directly, against the measured default leg (`cudnn_auto`, required).
+- A rule's changed cells are those whose verdict differs from the default.
+- A rule is feasible when its changed train cells run at geomean <= 1.0 and worst <= 1.05.
+- The feasible rule with the lowest training regret wins. Ties go to fewer changed cells, then `cost`.
+- No feasible rule means no entry.
+- `--two-feature` also tries a second condition, `ge` on KV or query tokens, for classes no single feature orders (few query rows win over a long cache and lose over a short one). Pre-register it before timing. It emits as `Entry(..., also=(direction, threshold, feature))`; a single-feature rule wins a tie.
+
+```
+gen.py study.json --constrained [--two-feature] --rules-out RULES.json [--emit]   # fit train, freeze RULES.json
+gen.py study.json --score RULES.json holdout.jsonl ...                            # score the holdout once
+```
+
+`--score` prints, per class, the changed holdout cells' geomean and worst against the default, and each twin's verdict. A twin is the class on and off the 128-key KV tile. It passes when both sides pass (geomean <= 1.0, worst <= 1.10) with at least one changed cell each. A second verdict tolerates a vacuous side: a side with no changed holdout cell keeps its existing entry, and the twin ships its passing sides if no side fails. Pre-register which verdict the study uses.
+
+When a study fails on a few cells, pool its train and holdout (`train` takes a list of paths) as the next study's train, and score once on a fresh holdout at new head pairs. Where the pooled data's default leg was timed under entries that have since changed, take the backend-only leg as the default (see `sm80_paged_d256_d192_v3_20261117/pool.py`). Time on a full-power board: record `power.limit` per shard.
 
 Entries carry the study id. Re-run the study when a kernel change touches the row's capabilities.

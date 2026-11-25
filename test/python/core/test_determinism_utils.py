@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -108,3 +109,20 @@ def test_golden_requires_exact_outputs_and_never_overwrites(tmp_path, monkeypatc
             checks.assert_golden("control", inputs, changed)
     with pytest.raises(pytest.fail.Exception, match="no golden"):
         checks.assert_golden("missing", inputs, outputs)
+
+
+def test_suite_local_goldens_and_explicit_directories(tmp_path, monkeypatch):
+    monkeypatch.setattr(checks, "runtime", lambda: {"sm": [10, 0]})
+    suite_goldens = tmp_path / "suite" / "goldens"
+    outputs = {"out": torch.ones(1)}
+    monkeypatch.delenv("CUDNN_DETERMINISM_GOLDENS", raising=False)
+    monkeypatch.setenv("CUDNN_DETERMINISM_RECORD", str(suite_goldens))
+    checks.assert_golden("control", {}, outputs)
+    monkeypatch.delenv("CUDNN_DETERMINISM_RECORD")
+    checks.assert_golden("control", {}, outputs, baseline_dir=suite_goldens)
+
+    monkeypatch.setenv("CUDNN_DETERMINISM_GOLDENS", str(Path(checks.__file__).with_name("determinism_goldens")))
+    checks.assert_golden("control", {}, outputs, baseline_dir=suite_goldens)
+    monkeypatch.setenv("CUDNN_DETERMINISM_GOLDENS", str(tmp_path / "external"))
+    with pytest.raises(pytest.fail.Exception, match="no golden"):
+        checks.assert_golden("control", {}, outputs, baseline_dir=suite_goldens)

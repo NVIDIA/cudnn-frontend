@@ -160,6 +160,14 @@ Selected helper routines in the block-sparse attention CuTe DSL utilities
 quack-kernels 0.4.1 and maintained locally. Those files retain the
 'QuACK team' copyright notice in their headers.
 
+Selected helper routines of the MoE dispatch, MLP and combine CuTe DSL
+kernels (python/cudnn/moe_ep/_cutemok/cutedsl/_compat/) are adapted
+from quack-kernels 0.5.0 and maintained locally. Those files retain their
+original copyright notices in their headers (Tri Dao; Wentao Guo, Tri Dao;
+Wentao Guo, Ted Zadouri, Tri Dao; Vijay Thakkar, Tri Dao; QuACK team).
+gemm_sm100.py there notes in its header, as QuACK's GEMM module does, that it
+is based on the CUTLASS CuTe DSL examples (entry 3).
+
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)
 
 -------------------------------------------------------------------------------
@@ -363,6 +371,20 @@ SOFTWARE.
 12. FlashInfer (flashinfer-ai/flashinfer)
     https://github.com/flashinfer-ai/flashinfer
 
+The batch-invariant GEMMs in python/cudnn/gemm/batch_invariant/ adapt
+Apache-2.0 sources from FlashInfer at commit e2d163fb3d46dfe251feba5b6652a08871f4a0b8.
+The BF16, FP8, groupwise FP8, MXFP8, NVFP4, MXFP4 and mixed MXFP8 x MXFP4
+kernels, K-chunk selection, tile and cluster heuristics, persistent scheduling,
+block-scale layouts and ordered FP32 epilogues
+come from flashinfer/gemm/batch_invariant/. The CuteF32 arithmetic in
+_quantized/arithmetic.py also adapts flashinfer/batch_invariant/fp_interface/cute.py.
+The cuDNN Frontend port binds graph tensors and workspace through its own
+compiler and launch interface.
+
+The BF16 input generator in test/python/gemm/batch_invariant/test_flashinfer_integration.py
+adapts adv_bf16 from tests/gemm/test_batch_invariant_mm_bf16.py at the same
+revision. The fixture selects the device to which the generated inputs are copied.
+
 The FP8 split-K projection kernel for decode rows in
 python/cudnn/gemm/frost/projection_decode/kernel/fp8_projection_decode_e4m3.py
 is derived from FlashInfer's cluster split-K dense GEMM kernel
@@ -394,5 +416,51 @@ FlashInfer's NOTICE:
     FlashInfer
     Copyright 2025-2026 NVIDIA
     Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+-------------------------------------------------------------------------------
+13. vLLM (vllm-project/vllm)
+    https://github.com/vllm-project/vllm
+
+The attention preparation kernel for decode rows in
+python/cudnn/attention_prepare/frost/kernel/prepare_decode_f16.py follows the
+thread shape and the arithmetic of vLLM's fused QK-RMSNorm + partial RoPE +
+gate copy kernel (_fused_qk_rmsnorm_rope_gate_kernel in
+vllm/model_executor/layers/fused_qk_norm_rope.py), pinned to commit
+2a777ce26e8315fa503ac5e88b595235d1c2b928. vLLM distributes the source file
+under Apache License 2.0 (Copyright contributors to the vLLM project); the
+derived file names the source and its licence in its header. The port is
+written on the CuTe DSL (the source is a Triton kernel), makes the geometry,
+the epsilon, the position form, the page size and the integer dtypes
+compile-time constants, serves bf16 only (the source takes its input dtype as
+a constant), fixes the gain at 1 + weight (the source adds a constant
+norm_beta), takes the query rows and the gate rows as two operands with their
+own strides (the source reads one [q | gate] row per head), loads a thread's
+elements once, reads the rotary partner from another thread of the warp,
+writes the keys into a paged pool at a slot and copies the value rows into a
+second pool beside them (the source writes the keys to a dense output and has
+no value operand) with the store predicated by the pool's capacity, and adds
+the host entry with its typed declines and launch arms.
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+14. Mixture-of-Kittens (cursor/mixture-of-kittens)
+    https://github.com/cursor/mixture-of-kittens
+
+The MoE dispatch, expert MLP and combine operator under
+python/cudnn/moe_ep/cutemok.py and
+python/cudnn/moe_ep/_cutemok/ is derived from Mixture-of-Kittens at
+commit 22fc95ae (22fc95ae6e331a738c4a58a227a8b03cac586e12). The CuTe DSL
+kernels and hosts under python/cudnn/moe_ep/_cutemok/cutedsl/ are
+ports of its CUDA megakernels and scheduler; the layer interface
+(cutemok.py, functional.py, ops.py) and parts of the tests under
+test/python/moe_ep/cutemok/ derive from its Python package and
+tests. Those files retain the 'Copyright 2026 Cursor Research' notice in their
+headers, followed by NVIDIA's copyright where NVIDIA modified them; files
+added by NVIDIA carry NVIDIA's copyright only.
+The port contains no code from Mixture-of-Kittens' ThunderKittens dependency.
+
+Copyright 2026 Cursor Research
 
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)

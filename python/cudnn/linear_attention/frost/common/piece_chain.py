@@ -65,6 +65,14 @@ LENGTH_RULE_PIECE_TOKENS = 8192
 CHAIN_MIN_UNITS_PER_PIECE = 4
 CHAIN_MIN_MEAN_TOKENS = 2048
 DV_SPLIT_TILES = 2
+# What a GDN forward chain costs against the plan it replaces, in units of the uncut prefill (``chain_pays``, ``chain_group_pays``).
+CHAIN_PASSES_PCT = 218
+CHAIN_FIXED_TOKENS = 1620
+# The fixed part of a chain tail, in tokens of the uncut prefill: what the tail's prologue, state chain and launches cost beside the
+# leftover round it replaces.  A tail of ``p`` slots is taken from a mean of ``100 * p * CHAIN_TAIL_FIXED_TOKENS / (100 * p - CHAIN_PASSES_PCT)`` tokens.
+CHAIN_TAIL_FIXED_TOKENS = 2239
+CHAIN_GROUP_TILE_TOKENS = 7
+DV_SPLIT_CHUNK_PCT = 86
 
 PIECE_TABLE_ALIGN = 256
 CHAIN_K_WARPS = 4
@@ -133,23 +141,72 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
     return 0, unit_chunks
 
 
+def chain_pays(*, pieces, num_seqs, total_tokens, split=False, tail=False) -> bool:
+    """Whether a GDN forward chain of ``pieces`` slots per sequence is faster than the plan that runs without it.
+
+    A chain runs every chunk through the summary and through the prefill and factors it in a pass of its own:
+    ``CHAIN_PASSES_PCT`` percent of the uncut prefill's work per chunk, shared by ``pieces`` slots that run side by side.  Its
+    prologue, state chain and extra launches cost what the uncut prefill spends on ``CHAIN_FIXED_TOKENS`` tokens, whatever the
+    length.  The plan it replaces walks a sequence at the uncut prefill's pace, or at ``DV_SPLIT_CHUNK_PCT`` percent of it
+    where that plan is the d_v split (``split``).  The chain pays from the mean sequence length at which the per-chunk gain
+    covers the fixed part::
+
+        mean_tokens * (rival_pct - CHAIN_PASSES_PCT / pieces) >= 100 * fixed_tokens
+
+    ``tail``: the chain of ``choose_tail`` replaces the leftover tiles' round of the uncut prefill, which needs no launch of
+    its own and starts on the first CTAs to finish, so its fixed part is ``CHAIN_TAIL_FIXED_TOKENS``.  The rule's inputs are
+    the slot budget (the SM count over the tiles), the tokens and the rival plan; its four constants are tuning."""
+    pieces, num_seqs = int(pieces), max(1, int(num_seqs))
+    rival_pct = DV_SPLIT_CHUNK_PCT if split else 100
+    fixed_tokens = CHAIN_TAIL_FIXED_TOKENS if tail else CHAIN_FIXED_TOKENS
+    return int(total_tokens) * (rival_pct * pieces - CHAIN_PASSES_PCT) >= 100 * fixed_tokens * pieces * num_seqs
+
+
+def chain_group_pays(*, pieces, num_seqs, heads_out, num_sm, total_tokens) -> bool:
+    """Whether a GDN forward plan of ``num_seqs`` sequences and ``total_tokens`` tokens can gain from the length-rule chain
+    group of ``pieces`` slots it would carry (``ragged_pieces``), whatever the sequence lengths.
+
+    The group runs the whole batch when the device hands it over.  It gains the most when one sequence holds every token:
+    the length rule then cuts it into ``min(pieces, ceil(total_tokens / LENGTH_RULE_PIECE_TOKENS))`` slots, which advance it
+    at ``CHAIN_PASSES_PCT`` percent of the uncut pace shared by the slots.  Beside a chain's own fixed part the group pays
+    for every other (sequence, head) tile of the batch: the state chain launches CTAs for each, the chain prologue lists
+    each, and their CTAs wait for the SMs the cut sequence's slots hold.  That is ``CHAIN_GROUP_TILE_TOKENS`` tokens of the
+    uncut prefill per tile where the slots hold every SM, and in proportion to the SMs they hold where they hold fewer.
+    Where the best case does not cover the fixed part the plan carries no group."""
+    slots = min(int(pieces), -(-int(total_tokens) // LENGTH_RULE_PIECE_TOKENS))
+    heads_out, num_sm = max(1, int(heads_out)), max(1, int(num_sm))
+    held_sms = min(slots * heads_out, num_sm)
+    other_tiles = (max(1, int(num_seqs)) - 1) * heads_out
+    fixed_tokens_by_sms = CHAIN_FIXED_TOKENS * num_sm + CHAIN_GROUP_TILE_TOKENS * other_tiles * held_sms
+    return int(total_tokens) * (100 * slots - CHAIN_PASSES_PCT) * num_sm >= 100 * fixed_tokens_by_sms * slots
+
+
 def ragged_pieces(*, heads_out, num_sm, total_tokens):
     """Slot cap of the length-rule chain group a main plan without pieces carries for the gate of its first kernel to take
     (``common/tail.py``), 0 for no group: the slots that keep one sequence's ``heads_out`` tiles in one wave, at most
-    ``CHAIN_MAX_PIECES`` and what the batch's tokens fill at ``LENGTH_RULE_PIECE_TOKENS`` each.  The group cuts a sequence at
-    ``CHAIN_MIN_PIECES`` slots or more, so a plan whose wave holds fewer of one sequence carries none."""
-    pieces = min(int(num_sm) // max(1, int(heads_out)), CHAIN_MAX_PIECES, -(-int(total_tokens) // LENGTH_RULE_PIECE_TOKENS))
-    return pieces if pieces >= CHAIN_MIN_PIECES else 0
+    ``CHAIN_MAX_PIECES``.  The group cuts a sequence at ``CHAIN_MIN_PIECES`` slots or more, so a plan whose wave holds fewer of
+    one sequence, or whose tokens fill fewer at ``LENGTH_RULE_PIECE_TOKENS`` each, carries none."""
+    pieces = min(int(num_sm) // max(1, int(heads_out)), CHAIN_MAX_PIECES)
+    return pieces if min(pieces, -(-int(total_tokens) // LENGTH_RULE_PIECE_TOKENS)) >= CHAIN_MIN_PIECES else 0
 
 
-def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks):
+def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks, uncut=False):
     """Whether a plan without pieces and without ``batch_invariant`` runs the d_v split: every (sequence, head) tile as
-    ``DV_SPLIT_TILES`` CTAs, each owning ``dim_v // DV_SPLIT_TILES`` value columns, at the tile counts where the slot budget
-    is exactly ``DV_SPLIT_TILES`` and ``dim_v`` is 128."""
+    ``DV_SPLIT_TILES`` CTAs, each owning ``dim_v // DV_SPLIT_TILES`` value columns, at ``dim_v`` 128.  A plan takes it at the
+    tile counts where the slot budget is exactly ``DV_SPLIT_TILES``.  ``uncut``: the plan runs one item per tile whatever the
+    gates (no split-K table, ``overwrite_initial_state``); with one sequence and no chain group for the device to take
+    (``ragged_pieces``) it then takes the split wherever its ``DV_SPLIT_TILES * heads_out`` CTAs fit in one wave of ``num_sm``,
+    at every length the plan does not chain."""
+    if int(dim_v) != 128:
+        return False
     budget = piece_budget(
         num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
     )
-    return budget == DV_SPLIT_TILES and int(dim_v) == 128
+    if budget == DV_SPLIT_TILES:
+        return True
+    if not uncut or int(num_seqs) != 1 or DV_SPLIT_TILES * max(1, int(heads_out)) > int(num_sm):
+        return False
+    return ragged_pieces(heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens) == 0
 
 
 def piece_capacity(*, num_seqs: int, pieces: int, total_tokens: int, batch_invariant: bool) -> int:

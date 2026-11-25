@@ -304,6 +304,10 @@ python/cudnn/
                                 of its compiled forms, the form as plain data,
                                 the launch shape (kernel_symbols_for /
                                 form_for / launch_shape_for on the entry)
+    init_order.py               the order of a direct-call entry's launches
+                                behind the initialization of the buffers an
+                                entry allocates for itself (pending_of /
+                                record / order_behind)
     tile_dsl/                   shared CuTe-DSL primitives (barriers, TMA,
                                 MMA, softmax pieces, masks, row reductions).
                                 Import by dotted path:
@@ -1067,6 +1071,52 @@ Contract:
   shape that refills the stage (`test/AGENTS.md`).
 
 
+## Handing data to another thread block through global memory: `tile_dsl.handover`
+
+One thread block stores data to global memory with ordinary stores and another
+block of the same grid loads it. Two blocks of a 1 x 1 x 1 cluster share no
+mbarrier, so the pair is ordered through a counter word in global memory.
+
+```python
+from cudnn.frost.tile_dsl.handover import acquired_zero, poll_then_acquire, release_add
+
+# writer: every lane that stored, behind its last store
+release_add(word, async_reader=True)                 # async_reader: the reader is a TMA or bulk copy
+# reader: a whole warp in converged control flow
+count = poll_then_acquire(word, WRITING_LANES, warp_uniform=True)
+row = row + acquired_zero(count, WRITING_LANES)      # what the loads are addressed from
+```
+
+| Form | Emits |
+|---|---|
+| `release_add(word, amount=1, async_reader=False)` | one add with release at GPU scope per lane, the previous value unused; with `async_reader`, `fence.proxy.async.global` in front of it |
+| `poll_then_acquire(word, at_least, warp_uniform=False)` | relaxed loads until the word reads `at_least`, then one acquire load, whose value is returned; `warp_uniform` leaves the loop on a warp vote |
+| `acquired_zero(count, adding_lanes)` | `count - adding_lanes`: 0 while exactly `adding_lanes` lanes add |
+
+Contract:
+
+- **The word is a counter.** It is cleared for every launch by a kernel in
+  front on the same stream, every writing lane adds once and the reader waits
+  for the number of writing lanes. No form elects, masks or counts for the
+  caller: SUM(adding lanes) == the value waited for belongs in the barrier
+  table beside the init counts.
+- **The reader's loads take a value from the acquire load.** Add
+  `acquired_zero` (or `tile_dsl.consume.consumed_zero`) to the address, the
+  index or the stored word the loads are formed from; a TMA load is formed
+  from its coordinates. A load whose address does not depend on the acquired
+  value may be scheduled in front of it.
+- **A writer never waits for its reader.** What the reader polls for is
+  reached by its writer on a path without a poll; the poll has no time limit,
+  so a table that names a reader without its writer hangs the launch.
+- **Keep it off per-chunk paths.** The lanes' adds of one warp become one
+  reduction behind one GPU-scope memory barrier, which drains the SM.
+- **Check a new call site** in the disassembly: the last store, the proxy
+  fence where one is asked for, one GPU-scope barrier and one reduction in
+  that order; one acquire load behind the poll and the loads' address computed
+  from it. `test/python/sdpa/frost/test_tile_dsl_handover.py` pins what the
+  forms compile to.
+
+
 ## Reducing a row over one thread block: `tile_dsl.rowwise`
 
 A row kernel launches one thread block per row -- a normalization, a per-row
@@ -1168,7 +1218,15 @@ store), `row_store8_e4m3(addr, values, inv, clamp=)` (the E4M3 codes of
 adds one `min.xorsign.abs.f32` against 448 per element and changes no code)
 and `fp8_dynamic_row_scale(amax)` (`scale = max(div.rn(amax, 448),
 fp32(1 / (448 * 512)))` and `inv = div.rn(1, scale)`: the per-row FP8 scale
-and its reciprocal, two IEEE divisions).
+and its reciprocal, two IEEE divisions). The FP8 row quantization decode
+kernel (`row_quantize/frost/kernel/row_quantize_fp8_decode_f16.py`) is these
+helpers around one `block_reduce(..., kind="max", order=None)`.
+One helper serves a sixteen-element-per-thread kernel:
+`row_store16_e2m1(addr, values, encode)` (the E2M1 codes of
+`values[j] * encode` as one 64-bit store, the code of `values[j]` in nibble
+`j`: the block of a 4-bit row that one block scale covers). The byte of that
+block scale in the 128 x 4 layout of a padded `rows x columns` scale matrix is
+`tile_dsl.sf_layout.sf_band_offset(row, column, atoms_per_band)`.
 
 
 ## Adding coverage, cheapest first
@@ -1268,3 +1326,40 @@ and its reciprocal, two IEEE divisions).
     in new or changed kernel code, even when every test passes
     (`python/cudnn/AGENTS.md` Rule 11); existing sites move over in follow-up
     changes.
+16. **A direct-call entry orders its launches behind entry-owned allocations.**
+    A buffer an entry allocates for itself (an output, a scratch) is initialized
+    by stream work of torch's current stream at that moment: a zero-fill, a fill
+    torch adds under deterministic algorithms, a write that stream still owes a
+    recycled block. A launch on another stream is not ordered behind it. So an
+    entry that allocates calls `cudnn.frost.init_order.record` right behind the
+    allocation and its fills, before the tensors are stored where a launch
+    finds them; and EVERY direct-call entry -- one that owns nothing too, its
+    output can be another entry's buffer -- keeps `init_order.pending_of(device)`
+    at construction and, in front of every launch and behind the truth test of
+    those records, calls `init_order.order_behind` with the byte ranges the
+    launch writes. A `torch.zeros` or `torch.empty` handed to a launch without
+    it is not accepted in new or changed entry code, even when every test
+    passes: the first launch of a newly compiled kernel has been observed to
+    wait for the other streams and hides the missing order, a warm launch on
+    another stream does not. The ordering makes ONE host wait: a captured
+    launch that writes an allocation whose initialization is still pending
+    waits for that one event before the launch (a capturing stream cannot wait
+    for an event recorded outside the capture); it is set-up, bounded by what
+    the allocating stream had queued, never replayed, and a caller avoids it
+    by allocating before the capture and letting that work finish. An eager
+    launch stream waits for the event whatever its raw handle, the allocating
+    stream's too (a destroyed stream's handle can go to the next new one; on
+    the allocating stream itself the wait is free). An accessor returns a copy
+    of the entry's table. The test is a WARM launch on another stream than the
+    allocation's, with that stream held behind pending work
+    (`test/python/init_order_schedules.py`). On the helper today:
+    `AddNormQuantDecode`, `AttentionPrepareDecode`, `AttentionGateQuantDecode`,
+    `RowArgmaxDecode`, `RowQuantizeFp8Decode`; `SharedExpertDecode`,
+    `RowQuantizeFp4Decode` (they allocate: record and order);
+    `Fp8ProjectionDecode`, `SwigluFp4Decode` (they own nothing: order).
+    Not yet, to follow in a separate change: `GdnDecodeFused`, `GdnVerifyFused`
+    (they allocate: record and order). Until then the caller orders (allocates
+    on the stream its calls run on, or orders that stream behind the allocating
+    one) every launch of one of `GdnDecodeFused`, `GdnVerifyFused` into an
+    entry-owned buffer, its own or another entry's; and every launch of any
+    other entry into a buffer `GdnDecodeFused` or `GdnVerifyFused` allocated.

@@ -81,6 +81,52 @@ def carve_plan(owner: str, regions) -> "_pybind_module.WorkspaceCarve":
     return _pybind_module.WorkspaceCarve(owner, spec)
 
 
+def _cuda_pointer_device(ptr, owner):
+    # CAI and raw pointers carry no ordinal. Older driver bindings report
+    # ordinal zero for every pointer, so use the runtime's pointer attributes.
+    from cuda.bindings import runtime as cudart
+
+    err, attrs = cudart.cudaPointerGetAttributes(ptr)
+    if err != cudart.cudaError_t.cudaSuccess:
+        raise ValueError(f"{owner}: cannot determine the workspace CUDA device: {err}")
+    if attrs.type not in (cudart.cudaMemoryType.cudaMemoryTypeDevice, cudart.cudaMemoryType.cudaMemoryTypeManaged):
+        raise ValueError(f"{owner}: workspace must be a CUDA device buffer")
+    return attrs.device
+
+
+def check_workspace_device(buffer, ptr, expected_device, owner):
+    """Check the placement of a normalized scratch pointer before launching."""
+    device = getattr(buffer, "device", None)
+    kind = getattr(device, "type", None)
+    ordinal = getattr(device, "index", None) if kind is not None else None
+    dl_device = getattr(buffer, "__dlpack_device__", None)
+    if dl_device is not None:
+        # Torch's typed device is cheaper than a second framework adapter
+        # call. Other DLPack producers publish a (kind, ordinal) pair.
+        if kind is None or ordinal is None:
+            kind, ordinal = dl_device()
+        if kind not in ("cuda", 2):  # kDLCUDA
+            raise ValueError(f"{owner}: workspace must be a CUDA device buffer")
+    else:
+        if isinstance(device, str):
+            kind, sep, index = device.partition(":")
+            if sep and not index.isdecimal():
+                raise ValueError(f"{owner}: invalid workspace device {device!r}")
+            ordinal = int(index) if sep else None
+        elif isinstance(device, tuple):
+            if len(device) != 2:
+                raise ValueError(f"{owner}: invalid workspace device {device!r}")
+            kind, ordinal = device
+        if kind is not None and kind not in ("cuda", 2):
+            raise ValueError(f"{owner}: workspace must be a CUDA device buffer")
+        # A raw address or Python metadata producer needs a pointer lookup.
+        # Reject an invalid declared ordinal even when the address is local.
+        if ordinal is None or ordinal == expected_device:
+            ordinal = _cuda_pointer_device(ptr, owner)
+    if ordinal != expected_device:
+        raise ValueError(f"{owner}: workspace must be on cuda:{expected_device}, got cuda:{ordinal}")
+
+
 class Workspace:
     """Execute-time view onto the caller's workspace buffer.
 
@@ -99,33 +145,8 @@ class Workspace:
         expected_device = device
         ptr, shape, strides, dtype, device = buffers.probe(buffer)
         if expected_device is not None:
-            device_attr = getattr(buffer, "device", None)
-            device_kind = getattr(device_attr, "type", None)
-            dlpack_device = getattr(buffer, "__dlpack_device__", None)
-            if device_kind is not None and getattr(device_attr, "index", None) is not None:
-                # Tensor metadata is cheaper than invoking a framework's DLPack
-                # adapter again after probe; no framework import is needed.
-                if device_kind != "cuda":
-                    raise ValueError(f"{owner}: workspace must be a CUDA device buffer")
-                device = device_attr.index
-            elif dlpack_device is not None:
-                device_type, device = dlpack_device()
-                if int(device_type) != 2:  # kDLCUDA; CPU/pinned-host storage is not scratch.
-                    raise ValueError(f"{owner}: workspace must be a CUDA device buffer")
-            else:
-                # CAI-only producers promise device storage but need not expose a
-                # device ordinal. Query pointer metadata; never read device contents.
-                # Older cuda-python driver bindings return zero for
-                # CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL on every device. The
-                # runtime's pointer-attributes struct carries the correct ordinal.
-                from cuda.bindings import runtime as cudart
-
-                err, attributes = cudart.cudaPointerGetAttributes(ptr)
-                if err != cudart.cudaError_t.cudaSuccess:
-                    raise RuntimeError(f"{owner}: cudaPointerGetAttributes failed: {err}")
-                device = attributes.device
-            if int(device) != int(expected_device):
-                raise ValueError(f"{owner}: workspace must be on cuda:{expected_device}, got cuda:{device}")
+            check_workspace_device(buffer, ptr, expected_device, owner)
+            device = expected_device
         if not buffers.is_contiguous(shape, strides):
             raise ValueError(f"{owner}: the workspace buffer must be contiguous")
         nbytes = buffers.DTYPE_ITEMSIZE[dtype]

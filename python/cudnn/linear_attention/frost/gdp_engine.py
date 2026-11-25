@@ -10,7 +10,6 @@ from __future__ import annotations
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
-from cudnn.frost.device import build_device
 from ..graph_analyzer import analyze
 from .engine import FrostLaPlan, frost_la_gate, summary_support_gates
 from .gdn_engine import build_gdn, build_gdn_summary, gdn_support_gates
@@ -32,10 +31,7 @@ class GdpFrostEngine(BaseEngine):
         gdn_support_gates("GdpFrostEngine", facts)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            return FrostLaPlan(build_gdn(graph))
+        return FrostLaPlan(build_gdn(graph))
 
 
 class GdpSummaryFrostEngine(BaseEngine):
@@ -55,7 +51,4 @@ class GdpSummaryFrostEngine(BaseEngine):
         summary_support_gates("GdpSummaryFrostEngine", facts, graph)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            return FrostLaPlan(build_gdn_summary(graph))
+        return FrostLaPlan(build_gdn_summary(graph))

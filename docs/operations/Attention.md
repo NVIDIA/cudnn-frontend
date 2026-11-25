@@ -60,6 +60,31 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
 | Blackwell (Consumer) <br /> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes | d &lt;= 128 |
 
 
+### FROST support matrix (python engines, FP16 / BF16)
+
+FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_*`, `sdpa_bwd_*`) that the frontend ranks beside the cuDNN backend plans; a graph every FROST row declines runs on the backend. The table covers the FP16 / BF16 rows for dense, padded (dense inputs with `use_padding_mask`) and ragged (THD) graphs; the FP8 / MXFP8 rows are documented with their kernels under `docs/operations/attention/`. Head dims are the native tiles; smaller multiples of 8 ride the next envelope. The per-architecture eligibility record is the [FROST support index](https://github.com/NVIDIA/cudnn-frontend/blob/develop/python/cudnn/sdpa/frost/support/README.md) and its pages.
+
+| Arch | Fprop | Bprop | Deterministic bprop⁶ | Padded | Ragged (THD) | Head dim |
+|-----------|-------------|-------------|-------------|-------------|-------------|------|
+| Ampere A100 (cc 8.0) | Yes | Yes | Yes | Fprop, bprop | Fprop, bprop | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 256 (d_qk = 192, d_vo = 128) |
+| Ampere GA10x (cc 8.6)⁷ | Yes | d &lt;= 128 | d &lt;= 128 | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop d &lt;= 128 |
+| Ada AD10x (cc 8.9)⁷ | Yes | Yes | Yes | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop as cc 8.0 (`sdpa_bwd_sm89`) |
+| Hopper (cc 9.0) | Yes | d = 64, 128 (opt-in)¹⁰ | d = 64, 128 (opt-in)¹⁰ | Fprop (d &gt; 64) | Fprop (d &gt; 64) | Fprop d &lt;= 512; bprop d = 64, 128 |
+| Blackwell B200 / B300 (cc 10.0, 10.3)⁸ | Yes | Yes | Yes | Fprop | Fprop; bprop d &gt;= 128 (deterministic: d_qk &gt;= 192) | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 (d_qk = 192, d_vo = 128) |
+| Thor (SM110, cc 11.0)⁹ | Yes | Yes | Yes | Fprop | As cc 10.0 / 10.3 | As cc 10.0 / 10.3 |
+| SM107 (cc 10.7)⁸ | Yes | Yes | d &lt;= 128 (d_qk = 192, d_vo = 128) | Fprop | Fprop; bprop d &lt;= 256 (deterministic: d_qk = 192, d_vo = 128) | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 (d_qk = 192, d_vo = 128) |
+| Blackwell consumer (cc 12.0) | Yes | Yes | Yes (THD: d = 512) | Fprop, bprop | Fprop, bprop | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 |
+
+⁶ `use_deterministic_algorithm=True`: the rows listed produce bitwise identical gradients across runs. FROST fprop plans are bitwise repeatable; FROST bprop plans without the flag are not (atomic dQ accumulation).
+
+⁷ cc 8.6 / 8.9 run the SM80 kernels under their smaller per-CTA shared-memory budget: the d = 256 prefill runs its 32-key tile. On cc 8.6 the d = 128 backward runs single-buffered Q / dO without the dQ staging tile and the (192, 128) and 256 backward envelopes decline; on cc 8.9 backward is served by the `sdpa_bwd_sm89` rows (32x32 tiles above d = 128). The rows rank after the backend plans.
+
+⁸ The cc 10.x FROST bprop rows take BSHD-physical Q / K / V / O / dO / dQ / dK / dV (BHSD-physical only through the d = 512 row) and do not serve `use_padding_mask` with dense inputs. The ragged (192, 128) rows (`sdpa_bwd_sm100_d192`, `sdpa_bwd_sm107_d192`) are opt-in (`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`).
+
+⁹ Thor is served by the SM100-line rows (the kernels compile for `sm_110a`); they rank after the backend plans.
+
+¹⁰ `sdpa_bwd_sm90` is offered only with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`: exact (64, 64) and (128, 128), FP16 / BF16, dense compact BSHD storage, no padding mask or THD. The default and the deterministic request run the same chain and return identical bytes.
+
 ### Glossary
 ¹ Interleaved q,k,v tensors. Generally they have layouts as BS3HD, B3SHD.
 
@@ -113,7 +138,7 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
       ```
 
   - Dimensions: $[B=2, H=1, S=8, D=64]$ (S is still max sequence length)
-  - Strides: $[512, 64, 64, 1]$ (strides unchanged, but ignored for ragged)
+  - Strides: $[512, 64, 64, 1]$ (the batch stride is ignored for ragged; head, sequence and feature strides still address storage)
   - **Ragged offset:** $[0, 2 \times H \times D, 5 \times H \times D] = [0, 128, 320]$
 
   &nbsp;&nbsp;&nbsp;&nbsp; *Partially Packed Layout:*<br />
@@ -416,6 +441,15 @@ graph.sdpa(
   - Sliding window: Set `left_bound` to window size
   - Band attention: Set both `left_bound` and `right_bound`
 
+The legacy `use_causal_mask=True` flag selects top-left causal masking. Combining
+it with `diagonal_alignment=BOTTOM_RIGHT` raises an error in every SDPA forward
+and backward API, including FP8 and MXFP8. For bottom-right causal masking, use
+`use_causal_mask_bottom_right=True`, or set the right band bound to zero with
+`diagonal_alignment=BOTTOM_RIGHT`. The bound is named `diagonal_band_right_bound`
+on `sdpa`, `sdpa_backward`, and `sdpa_mxfp8`, and `right_bound` on `sdpa_fp8`,
+`sdpa_fp8_backward`, and `sdpa_mxfp8_backward`. An alignment alone, without a band
+or causal flag, does not enable masking.
+
 - **Paged attention**: Enables non-contiguous K/V caches to reduce memory fragmentation. See the [PagedAttention paper](https://arxiv.org/abs/2309.06180).
   - **Requirements**:
     - Pass the `paged_attention_k_table` tensor with block offsets into the K container (optional if K is not paged)
@@ -495,7 +529,7 @@ pair alone, these engines serve any combination of the three. See
 #### Limitations
 
 - Head dimension must be a multiple of 8.
-- Q, K, V and O (and dO, dQ, dK, dV in backward) must meet the tensor's declared alignment, 16 bytes by default. If a non-unit stride is not a whole number of alignments in bytes, the native lowering declines the graph. If a device pointer is misaligned, `execute` refuses it before launching. Without these checks, the native kernels returned wrong output on SM90/SM100 and faulted on SM80/SM89 ([#1571](https://github.com/NVIDIA/cudnn-frontend/issues/1571)).
+- Q, K, V and O (and dO, dQ, dK, dV in backward) must meet the tensor's declared alignment, 16 bytes by default. If an addressed non-unit stride is not a whole number of alignments in bytes, the native lowering declines the graph. For an operand with a ragged-offset tensor, offsets replace the batch stride, so that unused stride is exempt at build time and in runtime shape overrides; its head and sequence strides remain checked. The caller must still provide aligned sequence starts through the ragged offsets. If a device pointer is misaligned, `execute` refuses it before launching. Without these checks, the native kernels returned wrong output on SM90/SM100 and faulted on SM80/SM89 ([#1571](https://github.com/NVIDIA/cudnn-frontend/issues/1571)).
 - ALiBi requires causal masking (`diagonal_band_right_bound=0`).
 - Block masking is only supported with the UNIFIED implementation.
 - Ampere/Ada architectures are limited to head dimensions up to 256 for prefill, 128 for decode and backward. On SM89 (Ada), the FROST `sdpa_bwd_sm89` engine serves FP16/BF16 backward up to head dimension 256 when the backend declines the graph.
@@ -1529,6 +1563,8 @@ Always deterministic on all architectures
 SM100 - Deterministic requires cuDNN backend version 9.19.0 or later.
 SM80 and SM120 do not support deterministic algorithm with ragged input tensor.
 SM90 - Determinism is supported.
+
+FROST plans: fprop is bitwise repeatable on every architecture; `use_deterministic_algorithm=True` selects the FROST bprop rows of the FROST support matrix above.
 
 
 

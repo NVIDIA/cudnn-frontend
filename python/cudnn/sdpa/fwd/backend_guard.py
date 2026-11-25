@@ -5,7 +5,8 @@
 (``cudnn.engines.manifest.EngineFamily.backend_guard``), and backend engines it keeps off a graph
 (``EngineFamily.backend_engine_guard``).
 
-One documented defect: on cc 10.7 the backend kills the process while planning or building a block-scale MXFP8
+Two documented defects.  The second (wrong single-query per-tensor FP8 output on cc 10.0 / 10.3) is described at
+``FP8_SQ1_WRONG_O_FIXED_IN`` below.  The first: on cc 10.7 the backend kills the process while planning or building a block-scale MXFP8
 (``sdpa_mxfp8``) forward graph with a single query row and no sink token.  Measured on cuDNN 9.26.0.51 and 9.27.0.28
 over the 21-contract trigger matrix of the detector named below: the heuristics SIGSEGV on every d128 contract (dense
 BSHD and BHSD, THD (ragged) queries, Stats on or off, batch 1 / 2 / 4 and one head, KV length 128 / 2048 / 4096, no
@@ -68,12 +69,46 @@ SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Optional[int] = 92900
 # The backend fix routes single-query MXFP8 graphs to the prefill kernel, so one FIXED_IN covers all three.
 SQ1_MXFP8_CRASH_DEVICES = frozenset({(10, 0), (10, 3), (10, 7)})
 
+# On cc 10.0 / 10.3 the backend returns O = 0 and an infinite Stats row for a dense, unpadded per-tensor FP8 (``sdpa_fp8``)
+# forward graph with one query row when every score of the row lies far below zero (Q = -8, K = 2, V = 1, so the right O
+# is 1; Q = 0 is the control).  Measured on a 68-SM cc 10.0 board, d 64 / 128, batch 2, 4 heads, BSHD, E4M3, bf16 O
+# (2026-11-16): engine 3 is wrong on every build from 9.21.1.3 through 9.25.0.15 at s_kv 129, 255, 257, 385, 511, 513 and
+# 1000 with Stats requested (the Stats-free graphs there fail the backend's compile and the walk moves on), and at 2048, 4096,
+# 8192 and 16384 with or without Stats, causal top-left / bottom-right bands included (9.24.0.43 for the bands and for 2048,
+# 8192, 16384).  s_kv 128, 256, 384 and 512 come back right, so every KV length and mask is guarded; s_q 2 / 4 and padded
+# graphs are right.  The 148-SM cc 10.0 board and cc 10.3 (B300) reproduce it on 9.24.0.43 (engine 3), and the 148-SM board
+# on 9.25.0.15 with engine 10, so a per-engine guard would miss it.  9.25.1.1 is right on all three.  d256 is outside: the
+# backend plans no single-query FP8 graph there.  With the guard armed on 9.24.0.43 the default walk served all 112 graphs
+# tried with a FROST plan and the right O and Stats (d 64 / 128, s_kv 1 to 16384, Stats on / off, no mask / top-left /
+# bottom-right, bf16 / f16 / E4M3 O, E4M3 / E5M2 inputs, 4/4, 8/2 and 1/1 heads).
+FP8_SQ1_WRONG_O_FIXED_IN = 92501
+FP8_SQ1_WRONG_O_DEVICES = frozenset({(10, 0), (10, 3)})
+FP8_SQ1_WRONG_O_HEAD_DIMS = (64, 128)
+
+
+def _fp8_sq1_wrong_o(facts) -> Optional[str]:
+    import cudnn
+
+    if facts.device_cc not in FP8_SQ1_WRONG_O_DEVICES or facts.s_q != 1 or facts.padded or facts.has_paged_kv:
+        return None
+    if facts.d_qk not in FP8_SQ1_WRONG_O_HEAD_DIMS or facts.d_v != facts.d_qk or cudnn.backend_version() >= FP8_SQ1_WRONG_O_FIXED_IN:
+        return None
+    return (
+        f"cuDNN {cudnn.backend_version_string()} backend returns a wrong O and Stats for single-query per-tensor FP8 SDPA forward on "
+        f"cc 10.0 / 10.3 (d 64 / 128, unpadded) when every score of a row is far below zero (measured 9.21.1.3 through 9.25.0.15, "
+        f"fixed in 9.25.1.1); the backend is not consulted for this graph"
+    )
+
 
 def backend_guard(graph, facts) -> Optional[str]:
     """The reason the backend must not be consulted for ``graph`` (its SDPA facts), or None."""
     import cudnn
 
-    if facts is None or facts.invalid is not None or facts.is_backward or not facts.is_mxfp8:
+    if facts is None or facts.invalid is not None or facts.is_backward:
+        return None
+    if facts.is_fp8:
+        return _fp8_sq1_wrong_o(facts)
+    if not facts.is_mxfp8:
         return None
     if facts.device_cc not in SQ1_MXFP8_CRASH_DEVICES or facts.s_q != 1 or facts.has_sink or facts.has_paged_kv:
         return None
@@ -185,3 +220,38 @@ def _wide_v_engine_guard(graph, facts) -> Dict[int, str]:
         f"(NVIDIA/cudnn-frontend#2401); the backend's other engines serve this graph"
         for engine in WIDE_V_WRONG_O_ENGINES
     }
+
+
+# Actual 9.24.0.43 and 9.25.1.1 native SM100 FP8 prefill STREAM_K=1
+# omit S/V/O compensation from their split partials. On an exact constant-V
+# 8K row with reciprocal S scales256/448, O is16/28 instead of1. 9.24 also
+# writes FP16 bits into BF16 O. Raw C++ and Python graph execution agree;
+# the same engine's STREAM_K=0 is correct. Released9.26.0.51 and9.27.0.42
+# and9.28 preview pass both configurations. Keep this guard plan-granular.
+# 9.23.2.1 offers only STREAM_K=0 and rejects an explicit STREAM_K=1
+# before launch; 9.24/9.25 also fail E4M3/E5M2 outputs, not just 16-bit O.
+FP8_PREFILL_SPLIT_WRONG_O_FIXED_IN = 92600
+
+
+def backend_plan_guard(graph, facts, engine_id, knobs) -> Optional[str]:
+    """Reject an affected native FP8 split configuration while retaining its unsplit sibling."""
+    import cudnn
+    from cudnn.engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
+
+    if facts is None or facts.invalid is not None or facts.is_backward or not facts.is_fp8:
+        return None
+    if facts.device_cc not in ((10, 0), (10, 3)) or facts.s_q <= 1:
+        return None
+    if facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2):
+        return None
+    version = cudnn.backend_version()
+    if not 92400 <= version < FP8_PREFILL_SPLIT_WRONG_O_FIXED_IN:
+        return None
+    opaque = engine_id == BACKEND_HEURISTIC_ENGINE_ID
+    if not opaque and (engine_id not in (3, 10) or not knobs or knobs.get(cudnn.knob_type.STREAM_K) != 1):
+        return None
+    return (
+        f"cuDNN {cudnn.backend_version_string()} native FP8 prefill STREAM_K=1 returns incorrectly scaled O "
+        f"on SM100/SM103 (reproduced in 9.24.0.43 and 9.25.1.1, fixed in 9.26.0.51); "
+        + ("an opaque backend fallback cannot exclude that configuration" if opaque else "STREAM_K=0 and other engines remain available")
+    )

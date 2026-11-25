@@ -55,10 +55,27 @@ def test_indexed_packed_reference(supported_gpu, lengths):
     check_case(inputs, indices_for(inputs))
 
 
+@pytest.mark.parametrize("hq", [12, 6])
+@pytest.mark.parametrize("lengths", [(3, 5, 7), (2049,)])
+def test_indexed_fp16(supported_gpu, lengths, hq):
+    """BF16 and FP16 calls of one shape alternate in one process, so each must build its own plan."""
+    for dtype in (torch.bfloat16, torch.float16, torch.bfloat16):
+        inputs = make_inputs(lengths, hq, 1, empty=True, all_selected=True, dtype=dtype)
+        out, grads = check_case(inputs, indices_for(inputs))
+        assert all(tensor.dtype == dtype for tensor in (out["out"], *grads))
+
+
 @pytest.mark.parametrize("lengths", [(3, 5, 7), (129, 133)])
 def test_indexed_six_query_heads(supported_gpu, lengths):
     """6Q/1KV runs the same forward kernels and backward engine as 12Q/1KV, with six head rows per query."""
     inputs = make_inputs(lengths, 6, 1, empty=True, all_selected=True)
+    check_case(inputs, indices_for(inputs))
+
+
+@pytest.mark.parametrize("lengths", [(3, 5, 7), (2049,)])
+def test_indexed_two_kv_heads(supported_gpu, lengths):
+    """24Q/2KV: each query head reads the KV head of its twelve-head group, and dK / dV gather per KV head."""
+    inputs = make_inputs(lengths, 24, 2, empty=True, all_selected=True)
     check_case(inputs, indices_for(inputs))
 
 

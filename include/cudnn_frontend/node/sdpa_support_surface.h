@@ -31,7 +31,8 @@ validate_sdpa_operand_stride_alignment(std::shared_ptr<Tensor_attributes> const&
         return {error_code_t::OK, ""};
     }
     auto const& stride = tensor->get_stride();
-    auto const i       = misaligned_stride_dimension(tensor->get_dim(), stride, element_bytes, alignment);
+    auto const i       = misaligned_stride_dimension(
+        tensor->get_dim(), stride, element_bytes, alignment, tensor->get_ragged_offset() != nullptr);
     RETURN_CUDNN_FRONTEND_ERROR_IF(i >= 0,
                                    error_code_t::GRAPH_NOT_SUPPORTED,
                                    name + ": stride " + std::to_string(stride[i]) + " of dimension " +

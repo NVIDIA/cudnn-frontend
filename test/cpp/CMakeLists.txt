@@ -31,6 +31,7 @@ add_executable(
     plans.cpp
     serialize.cpp
     validate.cpp
+    sdpa_alignment.cpp
     version.cpp
     numerical_notes.cpp
     tensor.cpp

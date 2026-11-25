@@ -81,7 +81,7 @@ _SLOT = 32  # fixed native body; retired slot 4 remains reserved
 _ENGINE_ID = 20_632
 _D = 256
 _RUBIN_CC = (10, 7)
-_SM_RANGE = (107, 119)  # the row mirrors the forward Rubin rows (fwd/engines.py)
+_SM_RANGE = (107, 109)  # the row mirrors the forward Rubin rows (fwd/engines.py); Thor (sm110) rides the SM100 rows
 _DTYPES = (torch.bfloat16, torch.float16)
 _DTYPE_IDS = ("bf16", "fp16")
 
@@ -194,7 +194,7 @@ def _spec(name=_ENGINE):
 
 def _rubin_only():
     if _SM is None or not (_SM_RANGE[0] <= _SM <= _SM_RANGE[1]):
-        pytest.skip("needs a Rubin-line GPU (107 <= SM <= 119), have " + ("none" if _SM is None else f"sm_{_SM}"))
+        pytest.skip("needs a Rubin-line GPU (107 <= SM <= 109), have " + ("none" if _SM is None else f"sm_{_SM}"))
 
 
 # =========================================================================== registration / capabilities (host)

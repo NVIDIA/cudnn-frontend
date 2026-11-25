@@ -688,11 +688,12 @@ records as `FROST_SOURCE_DIGEST`, joined with the function's name and its
 arguments, which pin shapes, strides and flags the way the params pin dtypes
 and masks (SDPA + GEMM suites: 5867 tests, 53:06 cold, 2:53 warm). An
 argument that is not a plain value (a tensor, a device, a stream) makes the
-key None and the call compiles as before. The GDN/GDP warmup forwards and GDN2/KDA uncut and piece-chain forwards
+key None and the call compiles as before. The linear-attention hosts the FROST engines build (GDN/GDP/Mamba-2 warmup,
+GDN2/KDA uncut and every family's piece-chain hosts: forward, backward and summary)
 also use this cache, with their existing static specialization tuples as keys.
 Those tuples include dtype, rank/layout specialization, device, schedule and
-gate/state flags; packed token totals remain dynamic. Other linear-attention
-compilers and the SDPA adapters'
+gate/state flags; packed token totals remain dynamic. The stand-alone linear-attention
+`chunk_*` launchers and the SDPA adapters'
 helper kernels in `api_dsl` still compile without persistent artifacts. A
 hit is the same object a miss produced, so the reloaded kernel is called
 exactly as the in-process one.
@@ -959,17 +960,17 @@ accepts legal execution-time Stats stride overrides, including changes to the
 head stride of packed HN Stats. It does not permit changing the packing, dtype,
 or storage capacity, or bypass the plan's ragged-offset and override bounds.
 
-The declaration covers admitted override-enabled FP16/BF16 THD plans
-with packed HN Stats through the prepared THD binder on qualified SM100/SM103
-devices, plus qualified SM107 and SM120 (cc 12.0) half THD plans.
-SM121 remains unqualified. The note follows the admitted graph/config and the
-prepared binder, including the new explicit implementation owners; it does not
-apply to every plan on those architectures.
-This includes the explicit D256 lookahead engine and eligible legacy
-half engines. Dense, token-major/padded Stats, no-Stats, override-disabled,
-quantized and ragged-Q dense-decode plans do not declare it. D256 swap-AB does
-not serve THD. Backend plans retain their existing notes and do not inherit this
-frontend declaration. `RUNTIME_COMPILATION` remains present on FROST plans.
+Each forward implementation declares whether it can bind a runtime head stride.
+The declaration applies on every device that admits the selected implementation.
+For the half-precision prepared THD binder, the graph must enable shape overrides
+and declare packed head-major FP32 Stats. The selected configuration must use
+that binder, and the installed extension must support the override. Half Q/O plans that
+admit FP8 K/V use the same FP32 Stats binder. Both note
+queries and graph-plan lowering use the same implementation declaration.
+
+For example, the SM120 general half, D256 all-compute and D512 paired
+implementations can advertise the note on both RTX 5080 and GB10. Dense decode,
+quantized, token-major and padded Stats plans keep their existing stride contract.
 
 Callers should use the selected plan's note to choose direct HN execution or
 retain their existing NH fallback. Do not infer support from the engine name or
@@ -977,6 +978,13 @@ from FROST membership. Selecting/deselecting behavior notes uses the same
 per-plan declaration, but integrations should not filter the candidate pool just
 to choose a Stats layout. Consumers of this new enum must require an FE release
 that supplies it.
+
+If direct HN with a changing head stride is mandatory, call
+`graph.select_behavior_notes([cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE])`
+between `create_execution_plans()` and `build_plans()`. This keeps the heuristic
+order among matching plans. The build fails if none qualify. Callers that can
+stage through NH can keep the full candidate list and cache the final plan's
+layout choice when they prepare it.
 
 The note has frontend-only integer value **1000**, in the band starting at
 `FRONTEND_BEHAVIOR_NOTE_BASE`; existing values 0–5 are unchanged. It serializes

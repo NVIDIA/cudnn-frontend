@@ -16,7 +16,13 @@ from .._plan import PreparedResources
 from .._workspace import WorkspaceRequirements
 from ._adapter import Mxfp8LaunchInputs
 from ._compile_common import _compile_kernel, _prepare_rubin_environment
-from ._config import MXFP8_CLUSTER_SHAPE_MNK, Mxfp8KernelConfig
+from ._config import (
+    MXFP8_CLUSTER_SHAPE_MNK,
+    MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK,
+    Mxfp8KernelConfig,
+    Mxfp8MixedCgaLaunch,
+    resolve_mixed_cga_launch,
+)
 from ._fingerprint import build_kernel_fingerprint
 from ._launch import build_runtime_kwargs, layout_signature
 
@@ -72,15 +78,30 @@ def prepare_environment(
     )
 
 
+def prepare_mixed_cga_launch(
+    device: torch.device,
+    *,
+    fallback_max_active_clusters: int,
+) -> Mxfp8MixedCgaLaunch:
+    """Query resident 4-CTA clusters and split the device for mixed CGA."""
+
+    _, preferred_max_active_clusters = _prepare_rubin_environment(
+        device,
+        cluster_size=MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK[0] * MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK[1],
+        context="forward mixed CGA",
+    )
+    return resolve_mixed_cga_launch(
+        preferred_max_active_clusters=preferred_max_active_clusters,
+        fallback_max_active_clusters=fallback_max_active_clusters,
+    )
+
+
 def _pre_reduced_workspace_metadata(
     device_workspace: Any,
     config: Mxfp8KernelConfig,
     shared_bytes: int,
 ) -> tuple[int | None, int]:
-    """Describe the standalone combine plane, if this kernel has one."""
-    if config.fc2_in_kernel_topk_reduce:
-        return None, 0
-
+    """Describe the standalone combine plane."""
     region = device_workspace.region(_PRE_REDUCED_ACTIVATION_REGION)
     if region.buffer_space != "shared":
         raise RuntimeError("Rubin pre_reduced_activation must reside in shared workspace")
@@ -114,7 +135,7 @@ def _pre_reduced_sf_workspace_metadata(
     shared_bytes: int,
 ) -> tuple[int | None, int]:
     """Describe the standalone quantized-combine scale plane, if present."""
-    if config.fc2_in_kernel_topk_reduce or config.combine_format == "bf16":
+    if config.combine_format == "bf16":
         return None, 0
 
     region = device_workspace.region(_PRE_REDUCED_ACTIVATION_SF_REGION)
@@ -174,8 +195,11 @@ def prepare_kernel(
         data_token_capacity=config.physical_recv_pool_size,
         hidden=config.hidden,
         launch_cluster_count=config.launch_cluster_count,
+        schedule_mode=config.schedule_mode,
+        fallback_cluster_shape_mn=config.fallback_cluster_shape_mn,
+        preferred_cluster_count=config.preferred_cluster_count,
+        fallback_cluster_count=config.fallback_cluster_count,
         drop_on_overflow=config.kernel_drop_on_overflow,
-        fc2_in_kernel_topk_reduce=config.fc2_in_kernel_topk_reduce,
         token_back_mode=config.token_back_mode,
         epi_flag_batch=config.epi_flag_batch,
         flag_batch=config.flag_batch,
@@ -186,7 +210,6 @@ def prepare_kernel(
         fc2_use_bulk=config.fc2_use_bulk,
         fc2_tma_stages=config.fc2_tma_stages,
         enable_col_quant=config.enable_col_quant,
-        col_quant_num_ctas=config.col_quant_num_ctas,
         weight_storage_mode=config.weight_storage_mode,
     )
     kernel = Sm107MegaMoEMxfp8GluKernel.from_kwargs(**kernel_kwargs)
@@ -318,4 +341,5 @@ __all__ = [
     "compile_or_get",
     "prepare_environment",
     "prepare_kernel",
+    "prepare_mixed_cga_launch",
 ]

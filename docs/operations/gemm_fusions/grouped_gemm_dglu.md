@@ -164,8 +164,8 @@ The wrapper return order is exactly `d_row_tensor`, `d_col_tensor`,
 
 ### Optional recomputed activation for training
 
-For torch BF16 `C` and `D_row` with `act_func="dgeglu"`, the class accepts
-`sample_activation` at construction and requires the corresponding
+For torch BF16 `C` and `D_row` with `act_func="dgeglu"` or `"dswiglu"`, the
+class accepts `sample_activation` at construction and requires the corresponding
 `activation_tensor` on every execution. Both parameters default to `None`.
 An undeclared output is rejected at execution. The wrapper accepts the same
 caller-allocated `activation_tensor` and appends it as an eighth result only
@@ -173,18 +173,27 @@ when supplied; calls without it retain the original seven-result order.
 
 The output is BF16 with shape `(M, N, 1)`, row-contiguous stride
 `(N, 1, M*N)` modulo unit dimensions, and a 32-byte-aligned data pointer.
-For each expert, using the clamped values of `beta[expert] * C`, it stores
+Let `gate` and `up` be the two halves of `beta[expert] * C` in the selected
+`glu_layout`. For each expert, the epilogue stores
 
 ```text
-activation = BF16(((clamped_gate * sigmoid(geglu_alpha * clamped_gate))
-                   * (clamped_input + linear_offset)) * prob)
+dgeglu:  activation = BF16(((clamped_gate * sigmoid(geglu_alpha * clamped_gate))
+                            * (clamped_input + linear_offset)) * prob)
+dswiglu: activation = BF16(((gate * sigmoid(gate)) * up) * prob)
 ```
+
+dSwiGLU uses no clamp or linear offset, as the SwiGLU forward does. Its
+operations run in the order of the BF16 GLU forward with the same
+`vector_f32` setting. When `beta * C` equals the forward's FP32 gate and up
+values, the dSwiGLU `activation` is bitwise equal to the forward `D`. This
+holds, for example, with `beta = 1` and a forward pre-activation that BF16
+represents exactly.
 
 The primal does not depend on the down-projection gradient or `alpha`; it
 remains defined when either the gradient or probability is zero. It can feed
 the down-projection weight-gradient GEMM when the forward activation was
-discarded. The epilogue reuses its existing clamp and sigmoid calculation and
-writes the output directly; it introduces no separate activation kernel.
+discarded. The epilogue reuses its existing clamp, sigmoid and SiLU
+calculation and writes the output directly; it introduces no separate activation kernel.
 It writes all addressed padded rows. Capacity after the final expert offset
 is unspecified and must not be consumed.
 
@@ -193,8 +202,10 @@ weight allocation. The API rejects overlapping byte spans of visible tensor
 arguments, including views, using host metadata only. With discrete weights,
 the caller must also ensure that the allocations behind `b_ptrs` do not
 overlap the output. Output storage must remain alive until the launch stream
-finishes. This option currently rejects JAX, block-scaled operands, dSwiGLU,
-and non-BF16 `C` or `D_row`; their existing default paths are unchanged.
+finishes. This option currently rejects JAX, block-scaled operands, and
+non-BF16 `C` or `D_row`; their existing default paths are unchanged. With
+dSwiGLU it accepts both `glu_layout` values; `gate_then_up` keeps its
+SM100/SM103 limit.
 
 ```python
 activation = torch.empty((M, N, 1), device=a.device, dtype=torch.bfloat16)
@@ -209,6 +220,36 @@ assert out["activation_tensor"] is activation
 ```
 
 ## Block-scaled contract
+
+### Gate/up storage order (BF16 and block-scaled)
+
+Set `glu_layout="gate_then_up"` on the Torch wrapper or class when saved C
+uses conventional `[gate | up]` channel order. D_row, D_col, their packed
+scale factors and dbias then use that same canonical order, allowing ordinary
+FC1 dgrad/wgrad GEMMs without a gradient permutation. B is the FC2 weight;
+its layout does not change. The default `glu_layout="interleaved_32"`
+preserves the existing contract below.
+
+This option requires SM100/SM103, Torch tensors, dSwiGLU, BF16 saved C,
+and N divisible by 128. It supports BF16 inputs with BF16 outputs; NVFP4
+E2M1 inputs with E4M3 block-16 scales and BF16 outputs; and MXFP8 E4M3
+inputs with E8M0 block-32 scales and E4M3 row/column outputs. Both packed and
+discrete FC2 weights are supported, subject to the existing weight-major
+restrictions, as is global/per-expert MXFP8 column-scale storage.
+`supports_gate_then_up_precisions` advertises the supported precision names
+(`"bf16"`, `"nvfp4"`, `"mxfp8"`). JAX and SM107 do not acquire canonical
+branch support from this option. The existing 256-row token-padding
+requirement remains. `supports_glu_layouts` advertises branch-order support;
+`supports_canonical_layouts` describes only tensor ranks and strides.
+
+The existing epilogue reads C and stores gradient payloads through nested
+TMA views, then maps scale and bias stores to their canonical addresses.
+No global intermediate repacking pass is inserted. Forward and backward
+must use the same `glu_layout` value. The option does not change the existing
+deterministic-dprob or atomic-dbias reduction guarantees.
+
+The remaining block-scaled examples use the default interleaved layout unless
+they explicitly select `gate_then_up`.
 
 The block-scaled backend performs:
 1. **Block-scaled grouped GEMM**: Low-precision GEMM (FP4, FP8) with per-block scale factors across multiple expert groups
@@ -710,8 +751,12 @@ partial goes to its own fp32 slot, and the slots are summed in a fixed order int
 launch stream; `use_dynamic_sched` stays supported and the other outputs are unchanged.
 
 Cost per call: a zeroed `valid_m x ceil(N / 256)` fp32 workspace (default tile and cluster) and a
-two-op reduction. Supported for the SM100 block-scaled kernel (dense or discrete weights) with
-torch tensors and without dbias; other configurations raise when the flag is set.
+two-op reduction. Supported for the SM100 block-scaled kernel and for the SM100-family BF16 kernel
+(dSwiGLU or dGeGLU, either `glu_layout`), each with dense or discrete weights, torch tensors and
+no dbias; other configurations raise when the flag is set. The BF16 kernel sums a tile's subtiles
+in a fixed order already, so only the slots change. On SM100, at the DeepSeek-V3, Qwen3.5-397B and
+Qwen3-2.4T FC2 shapes (EP4 and EP8, 8192 tokens), the flag adds 8-10 us (0.4-1.6%) of GPU time and
+10-19 us (0.6-2.0%) back to back.
 
 ### Wrapper Return Values
 

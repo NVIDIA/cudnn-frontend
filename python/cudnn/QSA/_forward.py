@@ -50,7 +50,7 @@ def _launch(
     ids_offset = Int64(0)
     if cutlass.const_expr(gated):
         tiles = cute.ceil_div(total, 128)
-        words = cute.ceil_div(total, 256) * 8
+        words = cute.math.min(cute.ceil_div(total, 256) * 8, Int64(fprop_prepare.MASK_WORDS))
         pieces = cute.ceil_div(Int64(cute.size(k)), 1024) * 4
         modes_offset = pieces
         ranges_offset = modes_offset + cute.ceil_div(tiles, 4) * 4
@@ -80,7 +80,11 @@ def _launch(
         fprop_dense._attn_launch(
             q_view, k_view, v_view, flat_bits, ranges, modes, order, flat_out, flat_out32, flat_lse, scale, Int32(bits.shape[1]), stream, hq // hkv, hq
         )
-        fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch)
+        # Past 16384 tokens a gathered query keeps its own CTA, which spreads a long sequence evenly over the SMs.
+        if total <= 16384:
+            fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch)
+        else:
+            fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch, False)
     else:
         ids = cute.make_tensor(scratch.iterator, cute.make_layout((total, blocks), stride=(blocks, 1)))
         counts_offset = cute.ceil_div(total * blocks, 4) * 4
@@ -95,14 +99,14 @@ def _launch(
 
 
 @lru_cache(maxsize=None)
-def _compile_args(hq, hkv, gated):
+def _compile_args(dtype, hq, hkv, gated):
     total, blocks, scratch_elements = (cute.sym_int64() for _ in range(3))
 
     def tensor(dtype, shape, alignment=4):
         return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=alignment)
 
-    q = tensor(cutlass.BFloat16, (total, hq, 256), 16)
-    kv = tensor(cutlass.BFloat16, (total, hkv, 256), 16)
+    q = tensor(dtype, (total, hq, 256), 16)
+    kv = tensor(dtype, (total, hkv, 256), 16)
     rows, spans = tensor(Int32, (total,)), tensor(Int32, (blocks,))
     return (
         q,
@@ -125,7 +129,7 @@ def _compile_args(hq, hkv, gated):
 
 
 @lru_cache(maxsize=None)
-def _compile_key(hq, hkv, arch, gated, n64=False):
+def _compile_key(dtype, hq, hkv, arch, gated, n64=False):
     return template_key(
         globals(),
         {
@@ -138,23 +142,32 @@ def _compile_key(hq, hkv, arch, gated, n64=False):
     )
 
 
-def compile_kernel(hq, hkv, arch, gated, n64=False):
-    key = _compile_key(hq, hkv, arch, gated, n64)
+def compile_kernel(dtype, hq, hkv, arch, gated, n64=False):
+    key = _compile_key(dtype, hq, hkv, arch, gated, n64)
     return compile_cached(
-        _launch, *_compile_args(hq, hkv, gated), arch, gated, n64, cache_key=key, symbol="qsa_forward_host", options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a"
+        _launch,
+        *_compile_args(dtype, hq, hkv, gated),
+        arch,
+        gated,
+        n64,
+        cache_key=key,
+        symbol="qsa_forward_host",
+        options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a",
     )
 
 
 def launch(impl, arch, q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, out, out_fp32, lse, scale, stream):
     total, hq, _ = q.shape
-    gated = 512 < total <= 16384
     # The 64-key Rubin forward is specialised for 12 heads per KV head; 6:1 stays on the shared gathered body.
     n64 = arch == 107 and hq == 12 * k.shape[1] and total >= 32768
-    compiled = compile_kernel(hq, k.shape[1], arch, gated, n64)
+    # Each query tile takes the dense or the gathered kernel on the device. The 64-key forward reads no tile modes.
+    gated = total > 512 and not n64
+    dtype = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}[q.dtype]
+    compiled = compile_kernel(dtype, hq, k.shape[1], arch, gated, n64)
     align4 = lambda value: (value + 3) // 4 * 4
     scratch_elements = align4(total * sel_blocks.shape[1]) + total
     if gated:
-        tiles, words = (total + 127) // 128, ((total + 255) // 256) * 8
+        tiles, words = (total + 127) // 128, min(((total + 255) // 256) * 8, fprop_prepare.MASK_WORDS)
         pieces = ((k.numel() + 1023) // 1024) * 4
         scratch_elements += pieces + 2 * align4(tiles) + align4(2 * tiles) + total * words
     scratch = torch.empty(scratch_elements, dtype=torch.int32, device=q.device)

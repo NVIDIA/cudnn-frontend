@@ -15,21 +15,25 @@ counts under each tick), separated by light vertical rules.
 
 Every expanded case owns an x slot whether or not it ran: an unsupported
 (model, shape, backend) combination is a blank slot, not a dropped tick, so
-coverage gaps are visible at a glance. Series are cudnn, cudnn_oss and cudnn_auto only
-(hatched = fp8 KV cache).
+coverage gaps are visible at a glance. Series are the cudnn legs (cudnn, cudnn_oss,
+cudnn_auto) plus the FlashInfer reference legs (flashinfer_fa2, flashinfer_cudnn) on
+the configs that declare them (hatched = fp8 KV cache).
 """
 
 import re
 from pathlib import Path
 from typing import List
 
-BACKEND_ORDER = ["cudnn", "cudnn_oss", "cudnn_auto"]
-# Two-hue categorical palette, fixed order, CVD-validated (ΔE 30.3 worst
-# adjacent pair); fp8-kv variants reuse the base hue with a hatch texture.
+BACKEND_ORDER = ["cudnn", "cudnn_oss", "cudnn_auto", "flashinfer_fa2", "flashinfer_cudnn"]
+# Categorical palette, fixed order, CVD-distinct adjacent pairs; fp8-kv variants
+# reuse the base hue with a hatch texture. The FlashInfer legs (serving_prefill)
+# take the two Okabe-Ito hues furthest from the cudnn trio.
 BACKEND_COLORS = {
     "cudnn": "#76B900",
     "cudnn_oss": "#5B8DEF",
     "cudnn_auto": "#E69F00",  # the frontend's default pick
+    "flashinfer_fa2": "#CC79A7",  # FlashInfer, FA2 kernels
+    "flashinfer_cudnn": "#8C564B",  # FlashInfer's own cudnn path
 }
 
 CLUSTER_GAP = 0.7  # x-units of air between shape clusters
@@ -191,7 +195,14 @@ def _plot_phase(df, config, phase: str, outdir: Path) -> List[Path]:
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.subplots_adjust(hspace=0.55)
     path = outdir / f"{config.name}_{phase}.webp"
-    fig.savefig(path, dpi=140, pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
+    # WebP hard-caps both image dimensions at 16383 px. The serving-form cases
+    # (paged / partial-fill clusters) grew some figures past 117 in wide, which
+    # at the fixed 140 dpi exceeds the cap and savefig raises — the chart is
+    # lost while the CSV survives. Scale dpi down just enough to fit: every
+    # element scales with the figure, so relative legibility is unchanged.
+    fig_h = 3.9 * len(row_keys)
+    dpi = min(140, int(16300 // max(fig_w, fig_h)))
+    fig.savefig(path, dpi=dpi, pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
     plt.close(fig)
     return [path]
 

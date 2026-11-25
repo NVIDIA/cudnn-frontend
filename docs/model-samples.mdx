@@ -1,7 +1,7 @@
 ---
 title: "Model Samples"
 ---
-Model samples run one open-weight model family end to end in a single process: text in, tokens, prefill, decode steps, text out. They are not a serving engine. Each sample prints which provider serves every block of the model before it runs, checks the whole path against a plain-PyTorch reference, and reports what a decode step costs on the host and on the GPU. The cuDNN Frontend APIs they use are experimental, and the timings they print are for orientation only.
+Model samples run one open-weight model family end to end in a single process: text in, tokens, prefill, decode steps, text out. They are not a server. Each sample prints which provider serves every block of the model before it runs, checks the whole path against a plain-PyTorch reference, and reports what a decode step costs on the host and on the GPU. The cuDNN Frontend APIs they use are experimental, and the timings they print are for orientation only.
 
 ## Source Code
 
@@ -10,6 +10,7 @@ Model samples run one open-weight model family end to end in a single process: t
 | Family | Sample | What it runs |
 |---|---|---|
 | [Dense Qwen 3.5 architecture](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/models/qwen_dense) | `00_decode.py` | Plain greedy decode. By default: the model at its published layer widths with two layers and seeded weights, token ids in and out, self-checking. With `--model`: text in and text out on a checkpoint from local disk, with the checkpoint's own tokenizer and chat template. The linear-attention step runs on [`cudnn.GdnDecodeFused`](/operations/LinearAttention/gdn_decode_flashinfer_backend). |
+| | `02_speculative_decode.py` | Speculative decoding with the checkpoint's drafter, for one request. The prompt goes through decode steps; then every step is the drafter's passes, one verify step of the drafted tokens and one host read. By default: the seeded model with a seeded drafter and scheduled drafts, self-checking against decode steps of the same tokens. With `--model`, `--draft-vocab` and `--speculative-config`: text out, and the tokens a step kept. Every block of the drafter is a reference chain; the sample states no speed. |
 
 ## Run
 
@@ -20,12 +21,14 @@ git clone https://github.com/NVIDIA/cudnn-frontend && cd cudnn-frontend
 python -m pip install --upgrade pip      # --group needs pip 25.1 or newer
 pip install --group torch
 pip install -e .                         # a minute or two; deprecation warnings of the build backend are expected
+pip install -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer.txt   # the kernel library the sample's stack calls
+pip install --no-deps --index-url https://flashinfer.ai/whl -c samples/models/constraints-native.txt -r samples/models/requirements-flashinfer-cubin.txt
 python samples/models/qwen_dense/00_decode.py
 ```
 
-The default run needs no checkpoint and no extra package. It ends in `[00] PASS`, or in `[00] SKIP` followed by the requirement, with exit code 0, on a GPU, a library version or a free-memory budget it does not serve. The fused linear-attention step serves compute capability 10.x and 12.x.
+The default run needs no checkpoint. Its stack is `native`: every block of a decode step is a kernel entry of cuDNN Frontend or a call of a kernel library, FlashInfer, and the step is recorded once as a launch sequence and replayed for every token. Where a package of that stack is not installed the run stops before anything is loaded with `[00] ERROR`, one line that names the package and the command that installs it; no other stack takes its place. It ends in `[00] PASS`, or in `[00] SKIP` followed by the requirement, with exit code 0, on a GPU, a library version or a free-memory budget it does not serve. So does `python samples/models/qwen_dense/02_speculative_decode.py`, with the tag `[02]`. The fused linear-attention step serves compute capability 10.x and 12.x.
 
-To run a checkpoint from local disk, install the sample-only packages, fetch the checkpoint and pass its directory. The sample downloads nothing: fetching a checkpoint is your own step, and its weights carry their own licence. The checkpoint the sample was last run with is `nvidia/Qwen3.8-27B-NVFP4` on the Hugging Face hub, a checkpoint of this architecture: 22 GB of disk, and on the stack `fe-cublas` a GPU of compute capability 10.x or 12.x with about 57 GiB of free memory. The run below takes about two and a half minutes.
+To run a checkpoint from local disk, install the sample-only packages, fetch the checkpoint and pass its directory. The sample downloads nothing: fetching a checkpoint is your own step, and its weights carry their own licence. The checkpoint the sample was last run with is `nvidia/Qwen3.8-27B-NVFP4` on the Hugging Face hub, a checkpoint of this architecture: 22 GB of disk, and a GPU of compute capability 10.x with about 28 GiB of free memory on compute capability 10.0.
 
 ```bash
 pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safetensors; brings the hf command
@@ -34,21 +37,21 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages request.json > answer.txt
 ```
 
-`--messages FILE` takes chat messages as JSON, with tool schemas and options of the checkpoint's chat template, or the whole request body a chat client sends (`--messages -` reads it from standard input): the fields a sample reads are read, a field that would change the output is refused by name, and `--max-tokens` and `--max-model-len` mean what they mean in a serving engine. Token choice is always greedy. The generated text goes to standard output as it is generated; every other line of a run goes to standard error, so the text can be piped. `--dump-tokens FILE` writes the prompt ids and the produced ids. The [family README](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/models/qwen_dense/README.md) lists every flag, the checkpoint and package versions the sample was last run with, and the disk and GPU memory it needs.
+`--messages FILE` takes chat messages as JSON, with tool schemas and options of the checkpoint's chat template, or the whole request body a chat client sends (`--messages -` reads it from standard input): the fields a sample reads are read, a field that would change the output is refused by name, and `--max-tokens` and `--max-model-len` are the limit of new tokens of a request and its context length. Token choice is always greedy. The generated text goes to standard output as it is generated; every other line of a run goes to standard error, so the text can be piped. `--dump-tokens FILE` writes the prompt ids and the produced ids. The [family README](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/models/qwen_dense/README.md) lists every flag, the checkpoint and package versions the sample was last run with, and the disk and GPU memory it needs.
 
 ## What a Run Prints
 
 On standard error, in this order (standard output carries the generated text of a checkpoint run and nothing else):
 
 - **Header**: the model or the checkpoint (directory name, shards, size, a manifest hash), the GPU, the stack, the versions, and whether `cudnn` is an editable checkout or a wheel.
-- **Served by**: per block, the calls per step, the provider (cuDNN Frontend, cuBLAS or PyTorch), the entry and the rows it serves, then the memory the run needs against what is free. It is decided and printed before anything is loaded.
-- **Stages**: seconds to read, merge and dequantise the weights, to compile, and to warm up.
+- **Served by**: per block, the calls per step, the provider (cuDNN Frontend, FlashInfer or PyTorch; cuBLAS on a functional-validation stack), the entry and the rows it serves, then the memory the run needs against what is free. It is decided and printed before anything is loaded.
+- **Stages**: seconds to read, merge and lay out the weights, to compile, to warm up and to record the step; then one line that says the step is recorded, with what the recorded sequence holds, or that it is launched from Python, and why.
 - **Text path**: render, tokenize, ids to the GPU, text out per token.
-- **Steps**: period, time in the step, turnaround; from one traced pass of 32 steps under the profiler: GPU busy, idle inside the step, host-exposed time, kernel launches per step; the bytes a step moves against the bytes the model needs in its stored formats.
-- **Text out** and the **checks**: replay, every provider block against the reference, the greedy tokens (judged against a declared band on the seeded model, reported on a checkpoint), each sequence alone against the same sequence in a batch.
+- **Steps**: period, time in the step, turnaround, and that a step is one replay and one host read; from one traced pass under the profiler: GPU busy and the kernel launches per step of the first 32 steps launched from Python, and of 2 of them replayed (a run that is launched from Python prints the idle time inside the step and the host-exposed time in their place); the bytes a step moves against the bytes the model needs in its stored formats.
+- **Text out** and the **checks**: the replayed steps launched again from Python, ids and logits byte for byte, and the step's own tail; every provider block against the reference; the greedy tokens (judged against a declared band on the seeded model, reported on a checkpoint); each sequence alone against the same sequence in a batch; the kernels of the traced steps against the plan.
 
-The stack of the first sample, `fe-cublas`, is a reference path: every quantised weight is held as a bf16 copy and every launch is issued from Python. It claims no number; performance numbers are published through the formal mode of the `benchmark/` folder.
+The other stacks of the sample are for functional validation and are taken by an explicit `--stack` alone: `fe-entries` runs the cuDNN Frontend entries without the library, `fe-cublas` holds every quantised weight as a bf16 copy and multiplies on cuBLAS, `reference` is every block in PyTorch; each is launched from Python and says so in one line of its run. Timings printed by a sample are for orientation only; performance numbers are published through the formal mode of the `benchmark/` folder.
 
 ## Tests
 
-The helper layer is tested without a GPU under `test/python/misc/` (`test_model_samples_plan.py`, `test_model_samples_weights.py`, `test_model_samples_text.py`), and the default run of each sample is a GPU test (`test/python/linear_attention/frost/test_model_sample_qwen_dense.py`). A run with a real checkpoint is made by hand; no checkpoint, tokenizer or template file is part of the repository.
+The helper layer is tested without a GPU under `test/python/misc/` (`test_model_samples_plan.py`, `test_model_samples_weights.py`, `test_model_samples_text.py`), and so are the speculative script's own lines, in the same modules; the default run of each sample is a GPU test (`test/python/linear_attention/frost/test_model_sample_qwen_dense.py`). A run with a real checkpoint is made by hand; no checkpoint, tokenizer or template file is part of the repository.

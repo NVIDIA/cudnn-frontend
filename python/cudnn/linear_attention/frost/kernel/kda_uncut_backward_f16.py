@@ -31,6 +31,7 @@ from cutlass.cute.runtime import from_dlpack
 import cutlass.experimental.cuda.tensor_map as tma
 from cudnn import cpp_launcher
 from cudnn.frost.buffers import DeviceView
+from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common import gate_bwd, head_reduce
@@ -1245,7 +1246,7 @@ def build_uncut_backward(
                     leading_dim=3
                 ),
             ]
-        uncut_backward_cache[key] = cute.compile(
+        uncut_backward_cache[key] = compile_cached(
             uncut_backward_host,
             int(b_t),
             io_dtype,
@@ -1304,6 +1305,8 @@ def build_uncut_backward(
             *tail_placeholders,
             *ragged_constexprs,
             *ragged_placeholders,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_kda_uncut_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return uncut_backward_cache[key]
@@ -1808,7 +1811,7 @@ def build_uncut_summary_backward(
             ]
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        uncut_summary_backward_cache[key] = cute.compile(
+        uncut_summary_backward_cache[key] = compile_cached(
             uncut_summary_backward_host,
             io_dtype,
             int(b_t),
@@ -1838,6 +1841,8 @@ def build_uncut_summary_backward(
             from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
             *tail_constexprs,
             *tail_placeholders,
+            cache_key=repr((__name__, "summary", key)),
+            symbol="frost_la_kda_uncut_summary_backward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return uncut_summary_backward_cache[key]
@@ -1873,7 +1878,8 @@ def run_uncut_summary_backward(
     tail_buffers=(),
 ) -> None:
     """Replay the uncut backward summary: one crossing into the DSL."""
-    compiled(
+    cpp_launcher.launch(
+        compiled,
         float(scale),
         q,
         k,

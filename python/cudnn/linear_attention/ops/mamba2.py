@@ -33,8 +33,19 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import cudnn
+from cudnn.cpp_launcher import cpp_launched
 
-from .common import check_composed_state, check_composed_summaries, execute_graph, make_execution_resources, select_plan, torch_dtype_to_cudnn
+from .common import (
+    check_composed_state,
+    check_composed_summaries,
+    eager_backward,
+    eager_dispatch,
+    execute_graph,
+    make_execution_resources,
+    select_plan,
+    summary_dispatch,
+    torch_dtype_to_cudnn,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -244,6 +255,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
+@cpp_launched
 def run_mamba2_fwd(
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -810,8 +822,8 @@ def build_bprop_graph(
     )
 
 
-@torch.library.custom_op("cudnn::mamba2_bwd", mutates_args=())
-def mamba2_bwd_op(
+@cpp_launched
+def run_mamba2_bwd(
     dy: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -995,6 +1007,9 @@ def mamba2_bwd_op(
     return dx, ddt, dA, dB, dC, dD, ddt_bias, dz, dstate0
 
 
+mamba2_bwd_op = torch.library.custom_op("cudnn::mamba2_bwd", run_mamba2_bwd, mutates_args=())
+
+
 @mamba2_bwd_op.register_fake
 def mamba2_bwd_fake(
     dy,
@@ -1097,7 +1112,7 @@ def mamba2_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(output[2], output[3], output[4])
 
 
-def mamba2_backward(ctx, dy, dFinal, dstate_checkpoints, dy_pre, d_composed_initial_state):
+def mamba2_backward(ctx, dy, dFinal, dstate_checkpoints, dy_pre, d_composed_initial_state, bwd=None):
     # read ctx.saved_tensors once
     saved_tensors = list(ctx.saved_tensors)
     x, dt, A, B, C, cu_seqlens = saved_tensors[:6]
@@ -1113,7 +1128,7 @@ def mamba2_backward(ctx, dy, dFinal, dstate_checkpoints, dy_pre, d_composed_init
     if dy is None:
         dy = torch.zeros_like(x)
     dstate_in = dFinal if (dFinal is not None and dFinal.numel() > 0) else None
-    dx, ddt, dA, dB, dC, dD, ddt_bias, dz, dstate0 = torch.ops.cudnn.mamba2_bwd(
+    dx, ddt, dA, dB, dC, dD, ddt_bias, dz, dstate0 = (bwd or torch.ops.cudnn.mamba2_bwd)(
         dy,
         x,
         dt,
@@ -1167,6 +1182,54 @@ torch.library.register_autograd(
     mamba2_backward,
     setup_context=mamba2_setup_context,
 )
+
+
+# ---------------------------------------------------------------------------
+# Eager path: the forward op and its autograd formula without the custom op's dispatch
+# ---------------------------------------------------------------------------
+
+FWD_ARGS = (
+    "x",
+    "dt",
+    "A",
+    "B",
+    "C",
+    "cu_seqlens",
+    "D",
+    "dt_bias",
+    "z",
+    "initial_state",
+    "output_final_state",
+    "output_pre_gate",
+    "checkpoint_every_n_tokens",
+    "dt_softplus",
+    "dt_min",
+    "dt_max",
+    "batch_invariant",
+    "plan_name",
+    "checkpoint_dtype",
+    "preceding_state_update",
+    "preceding_transition",
+    "checkpoint_after_block",
+)
+
+
+class EagerMamba2(torch.autograd.Function):
+    """``cudnn::mamba2_fwd`` with its registered autograd formula (:func:`mamba2_setup_context`,
+    :func:`mamba2_backward`), applied directly."""
+
+    @staticmethod
+    def forward(*args):
+        return run_mamba2_fwd(**dict(zip(FWD_ARGS, args)))
+
+    setup_context = staticmethod(mamba2_setup_context)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range, and a
+        # trace or mode that started after the forward has to see the op
+        return mamba2_backward(ctx, *grads, bwd=run_mamba2_bwd if eager_backward(grads) else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1306,30 +1369,37 @@ def mamba2(
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
-        y, final_state, state_checkpoints, _, composed_initial_state = torch.ops.cudnn.mamba2_fwd(
+        args = (
             x,
             dt,
             A,
             B,
             C,
             cu_seqlens,
-            D=D,
-            dt_bias=dt_bias,
-            z=z,
-            initial_state=initial_state,
-            output_final_state=bool(output_final_state),
-            output_pre_gate=needs_grad and z is not None,
-            checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
-            dt_softplus=bool(dt_softplus),
-            dt_min=float(dt_min),
-            dt_max=None if dt_max is None else float(dt_max),
-            batch_invariant=bool(batch_invariant),
-            plan_name=plan_name,
-            checkpoint_dtype=checkpoint_dtype,
-            preceding_state_update=preceding_state_update,
-            preceding_transition=preceding_transition,
-            checkpoint_after_block=bool(checkpoint_after_block),
+            D,
+            dt_bias,
+            z,
+            initial_state,
+            bool(output_final_state),
+            needs_grad and z is not None,
+            int(checkpoint_every_n_tokens),
+            bool(dt_softplus),
+            float(dt_min),
+            None if dt_max is None else float(dt_max),
+            bool(batch_invariant),
+            plan_name,
+            checkpoint_dtype,
+            preceding_state_update,
+            preceding_transition,
+            bool(checkpoint_after_block),
         )
+        if not eager_dispatch(args):
+            outputs = torch.ops.cudnn.mamba2_fwd(*args)
+        elif torch.is_grad_enabled() and any(a.requires_grad for a in args if isinstance(a, torch.Tensor)):
+            outputs = EagerMamba2.apply(*args)
+        else:
+            outputs = run_mamba2_fwd(**dict(zip(FWD_ARGS, args)))
+        y, final_state, state_checkpoints, _, composed_initial_state = outputs
         if preceding_state_update is not None:
             return y, final_state, state_checkpoints, composed_initial_state
     if checkpoint_every_n_tokens > 0:
@@ -1473,8 +1543,8 @@ def check_summary_args(op, dt, A, B, cu_seqlens, dt_bias, state, state_name, tot
     return N
 
 
-@torch.library.custom_op("cudnn::mamba2_summary", mutates_args=())
-def mamba2_summary_op(
+@cpp_launched
+def run_mamba2_summary(
     x: torch.Tensor,
     dt: torch.Tensor,
     A: torch.Tensor,
@@ -1561,6 +1631,9 @@ def mamba2_summary_op(
     return final_state, transition
 
 
+mamba2_summary_op = torch.library.custom_op("cudnn::mamba2_summary", run_mamba2_summary, mutates_args=())
+
+
 @mamba2_summary_op.register_fake
 def mamba2_summary_fake(
     x,
@@ -1585,8 +1658,8 @@ def mamba2_summary_fake(
     return final_state, transition
 
 
-@torch.library.custom_op("cudnn::mamba2_summary_bwd", mutates_args=())
-def mamba2_summary_bwd_op(
+@cpp_launched
+def run_mamba2_summary_bwd(
     dy: torch.Tensor,
     dt: torch.Tensor,
     A: torch.Tensor,
@@ -1675,6 +1748,9 @@ def mamba2_summary_bwd_op(
     return d_initial_state, transition
 
 
+mamba2_summary_bwd_op = torch.library.custom_op("cudnn::mamba2_summary_bwd", run_mamba2_summary_bwd, mutates_args=())
+
+
 @mamba2_summary_bwd_op.register_fake
 def mamba2_summary_bwd_fake(
     dy,
@@ -1727,7 +1803,9 @@ def mamba2_summary(
     """
     if x.dim() != 3 or B.dim() != 3 or dt.dim() != 2:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
-    final_state, transition = torch.ops.cudnn.mamba2_summary(
+    final_state, transition = summary_dispatch(
+        torch.ops.cudnn.mamba2_summary,
+        run_mamba2_summary,
         x,
         dt,
         A,
@@ -1774,7 +1852,9 @@ def mamba2_summary_bwd(
     """
     if dy.dim() != 3 or C.dim() != 3 or dt.dim() != 2:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
-    d_initial_state, transition = torch.ops.cudnn.mamba2_summary_bwd(
+    d_initial_state, transition = summary_dispatch(
+        torch.ops.cudnn.mamba2_summary_bwd,
+        run_mamba2_summary_bwd,
         dy,
         dt,
         A,

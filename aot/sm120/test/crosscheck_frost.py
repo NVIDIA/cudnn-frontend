@@ -10,7 +10,7 @@ extents and strides instead of per-plan in the process.
 
     PYTHONPATH=<repo>/python python aot/sm120/test/crosscheck_frost.py --lib <dir>/lib/libcudnn_frontend_aot_sm120.so
 
-Needs torch, the CuTeDSL wheel and an sm_120 GPU; the AOT library itself is driven through its C ABI (ctypes).
+Needs torch, the CuTeDSL wheel and an SM120-family GPU; the AOT library itself is driven through its C ABI (ctypes).
 """
 
 import argparse

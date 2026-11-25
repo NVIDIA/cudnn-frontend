@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Direct APIs for the SM100 Conv3D post-operation kernels."""
+"""Direct APIs for the SM100 Conv3D post-operation kernels.
+
+Plans validate sample metadata and storage during preparation. Execution binds
+compatible tensors without revalidation; callers preserve the prepared signature,
+pointer alignment, non-overlap, and inference-only contract on every call.
+"""
 
 import math
 import threading
@@ -9,22 +14,15 @@ import threading
 import cutlass
 import torch
 from cuda.bindings import driver as cuda
-from cutlass import cute
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 from cudnn._torch_stream import as_torch_stream, stream_context
-from cudnn.api_base import APIBase, TensorDesc, TupleDict
+from cudnn.api_base import APIBase, TensorDesc, TupleDict, tensor_byte_span
 from cudnn.conv.frost._cutedsl import requirement_error as cutedsl_requirement_error
 
 TensorLike = torch.Tensor | TensorDesc
 _CUTEDSL_MIN_VERSION = (4, 9)
-_SUPPORTED_CHANNEL_PAIRS = {
-    (160, 160),
-    (160, 320),
-    (320, 320),
-    (320, 640),
-    (640, 640),
-}
+from ._config import SUPPORTED_CHANNEL_PAIRS
+
 _PLAN_CACHE: dict[tuple, APIBase] = {}
 _PLAN_CACHE_LOCK = threading.Lock()
 _PLAN_CACHE_CAPACITY = 128
@@ -46,17 +44,17 @@ def _is_contiguous_stride(shape: tuple[int, ...], stride: tuple[int, ...]) -> bo
     return all(extent == 1 or actual == wanted for extent, actual, wanted in zip(shape, stride, expected))
 
 
-def _require_alignment(tensor: torch.Tensor, name: str) -> None:
-    """Reject tensor pointers that are not aligned to 16 bytes."""
-    remainder = tensor.data_ptr() % 16
-    if remainder:
-        raise ValueError(f"{name} data pointer must be 16-byte aligned, got remainder {remainder}")
-
-
-def _byte_span(tensor: torch.Tensor) -> tuple[int, int]:
-    """Return the half-open byte range occupied by a contiguous tensor."""
-    begin = tensor.data_ptr()
-    return begin, begin + tensor.numel() * tensor.element_size()
+def _check_sample_storage(spans: dict[str, tuple[int, int]], output_names: tuple[str, ...], requires_grad: bool) -> None:
+    """Validate captured storage properties without retaining sample tensors."""
+    if torch.is_grad_enabled() and requires_grad:
+        raise RuntimeError("Conv3D plans are inference-only; call under torch.no_grad()")
+    for output_name in output_names:
+        if output_name not in spans:
+            continue
+        begin, end = spans[output_name]
+        for name, (other_begin, other_end) in spans.items():
+            if name != output_name and begin < other_end and other_begin < end:
+                raise ValueError(f"{output_name} must not overlap {name}")
 
 
 def _record_streams(tensors: tuple[torch.Tensor | None, ...], stream: torch.cuda.Stream) -> None:
@@ -83,6 +81,8 @@ class _Conv3dPostOpsSm100(APIBase):
         sample_residual_bias: TensorLike | None = None,
         sample_residual_output: TensorLike | None = None,
         mode: str,
+        allow_tf32: bool = False,
+        sample_workspace: TensorLike | None = None,
     ) -> None:
         """Record sample metadata and fusion options without compiling or allocating outputs."""
         super().__init__()
@@ -90,6 +90,7 @@ class _Conv3dPostOpsSm100(APIBase):
 
         samples = {
             "input": sample_input,
+            "workspace": sample_workspace,
             "packed_weight": sample_packed_weight,
             "bias": sample_bias,
             "padded_output": sample_padded_output,
@@ -101,6 +102,10 @@ class _Conv3dPostOpsSm100(APIBase):
         }
         self.descs = {name: self._make_tensor_desc(sample, name=f"sample_{name}") for name, sample in samples.items()}
         self._sample_alignment_remainders = {name: sample.data_ptr() % 16 for name, sample in samples.items() if callable(getattr(sample, "data_ptr", None))}
+        self._sample_spans = {name: tensor_byte_span(sample) for name, sample in samples.items() if isinstance(sample, torch.Tensor)}
+        self._sample_requires_grad = any(sample.requires_grad for sample in samples.values() if isinstance(sample, torch.Tensor))
+        self.allow_tf32 = allow_tf32
+        self._compiled_round = None
         self.mode = mode
         self.config = None
         self.previous_frames = history_frames
@@ -111,22 +116,8 @@ class _Conv3dPostOpsSm100(APIBase):
         if desc.ndim != rank:
             raise ValueError(f"{name} must be {rank}D, got shape {desc.shape}")
 
-    @staticmethod
-    def _validate_runtime_tensor(tensor: torch.Tensor, desc: TensorDesc, name: str) -> None:
-        """Require runtime tensors to match the compiled shape, strides, dtype, and device."""
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
-        if tuple(tensor.shape) != desc.shape:
-            raise ValueError(f"{name} shape mismatch: expected {desc.shape}, got {tuple(tensor.shape)}")
-        if tuple(tensor.stride()) != desc.stride:
-            raise ValueError(f"{name} stride mismatch: expected {desc.stride}, got {tuple(tensor.stride())}")
-        if tensor.dtype != desc.dtype:
-            raise TypeError(f"{name} dtype mismatch: expected {desc.dtype}, got {tensor.dtype}")
-        if tensor.device != desc.device:
-            raise ValueError(f"{name} device mismatch: expected {desc.device}, got {tensor.device}")
-
     def _check_desc(self, name: str, shape: tuple[int, ...]) -> None:
-        """Validate a required contiguous BF16 tensor against its expected shape."""
+        """Validate a required contiguous tensor against its expected shape."""
         desc = self.descs[name]
         if desc is None:
             raise ValueError(f"{name} is required")
@@ -134,7 +125,7 @@ class _Conv3dPostOpsSm100(APIBase):
         self._check_tensor_shape(desc, shape, name)
         if not _is_contiguous_stride(shape, desc.stride):
             raise ValueError(f"{name} must be contiguous, got stride {desc.stride}")
-        self._check_dtype(desc, dtype=torch.bfloat16, name=name)
+        self._check_dtype(desc, dtype=self.descs["input"].dtype, name=name)
 
     def check_support(self) -> bool:
         """Validate the DSL version, GPU, tensor metadata, and selected fusion contract."""
@@ -148,6 +139,15 @@ class _Conv3dPostOpsSm100(APIBase):
         self._require_rank(input_desc, 5, "input")
         self._require_rank(weight_desc, 5, "packed_weight")
 
+        self._value_error_if(input_desc.dtype not in (torch.bfloat16, torch.float32), "input must be BF16 or FP32")
+        self._value_error_if(
+            input_desc.dtype == torch.float32 and not self.allow_tf32,
+            "FP32 convolution requires allow_tf32=True; strict FP32 convolution belongs to the caller",
+        )
+        if input_desc.dtype == torch.float32:
+            self._check_desc("workspace", input_desc.shape)
+        else:
+            self._value_error_if(self.descs["workspace"] is not None, "BF16 convolution does not use workspace")
         n, input_t, input_h, input_w, input_channels = input_desc.shape
         self._value_error_if(
             min(n, input_t, input_h, input_w, input_channels) <= 0,
@@ -160,17 +160,18 @@ class _Conv3dPostOpsSm100(APIBase):
         output_channels = weight_desc.shape[0]
         channel_pair = (input_channels, output_channels)
         self._value_error_if(
-            channel_pair not in _SUPPORTED_CHANNEL_PAIRS,
-            f"unsupported channel pair {channel_pair}; supported pairs: {sorted(_SUPPORTED_CHANNEL_PAIRS)}",
+            channel_pair not in SUPPORTED_CHANNEL_PAIRS,
+            f"unsupported channel pair {channel_pair}; supported pairs: {sorted(SUPPORTED_CHANNEL_PAIRS)}",
         )
         if self.mode in ("norm_silu", "norm_silu_pad"):
             self._value_error_if(
-                output_channels not in (160, 320),
-                "RMSNorm + SiLU requires 160 or 320 output channels",
+                output_channels not in (96, 160, 192, 256, 320),
+                "RMSNorm + SiLU requires 96, 160, 192, 256, or 320 output channels",
             )
 
         output_shape = (n, input_t - 2, input_h - 2, input_w - 2, output_channels)
-        packed_channels = (input_channels + 63) // 64 * 64
+        tile_k = 32 if input_desc.dtype == torch.float32 else 64
+        packed_channels = (input_channels + tile_k - 1) // tile_k * tile_k
         packed_weight_shape = (output_channels, 3, 3, 3, packed_channels)
         self._check_desc("input", input_desc.shape)
         self._check_desc("packed_weight", packed_weight_shape)
@@ -268,87 +269,40 @@ class _Conv3dPostOpsSm100(APIBase):
             f"{self.__class__.__name__} requires SM100 or SM103, found SM{capability[0]}{capability[1]}",
         )
 
+        _check_sample_storage(self._sample_spans, ("padded_output", "cache_output", "residual_output", "workspace"), self._sample_requires_grad)
         self._is_supported = True
         return True
 
     def compile(self) -> None:
-        """Compile the shape-specialized convolution plan after checking support."""
+        """Bind a reusable convolution executable after checking support."""
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
 
-        from .kernel import Conv3dConfig, Conv3dPostOpsLaunch
+        from ._compile import compile_conv, compile_round
+        from ._config import ConvConfig, ConvSpecialization, needs_wide_index
 
-        with torch.cuda.device(self.descs["input"].device):
-            max_active_clusters = int(cutlass.utils.HardwareInfo().get_max_active_clusters(2))
-            n, t, h, w, ci = self.descs["input"].shape
-            self.config = Conv3dConfig(
-                n=n,
-                t=t,
-                h=h,
-                w=w,
-                ci=ci,
-                co=self.descs["packed_weight"].shape[0],
-                max_active_clusters=max_active_clusters,
-            )
-            launch = Conv3dPostOpsLaunch(
-                self.config,
-                fuse_norm=self.mode in ("norm_silu", "norm_silu_pad"),
-                prepare_output=self.mode == "norm_silu_pad",
-                previous_frames=self.previous_frames if self.mode == "norm_silu_pad" else None,
-                has_residual=self.descs["residual"] is not None,
-                has_residual_bias=self.descs["residual_bias"] is not None,
-                spatial_output=self.mode == "bias_residual_pad",
-            )
-            fake = {name: self._make_fake_cute_tensor_from_desc(desc, assumed_align=16) for name, desc in self.descs.items()}
-            fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-            self._compiled_kernel = cute.compile(
-                launch,
-                fake["input"],
-                fake["packed_weight"],
-                fake["padded_output"],
-                fake_stream,
-                fake["bias"],
-                fake["gamma"],
-                fake["padded_output"],
-                fake["cache_output"],
-                fake["residual"],
-                fake["residual_bias"],
-                fake["residual_output"],
-                options="--enable-tvm-ffi --generate-line-info",
+        device = self.descs["input"].device
+        with torch.cuda.device(device):
+            ctas = 2 * int(cutlass.utils.HardwareInfo().get_max_active_clusters(2))
+            self.geometry = self.descs["input"].shape[:4]
+            precision = "bf16" if self.descs["input"].dtype == torch.bfloat16 else "tf32"
+            self.config = ConvConfig(*self.geometry, self.descs["input"].shape[-1], self.descs["packed_weight"].shape[0], ctas, precision)
+            spec = ConvSpecialization(self.config.ci, self.config.co, ctas, precision)
+            self._compiled_kernel = compile_conv(
+                device,
+                spec,
+                self.mode,
+                self.descs["residual"] is not None,
+                self.descs["residual_bias"] is not None,
+                needs_wide_index(self.config),
             )
 
-    def _execute(
-        self,
-        tensors: dict[str, torch.Tensor | None],
-        current_stream: cuda.CUstream | None,
-    ) -> None:
-        """Validate bound tensors and launch the compiled kernel on the requested stream."""
-        self._runtime_error_if(self._compiled_kernel is None, "plan not compiled; call compile() first")
-        for name, desc in self.descs.items():
-            tensor = tensors[name]
-            if (tensor is None) != (desc is None):
-                raise ValueError(f"{name} presence must match the compiled signature")
-            if tensor is not None:
-                self._validate_runtime_tensor(tensor, desc, name)
-                _require_alignment(tensor, name)
+            if precision == "tf32":
+                self._compiled_round = compile_round(device)
 
-        live_tensors = tuple(tensor for tensor in tensors.values() if tensor is not None)
-        if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in live_tensors):
-            raise RuntimeError("Conv3D plans are inference-only; call under torch.no_grad()")
-
-        output_names = ["padded_output", "cache_output", "residual_output"]
-        for output_name in output_names:
-            output = tensors[output_name]
-            if output is None:
-                continue
-            output_span = _byte_span(output)
-            for other_name, other in tensors.items():
-                if other is None or other_name == output_name:
-                    continue
-                if output_span[0] < _byte_span(other)[1] and _byte_span(other)[0] < output_span[1]:
-                    raise ValueError(f"{output_name} must not overlap {other_name}")
-
+    def _launch(self, tensors, current_stream, record_tensors=None):
+        """Bind and launch; wrappers record only externally allocated inputs."""
         device = tensors["input"].device
         if current_stream is None:
             consumer_stream = torch.cuda.current_stream(device)
@@ -357,28 +311,37 @@ class _Conv3dPostOpsSm100(APIBase):
             consumer_stream = as_torch_stream(current_stream, device)
             launch_stream = current_stream
 
-        self._compiled_kernel(
-            tensors["input"],
-            tensors["packed_weight"],
-            tensors["padded_output"],
-            launch_stream,
-            tensors["bias"],
-            tensors["gamma"],
-            tensors["padded_output"],
-            tensors["cache_output"],
-            tensors["residual"],
-            tensors["residual_bias"],
-            tensors["residual_output"],
-        )
-        _record_streams(tuple(tensors.values()), consumer_stream)
+        flat = lambda name: None if tensors[name] is None else tensors[name].view(-1)
+        with torch.cuda.device(device):
+            conv_input = flat("input")
+            if self._compiled_round is not None:
+                self._compiled_round(conv_input, flat("workspace"), tensors["input"].numel(), launch_stream)
+                conv_input = flat("workspace")
+            self._compiled_kernel(
+                conv_input,
+                flat("packed_weight"),
+                flat("padded_output"),
+                launch_stream,
+                flat("bias"),
+                flat("gamma"),
+                flat("padded_output"),
+                flat("cache_output"),
+                flat("residual"),
+                flat("residual_bias"),
+                flat("residual_output"),
+                geometry=self.geometry,
+                history=self.previous_frames,
+            )
+        _record_streams(tuple(tensors.values()) if record_tensors is None else record_tensors, consumer_stream)
 
 
 class CausalConv3dWithCacheSm100(APIBase):
     """Pack input/history, add causal/spatial padding, and run Conv3D without bias.
 
-    Currently supports only 12->160 channels. Input is BF16 NCTHW; output
-    and history are contiguous BF16 NTHWC. Executes packing and convolution
-    as two kernels.
+    Supports 12->160 channels. Input is strided NCTHW; output and history
+    are contiguous NTHWC. BF16 and explicit FP32/TF32 execution use two
+    kernels: packing (including TF32 rounding), then convolution. FP32 cache
+    retains unrounded input values.
     """
 
     def __init__(
@@ -389,6 +352,7 @@ class CausalConv3dWithCacheSm100(APIBase):
         sample_cache_output: TensorLike,
         sample_output: TensorLike,
         sample_previous: TensorLike | None = None,
+        allow_tf32: bool = False,
     ) -> None:
         """Record causal input, history, scratch, and output metadata for later validation."""
         super().__init__()
@@ -407,20 +371,23 @@ class CausalConv3dWithCacheSm100(APIBase):
             for name, sample in samples.items()
             if isinstance(sample, torch.Tensor) and name != "input"
         }
+        self._sample_spans = {name: tensor_byte_span(sample) for name, sample in samples.items() if isinstance(sample, torch.Tensor)}
+        self._sample_requires_grad = any(sample.requires_grad for sample in samples.values() if isinstance(sample, torch.Tensor))
+        self.allow_tf32 = allow_tf32
         self.previous_frames = 0
         self.input_span = 0
         self.max_active_clusters = 0
         self._compiled_pack = None
 
     def _check_dense(self, name: str, shape: tuple[int, ...]) -> None:
-        """Validate a required dense BF16 buffer against its expected shape."""
+        """Validate a required dense buffer against its expected shape."""
         desc = self.descs[name]
         if desc is None:
             raise ValueError(f"{name} is required")
         self._check_tensor_shape(desc, shape, name)
         if not _is_contiguous_stride(shape, desc.stride):
             raise ValueError(f"{name} must be contiguous, got stride {desc.stride}")
-        self._check_dtype(desc, dtype=torch.bfloat16, name=name)
+        self._check_dtype(desc, dtype=self.descs["input"].dtype, name=name)
 
     def check_support(self) -> bool:
         """Validate the DSL/GPU and the C12-to-C160 causal packing and cache contract."""
@@ -433,7 +400,11 @@ class CausalConv3dWithCacheSm100(APIBase):
         n, channels, frames, height, width = input_desc.shape
         self._value_error_if(channels != 12, f"input must have 12 channels, got {channels}")
         self._value_error_if(min(n, frames, height, width) <= 0, "input dimensions must be positive")
-        self._check_dtype(input_desc, dtype=torch.bfloat16, name="input")
+        self._value_error_if(input_desc.dtype not in (torch.bfloat16, torch.float32), "input must be BF16 or FP32")
+        self._value_error_if(
+            input_desc.dtype == torch.float32 and not self.allow_tf32,
+            "FP32 convolution requires allow_tf32=True; strict FP32 convolution belongs to the caller",
+        )
         self._value_error_if(min(input_desc.stride) < 0, "input strides must be nonnegative")
 
         previous_desc = self.descs["previous"]
@@ -443,7 +414,7 @@ class CausalConv3dWithCacheSm100(APIBase):
             self.previous_frames = previous_desc.shape[1]
             self._check_dense("previous", (n, self.previous_frames, height, width, 12))
         cache_frames = min(2, frames + self.previous_frames)
-        self._check_dense("packed_weight", (160, 448))
+        self._check_dense("packed_weight", (160, 448) if input_desc.dtype == torch.bfloat16 else (160, 3, 3, 3, 32))
         self._check_dense("padded_input", (n, frames + 2, height + 2, width + 2, 16))
         self._value_error_if(
             n * (frames + 2) * (height + 2) * (width + 2) * 16 >= 2**31,
@@ -470,6 +441,7 @@ class CausalConv3dWithCacheSm100(APIBase):
         )
         self.input_span = 1 + sum((extent - 1) * stride for extent, stride in zip(input_desc.shape, input_desc.stride))
         self.max_active_clusters = torch.cuda.get_device_properties(device).multi_processor_count
+        _check_sample_storage(self._sample_spans, ("padded_input", "cache_output", "output"), self._sample_requires_grad)
         self._is_supported = True
         return True
 
@@ -478,56 +450,18 @@ class CausalConv3dWithCacheSm100(APIBase):
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        from .causal import (
-            CausalConv3dConfig,
-            CausalConv3dLaunch,
-            CausalConv3dPackLaunch,
-        )
+        from ._compile import compile_causal_conv, compile_causal_pack, compile_conv
+        from ._config import ConvSpecialization
 
-        input_desc = self.descs["input"]
-        padded_desc = self.descs["padded_input"]
-        if input_desc is None or padded_desc is None:
-            raise RuntimeError("input descriptors are unavailable")
-        fake = {name: self._make_fake_cute_tensor_from_desc(desc, assumed_align=16) for name, desc in self.descs.items()}
-        fake_input = make_fake_compact_tensor(cutlass.BFloat16, (self.input_span,), assumed_align=2)
-        fake_padded = make_fake_compact_tensor(
-            cutlass.BFloat16,
-            (math.prod(self.descs["padded_input"].shape),),
-            assumed_align=16,
-        )
-        fake_cache = make_fake_compact_tensor(
-            cutlass.BFloat16,
-            (math.prod(self.descs["cache_output"].shape),),
-            assumed_align=16,
-        )
-        fake_previous = (
-            make_fake_compact_tensor(
-                cutlass.BFloat16,
-                (math.prod(self.descs["previous"].shape),),
-                assumed_align=8,
-            )
-            if self.descs["previous"] is not None
-            else None
-        )
-        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-        self._compiled_pack = cute.compile(
-            CausalConv3dPackLaunch(input_desc.shape, input_desc.stride, self.previous_frames),
-            fake_input,
-            fake_padded,
-            fake_cache,
-            fake_stream,
-            fake_previous,
-            options="--enable-tvm-ffi --generate-line-info",
-        )
-        n, frames, height, width, _ = padded_desc.shape
-        self._compiled_kernel = cute.compile(
-            CausalConv3dLaunch(CausalConv3dConfig(n, frames, height, width, self.max_active_clusters)),
-            fake["padded_input"],
-            fake["packed_weight"],
-            fake["output"],
-            fake_stream,
-            options="--enable-tvm-ffi --generate-line-info",
-        )
+        device = self.descs["input"].device
+        dtype = self.descs["input"].dtype
+        self._compiled_pack = compile_causal_pack(device, dtype, self.descs["previous"] is not None)
+        if dtype == torch.bfloat16:
+            self._compiled_kernel = compile_causal_conv(device, self.max_active_clusters)
+        else:
+            with torch.cuda.device(device):
+                ctas = 2 * int(cutlass.utils.HardwareInfo().get_max_active_clusters(2))
+            self._compiled_kernel = compile_conv(device, ConvSpecialization(16, 160, ctas, "tf32"), "raw", False, False, False)
 
     def execute(
         self,
@@ -540,7 +474,6 @@ class CausalConv3dWithCacheSm100(APIBase):
         current_stream: cuda.CUstream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Write caller-provided scratch, convolution output, and raw-input cache buffers."""
-        self._runtime_error_if(self._compiled_kernel is None or self._compiled_pack is None, "plan not compiled; call compile() first")
         tensors = {
             "input": input,
             "packed_weight": packed_weight,
@@ -549,29 +482,16 @@ class CausalConv3dWithCacheSm100(APIBase):
             "output": output,
             "previous": previous,
         }
-        for name, desc in self.descs.items():
-            tensor = tensors[name]
-            if (tensor is None) != (desc is None):
-                raise ValueError(f"{name} presence must match the compiled signature")
-            if tensor is not None:
-                _Conv3dPostOpsSm100._validate_runtime_tensor(tensor, desc, name)
-                if name != "input":
-                    alignment = 8 if name == "previous" else 16
-                    if tensor.data_ptr() % alignment:
-                        raise ValueError(f"{name} must be {alignment}-byte aligned")
-        if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors.values() if tensor is not None):
-            raise RuntimeError("input Conv3D is inference-only; call under torch.no_grad()")
-        for output_name in ("padded_input", "cache_output", "output"):
-            begin, end = _byte_span(tensors[output_name])
-            for name, tensor in tensors.items():
-                if tensor is None or name == output_name:
-                    continue
-                other_begin, other_end = _byte_span(tensor)
-                if name == "input":
-                    other_end = other_begin + self.input_span * tensor.element_size()
-                if begin < other_end and other_begin < end:
-                    raise ValueError(f"{output_name} must not overlap {name}")
+        return self._launch(tensors, current_stream)
 
+    def _launch(self, tensors, current_stream, record_tensors=None):
+        """Bind and launch; wrappers record only externally allocated inputs."""
+        input = tensors["input"]
+        packed_weight = tensors["packed_weight"]
+        padded_input = tensors["padded_input"]
+        cache_output = tensors["cache_output"]
+        output = tensors["output"]
+        previous = tensors["previous"]
         device = input.device
         if current_stream is None:
             consumer_stream = torch.cuda.current_stream(device)
@@ -580,22 +500,44 @@ class CausalConv3dWithCacheSm100(APIBase):
             consumer_stream = as_torch_stream(current_stream, device)
             launch_stream = current_stream
         flat_input = input.as_strided((self.input_span,), (1,))
-        self._compiled_pack(
-            flat_input,
-            padded_input.view(-1),
-            cache_output.view(-1),
-            launch_stream,
-            None if previous is None else previous.view(-1),
-        )
-        self._compiled_kernel(padded_input, packed_weight, output, launch_stream)
-        _record_streams(tuple(tensors.values()), consumer_stream)
+        with torch.cuda.device(device):
+            self._compiled_pack(
+                flat_input,
+                padded_input.view(-1),
+                cache_output.view(-1),
+                launch_stream,
+                None if previous is None else previous.view(-1),
+                geometry=(input.shape[0], *input.shape[2:]),
+                input_strides=tuple(input.stride()),
+                history=self.previous_frames,
+            )
+            if input.dtype == torch.bfloat16:
+                self._compiled_kernel(padded_input.view(-1), packed_weight.view(-1), output.view(-1), tuple(padded_input.shape[:4]), launch_stream)
+            else:
+                self._compiled_kernel(
+                    padded_input.view(-1),
+                    packed_weight.view(-1),
+                    output.view(-1),
+                    launch_stream,
+                    None,
+                    None,
+                    output.view(-1),
+                    None,
+                    None,
+                    None,
+                    None,
+                    geometry=tuple(padded_input.shape[:4]),
+                    history=0,
+                )
+        _record_streams(tuple(tensors.values()) if record_tensors is None else record_tensors, consumer_stream)
         return output, cache_output
 
 
 class Conv3dRawSm100(_Conv3dPostOpsSm100):
     """Run valid Conv3D without post-operations.
 
-    Supported channel pairs: 160->160, 160->320, 320->320, 320->640, 640->640.
+    Supports the channel pairs listed in the Conv3D post-operations API reference.
+    FP32 requires allow_tf32=True and caller-provided input-rounding workspace.
     """
 
     def __init__(
@@ -603,6 +545,8 @@ class Conv3dRawSm100(_Conv3dPostOpsSm100):
         sample_input: TensorLike,
         sample_packed_weight: TensorLike,
         sample_output: TensorLike,
+        allow_tf32: bool = False,
+        sample_workspace: TensorLike | None = None,
     ) -> None:
         """Record sample metadata for a valid Conv3D plan without post-operations."""
         super().__init__(
@@ -611,6 +555,8 @@ class Conv3dRawSm100(_Conv3dPostOpsSm100):
             None,
             sample_output,
             mode="raw",
+            allow_tf32=allow_tf32,
+            sample_workspace=sample_workspace,
         )
 
     def execute(
@@ -619,10 +565,12 @@ class Conv3dRawSm100(_Conv3dPostOpsSm100):
         packed_weight: torch.Tensor,
         output: torch.Tensor,
         current_stream: cuda.CUstream | None = None,
+        workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Write raw convolution results into the caller-provided output buffer."""
         tensors = {
             "input": input,
+            "workspace": workspace,
             "packed_weight": packed_weight,
             "bias": None,
             "padded_output": output,
@@ -632,16 +580,16 @@ class Conv3dRawSm100(_Conv3dPostOpsSm100):
             "residual_bias": None,
             "residual_output": None,
         }
-        self._execute(tensors, current_stream)
+        self._launch(tensors, current_stream)
         return output
 
 
 class Conv3dRmsNormSiluSm100(_Conv3dPostOpsSm100):
     """Fuse valid Conv3D, bias, optional residual, RMSNorm, and SiLU.
 
-    Output is contiguous NTHWC. Supported channel pairs: 160->160, 160->320,
-    320->320. Normalization uses an L2-norm clamp of 1e-12 followed by
-    sqrt(channels) scaling, not additive-epsilon RMSNorm.
+    Output is contiguous NTHWC. Supported pairs have Co=96/160/192/256/320.
+    FP32 requires allow_tf32=True and caller-provided input-rounding workspace. Normalization uses an L2-norm
+    clamp of 1e-12 followed by sqrt(channels) scaling, not additive-epsilon RMSNorm.
     """
 
     def __init__(
@@ -654,6 +602,8 @@ class Conv3dRmsNormSiluSm100(_Conv3dPostOpsSm100):
         sample_residual: TensorLike | None = None,
         sample_residual_bias: TensorLike | None = None,
         sample_residual_output: TensorLike | None = None,
+        allow_tf32: bool = False,
+        sample_workspace: TensorLike | None = None,
     ) -> None:
         """Record convolution, normalization, and optional residual-output metadata."""
         super().__init__(
@@ -666,6 +616,8 @@ class Conv3dRmsNormSiluSm100(_Conv3dPostOpsSm100):
             sample_residual_bias=sample_residual_bias,
             sample_residual_output=sample_residual_output,
             mode="norm_silu",
+            allow_tf32=allow_tf32,
+            sample_workspace=sample_workspace,
         )
 
     def execute(
@@ -679,10 +631,12 @@ class Conv3dRmsNormSiluSm100(_Conv3dPostOpsSm100):
         residual_bias: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
         current_stream: cuda.CUstream | None = None,
+        workspace: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Write activated output and any requested pre-normalization residual sum."""
         tensors = {
             "input": input,
+            "workspace": workspace,
             "packed_weight": packed_weight,
             "bias": bias,
             "padded_output": output,
@@ -692,7 +646,7 @@ class Conv3dRmsNormSiluSm100(_Conv3dPostOpsSm100):
             "residual_bias": residual_bias,
             "residual_output": residual_output,
         }
-        self._execute(tensors, current_stream)
+        self._launch(tensors, current_stream)
         return output, residual_output
 
 
@@ -717,6 +671,8 @@ class Conv3dRmsNormSiluPadSm100(_Conv3dPostOpsSm100):
         sample_residual: TensorLike | None = None,
         sample_residual_bias: TensorLike | None = None,
         sample_residual_output: TensorLike | None = None,
+        allow_tf32: bool = False,
+        sample_workspace: TensorLike | None = None,
     ) -> None:
         """Record padded-output and cache metadata, including caller-owned history length."""
         super().__init__(
@@ -731,6 +687,8 @@ class Conv3dRmsNormSiluPadSm100(_Conv3dPostOpsSm100):
             sample_residual_bias=sample_residual_bias,
             sample_residual_output=sample_residual_output,
             mode="norm_silu_pad",
+            allow_tf32=allow_tf32,
+            sample_workspace=sample_workspace,
         )
 
     def execute(
@@ -745,10 +703,12 @@ class Conv3dRmsNormSiluPadSm100(_Conv3dPostOpsSm100):
         residual_bias: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
         current_stream: cuda.CUstream | None = None,
+        workspace: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Write current activations, cache frames, and zeros while preserving existing history."""
         tensors = {
             "input": input,
+            "workspace": workspace,
             "packed_weight": packed_weight,
             "bias": bias,
             "gamma": gamma,
@@ -758,14 +718,15 @@ class Conv3dRmsNormSiluPadSm100(_Conv3dPostOpsSm100):
             "residual_bias": residual_bias,
             "residual_output": residual_output,
         }
-        self._execute(tensors, current_stream)
+        self._launch(tensors, current_stream)
         return padded_output, cache_output, residual_output
 
 
 class Conv3dBiasResidualPadSm100(_Conv3dPostOpsSm100):
     """Fuse valid Conv3D, bias, residual addition, and bottom/right padding.
 
-    Supported channel pairs: 160->160, 160->320, 320->320, 320->640, 640->640.
+    Supports the channel pairs listed in the Conv3D post-operations API reference.
+    FP32 requires allow_tf32=True and caller-provided input-rounding workspace.
     """
 
     def __init__(
@@ -776,6 +737,8 @@ class Conv3dBiasResidualPadSm100(_Conv3dPostOpsSm100):
         sample_residual: TensorLike,
         sample_padded_output: TensorLike,
         sample_residual_bias: TensorLike | None = None,
+        allow_tf32: bool = False,
+        sample_workspace: TensorLike | None = None,
     ) -> None:
         """Record convolution, residual, and bottom/right-padded output metadata."""
         super().__init__(
@@ -786,6 +749,8 @@ class Conv3dBiasResidualPadSm100(_Conv3dPostOpsSm100):
             sample_residual=sample_residual,
             sample_residual_bias=sample_residual_bias,
             mode="bias_residual_pad",
+            allow_tf32=allow_tf32,
+            sample_workspace=sample_workspace,
         )
 
     def execute(
@@ -797,10 +762,12 @@ class Conv3dBiasResidualPadSm100(_Conv3dPostOpsSm100):
         padded_output: torch.Tensor,
         residual_bias: torch.Tensor | None = None,
         current_stream: cuda.CUstream | None = None,
+        workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Write convolution plus bias/residual into the spatially padded output buffer."""
         tensors = {
             "input": input,
+            "workspace": workspace,
             "packed_weight": packed_weight,
             "bias": bias,
             "padded_output": padded_output,
@@ -810,15 +777,15 @@ class Conv3dBiasResidualPadSm100(_Conv3dPostOpsSm100):
             "residual_bias": residual_bias,
             "residual_output": None,
         }
-        self._execute(tensors, current_stream)
+        self._launch(tensors, current_stream)
         return padded_output
 
 
 class RmsNormSiluPadSm100(APIBase):
     """Fuse optional bias/residual, RMSNorm, SiLU, padding, and history/cache copies.
 
-    No convolution is performed. Supports 160, 320, or 640 channels in NTHWC
-    layout. Normalization follows ``Conv3dRmsNormSiluSm100``. Unlike that
+    No convolution is performed. Supports C96/160/192/256/320/384/512/640/1024
+    in contiguous NTHWC, with BF16 or FP32 storage. Normalization follows ``Conv3dRmsNormSiluSm100``. Unlike that
     convolution's padding variant, this operation copies existing history.
     """
 
@@ -850,11 +817,13 @@ class RmsNormSiluPadSm100(APIBase):
         }
         self.descs = {name: self._make_tensor_desc(sample, name=f"sample_{name}") for name, sample in samples.items()}
         self._sample_alignment_remainders = {name: sample.data_ptr() % 16 for name, sample in samples.items() if callable(getattr(sample, "data_ptr", None))}
+        self._sample_spans = {name: tensor_byte_span(sample) for name, sample in samples.items() if isinstance(sample, torch.Tensor)}
+        self._sample_requires_grad = any(sample.requires_grad for sample in samples.values() if isinstance(sample, torch.Tensor))
         self.shape = None
         self.previous_frames = 0
 
     def _check_desc(self, name: str, shape: tuple[int, ...]) -> None:
-        """Validate a required contiguous BF16 buffer against its expected shape."""
+        """Validate a required contiguous buffer against its expected shape."""
         desc = self.descs[name]
         if desc is None:
             raise ValueError(f"{name} is required")
@@ -863,7 +832,7 @@ class RmsNormSiluPadSm100(APIBase):
         self._check_tensor_shape(desc, shape, name)
         if not _is_contiguous_stride(shape, desc.stride):
             raise ValueError(f"{name} must be contiguous, got stride {desc.stride}")
-        self._check_dtype(desc, dtype=torch.bfloat16, name=name)
+        self._check_dtype(desc, dtype=self.descs["input"].dtype, name=name)
 
     def check_support(self) -> bool:
         """Validate the DSL/GPU and the standalone normalization, padding, and cache contract."""
@@ -877,7 +846,8 @@ class RmsNormSiluPadSm100(APIBase):
             raise ValueError(f"input must be 5D NTHWC, got shape {input_desc.shape}")
         n, frames, height, width, channels = input_desc.shape
         self._value_error_if(min(n, frames, height, width) <= 0, "input dimensions must be positive")
-        self._value_error_if(channels not in (160, 320, 640), f"unsupported channel count {channels}")
+        self._value_error_if(channels not in (96, 160, 192, 256, 320, 384, 512, 640, 1024), f"unsupported channel count {channels}")
+        self._value_error_if(input_desc.dtype not in (torch.bfloat16, torch.float32), "input must be BF16 or FP32")
         self._check_desc("input", input_desc.shape)
         self._check_desc("gamma", (channels,))
         self._check_desc("padded_output", (n, frames + 2, height + 2, width + 2, channels))
@@ -922,6 +892,7 @@ class RmsNormSiluPadSm100(APIBase):
             f"{self.__class__.__name__} requires SM100 or SM103, found SM{capability[0]}{capability[1]}",
         )
         self.shape = input_desc.shape
+        _check_sample_storage(self._sample_spans, ("padded_output", "cache_output", "residual_output"), self._sample_requires_grad)
         self._is_supported = True
         return True
 
@@ -930,30 +901,14 @@ class RmsNormSiluPadSm100(APIBase):
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        from .rmsnorm_silu_pad import RmsNormSiluPadLaunch
+        from ._compile import compile_norm
 
-        launch = RmsNormSiluPadLaunch(
-            self.shape,
-            self.previous_frames,
-            self.descs["input_bias"] is not None,
-            self.descs["residual"] is not None,
-            self.descs["residual_bias"] is not None,
-        )
-        fake = {name: self._make_fake_cute_tensor_from_desc(desc, assumed_align=16) for name, desc in self.descs.items()}
-        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-        self._compiled_kernel = cute.compile(
-            launch,
-            fake["input"],
-            fake["gamma"],
-            fake["padded_output"],
-            fake["cache_output"],
-            fake_stream,
-            fake["input_bias"],
-            fake["residual"],
-            fake["residual_bias"],
-            fake["residual_output"],
-            fake["previous"],
-            options="--enable-tvm-ffi --generate-line-info",
+        self._compiled_kernel = compile_norm(
+            self.descs["input"].device,
+            self.descs["input"].dtype,
+            self.shape[-1],
+            math.prod(self.descs["padded_output"].shape[:-1]) * (self.shape[-1] // 8) + 512 >= 2**31,
+            *(self.descs[name] is not None for name in ("input_bias", "residual", "residual_bias", "residual_output", "previous")),
         )
 
     def execute(
@@ -970,7 +925,6 @@ class RmsNormSiluPadSm100(APIBase):
         current_stream: cuda.CUstream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Write normalized/padded output, copied history/cache, and any requested preactivation."""
-        self._runtime_error_if(self._compiled_kernel is None, "plan not compiled; call compile() first")
         tensors = {
             "input": input,
             "gamma": gamma,
@@ -982,28 +936,19 @@ class RmsNormSiluPadSm100(APIBase):
             "residual_bias": residual_bias,
             "residual_output": residual_output,
         }
-        for name, desc in self.descs.items():
-            tensor = tensors[name]
-            if (tensor is None) != (desc is None):
-                raise ValueError(f"{name} presence must match the compiled signature")
-            if tensor is not None:
-                _Conv3dPostOpsSm100._validate_runtime_tensor(tensor, desc, name)
-                _require_alignment(tensor, name)
+        return self._launch(tensors, current_stream)
 
-        live_tensors = tuple(tensor for tensor in tensors.values() if tensor is not None)
-        if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in live_tensors):
-            raise RuntimeError("RMSNorm SiLU preparation is inference-only; call under torch.no_grad()")
-        for output_name in ("padded_output", "cache_output", "residual_output"):
-            output = tensors[output_name]
-            if output is None:
-                continue
-            output_span = _byte_span(output)
-            for other_name, other in tensors.items():
-                if other is None or other_name == output_name:
-                    continue
-                if output_span[0] < _byte_span(other)[1] and _byte_span(other)[0] < output_span[1]:
-                    raise ValueError(f"{output_name} must not overlap {other_name}")
-
+    def _launch(self, tensors, current_stream, record_tensors=None):
+        """Bind and launch; wrappers record only externally allocated inputs."""
+        input = tensors["input"]
+        gamma = tensors["gamma"]
+        padded_output = tensors["padded_output"]
+        cache_output = tensors["cache_output"]
+        input_bias = tensors["input_bias"]
+        previous = tensors["previous"]
+        residual = tensors["residual"]
+        residual_bias = tensors["residual_bias"]
+        residual_output = tensors["residual_output"]
         device = input.device
         if current_stream is None:
             consumer_stream = torch.cuda.current_stream(device)
@@ -1011,19 +956,23 @@ class RmsNormSiluPadSm100(APIBase):
         else:
             consumer_stream = as_torch_stream(current_stream, device)
             launch_stream = current_stream
-        self._compiled_kernel(
-            input,
-            gamma,
-            padded_output,
-            cache_output,
-            launch_stream,
-            input_bias,
-            residual,
-            residual_bias,
-            residual_output,
-            previous,
-        )
-        _record_streams(tuple(tensors.values()), consumer_stream)
+        flat = lambda tensor: None if tensor is None else tensor.view(-1)
+        with torch.cuda.device(device):
+            self._compiled_kernel(
+                flat(input),
+                flat(gamma),
+                flat(padded_output),
+                flat(cache_output),
+                launch_stream,
+                flat(input_bias),
+                flat(residual),
+                flat(residual_bias),
+                flat(residual_output),
+                flat(previous),
+                geometry=self.shape[:4],
+                history=self.previous_frames,
+            )
+        _record_streams(tuple(tensors.values()) if record_tensors is None else record_tensors, consumer_stream)
         return padded_output, cache_output, residual_output
 
 
@@ -1057,23 +1006,43 @@ def _cached_plan(key: tuple, factory) -> APIBase:
     return plan
 
 
+def _run_allocating_wrapper(
+    key: tuple,
+    inputs: dict[str, torch.Tensor | None],
+    outputs: dict[str, torch.Tensor | None],
+    factory,
+    current_stream: cuda.CUstream | None,
+) -> None:
+    """Bind cached input metadata and wrapper-owned outputs to the shared launcher.
+
+    Outputs/scratch are fresh allocations on the launch stream: their metadata is
+    derived from the key, they cannot alias live inputs, and their allocation
+    stream already orders reuse. Only externally allocated inputs need recording.
+    Cache misses validate the samples; hits rely on the caller's storage contract.
+    """
+    plan = _cached_plan((*key, *(_tensor_key(tensor) for tensor in inputs.values())), factory)
+    plan._launch({**inputs, **outputs}, current_stream, tuple(inputs.values()))
+
+
 def conv3d_raw_wrapper_sm100(
     input: torch.Tensor,
     packed_weight: torch.Tensor,
     current_stream: cuda.CUstream | None = None,
+    allow_tf32: bool = False,
 ) -> torch.Tensor:
     """Allocate output and run the tuned valid Conv3D core."""
-    if input.ndim != 5 or packed_weight.ndim != 5:
-        raise ValueError("input and packed_weight must be 5D")
     n, input_t, input_h, input_w, _ = input.shape
-    if min(input_t, input_h, input_w) < 3:
-        raise ValueError("input temporal and spatial dimensions must be at least 3")
     output_shape = (n, input_t - 2, input_h - 2, input_w - 2, packed_weight.shape[0])
     with stream_context(current_stream, input.device):
+        workspace = torch.empty_like(input) if input.dtype == torch.float32 else None
         output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-    key = ("raw", *(_tensor_key(tensor) for tensor in (input, packed_weight, output)))
-    plan = _cached_plan(key, lambda: Conv3dRawSm100(input, packed_weight, output))
-    plan.execute(input, packed_weight, output, current_stream)
+    _run_allocating_wrapper(
+        ("raw", allow_tf32),
+        {"input": input, "packed_weight": packed_weight, "bias": None, "gamma": None, "residual": None, "residual_bias": None},
+        {"workspace": workspace, "padded_output": output, "cache_output": None, "residual_output": None},
+        lambda: Conv3dRawSm100(input, packed_weight, output, allow_tf32=allow_tf32, sample_workspace=workspace),
+        current_stream,
+    )
     return output
 
 
@@ -1082,15 +1051,10 @@ def causal_conv3d_with_cache_wrapper_sm100(
     packed_weight: torch.Tensor,
     previous: torch.Tensor | None = None,
     current_stream: cuda.CUstream | None = None,
+    allow_tf32: bool = False,
 ) -> TupleDict:
     """Allocate outputs and run ``CausalConv3dWithCacheSm100`` (currently 12->160 only)."""
-    if input.ndim != 5:
-        raise ValueError("input must be 5D NCTHW")
-    n, channels, frames, height, width = input.shape
-    if channels != 12:
-        raise ValueError(f"input must have 12 channels, got {channels}")
-    if previous is not None and previous.ndim != 5:
-        raise ValueError("previous must be 5D NTHWC")
+    n, _, frames, height, width = input.shape
     previous_frames = 0 if previous is None else previous.shape[1]
     cache_frames = min(2, frames + previous_frames)
     with stream_context(current_stream, input.device):
@@ -1109,28 +1073,11 @@ def causal_conv3d_with_cache_wrapper_sm100(
             dtype=input.dtype,
             device=input.device,
         )
-    key = (
-        "input_c12",
-        *(_tensor_key(tensor) for tensor in (input, packed_weight, padded_input, cache_output, output, previous)),
-    )
-    plan = _cached_plan(
-        key,
-        lambda: CausalConv3dWithCacheSm100(
-            input,
-            packed_weight,
-            padded_input,
-            cache_output,
-            output,
-            previous,
-        ),
-    )
-    plan.execute(
-        input,
-        packed_weight,
-        padded_input,
-        cache_output,
-        output,
-        previous,
+    _run_allocating_wrapper(
+        ("input_c12", allow_tf32),
+        {"input": input, "packed_weight": packed_weight, "previous": previous},
+        {"padded_input": padded_input, "cache_output": cache_output, "output": output},
+        lambda: CausalConv3dWithCacheSm100(input, packed_weight, padded_input, cache_output, output, previous, allow_tf32=allow_tf32),
         current_stream,
     )
     return TupleDict(output=output, cache_output=cache_output)
@@ -1144,13 +1091,10 @@ def conv3d_rmsnorm_silu_wrapper_sm100(
     residual: torch.Tensor | None = None,
     residual_bias: torch.Tensor | None = None,
     current_stream: cuda.CUstream | None = None,
+    allow_tf32: bool = False,
 ) -> TupleDict:
     """Allocate outputs and run ``Conv3dRmsNormSiluSm100``; see its channel limits."""
-    if input.ndim != 5 or packed_weight.ndim != 5:
-        raise ValueError("input and packed_weight must be 5D")
     n, input_t, input_h, input_w, _ = input.shape
-    if min(input_t, input_h, input_w) < 3:
-        raise ValueError("input temporal and spatial dimensions must be at least 3")
     output_shape = (
         n,
         input_t - 2,
@@ -1159,47 +1103,17 @@ def conv3d_rmsnorm_silu_wrapper_sm100(
         packed_weight.shape[0],
     )
     with stream_context(current_stream, input.device):
+        workspace = torch.empty_like(input) if input.dtype == torch.float32 else None
         output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
         residual_output = torch.empty(output_shape, dtype=input.dtype, device=input.device) if residual is not None else None
 
-    key = (
-        "norm_silu",
-        *(
-            _tensor_key(tensor)
-            for tensor in (
-                input,
-                packed_weight,
-                bias,
-                gamma,
-                output,
-                residual,
-                residual_bias,
-                residual_output,
-            )
-        ),
-    )
-    plan = _cached_plan(
-        key,
+    _run_allocating_wrapper(
+        ("norm_silu", allow_tf32),
+        {"input": input, "packed_weight": packed_weight, "bias": bias, "gamma": gamma, "residual": residual, "residual_bias": residual_bias},
+        {"workspace": workspace, "padded_output": output, "cache_output": None, "residual_output": residual_output},
         lambda: Conv3dRmsNormSiluSm100(
-            input,
-            packed_weight,
-            bias,
-            gamma,
-            output,
-            residual,
-            residual_bias,
-            residual_output,
+            input, packed_weight, bias, gamma, output, residual, residual_bias, residual_output, allow_tf32=allow_tf32, sample_workspace=workspace
         ),
-    )
-    plan.execute(
-        input,
-        packed_weight,
-        bias,
-        gamma,
-        output,
-        residual,
-        residual_bias,
-        residual_output,
         current_stream,
     )
     return TupleDict(output=output, residual_output=residual_output)
@@ -1214,19 +1128,14 @@ def conv3d_rmsnorm_silu_pad_wrapper_sm100(
     residual: torch.Tensor | None = None,
     residual_bias: torch.Tensor | None = None,
     current_stream: cuda.CUstream | None = None,
+    allow_tf32: bool = False,
 ) -> TupleDict:
     """Allocate padded/cache outputs; the caller must fill their history interiors.
 
     Only current frames, missing-history zeros, and spatial borders are written.
     See ``Conv3dRmsNormSiluPadSm100`` for the preallocated-output API.
     """
-    if input.ndim != 5 or packed_weight.ndim != 5:
-        raise ValueError("input and packed_weight must be 5D")
     n, input_t, input_h, input_w, _ = input.shape
-    if min(input_t, input_h, input_w) < 3:
-        raise ValueError("input temporal and spatial dimensions must be at least 3")
-    if history_frames not in (0, 1, 2):
-        raise ValueError("history_frames must be 0, 1, or 2")
     output_channels = packed_weight.shape[0]
     output_shape = (n, input_t - 2, input_h - 2, input_w - 2, output_channels)
     cache_shape = (
@@ -1244,30 +1153,15 @@ def conv3d_rmsnorm_silu_pad_wrapper_sm100(
         output_channels,
     )
     with stream_context(current_stream, input.device):
+        workspace = torch.empty_like(input) if input.dtype == torch.float32 else None
         padded_output = torch.empty(padded_shape, dtype=input.dtype, device=input.device)
         cache_output = torch.empty(cache_shape, dtype=input.dtype, device=input.device)
         residual_output = torch.empty(output_shape, dtype=input.dtype, device=input.device) if residual is not None else None
 
-    key = (
-        "norm_silu_pad",
-        history_frames,
-        *(
-            _tensor_key(tensor)
-            for tensor in (
-                input,
-                packed_weight,
-                bias,
-                gamma,
-                padded_output,
-                cache_output,
-                residual,
-                residual_bias,
-                residual_output,
-            )
-        ),
-    )
-    plan = _cached_plan(
-        key,
+    _run_allocating_wrapper(
+        ("norm_silu_pad", allow_tf32, history_frames),
+        {"input": input, "packed_weight": packed_weight, "bias": bias, "gamma": gamma, "residual": residual, "residual_bias": residual_bias},
+        {"workspace": workspace, "padded_output": padded_output, "cache_output": cache_output, "residual_output": residual_output},
         lambda: Conv3dRmsNormSiluPadSm100(
             input,
             packed_weight,
@@ -1279,18 +1173,9 @@ def conv3d_rmsnorm_silu_pad_wrapper_sm100(
             residual,
             residual_bias,
             residual_output,
+            allow_tf32=allow_tf32,
+            sample_workspace=workspace,
         ),
-    )
-    plan.execute(
-        input,
-        packed_weight,
-        bias,
-        gamma,
-        padded_output,
-        cache_output,
-        residual,
-        residual_bias,
-        residual_output,
         current_stream,
     )
     return TupleDict(
@@ -1307,50 +1192,23 @@ def conv3d_bias_residual_pad_wrapper_sm100(
     residual: torch.Tensor,
     residual_bias: torch.Tensor | None = None,
     current_stream: cuda.CUstream | None = None,
+    allow_tf32: bool = False,
 ) -> TupleDict:
     """Allocate output and run fused Conv3D + bias + residual + spatial pad."""
-    if input.ndim != 5 or packed_weight.ndim != 5:
-        raise ValueError("input and packed_weight must be 5D")
     n, input_t, input_h, input_w, _ = input.shape
-    if min(input_t, input_h, input_w) < 3:
-        raise ValueError("input temporal and spatial dimensions must be at least 3")
     output_channels = packed_weight.shape[0]
     padded_shape = (n, input_t - 2, input_h - 1, input_w - 1, output_channels)
     with stream_context(current_stream, input.device):
+        workspace = torch.empty_like(input) if input.dtype == torch.float32 else None
         padded_output = torch.empty(padded_shape, dtype=input.dtype, device=input.device)
 
-    key = (
-        "bias_residual_pad",
-        *(
-            _tensor_key(tensor)
-            for tensor in (
-                input,
-                packed_weight,
-                bias,
-                residual,
-                residual_bias,
-                padded_output,
-            )
-        ),
-    )
-    plan = _cached_plan(
-        key,
+    _run_allocating_wrapper(
+        ("bias_residual_pad", allow_tf32),
+        {"input": input, "packed_weight": packed_weight, "bias": bias, "gamma": None, "residual": residual, "residual_bias": residual_bias},
+        {"workspace": workspace, "padded_output": padded_output, "cache_output": None, "residual_output": None},
         lambda: Conv3dBiasResidualPadSm100(
-            input,
-            packed_weight,
-            bias,
-            residual,
-            padded_output,
-            residual_bias,
+            input, packed_weight, bias, residual, padded_output, residual_bias, allow_tf32=allow_tf32, sample_workspace=workspace
         ),
-    )
-    plan.execute(
-        input,
-        packed_weight,
-        bias,
-        residual,
-        padded_output,
-        residual_bias,
         current_stream,
     )
     return TupleDict(padded_output=padded_output)
@@ -1367,11 +1225,7 @@ def rmsnorm_silu_pad_wrapper_sm100(
     *,
     save_input: bool = False,
 ) -> TupleDict:
-    """Allocate outputs and run ``RmsNormSiluPadSm100`` (C160/C320/C640; no convolution)."""
-    if input.ndim != 5:
-        raise ValueError("input must be 5D NTHWC")
-    if previous is not None and previous.ndim != 5:
-        raise ValueError("previous must be 5D NTHWC")
+    """Allocate outputs and run ``RmsNormSiluPadSm100`` (BF16/FP32; no convolution)."""
     n, frames, height, width, channels = input.shape
     previous_frames = 0 if previous is None else previous.shape[1]
     padded_shape = (n, frames + 2, height + 2, width + 2, channels)
@@ -1381,47 +1235,11 @@ def rmsnorm_silu_pad_wrapper_sm100(
         cache_output = torch.empty(cache_shape, dtype=input.dtype, device=input.device)
         residual_output = torch.empty_like(input) if residual is not None or save_input else None
 
-    key = (
-        "rmsnorm_silu_pad",
-        *(
-            _tensor_key(tensor)
-            for tensor in (
-                input,
-                gamma,
-                padded_output,
-                cache_output,
-                input_bias,
-                previous,
-                residual,
-                residual_bias,
-                residual_output,
-            )
-        ),
-    )
-    plan = _cached_plan(
-        key,
-        lambda: RmsNormSiluPadSm100(
-            input,
-            gamma,
-            padded_output,
-            cache_output,
-            input_bias,
-            previous,
-            residual,
-            residual_bias,
-            residual_output,
-        ),
-    )
-    plan.execute(
-        input,
-        gamma,
-        padded_output,
-        cache_output,
-        input_bias,
-        previous,
-        residual,
-        residual_bias,
-        residual_output,
+    _run_allocating_wrapper(
+        ("rmsnorm_silu_pad", save_input),
+        {"input": input, "gamma": gamma, "input_bias": input_bias, "previous": previous, "residual": residual, "residual_bias": residual_bias},
+        {"padded_output": padded_output, "cache_output": cache_output, "residual_output": residual_output},
+        lambda: RmsNormSiluPadSm100(input, gamma, padded_output, cache_output, input_bias, previous, residual, residual_bias, residual_output),
         current_stream,
     )
     return TupleDict(

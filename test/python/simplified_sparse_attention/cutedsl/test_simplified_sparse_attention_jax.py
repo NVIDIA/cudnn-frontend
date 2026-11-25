@@ -25,6 +25,9 @@ def test_public_jax_export():
 
 def jax_inputs(inputs):
     tensors, metadata, upstream = inputs
+    # Initialize XLA before a DLPack export selects its tensor's CUDA device.
+    with torch.cuda.device(tensors[0].device):
+        jax.local_devices(backend="gpu")
 
     def convert(t):
         with torch.cuda.device(t.device):
@@ -59,9 +62,10 @@ def runner(topk=512, coefficient=0.1, triangular=False, backward=True):
 
 
 def execute(inputs, topk=512, coefficient=0.1, triangular=False, backward=True):
-    tensors, metadata, upstream = jax_inputs(inputs)
-    result = jax.block_until_ready(runner(topk, coefficient, triangular, backward)(*tensors, *metadata, upstream))
-    return dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), torch_outputs(result, inputs[0][0].device)))
+    with torch.cuda.device(inputs[0][0].device):
+        tensors, metadata, upstream = jax_inputs(inputs)
+        result = jax.block_until_ready(runner(topk, coefficient, triangular, backward)(*tensors, *metadata, upstream))
+        return dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), torch_outputs(result, inputs[0][0].device)))
 
 
 @pytest.mark.parametrize("heads", [16, 32, 96], ids=lambda n: f"bf16-h{n}")
@@ -183,6 +187,66 @@ def test_dlpack_device_context(monkeypatch):
     torch_outputs((*values, *bounds, upstream), inputs[0][0].device)
     assert len(seen) == 20
     assert not active
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["success", "error"])
+@pytest.mark.parametrize("entry_point", [jax_inputs, execute], ids=["convert", "execute"])
+def test_jax_initialization_restores_caller_device(monkeypatch, fail, entry_point):
+    from contextlib import contextmanager
+
+    inputs = pack([sample(3)])
+    caller = torch.device("cuda:1")
+    current = caller
+    initialized = False
+
+    @contextmanager
+    def device_guard(device):
+        nonlocal current
+        previous, current = current, device
+        try:
+            yield
+        finally:
+            current = previous
+
+    def initialize(*, backend):
+        nonlocal current, initialized
+        assert backend == "gpu"
+        initialized = True
+        current = torch.device("cuda:3")
+        if fail and entry_point is jax_inputs:
+            raise RuntimeError("JAX initialization failed")
+        return ()
+
+    def convert(tensor):
+        if not initialized:
+            initialize(backend="gpu")
+        assert current == tensor.device, "JAX initialization changed the DLPack device"
+        return tensor
+
+    def invoke(*arrays):
+        nonlocal current
+        current = torch.device("cuda:2")
+        if fail:
+            raise RuntimeError("JAX execution failed")
+        return arrays[:2]
+
+    monkeypatch.setattr(torch.cuda, "device", device_guard)
+    monkeypatch.setattr(jax, "local_devices", initialize)
+    monkeypatch.setattr(jax.dlpack, "from_dlpack", convert)
+    monkeypatch.setattr(torch, "from_dlpack", convert)
+    monkeypatch.setattr(jax, "block_until_ready", lambda x: x)
+    monkeypatch.setitem(execute.__globals__, "runner", lambda *args: invoke)
+    if fail:
+        with pytest.raises(RuntimeError, match="JAX (?:initialization|execution) failed"):
+            entry_point(inputs)
+    else:
+        actual = entry_point(inputs)
+        if entry_point is execute:
+            assert actual["output"] is inputs[0][0]
+        else:
+            assert actual[0][0] is inputs[0][0]
+    assert initialized
+    assert current == caller
 
 
 def test_dlpack_with_another_gpu_current():

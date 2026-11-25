@@ -477,3 +477,141 @@ def test_wide_v_engine_guard_is_current(monkeypatch):
         )
     elif cudnn.backend_version() >= recorded:
         assert not wrong, f"cuDNN {cudnn.backend_version()} engines {errors} at or above the recorded fix {recorded}"
+
+
+# ------------------------------------------------------------------------------------------------ single-query FP8 guard
+# On cc 10.0 / 10.3 the backend returns O = 0 and an infinite Stats row for a dense single-query per-tensor FP8 forward
+# graph when every score of a row is far below zero (9.21.1.3 through 9.25.0.15). sdpa/fwd/backend_guard.py keeps the
+# backend off those graphs below FP8_SQ1_WRONG_O_FIXED_IN; FROST serves them.
+
+_FP8 = dict(is_mxfp8=False, is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, device_sm_count=148)
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("s_kv", [128, 257, 4096])
+@pytest.mark.parametrize("over", [{}, dict(causal=True, right_bound=0)], ids=["no_mask", "causal"])
+def test_fp8_single_query_guard_arms_below_9_25_1(monkeypatch, cc, d, s_kv, over):
+    monkeypatch.setattr(cudnn, "backend_version", lambda: 92400)
+    monkeypatch.setattr(cudnn, "backend_version_string", lambda: "9.24.0")
+    reason = backend_guard(None, _facts(**_FP8, device_cc=cc, d_qk=d, d_v=d, s_kv=s_kv, **over))
+    assert reason is not None and "single-query per-tensor FP8" in reason and reason.endswith(_TAIL), reason
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(s_q=2),
+        dict(padded=True),
+        dict(has_paged_kv=True),
+        dict(d_qk=256, d_v=256),
+        dict(d_qk=128, d_v=64),
+        dict(device_cc=(10, 7)),
+        dict(device_cc=(9, 0)),
+        dict(device_cc=(12, 0)),
+        dict(is_backward=True),
+        dict(is_fp8=False, dtype=cudnn.data_type.BFLOAT16),
+    ],
+)
+def test_fp8_single_query_guard_leaves_other_graphs_alone(monkeypatch, over):
+    monkeypatch.setattr(cudnn, "backend_version", lambda: 92400)
+    assert backend_guard(None, _facts(**{**_FP8, "device_cc": (10, 0), **over})) is None
+
+
+def test_fp8_single_query_guard_version_bound(monkeypatch):
+    facts = _facts(**_FP8, device_cc=(10, 0))
+    for version, armed in ((92101, True), (92400, True), (92500, True), (92501, False), (93000, False)):
+        monkeypatch.setattr(cudnn, "backend_version", lambda version=version: version)
+        monkeypatch.setattr(cudnn, "backend_version_string", lambda version=version: str(version))
+        assert (backend_guard(None, facts) is not None) == armed, version
+
+
+def _requires_fp8_sq1_device():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in _bg.FP8_SQ1_WRONG_O_DEVICES:
+        pytest.skip("the single-query FP8 guard covers cc 10.0 / 10.3 devices")
+
+
+def _fp8_sq1_graph(d, s_kv, stats):
+    """A dense single-query E4M3 graph with every score far below zero (Q = -8, K = 2, V = 1, scale 1/8): O must be 1 and
+    Stats ln(s_kv) - 2 d."""
+    import torch
+    from sdpa.fp8 import GraphFwdUid as U, generate_graph_fwd
+
+    b, h = 2, 4
+    g = generate_graph_fwd(cudnn.data_type.FP8_E4M3, cudnn.data_type.BFLOAT16, b, h, h, h, 1, s_kv, d, d, 0.125, 0, generate_stats=stats)
+    g.validate()
+    g.build_operation_graph()
+    fp8 = lambda shape, value: torch.full(shape, value, device="cuda").to(torch.float8_e4m3fn).transpose(1, 2)  # noqa: E731
+    pack = {
+        int(U.q): fp8((b, 1, h, d), -8.0),
+        int(U.k): fp8((b, s_kv, h, d), 2.0),
+        int(U.v): fp8((b, s_kv, h, d), 1.0),
+        int(U.o): torch.full((b, 1, h, d), float("nan"), device="cuda", dtype=torch.bfloat16).transpose(1, 2),
+        int(U.o_amax): torch.empty(1, device="cuda"),
+    }
+    if stats:
+        pack[int(U.stats)] = torch.full((b, h, 1, 1), float("nan"), device="cuda")
+    for uid in (U.q_descale, U.k_descale, U.v_descale, U.s_scale, U.s_descale, U.o_scale):
+        pack[int(uid)] = torch.ones(1, device="cuda")
+
+    def error():
+        o_err = (pack[int(U.o)].float() - 1).abs().max().item()
+        lse_err = (pack[int(U.stats)] - (math.log(s_kv) - 2 * d)).abs().max().item() if stats else 0.0
+        return max(o_err, lse_err) if math.isfinite(o_err) and math.isfinite(lse_err) else math.inf
+
+    return g, pack, error
+
+
+_FP8_SQ1_CONTRACTS = [(128, 257, True), (64, 1000, True), (128, 4096, False), (64, 16384, True)]
+
+
+@pytest.mark.parametrize("d,s_kv,stats", _FP8_SQ1_CONTRACTS)
+def test_fp8_single_query_default_is_right(monkeypatch, d, s_kv, stats):
+    """Whatever the installed backend, the default walk returns the right O and Stats for the trigger graph."""
+    import torch
+
+    _requires_fp8_sq1_device()
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    g, pack, error = _fp8_sq1_graph(d, s_kv, stats)
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    g.check_support()
+    g.build_plans()
+    if cudnn.backend_version() < _bg.FP8_SQ1_WRONG_O_FIXED_IN:
+        assert g.selected_engine is not None, "the guard is armed, yet the backend serves the graph"
+    g.execute(pack, torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8))
+    torch.cuda.synchronize()
+    assert error() < 0.05, (g.selected_engine and g.selected_engine.name, error())
+
+
+def test_fp8_single_query_guard_is_current(monkeypatch):
+    """Detector for FP8_SQ1_WRONG_O_FIXED_IN: with the guard lifted, the installed backend's first buildable plan runs the
+    trigger contracts. Below the recorded fix at least one must be wrong (all right fails with the version to record); at
+    or above it every one must be right."""
+    import torch
+
+    _requires_fp8_sq1_device()
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    recorded = _bg.FP8_SQ1_WRONG_O_FIXED_IN
+    monkeypatch.setattr(_bg, "FP8_SQ1_WRONG_O_FIXED_IN", 0)  # lift the guard
+    errors = {}
+    for d, s_kv, stats in _FP8_SQ1_CONTRACTS:
+        g, pack, error = _fp8_sq1_graph(d, s_kv, stats)
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        for index in (i for i, p in enumerate(g.plans) if not is_python_engine(p.engine_id)):
+            try:
+                g.build_plan_at_index(index)
+            except cudnn.cudnnGraphNotSupportedError:
+                continue
+            g.execute_plan_at_index(pack, torch.empty(max(g.get_workspace_size_plan_at_index(index), 1), device="cuda", dtype=torch.uint8), index=index)
+            torch.cuda.synchronize()
+            errors[(d, s_kv, stats, g.get_plan_name_at_index(index))] = error()
+            break
+    if not errors:
+        pytest.skip(f"cuDNN {cudnn.backend_version()} builds no backend plan for the trigger contracts")
+    wrong = any(err > 0.05 for err in errors.values())
+    if cudnn.backend_version() < recorded:
+        assert wrong, f"cuDNN {cudnn.backend_version()} returns the right O and Stats on {errors}: lower FP8_SQ1_WRONG_O_FIXED_IN"
+    else:
+        assert not wrong, f"cuDNN {cudnn.backend_version()} at or above the recorded fix {recorded}: {errors}"

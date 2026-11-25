@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The dense Qwen 3.5-architecture family: ``QwenDense`` (geometry, layer order, block wiring) and its provider table;
-``QwenDenseDrafter``, the loader of a checkpoint's drafter."""
+``QwenDenseDrafter``, the loader of a checkpoint's drafter and its draft pass on reference blocks."""
 
 from .drafter import QwenDenseDrafter
 from .model import Geometry, QwenDense

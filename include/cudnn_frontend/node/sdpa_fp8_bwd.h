@@ -38,6 +38,62 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
     // engine (sdpa_bwd_sm107_fp8, opt-in). Same role as the MXFP8 flag above.
     mutable bool is_d256_fp8_on_rubin = false;  // Will be edited in pre_validate_node()
 
+    // Per-tensor FP8 GQA full-head dK/dV partials held in frontend workspace
+    std::shared_ptr<Tensor_attributes> dK_fullhead;
+    int64_t dK_fullhead_size = 0;
+    std::shared_ptr<Tensor_attributes> dV_fullhead;
+    int64_t dV_fullhead_size = 0;
+
+    // True when the full-head partial of a GQA dK/dV output goes to frontend workspace sized by the packed token total.
+    bool
+    packs_fullhead(std::shared_ptr<Tensor_attributes> const& output) const {
+        auto const& dim    = output->get_dim();
+        auto const& stride = output->get_stride();
+        auto const d_qk    = attributes.inputs.at(input_names::Q)->get_dim()[3];
+        return output->get_ragged_offset() != nullptr && attributes.max_total_seq_len_kv.has_value() &&
+               stride[2] >= dim[1] * stride[1] && d_qk <= 128 && detail::get_backend_version() >= 93000;
+    }
+
+    // Gives a full-head partial the output's ragged offset and its strides scaled to h_q heads, and makes it real.
+    void
+    place_fullhead_in_workspace(std::shared_ptr<Tensor_attributes> const& fullhead,
+                                std::shared_ptr<Tensor_attributes> const& output,
+                                int64_t head_ratio,
+                                int64_t& fullhead_size) const {
+        std::vector<int64_t> fullhead_stride = output->get_stride();
+        fullhead_stride[0]                   = fullhead_stride[0] * head_ratio;
+        fullhead_stride[2]                   = fullhead_stride[2] * head_ratio;
+        fullhead->set_stride(fullhead_stride);
+        fullhead->set_ragged_offset(output->get_ragged_offset());
+        fullhead->set_is_virtual(false);
+        fullhead_size = ragged_workspace_size(
+            attributes.max_total_seq_len_kv.value(), fullhead->get_dim(), fullhead_stride, sizeof(float));
+        fullhead_size = (fullhead_size + 127) / 128 * 128;
+    }
+
+    // Head reduction, descales, scale and amax of a GQA matmul_fp8 over an explicit full-head partial.
+    void
+    reduce_and_quantize_fullhead(std::shared_ptr<Tensor_attributes> const& fullhead,
+                                 std::shared_ptr<Tensor_attributes> const& descale_a,
+                                 std::shared_ptr<Tensor_attributes> const& descale_b,
+                                 std::shared_ptr<Tensor_attributes> const& scale_c,
+                                 std::shared_ptr<Tensor_attributes> const& c,
+                                 std::shared_ptr<Tensor_attributes> const& amax_c,
+                                 std::vector<int64_t> const& c_dim) {
+        auto last_output = reduction(fullhead, Reduction_attributes().set_name("gqa_c").set_mode(ReductionMode_t::ADD));
+        last_output->set_dim(c_dim);
+
+        auto mul_attributes = Pointwise_attributes().set_mode(PointwiseMode_t::MUL);
+        mul_attributes.set_name("descale_a");
+        last_output = pointwise(last_output, descale_a, mul_attributes);
+        mul_attributes.set_name("descale_b");
+        last_output = pointwise(last_output, descale_b, mul_attributes);
+        mul_attributes.set_name("scale_c");
+        pointwise(last_output, scale_c, mul_attributes, c);
+
+        reduction(last_output, Reduction_attributes().set_name("amax_c").set_mode(ReductionMode_t::AMAX), amax_c);
+    }
+
     // Promote any 1-D seq_len / ragged-offset index tensors to the 4-D
     // [n, 1, 1, 1] form the cuDNN backend requires (see promote_1d_index_tensor_to_4d).
     void
@@ -989,6 +1045,23 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                     Reduction_attributes().set_name("amax_dV").set_mode(ReductionMode_t::AMAX);
                 reduction(attributes.outputs[output_names::dV], amax_dv_attributes, amax_dv);
             }
+        } else if (h_q != h_v && packs_fullhead(attributes.outputs[output_names::dV])) {
+            dV_fullhead = matmul(last_dV,
+                                 attributes.inputs[input_names::dO],
+                                 Matmul_attributes()
+                                     .set_name("bmm_S_T_dO")
+                                     .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                                     .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]));
+            dV_fullhead->set_dim({b, h_q, s_kv, d_v});
+            dV_fullhead->set_data_type(DataType_t::FLOAT);
+            place_fullhead_in_workspace(dV_fullhead, attributes.outputs[output_names::dV], h_q / h_v, dV_fullhead_size);
+            reduce_and_quantize_fullhead(dV_fullhead,
+                                         attributes.inputs[input_names::Descale_S],
+                                         attributes.inputs[input_names::Descale_dO],
+                                         attributes.inputs[input_names::Scale_dV],
+                                         attributes.outputs[output_names::dV],
+                                         attributes.outputs[output_names::Amax_dV],
+                                         {b, h_v, s_kv, d_v});
         } else {
             matmul_fp8(last_dV,
                        attributes.inputs[input_names::dO],
@@ -1159,6 +1232,23 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                     Reduction_attributes().set_name("amax_dK").set_mode(ReductionMode_t::AMAX);
                 reduction(attributes.outputs[output_names::dK], amax_dk_attributes, amax_dk);
             }
+        } else if (h_q != h_k && packs_fullhead(attributes.outputs[output_names::dK])) {
+            dK_fullhead = matmul(dP_T,
+                                 attributes.inputs[input_names::Q],
+                                 Matmul_attributes()
+                                     .set_name("bmm_dP_T_Q")
+                                     .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
+                                     .set_k_override(attributes.inputs[input_names::SEQ_LEN_Q]));
+            dK_fullhead->set_dim({b, h_q, s_kv, d_qk});
+            dK_fullhead->set_data_type(DataType_t::FLOAT);
+            place_fullhead_in_workspace(dK_fullhead, attributes.outputs[output_names::dK], h_q / h_k, dK_fullhead_size);
+            reduce_and_quantize_fullhead(dK_fullhead,
+                                         attributes.inputs[input_names::Descale_dP],
+                                         attributes.inputs[input_names::Descale_Q],
+                                         attributes.inputs[input_names::Scale_dK],
+                                         attributes.outputs[output_names::dK],
+                                         attributes.outputs[output_names::Amax_dK],
+                                         {b, h_k, s_kv, d_qk});
         } else {
             auto bmm_dP_T_Q_attributes = Matmul_fp8_attributes().set_name("bmm_dP_T_Q")
                            .set_m_override(attributes.inputs[input_names::SEQ_LEN_KV])
@@ -1173,6 +1263,27 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                        attributes.outputs[output_names::Amax_dK]);
         }
 
+        return {error_code_t::OK, ""};
+    }
+
+    virtual int64_t
+    get_fe_workspace_size_node() const override final {
+        return dK_fullhead_size + dV_fullhead_size;
+    }
+
+    virtual error_t
+    collect_tensors_in_workspace_node(
+        std::unordered_map<Tensor_attributes::uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>&
+            workspace_modifications,
+        int64_t& offset) const override final {
+        if (dK_fullhead) {
+            workspace_modifications.emplace(dK_fullhead->get_uid(), std::make_tuple(2, offset, std::vector<float>()));
+            offset = offset + dK_fullhead_size;
+        }
+        if (dV_fullhead) {
+            workspace_modifications.emplace(dV_fullhead->get_uid(), std::make_tuple(2, offset, std::vector<float>()));
+            offset = offset + dV_fullhead_size;
+        }
         return {error_code_t::OK, ""};
     }
 

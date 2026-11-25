@@ -377,10 +377,11 @@ class MoeEpTrainingWgradOperands:
     outputs are ``fc1_b=(T, 2I)`` and ``fc2_b=(T, H)``.
 
     For expert ``e``, the physical segment starts at zero or
-    ``expert_offsets[e - 1]``.  Only the next ``valid_route_counts[e]`` rows
-    are defined; per-expert padding and the final capacity tail are
-    unspecified.  Consumers must use both metadata tensors when reading the
-    operands.
+    ``expert_offsets[e - 1]`` and ends at ``expert_offsets[e]``.  The first
+    ``valid_route_counts[e]`` rows carry routed data.  The remaining padding
+    rows of the segment are zero-contribution rows: zero payload with finite
+    scales, so a consumer may reduce over the whole padded segment.  The
+    capacity tail after ``expert_offsets[-1]`` is unspecified.
     """
 
     fc1_a: torch.Tensor
@@ -393,6 +394,57 @@ class MoeEpTrainingWgradOperands:
     fc2_sfb: torch.Tensor
     expert_offsets: torch.Tensor
     valid_route_counts: torch.Tensor
+
+
+class MoeEpWgradLayout(str, Enum):
+    """Storage order of one expert's weight gradient.
+
+    ``GEMM_ROW_MAJOR`` stores dW1 as ``(H, 2I)`` and dW2 as ``(I, H)``, last
+    dimension contiguous. ``WEIGHT_ROW_MAJOR`` stores the transposes, dW1 as
+    ``(2I, H)`` and dW2 as ``(H, I)``: the orientation of the source weights.
+    """
+
+    GEMM_ROW_MAJOR = "gemm_row_major"
+    WEIGHT_ROW_MAJOR = "weight_row_major"
+
+
+@dataclass(frozen=True)
+class MoeEpTrainingWgradOutputs:
+    """Contiguous-expert weight-gradient destinations in GEMM orientation.
+
+    ``fc1`` has logical shape ``(E_local, H, 2I)`` and ``fc2`` has
+    ``(E_local, I, H)``. Each is either row-major in that shape
+    (``MoeEpWgradLayout.GEMM_ROW_MAJOR``) or the transpose of a contiguous
+    weight-oriented buffer, e.g. ``grad_w1.transpose(1, 2)`` for a contiguous
+    ``(E_local, 2I, H)`` gradient (``WEIGHT_ROW_MAJOR``). The dW1 columns
+    follow ``fc1_b``: gate and up interleaved in 32-column strips.
+    """
+
+    fc1: torch.Tensor
+    fc2: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MoeEpTrainingDiscreteWgradOutputs:
+    """Per-expert weight-gradient destinations addressed through pointer tables.
+
+    ``fc1_ptrs`` and ``fc2_ptrs`` are CUDA ``int64[E_local]`` tables. Each
+    entry addresses one expert's dense dW1 or dW2 buffer of ``dtype`` stored
+    in ``layout``. MoeEp owns neither the tables nor the buffers.
+    """
+
+    fc1_ptrs: torch.Tensor
+    fc2_ptrs: torch.Tensor
+    dtype: torch.dtype
+    layout: Union[MoeEpWgradLayout, str] = MoeEpWgradLayout.WEIGHT_ROW_MAJOR
+
+    def __post_init__(self) -> None:
+        try:
+            layout = MoeEpWgradLayout(self.layout)
+        except (TypeError, ValueError) as exc:
+            choices = ", ".join(value.value for value in MoeEpWgradLayout)
+            raise ValueError(f"unsupported WGrad layout {self.layout!r}; expected one of: {choices}") from exc
+        object.__setattr__(self, "layout", layout)
 
 
 MoeTensor = Union[torch.Tensor, BlockScaledTensor]
@@ -413,8 +465,11 @@ __all__ = [
     "MoeEpNativeWeightLayout",
     "MoeEpNativeWeightStorageMode",
     "MoeEpTrainingBackwardOutputs",
+    "MoeEpTrainingDiscreteWgradOutputs",
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
+    "MoeEpTrainingWgradOutputs",
+    "MoeEpWgradLayout",
     "MoeFormat",
     "MoeTensor",
     "parse_native_weight_storage_mode",

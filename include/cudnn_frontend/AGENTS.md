@@ -20,6 +20,14 @@ The header-only C++ library (CMake INTERFACE target `cudnn_frontend`, C++17). Um
 - **Guard new enum attributes with the header version, like the rest of the codebase.** Wrap the use of an attribute that only exists from cuDNN X.Y on in `#if (CUDNN_VERSION >= XY00)` with a not-supported `#else` branch, and keep the runtime backend version check (`NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION`) inside it. Only gate on a version whose released headers actually define the attribute; `#ifdef` cannot detect an enum constant, and guessing its integer value risks an ABI collision.
 - Native CUDA graph entry points retain the selected execution plan on the caller's CUDA graph after successful population and update. Cover graphExecs instantiated from clones after destroying both source graphs and the frontend Graph; the plan owns runtime-compiled kernel code.
 - clang-format (Google-based, indent 4, 120 cols, `SortIncludes: false`) via `pre-commit run`.
+
+Ragged offsets replace only the batch stride of that operand. Alignment checks
+must ignore that unused stride while retaining dense batch, head and sequence
+checks. Cache this fact for runtime overrides and restore it from resolved tensor
+metadata when loading a plan. Plan-only serialization must retain the fact
+without the tensor records; legacy opaque blobs keep their existing checks.
+Do not infer it from another operand or read device offsets on the host. `test/cpp/sdpa_alignment.cpp` keeps the unused-stride
+regression and real misalignment controls together.
 - Windows shim loader errors: capture `GetLastError()` immediately after the primary load fails; preserve it only if the fallback also fails, and clear errors on success. Test with primary and fallback failures that return different codes.
 - Windows runtime validation must establish scoped ownership before diagnostics can throw and transfer ownership only on success. Allocation-failure tests must verify cleanup releases exactly the validator's reference.
 - A backend correctness workaround belongs to the affected native support surface, not an unrelated frontend engine's admission. For SDPA block masks, test `AUTO` and explicit `UNIFIED`, runtime versions below/at the fix, and unaffected architectures/no-mask controls. Mask contents are mutable device data; an all-visible validation sample cannot establish a safe reusable plan. `SDPA block-mask backend support boundary` is the descriptor-only detector; actual numerical qualification must identify the loaded released backend artifact, not just its version label.

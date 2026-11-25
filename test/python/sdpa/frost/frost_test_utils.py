@@ -858,16 +858,24 @@ def ptx_kernel_name(mangled: str) -> str:
 
 
 def ptx_kernel_md5s(text: str) -> dict:
-    """{kernel: md5} over the entry regions of ONE dumped PTX module (text), in entry order: a region runs from its ``.entry`` line to the next
-    entry (or the end of the module); the preamble before the first entry is not a kernel and is not hashed."""
+    """Hash every entry region. The shared THD fold has straight-line and
+    grid-stride specializations in one module, selected by a runtime bound.
+    Hash both in symbol order; ordinary single-entry records stay unchanged.
+    Duplicate symbols and unrecognized multiple specializations remain errors.
+    """
     entries = list(_PTX_ENTRY.finditer(text))
-    out = {}
+    regions = {}
+    symbols = set()
     for i, m in enumerate(entries):
         end = entries[i + 1].start() if i + 1 < len(entries) else len(text)
-        name = ptx_kernel_name(m.group(1))
-        assert name not in out, f"two entries named {name} in one module"
-        out[name] = hashlib.md5(text[m.start() : end].encode()).hexdigest()
-    return out
+        symbol = m.group(1)
+        assert symbol not in symbols, f"duplicate PTX entry symbol {symbol}"
+        symbols.add(symbol)
+        name = ptx_kernel_name(symbol)
+        variants = regions.setdefault(name, [])
+        assert not variants or (name in D128_THD_SHARED_KERNELS and len(variants) == 1), f"unexpected multiple entries named {name} in one module"
+        variants.append((symbol, text[m.start() : end]))
+    return {name: hashlib.md5("".join(region for _, region in sorted(variants)).encode()).hexdigest() for name, variants in regions.items()}
 
 
 def read_kernel_record(path, token: str, arch: str = "sm_100a") -> tuple:

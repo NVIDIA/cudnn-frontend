@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional, Tuple
 import cudnn
 
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+from cudnn.sdpa.native_sm80 import SM80_ROW_PARTS
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import band
 from .kernels.sm90.d64_f16_one_wg import contract as _sm90_d64_owner
@@ -231,11 +232,16 @@ _LOG = logging.getLogger(__name__)
 # Arch ranges the spec rows below serve, inclusive, encoded major*10 + minor as
 # in engines/manifest.py. RANGES, not the exact device families that exist
 # today: an sm100 kernel runs on the whole sm100 line, so enumerating members
-# silently declines the parts that ship later -- Rubin (sm107) and Thor (sm110)
-# are meant to reuse these kernels and an exact {(10,0), (10,3)} excluded both.
+# silently declines the parts that ship later. The SM100-line rows stop at 106
+# and name Thor (sm110: an SM100-class part, the same 227 KiB SMEM carveout) in
+# ``Capabilities.sm_extra``; the Rubin rows own 107-109 (Thor cannot run the
+# Rubin kernels, which assume Rubin's 327 KiB carveout).
 # Within the range, cc10.3+ additionally enables the fused LDTM.STAT row-max for
 # MXFP8 — handled in the lowering, from the device capability.
 _BLACKWELL = (100, 119)
+_RUBIN = (107, 109)
+_THOR = 110
+_THD_ORIGIN_CCS = ((10, 0), (10, 3), (11, 0))  # the SM100-line parts whose THD graphs compile the independent-origin specialization
 _BLACKWELL_GEFORCE = (120, 129)
 
 
@@ -256,7 +262,8 @@ class SdpaFwdKnobs:
     the backend's own encoding of its 2-CTA SDPA variant); ``sched_policy``,
     ``pack_gqa`` and ``split_kv`` are frontend-only types (the backend's
     split-KV counterpart, ``STREAM_K``, is an on/off mode, not a chunk count,
-    hence the distinct ``SPLIT_KV``).
+    hence the distinct ``SPLIT_KV``); ``cluster_reduce`` is the frontend-only
+    ``CLUSTER_K_REDUCE``, read here against ``SPLIT_KV``.
 
     Knobs are performance-only: every value computes the same function, so an
     autotuner may pick any of them. The softmax accumulator precision (the
@@ -278,6 +285,13 @@ class SdpaFwdKnobs:
     warp_spec_cfg: Optional[int] = None
     # Explicit MMA operand orientation; unset preserves the existing lowering.
     swap_ab: Optional[int] = None
+    # Reduce the split_kv partials inside the launch: the chunks of one unit run as one thread-block cluster and fold their
+    # partials there, in the separate reduction pass's own order, instead of a second launch. None and False are the
+    # two-launch form. Meaningful with split_kv > 1 only; a row that cannot run it for the plan declines the request.
+    cluster_reduce: Optional[bool] = None
+
+    # The 0/1 knobs: a public record carries them as ints, the native field is a bool.
+    _BOOL_KNOBS = ("pack_gqa", "cluster_reduce")
 
     # field name -> cudnn.knob_type member name (resolved lazily: the compiled
     # module is not importable at class-definition time in every build).
@@ -290,6 +304,7 @@ class SdpaFwdKnobs:
         ("split_kv", "SPLIT_KV"),
         ("warp_spec_cfg", "WARP_SPEC_CFG"),
         ("swap_ab", "SWAP_AB"),
+        ("cluster_reduce", "CLUSTER_K_REDUCE"),
     )
 
     def to_public(self) -> dict:
@@ -314,16 +329,16 @@ class SdpaFwdKnobs:
             if field is None:
                 raise ValueError(f"knob {knob.name} is not a tuning axis of the SDPA-forward engines")
             if isinstance(value, bool):
-                if field != "pack_gqa":
+                if field not in cls._BOOL_KNOBS:
                     raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
                 value = int(value)
             if not isinstance(value, int):
                 # A persisted record carries ints; "0" or 1.0 would round-trip to
                 # a different native knob than the one recorded.
                 raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
-            if field == "pack_gqa" and value not in (0, 1):
-                raise ValueError(f"knob PACK_GQA must be 0 or 1, got {value}")
-            kwargs[field] = bool(value) if field == "pack_gqa" else value
+            if field in cls._BOOL_KNOBS and value not in (0, 1):
+                raise ValueError(f"knob {knob.name} must be 0 or 1, got {value}")
+            kwargs[field] = bool(value) if field in cls._BOOL_KNOBS else value
         return cls(**kwargs)
 
 
@@ -747,6 +762,12 @@ class Capabilities:
 
     # Delegate by the native shape a padded graph selects, so an owner also serves the row's envelope onto its tile.
     delegated_envelope: bool = False
+    # cc codes outside [sm_lo, sm_hi] the row also serves (Thor on the SM100-line rows, cc 8.6 / 8.9 on the SM80 rows).
+    sm_extra: frozenset[int] = frozenset()
+    # CLUSTER_K_REDUCE domain (SdpaFwdKnobs.cluster_reduce): True = the row's split kernel can reduce its partials inside
+    # the launch. WHICH plans it does so for is the implementation's own check in mismatch(). APPENDED after sm_extra
+    # (append-only contract above).
+    cluster_reduces: frozenset[bool] = frozenset({False})
 
 
 # The block sizes the own-block-excluded causal bound is wired for: the MXFP8 V
@@ -1906,6 +1927,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return "this engine serves sdpa() forward graphs only"
     if knobs is not None and not isinstance(knobs, SdpaFwdKnobs):
         return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
+    if knobs is not None and knobs.cluster_reduce and True not in capabilities.cluster_reduces:
+        return "CLUSTER_K_REDUCE=1 (the split-KV partials reduced inside the launch) is a form of the SM100 D256 swap-AB split decode tile; this engine has no such form"
     delegated = (facts.d_qk, facts.d_v)
     if capabilities.delegated_envelope and (facts.device_cc, delegated) not in capabilities.delegated_exact:
         delegated = _selected_d_shape(capabilities, facts, knobs) or delegated
@@ -2205,7 +2228,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "attn_scale_prefolded is not admitted on the half THD packed split / D128 packing / D192 single-Q legs"
         if (
             packed_split
-            and facts.device_cc in ((10, 0), (10, 3))
+            and facts.device_cc in _THD_ORIGIN_CCS
             and not facts.has_paged_kv
             and (facts.d_qk, facts.d_v) == (128, 128)
             and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d128_split_physical_origins", False)
@@ -2213,7 +2236,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "nonpaged D128 split physical origins require the matching native cuDNN Frontend extension"
         if (
             packed_split
-            and facts.device_cc in ((10, 0), (10, 3), (10, 7))
+            and facts.device_cc in (*_THD_ORIGIN_CCS, (10, 7))
             and not facts.has_paged_kv
             and (facts.d_qk, facts.d_v) == (192, 128)
             and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d192_split_physical_origins", False)
@@ -2269,6 +2292,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if knobs.split_kv is not None and knobs.split_kv > 1:
             if not capabilities.split_kv_supported:
                 return "split_kv > 1 is not wired in this engine's lowering"
+            if capabilities.sm_lo == 120 and knobs.sched_policy not in (None, SCHED_NATURAL):
+                return "SM120 split_kv > 1 requires SCHED_NATURAL: the split index uses the batch grid axis"
             if facts.has_epilogue_gate and not decode_tile:
                 if facts.shape_overrides and d256_decode_tile_selected(
                     capabilities, replace(facts, shape_overrides=False), _decode_tile_pack_g(facts, knobs), knobs.split_kv
@@ -2556,8 +2581,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "score_max / score_sum_exp are stored by the 2-CTA prefill tile; cga=1 selects a tile without the store"
     cc = facts.device_cc
     sm = None if cc is None else cc[0] * 10 + cc[1]
-    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
-        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
+    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi or sm in capabilities.sm_extra):
+        extra = "".join(f" or SM{code}" for code in sorted(capabilities.sm_extra))
+        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}{extra}; current device is {cc}"
     for owner in (_sm90_d64_owner, _sm90_three_wg_owner, _sm90_d128_owner):
         if capabilities.implementation == owner.NAME:
             reason = owner.mismatch(facts, knobs)
@@ -2599,7 +2625,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     ):
         return "SM120 D576 envelope requires the matching native cuDNN Frontend extension"
     if _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE and not getattr(
-        cudnn._pybind_module._SdpaDenseBinder, "supports_native_d576", False
+        cudnn._pybind_module._SdpaDenseBinder, "supports_fp8_d576" if facts.is_fp8 else "supports_native_d576", False
     ):
         return "native D576x512 requires the matching cuDNN Frontend native extension"
     if (
@@ -3086,6 +3112,34 @@ class EngineSpec:
     # Unmigrated legacy rows retain their internal body dispatch.
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Optional[SdpaFwdKnobs]], Any]"
 
+    # The implementation binds a runtime packed HN Stats head stride.
+    packed_hn_stats_override: bool = False
+
+    def supports_stats_stride_override(self, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> bool:
+        """Plan-time contract of the prepared half THD HN binder, after admission.
+
+        This describes changing a packed head stride within the declared override
+        domain, not changing Stats packing, dtype, or storage capacity. Quantized,
+        padded-Stats and ragged-Q dense-decode binders have separate contracts.
+        """
+        # Admitted mixed FP8 K/V graphs also use the half Q/O template and
+        # its FP32 Stats binding. K/V storage does not set the Stats stride.
+        if not (self.packed_hn_stats_override and facts.shape_overrides and facts.thd and facts.wants_stats):
+            return False
+        if facts.is_fp8 or facts.is_mxfp8 or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+            return False
+        stats = facts.stats_t
+        if stats is None or stats.ragged_offset is None:
+            return False
+        stride = stats.get_stride()
+        if ga.thd_stats_packing(stride[1], stride[2], facts.h_q) != "head_major":
+            return False
+        # Only the single-CTA split decode/combine can bind ragged Q through
+        # the dense launch. The same Q=1 paged graph can select THD prefill.
+        if knobs is not None and (knobs.split_kv or 1) > 1 and knobs.cga in (None, 1) and _thd_decode_leg(self.capabilities, facts):
+            return False
+        return bool(getattr(cudnn._pybind_module._SdpaThdBinder, "supports_stats_stride_override", False))
+
 
 def _sm100_spec() -> EngineSpec:
     """Legacy f16/bf16 SM100 row for widths/envelopes not yet delegated.
@@ -3097,13 +3151,15 @@ def _sm100_spec() -> EngineSpec:
     is the prefill pipeline (512 Q rows per cluster), TILE_CGA_M=1 the decode
     tile (128 rows per CTA, sm100/d128_f16_single_q/kernel.py) -- the "decode vs prefill
     by S_q" kernel choice EngineSpec.lower anticipates, driven by the
-    heuristics' cga rule. The separate SM107 row owns Rubin lowering."""
+    heuristics' cga rule. The separate SM107 row owns Rubin lowering. Thor (cc 11.0) is an SM100-class part and rides this
+    row (``sm_extra``)."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm100",
         capabilities=Capabilities(
             mixed_fp8_kv_d_shapes=frozenset({(128, 128)}),
             sm_lo=_BLACKWELL[0],
             sm_hi=106,
+            sm_extra=frozenset({_THOR}),
             phase="prefill",
             delegated_exact=frozenset(
                 (cc, shape)
@@ -3222,14 +3278,15 @@ def _sm100_spec() -> EngineSpec:
             score_sum_exp=True,
             score_stats_d_shapes=SM100_SCORE_STATS_SHAPES,
         ),
+        packed_hn_stats_override=True,
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
 def _sm100_d192_half_specs():
     """The D192 multi-Q owner and the shared D64/D128/D192 single-Q owner."""
-    from .kernels.sm100.d192_f16_multi_q.host import lower as lower_multi_q
-    from .kernels.sm100.d128_f16_single_q.host import lower as lower_single_q
+    from .kernels.sm100.d192_f16_multi_q import host as multi_q_host
+    from .kernels.sm100.d128_f16_single_q import host as single_q_host
 
     shape = frozenset({(192, 128)})
     base = replace(
@@ -3285,14 +3342,26 @@ def _sm100_d192_half_specs():
         sched_policies_by_d_shape=(),
     )
     return tuple(
-        EngineSpec(caps.implementation, caps, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
-        for caps, lower in ((multi_q, lower_multi_q), (single_q, lower_single_q))
+        EngineSpec(
+            caps.implementation,
+            caps,
+            partial(host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE,
+        )
+        for caps, host in ((multi_q, multi_q_host), (single_q, single_q_host))
     )
+
+
+def _resolve_sm100_multi_q_geometry(facts, knobs, *, d_flavor):
+    # Defer policy loading until the fixed engine is lowered.
+    from .heuristics import resolve_sm100_half_multi_q_geometry
+
+    return resolve_sm100_half_multi_q_geometry(facts, knobs, d_flavor=d_flavor)
 
 
 def _sm100_small_half_specs():
     """Independent multi-Q and quadrant bodies; exact widths retain legal envelopes."""
-    from .kernels.sm100.d128_f16_multi_q.host import lower as lower_multi_q
+    from .kernels.sm100.d128_f16_multi_q import host as multi_q_host
     from .kernels.sm100.d64_f16_quadrant.host import lower as lower_quadrant
 
     shapes = frozenset({(32, 32), (64, 64), (128, 128)})
@@ -3324,7 +3393,14 @@ def _sm100_small_half_specs():
         EngineSpec(
             multi_q.implementation,
             multi_q,
-            partial(lower_multi_q, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs, selected_shape=_selected_d_shape),
+            partial(
+                multi_q_host.lower,
+                lower_impl=lower_dsl_prefill,
+                knob_type=SdpaFwdKnobs,
+                selected_shape=_selected_d_shape,
+                resolve_geometry=_resolve_sm100_multi_q_geometry,
+            ),
+            packed_hn_stats_override=multi_q_host.PACKED_HN_STATS_OVERRIDE,
         ),
         EngineSpec(quadrant.implementation, quadrant, partial(lower_quadrant, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs)),
     )
@@ -3332,8 +3408,8 @@ def _sm100_small_half_specs():
 
 def _sm100_d512_specs():
     """Two wide half main implementations with the existing common graph contract."""
-    from .kernels.sm100.d512_f16_role_split.host import lower as lower_role_split
-    from .kernels.sm100.d512_f16_2x2.host import lower as lower_two_by_two
+    from .kernels.sm100.d512_f16_role_split import host as role_split_host
+    from .kernels.sm100.d512_f16_2x2 import host as two_by_two_host
 
     base = replace(
         _sm100_spec().capabilities,
@@ -3367,14 +3443,24 @@ def _sm100_d512_specs():
     )
     two_by_two = replace(base, implementation=_D512_TWO_BY_TWO, tile_ms=frozenset({64}), cgas=frozenset({2, 4}))
     return (
-        EngineSpec(_D512_ROLE_SPLIT, role_split, lower_role_split),
-        EngineSpec(_D512_TWO_BY_TWO, two_by_two, lower_two_by_two),
+        EngineSpec(
+            _D512_ROLE_SPLIT,
+            role_split,
+            partial(role_split_host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=role_split_host.PACKED_HN_STATS_OVERRIDE,
+        ),
+        EngineSpec(
+            _D512_TWO_BY_TWO,
+            two_by_two,
+            partial(two_by_two_host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=two_by_two_host.PACKED_HN_STATS_OVERRIDE,
+        ),
     )
 
 
 def _sm100_d256_specs():
     """Two explicit main implementations; common graph support stays shared."""
-    from .kernels.sm100.d256_f16_lookahead.host import lower as lower_lookahead
+    from .kernels.sm100.d256_f16_lookahead import host as lookahead_host
     from .kernels.sm100.d256_f16_swap_ab.host import lower as lower_swap_ab
 
     base = replace(
@@ -3413,9 +3499,17 @@ def _sm100_d256_specs():
         sched_policies=frozenset({SCHED_NATURAL}),
         pack_gqa_partial_d_shapes=None,
         pack_gqa_requires_divisible=False,
+        # The split decode tile's in-launch reduction; the plans it serves are the swap-AB contract's own
+        # (d256_f16_swap_ab.contract.cluster_reduce_decline, read by mismatch()).
+        cluster_reduces=frozenset({False, True}),
     )
     return (
-        EngineSpec(_D256_LOOKAHEAD, lookahead, lower_lookahead),
+        EngineSpec(
+            _D256_LOOKAHEAD,
+            lookahead,
+            partial(lookahead_host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=lookahead_host.PACKED_HN_STATS_OVERRIDE,
+        ),
         EngineSpec(_D256_SWAP_AB, swap_ab, lower_swap_ab),
     )
 
@@ -3507,8 +3601,8 @@ def _sm107_spec() -> EngineSpec:
         name="sdpa_fwd_prefill_sm107",
         capabilities=Capabilities(
             layouts=frozenset({"bshd", "dense_flex"}),
-            sm_lo=107,
-            sm_hi=_BLACKWELL[1],
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
             delegated_exact=frozenset(((10, 7), shape) for shape in _sm107_shared_half.SHAPES | {(512, 512), (576, 512)}),
             delegated_envelope=True,
             phase="prefill",
@@ -3663,32 +3757,33 @@ def _sm107_spec() -> EngineSpec:
             # 128 = min(tile_ns)); the d128 rendering of the same file keeps 128.
             tile_ns_by_d_shape=SM107_TILE_NS_BY_D_SHAPE,
         ),
+        packed_hn_stats_override=True,
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
 def _sm107_half_specs():
     """Five native bodies plus two architecture contracts for shared bodies."""
-    from .kernels.sm107.d128_f16_multi_q.host import lower as lower_multi_q
-    from .kernels.sm107.small_f16_batch_pair.host import lower as lower_pair
-    from .kernels.sm107.d192_f16_multi_q.host import lower as lower_d192
-    from .kernels.sm107.d256_f16_lookahead.host import lower as lower_lookahead
-    from .kernels.sm107.d256_f16_swap_ab.host import lower as lower_swap_ab
-    from .kernels.sm107.shared_f16_single_q.host import lower as lower_shared_single_q
-    from .kernels.sm107.shared_d256_f16_lookahead.host import lower as lower_shared_lookahead
+    from .kernels.sm107.d128_f16_multi_q import host as multi_q_host
+    from .kernels.sm107.small_f16_batch_pair import host as pair_host
+    from .kernels.sm107.d192_f16_multi_q import host as d192_host
+    from .kernels.sm107.d256_f16_lookahead import host as lookahead_host
+    from .kernels.sm107.d256_f16_swap_ab import host as swap_ab_host
+    from .kernels.sm107.shared_f16_single_q import host as shared_single_q_host
+    from .kernels.sm107.shared_d256_f16_lookahead import host as shared_lookahead_host
 
     # The legacy policy owns the legal width envelopes and common features.
     # Each local contract narrows that declaration to one fixed body. Keep
     # the original flavor pool so exact D32 can retain its D64/D128 envelope.
     base = replace(_sm107_spec().capabilities, delegated_exact=frozenset(), delegated_envelope=False, sm_hi=107, tile_ms_by_d_shape=())
     rows = (
-        (_sm107_small_half.MULTI_Q, lower_multi_q, frozenset({128})),
-        (_sm107_small_half.BATCH_PAIR, lower_pair, frozenset({128})),
-        (_sm107_mid_half.D192, lower_d192, frozenset({128})),
-        (_sm107_mid_half.LOOKAHEAD, lower_lookahead, frozenset({128})),
-        (_sm107_mid_half.SWAP_AB, lower_swap_ab, frozenset({16, 32, 64})),
-        (_sm107_shared_half.SINGLE_Q, lower_shared_single_q, frozenset({128})),
-        (_sm107_shared_half.LOOKAHEAD, lower_shared_lookahead, frozenset({128})),
+        (_sm107_small_half.MULTI_Q, multi_q_host, frozenset({128})),
+        (_sm107_small_half.BATCH_PAIR, pair_host, frozenset({128})),
+        (_sm107_mid_half.D192, d192_host, frozenset({128})),
+        (_sm107_mid_half.LOOKAHEAD, lookahead_host, frozenset({128})),
+        (_sm107_mid_half.SWAP_AB, swap_ab_host, frozenset({16, 32, 64})),
+        (_sm107_shared_half.SINGLE_Q, shared_single_q_host, frozenset({128})),
+        (_sm107_shared_half.LOOKAHEAD, shared_lookahead_host, frozenset({128})),
     )
     body_shapes = {
         _sm107_small_half.BATCH_PAIR: frozenset({(32, 32), (64, 64)}),
@@ -3714,20 +3809,21 @@ def _sm107_half_specs():
                 **({"d_pad_multiple": 8, "d_envelope_floors": ()} if name in body_shapes else {}),
             ),
             partial(
-                lower,
+                host.lower,
                 lower_impl=lower_dsl_prefill,
                 knob_type=SdpaFwdKnobs,
                 **({"shape_of": _selected_d_shape} if name in _sm107_small_half.IMPLEMENTATIONS else {}),
             ),
+            packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE,
         )
-        for name, lower, tiles in rows
+        for name, host, tiles in rows
     )
 
 
 def _sm107_wide_half_specs():
     """Native Rubin wide-half owners; common graph semantics stay shared."""
-    from .kernels.sm107.d512_f16_role_split.host import lower as lower_role_split
-    from .kernels.sm107.d512_f16_2x2.host import lower as lower_two_by_two
+    from .kernels.sm107.d512_f16_role_split import host as role_split_host
+    from .kernels.sm107.d512_f16_2x2 import host as two_by_two_host
 
     base = replace(
         _sm107_spec().capabilities,
@@ -3771,8 +3867,13 @@ def _sm107_wide_half_specs():
     )
     two_by_two = replace(base, implementation=_sm107_wide_half.TWO_BY_TWO, tile_ms=frozenset({64}), cgas=frozenset({2, 4}))
     return tuple(
-        EngineSpec(caps.implementation, caps, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
-        for caps, lower in ((role_split, lower_role_split), (two_by_two, lower_two_by_two))
+        EngineSpec(
+            caps.implementation,
+            caps,
+            partial(host.lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs),
+            packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE,
+        )
+        for caps, host in ((role_split, role_split_host), (two_by_two, two_by_two_host))
     )
 
 
@@ -3908,25 +4009,27 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     """
 
     rubin_row = arch == "sm107"
+    native_shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    blackwell_shapes = native_shapes | {SM100_NATIVE_D576_SHAPE}
     return EngineSpec(
         name=f"sdpa_fwd_prefill_{arch}_fp8",
         capabilities=Capabilities(
             delegated_exact=(
                 frozenset(((10, 7), shape) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
                 if rubin_row
-                else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
+                else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in blackwell_shapes)
             ),
             delegated_envelope=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             # Ranges, not the parts that exist today (see sm_lo above): the
             # split point is the Rubin line — 100-106 runs the SM100 modules,
             # 107-119 the SM107 sibling.
-            sm_lo=107 if rubin_row else _BLACKWELL[0],
-            sm_hi=_BLACKWELL[1] if rubin_row else 106,
+            sm_lo=_RUBIN[0] if rubin_row else _BLACKWELL[0],
+            sm_hi=_RUBIN[1] if rubin_row else 106,
             phase="prefill",
             # Both architectures carry native D64 through their d128 FP8 body.
             # The record selects 64-wide K/O geometry, including packed/split plans.
-            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            d_shapes=native_shapes if rubin_row else blackwell_shapes,
             d_pad_multiple=16,
             # The d512 flavor serves the (256, 512] band on BOTH head dims —
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
@@ -3941,7 +4044,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # keep rank-5. Native SM107 uses rank-4 for both exact and partial heads.
             # Both architecture rows mirror api_dsl._SM100_FP8_ENVELOPE_FLOORS
             # so graph admission and prepared lowering agree.
-            d_envelope_floors=(((512, 512), 256),),
+            d_envelope_floors=(((512, 512), 256),) if rubin_row else (((512, 512), 256), (SM100_NATIVE_D576_SHAPE, 512)),
             # Both lines serve THD at every native flavor.  The Rubin arm keeps a
             # NAMED constant (shared with the standalone adapter's gate, rule 8b')
             # rather than collapsing to `d_shapes`, so a future partial arch line
@@ -3969,13 +4072,15 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
-            # Native per-tensor FP8 page pools on SM100/103: D64, D128,
-            # D256 and D512 use independent K/V block tables and pool strides. Dense Q,
+            # SM100/103 page loaders use independent K/V block tables and pool
+            # strides, including the shared D576/V512 MLA record. Dense Q,
             # scalar-scaled O, padding/causal/windows, sink and legal KV splits
             # compose with the loader. Native Rubin serves dense-Q D512 pools
             # through its role-split pipeline. THD D512 and block-scaled O decline.
             paged_kv=True,
-            paged_d_shapes=frozenset({(512, 512)}) if rubin_row else frozenset({(64, 64), (128, 128), (256, 256), (512, 512)}),
+            paged_d_shapes=(
+                frozenset({(512, 512)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE})
+            ),
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
@@ -4095,7 +4200,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             split_kv_supported=True,
-            split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})),
+            split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else blackwell_shapes),
             pack_gqas=frozenset({False, True}),
             # Native SM107 per-tensor FP8 flavors pack whole GQA groups,
             # including the D512 role-split pipeline.
@@ -4217,8 +4322,8 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
         d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=shape,
-        paged_kv=False,
-        paged_d_shapes=frozenset(),
+        paged_kv=True,
+        paged_d_shapes=shape,
         split_d_shapes=shape,
         pack_gqa_d_shapes=shape,
         out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
@@ -4328,7 +4433,7 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
     """One per-tensor FP8 body; shared graph binding and launch construction."""
     from .kernels.sm100.d512_fp8_role_split.host import lower
 
-    shape = frozenset({(512, 512)})
+    shape = frozenset({(512, 512), SM100_NATIVE_D576_SHAPE})
     capabilities = replace(
         _sm100_fp8_spec().capabilities,
         implementation=_D512_FP8_ROLE_SPLIT,
@@ -4336,8 +4441,8 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
         delegated_envelope=False,
         d_shapes=shape,
         d_pad_multiple=16,
-        d_envelope_floors=(((512, 512), 256),),
-        thd_d_shapes=shape,
+        d_envelope_floors=(((512, 512), 256), (SM100_NATIVE_D576_SHAPE, 512)),
+        thd_d_shapes=frozenset({(512, 512)}),
         paged_d_shapes=shape,
         split_d_shapes=shape,
         pack_gqa_d_shapes=shape,
@@ -4552,8 +4657,8 @@ def _sm107_mxfp8_spec() -> EngineSpec:
         capabilities=Capabilities(
             delegated_exact=frozenset((cc, shape) for cc in _sm107_mxfp8.DEVICE_CCS for shape in _sm107_mxfp8.SHAPES),
             layouts=frozenset({"bshd", "dense_flex"}),
-            sm_lo=107,
-            sm_hi=_BLACKWELL[1],
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
             phase="prefill",
             # Exact native shapes only -- the SF tensors are not zero-padded.
             # (192, 128) deliberately takes NO cgas_by_d_shape entry below, so it
@@ -4719,7 +4824,8 @@ def _sm80_spec() -> EngineSpec:
         capabilities=Capabilities(
             zero_scale=True,  # score_sign specialization (#1435)
             sm_lo=80,
-            sm_hi=80,  # A100 exactly: the kernels assume its 164 KiB opt-in SMEM
+            sm_hi=80,
+            sm_extra=frozenset({86, 89}),  # the same sm_80 kernels; api_dsl fits the tiles into the 99 KiB per-CTA budget
             phase="prefill",
             d_shapes=frozenset({(256, 256), (512, 512), (576, 512)}),  # masked native loads
             d_pad_multiple=8,
@@ -4757,7 +4863,7 @@ def _sm80_spec() -> EngineSpec:
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             # Explicit geometry is admitted by the shared native flavor domains
             # above. Leave the row domains empty to preserve A/FALLBACK choices.
-            delegated_exact=frozenset(((8, 0), shape) for shapes in _SM80_HALF_SHAPES.values() for shape in shapes),
+            delegated_exact=frozenset((cc, shape) for cc in SM80_ROW_PARTS for shapes in _SM80_HALF_SHAPES.values() for shape in shapes),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM80),
     )
@@ -4857,11 +4963,12 @@ def _sm120_spec() -> EngineSpec:
             delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS | _SM120_HALF_EXACT_SHAPES),
             delegated_envelope=True,
         ),
+        packed_hn_stats_override=True,
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
 
 
-def _sm120_explicit_spec(legacy: EngineSpec, implementation: str, shapes, tile_ms, host_lower, tile_ns=None) -> EngineSpec:
+def _sm120_explicit_spec(legacy: EngineSpec, implementation: str, shapes, tile_ms, host_lower, tile_ns=None, *, packed_hn_stats_override=False) -> EngineSpec:
     """An SM120 body on its native head tiles; shared graph binding and launch. ``tile_ns`` None keeps the legacy domain.
 
     A row that delegates its envelope keeps the padding rule on the owners, so padded graphs land on the owner's tile."""
@@ -4877,15 +4984,22 @@ def _sm120_explicit_spec(legacy: EngineSpec, implementation: str, shapes, tile_m
         tile_ms=frozenset(tile_ms),
         tile_ns=legacy.capabilities.tile_ns if tile_ns is None else frozenset(tile_ns),
     )
-    return EngineSpec(implementation, capabilities, partial(host_lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM120), knob_type=SdpaFwdKnobs))
+    return EngineSpec(
+        implementation,
+        capabilities,
+        partial(host_lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM120), knob_type=SdpaFwdKnobs),
+        packed_hn_stats_override=packed_hn_stats_override,
+    )
 
 
 def _sm120_d512_paired_spec() -> EngineSpec:
     from cudnn.sdpa.fwd.config_sm120 import D512_TILE
 
-    from .kernels.sm120.d512_f16_paired.host import lower
+    from .kernels.sm120.d512_f16_paired import host
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_D512_PAIRED, WIDE_F16_FLAVORS, {D512_TILE[0]}, lower, {D512_TILE[1]})
+    return _sm120_explicit_spec(
+        _sm120_spec(), _SM120_D512_PAIRED, WIDE_F16_FLAVORS, {D512_TILE[0]}, host.lower, {D512_TILE[1]}, packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE
+    )
 
 
 def _sm120_d512_fp8_paired_spec() -> EngineSpec:
@@ -4920,16 +5034,25 @@ def _sm120_mxfp8_general_spec() -> EngineSpec:
 
 def _sm120_d256_all_compute_spec() -> EngineSpec:
     from .kernels.sm120.d256_f16_all_compute.contract import QUERY_TILES
-    from .kernels.sm120.d256_f16_all_compute.host import lower
+    from .kernels.sm120.d256_f16_all_compute import host
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_D256_ALL_COMPUTE, {_SM120_D256}, QUERY_TILES, lower)
+    return _sm120_explicit_spec(
+        _sm120_spec(), _SM120_D256_ALL_COMPUTE, {_SM120_D256}, QUERY_TILES, host.lower, packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE
+    )
 
 
 def _sm120_f16_general_spec() -> EngineSpec:
     from .kernels.sm120.f16_general.contract import QUERY_TILES
-    from .kernels.sm120.f16_general.host import lower
+    from .kernels.sm120.f16_general import host
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_F16_GENERAL, _SM120_HALF_EXACT_SHAPES - {_SM120_D256}, QUERY_TILES, lower)
+    return _sm120_explicit_spec(
+        _sm120_spec(),
+        _SM120_F16_GENERAL,
+        _SM120_HALF_EXACT_SHAPES - {_SM120_D256},
+        QUERY_TILES,
+        host.lower,
+        packed_hn_stats_override=host.PACKED_HN_STATS_OVERRIDE,
+    )
 
 
 def _sm120_decode_key_group_spec() -> EngineSpec:
@@ -4953,33 +5076,6 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     if facts is None:
         return None, "graph is not a single sdpa() forward node (optionally followed by O * sigmoid(G))"
     return facts, mismatch(spec.capabilities, facts, knobs)
-
-
-def supports_stats_stride_override(spec: EngineSpec, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> bool:
-    """Plan-time contract of the prepared half THD HN binder, after admission.
-
-    This describes changing a packed head stride within the declared override
-    domain, not changing Stats packing, dtype, or storage capacity. Quantized,
-    padded-Stats and ragged-Q dense-decode binders have separate contracts.
-    """
-    if not (facts.shape_overrides and facts.thd and facts.wants_stats and facts.uniform_dtype):
-        return False
-    if facts.is_fp8 or facts.is_mxfp8 or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
-        return False
-    # Public notes require hardware qualification, not only a shared binder.
-    if (spec.capabilities.sm_lo, facts.device_cc) not in ((100, (10, 0)), (100, (10, 3)), (107, (10, 7)), (120, (12, 0))):
-        return False
-    stats = facts.stats_t
-    if stats is None or stats.ragged_offset is None:
-        return False
-    stride = stats.get_stride()
-    if ga.thd_stats_packing(stride[1], stride[2], facts.h_q) != "head_major":
-        return False
-    if _thd_decode_leg(spec.capabilities, facts):
-        return False
-    if _prepared_decline_reason(spec.capabilities, facts, _decode_tile_split_kv(knobs)) is not None:
-        return False
-    return bool(getattr(cudnn._pybind_module._SdpaThdBinder, "supports_stats_stride_override", False))
 
 
 def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
@@ -5144,6 +5240,8 @@ def lower_dsl_prefill(
             else ({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {})
         ),
         **({"swap_ab": knobs.swap_ab} if knobs is not None and knobs.swap_ab is not None else {}),
+        # CLUSTER_K_REDUCE: forwarded only when SET (mismatch admitted it on this row), so only an adapter that declares it sees it.
+        **({"cluster_reduce": True} if knobs is not None and knobs.cluster_reduce else {}),
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
         # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
         # attn_scale_prefolded_d_shapes claim gated it; every forward adapter declares the kwarg).
@@ -5227,7 +5325,7 @@ def lower_dsl_prefill(
             facts.thd
             and not getattr(api, "thd_decode_leg", False)
             and facts.epilogue_gate_t is None
-            and (facts.device_cc in ((10, 0), (10, 3)) or (facts.device_cc == (10, 7) and facts.d_qk == 128 and not (facts.is_fp8 or facts.is_mxfp8)))
+            and (facts.device_cc in _THD_ORIGIN_CCS or (facts.device_cc == (10, 7) and facts.d_qk == 128 and not (facts.is_fp8 or facts.is_mxfp8)))
             and (facts.d_qk, facts.d_v) in ((128, 128), (256, 256), SM100_NATIVE_D576_SHAPE)
             and (
                 (
@@ -5264,7 +5362,7 @@ def lower_dsl_prefill(
             and not getattr(api, "thd_decode_leg", False)
             and facts.epilogue_gate_t is None
             and lowering_row_name == "sdpa_fwd_prefill_sm100"
-            and facts.device_cc in ((10, 0), (10, 3))
+            and facts.device_cc in _THD_ORIGIN_CCS
             and (facts.d_qk, facts.d_v) == (64, 64)
             and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
             and (facts.has_paged_kv or api.pack_gqa)
@@ -5280,7 +5378,7 @@ def lower_dsl_prefill(
             facts.thd
             and facts.epilogue_gate_t is None
             and lowering_row_name in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm107")
-            and facts.device_cc in ((10, 0), (10, 3), (10, 7))
+            and facts.device_cc in (*_THD_ORIGIN_CCS, (10, 7))
             and (
                 (facts.d_qk, facts.d_v) == (192, 128)
                 or ((facts.d_qk, facts.d_v) == (64, 64) and api.packed_thd_split)
@@ -5396,7 +5494,11 @@ def lower_dsl_prefill(
             scheduler=getattr(cfg, "SCHEDULER_POLICY", SCHED_NATURAL),
             pack_group=getattr(cfg, "PACK_G", cfg.QH_PER_KH if cfg.PACK_GQA else 1),
             split_kv=cfg.SPLIT_KV,
+            # whether the split's partials are reduced inside the launch (one launch) or by the separate pass
+            cluster_reduce=bool(getattr(api, "_cluster_combine", False)),
         )
+        # A kernel whose in-launch reduction is the plan's CLUSTER_K_REDUCE knob must have compiled the selected form.
+        reduce_by_knob = bool(getattr(kernel_module, "CLUSTER_COMBINE_BY_KNOB", False))
         if (
             kernel_template != selected_kernel.template
             or implementation_config["query_tile"] != selected_kernel.query_tile
@@ -5406,6 +5508,7 @@ def lower_dsl_prefill(
             or implementation_config["scheduler"] != knobs.sched_policy
             or params.split_kv != knobs.split_kv
             or bool(params.pack_gqa) != bool(knobs.pack_gqa)
+            or (reduce_by_knob and implementation_config["cluster_reduce"] != bool(knobs.cluster_reduce))
         ):
             raise RuntimeError(f"{spec.name}: compiled implementation disagrees with the selected configuration: {implementation_config}")
 
@@ -5686,7 +5789,9 @@ def lower_dsl_prefill(
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch, PreparedThdLaunch
 
         if facts.thd and getattr(api, "_thd_spec", None) is not None:
-            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding, stats_stride_override=facts.shape_overrides)
+            # The selected adapter has built a THD launch. Its concrete LSE
+            # layout and quantization determine whether the binder can rebind.
+            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding, stats_stride_override=spec.packed_hn_stats_override and facts.shape_overrides)
         elif getattr(api, "_dense_spec", None) is not None:
             # Dense plans, and the decode tile's ragged-Q leg (a dense split
             # launch whose Q / O / Stats rows come from the bound ragged offsets).

@@ -170,6 +170,11 @@ query_knobs(int64_t const engine_id,
             frontend_knobs[i].get_ptr(), CUDNN_ATTR_KNOB_INFO_STRIDE, CUDNN_TYPE_INT64, 1, &elemCount, &stride));
 
         auto frontend_knob_type = convert_from_backend_knob_type(type);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(frontend_knob_type == KnobType_t::NOT_SET,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Cannot represent backend knob type " +
+                                           std::to_string(static_cast<int64_t>(type)) +
+                                           " in the public knob vocabulary.");
         knobs.emplace_back(frontend_knob_type, maxValue, minValue, stride);
     }
 

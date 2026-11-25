@@ -100,6 +100,15 @@ def test_heads_outside_the_wide_envelope_do_not_enter_the_owner(dims):
     assert engines.mismatch(SPECS[NAME].capabilities, facts(d_qk=dims[0], d_v=dims[1])) is not None
 
 
+@pytest.mark.parametrize("cc", [(12, 0), (12, 1)])
+def test_split_records_require_the_natural_scheduler(cc):
+    f = facts(device_cc=cc)
+    caps = SPECS[NAME].capabilities
+    for sched in (1, 2):
+        assert "SCHED_NATURAL" in engines.mismatch(caps, f, engines.SdpaFwdKnobs(split_kv=3, sched_policy=sched))
+    assert engines.mismatch(caps, f, engines.SdpaFwdKnobs(split_kv=3, sched_policy=0)) is None
+
+
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
 @pytest.mark.parametrize(
     "overrides",

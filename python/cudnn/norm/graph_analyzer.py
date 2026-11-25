@@ -62,9 +62,14 @@ _BWD_MARKERS = ("BACKWARD", "BPROP", "BWD", "GRAD")
 
 
 def _device_cc() -> Optional[tuple]:
-    if not torch.cuda.is_available():
+    """Compute capability of the build scope's (the graph handle's) device, else the current one."""
+    from cudnn._device import device_info
+    from cudnn.frost.device import current_device
+
+    try:
+        return device_info(current_device()).compute_capability
+    except (NotImplementedError, RuntimeError, ValueError):
         return None
-    return torch.cuda.get_device_capability(torch.cuda.current_device())
 
 
 def _stride_order(dim: tuple, stride: tuple) -> tuple:

@@ -3,7 +3,7 @@
 """Shared-memory and tensor-memory operands for the 64-key QSA forward.
 
 KV retains native forward feature-slab order: each slab holds 64 rows of 64
-BF16 features. P has a separate unswizzled MN-major core-8 layout. M64 scores
+16-bit (BF16 or FP16) features. P has a separate unswizzled MN-major core-8 layout. M64 scores
 and M128 output pages have different per-thread coordinates; callers must
 redistribute head scalars before updating output.
 """
@@ -28,32 +28,32 @@ def pointer(raw, offset, dtype: cutlass.Constexpr):
 
 
 @cute.jit
-def slab_pointer(raw, offset):
-    return cute.recast_ptr(pointer(raw, offset, BF16), swizzle_=cute.make_swizzle(3, 4, 3))
+def slab_pointer(raw, offset, dtype: cutlass.Constexpr):
+    return cute.recast_ptr(pointer(raw, offset, dtype), swizzle_=cute.make_swizzle(3, 4, 3))
 
 
 @cute.jit
-def kv_tensor(raw, offset):
+def kv_tensor(raw, offset, dtype: cutlass.Constexpr):
     layout = cute.make_layout(((8, 8), (64, 4)), stride=((64, 512), (1, 4096)))
-    return cute.make_tensor(slab_pointer(raw, offset), layout)
+    return cute.make_tensor(slab_pointer(raw, offset, dtype), layout)
 
 
 @cute.jit
-def q_tensor(raw, offset):
+def q_tensor(raw, offset, dtype: cutlass.Constexpr):
     layout = cute.make_layout(((8, 2), (64, 4)), stride=((64, 512), (1, 1024)))
-    return cute.make_tensor(slab_pointer(raw, offset), layout)
+    return cute.make_tensor(slab_pointer(raw, offset, dtype), layout)
 
 
 @cute.jit
-def p_tensor(raw, offset):
+def p_tensor(raw, offset, dtype: cutlass.Constexpr):
     layout = cute.make_layout(((8, 2), (8, 8)), stride=((1, 64), (8, 128)))
-    return cute.make_tensor(pointer(raw, offset, BF16), layout)
+    return cute.make_tensor(pointer(raw, offset, dtype), layout)
 
 
 @cute.jit
-def store_p(raw, offset, key, head, value):
+def store_p(raw, offset, key, head, value, dtype: cutlass.Constexpr):
     index = head % 8 + head // 8 * 64 + key % 8 * 8 + key // 8 * 128
-    (pointer(raw, offset, BF16) + index).store(value.to(BF16))
+    (pointer(raw, offset, dtype) + index).store(value.to(dtype))
 
 
 @cute.jit
@@ -96,10 +96,10 @@ def gather_four(desc, raw, offset, head, slab: cutlass.Constexpr, rows, bar):
 
 
 @cute.jit
-def atom(m: cutlass.Constexpr, major: cutlass.Constexpr):
+def atom(m: cutlass.Constexpr, major: cutlass.Constexpr, dtype: cutlass.Constexpr = BF16):
     return cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
-            BF16,
+            dtype,
             F32,
             (m, 16, 16),
             tcgen05.CtaGroup.ONE,
@@ -120,10 +120,10 @@ def accumulator(mma, tmem, column, m: cutlass.Constexpr):
 
 
 @cute.jit
-def score(raw, kv_offset, tmem, column, k16, accumulate):
-    mma = atom(64, cute.nvgpu.OperandMajorMode.K)
-    a = cute.local_tile(kv_tensor(raw, kv_offset), (64, 16), (0, k16))
-    b = cute.local_tile(q_tensor(raw, 0), (16, 16), (0, k16))
+def score(raw, kv_offset, tmem, column, k16, accumulate, dtype: cutlass.Constexpr):
+    mma = atom(64, cute.nvgpu.OperandMajorMode.K, dtype)
+    a = cute.local_tile(kv_tensor(raw, kv_offset, dtype), (64, 16), (0, k16))
+    b = cute.local_tile(q_tensor(raw, 0, dtype), (16, 16), (0, k16))
     part = mma.get_slice(0)
     mma.set(tcgen05.Field.ACCUMULATE, accumulate)
     acc = accumulator(mma, tmem, column, 64)
@@ -131,12 +131,12 @@ def score(raw, kv_offset, tmem, column, k16, accumulate):
 
 
 @cute.jit
-def value(raw, kv_offset, p_offset, tmem, column, half: cutlass.Constexpr, k16, accumulate):
-    mma = atom(128, cute.nvgpu.OperandMajorMode.MN)
-    base = kv_tensor(raw, kv_offset)
+def value(raw, kv_offset, p_offset, tmem, column, half: cutlass.Constexpr, k16, accumulate, dtype: cutlass.Constexpr):
+    mma = atom(128, cute.nvgpu.OperandMajorMode.MN, dtype)
+    base = kv_tensor(raw, kv_offset, dtype)
     transposed = cute.make_tensor(base.iterator, cute.select(base.layout, mode=[1, 0]))
     a = cute.local_tile(transposed, (128, 16), (half, k16))
-    b = cute.local_tile(p_tensor(raw, p_offset), (16, 16), (0, k16))
+    b = cute.local_tile(p_tensor(raw, p_offset, dtype), (16, 16), (0, k16))
     part = mma.get_slice(0)
     mma.set(tcgen05.Field.ACCUMULATE, accumulate)
     acc = accumulator(mma, tmem, column, 128)

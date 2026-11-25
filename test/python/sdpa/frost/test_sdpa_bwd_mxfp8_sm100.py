@@ -214,10 +214,11 @@ def _run(
     repeat_outputs=0,
     d=None,
     dv=None,
+    pin=True,
     **sdpa_kwargs,
 ):
-    """Quantize random operands, build the graph, pin the engine, execute, and
-    compare dQ/dK/dV against the MXFP8 backward reference (``dv`` = D_V, default D_QK)."""
+    """Quantize random operands, build the graph, pin the engine (``pin=False``: take the default walk), execute,
+    and compare dQ/dK/dV against the MXFP8 backward reference (``dv`` = D_V, default D_QK)."""
     from sdpa.mxfp8_ref import compute_ref, compute_ref_backward
 
     torch.manual_seed(seed)
@@ -278,9 +279,10 @@ def _run(
         sdpa_kwargs["use_causal_mask"] = True
     g, t, (dq_t, dk_t, dv_t, *_amax) = _build_graph(b, hq, hkv, sq, skv, d, dv=dv, out_dt=out_dt, scale=None if omit_scale else scale, **sdpa_kwargs)
     g.create_execution_plans([cudnn.heur_mode.A])
-    idx = _plan_index(g)
-    assert idx is not None, f"{_ENGINE} not offered; plans = {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
-    g.select_plan(idx)
+    if pin:
+        idx = _plan_index(g)
+        assert idx is not None, f"{_ENGINE} not offered; plans = {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
+        g.select_plan(idx)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -429,6 +431,65 @@ def test_deterministic_flag():
     """Both kernels own their output tiles (no atomics), so the row honors
     use_deterministic_algorithm; the result must be bitwise stable."""
     _run(use_deterministic_algorithm=True)
+
+
+@pytest.mark.L0
+def test_fp16_delta_product_does_not_overflow(monkeypatch):
+    """O * dO = 256 * 256 overflows FP16, so the delta preprocessing must widen before the product (review on #2637). One query
+    sees one key (top-left causal, S_q 1): with Q = K = 0 and V = dO = 256, dQ = dK = 0 and dV = 256 at that key, 0 elsewhere.
+    The opt-in flag offers the chain; the backend declines D256, so the walk selects it."""
+    from sdpa.mxfp8_ref import compute_ref
+
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    b, h, sq, skv, d, dev = 1, 2, 1, 128, _D, "cuda"
+    scale, out_dt = 1.0 / math.sqrt(d), torch.float16
+    q, k = torch.zeros(b, h, sq, d, device=dev), torch.zeros(b, h, skv, d, device=dev)
+    v, dO = torch.full((b, h, skv, d), 256.0, device=dev), torch.full((b, h, sq, d), 256.0, device=dev)
+    Q, K, V, DO = (_quantize(x, b, h, s, d) for x, s in ((q, sq), (k, skv), (v, skv), (dO, sq)))
+    o_ref, stats = compute_ref(
+        Q["row"], K["row"], V["col"], Q["sf_row_ref"], K["sf_row_ref"], V["sf_col_ref"], scale,
+        output_type=out_dt, right_bound=0, diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+    )  # fmt: skip
+    g, t, (dq_t, dk_t, dv_t, *_amax) = _build_graph(b, h, h, sq, skv, out_dt=out_dt, scale=scale, use_causal_mask=True)
+    g.create_execution_plans([cudnn.heur_mode.A])
+    g.check_support()
+    g.build_plans()
+    assert g.selected_engine is not None and g.selected_engine.name == "sdpa_bwd_sm100_d256_mxfp8", g.selected_engine
+    grads = [_to_bshd(torch.full(shape, float("nan"), device=dev, dtype=out_dt)) for shape in ((b, h, sq, d), (b, h, skv, d), (b, h, skv, d))]
+    pack = {
+        t[n]: x for n, x in (("q", Q["row"]), ("q_T", Q["col"]), ("k", K["row"]), ("k_T", K["col"]), ("v", V["row"]), ("dO", DO["row"]), ("dO_T", DO["col"]))
+    }
+    pack.update({t[n]: s for n, s in (("sf_q", Q["sf_row"]), ("sf_q_T", Q["sf_col"]), ("sf_k", K["sf_row"]), ("sf_k_T", K["sf_col"]))})
+    pack.update({t["sf_v"]: V["sf_row"], t["sf_dO"]: DO["sf_row"], t["sf_dO_T"]: DO["sf_col"], t["stats"]: stats.contiguous()})
+    pack.update({t["o_f16"]: _to_bshd(o_ref.to(out_dt)), t["dO_f16"]: _to_bshd(dO.to(out_dt)), dq_t: grads[0], dk_t: grads[1], dv_t: grads[2]})
+    g.execute(pack, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+    torch.cuda.synchronize()
+    dq, dk, dv = (x.float() for x in grads)
+    assert torch.isfinite(dq).all() and torch.isfinite(dk).all() and torch.isfinite(dv).all()
+    assert dq.abs().max().item() == 0 and dk.abs().max().item() == 0
+    assert torch.equal(dv[:, :, 0], torch.full_like(dv[:, :, 0], 256.0)) and dv[:, :, 1:].abs().max().item() == 0
+
+
+@pytest.mark.L0
+def test_default_planning_serves_d256(monkeypatch):
+    """Flag unset, nothing pinned: the backend declines D256 (9.24 through 9.30), so the walk reaches the trailing
+    D256 chain (20625) and its gradients pass the reference."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    run = _run(hq=8, hkv=2, sq=257, skv=256, causal=True, pin=False)
+    engine = run.graph.selected_engine
+    assert engine is not None and engine.name == "sdpa_bwd_sm100_d256_mxfp8", engine
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128)], ids=["d128", "d192"])
+def test_default_planning_keeps_backend_widths_on_the_backend(monkeypatch, d, dv):
+    """Control for the D256 case: where the backend plans, default planning still selects it."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    g, *_ = _build_graph(1, 2, 2, 256, 256, d=d, dv=dv, scale=d**-0.5)
+    g.create_execution_plans([cudnn.heur_mode.A])
+    g.check_support()
+    g.build_plans()
+    assert g.selected_engine is None, g.selected_engine.name
 
 
 @pytest.mark.L0

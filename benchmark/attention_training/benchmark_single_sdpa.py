@@ -490,7 +490,7 @@ def run_benchmark(
         Dict with keys:
             - time_ms: Median time of the requested pass in milliseconds
             - tflops: TFLOPS for the requested pass
-            - max_diff: Maximum difference vs reference
+            - max_diff: Maximum absolute difference across checked tensors, or NaN if validation was skipped or failed
             - gpu_name: GPU name string
             - cudnn_version: cuDNN version (if available)
 
@@ -615,7 +615,7 @@ def run_benchmark(
         "backend_detail": ",".join(parts[15:]) or None,
         "time_ms": time_ms,
         "tflops": tflops,
-        "max_diff": float(parts[12]) if len(parts) > 12 else 0.0,
+        "max_diff": float(parts[12]) if len(parts) > 12 else float("nan"),
         "gpu_name": gpu_name,
         "cudnn_version": cudnn_version,
         "cudnn_backend_version": cudnn_backend_version,
@@ -694,6 +694,8 @@ else:
     else:
         raise ValueError(f"Invalid data type: {args.data_type}")
 
+    if args.sliding_window_size is not None and args.sliding_window_size < 1:
+        raise ValueError("Sliding window size must be positive")
     if args.sliding_window_size is not None and args.attn_mask not in ("top_left", "bottom_right"):
         raise ValueError("Sliding window attention requires attn_mask='top_left' or 'bottom_right' (causal)")
 
@@ -905,10 +907,14 @@ else:
             dQuery = torch.empty_like(query)
             dKey = torch.empty_like(key)
             dValue = torch.empty_like(value)
+
         # dO in O's memory format (BSHD-physical): torch.randn(output.shape) would
         # allocate BHSD-contiguous and hand every backward a gradient laid out
         # differently from the activations.
-        dOutput = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
+        def new_cudnn_doutput():
+            return torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
+
+        dOutput = new_cudnn_doutput()
         stats = _new_stats()
         if is_dropout:
             dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
@@ -1368,16 +1374,10 @@ else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride()).set_data_type(cudnn.data_type.BFLOAT16)
                 dV_bwd.set_output(True).set_dim(dValue.size()).set_stride(dValue.stride()).set_data_type(cudnn.data_type.BFLOAT16)
-                # The gradients are half precision, so the amax_dQ/dK/dV outputs
-                # carry no information a consumer needs; the FROST MXFP8 backward
-                # engine does not produce them and declines a graph that asks.
-                # Leave them virtual under cudnn_oss (dims are still required by
-                # validate()); the native backend path keeps requesting them.
-                mxfp8_amax_requested = args.sdpa_backend != "cudnn_oss"
+                # amax_dQ/dK/dV stay virtual on every leg, as Transformer Engine builds this graph (the gradients
+                # are half precision); validate() still needs their dims.
                 for _amax_t, _amax_gpu in ((amax_dQ_bwd, amax_dQ_gpu), (amax_dK_bwd, amax_dK_gpu), (amax_dV_bwd, amax_dV_gpu)):
                     _amax_t.set_dim(_amax_gpu.size()).set_stride(_amax_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
-                    if mxfp8_amax_requested:
-                        _amax_t.set_output(True)
             else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride())
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride())
@@ -1497,10 +1497,6 @@ else:
                     dK_bwd: dKey,
                     dV_bwd: dValue,
                 }
-                if mxfp8_amax_requested:
-                    variant_pack_bwd[amax_dQ_bwd] = amax_dQ_gpu
-                    variant_pack_bwd[amax_dK_bwd] = amax_dK_gpu
-                    variant_pack_bwd[amax_dV_bwd] = amax_dV_gpu
                 workspace = torch.empty(
                     max(graph_fwd.get_workspace_size(), graph_bwd.get_workspace_size()),
                     device="cuda",
@@ -1602,41 +1598,57 @@ else:
                 is_causal=args.attn_mask in ("top_left", "bottom_right"),
             )
 
+    # FlashAttention centers both window radii on its bottom-right diagonal.
+    flash_causal = args.attn_mask != "no_mask"
+    width = args.sliding_window_size
+    flash_window = (width - 1, 0) if width is not None else (None, None)
+    reverse_reference = False
+    if args.attn_mask == "top_left" and q_seqlen != kv_seqlen:
+        shift = q_seqlen - kv_seqlen
+        flash_causal = False
+        # Relative to bottom-right, top-left has right radius shift and left radius W - 1 - shift.
+        if shift >= 0 and (width is None or width > shift):
+            flash_window = (None if width is None else width - 1 - shift, shift)
+        else:
+            if args.sdpa_backend.startswith("flash_attention"):
+                exit_unsupported(f"{args.sdpa_backend} cannot express this rectangular top-left mask with native window radii")
+            # For the untimed reference, reverse Q and KV. The top-left band
+            # becomes a bottom-right band pointing toward increasing key indices.
+            reverse_reference = True
+            flash_window = (0, None if width is None else width - 1)
+    # FA2 and FA3 require integer radii. FA4 uses None for an unbounded side.
+    flash_window_int = tuple(-1 if radius is None else radius for radius in flash_window)
+
     if args.sdpa_backend == "flash_attention":
         import flash_attn
         from flash_attn import flash_attn_func
 
         # Flash Attention Native
         def flash_attention_sdpa(query, key, value):
-            # flash-attn 2.7+ requires ints here: (-1, -1) is its no-window
-            # sentinel; passing None fails the SymInt cast in the op schema.
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
             return flash_attn_func(
                 query,
                 key,
                 value,
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
+                causal=flash_causal,
+                window_size=flash_window_int,
                 deterministic=args.deterministic_bwd,
             )
 
     if args.sdpa_backend == "flash_attention_3":
-        import flash_attn_interface
+        from flash_attn_interface import flash_attn_func as fa3_func
 
         def flash_attention_3_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
-            output, _ = flash_attn_interface.flash_attn_func(
+            return fa3_func(
                 query,
                 key,
                 value,
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
+                causal=flash_causal,
+                window_size=flash_window_int,
                 deterministic=args.deterministic_bwd,
             )
-            return output
 
     if args.sdpa_backend == "flash_attention_4" or (not args.skip_ref):
-        import flash_attn.cute.interface as flash_attn_interface
+        from flash_attn.cute.interface import flash_attn_func as fa4_func
 
         # flash_attn_func's own default is num_splits=1 (never split KV); 0 engages
         # FA4's split-KV heuristic. Always pass the resolved value explicitly.
@@ -1647,20 +1659,21 @@ else:
             fa4_num_splits = 1
 
         def flash_attention_4_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
+            if reverse_reference:
+                query, key, value = (t.flip([1]) for t in (query, key, value))
             kwargs = dict(
-                causal=args.attn_mask != "no_mask",
-                window_size=window_size,
+                causal=flash_causal,
+                window_size=flash_window,
                 deterministic=args.deterministic_bwd,
                 num_splits=fa4_num_splits,
             )
-            output, _ = flash_attn_interface.flash_attn_func(
+            output, _ = fa4_func(
                 query,
                 key,
                 value,
                 **kwargs,
             )
-            return output
+            return output.flip([1]) if reverse_reference else output
 
     def get_sdpa_function(backend):
         if backend == "pyt_math":
@@ -1718,6 +1731,21 @@ else:
             return dQuery, dKey, dValue, dOutput
         else:
             raise ValueError(f"Invalid backend: {backend}")
+
+    def check_reference(query, key, value, output, gradients, d_output):
+        # The measured tensors are in BHSD after postprocessing. FA4 takes and returns BSHD.
+        ref_inputs = preprocess_qkv(query, key, value, "flash_attention_4")
+        output_ref = flash_attention_4_sdpa(*ref_inputs).transpose(1, 2)
+        comparisons = [(output, output_ref, 1e-2)]
+        if gradients:
+            ref_grads = torch.autograd.grad(output_ref, (query, key, value), d_output)
+            comparisons.extend((actual, expected, 2e-2) for actual, expected in zip(gradients, ref_grads))
+
+        max_diffs = []
+        for actual, expected, tol in comparisons:
+            torch.testing.assert_close(actual, expected, rtol=tol, atol=tol)
+            max_diffs.append((actual.detach() - expected.detach()).abs().max())
+        return torch.stack(max_diffs).max().item()
 
     # Util functions for calculating flops and tflops/s achieved
     def flops(
@@ -1805,7 +1833,7 @@ else:
 
     forward_times = []
     backward_times = []
-    forward_diffs = []
+    reference_diffs = []
 
     total_iters = num_iters + dry_run_iters
 
@@ -1851,9 +1879,8 @@ else:
             amax_dP_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
         query, key, value = preprocess_qkv(query, key, value, args.sdpa_backend)
-        dOutput = torch.randn(*query.shape[:-1], head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype)
-
         if is_cudnn_fe:
+            dOutput = new_cudnn_doutput()
             if args.data_type == "mxfp8":
                 if o_block_scale == 16:
                     # FP4 O: the packed byte container (two E2M1 per byte).
@@ -2040,6 +2067,8 @@ else:
                 if run_bwd:
                     variant_pack_bwd[seed_bwd] = dropout_seed
                     variant_pack_bwd[offset_bwd] = dropout_offset
+        else:
+            dOutput = torch.randn(*query.shape[:-1], head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype)
 
         l2_flush_buffer.zero_()
 
@@ -2184,21 +2213,9 @@ else:
             value,
             output,
         ) = postprocess_qkvo(query, key, value, output, args.sdpa_backend)
-        if args.data_type not in ("fp8", "mxfp8") and not args.skip_ref and run_fwd:
+        if args.data_type not in ("fp8", "mxfp8") and not args.skip_ref:
             try:
-                output_ref = flash_attention_4_sdpa(query, key, value)
-                if run_bwd:
-                    query.retain_grad()
-                    key.retain_grad()
-                    value.retain_grad()
-                    output_ref.backward(dOutput)
-
-                    torch.testing.assert_close(dQuery, query.grad, rtol=2e-2, atol=2e-2)
-                    torch.testing.assert_close(dKey, key.grad, rtol=2e-2, atol=2e-2)
-                    torch.testing.assert_close(dValue, value.grad, rtol=2e-2, atol=2e-2)
-
-                torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
-                forward_diffs.append(torch.max(torch.abs(output.detach() - output_ref.detach())).item())
+                reference_diffs.append(check_reference(query, key, value, output, (dQuery, dKey, dValue) if run_bwd else (), dOutput))
             except Exception as e:
                 if first_error:
                     print(
@@ -2206,9 +2223,7 @@ else:
                     )
                     print(f"[WARN] See error message: {e}")
                     first_error = False
-                forward_diffs.append(0.0)
-        else:
-            forward_diffs.append(0.0)
+                reference_diffs.append(float("nan"))
 
         if is_cudnn_fe:
             del query, key, value, output, dQuery, dKey, dValue, dOutput, stats
@@ -2301,6 +2316,8 @@ else:
     bwd_sol_str = _sol(bwd_tflops)
 
     if args.format_output:
+        # A failed check on any iteration invalidates the aggregate, including during timing warmup.
+        max_diff = np.max(reference_diffs) if reference_diffs else float("nan")
         # Trailing field: the plan the measured pass ran (cuDNN legs; may itself contain commas, so it goes last).
         _plan = ""
         if is_cudnn_fe:
@@ -2312,7 +2329,7 @@ else:
         if args.graph_replay > 0 and is_cudnn_fe:
             _plan = f"{_plan} [graph-replay x{args.graph_replay}]"
         print(
-            f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''},{_plan}"
+            f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{max_diff},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''},{_plan}"
         )
     else:
         _tt = f" [graph-replay x{args.graph_replay}]" if (args.graph_replay > 0 and is_cudnn_fe) else (" [cuda-events]" if _EVENT_TIMING else "")

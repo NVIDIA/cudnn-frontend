@@ -1,0 +1,70 @@
+{
+  "inputs": {
+    "indices": {
+      "dtype": "torch.int32",
+      "sha256": "05a38ce0e7c0669349f922173148afb07968d00b6ab677d4d121a1671d2215a2",
+      "shape": [
+        2
+      ]
+    },
+    "initial_state": {
+      "dtype": "torch.float16",
+      "sha256": "9163f1d0b8b9857f3c21ed469086c1c71562b6fcaae08b50d03bbf566fd78670",
+      "shape": [
+        3,
+        17,
+        4
+      ]
+    },
+    "weight": {
+      "dtype": "torch.float16",
+      "sha256": "2eefc17b6459a05fcbc9606c62af08d15a522d7a0ce7619e710effdf817c33dd",
+      "shape": [
+        17,
+        4
+      ]
+    },
+    "x": {
+      "dtype": "torch.float16",
+      "sha256": "c6f2ef5c15e83cf957eb83fafe2378a689ac66e7870854ee1c555014d94f4105",
+      "shape": [
+        2,
+        17
+      ]
+    }
+  },
+  "outputs": {
+    "output": {
+      "dtype": "torch.float16",
+      "sha256": "2b88a80b1739a704db49f0d5c11c2371b8ba07dcf39513fb4427dd196d1b75c3",
+      "shape": [
+        2,
+        17
+      ]
+    },
+    "state": {
+      "dtype": "torch.float16",
+      "sha256": "80f2e8478266ed41cbb4e9ac187c2e54d29592fa9f6f834a46e65e84b1ab59de",
+      "shape": [
+        3,
+        17,
+        4
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13020,
+    "cudnn": 92700,
+    "cutlass": "4.8.1",
+    "gpu": "NVIDIA GH200 480GB",
+    "sm": [
+      9,
+      0
+    ],
+    "sm_count": 132,
+    "torch": "2.14.0+cu130",
+    "tvm_ffi": "0.1.15.post2"
+  },
+  "schema": 1
+}

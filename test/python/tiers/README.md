@@ -18,7 +18,8 @@ SMOKE is a subset of FULL, FULL of CI's L0, CI's L0 of NIGHTLY.
 carries a tier and moving a cell is a one-line edit of a list:
 
 - `smoke_<arch>.txt` -- one list per compute capability, `arch` = `cc<major><minor>` of the GPU the process runs on (`cc107`
-  on Rubin, `cc100` on B200 / GB200, `cc103` on B300 / GB300, `cc120` on the SM120 class -- RTX 5090 / RTX PRO 6000, cc 12.0;
+  on Rubin, `cc100` on B200 / GB200, `cc103` on B300 / GB300, `cc90` on H100 / H200 / GH200, `cc120` on the SM120 class --
+  RTX 5090 / RTX PRO 6000, cc 12.0;
   a cc 12.1 part reads `cc121`, which has no list yet). A capability without a list has an EMPTY SMOKE tier --
   `-m smoke` then selects nothing (exit 5) and `conftest.py` says so in one `[tiers] no SMOKE list for this GPU ...` line on
   stderr. `CUDNN_TEST_TIER_ARCH=cc107` applies another arch's list on any host (to inspect or collect it).
@@ -66,8 +67,9 @@ NIGHTLY-only -- a cell leaves FULL only with a named twin that keeps its arm (`n
    today; a cell that is its own contract -- an Int32-overflow probe -- stays in FULL.)
 4. Never: `gpu_exclusive` cells, reject / decline / typed-error cells, or any cell whose demotion would change a tolerance.
 
-Counts at the time of writing: SMOKE cc 10.7 = 358 cells (266 hand-picked + 92 rule-added), cc 10.0 = 267 (135 + 132),
-cc 10.3 = 252 (the cc 10.0 cells that run on cc 10.3; the list's header names the 24 left out);
+Counts at the time of writing: SMOKE cc 10.7 = 358 cells (266 hand-picked + 92 rule-added), cc 10.0 = 274 (142 + 132),
+cc 9.0 = 60 (49 FROST SDPA sm90 hand-picked + 11 rule-added; the routing / eligibility modules are host-only and stay out),
+cc 10.3 = 282 (the cc 10.0 cells that run on cc 10.3; the list's header names the 15 left out);
 NIGHTLY-only = 120 (96 codegen pins + 24 B / H / seed twins); SMOKE cc 12.0 = 12 cells (the fused GDN decode / verify steps only -- the
 FROST SDPA sm120 modules have no list yet). Lists for other capabilities are added as they are reviewed.
 
@@ -80,6 +82,10 @@ contiguous on the command line (`test/AGENTS.md`):
 pytest -m smoke -n 4 --dist loadgroup sdpa/frost gated_attention_block/cutedsl sdpa/graph/test_mhas_v2.py linear_attention/frost   # SMOKE, one GPU
 pytest -m "L0 and not nightly_only" sdpa/frost gated_attention_block/cutedsl sdpa/graph/test_mhas_v2.py linear_attention/frost      # FULL
 ```
+
+On a cc 9.0 part (`cc90`) the SMOKE list holds the FROST SDPA sm90 cells of `sdpa/frost` (one section per engine row of
+`python/cudnn/sdpa/frost/support/sm90.md`), so `pytest -m smoke sdpa/frost` is the whole tier there; the other paths collect and
+deselect.
 
 On a cc 12.0 part (`cc120`) the SMOKE list holds the fused GDN decode / verify cells of `linear_attention/frost` only (12 cells;
 the FROST SDPA sm120 modules have no list yet), so `pytest -m smoke linear_attention/frost` is the whole tier there; the other

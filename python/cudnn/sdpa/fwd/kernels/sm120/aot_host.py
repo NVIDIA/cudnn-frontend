@@ -24,7 +24,7 @@ from cuda.bindings import driver as cuda_driver
 from cudnn.frost.template_loader import load_template
 from cudnn.sdpa.fwd.kernels._common_blackwell import _bshd
 
-EXPORT_OPTIONS = "--gpu-arch sm_120a"
+EXPORT_OPTIONS = "--gpu-arch sm_120f"
 
 
 @cute.jit

@@ -808,8 +808,8 @@ def test_grouped_gemm_glu_hadamard_wrapper_canonical_matches_legacy(request, ab_
 #
 # 1. D is evaluated from C *as stored in c_dtype*, so a consumer that recomputes the activation
 #    from the saved C (the dSReLU backward, activation recomputation) reproduces D bit for bit.
-# 2. Amax is the amax of D as stored in d_dtype, and PostRhtAmax is the amax of the transformed
-#    values after rounding to BF16 -- the values the downstream NVFP4 quantizer actually sees.
+# 2. Amax describes stored D; PostRhtAmax uses BF16 input/output rounding around the
+#    transform, matching the downstream NVFP4 quantizer.
 # 3. tanh_clamp_scale and rht_sign_mask are trace-time constants: both must reach the kernel
 #    and both must be part of the wrapper's cache key.
 # 4. All of the above hold on both post-RHT paths (shared-memory FWHT and TMEM).
@@ -895,13 +895,13 @@ def _build_srelu_option_case(request, *, c_dtype=torch.bfloat16, d_dtype=torch.b
     return inputs, cfg
 
 
-def _run_srelu_option_case(case, **wrapper_kwargs):
-    """Run the wrapper over an already-built case, so repeated calls share identical inputs."""
+def _launch_srelu_option_case(case, **wrapper_kwargs):
+    """Launch the wrapper over an already-built case without waiting for the kernel."""
     from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
 
     inputs, cfg = case
     wrapper_kwargs.setdefault("act_func", "srelu")
-    outputs = grouped_gemm_glu_hadamard_wrapper_sm100(
+    return grouped_gemm_glu_hadamard_wrapper_sm100(
         a_tensor=inputs["a_tensor"],
         b_tensor=inputs["b_tensor"],
         sfa_tensor=inputs["sfa_tensor"],
@@ -920,6 +920,11 @@ def _run_srelu_option_case(case, **wrapper_kwargs):
         m_aligned=cfg["m_aligned"],
         **wrapper_kwargs,
     )
+
+
+def _run_srelu_option_case(case, **wrapper_kwargs):
+    """Run the wrapper over an already-built case, so repeated calls share identical inputs."""
+    outputs = _launch_srelu_option_case(case, **wrapper_kwargs)
     torch.cuda.synchronize()
     return outputs
 
@@ -957,11 +962,11 @@ def _assert_amax_is_stored_d_amax(inputs, outputs, d: torch.Tensor) -> None:
 
 
 def _post_rht_amax_ref(inputs, d: torch.Tensor, rht_sign_mask: int = 0) -> Dict[int, float]:
-    """Per-expert amax of the randomized Hadamard transform of the stored D, rounded to BF16.
+    """Per-expert Hadamard amax with BF16 input/output rounding.
 
-    Bit ``i`` of ``rht_sign_mask`` negates element ``i`` of each 16-token block before the
-    normalized 16-point transform. Computed in FP64, where the transform of BF16/FP16 inputs
-    is exact, then rounded to BF16 as the consumer's BF16 transform output is.
+    Round stored D to BF16, apply the normalized 16-point transform in FP64,
+    then round to BF16 before reducing. Bit ``i`` of ``rht_sign_mask`` negates
+    element ``i`` of each input block.
     """
     from cudnn.gemm.cutedsl.grouped.glu_hadamard.hadamard_utils import HADAMARD_SIZE, hadamard_matrix
 
@@ -971,10 +976,17 @@ def _post_rht_amax_ref(inputs, d: torch.Tensor, rht_sign_mask: int = 0) -> Dict[
     for expert, rows, group_m in _expert_slices(inputs):
         if group_m == 0:
             continue
-        blocks = d[rows].double().T.reshape(d.shape[1], group_m // HADAMARD_SIZE, HADAMARD_SIZE) * signs
+        blocks = d[rows].to(torch.bfloat16).double().T.reshape(d.shape[1], group_m // HADAMARD_SIZE, HADAMARD_SIZE) * signs
         transformed = (blocks @ hadamard) * (HADAMARD_SIZE**-0.5)
         ref[expert] = transformed.to(torch.bfloat16).float().abs().max().item()
     return ref
+
+
+@pytest.mark.L0
+def test_post_rht_amax_ref_rounds_fp16_inputs_to_bf16():
+    # Direct FP16 input gives 80.5; the BF16-rounded input gives 80.0.
+    d = torch.tensor([20.0625] * 15 + [20.125], dtype=torch.float16).reshape(16, 1)
+    assert _post_rht_amax_ref({"aligned_group_m_list": [16]}, d) == {0: 80.0}
 
 
 def _assert_post_rht_amax(inputs, outputs, d: torch.Tensor, rht_sign_mask: int = 0) -> None:
@@ -1127,6 +1139,46 @@ def test_grouped_gemm_glu_hadamard_srelu_options_replay(request, use_tmem_post_r
         return {name: outputs[name] for name in ("c_tensor", "d_tensor", "amax_tensor", "post_rht_amax_tensor")}
 
     assert_replays(run)
+
+
+TMEM_POST_RHT_AMAX_REPEATS = 64
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("act_func", ["swiglu", "srelu"])
+def test_grouped_gemm_glu_hadamard_tmem_post_rht_amax_matches_smem_repeated(request, act_func):
+    """The TMEM post-RHT amax equals the shared-memory path, bit for bit, on every back-to-back launch.
+
+    In the TMEM path the Hadamard MMA's A operand and accumulator share TMEM columns, and both
+    CTAs of the pair hand them over through mbarriers twice per subtile. A missing or aliased
+    handoff shows up as an MMA on a stale operand or a read of an overwritten accumulator, which
+    changes the amax (or hangs). Prob leaves each expert's amax to a few tokens so that a single
+    misread round is visible, and the launches are queued without host synchronization.
+    """
+    case = _build_srelu_option_case(request)
+    inputs, _ = case
+    prob = inputs["prob_tensor"]
+    spiky = torch.full_like(prob, 1.0 / 64)
+    spiky[::97] = 1.0
+    prob.copy_(spiky)
+
+    smem = _run_srelu_option_case(case, act_func=act_func, use_tmem_post_rht_amax=False)
+    tmem = _run_srelu_option_case(case, act_func=act_func, use_tmem_post_rht_amax=True)
+    for name in ("c_tensor", "d_tensor", "amax_tensor", "post_rht_amax_tensor"):
+        _assert_same_bytes(tmem[name], smem[name], f"{name}: TMEM vs shared-memory post-RHT amax path")
+    _, d, _ = _stored_cd_prob(inputs, tmem)
+    _assert_post_rht_amax(inputs, tmem, d)
+
+    want = smem["post_rht_amax_tensor"].cpu()
+    launches = [
+        _launch_srelu_option_case(case, act_func=act_func, use_tmem_post_rht_amax=True)["post_rht_amax_tensor"] for _ in range(TMEM_POST_RHT_AMAX_REPEATS)
+    ]
+    torch.cuda.synchronize()
+    wrong = [i for i, got in enumerate(launches) if not torch.equal(bitwise_bits(got.cpu()), bitwise_bits(want))]
+    assert (
+        not wrong
+    ), f"{len(wrong)}/{len(launches)} launches returned a different post-RHT amax, first at launch {wrong[0]}: {launches[wrong[0]].reshape(-1).tolist()} != {want.reshape(-1).tolist()}"
 
 
 @pytest.mark.L0

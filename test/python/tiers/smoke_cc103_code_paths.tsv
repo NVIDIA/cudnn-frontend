@@ -140,6 +140,13 @@ sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_dense[bf16]	bwd mxfp8 SM100 (two-k
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_causal	bwd mxfp8 SM100 | causal
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_gqa	bwd mxfp8 SM100 | GQA
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_ragged_tails	bwd mxfp8 SM100 | ragged tails
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_dense[gqa]	bwd mxfp8 d128 BHSD (CuTeDSL prep / dK-dV / persistent dQ chain) | dense | GQA 8/2, walk split
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_sequence_tails[s100]	bwd mxfp8 d128 BHSD | sequence tail (S % 256 != 0): clipped maps, -inf LSE rows, dQ key mask
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_causal[gqa-512]	bwd mxfp8 d128 BHSD | causal
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_causal[gqa-1000]	bwd mxfp8 d128 BHSD | causal + sequence tail
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_causal[mha-384]	bwd mxfp8 d128 BHSD | causal MHA, odd block count: walk split compiled out
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_amax	bwd mxfp8 d128 BHSD | amax dQ / dK / dV
+sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py::test_large_batch_plans	bwd mxfp8 d128 BHSD | B = 8: unsplit throughput plan + split batch-invariant plan
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]	graph suite fwd (FROST-routed where claimed)
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test1]	graph suite bwd
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_sq1_L0[test1]	graph suite decode

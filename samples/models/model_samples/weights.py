@@ -15,11 +15,10 @@ bytes a kernel on the stored formats would see.  :func:`dequantize` returns the 
 an E4M3 code has a 4-bit significand and an E2M1 code times its E4M3 block scale at most 6 bits, so both are exact in bf16
 (8 bits), and a multiply over these copies applies the scales to its result.
 
-Two more containers carry what a kernel on the stored formats hands to a block that is not one yet.
+One more container carries what a kernel on the stored formats hands to a block that is not one yet.
 :class:`TiledBlockScaledTensor` is a 4-bit activation with its block scales in the 128 x 4 layout such a kernel writes
-(:func:`tile_scale_index`); :class:`Unquantized` is bf16 rows whose producer wrote no codes, with the quantisation the
-consumer's operand has.  :func:`dequantize` reads both, so the gather out of the layout and the quantisation are launched by
-the block that consumes the operand, never by the one that produced it.
+(:func:`tile_scale_index`).  :func:`dequantize` reads it, so the gather out of the layout is launched by the block that
+consumes the operand, never by the one that produced it.
 
 A weight is held in the forms the blocks of a run read it in (:class:`Dequantized`): its bf16 copy where a block reads
 one, and its stored form where a block multiplies on that -- the merged 8-bit codes with their one scale, or the packed
@@ -36,13 +35,18 @@ its rows in tiles of gate rows and up rows and its block scales in the 128 x 4 l
 (:class:`InterleavedBlockScaledTensor`): the same bytes in another order, built once per weight at load by the
 provider that multiplies on it.  A load then holds that ONE tensor, never the checkpoint's order beside it, and
 :func:`dequantize` gives its bf16 copy back in the checkpoint's row order, which is what every reader of a copy reads.
+A library multiply on the stored 4-bit format reads the rows in the checkpoint's order and the block scales in the
+128 x 4 layout (:class:`TiledBlockScaledWeight`): built at load in the same way, and kept as that weight's one stored form.
 
 The quantisers follow the public arithmetic of the two formats (round to nearest even, saturating); they are not promised to
 make the midpoint choices of another quantiser.
 
 A weight that a checkpoint stores in bf16 can be brought to 8 bits when it is loaded, with one scale per row -- per output
 channel of the multiply (:func:`quantize_fp8_per_channel`).  That rule is fixed down to its division, because the codes are
-what a kernel on them reads: a host test pins it against the format definition.
+what a kernel on them reads: a host test pins it against the format definition.  The rows of a step can be brought to 8
+bits each at a scale of its own, formed from the row (:func:`quantize_fp8_per_row`): a third rule beside the static scale
+of :func:`quantize_fp8` and the weight's, fixed down to its multiplication by the reciprocal of the scale and pinned the
+same way.
 
 ``Checkpoint.synthetic`` draws every tensor on the CPU generator from a seed and the tensor's name, so a tensor's values depend
 on neither the device nor the load order.
@@ -91,7 +95,8 @@ E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 class ScaledTensor:
     """8-bit E4M3 codes with a scale: ``value = code * scale``.  ``codes`` holds the code bytes (``uint8``; view them as
     ``torch.float8_e4m3fn`` for a kernel); ``scale`` is a float, or a 1-D fp32 tensor with one scale per row: of a merged
-    weight whose parts kept their scales, or of a weight quantised per channel."""
+    weight whose parts kept their scales, of a weight quantised per channel, or of the rows of a step that were each
+    quantised at a scale of their own (:func:`quantize_fp8_per_row`)."""
 
     codes: torch.Tensor
     scale: Union[float, torch.Tensor]
@@ -101,7 +106,12 @@ class ScaledTensor:
         return self.codes.shape
 
     def rows(self, start: int, stop: int) -> "ScaledTensor":
-        return ScaledTensor(self.codes[start:stop], self.scale)
+        """The rows ``start`` to ``stop`` with their scale: a scale per row (one entry per row of the codes) is sliced with
+        the codes, one scale for every row is handed on as it is."""
+        scale = self.scale
+        if isinstance(scale, torch.Tensor) and scale.dim() == 1 and scale.shape[0] == self.codes.shape[0]:
+            scale = scale[start:stop]
+        return ScaledTensor(self.codes[start:stop], scale)
 
     def clone(self) -> "ScaledTensor":
         return ScaledTensor(self.codes.clone(), self.scale)
@@ -215,6 +225,25 @@ def untile_scales(tiled: torch.Tensor, rows: int, blocks: int) -> torch.Tensor:
 
 
 @dataclass
+class TiledBlockScaledWeight(TiledBlockScaledTensor):
+    """A 4-bit weight in the layout a library multiply on the stored format reads: the packed E2M1 codes ``[out, in / 2]`` in
+    the checkpoint's row order and the E4M3 block scales of those rows as code bytes in the 128 x 4 layout
+    (:func:`tile_scales`).  The same bytes as the stored weight, the scale bytes in another order: a provider that
+    multiplies on this layout builds it once per weight at load, and a load that keeps it keeps no other form of the stored
+    weight.  A reader of a bf16 copy gets one from it (:func:`dequantize`), bit for bit the copy of the stored weight."""
+
+    def row_major(self) -> BlockScaledTensor:
+        """The weight with its block scales row by row: whole bands of whole tiles are a permutation of dimensions (every
+        weight of the published widths), anything else one gather."""
+        rows, blocks = self.codes.shape[0], self.codes.shape[-1] * 2 // BLOCK
+        return BlockScaledTensor(self.codes, untile_scales(self.tiled_scales, rows, blocks), self.scale)
+
+    def tensors(self):
+        """What the block multiplies on, as it holds it: the bytes a checksum of this weight reads."""
+        return (self.codes, self.tiled_scales)
+
+
+@dataclass
 class InterleavedBlockScaledTensor:
     """The merged gate / up weight of an MLP in the layout a fused gate / up kernel multiplies on: packed E2M1 codes
     ``[2 x intermediate, in / 2]`` whose rows come in tiles of ``tile`` gate rows followed by the ``tile`` up rows of the
@@ -239,45 +268,13 @@ class InterleavedBlockScaledTensor:
 
 
 @dataclass
-class Unquantized:
-    """bf16 rows on their way to a block that reads a quantised operand, with the quantisation that operand has (``fmt``:
-    ``"fp8"`` or ``"nvfp4"``; ``scale``: its static scale).  The producer wrote no codes -- a kernel whose form at this call
-    site ends at the bf16 rows -- so the consumer quantises them itself: ``quantized()`` is what :func:`dequantize` and
-    every comparison read, and its launches are the consumer's."""
-
-    data: torch.Tensor
-    fmt: str
-    scale: float
-
-    @property
-    def shape(self):
-        return self.data.shape
-
-    def quantized(self):
-        if self.fmt == "fp8":
-            return quantize_fp8(self.data, self.scale)
-        if self.fmt == "nvfp4":
-            return quantize_nvfp4(self.data, self.scale)
-        raise ValueError(f"unknown quantisation format {self.fmt!r}")
-
-    def rows(self, start: int, stop: int) -> "Unquantized":
-        return Unquantized(self.data[start:stop], self.fmt, self.scale)
-
-    def clone(self) -> "Unquantized":
-        return Unquantized(self.data.clone(), self.fmt, self.scale)
-
-    def tensors(self):
-        return self.quantized().tensors()
-
-
-@dataclass
 class Dequantized:
     """A weight as a multiply is handed it, in the forms the plans of a run read: ``data`` is the bf16 copy of its code
     values (exact), ``scale`` the scale a multiply applies to its result (a float or one scale per row), ``stored`` the
     stored tensor the copy is made from (a :class:`ScaledTensor`, a :class:`BlockScaledTensor`, or that weight in the
-    layout its provider multiplies on: an :class:`InterleavedBlockScaledTensor`).  A family's loader
-    decides from the plans which of the two a weight has: ``stored`` is ``None`` where no block multiplies on the stored
-    format, ``data`` is ``None`` where no block reads a copy.  It has one of them at least.  ``checksum`` is taken by the
+    layout its provider multiplies on: an :class:`InterleavedBlockScaledTensor`, a :class:`TiledBlockScaledWeight`).  A
+    family's loader decides from the plans which of the two a weight has: ``stored`` is ``None`` where no block multiplies
+    on the stored format, ``data`` is ``None`` where no block reads a copy.  It has one of them at least.  ``checksum`` is taken by the
     loader of a weight it keeps on its stored format alone (:func:`stored_checksum`): what its stored bytes were at the
     load, for the checks of the run to hold them to (``intact``)."""
 
@@ -463,6 +460,36 @@ def quantize_fp8_per_channel(x: torch.Tensor, rows_per_chunk: int = 2048) -> Sca
     return ScaledTensor(codes, scale)
 
 
+#: a row of a step quantised at a scale of its own never gets a smaller scale than ``1 / (448 * PER_ROW_FLOOR)``
+PER_ROW_FLOOR = 512
+
+
+def quantize_fp8_per_row(x: torch.Tensor) -> ScaledTensor:
+    """8-bit quantisation of the rows of a step ``[rows, width]``, each at a scale of its own that is formed from the row:
+    the operand of a multiply whose activation scale is no constant of the checkpoint.
+
+    * The largest magnitude of a row is taken over its bf16 values (rows handed over in another dtype are rounded to bf16
+      first, and their codes are those of the rounded values);
+    * ``scale = max(largest / 448, 1 / (448 * 512))``: a division in fp32, the floor formed in fp32, so a row of zeros has
+      a scale and the codes 0;
+    * ``code = e4m3(value * (1 / scale))``, saturating at +-448, round to nearest even: the reciprocal of the scale is
+      formed in fp32 and the product is an fp32 multiplication.
+
+    Three fp32 operations, none formed in a wider type and rounded.  This is NOT the rule of a weight quantised per
+    channel (:func:`quantize_fp8_per_channel`), which divides every element by the scale: where a quotient is the
+    midpoint of two codes the two rules can give two codes (the product then lands just above the midpoint and takes
+    the code above, where the division takes the even one).  A row is quantised by itself: the rows of a step, quantised
+    together or one by one, give the same bytes.  Nothing is read from the device.  Returns a :class:`ScaledTensor`
+    whose ``scale`` is the fp32 tensor ``[rows]``.  ``ValueError`` for a tensor that is not ``[rows, width]``."""
+    if x.dim() != 2:
+        raise ValueError(f"the per-row 8-bit quantisation takes the rows of a step [rows, width]; got {list(x.shape)}")
+    one = torch.tensor(1.0, dtype=torch.float32, device=x.device)
+    top = torch.tensor(E4M3_MAX, dtype=torch.float32, device=x.device)
+    values = x.to(torch.bfloat16).float()
+    scale = torch.maximum(values.abs().amax(dim=1) / top, one / (top * PER_ROW_FLOOR))
+    return ScaledTensor(_e4m3(values * (one / scale).unsqueeze(1)), scale)
+
+
 def quantize_nvfp4(x: torch.Tensor, scale: float, rows_per_chunk: int = 2048) -> BlockScaledTensor:
     """4-bit quantisation with a static global scale: per block of 16, ``block_scale = e4m3(max|x| / 6 / scale)`` and
     ``code = e2m1(x / (block_scale * scale))``; an all-zero block has block scale 0 and codes 0."""
@@ -485,12 +512,10 @@ def quantize_nvfp4(x: torch.Tensor, scale: float, rows_per_chunk: int = 2048) ->
 def dequantize(t, rows_per_chunk: int = 2048) -> Dequantized:
     """The code values of a stored tensor as a bf16 copy, without the outer scale (exact: see the module docstring), and that
     scale.  A plain tensor is returned as it is with scale 1.  An operand a kernel on the stored formats handed over is
-    brought to the stored form first, here, by the block that reads it: bf16 rows without codes are quantised
-    (:class:`Unquantized`), block scales in the 128 x 4 layout are gathered (:class:`TiledBlockScaledTensor`).  A merged
+    brought to the stored form first, here, by the block that reads it: block scales in the 128 x 4 layout are gathered
+    (:class:`TiledBlockScaledTensor`).  A merged
     gate / up weight kept in a fused kernel's layout (:class:`InterleavedBlockScaledTensor`) gives its copy in the
     checkpoint's row order."""
-    if isinstance(t, Unquantized):
-        t = t.quantized()
     if isinstance(t, TiledBlockScaledTensor):
         t = t.row_major()
     if isinstance(t, ScaledTensor):
@@ -538,9 +563,9 @@ def _interleaved_values(t: InterleavedBlockScaledTensor, rows_per_chunk: int) ->
 def merge_scaled(parts: Sequence[ScaledTensor], rule: str = "largest_scale") -> ScaledTensor:
     """Merge 8-bit weights along their first dimension (the projections of one multiply: Q, K and V; ``qkv`` and ``z``).
 
-    ``"largest_scale"`` (the default, what the stock serving engine does): every part whose scale is not the largest is
+    ``"largest_scale"`` (the default): every part whose scale is not the largest is
     dequantised and re-quantised at the largest scale, so the merged weight has ONE scale.  ``"own_scale"`` keeps every part's
-    codes and returns one scale per row: closer to the checkpoint, and not comparable with an engine that merges."""
+    codes and returns one scale per row: closer to the checkpoint, and other codes than the default's."""
     if rule not in ("largest_scale", "own_scale"):
         raise ValueError(f'merge rule must be "largest_scale" or "own_scale"; got {rule!r}')
     if not parts or any(not isinstance(p, ScaledTensor) or isinstance(p.scale, torch.Tensor) for p in parts):

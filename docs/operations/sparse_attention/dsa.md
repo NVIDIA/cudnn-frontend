@@ -172,13 +172,73 @@ attention sink participates only in the output denominator, not in any stats.
 
 - **Inputs**
   - `q`: `(total_S_q, H, D_qk)` FP16 or BF16
-  - `kv`: `(total_S_kv, D_qk)`, with the same dtype as `q` (K = V latent; MQA)
+  - `kv`: `(total_S_kv, D_qk)`, with the same dtype as `q` (K = V latent;
+    MQA); or `float8_e4m3fn` with `descale_kv`; or the `torch.uint8` rows
+    of a packed cache named by `kv_format`. See *Quantized KV caches*.
   - `topk_idxs`: `(total_S_q, K)` INT32 global token ids; K may be any
     nonnegative value. SM100 pads a tail internally; SM90 masks it in place.
   - `attn_sink` (optional): `(H,)` FP32
   - `topk_length` (optional): `(total_S_q,)` INT32, clamped to `[0, K]`
   - `softmax_scale` (optional runtime float): defaults to `1 / sqrt(D_qk)`
   - `indexer_topk`: compile-time prefix length
+  - `kv_format`, `descale_kv` (optional, keyword-only; `sample_descale_kv` on
+    the class): the format of a packed `kv`, or the per-tensor descale of an
+    FP8 `kv`. See *Quantized KV caches*.
+  - `extra_kv`, `extra_kv_format`, `descale_extra_kv`, `extra_topk_idxs`,
+    `extra_topk_length` (optional, keyword-only; the tensors take a
+    `sample_` prefix on the class): a second pool and its own token ids. See
+    *Quantized KV caches*.
+- **Quantized KV caches** — besides a pool of `q`'s dtype, a KV pool can be
+  stored in two quantized forms:
+  - Per-tensor FP8: `kv` is `float8_e4m3fn (total_S_kv, D_qk)` and
+    `descale_kv` is an FP32 `(1,)` tensor. Channel `c` of token `t` has the
+    value `e4m3(kv[t, c]) * descale_kv[0]`.
+  - Packed rows: each token's row is one run of bytes, holding the quantized
+    channels, their block scales and, at `D_qk = 576`, the 64 channels only K
+    reads. Pass the `torch.uint8` tensor of the rows, shape
+    `(total_S_kv, record_bytes)`, and name the format with `kv_format`. A
+    cache with padded rows is passed as that view of its buffer: the row
+    pitch, `stride(0)`, is a multiple of 16 bytes and at least
+    `record_bytes`. A format is never inferred from the row width:
+    `mxfp8_528` and `fp8_528` share one.
+
+  | `kv_format` | `D_qk` | Bytes per token | Row layout (byte offsets) | Value of channel `c` | Served |
+  |---|---|---|---|---|---|
+  | `mxfp8_528` | 512 | 528 | `[0, 512)` E4M3 codes; `[512, 528)` one UE8M0 scale per 32 channels | `e4m3(code[c]) * 2^(sf[c/32] - 127)` | not yet |
+  | `nvfp4_288` | 512 | 288 | `[0, 256)` E2M1 codes, channel `2i` in the low nibble of byte `i`; `[256, 288)` one E4M3 scale per 16 channels | `e2m1(code[c]) * e4m3(sf[c/16])` | not yet |
+  | `fp8_bf16rope_656` | 576 | 656 | `[0, 512)` E4M3 codes of channels `[0, 512)`; `[512, 528)` one FP32 scale per 128 of them; `[528, 656)` channels `[512, 576)` as BF16 | `e4m3(code[c]) * sf[c/128]` for `c < 512`, else the BF16 value | not yet |
+  | `nvfp4_fp8rope_352` | 576 | 352 | `[0, 256)` E2M1 codes of channels `[0, 512)`, as in `nvfp4_288`; `[256, 320)` channels `[512, 576)` as unscaled E4M3; `[320, 352)` one E4M3 scale per 16 of channels `[0, 512)`, block `b` at byte `320 + 8 * (b % 4) + b // 4` | `e2m1(code[c]) * e4m3(sf[c/16])` for `c < 512`, else the E4M3 value | not yet |
+  | `fp8_528` | 512 | 528 | `fp8_bf16rope_656` without its last 64 channels: `[0, 512)` E4M3 codes; `[512, 528)` one FP32 scale per 128 channels | `e4m3(code[c]) * sf[c/128]` | not yet |
+
+  V reads channels `[0, 512)` of every form. DeepSeek-V4.1 keeps its window
+  cache as `mxfp8_528` or per-tensor FP8 and its compressed cache as
+  `nvfp4_288`. DeepSeek-V3.2 and GLM-5.3 keep a 512-channel latent with 64
+  RoPE channels as `fp8_bf16rope_656`, `nvfp4_fp8rope_352` or per-tensor
+  FP8; GLM-5.3-Flash, whose latent has no RoPE channels, keeps `fp8_528`.
+
+  `extra_kv` is a second pool, for models that attend to tokens of two
+  caches. It has its own token ids: `extra_topk_idxs` `(total_S_q, extra_K)`
+  INT32, with an optional `extra_topk_length` `(total_S_q,)` clamped to
+  `[0, extra_K]`, index `extra_kv` as `topk_idxs` and `topk_length` index
+  `kv`. Each query attends to both sets of slots under one softmax and one
+  sink, and `max_logits` and `lse` cover the slots of both pools. Each pool
+  is stored in its own form: `extra_kv_format` and `descale_extra_kv`
+  describe `extra_kv` as `kv_format` and `descale_kv` describe `kv`.
+  `indexer_topk > 0` is not served with a second pool. For
+  DeepSeek-V4.1, `kv` is the window cache and `extra_kv` the compressed
+  cache:
+
+  ```python
+  result = DSA.sparse_attention_forward_wrapper(
+      q, window_rows, window_idxs, topk_length=window_lens, kv_format="mxfp8_528",
+      extra_kv=compressed_rows, extra_kv_format="nvfp4_288",
+      extra_topk_idxs=compressed_idxs, extra_topk_length=compressed_lens,
+      attn_sink=attn_sink,
+  )
+  ```
+
+  Declaring a quantized pool or a second pool raises `NotImplementedError`
+  until a kernel serves it.
 - **Outputs** — stable `TupleDict` keys:
   - `out`: `(total_S_q, H, 512)`, with the same dtype as `q`
   - `max_logits`: `(total_S_q, H)` FP32
@@ -1159,8 +1219,15 @@ result = DSA.indexer_top_k_wrapper(
 indices, values = result["indices"], result["values"]
 ```
 
+The PyTorch wrapper accepts keyword-only `starts`, an optional INT32 vector of
+length `n_rows` on the scores device. Row `r` selects from
+`[starts[r], effective_end[r])` and returns column ids relative to the original
+score row. Bounds are in `[0, num_cols]`; an end at or below the start
+produces an empty row. The valid ids and matching values precede the
+`-1` / `-inf` padding. Omitting `starts` uses zero for every row.
+
 `IndexerTopK` owns no device memory. `execute(input_values, seq_lens,
-out_indices, out_values=None, current_stream=None, workspace=None)` writes into
+current_stream=None, *, out_indices, out_values=None, workspace=None, starts=None)` writes into
 caller-owned outputs: `out_indices` is `(n_rows, top_k)` INT32 and `out_values`
 is `(n_rows, top_k)` in the input dtype, both contiguous and on `input_values`'
 device. `out_values` is required when the object was built with
@@ -1168,6 +1235,8 @@ device. `out_values` is required when the object was built with
 `workspace`, a CUDA `uint8` tensor of at least `scratch_workspace_bytes()` bytes
 (`n_rows * (2 for FP32, else 1) * num_cols * 4`, rounded up to 128) that is
 32-byte aligned; an absent or undersized workspace raises before launch.
+Build the plan with `has_starts=True` to bind a contiguous `starts` tensor at
+execution. Its contents may change between CUDA Graph replays.
 The writable `out_indices`, optional `out_values`, and carved scratch byte
 ranges must not overlap one another or the read-only inputs. Disjoint views of
 the same backing allocation are valid. The class API also requires a 32-byte

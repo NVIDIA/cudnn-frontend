@@ -97,6 +97,10 @@ class TestSparseDecodeForwardRegressions:
     test_sparse_dense_reference = staticmethod(_sparse.test_identity_vs_the_dense_kernel_below_the_bound)
     test_decode_qwen_token_tile = staticmethod(_decode.test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units)
     test_decode_independent_pool_layouts = staticmethod(_decode.test_paged_decode_independent_pool_layouts)
+    test_decode_wide_output_replay = staticmethod(_decode.test_decode_64_column_tile_wide_output_replays)
+    test_wide_tile_no_spill = staticmethod(_decode.test_sm107_decode_wide_tile_renderings_carry_no_spill)
+    test_column_groups = staticmethod(_decode.test_decode_kernel_four_column_groups)
+    test_source_twin = staticmethod(_decode.test_sm107_decode_body_matches_the_sm100_body)
 
 
 @requires_rubin
@@ -209,10 +213,11 @@ def test_sm100_module_unchanged():
 
 
 def test_sm107_per_tensor_fp8_native_shapes():
-    """Both architecture lines provide native per-tensor D64 geometry."""
-    shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == shapes
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0)) == shapes
+    """Blackwell and Rubin share the D64 through D512 flavors. Blackwell also serves absorbed MLA."""
+    shared = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == shared
+    for cc in ((10, 0), (10, 3)):
+        assert _sm100_fp8_shapes(pertensor=True, device_cc=cc) == shared | {(576, 512)}
 
 
 @pytest.mark.parametrize("cga", [1, 2])
@@ -242,19 +247,17 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
 
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
-    assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
+    assert (sm107.sm_lo, sm107.sm_hi) == (107, 109)
     assert sm100.d_shapes == frozenset({(64, 64), (128, 128)})
-    assert sm100_envelopes.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert sm100_envelopes.d_shapes == sm107.d_shapes | {(576, 512)}
     assert dict(sm107.cgas_by_d_shape)[(64, 64)] == frozenset({1, 2})
     assert (64, 64) in sm107.split_d_shapes and (64, 64) in sm107.pack_gqa_d_shapes
     assert (64, 64) not in sm107.thd_d_shapes
-    # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
-    # so a row that gains a flavor must gain its floor in the same commit --
-    # otherwise mismatch() admits a graph check_support kills (contract 8b').
-    assert dict(sm107.d_envelope_floors) == dict(sm100_envelopes.d_envelope_floors)
-    # The legacy SM100 envelope row and Rubin retain the D512 floor. The
-    # explicit small-head owner only accepts its exact D64/D128 shapes.
-    assert sm100_envelopes.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
+    # Both rows share the D512 floor. On Blackwell, the D576 floor prevents narrower
+    # pairs from selecting the exact MLA flavor through the envelope matcher.
+    assert dict(sm107.d_envelope_floors) == {(512, 512): 256}
+    assert dict(sm100_envelopes.d_envelope_floors) == {(512, 512): 256, (576, 512): 512}
     assert sm100.d_envelope_floors == ()
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
@@ -2289,6 +2292,11 @@ class TestMidFp8Implementation:
         test_public_record_rebuild_rebind_and_retained_capture as _record,
         test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
         test_mid_fp8_refilled_stage_warm_stress as _warm,
+        test_d256_pair_admission as _pair_admission,
+        test_d256_pair_body_reference_and_replay as _pair_replay,
+        test_d256_pair_refilled_stage_warm_stress as _pair_warm,
+        test_d256_pair_release_dependence as _pair_release,
+        test_d256_pair_batch_invariance as _pair_batch,
         test_d192_cga1_causal_public_record as _cga1,
         test_wide_envelopes_keep_the_adapter_block_output_decline as _block_output,
     )
@@ -2296,6 +2304,11 @@ class TestMidFp8Implementation:
     test_public_record = staticmethod(_record)
     test_retired_record = staticmethod(_retired)
     test_warm_stress = staticmethod(_warm)
+    test_d256_pair_admission = staticmethod(_pair_admission)
+    test_d256_pair_replay = staticmethod(_pair_replay)
+    test_d256_pair_warm_stress = staticmethod(_pair_warm)
+    test_d256_pair_release_dependence = staticmethod(_pair_release)
+    test_d256_pair_batch_invariance = staticmethod(_pair_batch)
     test_cga1 = staticmethod(_cga1)
     test_block_output_decline = staticmethod(_block_output)
 

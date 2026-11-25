@@ -203,6 +203,22 @@ def _trace(event, nodeid):
         pass  # a diagnostic must never be what breaks the run
 
 
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_protocol(item, nextitem):
+    # Torchrun ranks must enter collectives together, each on its own GPU.
+    if os.name != "posix" or int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        return (yield)
+    import fcntl
+
+    os.makedirs(_FROST_ROUTING_DIR, exist_ok=True)
+    with open(os.path.join(_FROST_ROUTING_DIR, "gpu.lock"), "a") as lock:
+        mode = fcntl.LOCK_EX if item.get_closest_marker("gpu_exclusive") else fcntl.LOCK_SH
+        fcntl.flock(lock, mode)
+        # Lock before logstart arms the watchdog; include fixture teardown and
+        # the final CUDA synchronization before another worker gets the GPU.
+        return (yield)
+
+
 def pytest_runtest_logstart(nodeid, location):
     _trace("START ", nodeid)
     # faulthandler's watchdog is a C thread that needs no GIL, so it fires even

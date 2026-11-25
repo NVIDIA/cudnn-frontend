@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU admission tests for plan-specific Stats stride override declarations."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -78,14 +79,23 @@ def test_note_excludes_ineligible_graphs(changes):
     assert NOTE not in _notes("sdpa_fwd_sm100_d128_multi_q", _facts(**changes))
 
 
-@pytest.mark.parametrize("name,cc", [("sdpa_fwd_sm120_f16_general", (12, 1))])
-def test_unqualified_architectures_do_not_advertise_the_shared_binder(name, cc, monkeypatch):
-    from cudnn.frost import buffers
-
-    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+@pytest.mark.parametrize("cc", [(12, 0), (12, 1), (12, 2)])
+def test_stats_override_follows_the_implementation_on_every_admitted_cc(cc):
+    # 12.2 is synthetic: changing only the minor CC must not require a second opt-in.
+    name = "sdpa_fwd_sm120_f16_general"
     facts = _facts(device_cc=cc)
     assert engines.mismatch(SPECS[name].capabilities, facts) is None
-    assert NOTE not in _notes(name, facts)
+    assert NOTE in _notes(name, facts)
+
+
+def test_template_opt_in_is_required_even_when_the_graph_and_device_match():
+    owner = SPECS["sdpa_fwd_sm120_f16_general"]
+    facts = _facts(device_cc=(12, 1))
+    assert engines.mismatch(owner.capabilities, facts) is None
+    sibling = engines.EngineSpec("new_template", owner.capabilities, owner.lower)
+    graph = SimpleNamespace(_facts_for=lambda analyzer: facts)
+    engine = FrostSdpaFwdEngine(sibling, 20519)
+    assert NOTE not in engine.get_behavior_notes(graph, PlanConfig(engine.engine_id, None))
 
 
 @pytest.mark.parametrize(
@@ -114,9 +124,36 @@ def test_admitted_sm107_half_owners_declare_qualified_notes(name, dq, dv, tile, 
     assert _notes(name, f, knobs.to_public()) == (cudnn.behavior_note.RUNTIME_COMPILATION, NOTE)
 
 
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("kv_dtype", [cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
+def test_mixed_kv_half_template_keeps_its_stats_contract(cc, kv_dtype, monkeypatch):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    name = "sdpa_fwd_sm107_d128_multi_q" if cc == (10, 7) else "sdpa_fwd_sm100_d128_multi_q"
+    knobs = engines.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=2, split_kv=1, pack_gqa=False)
+    facts = _facts(device_cc=cc, dtype_o=cudnn.data_type.BFLOAT16, kv_dtype=kv_dtype, uniform_dtype=False, max_total_seq_len_q=32)
+    assert engines.mismatch(SPECS[name].capabilities, facts, knobs) is None
+    assert NOTE in _notes(name, facts, knobs)
+
+
 def test_new_swap_ab_does_not_inherit_lookahead_notes():
     f = _facts(d_qk=256, d_v=256)
     assert NOTE not in _notes("sdpa_fwd_sm100_d256_swap_ab", f)
+
+
+def test_paged_q1_note_follows_selected_binder():
+    offset = SimpleNamespace(get_data_type=lambda: cudnn.data_type.INT32)
+    tensor = SimpleNamespace(ragged_offset=offset, get_stride=lambda: (1024, 128, 1024, 1), get_ragged_offset_multiplier=lambda: 1)
+    facts = _facts(s_q=1, q_t=tensor, o_t=tensor, has_paged_kv=True)
+    facts.stats_t.ragged_offset = offset
+    facts.stats_t.get_ragged_offset_multiplier = lambda: 1
+    prefill = SPECS["sdpa_fwd_sm100_d128_multi_q"]
+    decode = SPECS["sdpa_fwd_sm100_d128_single_q"]
+    assert engines._thd_decode_leg(prefill.capabilities, facts)
+    assert prefill.supports_stats_stride_override(facts, None)  # the default record lowers unsplit
+    assert prefill.supports_stats_stride_override(facts, engines.SdpaFwdKnobs(cga=2, split_kv=1))
+    assert not decode.supports_stats_stride_override(facts, engines.SdpaFwdKnobs(cga=1, split_kv=2))
 
 
 def test_ineligible_knobs_and_sibling_plans_do_not_leak_notes():
@@ -143,8 +180,6 @@ def test_note_requires_the_native_binder_feature(monkeypatch):
 )
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
 def test_wide_half_notes_follow_selected_plan(name, dq, tile, cluster, cc):
-    from dataclasses import replace
-
     f = _facts(d_qk=dq, d_v=512, device_cc=cc)
     good = engines.SdpaFwdKnobs(tile_m=tile, cga=cluster, split_kv=1, pack_gqa=False)
     assert NOTE in _notes(name, f, good.to_public())
@@ -165,12 +200,17 @@ QUALIFIED_OVERRIDE_CASES = [
     (107, "sm107_shared_d256_lookahead", 256, 256, 128, 128, 2, 2, 0, 0, False),
     (107, "sm107_d512_role_split", 512, 512, 128, 128, 4, 1, 0, 0, False),
     (107, "sm107_d512_2x2", 512, 512, 64, 128, 4, 1, 0, 0, False),
-    (120, "sm120_f16_general", 64, 64, 64, 64, 1, 1, 0, 0, False),
-    (120, "sm120_f16_general", 128, 128, 64, 64, 1, 1, 0, 0, False),
-    (120, "sm120_f16_general", 192, 128, 64, 64, 1, 1, 0, 0, False),
-    (120, "sm120_d256_all_compute", 256, 256, 64, 64, 1, 1, 0, 0, False),
-    (120, "sm120_d512_paired", 512, 512, 64, 32, 1, 1, 0, 0, False),
-    (120, "sm120_d512_paired", 576, 512, 64, 32, 1, 1, 0, 0, False),
+] + [
+    (sm, *case)
+    for sm in (120, 121)
+    for case in (
+        ("sm120_f16_general", 64, 64, 64, 64, 1, 1, 0, 0, False),
+        ("sm120_f16_general", 128, 128, 64, 64, 1, 1, 0, 0, False),
+        ("sm120_f16_general", 192, 128, 64, 64, 1, 1, 0, 0, False),
+        ("sm120_d256_all_compute", 256, 256, 64, 64, 1, 1, 0, 0, False),
+        ("sm120_d512_paired", 512, 512, 64, 32, 1, 1, 0, 0, False),
+        ("sm120_d512_paired", 576, 512, 64, 32, 1, 1, 0, 0, False),
+    )
 ]
 
 

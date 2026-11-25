@@ -165,6 +165,25 @@ def eager_dispatch(args) -> bool:
     )
 
 
+def eager_backward(grads) -> bool:
+    """Whether the backward of an eager forward may call its body: no graph of the backward is being built, and the
+    conditions of :func:`eager_dispatch` hold now.  A trace, mode or transform can start between the forward and its
+    backward, and has to see the backward's op as it would the forward's."""
+    return not torch.is_grad_enabled() and eager_dispatch(grads)
+
+
+def summary_dispatch(op, body, *args, **kwargs):
+    """A summary op's call: ``op``, or its ``body`` directly where the call may bypass the custom op
+    (:func:`eager_dispatch`).  A summary's outputs are non-differentiable, so the op adds no autograd formula; the body
+    runs without grad, as it does under the op."""
+    if not eager_dispatch((*args, *kwargs.values())):
+        return op(*args, **kwargs)
+    if torch.is_grad_enabled():
+        with torch.no_grad():
+            return body(*args, **kwargs)
+    return body(*args, **kwargs)
+
+
 def torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
     return TORCH_DTYPE_TO_CUDNN[dtype]

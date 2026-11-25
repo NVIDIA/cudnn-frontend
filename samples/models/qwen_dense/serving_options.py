@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""What a user of a serving engine brings to the samples of this family, in one module beside the scripts.
+"""A request and its options for the samples of this family, in one module beside the scripts.
 
-A sample is one process with greedy token choice, not a serving engine.  Its user often comes from one, with the request
-body a chat client sends and with the option names of a serving command line.  This module reads that body as it is and
+A sample is one process with greedy token choice.  Its user often brings the request body a chat client sends and the
+option names that go with it (``--max-tokens``, ``--max-model-len``).  This module reads that body as it is and
 answers every field of it:
 
 * **read**: ``messages``, ``tools``, ``chat_template_kwargs``, and the limit of new tokens (``max_tokens`` or its newer name
@@ -22,7 +22,7 @@ answers every field of it:
 
 What a run prints of a body is the names of its fields and the values this module knows: a number, a boolean, a value of
 the table.  It never prints back what somebody else wrote into the body -- a user, metadata -- and of ``model`` it prints
-the last part, which is what it compares: a serving engine that serves a directory is asked for it by its path.
+the last part, which is what it compares: a model that is a directory is named by its path.
 
 It also holds what a run says to that user before anything is loaded -- the decoding rule beside the checkpoint's own
 generation settings (``greedy_line``), how many decode steps a prompt takes before the first new token
@@ -30,8 +30,8 @@ generation settings (``greedy_line``), how many decode steps a prompt takes befo
 generated text goes (``TextSink``: standard output, or a file; as it is generated, or once).
 
 A request body never enters the helper layer (``model_samples``): that layer is handed messages, tool schemas and template
-options.  Field names are those of the public chat-completions request and of the sampling parameters serving engines add
-to it.  This module imports the standard library only; the helper layer is imported where a request is read, after the
+options.  Field names are those of the public chat-completions request and of the sampling parameters commonly sent
+with it.  This module imports the standard library only; the helper layer is imported where a request is read, after the
 sample has imported ``cudnn`` and PyTorch in their order.
 """
 
@@ -46,7 +46,7 @@ from typing import Optional, Sequence
 
 #: new tokens of a request that names no limit
 MAX_TOKENS = 256
-#: the default of ``--max-model-len``: the context length the family's census of the target kernel set was recorded with
+#: the default of ``--max-model-len``: the context length the runs of this area were made at
 MAX_MODEL_LEN = 2051
 
 #: the two names of a request's limit of new tokens
@@ -135,6 +135,61 @@ NEUTRAL = {
 }
 
 
+#: The speculative configuration: the JSON object that says how tokens are drafted.  A key of it selects
+#: what is launched, so none is printed and ignored: a key is read, accepted at the value that changes nothing, or refused.
+#: The object ``02_speculative_decode.py`` runs when it is given none:
+SPECULATIVE_DEFAULT = '{"method": "mtp", "num_speculative_tokens": 5, "use_local_argmax_reduction": true}'
+#: the keys the object is read for, each with what is accepted and why nothing else is; all three must be named
+SPECULATIVE_READ = {
+    "method": (("mtp",), "the drafter is the checkpoint's own, the method mtp; no other method is served"),
+    "num_speculative_tokens": ((), "it is the number of tokens a step drafts: a whole number from 1"),
+    "use_local_argmax_reduction": (
+        (True,),
+        "the draft token is the largest of the listed rows of the head: the one form of the drafter's head this sample runs",
+    ),
+}
+#: keys that are accepted at the value at which they change nothing, and at ``null``, each with the reason for another value
+SPECULATIVE_NEUTRAL = {
+    "rejection_sample_method": (("standard",), "a drafted token is kept while it equals the greedy token in front of it: nothing is drawn"),
+    "draft_sample_method": (("greedy",), "the drafter proposes the token of its largest logit"),
+    "enable_adaptive_verification": ((False,), "every step verifies every token it drafted"),
+    "disable_padded_drafter_batch": ((False,), "one request: there is no batch of drafts to pad"),
+    "parallel_drafting": ((False,), "the drafter's passes run one after the other, each on the proposal of the pass before"),
+    "use_heterogeneous_vocab": ((False,), "the drafter proposes ids of the model's own vocabulary"),
+}
+_OWN_DRAFTER = "the drafter is the checkpoint's own, loaded as its loader loads it"
+_ACCEPTANCE = "the tokens a step keeps are decided by the greedy comparison: an acceptance that is drawn, scheduled or loosened is not served"
+_ONE_PROCESS = "one process on one GPU, launched from Python"
+_ROWS = "which kernel serves a block is a row of the table a run prints (--stack, --provider)"
+_OTHER_METHOD = "it is an option of another speculative method, or of a cache keyed by content, which a sample does not have"
+_FLY = ("fly_window_size", "fly_entropy_threshold", "fly_entropy_top_k")  # of a rejection sample method that is not served
+#: every other key of a speculative configuration this module knows, each with the reason it is refused whatever its value
+SPECULATIVE_REFUSED = {
+    **dict.fromkeys(("model", "quantization", "revision", "code_revision", "draft_load_config", "draft_lm_head_quantization"), _OWN_DRAFTER),
+    "index_share_for_mtp_iteration": "it overrides a field of the drafter's own configuration: the drafter runs as its checkpoint describes it",
+    "max_model_len": "the drafter has no context length of its own: its cache has the positions of the model's (--max-model-len)",
+    **dict.fromkeys(("synthetic_acceptance_rates", "synthetic_acceptance_length", *_FLY), _ACCEPTANCE),
+    "num_speculative_tokens_per_batch_size": "one request: the number of drafted tokens is one number (num_speculative_tokens)",
+    **dict.fromkeys(("enforce_eager", "tensor_parallel_size", "draft_tensor_parallel_size"), _ONE_PROCESS),
+    **dict.fromkeys(("moe_backend", "attention_backend", "kv_cache_dtype"), _ROWS),
+    **dict.fromkeys(
+        (
+            "disable_eagle_block_drop",
+            "disable_lookahead_block_hashes",
+            "prompt_lookup_max",
+            "prompt_lookup_min",
+            "suffix_decoding_max_tree_depth",
+            "suffix_decoding_max_cached_requests",
+            "suffix_decoding_max_spec_factor",
+            "suffix_decoding_min_token_prob",
+            "dspark_draft_topk",
+            "xpress_topc",
+        ),
+        _OTHER_METHOD,
+    ),
+}
+
+
 def _text_io():
     """The text module of the helper layer, imported where a request is read and not with this module: a sample imports
     ``cudnn`` before PyTorch, and the helper layer imports PyTorch."""
@@ -157,8 +212,8 @@ def _name(name: str) -> str:
 
 def _last_part(model: str) -> tuple:
     """The last part of a model name -- what is compared with the checkpoint directory, and all a run prints of it -- and
-    how a run shows it: with ``.../`` in front where the name had more parts.  A serving engine that serves a directory
-    is asked for it by its path, and a path is never printed."""
+    how a run shows it: with ``.../`` in front where the name had more parts.  A model that is a directory is named by
+    its path, and a path is never printed."""
     name = model.strip().rstrip("/\\")
     last = re.split(r"[/\\]", name)[-1]
     return last, _show(last if last == name else ".../" + last)
@@ -289,7 +344,13 @@ def read_request(source: str, checkpoint: str = "", stdin=None) -> Request:
 
 
 def new_tokens(
-    request: Request, prompt_tokens: int, max_model_len: int, flag: Optional[int] = None, forced: Optional[int] = None, flag_name: str = "--max-tokens"
+    request: Request,
+    prompt_tokens: int,
+    max_model_len: int,
+    flag: Optional[int] = None,
+    forced: Optional[int] = None,
+    flag_name: str = "--max-tokens",
+    reserve: int = 0,
 ):
     """The limit of new tokens of one request, held against the context length: ``(limit, note)``.
 
@@ -297,7 +358,12 @@ def new_tokens(
     which is the limit of a request that names none; then the default.  A prompt and its new tokens share the context
     (``max_model_len`` positions): a limit somebody asked for that does not fit is a ``ValueError`` before anything is
     loaded, as is a prompt that leaves no room at all, and the default is cut to the room that is left.  ``note`` is ""
-    or the line a run prints when a limit that was given does not apply."""
+    or the line a run prints when a limit that was given does not apply.
+
+    ``reserve`` is the positions a run writes behind its last new token, which share the context too: the last verify
+    step of a speculative run writes a row for every token it drafted, and all but one of those rows lie behind the
+    last new token.  A run that writes none leaves it at 0.  The room is what the prompt and the reserve leave: the
+    limit that is returned, the count an error names and the default's cut all fit the context together with those rows."""
     note = ""
     if forced is not None:
         limit, source = forced, f"--force-tokens {forced}"
@@ -316,20 +382,21 @@ def new_tokens(
         limit, source = flag, f"{flag_name} {flag}"
     else:
         limit, source = MAX_TOKENS, ""
-    room = max_model_len - prompt_tokens
+    held = f" and the rows the last verify step writes behind the last new token ({reserve:,})" if reserve else ""
+    room = max_model_len - prompt_tokens - reserve
     if room < 1:
         raise ValueError(
-            f"{request.shown}: the prompt is {prompt_tokens:,} tokens and --max-model-len is {max_model_len:,}: a prompt and its new tokens share "
+            f"{request.shown}: the prompt is {prompt_tokens:,} tokens and --max-model-len is {max_model_len:,}: a prompt and its new tokens{held} share "
             "the context, and no position is left for a new token; raise --max-model-len"
         )
     if limit > room and source:
         raise ValueError(
-            f"{request.shown}: {prompt_tokens:,} prompt tokens + {limit:,} new tokens ({source}) are {prompt_tokens + limit:,} positions and "
+            f"{request.shown}: {prompt_tokens:,} prompt tokens + {limit:,} new tokens ({source}){held} are {prompt_tokens + limit + reserve:,} positions and "
             f"--max-model-len is {max_model_len:,}; ask for at most {room:,} new tokens, or raise --max-model-len"
         )
     if limit > room:
         note = (
-            f"{request.shown}: up to {room:,} new tokens, not the default {MAX_TOKENS}: {prompt_tokens:,} prompt tokens leave that many positions "
+            f"{request.shown}: up to {room:,} new tokens, not the default {MAX_TOKENS}: {prompt_tokens:,} prompt tokens{held} leave that many positions "
             f"under --max-model-len {max_model_len:,}"
         )
         limit = room
@@ -338,7 +405,7 @@ def new_tokens(
 
 def greedy_line(defaults: dict) -> str:
     """The decoding rule of a run beside the checkpoint's own generation settings (``TextIO.generation_defaults``), so that
-    the difference from an engine that applies those settings is never silent."""
+    a run never differs from those settings silently."""
     rule = "greedy decoding: the token of the largest logit at every step"
     if not defaults:
         return f"{rule} (the checkpoint's generation_config.json names no sampling setting)"
@@ -356,6 +423,68 @@ def first_token_line(prompts: Sequence[tuple]) -> str:
         "first token: a prompt goes through the decode step, one step per prompt token (no stack of this sample has a prefill kernel): "
         f"{counts}. No text is written until then; the first token line of the report has the time"
     )
+
+
+def parse_speculative_config(text: str, shown: str) -> tuple:
+    """The speculative configuration, as the JSON text of its object: ``(drafted tokens of a step, the
+    line a run prints for it)``.  Every key is answered by the three tables above: the keys of ``SPECULATIVE_READ`` must be
+    named and are held to what is accepted; a key of ``SPECULATIVE_NEUTRAL`` is accepted at its value and at ``null``,
+    which is the key left out; a key of ``SPECULATIVE_REFUSED`` is refused whatever it holds, with its reason; any other
+    key is refused by its name.  Each refusal is a ``ValueError`` that starts with ``shown``.  The line holds the names
+    of the keys and the values the tables know, never what somebody else wrote into the object."""
+    try:
+        config = json.loads(text)
+    except ValueError as error:
+        raise ValueError(f"{shown}: not JSON ({error})") from None
+    if not isinstance(config, dict):
+        raise ValueError(f"{shown}: {_show(config, 40)} is not a JSON object; a speculative configuration is one, with its keys")
+    for name in config:  # a key no table holds, whatever it holds: a name that is mistyped is not taken for a key left out
+        if name not in SPECULATIVE_READ and name not in SPECULATIVE_NEUTRAL and name not in SPECULATIVE_REFUSED:
+            raise ValueError(
+                f"{shown}: {_show(name, 64)} is not a key this sample holds: a key of a speculative configuration selects what is launched, "
+                "so none is ignored. Leave the key out"
+            )
+    config = {name: value for name, value in config.items() if value is not None}  # null is the key left out
+    read, neutral = [], []
+    for name, (values, reason) in SPECULATIVE_READ.items():
+        accepted = ", ".join(_show(known) for known in values) or "a whole number from 1"
+        if name not in config:
+            raise ValueError(f'{shown}: "{name}" is not named: {reason}. Accepted: {accepted}')
+        value = config[name]
+        if not (any(_same(value, known) for known in values) if values else type(value) is int and value >= 1):
+            raise ValueError(f'{shown}: "{name}": {_show(value, 40)} is not served: {reason}. Accepted: {accepted}')
+        read.append(f"{name} {_show(value)}")
+    for name, value in config.items():
+        if name in SPECULATIVE_READ:
+            continue
+        if name in SPECULATIVE_NEUTRAL:
+            values, reason = SPECULATIVE_NEUTRAL[name]
+            if not any(_same(value, known) for known in values):
+                accepted = ", ".join([_show(known) for known in values] + ["null"])
+                raise ValueError(
+                    f'{shown}: "{name}": {_show(value, 40)} would change what is launched and is not served: {reason}. '
+                    f"Accepted: {accepted}, or the key left out"
+                )
+            neutral.append(f"{name} {_show(value)}")
+        else:  # a refused key: what it holds is somebody's own -- a model's path, a revision -- and is not printed back
+            raise ValueError(f'{shown}: "{name}" is not served: {SPECULATIVE_REFUSED[name]}. Leave the key out')
+    line = f"{shown}: read: " + ", ".join(read) + "."
+    if neutral:
+        line += " At the value that changes nothing: " + ", ".join(neutral) + "."
+    return config["num_speculative_tokens"], line
+
+
+def speculative_line(prompts: Sequence[tuple], draft_tokens: int) -> str:
+    """What a speculative run does before its first new token and in every step behind it, said before anything is loaded: a
+    rule and counts, never a time.  ``prompts``: ``(shown, prompt tokens)`` per request; a run of several names each."""
+    named = len(prompts) > 1
+    each = "; ".join(
+        f"prompt of {tokens:,} tokens{f' ({shown})' if named else ''} = {tokens:,} decode steps and {tokens - 1:,} passes of the drafter "
+        "before the first token"
+        for shown, tokens in prompts
+    )
+    passes = f"{draft_tokens} draft pass{'es' if draft_tokens > 1 else ''}"
+    return f"{each}; then every step is {passes} and one verify step of {draft_tokens + 1} tokens, and keeps 1 to {draft_tokens + 1} of them"
 
 
 def _silence_stdout() -> None:

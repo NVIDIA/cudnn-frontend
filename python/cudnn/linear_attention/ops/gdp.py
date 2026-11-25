@@ -14,16 +14,21 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import cudnn
+from cudnn.cpp_launcher import cpp_launched
 
+from ..graph_analyzer import DEFAULT_QK_L2NORM_EPS, qk_l2norm_eps_error
 from .common import (
     check_composed_state,
     check_composed_summaries,
     check_context,
+    eager_backward,
+    eager_dispatch,
     execute_graph,
     make_execution_resources,
     make_summary_cache_key,
     select_plan,
     summary_backward,
+    summary_dispatch,
     summary_setup_context,
     torch_dtype_to_cudnn,
 )
@@ -45,6 +50,16 @@ def check_dtype(name, t, want) -> None:
     if t.dtype not in wants:
         names = " or ".join(str(w) for w in wants)
         raise TypeError(f"gated_delta_product: {name} must be {names} (kernel-native; callers convert), got {t.dtype}")
+
+
+def check_qk_l2norm_eps(op_name, qk_l2norm_eps, use_qk_l2norm_in_kernel) -> float:
+    """Validate ``qk_l2norm_eps`` for the op ``op_name`` and return the epsilon the kernel will use (the default for
+    ``None``).  Raises ``ValueError`` for a value that is not usable in float32, and for a custom value while
+    ``use_qk_l2norm_in_kernel`` is off.  The rule itself is the graph analyzer's ``qk_l2norm_eps_error``."""
+    error = qk_l2norm_eps_error(qk_l2norm_eps, bool(use_qk_l2norm_in_kernel))
+    if error is not None:
+        raise ValueError(f"{op_name}: {error}")
+    return DEFAULT_QK_L2NORM_EPS if qk_l2norm_eps is None else float(qk_l2norm_eps)
 
 
 def make_fprop_cache_key(
@@ -83,6 +98,7 @@ def make_fprop_cache_key(
     composed_rows=None,
     checkpoint_after_block=False,
     state_indices_dtype=None,
+    qk_l2norm_eps=DEFAULT_QK_L2NORM_EPS,
 ):
     return (
         "gdp_fprop",
@@ -121,6 +137,7 @@ def make_fprop_cache_key(
         composed_rows,
         bool(checkpoint_after_block),
         state_indices_dtype,
+        float(qk_l2norm_eps),
     )
 
 
@@ -159,6 +176,7 @@ def make_bprop_cache_key(
     beta_shape=None,
     composed_rows=None,
     checkpoint_after_block=False,
+    qk_l2norm_eps=DEFAULT_QK_L2NORM_EPS,
 ):
     return (
         "gdp_bprop",
@@ -196,6 +214,7 @@ def make_bprop_cache_key(
         beta_shape,
         composed_rows,
         bool(checkpoint_after_block),
+        float(qk_l2norm_eps),
     )
 
 
@@ -272,6 +291,7 @@ def build_fprop_graph(
     input_context=False,
     checkpoint_after_block=False,
     output_context=False,
+    qk_l2norm_eps=DEFAULT_QK_L2NORM_EPS,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -327,6 +347,7 @@ def build_fprop_graph(
         input_context=input_context or None,
         checkpoint_after_block=checkpoint_after_block or None,
         output_context=output_context or None,
+        qk_l2norm_eps=None if qk_l2norm_eps == DEFAULT_QK_L2NORM_EPS else float(qk_l2norm_eps),
         name="gdp",
     )
     if state_checkpoints_t is not None:
@@ -357,6 +378,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
+@cpp_launched
 def run_gdp_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -386,6 +408,7 @@ def run_gdp_fwd(
     context: Optional[torch.Tensor] = None,
     checkpoint_after_block: bool = False,
     output_context: bool = False,
+    qk_l2norm_eps: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP forward over a cached single-node GDP pygraph in THD layout.
 
@@ -402,12 +425,14 @@ def run_gdp_fwd(
     empty ``P = 0`` pair.  ``context`` is the forward summary's context over the same tokens (``output_context``); a
     zero-size tensor is none, and it requires ``use_qk_l2norm_in_kernel``.  ``output_context`` adds a fifth value, the
     uint8 context this forward leaves for the backward of the same tokens (zero-size without it, or when the plan keeps
-    nothing).
+    nothing).  ``qk_l2norm_eps`` is the additive epsilon of the q/k normalization (``None``: the default ``1e-6``); the
+    rows a ``context`` already holds were normalized by the summary that wrote it, at the summary's epsilon.
     """
     total, H, K = q.shape
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product: num_householder must be a positive integer, got {num_householder}")
+    eps = check_qk_l2norm_eps("gated_delta_product", qk_l2norm_eps, use_qk_l2norm_in_kernel)
     if 0 in k.stride():
         k = k.contiguous()
     if 0 in v.stride():
@@ -546,6 +571,7 @@ def run_gdp_fwd(
         composed_rows=composed_rows or None,
         checkpoint_after_block=bool(checkpoint_after_block),
         state_indices_dtype=state_indices.dtype if state_indices is not None else None,
+        qk_l2norm_eps=eps,
     ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), has_context, bool(output_context))
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
@@ -584,6 +610,7 @@ def run_gdp_fwd(
             input_context=has_context,
             checkpoint_after_block=bool(checkpoint_after_block),
             output_context=bool(output_context),
+            qk_l2norm_eps=eps,
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -659,6 +686,7 @@ def gdp_fwd(
     context: Optional[torch.Tensor] = None,
     checkpoint_after_block: bool = False,
     output_context: bool = False,
+    qk_l2norm_eps: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional GDP forward: :func:`run_gdp_fwd` with fresh outputs; the autograd formula registers below."""
     return run_gdp_fwd(
@@ -688,6 +716,7 @@ def gdp_fwd(
         context=context,
         checkpoint_after_block=checkpoint_after_block,
         output_context=output_context,
+        qk_l2norm_eps=qk_l2norm_eps,
     )
 
 
@@ -717,6 +746,7 @@ def gdp_fwd_overwrite_state(
     output_final_state: bool = True,
     context: Optional[torch.Tensor] = None,
     checkpoint_after_block: bool = False,
+    qk_l2norm_eps: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GDP forward whose final state overwrites ``initial_state``, the rows ``state_indices`` names when that int32 or int64 ``[N]``
     table addresses a state pool.  The engine runs the chain or the uncut schedule and
@@ -748,6 +778,7 @@ def gdp_fwd_overwrite_state(
         state_indices=state_indices,
         context=context,
         checkpoint_after_block=checkpoint_after_block,
+        qk_l2norm_eps=qk_l2norm_eps,
     )
     return o, state_checkpoints
 
@@ -780,9 +811,11 @@ def gdp_fwd_fake(
     context=None,
     checkpoint_after_block=False,
     output_context=False,
+    qk_l2norm_eps=None,
 ):
     total, H, K = q.shape
     HK = k.shape[-2]
+    check_qk_l2norm_eps("gated_delta_product", qk_l2norm_eps, use_qk_l2norm_in_kernel)
     if context is not None and context.numel() > 0 and not use_qk_l2norm_in_kernel:
         raise ValueError("gated_delta_product: context (the forward summary's normalized k rows) requires use_qk_l2norm_in_kernel")
     HV, V = v.shape[-2], v.shape[-1]
@@ -848,6 +881,7 @@ def gdp_fwd_overwrite_state_fake(
     output_final_state=True,
     context=None,
     checkpoint_after_block=False,
+    qk_l2norm_eps=None,
 ):
     o, _, state_checkpoints, _, _ = gdp_fwd_fake(
         q=q,
@@ -873,6 +907,7 @@ def gdp_fwd_overwrite_state_fake(
         output_final_state=bool(output_final_state),
         context=context,
         checkpoint_after_block=checkpoint_after_block,
+        qk_l2norm_eps=qk_l2norm_eps,
     )
     return o, state_checkpoints
 
@@ -917,6 +952,7 @@ def build_bprop_graph(
     input_context=False,
     checkpoint_after_block=False,
     context_from_forward=False,
+    qk_l2norm_eps=DEFAULT_QK_L2NORM_EPS,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -976,6 +1012,7 @@ def build_bprop_graph(
         gate_domain=None if gate_domain == "log" else gate_domain,
         input_context=input_context or None,
         context_from_forward=context_from_forward or None,
+        qk_l2norm_eps=None if qk_l2norm_eps == DEFAULT_QK_L2NORM_EPS else float(qk_l2norm_eps),
         name="gdp_bwd",
     )
     return graph, dict(
@@ -1009,8 +1046,8 @@ def build_bprop_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_product_bwd", mutates_args=())
-def gdp_bwd(
+@cpp_launched
+def run_gdp_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1039,6 +1076,7 @@ def gdp_bwd(
     context: Optional[torch.Tensor] = None,
     checkpoint_after_block: bool = False,
     context_from_forward: bool = False,
+    qk_l2norm_eps: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP backward over a cached single-node GDP_BWD pygraph in THD layout.
 
@@ -1055,10 +1093,13 @@ def gdp_bwd(
     parallelism, beside the caller's optional ``initial_state``.  ``context`` is the backward summary's context over the
     same tokens (``output_context``), or with ``context_from_forward`` the one the forward of the same tokens left (its
     ``output_context``, prepared at the forward's ``checkpoint_every_n_tokens`` and ``batch_invariant``, which this call
-    must be given); a zero-size tensor is none.
+    must be given); a zero-size tensor is none.  ``qk_l2norm_eps`` is the forward's (``None``: the default ``1e-6``): the
+    backward normalizes q/k again at this epsilon unless a ``context`` hands it the normalized rows and their inverse
+    norms, which then carry the epsilon of the call that wrote them.
     """
     total, H, K = q.shape
     n = int(num_householder)
+    eps = check_qk_l2norm_eps("gated_delta_product", qk_l2norm_eps, use_qk_l2norm_in_kernel)
     if 0 in dO.stride():
         dO = dO.contiguous()
     check_dtype("dO", dO, q.dtype)
@@ -1177,6 +1218,7 @@ def gdp_bwd(
             tuple(beta.shape),
             composed_rows=composed_rows or None,
             checkpoint_after_block=bool(checkpoint_after_block),
+            qk_l2norm_eps=eps,
         )
         + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), composed_state is not None)
         + (has_context, has_context and bool(context_from_forward))
@@ -1217,6 +1259,7 @@ def gdp_bwd(
             input_context=has_context,
             checkpoint_after_block=bool(checkpoint_after_block),
             context_from_forward=has_context and bool(context_from_forward),
+            qk_l2norm_eps=eps,
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -1276,6 +1319,9 @@ def gdp_bwd(
     return dq, dk.view(k_in.shape), dv.view(v_in.shape), dg, dbeta.view(beta_in.shape), dstate0, d_a_log, d_dt_bias
 
 
+gdp_bwd = torch.library.custom_op("cudnn::gated_delta_product_bwd", run_gdp_bwd, mutates_args=())
+
+
 @gdp_bwd.register_fake
 def gdp_bwd_fake(
     dO,
@@ -1306,7 +1352,9 @@ def gdp_bwd_fake(
     context=None,
     checkpoint_after_block=False,
     context_from_forward=False,
+    qk_l2norm_eps=None,
 ):
+    check_qk_l2norm_eps("gated_delta_product", qk_l2norm_eps, use_qk_l2norm_in_kernel)
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None and d_final_state.dtype != dstate_dtype:
         raise TypeError(f"gated_delta_product: d_final_state must be {dstate_dtype} (one state dtype per kernel)")
@@ -1358,6 +1406,7 @@ def gdp_setup_context(ctx, inputs, output):
         context,
         checkpoint_after_block,
         output_context,
+        qk_l2norm_eps,
     ) = inputs
     saved = [q, k, v, g, beta, cu_seqlens]
     ctx.checkpoint_reuse = (
@@ -1390,6 +1439,7 @@ def gdp_setup_context(ctx, inputs, output):
     ctx.num_householder = num_householder
     ctx.scale = scale
     ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+    ctx.qk_l2norm_eps = qk_l2norm_eps
     ctx.batch_invariant = batch_invariant
     ctx.plan_name = plan_name
     ctx.use_beta_sigmoid_in_kernel = bool(use_beta_sigmoid_in_kernel)
@@ -1398,7 +1448,7 @@ def gdp_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(output[2], output[3], output[4])
 
 
-def gdp_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, d_context):
+def gdp_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, d_context, bwd=None):
     # Non-reentrant activation checkpointing allows one saved-tensor unpack.
     saved_tensors = ctx.saved_tensors
     if ctx.checkpoint_reuse:
@@ -1416,7 +1466,7 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, 
     if dO is None:
         dO = torch.zeros(q.shape[0], max(q.shape[1], v.shape[1]), v.shape[2], dtype=q.dtype, device=q.device)
     dstate_in = dFinal if (dFinal is not None and dFinal.numel() > 0) else None
-    dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias = torch.ops.cudnn.gated_delta_product_bwd(
+    dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias = (bwd or torch.ops.cudnn.gated_delta_product_bwd)(
         dO,
         q,
         k,
@@ -1442,6 +1492,7 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, 
         plan_name=ctx.plan_name,
         context=context,
         context_from_forward=ctx.context_from_forward,
+        qk_l2norm_eps=ctx.qk_l2norm_eps,
     )
     return (
         dq,
@@ -1470,6 +1521,7 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, 
         None,
         None,
         None,
+        None,
     )
 
 
@@ -1478,6 +1530,59 @@ torch.library.register_autograd(
     gdp_backward,
     setup_context=gdp_setup_context,
 )
+
+
+# ---------------------------------------------------------------------------
+# Eager path: the forward op and its autograd formula without the custom op's dispatch
+# ---------------------------------------------------------------------------
+
+FWD_ARGS = (
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "cu_seqlens",
+    "num_householder",
+    "scale",
+    "initial_state",
+    "output_final_state",
+    "use_qk_l2norm_in_kernel",
+    "batch_invariant",
+    "use_beta_sigmoid_in_kernel",
+    "allow_neg_eigval",
+    "safe_gate",
+    "gate_domain",
+    "a_log",
+    "dt_bias",
+    "checkpoint_every_n_tokens",
+    "checkpoint_dtype",
+    "plan_name",
+    "preceding_state_update",
+    "preceding_transition",
+    "context",
+    "checkpoint_after_block",
+    "output_context",
+    "qk_l2norm_eps",
+)
+
+
+class EagerGdp(torch.autograd.Function):
+    """``cudnn::gated_delta_product_fwd`` with its registered autograd formula (:func:`gdp_setup_context`,
+    :func:`gdp_backward`), applied directly."""
+
+    @staticmethod
+    def forward(*args):
+        return run_gdp_fwd(**dict(zip(FWD_ARGS, args)))
+
+    setup_context = staticmethod(gdp_setup_context)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range, and a
+        # trace or mode that started after the forward has to see the op
+        return gdp_backward(ctx, *grads, bwd=run_gdp_bwd if eager_backward(grads) else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1514,6 +1619,7 @@ def gated_delta_product(
     context: Optional[torch.Tensor] = None,
     checkpoint_after_block: bool = False,
     output_context: bool = False,
+    qk_l2norm_eps: Optional[float] = None,
 ):
     """Gated DeltaProduct (GDP) linear attention.
 
@@ -1599,6 +1705,16 @@ def gated_delta_product(
             final state back to that row in place, so a serving stack keeps
             its paged state pool without a gather and scatter around the
             call.  Implies ``overwrite_initial_state``.  Forward only.
+        qk_l2norm_eps: the additive epsilon of the q/k normalization under
+            ``use_qk_l2norm_in_kernel``, ``x / sqrt(sum(x**2) + eps)`` over
+            each head's ``K`` channels; ``None`` is the default ``1e-6``.  A
+            finite, positive, normal float32 value; another value than the
+            default requires ``use_qk_l2norm_in_kernel``.  It is a launch
+            argument of the normalize kernel, so changing it between calls
+            (a schedule) builds a plan but compiles nothing.  The backward
+            runs at the forward's epsilon.  Under context parallelism give
+            the summary ops and the raw backward op the same value: a
+            context carries the rows its writer normalized.
 
     ``preceding_state_update`` / ``preceding_transition`` (context parallelism) and the fourth output
     ``composed_initial_state`` they add follow :func:`gated_delta_net` as well, and so do ``context`` (the forward
@@ -1609,6 +1725,8 @@ def gated_delta_product(
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
+    if qk_l2norm_eps is not None:  # a plain float for the op's schema (a numpy scalar is not one)
+        qk_l2norm_eps = check_qk_l2norm_eps("gated_delta_product", qk_l2norm_eps, use_qk_l2norm_in_kernel)
     if state_indices is not None and initial_state is None:
         raise ValueError("gated_delta_product: state_indices selects rows of the initial_state pool, so initial_state is required")
     if overwrite_initial_state or state_indices is not None:
@@ -1643,10 +1761,11 @@ def gated_delta_product(
             output_final_state=bool(output_final_state) or bool(overwrite_initial_state),
             context=context,
             checkpoint_after_block=bool(checkpoint_after_block),
+            qk_l2norm_eps=qk_l2norm_eps,
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
-        o, final_state, state_checkpoints, composed_initial_state, context_out = torch.ops.cudnn.gated_delta_product_fwd(
+        args = (
             q,
             k,
             v,
@@ -1655,25 +1774,33 @@ def gated_delta_product(
             cu_seqlens,
             int(num_householder),
             float(scale),
-            initial_state=initial_state,
-            output_final_state=bool(output_final_state),
-            use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
-            batch_invariant=bool(batch_invariant),
-            use_beta_sigmoid_in_kernel=bool(use_beta_sigmoid_in_kernel),
-            allow_neg_eigval=bool(allow_neg_eigval),
-            safe_gate=bool(safe_gate),
-            gate_domain=str(gate_domain),
-            a_log=a_log,
-            dt_bias=dt_bias,
-            checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
-            checkpoint_dtype=checkpoint_dtype,
-            plan_name=plan_name,
-            preceding_state_update=preceding_state_update,
-            preceding_transition=preceding_transition,
-            context=context,
-            checkpoint_after_block=bool(checkpoint_after_block),
-            output_context=bool(output_context),
+            initial_state,
+            bool(output_final_state),
+            bool(use_qk_l2norm_in_kernel),
+            bool(batch_invariant),
+            bool(use_beta_sigmoid_in_kernel),
+            bool(allow_neg_eigval),
+            bool(safe_gate),
+            str(gate_domain),
+            a_log,
+            dt_bias,
+            int(checkpoint_every_n_tokens),
+            checkpoint_dtype,
+            plan_name,
+            preceding_state_update,
+            preceding_transition,
+            context,
+            bool(checkpoint_after_block),
+            bool(output_context),
+            qk_l2norm_eps,
         )
+        if not eager_dispatch(args):
+            outputs = torch.ops.cudnn.gated_delta_product_fwd(*args)
+        elif torch.is_grad_enabled() and any(a.requires_grad for a in args if isinstance(a, torch.Tensor)):
+            outputs = EagerGdp.apply(*args)
+        else:
+            outputs = run_gdp_fwd(**dict(zip(FWD_ARGS, args)))
+        o, final_state, state_checkpoints, composed_initial_state, context_out = outputs
         if preceding_state_update is not None:
             if output_context:
                 return o, final_state, state_checkpoints, composed_initial_state, context_out
@@ -1717,6 +1844,7 @@ def build_gdp_summary_graph(
     v_shape=None,
     beta_shape=None,
     output_context=False,
+    qk_l2norm_eps=DEFAULT_QK_L2NORM_EPS,
 ):
     graph = cudnn.pygraph()
     expanded = total * num_householder
@@ -1751,6 +1879,7 @@ def build_gdp_summary_graph(
         safe_gate=safe_gate or None,
         gate_domain=None if gate_domain == "log" else gate_domain,
         output_context=output_context or None,
+        qk_l2norm_eps=None if qk_l2norm_eps == DEFAULT_QK_L2NORM_EPS else float(qk_l2norm_eps),
         name="gdp_summary",
     )
     fs_t.set_data_type(cudnn.data_type.FLOAT)
@@ -1775,8 +1904,8 @@ def build_gdp_summary_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_product_summary", mutates_args=())
-def gdp_summary(
+@cpp_launched
+def run_gdp_summary(
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
@@ -1795,15 +1924,18 @@ def gdp_summary(
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
     output_context: bool = False,
+    qk_l2norm_eps: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP summary over a cached single-node GDP_SUMMARY pygraph; k/v/beta on the expanded timeline, g and
     cu_seqlens at the real tokens.  Returns ``(final_state, transition, context)``: the two float32 outputs,
     ``transition`` zero-size unless ``output_transition``, and the uint8 context for the forward of the same tokens,
-    zero-size unless ``output_context`` and ``use_qk_l2norm_in_kernel``."""
+    zero-size unless ``output_context`` and ``use_qk_l2norm_in_kernel``.  ``qk_l2norm_eps`` is the additive epsilon of the
+    k normalization (``None``: the default ``1e-6``)."""
     total, HO = g.shape[0], g.shape[1]
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary: num_householder must be a positive integer, got {num_householder}")
+    eps = check_qk_l2norm_eps("gated_delta_product_summary", qk_l2norm_eps, use_qk_l2norm_in_kernel)
     if output_context and not output_transition:
         raise ValueError("gated_delta_product_summary: output_context requires output_transition")
     if 0 in k.stride():
@@ -1890,7 +2022,7 @@ def gdp_summary(
         gate_domain=gate_domain,
         num_householder=n,
         beta_shape=tuple(beta.shape),
-    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), bool(output_context))
+    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), bool(output_context), eps)
     if cache_key not in summary_cache:
         summary_cache[cache_key] = build_gdp_summary_graph(
             total,
@@ -1919,6 +2051,7 @@ def gdp_summary(
             v_shape=tuple(v.shape),
             beta_shape=tuple(beta.shape),
             output_context=bool(output_context),
+            qk_l2norm_eps=eps,
         )
         select_plan(summary_cache[cache_key][0], plan_name)
 
@@ -1949,6 +2082,9 @@ def gdp_summary(
     return final_state, transition, context
 
 
+gdp_summary = torch.library.custom_op("cudnn::gated_delta_product_summary", run_gdp_summary, mutates_args=())
+
+
 @gdp_summary.register_fake
 def gdp_summary_fake(
     k,
@@ -1969,11 +2105,13 @@ def gdp_summary_fake(
     batch_invariant=False,
     plan_name: Optional[str] = None,
     output_context=False,
+    qk_l2norm_eps=None,
 ):
     total, HO = g.shape[0], g.shape[1]
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary: num_householder must be a positive integer, got {num_householder}")
+    check_qk_l2norm_eps("gated_delta_product_summary", qk_l2norm_eps, use_qk_l2norm_in_kernel)
     if output_context and not output_transition:
         raise ValueError("gated_delta_product_summary: output_context requires output_transition")
     K = k.shape[-1]
@@ -2029,6 +2167,7 @@ def build_gdp_summary_bwd_graph(
     beta_shape=None,
     output_context=False,
     checkpoint_every_n_tokens=0,
+    qk_l2norm_eps=DEFAULT_QK_L2NORM_EPS,
 ):
     graph = cudnn.pygraph()
     expanded = total * num_householder
@@ -2067,6 +2206,7 @@ def build_gdp_summary_bwd_graph(
         gate_domain=None if gate_domain == "log" else gate_domain,
         output_context=output_context or None,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens or None,
+        qk_l2norm_eps=None if qk_l2norm_eps == DEFAULT_QK_L2NORM_EPS else float(qk_l2norm_eps),
         name="gdp_summary_bwd",
     )
     d_initial_state_t.set_data_type(cudnn.data_type.FLOAT)
@@ -2092,8 +2232,8 @@ def build_gdp_summary_bwd_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_product_summary_bwd", mutates_args=())
-def gdp_summary_bwd(
+@cpp_launched
+def run_gdp_summary_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2115,16 +2255,19 @@ def gdp_summary_bwd(
     plan_name: Optional[str] = None,
     output_context: bool = False,
     checkpoint_every_n_tokens: int = 0,
+    qk_l2norm_eps: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP backward summary over a cached single-node GDP_SUMMARY_BWD pygraph; k/beta on the expanded timeline,
     q, g, dO and cu_seqlens at the real tokens.  Returns ``d_initial_state`` float32 ``[N, HO, V, K]`` (``G`` with no
     ``d_final_state``, the full ``dh0`` otherwise), ``transition`` float32 ``[N, HO, K, K]`` in the backward's
     stored-domain orientation (``M_buf^T``), zero-size unless ``output_transition``, and ``context``, the uint8 context
-    for the backward over the same tokens, zero-size unless ``output_context``."""
+    for the backward over the same tokens, zero-size unless ``output_context``.  ``qk_l2norm_eps`` is the additive epsilon
+    of the q/k normalization (``None``: the default ``1e-6``)."""
     total, HQ, K = q.shape
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary_bwd: num_householder must be a positive integer, got {num_householder}")
+    eps = check_qk_l2norm_eps("gated_delta_product_summary_bwd", qk_l2norm_eps, use_qk_l2norm_in_kernel)
     if output_context and not output_transition:
         raise ValueError("gated_delta_product_summary_bwd: output_context requires output_transition")
     if 0 in k.stride():
@@ -2221,6 +2364,7 @@ def gdp_summary_bwd(
         family_slots(beta, n, 2),
         bool(output_context),
         int(checkpoint_every_n_tokens),
+        eps,
     )
     if cache_key not in summary_cache:
         summary_cache[cache_key] = build_gdp_summary_bwd_graph(
@@ -2252,6 +2396,7 @@ def gdp_summary_bwd(
             beta_shape=tuple(beta.shape),
             output_context=bool(output_context),
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            qk_l2norm_eps=eps,
         )
         select_plan(summary_cache[cache_key][0], plan_name)
 
@@ -2283,6 +2428,9 @@ def gdp_summary_bwd(
     return d_initial_state, transition, context
 
 
+gdp_summary_bwd = torch.library.custom_op("cudnn::gated_delta_product_summary_bwd", run_gdp_summary_bwd, mutates_args=())
+
+
 @gdp_summary_bwd.register_fake
 def gdp_summary_bwd_fake(
     dO,
@@ -2306,10 +2454,12 @@ def gdp_summary_bwd_fake(
     plan_name: Optional[str] = None,
     output_context=False,
     checkpoint_every_n_tokens=0,
+    qk_l2norm_eps=None,
 ):
     n = int(num_householder)
     if n < 1:
         raise ValueError(f"gated_delta_product_summary_bwd: num_householder must be a positive integer, got {num_householder}")
+    check_qk_l2norm_eps("gated_delta_product_summary_bwd", qk_l2norm_eps, use_qk_l2norm_in_kernel)
     V = dO.shape[-1]
     K = k.shape[-1]
     HO = g.shape[1]
@@ -2373,6 +2523,7 @@ def gated_delta_product_summary(
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
     output_context: bool = False,
+    qk_l2norm_eps: Optional[float] = None,
 ):
     """Gated DeltaProduct (GDP) per-span summary for context parallelism: the state-only pass over each sequence, returning
     ``(H, M)`` float32 with ``H`` ``[N, HO, V, K]`` the final state under ``initial_state`` (zero when ``None``) and ``M``
@@ -2390,10 +2541,16 @@ def gated_delta_product_summary(
         plan_name: pin one execution plan by name (e.g. ``gdp_summary_frost``).
         output_context: also return the forward's context as a third value, for
             ``gated_delta_product(..., context=context)``; zero-size without ``use_qk_l2norm_in_kernel``.
+        qk_l2norm_eps: the additive epsilon of the k normalization, as in :func:`gated_delta_product` (``None``: the default
+            ``1e-6``); the forward that reads this summary's context must be given the same value.
     """
     if k.dim() not in (3, 4):
         raise ValueError("expected THD [total_tokens * n, heads, dim] or token-major [total_tokens, n, heads, dim] tensors")
-    final_state, transition, context = torch.ops.cudnn.gated_delta_product_summary(
+    if qk_l2norm_eps is not None:  # a plain float for the op's schema (a numpy scalar is not one)
+        qk_l2norm_eps = check_qk_l2norm_eps("gated_delta_product_summary", qk_l2norm_eps, use_qk_l2norm_in_kernel)
+    final_state, transition, context = summary_dispatch(
+        torch.ops.cudnn.gated_delta_product_summary,
+        run_gdp_summary,
         k,
         v,
         g,
@@ -2412,6 +2569,7 @@ def gated_delta_product_summary(
         batch_invariant=bool(batch_invariant),
         plan_name=plan_name,
         output_context=bool(output_context),
+        qk_l2norm_eps=qk_l2norm_eps,
     )
     if output_context:
         return final_state, transition, context
@@ -2441,6 +2599,7 @@ def gated_delta_product_summary_bwd(
     plan_name: Optional[str] = None,
     output_context: bool = False,
     checkpoint_every_n_tokens: int = 0,
+    qk_l2norm_eps: Optional[float] = None,
 ):
     """Gated DeltaProduct (GDP) per-span backward summary for context parallelism: the reverse state-gradient recurrence
     over each sequence, returning ``G`` ``[N, HO, V, K]`` float32, the incoming state gradient ``d_initial_state`` under
@@ -2462,12 +2621,18 @@ def gated_delta_product_summary_bwd(
         output_context: with ``output_transition``, also return the backward's context as a third value, for
             ``torch.ops.cudnn.gated_delta_product_bwd(..., context=context)``; prepared at ``checkpoint_every_n_tokens``, which must
             equal the backward's.
+        qk_l2norm_eps: the additive epsilon of the q/k normalization, as in :func:`gated_delta_product` (``None``: the default
+            ``1e-6``); the forward's value, and the one the backward that reads this summary's context must be given.
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    d_initial_state, transition, context = torch.ops.cudnn.gated_delta_product_summary_bwd(
+    if qk_l2norm_eps is not None:  # a plain float for the op's schema (a numpy scalar is not one)
+        qk_l2norm_eps = check_qk_l2norm_eps("gated_delta_product_summary_bwd", qk_l2norm_eps, use_qk_l2norm_in_kernel)
+    d_initial_state, transition, context = summary_dispatch(
+        torch.ops.cudnn.gated_delta_product_summary_bwd,
+        run_gdp_summary_bwd,
         dO,
         q,
         k,
@@ -2489,6 +2654,7 @@ def gated_delta_product_summary_bwd(
         plan_name=plan_name,
         output_context=bool(output_context),
         checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+        qk_l2norm_eps=qk_l2norm_eps,
     )
     if output_context:
         return d_initial_state, transition, context

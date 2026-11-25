@@ -18,10 +18,14 @@ import contextlib
 import functools
 import importlib
 import itertools
+import json
 import math
 import os
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -30,6 +34,7 @@ import pytest
 torch = pytest.importorskip("torch")
 cudnn = pytest.importorskip("cudnn")
 la_ops = pytest.importorskip("cudnn.linear_attention.ops")
+graph_analyzer = pytest.importorskip("cudnn.linear_attention.graph_analyzer")
 
 import torch.nn.functional as F  # noqa: E402
 import torch.utils.checkpoint  # noqa: E402
@@ -80,9 +85,10 @@ STATE_GRAD_TOL = 6e-2
 L2_NORM_EPS = 1e-6
 
 
-def l2norm_ref(x):
-    """The in-kernel Q/K normalization, ``x * rsqrt(sum(x * x) + L2_NORM_EPS)``."""
-    return x * (x.square().sum(-1, keepdim=True) + L2_NORM_EPS).rsqrt()
+def l2norm_ref(x, eps=L2_NORM_EPS):
+    """The in-kernel Q/K normalization, ``x * rsqrt(sum(x * x) + eps)`` (``L2_NORM_EPS`` unless the op is given a
+    ``qk_l2norm_eps``)."""
+    return x * (x.square().sum(-1, keepdim=True) + eps).rsqrt()
 
 
 HEAD_DIMS = [(64, 64), (64, 128), (128, 64), (128, 128)]  # (K, V) pairs every FROST family serves
@@ -525,13 +531,25 @@ def reference_call(variant, tensors, n=1, **kwargs):
 
 
 def reference(
-    case, *, scale=None, initial_state=None, l2norm=False, cu=None, beta_guard=False, v=None, safe_gate=False, a_log=None, dt_bias=None, use_beta_sigmoid=False
+    case,
+    *,
+    scale=None,
+    initial_state=None,
+    l2norm=False,
+    cu=None,
+    beta_guard=False,
+    v=None,
+    safe_gate=False,
+    a_log=None,
+    dt_bias=None,
+    use_beta_sigmoid=False,
+    l2norm_eps=L2_NORM_EPS,
 ):
     """fp64 reference forward of a case; returns (o, final_state) with V-major states."""
     tensors = dict(case_tensors(case))
     if l2norm:
-        tensors["q"] = l2norm_ref(case.q.float())
-        tensors["k"] = l2norm_ref(case.k.float())
+        tensors["q"] = l2norm_ref(case.q.float(), l2norm_eps)
+        tensors["k"] = l2norm_ref(case.k.float(), l2norm_eps)
     if v is not None:
         tensors["v"] = v
     kwargs = dict(scale=scale, initial_state=initial_state)
@@ -556,8 +574,19 @@ def assert_rms_close(name, out, want, tol):
 
 
 def assert_fwd_parity(
-    backend, case, *, scale=None, use_initial_state=False, state_dtype=torch.float32, l2norm=False, beta_guard=False, seed=SEED + 1, tol_scale=1.0
+    backend,
+    case,
+    *,
+    scale=None,
+    use_initial_state=False,
+    state_dtype=torch.float32,
+    l2norm=False,
+    beta_guard=False,
+    seed=SEED + 1,
+    tol_scale=1.0,
+    qk_l2norm_eps=None,
 ):
+    """``qk_l2norm_eps`` (the families that take it) is handed to the op and normalizes the reference's q/k."""
     set_seed(seed)
     state0 = None
     if use_initial_state:
@@ -565,8 +594,11 @@ def assert_fwd_parity(
     op_kw = dict(scale=scale, initial_state=state0, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
     if beta_guard:
         op_kw["beta_guard"] = True
+    if qk_l2norm_eps is not None:
+        op_kw["qk_l2norm_eps"] = qk_l2norm_eps
     o, fs = run_fwd(backend, case, **op_kw)
-    o_ref, fs_ref = reference(case, scale=scale, initial_state=state0, l2norm=l2norm, beta_guard=beta_guard)
+    l2norm_eps = L2_NORM_EPS if qk_l2norm_eps is None else qk_l2norm_eps
+    o_ref, fs_ref = reference(case, scale=scale, initial_state=state0, l2norm=l2norm, beta_guard=beta_guard, l2norm_eps=l2norm_eps)
     if state0 is not None:
         assert fs.dtype == state_dtype, f"final_state is {fs.dtype}, initial_state is {state_dtype}"
     assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype] * tol_scale)
@@ -897,8 +929,11 @@ def assert_bwd_parity(
     gate_grad_tol=None,
     seed=SEED + 1,
     tol_scale=1.0,
+    qk_l2norm_eps=None,
 ):
+    """``qk_l2norm_eps`` (the families that take it) is handed to the op and normalizes the reference's q/k."""
     variant, tol = case.variant, BWD_TOL[case.dtype] * tol_scale
+    l2norm_eps = L2_NORM_EPS if qk_l2norm_eps is None else qk_l2norm_eps
     tensors = case_tensors(case)
     op_leaves = {name: to_thd(t).detach().clone().requires_grad_(True) for name, t in tensors.items()}
     ref_leaves = {name: t.detach().double().requires_grad_(True) for name, t in tensors.items()}
@@ -914,6 +949,8 @@ def assert_bwd_parity(
         op_kw = dict(scale=scale, initial_state=state0_op, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
         if beta_guard:
             op_kw["beta_guard"] = True
+        if qk_l2norm_eps is not None:
+            op_kw["qk_l2norm_eps"] = qk_l2norm_eps
         o, fs = pinned_op(backend, variant)(*args, **op_kw)
         dO = torch.randn_like(o)
         outputs, grad_outputs = [o], [dO]
@@ -927,7 +964,7 @@ def assert_bwd_parity(
 
     ref_tensors = dict(ref_leaves)
     if l2norm:
-        ref_tensors["q"], ref_tensors["k"] = l2norm_ref(ref_leaves["q"]), l2norm_ref(ref_leaves["k"])
+        ref_tensors["q"], ref_tensors["k"] = l2norm_ref(ref_leaves["q"], l2norm_eps), l2norm_ref(ref_leaves["k"], l2norm_eps)
     ref_kwargs = dict(scale=scale, initial_state=state0_ref)
     if beta_guard:
         ref_kwargs["beta_guard"] = True
@@ -3625,6 +3662,63 @@ def test_bwd_same_graph_two_streams(backend, variant, dtype):
 
 
 # ---------------------------------------------------------------------------
+# Compiled cache: a training step in a fresh process
+# ---------------------------------------------------------------------------
+
+RELOAD_CHILD = r"""
+import hashlib, json, sys
+from pathlib import Path
+import torch, cudnn
+from linear_attention.test_la import make_case, op, op_tail, random_state, summary_bwd_inputs, thd_tensors
+variant, phase, result_path, expected_module = sys.argv[1:]
+assert Path(cudnn.__file__).resolve() == Path(expected_module).resolve(), cudnn.__file__
+case = make_case(variant, torch.bfloat16, seq_lens=[128, 64], H=4)
+d_o, _, d_final = summary_bwd_inputs(case)
+seed = random_state(case).requires_grad_(True)
+leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
+o, fs = op(variant)(*leaves, *op_tail(case), initial_state=seed, output_final_state=True, plan_name=f"{variant}_frost")
+tensors = [o, fs]
+if phase != "forward":
+    tensors += torch.autograd.grad([o, fs], leaves + [seed], [d_o, d_final])
+digests = [hashlib.sha256(t.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest() for t in tensors]
+Path(result_path).write_text(json.dumps(digests))
+"""
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_training_step_reloads_in_a_fresh_process(backend, variant, tmp_path):
+    """The backward of a training step stores its compiled hosts in the on-disk cache, and a fresh process runs the same step
+    from them: it leaves the cache directory as it found it and returns the same o, final_state and gradients."""
+    reason = frost_la_unavailable()
+    if reason:
+        pytest.skip(reason)
+    cache = tmp_path / "cache"
+    env = dict(os.environ, CUDNN_FRONTEND_COMPILED_CACHE=str(cache), CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO="0")
+    env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
+    module_path = Path(cudnn.__file__).resolve()
+    env["PYTHONPATH"] = os.pathsep.join([str(module_path.parent.parent), str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH", "")])
+    results, listings = [], []
+    for phase in ("forward", "cold", "warm"):
+        path = tmp_path / f"{phase}.json"
+        process = subprocess.run(
+            [sys.executable, "-c", RELOAD_CHILD, variant, phase, str(path), str(module_path)],
+            env=env,
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert process.returncode == 0, process.stdout[-4000:] + process.stderr[-6000:]
+        results.append(json.loads(path.read_text()))
+        listings.append(sorted((str(p.relative_to(cache)), p.stat().st_size, p.stat().st_mtime_ns) for p in cache.rglob("*") if p.is_file()))
+    objects = [{name for name, _, _ in listing if name.endswith("kernel.o")} for listing in listings]
+    assert objects[1] > objects[0], "the backward stored no compiled kernel object (kernel.o) in the cache directory"
+    assert listings[2] == listings[1], "the warm process rewrote or added cache artifacts instead of reusing them"
+    assert results[2] == results[1], "the warm process computed different outputs from the cached artifacts"
+
+
+# ---------------------------------------------------------------------------
 # Batch invariance (whole-sequence work items; packed == solo, bitwise)
 # ---------------------------------------------------------------------------
 
@@ -4155,6 +4249,122 @@ def test_gdp_long_bwd_compact_summary(backend, l2norm, n):
     _, _, grads, dO, _ = long_grads(backend, case, **kw)
     _, _, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, dO=dO, **kw)
     assert_long_grads_close(grads, grads_inv)
+
+
+QK_L2NORM_EPSILONS = (1e-3, 1e-10)  # GDP's qk_l2norm_eps: one value above the default 1e-6 and one below it
+
+
+def gdp_small_rows_case(**layout):
+    """A GDP case with half of the q / k rows scaled down to squared norms between about 1e-8 and 1e-10, so that the
+    normalized rows change with the epsilon."""
+    case = make_case("gdp", torch.bfloat16, **layout)
+    for x in (case.q, case.k):
+        x[:, 0::4] *= 1e-4
+        x[:, 1::4] *= 1e-5
+    return case
+
+
+@pytest.mark.parametrize(
+    "eps,l2norm,error",
+    [
+        (None, False, None),
+        (1e-6, False, None),
+        (1e-10, True, None),
+        (1e-10, False, "requires the in-kernel q/k normalization"),
+        (0.0, True, "normal float32"),
+        (-1e-6, True, "normal float32"),
+        (float("nan"), True, "normal float32"),
+        (float("inf"), True, "normal float32"),
+        (1e-39, True, "normal float32"),
+        (True, True, "real number"),
+        ("1e-6", True, "real number"),
+    ],
+)
+def test_gdp_qk_l2norm_eps_rule(eps, l2norm, error):
+    """``qk_l2norm_eps_error`` is the check the graph analyzer and the GDP ops share: the value must be usable in
+    float32, and a custom value needs the in-kernel normalization on."""
+    message = graph_analyzer.qk_l2norm_eps_error(eps, l2norm)
+    if error is None:
+        assert message is None
+    else:
+        assert error in message
+
+
+def test_gdp_qk_l2norm_eps_default_matches_kernels():
+    """The graph analyzer cannot import the kernels' constant, so it keeps a copy; the two must be equal."""
+    pointwise = pytest.importorskip("cudnn.frost.tile_dsl.pointwise")
+    assert graph_analyzer.DEFAULT_QK_L2NORM_EPS == pointwise.L2_NORM_EPS == L2_NORM_EPS
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdp_qk_l2norm_eps_invalid_raises(backend):
+    """The forward and both summaries raise for a ``qk_l2norm_eps`` float32 cannot use, and for a custom one while the
+    in-kernel normalization is off."""
+    case = make_case("gdp", torch.bfloat16, T=64)
+    d_o = to_thd(torch.zeros(case.B, case.T, case.HO, case.V, device="cuda")).to(case.v.dtype)
+    calls = {
+        "gated_delta_product": lambda **kw: run_fwd(backend, case, **kw),
+        "gated_delta_product_summary": lambda **kw: run_summary(case, **kw),
+        "gated_delta_product_summary_bwd": lambda **kw: run_summary_bwd(case, d_o, **kw),
+    }
+    for name, call in calls.items():
+        with pytest.raises(ValueError, match=f"{name}: qk_l2norm_eps must be a finite, positive, normal float32"):
+            call(use_qk_l2norm_in_kernel=True, qk_l2norm_eps=0.0)
+        with pytest.raises(ValueError, match=f"{name}: qk_l2norm_eps=1e-08 requires the in-kernel q/k normalization"):
+            call(qk_l2norm_eps=1e-8)
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("eps", QK_L2NORM_EPSILONS)
+def test_gdp_qk_l2norm_eps_matches_reference(backend, eps):
+    """The forward and every gradient against the fp64 reference on q / k normalized at the same epsilon."""
+    assert_fwd_parity(backend, gdp_small_rows_case(T=256), l2norm=True, qk_l2norm_eps=eps)
+    assert_bwd_parity(backend, gdp_small_rows_case(T=128), l2norm=True, qk_l2norm_eps=eps)
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("length", [256, LONG_T], ids=["short", "long"])
+@pytest.mark.parametrize("eps", QK_L2NORM_EPSILONS)
+def test_gdp_qk_l2norm_eps_matches_host_normalization(backend, eps, length):
+    """With ``use_qk_l2norm_in_kernel`` and ``qk_l2norm_eps`` the ops give what they give without the in-kernel
+    normalization on q / k normalized on the host at the same epsilon: the forward, its gradients back to the raw
+    q / k, and both summaries.  The short and the long sequence run different launch hosts."""
+    case = gdp_small_rows_case(T=length, V=64, lo=0.99)
+    fused = dict(use_qk_l2norm_in_kernel=True, qk_l2norm_eps=eps)
+
+    def host_normalized(x):
+        return l2norm_ref(x.float(), eps).to(x.dtype)
+
+    set_seed(SEED + 71)
+    d_o = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    names = LEAF_NAMES["gdp"]
+    results = []
+    for on_host in (False, True):
+        leaves = dict(zip(names, (t.requires_grad_(True) for t in thd_tensors(case))))
+        inputs = dict(leaves, q=host_normalized(leaves["q"]), k=host_normalized(leaves["k"])) if on_host else leaves
+        with waive_unsupported(backend, "gdp"):
+            o = pinned_op(backend, "gdp")(*inputs.values(), *op_tail(case), **({} if on_host else fused))[0]
+        results.append((o, *torch.autograd.grad(o, list(leaves.values()), d_o)))
+    for name, got, want in zip(("o", *(f"d{name}" for name in names)), *results):
+        assert_rms_close(f"{name}[eps {eps:g}]", got, want.float(), FWD_TOL[case.dtype] if name == "o" else BWD_TOL[case.dtype])
+
+    host_case = case.clone(q=host_normalized(case.q), k=host_normalized(case.k))
+    for name, got, want in zip(("h", "m"), run_summary(case, **fused), run_summary(host_case)):
+        assert_rms_close(f"{name}[eps {eps:g}]", got, want.float(), FWD_TOL[case.dtype])
+    assert_rms_close(f"g[eps {eps:g}]", run_summary_bwd(case, d_o, **fused), run_summary_bwd(host_case, d_o).float(), BWD_TOL[case.dtype])
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdp_qk_l2norm_eps_change_compiles_nothing(backend):
+    """``qk_l2norm_eps`` is a launch argument and not a compile key: after the forward and the backward ran at one
+    epsilon, they run at another on the kernels already compiled, and the result changes."""
+    from cudnn.frost import compiled_cache
+
+    case = gdp_small_rows_case(T=256)
+    o, _, grads, dO, _ = long_grads(backend, case, use_qk_l2norm_in_kernel=True, qk_l2norm_eps=1e-8)
+    with compiled_cache.refuse_compiles():
+        o_other, _, grads_other, _, _ = long_grads(backend, case, dO=dO, use_qk_l2norm_in_kernel=True, qk_l2norm_eps=1e-10)
+    assert not torch.equal(o_other, o) and not torch.equal(grads_other["q"], grads["q"])
 
 
 def token_major_views(case, pad=24):
@@ -6506,6 +6716,47 @@ def test_state_indices_graph_declines_wrong_table_shape(backend):
             graph.check_support()
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("node", ["bwd", "summary_bwd"])
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_bwd_graph_declines_do_dtype_other_than_io(backend, variant, node):
+    """A hand-built backward or summary-backward graph gets the FROST plan with ``dO`` declared at the io dtype, as the
+    ops declare it, and no FROST plan with ``dO`` at the other half dtype."""
+    case = make_case(variant, torch.bfloat16, T=256, lo=0.99)
+    leaves = dict(zip(LEAF_NAMES[variant], op_args(case)))
+    if node == "summary_bwd":
+        leaves = {name: leaves[name] for name in ("q", "k", "g", "beta") if name in leaves}
+    inputs = dict(leaves, cu_seqlens=case.cu, dO=summary_bwd_inputs(case)[0])
+    attrs = {"output_transition": True} if node == "summary_bwd" else {}
+    if variant in NO_BETA_VARIANTS:
+        inputs.update(a=case.gates["A"], dt_bias=case.gates["dt_bias"])
+    else:
+        attrs["scale"] = 1.0 / math.sqrt(case.K)
+    if variant in HOUSEHOLDER_VARIANTS:
+        attrs["num_householder"] = case.n
+    out_dtypes = [torch.float32] * 2 if node == "summary_bwd" else [t.dtype for t in leaves.values()]
+    plan_name = f"{variant}_summary_frost" if node == "summary_bwd" else f"{variant}_frost"
+
+    def plans(do_dtype):
+        graph = cudnn.pygraph()
+        ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[do_dtype if name == "dO" else t.dtype], name=name) for name, t in inputs.items()}
+        outs = getattr(graph, f"{variant}_{node}")(**ports, **attrs, name=node)
+        for port, dtype in zip(outs, out_dtypes):
+            port.set_output(True).set_data_type(CUDNN_DTYPE[dtype])
+        graph.validate()
+        graph.build_operation_graph()
+        try:
+            graph.create_execution_plans([cudnn.heur_mode.A])
+        except cudnn.cudnnGraphNotSupportedError:
+            return []
+        return [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+
+    if plan_name not in plans(torch.bfloat16):
+        pytest.skip(f"no {plan_name} plan for this graph")
+    assert plan_name not in plans(torch.float16), f"{plan_name} serves a bf16 graph whose dO is fp16"
+
+
 # ---------------------------------------------------------------------------
 # Heads at half the SM count: the default call against its batch_invariant run and the fp64 reference
 # ---------------------------------------------------------------------------
@@ -7959,16 +8210,21 @@ CP_CONTEXT_VARIANTS = ("gdn", "kda", "gdn2", "gdp")
 CP_CONTEXT_FULL = ("gdn", "gdp")
 
 
+# every variant in three modes, and GDP once more with the q/k l2norm at a ``qk_l2norm_eps`` that changes every row
+CP_CONTEXT_CASES = [(variant, mode) for mode in ("no_checkpoints", "checkpoints", "l2norm") for variant in CP_CONTEXT_VARIANTS]
+CP_CONTEXT_CASES.append(("gdp", "l2norm_eps"))
+
+
 @pytest.mark.L0
-@pytest.mark.parametrize("mode", ["no_checkpoints", "checkpoints", "l2norm"])
-@pytest.mark.parametrize("variant", CP_CONTEXT_VARIANTS)
+@pytest.mark.parametrize("variant,mode", CP_CONTEXT_CASES)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_context_parallel_context(backend, variant, mode):
     """The backward summary's context (``output_context``): one sequence per slab, the summary on the first (only) local
     sequence returns its context beside ``G`` and the transition, and the raw backward given it is BITWISE the raw
     backward without it, without checkpoints, with the forward's checkpoints at the chunk cadence, and with the q/k l2norm
-    fused in the kernels (GDP at d_v = 64; the forward summary's context then feeds the forward the same way)."""
-    l2norm = mode == "l2norm"
+    fused in the kernels (GDP at d_v = 64; the forward summary's context then feeds the forward the same way).  GDP also
+    runs with that normalization at a ``qk_l2norm_eps``, given to all four ops."""
+    l2norm = mode in ("l2norm", "l2norm_eps")
     full = variant in CP_CONTEXT_FULL
     cadence = CP_CADENCE[variant] if mode == "checkpoints" else 0
     V = 64 if (l2norm and variant == "gdp") else 128
@@ -7981,6 +8237,8 @@ def test_context_parallel_context(backend, variant, mode):
     set_seed(SEED + 53)
     dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
     op_kw = dict(use_qk_l2norm_in_kernel=True) if l2norm else {}
+    if mode == "l2norm_eps":
+        op_kw["qk_l2norm_eps"] = 0.1
     with waive_unsupported(backend, variant):
         summaries = [cp_forward_prepare(case, slab_leaves[r], cus[r]) for r in range(slabs)]
     h_all = torch.stack([s[0] for s in summaries])
@@ -8538,6 +8796,24 @@ def test_one_long_cut_on_device(backend, variant, shape, checkpoints):
         assert_bitwise(f"d{name}", g, grads_inv[name])
 
 
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_one_long_piece_counts_one_after_the_other(backend, variant):
+    """Two batches above the SM count, one long sequence among short ones, whose device chains differ in piece count, run one
+    after the other: o, final_state and every gradient of each are bitwise its ``batch_invariant`` run."""
+    heads, B, _, _ = over_sm_shape()
+    for long in (32768, 65536):
+        case = long_case(variant, [long] + [64] * (B - 1), H=heads, HK=heads, HV=heads)
+        state0, d_final, dO = bwd_inputs(case)
+        kw = dict(initial_state=state0, d_final_state=d_final, dO=dO)
+        o, fs, grads, _, _ = long_grads(backend, case, **kw)
+        o_inv, fs_inv, grads_inv, _, _ = long_grads(backend, case, batch_invariant=True, **kw)
+        assert_bitwise("o", o, o_inv)
+        assert_bitwise("final_state", fs, fs_inv)
+        for name, g in grads.items():
+            assert_bitwise(f"d{name}", g, grads_inv[name])
+
+
 def prepared_kda_graph(inputs, phase, safe_gate, handle):
     """``(execute, outputs, storage, size)`` of one pinned batch_invariant KDA graph over ``inputs`` with all storage built before
     any capture; ``storage`` carries a canary after the exact workspace extent ``size``."""
@@ -8703,7 +8979,7 @@ def test_ragged_pieces_cap():
     assert ragged_pieces(heads_out=32, num_sm=152, total_tokens=1 << 20) == 4
     assert ragged_pieces(heads_out=50, num_sm=152, total_tokens=1 << 20) == 3
     assert ragged_pieces(heads_out=64, num_sm=152, total_tokens=1 << 20) == 0
-    assert ragged_pieces(heads_out=16, num_sm=152, total_tokens=3 * 8192) == 3
+    assert ragged_pieces(heads_out=16, num_sm=152, total_tokens=3 * 8192) == 9
     assert ragged_pieces(heads_out=16, num_sm=152, total_tokens=2 * 8192) == 0
 
 

@@ -75,10 +75,13 @@ from cudnn.moe_ep.api import _resolve_training_device
 from moe_ep.moe_ep_distributed_workers import _distributed_backward_worker
 from moe_ep.moe_ep_test_support import (
     _allocate_stateless_training_outputs,
+    _allocate_training_wgrad_outputs,
     _allocate_training_weight_staging,
     _assert_backward_matches,
     _assert_grouped_wgrads_match_reference,
     _assert_matches_reference,
+    _assert_training_wgrads_match,
+    _assert_wgrad_padding_rows_contribute_zero,
     _assert_wgrads_match_reference,
     _dense_wgrads_from_grouped_kernel,
     _dense_wgrads_from_operands,
@@ -86,11 +89,15 @@ from moe_ep.moe_ep_test_support import (
     _fixed_training_weights,
     _grad_output,
     _interleave_fc1_wgrad,
+    _join_spawned_with_deadline,
     _make_discrete_training_weights,
+    _make_forward_case,
     _moe_ep_config,
     _poison_pre_reduced_for_test,
     _poison_training_outputs_for_test,
     _require_distributed_sm107,
+    _run_isolated,
+    _run_training_wgrad,
     _sm107_device,
     _training_abi_prepared,
     _training_config,
@@ -782,6 +789,205 @@ def test_phase_kernel_config_factories_bind_launch_count_and_phase(
     ) == expected_flags
 
 
+_DEFAULT_FORWARD_KERNEL_FIELDS = {
+    "load_balance_mode": "static",
+    "schedule_mode": "grouped",
+    "fc2_use_bulk": False,
+    "fc2_tma_stages": None,
+    "cluster_shape_mnk": (2, 1, 1),
+    "fallback_cluster_shape_mn": None,
+    "preferred_cluster_count": None,
+    "fallback_cluster_count": None,
+    "launch_cluster_count": 16,
+    "group_hint": 16,
+}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("factory_name", "phase"),
+    (
+        ("for_inference", "inference_tuning"),
+        ("for_training_forward", "training_forward_tuning"),
+    ),
+)
+def test_forward_kernel_tuning_public_values_map_to_kernel_parameters(factory_name, phase):
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import Mxfp8MixedCgaLaunch
+
+    factory = getattr(Mxfp8KernelConfig, factory_name)
+    mixed_launch = Mxfp8MixedCgaLaunch(preferred_cluster_count=30, fallback_cluster_count=14)
+    cases = (
+        ({}, {}),
+        ({"scheduling": "atomic"}, {"load_balance_mode": "atomic_counter"}),
+        ({"scheduling": "phase_interleave"}, {"load_balance_mode": "atomic_counter", "schedule_mode": "phase_interleave"}),
+        ({"fc2_bulk_store": "auto"}, {"fc2_use_bulk": True}),
+        ({"fc2_bulk_store": 4}, {"fc2_use_bulk": True, "fc2_tma_stages": 4}),
+        (
+            {"mixed_cga": True},
+            {
+                "cluster_shape_mnk": (4, 1, 1),
+                "fallback_cluster_shape_mn": (2, 1),
+                "preferred_cluster_count": 30,
+                "fallback_cluster_count": 14,
+                "launch_cluster_count": 37,
+                "group_hint": 37,
+            },
+        ),
+        ({"mixed_cga": True, "group_hint": 64}, {"cluster_shape_mnk": (4, 1, 1), "launch_cluster_count": 37, "group_hint": 64}),
+    )
+    compile_keys = set()
+    for overrides, changed in cases:
+        resolved = _training_config(**{phase: MoeEpTuningConfig(**overrides)})
+        kernel_config = factory(resolved, launch_cluster_count=16, mixed_cga_launch=mixed_launch)
+        expected = {**_DEFAULT_FORWARD_KERNEL_FIELDS, **changed}
+        if overrides.get("mixed_cga") and "fallback_cluster_shape_mn" not in changed:
+            expected.update(fallback_cluster_shape_mn=(2, 1), preferred_cluster_count=30, fallback_cluster_count=14)
+        assert {name: getattr(kernel_config, name) for name in expected} == expected
+        compile_keys.add(kernel_config.compile_key(torch.device("cuda", 0), (10, 7), ()))
+    assert len(compile_keys) == len(cases)
+
+    # Without fallback clusters the launch collapses to uniform 4-CTA clusters.
+    collapsed = factory(
+        _training_config(**{phase: MoeEpTuningConfig(mixed_cga=True)}),
+        launch_cluster_count=16,
+        mixed_cga_launch=Mxfp8MixedCgaLaunch(preferred_cluster_count=37, fallback_cluster_count=0),
+    )
+    assert (collapsed.cluster_shape_mnk, collapsed.fallback_cluster_shape_mn, collapsed.launch_cluster_count) == ((4, 1, 1), None, 37)
+
+    with pytest.raises(ValueError, match="mixed_cga requires a mixed-CGA launch geometry"):
+        factory(_training_config(**{phase: MoeEpTuningConfig(mixed_cga=True)}), launch_cluster_count=16)
+
+
+@pytest.mark.L0
+def test_forward_kernel_tuning_leaves_backward_kernel_config_unchanged():
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import Mxfp8MixedCgaLaunch
+
+    forward_tuning = MoeEpTuningConfig(scheduling="phase_interleave", fc2_bulk_store="auto", mixed_cga=True)
+    resolved = _training_config(training_forward_tuning=forward_tuning, inference_tuning=forward_tuning)
+    backward = Mxfp8KernelConfig.for_training_backward(resolved, launch_cluster_count=16)
+    assert {name: getattr(backward, name) for name in _DEFAULT_FORWARD_KERNEL_FIELDS} == _DEFAULT_FORWARD_KERNEL_FIELDS
+    assert backward == Mxfp8KernelConfig.for_training_backward(_training_config(), launch_cluster_count=16)
+
+    forward = Mxfp8KernelConfig.for_training_forward(
+        resolved,
+        launch_cluster_count=16,
+        mixed_cga_launch=Mxfp8MixedCgaLaunch(preferred_cluster_count=30, fallback_cluster_count=14),
+    )
+    assert forward.tuning_signature()[4:] == (True, None, "atomic_counter", "phase_interleave", (4, 1, 1), (2, 1))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("preferred", "fallback_total", "expected_fallback", "expected_launch"),
+    (
+        (30, 74, 14, 37),
+        (35, 74, 4, 37),
+        (35, 73, 2, 36),
+        (37, 74, 0, 37),
+    ),
+)
+def test_resolve_mixed_cga_launch_matches_vendored_geometry(preferred, fallback_total, expected_fallback, expected_launch):
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import resolve_mixed_cga_launch
+
+    launch = resolve_mixed_cga_launch(
+        preferred_max_active_clusters=preferred,
+        fallback_max_active_clusters=fallback_total,
+    )
+    assert (launch.preferred_cluster_count, launch.fallback_cluster_count, launch.launch_cluster_count) == (
+        preferred,
+        expected_fallback,
+        expected_launch,
+    )
+
+    _vendored_dgrad_kernel_class()  # skips without the Rubin CuTe DSL
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.kernel_src.schedulers.non_clc_mixed_cga import NonClcMixedCgaConfig
+
+    vendored = NonClcMixedCgaConfig(
+        preferred_cluster_shape=(4, 1),
+        fallback_cluster_shape=(2, 1),
+        launch_cluster_count=launch.launch_cluster_count,
+        preferred_cluster_count=launch.preferred_cluster_count,
+        fallback_cluster_count=launch.fallback_cluster_count,
+    )
+    assert vendored.launch_cluster_cnt_merge_as_preferred == launch.launch_cluster_count
+    # Every CTA the kernel promises to token communication must be resident.
+    assert vendored.total_cta_cnt <= fallback_total * 2
+
+
+@pytest.mark.L0
+def test_resolve_mixed_cga_launch_rejects_unusable_occupancy():
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import resolve_mixed_cga_launch
+
+    with pytest.raises(RuntimeError, match="no launchable 4-CTA clusters"):
+        resolve_mixed_cga_launch(preferred_max_active_clusters=0, fallback_max_active_clusters=74)
+    with pytest.raises(RuntimeError, match="2-CTA cluster capacity"):
+        resolve_mixed_cga_launch(preferred_max_active_clusters=30, fallback_max_active_clusters=59)
+
+
+@pytest.mark.L0
+def test_forward_kernel_construction_enforces_tuning_constraints():
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._compile import prepare_kernel
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import Mxfp8MixedCgaLaunch
+
+    device = _sm107_device()
+
+    def prepare(tuning, *, mixed_cga_launch=None, **overrides):
+        resolved = _training_config(training_forward_tuning=tuning, **overrides)
+        config = Mxfp8KernelConfig.for_training_forward(resolved, launch_cluster_count=16, mixed_cga_launch=mixed_cga_launch)
+        return prepare_kernel(resolved, config, device, architecture=(10, 7))
+
+    # The default tuning still builds the pre-existing kernel variant.
+    default_name = prepare(MoeEpTuningConfig()).kernel.name()
+    for fragment in ("cluster(2, 1, 1)", "schedgrouped_workstatic", "fallbackNone_prefcNone_fallbackcNone", "fc2bulk0x0"):
+        assert fragment in default_name
+
+    mixed = prepare(
+        MoeEpTuningConfig(mixed_cga=True, scheduling="phase_interleave", fc2_bulk_store="auto"),
+        mixed_cga_launch=Mxfp8MixedCgaLaunch(preferred_cluster_count=6, fallback_cluster_count=4),
+        hidden_size=256,
+    )
+    assert mixed.kernel.is_mixed_cga
+    assert mixed.kernel.mixed_cga_config.launch_cluster_cnt_merge_as_preferred == mixed.config.launch_cluster_count == 8
+
+    # The scheduler is built with the kernel, so a too-small hint fails before allocation.
+    with pytest.raises(ValueError, match="phase_interleave hint 64 must be at least"):
+        prepare(
+            MoeEpTuningConfig(scheduling="phase_interleave", group_hint=64),
+            hidden_size=256,
+            intermediate_size=8448,
+        )
+
+
+@pytest.mark.L0
+def test_backend_queries_cluster4_only_for_mixed_cga_phase(monkeypatch):
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8 import _backend as backend_module
+
+    queries = []
+
+    def fake_prepare_mixed_cga_launch(device, *, fallback_max_active_clusters):
+        queries.append(fallback_max_active_clusters)
+        from cudnn.moe_ep._megamoe_backend.mxfp8._config import Mxfp8MixedCgaLaunch
+
+        return Mxfp8MixedCgaLaunch(preferred_cluster_count=30, fallback_cluster_count=14)
+
+    monkeypatch.setattr(backend_module, "prepare_mixed_cga_launch", fake_prepare_mixed_cga_launch)
+    backend = backend_module.Mxfp8Backend.__new__(backend_module.Mxfp8Backend)
+    backend._device = torch.device("cuda", 0)
+    backend._prepare_context = ((10, 7), 74)
+    backend._mixed_cga_launch = None
+
+    assert backend._mixed_cga_launch_for(MoeEpTuningConfig()) is None
+    assert queries == []
+    first = backend._mixed_cga_launch_for(MoeEpTuningConfig(mixed_cga=True))
+    second = backend._mixed_cga_launch_for(MoeEpTuningConfig(mixed_cga=True, scheduling="atomic"))
+    assert first is second
+    assert queries == [74]
+
+
 def _vendored_dgrad_kernel_class():
     from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import (
         require_rubin_cutedsl,
@@ -799,35 +1005,15 @@ def _vendored_dgrad_kernel_class():
 
 
 @pytest.mark.L0
-def test_vendored_dgrad_resolver_preserves_moe_ep_legacy_defaults():
-    kernel_class = _vendored_dgrad_kernel_class()
-
-    resolved = kernel_class._resolve_tuning(
-        {},
-        {
-            "load_balance_mode": "static",
-            "force_static_sched": True,
-            "num_sched_stages": None,
-            "token_back_mode": "epi_warps",
-            "epi_flag_batch": (1, 1),
-            "flag_batch": 1,
-            "enable_grad_y2_col_quant": True,
-            "num_ctas_grad_y2_col_quant": 2368,
-        },
+@pytest.mark.parametrize("profile", ("baseline", "rolling", "ds3_ep4_pattern"))
+def test_vendored_dgrad_resolver_matches_moe_ep_profiles(profile):
+    from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        _RESOLVED_DGRAD_PROFILES,
+        _dgrad_selector_kwargs,
     )
 
-    assert resolved["enable_dgrad_optimizations"] is False
-    assert resolved["dgrad_optimization_profile"] == "explicit"
-    assert resolved["schedule_mode"] == "grouped"
-    assert resolved["input_dedup_mode"] == "off"
-    assert resolved["dfc1_m_group"] == 1
-    assert resolved["use_scaled_cvt"] is False
-
-
-@pytest.mark.L0
-def test_vendored_dgrad_resolver_preserves_ds3_preset_and_overrides():
     kernel_class = _vendored_dgrad_kernel_class()
-
+    ds3 = profile == "ds3_ep4_pattern"
     problem = {
         "world_size": 4,
         "expert_count": 32,
@@ -840,6 +1026,16 @@ def test_vendored_dgrad_resolver_preserves_ds3_preset_and_overrides():
         "combine_format": "32e4m3xe8m0",
         "gate_up_clamp": None,
     }
+    expanded_problem = {
+        **problem,
+        "world_size": 8,
+        "expert_count": 64,
+        "topk": 2,
+        "max_tokens_per_rank": 128,
+        "max_recv_size_per_rank": 2048,
+        "hidden_size": 1024,
+        "intermediate_gateup_size": 256,
+    }
     implementation = {
         "mma_tiler_mnk": (256, 256, 128),
         "cluster_shape_mnk": (2, 1, 1),
@@ -851,54 +1047,20 @@ def test_vendored_dgrad_resolver_preserves_ds3_preset_and_overrides():
         "group_hint": None,
         "drop_on_overflow": True,
         "act_func": "swiglu",
-        "fc2_in_kernel_topk_reduce": False,
         "dfc2_recompute": True,
         "dfc2_col_output": True,
         "enable_grad_y2_col_quant": True,
         "weight_storage_mode": "contiguous",
-        "enable_dgrad_optimizations": True,
+        "load_balance_mode": "static" if profile == "baseline" else "atomic_counter",
+        "epi_flag_batch": (4, 2) if ds3 else (1, 1),
+        **_dgrad_selector_kwargs(SimpleNamespace(dgrad_optimization=profile)),
     }
 
-    resolved = kernel_class._resolve_tuning(problem, implementation)
-    assert resolved["dgrad_optimization_profile"] == "ds3_ep4_v1"
-    assert resolved["dgrad_optimization_overrides"] == {}
-    assert (
-        resolved["load_balance_mode"],
-        resolved["schedule_mode"],
-        resolved["num_sched_stages"],
-        resolved["epi_flag_batch"],
-        resolved["num_ctas_grad_y2_col_quant"],
-        resolved["input_dedup_mode"],
-    ) == (
-        "atomic_counter",
-        "phase_interleave",
-        2,
-        (4, 2),
-        -1,
-        "rank",
-    )
-
-    custom = kernel_class._resolve_tuning(
-        problem,
-        {**implementation, "use_scaled_cvt": False},
-    )
-    assert custom["dgrad_optimization_profile"] == "ds3_ep4_v1_custom"
-    assert custom["dgrad_optimization_overrides"] == {"use_scaled_cvt": False}
-
-    expanded = kernel_class._resolve_tuning(
-        {
-            **problem,
-            "world_size": 8,
-            "expert_count": 64,
-            "topk": 2,
-            "max_tokens_per_rank": 128,
-            "max_recv_size_per_rank": 2048,
-            "hidden_size": 1024,
-            "intermediate_gateup_size": 256,
-        },
-        implementation,
-    )
-    assert expanded["dgrad_optimization_profile"] == "ds3_ep4_v1"
+    expected = _RESOLVED_DGRAD_PROFILES[profile]
+    for description in (problem, expanded_problem):
+        resolved = kernel_class._resolve_tuning(description, implementation)
+        assert {name: resolved[name] for name in expected} == expected
+        assert resolved["load_balance_mode"] == implementation["load_balance_mode"]
 
 
 def _qualified_ds3_training_config(
@@ -942,25 +1104,9 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
     baseline = configs["baseline"]
     rolling = configs["rolling"]
     ds3 = configs["ds3_ep4_pattern"]
-    assert (
-        baseline.load_balance_mode,
-        baseline.num_sched_stages,
-        baseline.epi_flag_batch,
-        baseline.col_quant_num_ctas,
-    ) == ("static", None, (1, 1), 2368)
-    assert (
-        rolling.load_balance_mode,
-        rolling.num_sched_stages,
-        rolling.epi_flag_batch,
-        rolling.col_quant_num_ctas,
-    ) == ("atomic_counter", None, (1, 1), 2368)
-    assert (
-        ds3.load_balance_mode,
-        ds3.num_sched_stages,
-        ds3.epi_flag_batch,
-        ds3.col_quant_num_ctas,
-        ds3.group_hint,
-    ) == ("atomic_counter", 2, (4, 2), -1, 106)
+    assert (baseline.load_balance_mode, baseline.epi_flag_batch) == ("static", (1, 1))
+    assert (rolling.load_balance_mode, rolling.epi_flag_batch) == ("atomic_counter", (1, 1))
+    assert (ds3.load_balance_mode, ds3.epi_flag_batch, ds3.group_hint) == ("atomic_counter", (4, 2), 106)
 
     assert {name: config.effective_config()["dgrad_optimization"] for name, config in configs.items()} == {
         "baseline": "baseline",
@@ -969,16 +1115,19 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
     }
     assert {name: _dgrad_selector_kwargs(config) for name, config in configs.items()} == {
         "baseline": {
-            "enable_dgrad_optimizations": False,
-            "dgrad_schedule": None,
+            "schedule_mode": "grouped",
+            "input_dedup_mode": "off",
+            "token_in_async_flags": False,
         },
         "rolling": {
-            "enable_dgrad_optimizations": False,
-            "dgrad_schedule": "optimized",
+            "schedule_mode": "phase_interleave",
+            "input_dedup_mode": "off",
+            "token_in_async_flags": False,
         },
         "ds3_ep4_pattern": {
-            "enable_dgrad_optimizations": True,
-            "dgrad_schedule": None,
+            "schedule_mode": "phase_interleave",
+            "input_dedup_mode": "rank",
+            "token_in_async_flags": True,
         },
     }
     compile_keys = {config.compile_key(torch.device("cuda", 0), (10, 7), ()) for config in configs.values()}
@@ -992,6 +1141,13 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
         launch_cluster_count=106,
     )
     assert forward.dgrad_optimization == "baseline"
+    # The backward dgrad profile does not leak into the forward kernel's schedule.
+    assert (forward.load_balance_mode, forward.schedule_mode, forward.fc2_use_bulk, forward.cluster_shape_mnk) == (
+        "static",
+        "grouped",
+        False,
+        (2, 1, 1),
+    )
     assert forward.max_recv_size_per_rank == 131072
     assert ds3.max_recv_size_per_rank == 131072
     assert (
@@ -1036,8 +1192,9 @@ def test_ds3_public_config_accepts_upstream_expanded_topology_and_shape():
     assert config.hidden == 1024
     assert config.intermediate == 256
     assert _dgrad_selector_kwargs(config) == {
-        "enable_dgrad_optimizations": True,
-        "dgrad_schedule": None,
+        "schedule_mode": "phase_interleave",
+        "input_dedup_mode": "rank",
+        "token_in_async_flags": True,
     }
 
 
@@ -1076,30 +1233,10 @@ def test_ds3_accepts_overprovisioned_exact_physical_pool():
 
 
 @pytest.mark.L0
-def test_automatic_col_quant_grid_is_scoped_to_ds3():
-    from cudnn import MoeEpTuningConfig
-
-    baseline = Mxfp8KernelConfig.for_training_backward(
-        _training_config(),
-        launch_cluster_count=16,
-    )
-    with pytest.raises(ValueError, match="requires ds3_ep4_pattern"):
-        replace(baseline, col_quant_num_ctas=-1)
-
-    ds3 = Mxfp8KernelConfig.for_training_backward(
-        _qualified_ds3_training_config(
-            MoeEpTuningConfig(dgrad_optimization="ds3_ep4_pattern"),
-        ),
-        launch_cluster_count=106,
-    )
-    with pytest.raises(ValueError, match="requires ds3_ep4_pattern"):
-        replace(ds3, dgrad_optimization="rolling")
-
-
-@pytest.mark.L0
 def test_resolved_dgrad_profile_guard_rejects_upstream_drift():
     from cudnn import MoeEpTuningConfig
     from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        _RESOLVED_DGRAD_PROFILES,
         _validate_resolved_dgrad_profile,
     )
 
@@ -1107,24 +1244,13 @@ def test_resolved_dgrad_profile_guard_rejects_upstream_drift():
         _training_config(),
         launch_cluster_count=16,
     )
-    _validate_resolved_dgrad_profile(
-        baseline,
-        SimpleNamespace(
-            resolved_dgrad_config={
-                "dgrad_optimization_profile": "explicit",
-                "dgrad_optimization_overrides": {},
-            }
-        ),
-    )
+    resolved = dict(_RESOLVED_DGRAD_PROFILES["baseline"])
+    _validate_resolved_dgrad_profile(baseline, SimpleNamespace(resolved_dgrad_config=resolved))
+    # Upstream resolving a profile field differently, such as a new "auto" default, is drift.
     with pytest.raises(RuntimeError, match="resolution drifted"):
         _validate_resolved_dgrad_profile(
             baseline,
-            SimpleNamespace(
-                resolved_dgrad_config={
-                    "dgrad_optimization_profile": "optimized",
-                    "dgrad_optimization_overrides": {},
-                }
-            ),
+            SimpleNamespace(resolved_dgrad_config={**resolved, "input_dedup_mode": "rank"}),
         )
 
     ds3 = Mxfp8KernelConfig.for_training_backward(
@@ -1133,17 +1259,12 @@ def test_resolved_dgrad_profile_guard_rejects_upstream_drift():
         ),
         launch_cluster_count=106,
     )
-    with pytest.raises(RuntimeError, match="unexpected downstream overrides"):
+    resolved = dict(_RESOLVED_DGRAD_PROFILES["ds3_ep4_pattern"])
+    _validate_resolved_dgrad_profile(ds3, SimpleNamespace(resolved_dgrad_config=resolved))
+    with pytest.raises(RuntimeError, match="resolution drifted"):
         _validate_resolved_dgrad_profile(
             ds3,
-            SimpleNamespace(
-                resolved_dgrad_config={
-                    "dgrad_optimization_profile": "ds3_ep4_v1",
-                    "dgrad_optimization_overrides": {
-                        "num_sched_stages": None,
-                    },
-                }
-            ),
+            SimpleNamespace(resolved_dgrad_config={**resolved, "use_scaled_cvt": False}),
         )
 
 
@@ -1775,7 +1896,8 @@ def test_training_abi_fingerprint_covers_workspace_and_native_layouts():
         source_tree_digest="source",
     )
 
-    assert first["schema_version"] == 6
+    assert first["schema_version"] == 7
+    assert first["wgrad_kernel"] is None
     assert first["geometry"]["physical_recv_pool_rows"] == 128
     assert first["geometry"]["logical_recv_route_capacity"] == 16
     assert first["geometry"]["required_padded_rows"] == 128
@@ -1985,18 +2107,25 @@ def test_ds3_prepares_qualified_upstream_kernel(
     )
 
     assert prepared.pool_token_capacity == physical_recv_pool_rows
-    assert prepared.kernel.resolved_dgrad_config["dgrad_optimization_profile"] == "ds3_ep4_v1"
-    assert prepared.kernel.resolved_dgrad_config["dgrad_optimization_overrides"] == {}
+    assert prepared.kernel.resolved_dgrad_config["schedule_mode"] == "phase_interleave"
+    # The mode actually built: an explicit "rank" never falls back to "off".
+    assert prepared.kernel.input_dedup_mode == "rank"
 
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize(
     "dgrad_optimization",
-    ("baseline", "rolling"),
+    ("baseline", "rolling", "ds3_ep4_pattern"),
+)
+@pytest.mark.parametrize(
+    "forward_tuning",
+    ({}, {"scheduling": "phase_interleave", "mixed_cga": True}),
+    ids=("forward-default", "forward-phase-mixed"),
 )
 def test_discrete_training_forward_backward_and_graph_match_reference(
     dgrad_optimization,
+    forward_tuning,
 ):
     from cudnn import MoeEpTuningConfig
 
@@ -2022,6 +2151,7 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
             physical_recv_pool_rows=256,
             combine_format="bf16",
             training_weight_storage_mode=(MoeEpNativeWeightStorageMode.DISCRETE),
+            training_forward_tuning=MoeEpTuningConfig(**forward_tuning),
             training_backward_tuning=MoeEpTuningConfig(
                 dgrad_optimization=dgrad_optimization,
             ),
@@ -2048,10 +2178,11 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
         assert discrete_owners
         state = op._training_state
         assert state is not None
-        expected_descriptor_bytes = op.experts_per_rank * 4 * 128
         for prepared in (state.forward_prepared, state.backward_prepared):
+            # Mixed CGA keeps one descriptor set per preferred and fallback cluster role.
+            roles = 1 + int(getattr(prepared.kernel, "is_mixed_cga", False))
             descriptor_region = prepared.kernel.weight_descriptor_region
-            assert prepared.kernel._mega_device_workspace.nbytes(descriptor_region) == expected_descriptor_bytes
+            assert prepared.kernel._mega_device_workspace.nbytes(descriptor_region) == op.experts_per_rank * 4 * 128 * roles
 
         symmetric = op.training_symmetric_buffers()
         forward_out, backward_out = _allocate_stateless_training_outputs(
@@ -2095,6 +2226,13 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
             expected[3],
             weight_interleave_size=32,
         )
+        # Every dgrad profile produces the operands training_wgrad consumes in place.
+        dense_wgrads = _dense_wgrads_from_operands(eager[3])
+        grouped_wgrads = _dense_wgrads_from_grouped_kernel(eager[3])
+        _assert_wgrad_padding_rows_contribute_zero(eager[3])
+        wgrads = _run_training_wgrad(op, eager[3], _allocate_training_wgrad_outputs(dense_wgrads))
+        torch.cuda.synchronize(device)
+        _assert_training_wgrads_match(wgrads, dense_wgrads, grouped=grouped_wgrads)
 
         table_addresses = tuple(table.data_ptr() for bundle in (discrete_forward, discrete_backward) for table in MoeEp._discrete_pointer_tables(bundle))
         graph = torch.cuda.CUDAGraph()
@@ -2125,6 +2263,113 @@ def test_discrete_training_multi_gpu_matches_reference(world_size, tmp_path):
         args=(world_size, str(init_file), "discrete"),
         nprocs=world_size,
         join=True,
+    )
+
+
+_TRAINING_MIXED_CGA_TUNINGS = {
+    "phase-mixed": {"mixed_cga": True, "scheduling": "phase_interleave"},
+    "phase-mixed-standalone": {"mixed_cga": True, "scheduling": "phase_interleave", "token_back_mode": "standalone_warps"},
+}
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("world_size", [4], ids=["ep4"])
+@pytest.mark.parametrize("tuning_name", sorted(_TRAINING_MIXED_CGA_TUNINGS))
+def test_training_multi_gpu_mixed_cga_matches_reference(world_size, tuning_name, tmp_path):
+    """Mixed-CGA acceptance G2: upstream CI covers mixed CGA only at EP1.
+
+    Discrete storage only: mixed CGA keeps one weight-descriptor set per cluster role there, and the multi-node
+    mixed-CGA cases already cover contiguous storage. EP4 covers EP2's single-node transport.
+    """
+
+    storage_mode = "discrete"
+    _require_distributed_sm107(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / f"mixed_cga_training_{tuning_name}_{storage_mode}_ep{world_size}.init"
+    context = mp.spawn(
+        _distributed_backward_worker,
+        args=(world_size, str(init_file), storage_mode, _TRAINING_MIXED_CGA_TUNINGS[tuning_name]),
+        nprocs=world_size,
+        join=False,
+    )
+    _join_spawned_with_deadline(context, what=f"EP{world_size} mixed-CGA training {tuning_name} ({storage_mode})")
+
+
+_TRAINING_FORWARD_TUNING_CASES = {
+    "bulk-auto": {"fc2_bulk_store": "auto"},
+    "atomic": {"scheduling": "atomic"},
+    "phase-mixed": {"scheduling": "phase_interleave", "mixed_cga": True},
+    # atomic and phase_interleave switch token-back to atomic-counter claiming; standalone warps then claim that way too.
+    "atomic-standalone": {"scheduling": "atomic", "token_back_mode": "standalone_warps"},
+    "phase-mixed-standalone": {"scheduling": "phase_interleave", "mixed_cga": True, "token_back_mode": "standalone_warps"},
+}
+
+
+def _training_forward_tuning_worker(case_name: str) -> None:
+    from cudnn import MoeEpTuningConfig
+
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    hidden = 256  # FC2 bulk stores need whole 256-column FC2 tiles.
+    base_args = _make_forward_case(
+        device,
+        experts=2,
+        tokens=5,
+        hidden=hidden,
+        intermediate=256,
+        top_k=2,
+        index_dtype=torch.int32,
+        weight_dtype=torch.float32,
+    )
+    args = (base_args[0].dequantize(torch.bfloat16).contiguous(), *base_args[1:4], base_args[4].float().contiguous())
+    token_count = args[0].shape[0]
+    grad_output = _grad_output(device, token_count, seed=20261111, hidden_size=hidden)
+    expected = _fixed_training_reference(
+        args,
+        grad_output,
+        combine_format="bf16",
+        gate_up_clamp=None,
+        max_tokens_per_rank=token_count,
+        physical_recv_pool_rows=256,
+    )
+    source_weights = _fixed_training_weights(args)
+
+    def forward_outputs(tuning, calls):
+        with MoeEp(
+            _training_public_config(
+                hidden_size=hidden,
+                top_k=args[3].shape[1],
+                max_tokens_per_rank=token_count,
+                physical_recv_pool_rows=256,
+                combine_format="bf16",
+                training_forward_tuning=tuning,
+            )
+        ) as op:
+            requirements = op.prepare_training(device=device)
+            forward_staging, _ = _allocate_training_weight_staging(source_weights)
+            native_forward = op.pack_forward_weights(source_weights[0], out=forward_staging)
+            forward_out, _ = _allocate_stateless_training_outputs(requirements, device, op.training_symmetric_buffers())
+            results = [op.training_forward(args[0], args[3], args[4], weights=native_forward, out=forward_out).clone() for _ in range(calls)]
+            torch.cuda.synchronize(device)
+            return results
+
+    (default_output,) = forward_outputs(MoeEpTuningConfig(), 1)
+    # Repeated calls reuse the zero-once workspace: the kernel's tail reset must hold.
+    for output in forward_outputs(MoeEpTuningConfig(**_TRAINING_FORWARD_TUNING_CASES[case_name]), 3):
+        _assert_matches_reference(output, expected[0])
+        assert torch.equal(output.view(torch.int16), default_output.view(torch.int16))
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("case_name", sorted(_TRAINING_FORWARD_TUNING_CASES))
+def test_training_forward_kernel_tuning_does_not_accumulate_across_calls(case_name):
+    _sm107_device()
+    _run_isolated(
+        _training_forward_tuning_worker,
+        (case_name,),
+        what=f"training forward tuning case {case_name}",
     )
 
 
@@ -2457,10 +2702,13 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
                 out=backward_out,
             )
             assert operands is not None
-            return y, dx, dprob, operands
+            wgrads = _run_training_wgrad(op, operands, wgrad_outputs)
+            return y, dx, dprob, operands, wgrads
 
         def assert_matches(actual, reference=expected):
-            y, dx, dprob, operands = actual
+            y, dx, dprob, operands, wgrads = actual
+            _assert_wgrad_padding_rows_contribute_zero(operands)
+            _assert_training_wgrads_match(wgrads, grouped_reference(reference))
             _assert_matches_reference(y, reference[0])
             if token_count == 5:
                 _assert_backward_matches(
@@ -2508,6 +2756,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
 
         grouped_expected = grouped_reference(expected)
         grouped_outputs = tuple(torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected)
+        wgrad_outputs = _allocate_training_wgrad_outputs(grouped_expected)
 
         def run_grouped(operands):
             return _dense_wgrads_from_grouped_kernel(
@@ -2532,6 +2781,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
             assert physical_recv_pool_rows > expected_effective_pool
         assert_matches(eager)
         assert_grouped_matches(eager_grouped, grouped_expected)
+        _assert_training_wgrads_match(eager[4], grouped_expected, grouped=eager_grouped)
 
         capture_stream = torch.cuda.current_stream(device)
         graphs = []
@@ -2573,56 +2823,6 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         captured_grouped = run_grouped(captured[3])
         torch.cuda.synchronize(device)
         assert_grouped_matches(captured_grouped, grouped_expected)
-
-
-@pytest.mark.L0
-def test_training_forward_in_kernel_topk_reduce_does_not_accumulate_across_calls():
-    from cudnn import MoeEpTuningConfig
-
-    device = _sm107_device()
-    base_args = make_forward_inputs(device)
-    args = (
-        base_args[0].dequantize(torch.bfloat16).contiguous(),
-        base_args[1],
-        base_args[2],
-        base_args[3],
-        base_args[4].float().contiguous(),
-    )
-    token_count = args[0].shape[0]
-    grad_output = _grad_output(device, token_count, seed=20260902)
-    expected = _fixed_training_reference(
-        args,
-        grad_output,
-        combine_format="bf16",
-        gate_up_clamp=None,
-        max_tokens_per_rank=token_count,
-        physical_recv_pool_rows=256,
-    )
-    source_weights = _fixed_training_weights(args)
-
-    # In-kernel top-k reduction needs BF16 combine and output, apply_topk_in_fc1 and token_back_mode="epi_warps".
-    with MoeEp(
-        _training_public_config(
-            top_k=args[3].shape[1],
-            max_tokens_per_rank=token_count,
-            physical_recv_pool_rows=256,
-            combine_format="bf16",
-            output_format="bf16",
-            apply_topk_in_fc1=True,
-            training_forward_tuning=MoeEpTuningConfig(reduce_topk_in_kernel=True),
-        )
-    ) as op:
-        requirements = op.prepare_training(device=device)
-        forward_staging, _ = _allocate_training_weight_staging(source_weights)
-        native_forward = op.pack_forward_weights(source_weights[0], out=forward_staging)
-        forward_out, _ = _allocate_stateless_training_outputs(requirements, device, op.training_symmetric_buffers())
-
-        def run():
-            return op.training_forward(args[0], args[3], args[4], weights=native_forward, out=forward_out)
-
-        # BF16 atomics make the reduction order-dependent: check each call against the reference, not against call 1.
-        _assert_matches_reference(run(), expected[0])
-        _assert_matches_reference(run(), expected[0])
 
 
 @pytest.mark.L1
@@ -2741,6 +2941,10 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
             dense_wgrads,
             reference_name="the valid-range decoded MoeEP operands",
         )
+        _assert_wgrad_padding_rows_contribute_zero(operands)
+        wgrads = _run_training_wgrad(op, operands, _allocate_training_wgrad_outputs(dense_wgrads))
+        torch.cuda.synchronize(device)
+        _assert_training_wgrads_match(wgrads, dense_wgrads, grouped=grouped_wgrads)
 
 
 @pytest.mark.L1
@@ -2885,10 +3089,13 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
                 expert_offsets=forward_out.expert_offsets,
                 out=backward_out,
             )
-            return output, grad_activation, dprob, operands
+            wgrads = _run_training_wgrad(op, operands, wgrad_outputs)
+            return output, grad_activation, dprob, operands, wgrads
 
         def assert_matches(result):
-            output, grad_activation, dprob, operands = result
+            output, grad_activation, dprob, operands, wgrads = result
+            _assert_wgrad_padding_rows_contribute_zero(operands)
+            _assert_training_wgrads_match(wgrads, grouped_expected)
             assert output.data_ptr() == forward_out.output.data_ptr()
             assert grad_activation.data_ptr() == backward_out.grad_activation.data_ptr()
             assert dprob.data_ptr() == backward_out.dprob.data_ptr()
@@ -2910,6 +3117,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
             expected_fc2_wgrad,
         )
         grouped_outputs = tuple(torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected)
+        wgrad_outputs = _allocate_training_wgrad_outputs(grouped_expected)
 
         def assert_grouped_matches(operands):
             grouped_wgrads = _dense_wgrads_from_grouped_kernel(

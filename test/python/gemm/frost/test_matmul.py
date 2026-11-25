@@ -4208,10 +4208,13 @@ _SPLITK_EPI_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
 
 
 def _splitk_cfg(sm100_name=None):
-    """sm120 runs every split-K test on one config; sm100 keeps its per-test pick."""
+    """The sm120 tree runs every split-K test on one config; the sm100 tree keeps its per-test pick.
+
+    Keyed on the tree, not on SM 12.0 alone: GB10 is SM 12.1, and an sm100 config there is declined by the
+    arch gate, which the frost conftest reports as a skip."""
     from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG
 
-    if _current_arch() == 120:
+    if active_family() == "sm120":
         return by_name(_SM120_SPLITK_CFG)
     return by_name(sm100_name) if sm100_name else DEFAULT_CONFIG
 
@@ -4354,7 +4357,7 @@ def test_splitk_n_not_multiple_of_4(N):
     # splitk_reduce_elems clamps to divide N (2 for 250, 1 for 255), so reducer
     # groups never cross a workspace row. The output store may narrow further
     # to a byte or halfword according to its own dtype and layout alignment.
-    if N % 2 and _current_arch() == 120:
+    if N % 2 and active_family() == "sm120":
         pytest.skip("the sm120 template stores whole (n, n+1) accumulator pairs; odd N is rejected")
     g, A, Bt, C = _splitk_graph(1, 256, N, 4096, out_dt=cudnn.data_type.FLOAT)
     compiled = _jit_splitk(g, 8)

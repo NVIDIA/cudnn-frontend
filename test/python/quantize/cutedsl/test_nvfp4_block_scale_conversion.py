@@ -28,39 +28,7 @@ requires_sm100_or_newer = pytest.mark.skipif(
 )
 
 
-def _make_buffers(m=128, k=2048):
-    x = torch.empty((1, m, k), device="cuda", dtype=torch.bfloat16)
-    encode = torch.ones((1, 1, 1), device="cuda", dtype=torch.float32)
-    carrier = torch.empty((1, m, k // 2), device="cuda", dtype=torch.uint8)
-    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    packed = carrier.view(fp4_dtype) if fp4_dtype is not None else carrier
-    scales = torch.empty((1, m, k // 16), device="cuda", dtype=torch.float8_e4m3fn)
-    output = torch.empty_like(x)
-    return x, encode, packed, scales, output
-
-
-@requires_sm100_or_newer
-@pytest.mark.L0
-def test_nvfp4_conversion_is_exposed_through_semantic_ops_namespace():
-    assert cudnn.ops.nvfp4_block_scale_quantize.__name__ == "nvfp4_block_scale_quantize"
-    assert cudnn.ops.nvfp4_block_scale_dequantize.__name__ == "nvfp4_block_scale_dequantize"
-
-
-@requires_sm100_or_newer
-@pytest.mark.L0
-def test_nvfp4_plan_rejects_non_materializable_contracts():
-    x, encode, packed, scales, _ = _make_buffers()
-    bad_x = torch.empty((1, x.shape[-1], x.shape[-2]), device="cuda", dtype=x.dtype).transpose(1, 2)
-    plan = cudnn.ops.Nvfp4BlockScaleQuantizer(bad_x, encode, packed, scales)
-    with pytest.raises(ValueError, match="input must be C-contiguous"):
-        plan.check_support()
-
-
-@requires_sm100_or_newer
-@pytest.mark.parametrize(
-    "m,k", [pytest.param(128, 2048, marks=pytest.mark.L0), pytest.param(256, 5376, marks=pytest.mark.L1), pytest.param(128, 8192, marks=pytest.mark.L1)]
-)
-def test_nvfp4_quantize_dequantize_round_trip_on_representable_values(m, k):
+def _representable_input(m, k):
     levels = torch.tensor(
         (-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
         device="cuda",
@@ -71,13 +39,39 @@ def test_nvfp4_quantize_dequantize_round_trip_on_representable_values(m, k):
     rows = torch.arange(m, device="cuda").unsqueeze(1)
     columns = torch.arange(groups, device="cuda").unsqueeze(0)
     logical_scales = scale_lut[(rows + columns) & 3]
-    x = (logical_scales.unsqueeze(-1) * levels).reshape(1, m, k).to(torch.bfloat16)
+    return (logical_scales.unsqueeze(-1) * levels).reshape(1, m, k).to(torch.bfloat16)
+
+
+@requires_sm100_or_newer
+@pytest.mark.L0
+def test_nvfp4_conversion_is_exposed_through_semantic_ops_namespace():
+    assert cudnn.ops.nvfp4_block_scale_quantize_forward.__name__ == "nvfp4_block_scale_quantize_forward"
+    assert cudnn.ops.nvfp4_block_scale_dequantize_forward.__name__ == "nvfp4_block_scale_dequantize_forward"
+    assert not hasattr(cudnn.ops, "Nvfp4BlockScaleQuantizer")
+    assert not hasattr(cudnn.ops, "Nvfp4BlockScaleDequantizer")
+
+
+@requires_sm100_or_newer
+@pytest.mark.L0
+def test_nvfp4_quantize_rejects_non_contiguous_input():
+    bad_x = torch.empty((1, 2048, 128), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    encode = torch.ones((1, 1, 1), device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="contiguous"):
+        cudnn.ops.nvfp4_block_scale_quantize_forward(bad_x, encode)
+
+
+@requires_sm100_or_newer
+@pytest.mark.parametrize(
+    "m,k", [pytest.param(128, 2048, marks=pytest.mark.L0), pytest.param(256, 5376, marks=pytest.mark.L1), pytest.param(128, 8192, marks=pytest.mark.L1)]
+)
+def test_nvfp4_quantize_dequantize_round_trip_on_representable_values(m, k):
+    x = _representable_input(m, k)
     encode = torch.full((1, 1, 1), 2.0, device="cuda", dtype=torch.float32)
     decode = torch.full((1, 1, 1), 0.5, device="cuda", dtype=torch.float32)
 
-    result = cudnn.ops.nvfp4_block_scale_quantize(x, encode)
+    result = cudnn.ops.nvfp4_block_scale_quantize_forward(x, encode)
     packed, scales = result
-    restored = cudnn.ops.nvfp4_block_scale_dequantize(packed, scales, decode)
+    restored = cudnn.ops.nvfp4_block_scale_dequantize_forward(packed, scales, decode)
     torch.cuda.synchronize()
 
     assert tuple(packed.shape) == (1, m, k // 2)
@@ -88,47 +82,23 @@ def test_nvfp4_quantize_dequantize_round_trip_on_representable_values(m, k):
 
 @requires_sm100_or_newer
 @pytest.mark.L1
-def test_nvfp4_prepared_plans_accept_explicit_uint8_carrier():
-    m, k = 128, 2048
-    levels = torch.tensor(
-        (-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
-        device="cuda",
-        dtype=torch.float32,
-    )
-    x = (levels.repeat(m, k // 16) * 0.25).reshape(1, m, k).to(torch.bfloat16)
+def test_nvfp4_dequantize_accepts_uint8_carrier():
+    x = _representable_input(128, 2048)
     one = torch.ones((1, 1, 1), device="cuda", dtype=torch.float32)
-    packed = torch.empty((1, m, k // 2), device="cuda", dtype=torch.uint8)
-    scales = torch.empty((1, m, k // 16), device="cuda", dtype=torch.float8_e4m3fn)
-    restored = torch.empty_like(x)
-
-    quantizer = cudnn.ops.Nvfp4BlockScaleQuantizer(x, one, packed, scales)
-    dequantizer = cudnn.ops.Nvfp4BlockScaleDequantizer(packed, scales, one, restored)
-    assert quantizer.check_support() and dequantizer.check_support()
-    quantizer.compile()
-    dequantizer.compile()
-    quantizer.execute(x, one, packed, scales)
-    dequantizer.execute(packed, scales, one, restored)
+    packed, scales = cudnn.ops.nvfp4_block_scale_quantize_forward(x, one)
+    restored = cudnn.ops.nvfp4_block_scale_dequantize_forward(packed.view(torch.uint8), scales, one)
     torch.cuda.synchronize()
 
-    assert packed.dtype == torch.uint8
     torch.testing.assert_close(restored, x, rtol=0, atol=0)
 
 
 @requires_sm100_or_newer
 @pytest.mark.L1
-def test_nvfp4_prepared_plans_reuse_compiled_k_across_runtime_m():
-    x0, encode0, packed0, scales0, output0 = _make_buffers(m=128)
-    quantizer = cudnn.ops.Nvfp4BlockScaleQuantizer(x0, encode0, packed0, scales0)
-    dequantizer = cudnn.ops.Nvfp4BlockScaleDequantizer(packed0, scales0, encode0, output0)
-    assert quantizer.check_support() and dequantizer.check_support()
-    quantizer.compile()
-    dequantizer.compile()
-
-    x1, encode1, packed1, scales1, output1 = _make_buffers(m=256)
-    x1.normal_()
-    quantizer.execute(x1, encode1, packed1, scales1)
-    dequantizer.execute(packed1, scales1, encode1, output1)
-    torch.cuda.synchronize()
-
-    assert torch.isfinite(output1).all()
-    assert output1.abs().sum() > 0
+def test_nvfp4_reuses_compiled_k_across_runtime_m():
+    one = torch.ones((1, 1, 1), device="cuda", dtype=torch.float32)
+    for m in (128, 256):
+        x = _representable_input(m, 2048)
+        packed, scales = cudnn.ops.nvfp4_block_scale_quantize_forward(x, one)
+        restored = cudnn.ops.nvfp4_block_scale_dequantize_forward(packed, scales, one)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(restored, x, rtol=0, atol=0)

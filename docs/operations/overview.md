@@ -4,6 +4,7 @@ The API reference groups graph operations and experimental Python kernels by
 operation. Use the sidebar to find an operation and its related APIs.
 
 - [Attention](/operations/Attention)
+- [JAX SDPA Python frontend (experimental)](sdpa_jax.md)
 - [Sparse Attention](/operations/sparse_attention)
 - [Linear Attention](/operations/LinearAttention)
 - [Matmul and GEMM Fusions](/operations/Matmul)
@@ -30,10 +31,15 @@ The experimental API catalog includes:
 - [Kimi Delta Attention in JAX](/operations/LinearAttention/kda_jax)
 - [Fused GDN Decode / Verify Steps as a FlashInfer Backend (SM100 / SM120)](/operations/LinearAttention/gdn_decode_flashinfer_backend) — the fused Gated DeltaNet decode step and MTP verify step of a Qwen 3.5-architecture dense model's GDN sub-layer as one FROST launch each, registered as the `frost_fe` backend of FlashInfer's experimental Qwen 3.5 GDN block (bf16 operands, fp32 state, FP8 output)
 - [Shared-Expert Decode Pair (SM100-class)](/operations/MoeGroupedMatmul/shared_expert_decode) — the bf16 shared expert next to a routed MoE at decode-time token counts (1 .. 24) as two FROST launches (gate_up + SiLU-mul with the gate logit, down + sigmoid gate), bitwise repeatable and batch-invariant
+- [CuTe MoK (SM100 / SM103)](/operations/MoeGroupedMatmul/cutemok) — one expert-parallel MoE layer (token dispatch across ranks, the routed and shared experts' SwiGLU MLPs, combine) as one persistent CuTe DSL megakernel per direction, BF16 or MXFP8 routed weights, derived from Mixture-of-Kittens
 - [Attention Gate + Quantize Decode Step (SM100-class)](/operations/Attention/gate_quant_decode) — the sigmoid output gate of an attention block fused with the static FP8 (E4M3) quantization of the following projection's input, at decode-time row counts (1 .. 160), as one FROST launch (bf16 in, E4M3 out), bitwise repeatable and batch-invariant
 - [FP8 Projection for Decode Rows (SM100-class)](/operations/Matmul/gemm_fusions/fp8_projection_decode) — an FP8 E4M3 weight times FP8 E4M3 activations to bf16 at decode-time row counts (1 .. 32) as one FROST launch with split-K clusters (or one K slice per weight tile, without a cluster) and the weight stream ahead of the dependent-launch wait; the split is a numerics attribute fixed per entry, bitwise repeatable and batch-invariant
 - [Add + RMSNorm + Quantize Decode Step (SM100-class)](/operations/Normalizations/add_norm_quant_decode) — the residual add, the RMSNorm and the quantization of the next projection's input at decode-time row counts (1 .. 1024) as one FROST launch (bf16 in; bf16, FP8 E4M3 or NVFP4 out), bitwise repeatable and batch-invariant
 - [SwiGLU FP4 Gate / Up Product for Decode Rows (SM100-class)](/operations/Matmul/gemm_fusions/swiglu_fp4_decode) — the gate / up product of a block-scaled FP4 (NVFP4) MLP with SiLU(gate) x up and the FP4 re-quantization of the result at decode-time row counts (1 .. 64) as one FROST launch, with the weight stream ahead of the dependent-launch wait; no numerics knob, bitwise repeatable and batch-invariant
+- [Attention Preparation Decode Step (SM100-class)](/operations/Attention/attention_prepare_decode) — per token of a decode step the RMSNorm of every query and key head row, the rotation of its rotary part by the token's position (one or three position rows), the gate rows copied beside the queries and the keys and values written into paged pools at the token's slot, at decode-time token counts (1 .. 1024), as one FROST launch (bf16 in and out), bitwise repeatable and batch-invariant
+- [FP4 Row Quantization Decode Step (SM100-class)](/operations/BlockScaling/row_quantize_fp4_decode) — the block-scaled FP4 (NVFP4) quantization of bf16 rows under a global scale (E2M1 codes, one E4M3 block scale per sixteen elements in the 128 x 4 scale layout) at decode-time row counts (1 .. 1024) as one FROST launch; no numerics knob, bitwise repeatable and batch-invariant
+- [FP8 Row Quantization Decode Step (SM100-class)](/operations/Pointwise/row_quantize_fp8_decode) — the dynamic FP8 (E4M3) quantization of bf16 rows, each under its own scale (the row maximum over 448 with a floor; E4M3 codes and one fp32 scale per row), at decode-time row counts (1 .. 1024) as one FROST launch; every step exactly specified, no numerics knob, bitwise repeatable and batch-invariant
+- [Row Argmax Decode Step (SM100-class)](/operations/Pointwise/row_argmax_decode) — per row of a bf16 slab the lowest column of the row maximum, or the entry of an int32 / int64 id table at that column (ties to the lowest column, a NaN never chosen), at decode-time row counts (1 .. 1024) as one FROST launch; exact, bitwise repeatable and batch-invariant
 - [LayerNorm and RMSNorm in JAX](/operations/Normalizations/norm_jax) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/normalizations/norm_jax.md))
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
@@ -63,6 +69,7 @@ The experimental API catalog includes:
 - [Query Sparse Attention (QSA): attention and indexer entry points](/operations/sparse_attention/qsa)
 - [QSA training from existing token indices](/operations/sparse_attention/qsa/qsa_indexed)
 - [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa)
+- [Pooled DSA](/operations/sparse_attention/pooled_dsa): full indexer, selection from logits, cache update, and index expansion
 - [Fused DSA indexer and exact top-k (Cake)](/operations/dsa_indexer_topk)
 - [Cake sparse-attention training](/operations/dsa_sparse_training)
 - [Cake deterministic DSA and Lightning indexer](/operations/dsa_deterministic)
@@ -74,6 +81,7 @@ The experimental API catalog includes:
 - [Aligned HCA Backward](/operations/sparse_attention/csa/aligned_hca_backward)
 - [DSv4.1 Vision RoPE Backward](/operations/RoPE/vision_rope_backward)
 - [Engram Saved-State Gate](/operations/Pointwise/engram_saved_gate)
+- [Row Argmax Decode Step (SM100-class)](/operations/Pointwise/row_argmax_decode)
 - [RMSNorm + RHT + Amax](/operations/Normalizations/rmsnorm_rht_amax)
 - [Ahead-of-time attention for SM120 (C/C++ API)](/operations/Attention/aot_sm120_attention)
 - [SDPA Backward, d = 128, dense and THD MHA/GQA/MQA (SM100 / SM103)](/operations/Attention/sdpa_bwd_sm100_d128)
@@ -85,6 +93,8 @@ The experimental API catalog includes:
 - [RMSNorm + SiLU](/operations/Normalizations/rmsnorm_silu)
 - [Fused Conv3D + Bias + Residual + RMSNorm + SiLU](/operations/Convolutions/conv3d_postops)
 - [NVFP4 Block-Scale Conversion](/operations/BlockScaling/nvfp4_block_scale_conversion)
+- [FP4 Row Quantization Decode Step (SM100-class)](/operations/BlockScaling/row_quantize_fp4_decode)
+- [FP8 Row Quantization Decode Step (SM100-class)](/operations/Pointwise/row_quantize_fp8_decode)
 - [DSv4.1 mHC projection/RMS backward](/operations/Matmul/gemm_fusions/mhc_projection_bwd)
 
 - [Ragged grouped GEMM training](/operations/gemm_fusions/ragged_grouped_gemm)

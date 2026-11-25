@@ -39,12 +39,14 @@ from .common import (
     check_composed_state,
     check_composed_summaries,
     check_context,
+    eager_backward,
     eager_dispatch,
     execute_graph,
     make_execution_resources,
     make_summary_cache_key,
     select_plan,
     summary_backward,
+    summary_dispatch,
     summary_setup_context,
     torch_dtype_to_cudnn,
 )
@@ -681,7 +683,9 @@ def gdn_fwd_overwrite_state(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GDN forward whose final state overwrites ``initial_state``, the rows ``state_indices`` names when that int32 or int64 ``[N]``
     table addresses a state pool.  The engine runs the chain or the uncut schedule and
-    never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last.  Inference
+    never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last (a prefill
+    kernel built with its levelled plan may run a tile as two work items, the second handed out behind the first one's
+    store of that state: see ``gated_delta_net``).  Inference
     only: a mutating op registers no autograd formula.  Returns ``(o, state_checkpoints)``."""
     o, _, state_checkpoints, _, _ = run_gdn_fwd(
         q=q,
@@ -1445,8 +1449,9 @@ class EagerGdn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
-        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range
-        return gdn_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else run_gdn_bwd)
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range, and a
+        # trace or mode that started after the forward has to see the op
+        return gdn_backward(ctx, *grads, bwd=run_gdn_bwd if eager_backward(grads) else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1526,8 +1531,22 @@ def gated_delta_net(
             into the ``initial_state`` buffer, which is required and
             returned as the final state; the engine runs the chain or the
             uncut schedule and never the split-K cut, so the aliasing is
-            race-free.  Inference only: the in-place op has no autograd
-            formula.
+            race-free.  A prefill kernel built with its levelled plan may
+            run a (sequence, head) tile as two work items on two thread
+            blocks: the second starts from the state the first stored in
+            this buffer and is handed out only behind that store, so the
+            output and the final state stay the uncut schedule's.  A batch
+            whose sequences do not all have the chunk count its token rows
+            give them (the rows shared out evenly to the sequences), or
+            whose ``state_indices`` name one row twice, keeps the uncut
+            schedule.  A last chunk that is not full counts as a chunk, so
+            sequences that end in a partial chunk are levelled as
+            sequences of full chunks are.  Where the engine would otherwise
+            run a batch's last partial wave as a chain of pieces, whose
+            output and final state differ from the uncut schedule's inside
+            the op's tolerance, a levelled plan runs the whole batch and
+            returns the uncut schedule's.
+            Inference only: the in-place op has no autograd formula.
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` inside the kernel.
         allow_neg_eigval: scale the fused beta sigmoid by 2, so the delta-rule
             operator ``I - beta k k^T`` can reach negative eigenvalues
@@ -1772,8 +1791,8 @@ def build_gdn_summary_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_net_summary", mutates_args=())
-def gdn_summary(
+@cpp_launched
+def run_gdn_summary(
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
@@ -1924,6 +1943,9 @@ def gdn_summary(
     return final_state, transition, context
 
 
+gdn_summary = torch.library.custom_op("cudnn::gated_delta_net_summary", run_gdn_summary, mutates_args=())
+
+
 @gdn_summary.register_fake
 def gdn_summary_fake(
     k,
@@ -2059,8 +2081,8 @@ def build_gdn_summary_bwd_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::gated_delta_net_summary_bwd", mutates_args=())
-def gdn_summary_bwd(
+@cpp_launched
+def run_gdn_summary_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2227,6 +2249,9 @@ def gdn_summary_bwd(
     return d_initial_state, transition, context
 
 
+gdn_summary_bwd = torch.library.custom_op("cudnn::gated_delta_net_summary_bwd", run_gdn_summary_bwd, mutates_args=())
+
+
 @gdn_summary_bwd.register_fake
 def gdn_summary_bwd_fake(
     dO,
@@ -2331,7 +2356,9 @@ def gated_delta_net_summary(
     """
     if k.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
-    final_state, transition, context = torch.ops.cudnn.gated_delta_net_summary(
+    final_state, transition, context = summary_dispatch(
+        torch.ops.cudnn.gated_delta_net_summary,
+        run_gdn_summary,
         k,
         v,
         g,
@@ -2401,7 +2428,9 @@ def gated_delta_net_summary_bwd(
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    d_initial_state, transition, context = torch.ops.cudnn.gated_delta_net_summary_bwd(
+    d_initial_state, transition, context = summary_dispatch(
+        torch.ops.cudnn.gated_delta_net_summary_bwd,
+        run_gdn_summary_bwd,
         dO,
         q,
         k,

@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import math
 from operator import itemgetter
+from typing import NamedTuple, Tuple
 
 import cudnn
 from cudnn import cpp_launcher
-from cudnn.engines.base import BaseEngine, CompiledPlan
+from cudnn.engines.base import BaseEngine, CompiledPlan, require_stream
 
-from cudnn.frost.device import build_device, current_device, multiprocessor_count
+from cudnn.frost.buffers import data_ptr
+from cudnn.frost.device import compute_capability, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
-from ..graph_analyzer import analyze
+from ..graph_analyzer import analyze, qk_l2norm_eps
 from .common.context import backward_context, forward_apply_context, forward_context
 from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_gates
 
@@ -62,7 +64,6 @@ def gdn_support_gates(engine: str, facts) -> None:
             raise NotImplementedError(f"{engine}: 'state_indices' must be int32 or int64, got {facts.state_indices_dtype}")
         if facts.is_bwd:
             raise NotImplementedError(f"{engine}: 'state_indices' is a forward-only pool addressing mode")
-    io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
     if facts.beta_dtype not in beta_wants + (None,):
@@ -90,8 +91,8 @@ def gdn_support_gates(engine: str, facts) -> None:
             raise NotImplementedError(f"{engine}: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
         if facts.dg_dtype not in (facts.g_dtype, None):
             raise NotImplementedError(f"{engine}: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
-        if facts.do_dtype not in io + (None,):
-            raise NotImplementedError(f"{engine}: 'dO' must be fp16/bf16, got {facts.do_dtype}")
+        if facts.do_dtype not in (facts.io_dtype, None):
+            raise NotImplementedError(f"{engine}: 'dO' must match the io dtype ({facts.io_dtype}), got {facts.do_dtype}")
         if facts.io_dtype is not None and facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
             raise NotImplementedError(
                 f"{engine}: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_dtype}"
@@ -102,6 +103,77 @@ def gdn_support_gates(engine: str, facts) -> None:
         raise NotImplementedError(
             f"{engine}: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_out_dtype}"
         )
+
+
+class LevelFacts(NamedTuple):
+    """What decides whether a forward plan takes the prefill kernel's levelled table (``level_plan_refusal``)."""
+
+    io_name: str
+    dim_k: int
+    dim_v: int
+    heads_out: int
+    heads_key: int
+    num_seqs: int
+    rows: int  # token rows of the batch
+    b_t: int
+    num_sm: int
+    compute_capability: Tuple[int, int]  # of the part the plan is built for
+    expand_num: int = 1
+    gdn: bool = True
+    scheme: str = "uncut"  # "uncut", or the scheme the plan chose in its place: chain, dv_split, warmup
+    batch_invariant: bool = False
+    tail: bool = False
+    ragged_pieces: bool = False
+    state_in_place: bool = True  # one fp32 state table is the seed and receives the final state
+    folded_seed: bool = False  # preceding summaries or a composed initial state
+    checkpoints: bool = False
+
+
+def level_plan_refusal(kernel_module, facts: LevelFacts):
+    """Why a forward plan keeps the uncut table, or ``None`` where it takes the levelled one.  The levelled table cuts a
+    (sequence, head) tile at a share border and runs it as two items that hand the fp32 state over through its stored
+    row, so it needs: the kernel's level build at this geometry; a GDN plan that is the uncut one with nothing in front
+    of or behind the prefill (no chain group, value-width split, cut table or ragged pieces); a schedule that may
+    depend on the batch; one fp32 state table as seed and final state, with no folded seed; no checkpoint (a checkpoint
+    row belongs to one item); no sub-token expansion; a total that divides into sequences of one length (the prologue
+    checks the lengths themselves); value heads in whole groups per key head; a shape the table can be laid out for; and
+    a cell that was measured (``LEVEL_MEASURED_CELLS``).  A tail -- the plan's last partial wave as a launch of its own
+    -- keeps a batch no line names on the uncut table; at a measured cell the levelled table runs the whole batch in
+    the tail's place."""
+    from .common.host import get_dtype
+    from .common.split_k import level_plan_shape
+
+    if not kernel_module.level_plan_form(get_dtype(facts.io_name), facts.dim_k, facts.dim_v):
+        return "level_plan_form"
+    if not facts.gdn or facts.scheme != "uncut":
+        return "scheme"
+    if facts.batch_invariant:
+        return "batch_invariant"
+    if facts.ragged_pieces:
+        return "tail"
+    if not facts.state_in_place or facts.folded_seed:
+        return "state"
+    if facts.checkpoints:
+        return "checkpoints"
+    if facts.expand_num != 1:
+        return "expand_num"
+    if facts.num_seqs < 1 or facts.rows % facts.num_seqs != 0:
+        return "lengths"
+    if facts.heads_key < 1 or facts.heads_out % facts.heads_key != 0:
+        return "heads"
+    group = facts.heads_out // facts.heads_key
+    n_tiles = facts.num_seqs * facts.heads_out
+    chunks = -(-(facts.rows // facts.num_seqs) // facts.b_t)
+    cell = kernel_module.LevelCell(
+        tuple(facts.compute_capability), facts.num_sm, facts.io_name, facts.dim_k, facts.dim_v, facts.heads_key, facts.heads_out, facts.num_seqs, chunks
+    )
+    if facts.tail and not kernel_module.level_plan_listed(cell):
+        return "tail"
+    if not level_plan_shape(n_tiles, chunks, facts.num_sm, facts.heads_out, group):
+        return "shape"
+    if not kernel_module.level_plan_cell(cell):
+        return "cell"
+    return None
 
 
 class GdnFrostEngine(BaseEngine):
@@ -121,10 +193,7 @@ class GdnFrostEngine(BaseEngine):
         gdn_support_gates("GdnFrostEngine", facts)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            return FrostLaPlan(build_gdn(graph))
+        return FrostLaPlan(build_gdn(graph))
 
 
 class CompiledGdn:
@@ -132,11 +201,15 @@ class CompiledGdn:
     (one item per sequence and head), ``warmup`` (decay-warmup split-K), ``dv_split`` (two uncut items per sequence and head,
     each owning half of d_v) or ``chain`` (per-piece H and M from the fused summary, an fp32 state chain seeding every piece,
     the prefill over the pieces as independent sequences).  The chunk factor T comes from the T pass in chain
-    plans."""
+    plans.  A GDN plan that overwrites its initial state, without a context port and without ``batch_invariant``, carries the
+    length-rule chain group only where ``chain_group_pays``, and keeps a chain, whole-batch or tail, only where ``chain_pays``
+    against the scheme it would run instead; a whole-batch chain whose scheme below would carry the chain group stays."""
 
     def __init__(self, node, kernel_module):
         from .common.piece_chain import (
             DV_SPLIT_TILES,
+            chain_group_pays,
+            chain_pays,
             chain_rows_per_cta,
             choose_pieces,
             is_dv_split,
@@ -148,7 +221,7 @@ class CompiledGdn:
 
         from .kernel.gdn_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.gdn_warmup_forward_f16 import TAIL_BUFFERS, build_warmup_forward, run_warmup_forward
-        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
+        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, level_scheduler_words, max_work_items, split_scratch_rows
         from .common.tail import GATE_WORDS, choose_tail
 
         self.node = node
@@ -167,6 +240,7 @@ class CompiledGdn:
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
         self.expand_num = self.num_householder
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_eps = qk_l2norm_eps(node.params)
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.safe_gate = bool(node.params.get("safe_gate", False))
@@ -213,27 +287,37 @@ class CompiledGdn:
             batch_invariant=self.batch_invariant,
             expand_num=self.expand_num,
         )
-        self.chain = self.pieces > 0
-        self.dv_split = (
-            not self.chain
-            and not self.batch_invariant
-            and is_dv_split(
-                num_seqs=B,
-                heads_out=HO,
-                dim_v=V,
-                num_sm=self.num_sm,
-                total_tokens=self.q_rows,
-                b_t=self.b_t,
-                expand_num=self.expand_num,
-                unit_chunks=self.unit_chunks,
-            )
+        dv_split = not self.batch_invariant and is_dv_split(
+            num_seqs=B,
+            heads_out=HO,
+            dim_v=V,
+            num_sm=self.num_sm,
+            total_tokens=self.q_rows,
+            b_t=self.b_t,
+            expand_num=self.expand_num,
+            unit_chunks=self.unit_chunks,
+            uncut=self.overwrite_initial_state,
         )
+        # A context port fixes the pieces by the shared rule (common/context.py) and batch_invariant by the length rule.  A plan
+        # that does not overwrite its initial state runs the split-K table below the chain, whose pace follows the gates, and
+        # keeps the shared rule too.  Every other GDN forward chains only where the chain beats the plan it would run instead.
+        by_shape = self.batch_invariant or self.has_context or node.params.get("output_context", False)
+        chain_by_cost = self.expand_num == 1 and self.overwrite_initial_state and not by_shape
+        chain_group = 0
+        if not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
+            chain_group = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
+            group = dict(pieces=chain_group, num_seqs=B, heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
+            if chain_group and chain_by_cost and not chain_group_pays(**group):
+                chain_group = 0
+        # chain_pays reads the chain against a plan without the chain group, so a chain whose plan below would carry one stays.
+        if self.pieces and chain_by_cost and not chain_group and not chain_pays(pieces=self.pieces, num_seqs=B, total_tokens=self.q_rows, split=dv_split):
+            self.pieces = 0
+        self.chain = self.pieces > 0
+        self.dv_split = not self.chain and dv_split
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.tail = None
-        self.ragged_pieces = 0
-        if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
-            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
+        self.ragged_pieces = 0 if self.chain else chain_group
         if not self.chain and not self.dv_split and not self.batch_invariant:
             self.tail = choose_tail(
                 num_seqs=B,
@@ -247,6 +331,45 @@ class CompiledGdn:
             )
             if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
                 self.tail = None
+            chain_tail = self.tail is not None and not self.tail.dv_split
+            if chain_tail and chain_by_cost and not chain_pays(pieces=self.tail.pieces, num_seqs=B, total_tokens=self.q_rows, tail=True):
+                self.tail = None
+        # The levelled table (level_plan_refusal); everything else keeps the plan above.  A measured cell's levelled table
+        # runs the whole batch: it ranks above the tail, which is dropped there.
+        self.level_group = HO // HK if HK and HO % HK == 0 else 1
+        self.level_refusal = level_plan_refusal(
+            kernel_module,
+            LevelFacts(
+                io_name=self.io_name,
+                dim_k=K,
+                dim_v=V,
+                heads_out=HO,
+                heads_key=HK,
+                num_seqs=B,
+                rows=self.q_rows,
+                b_t=self.b_t,
+                num_sm=self.num_sm,
+                compute_capability=compute_capability(self.device),
+                expand_num=self.expand_num,
+                gdn=node.node_type.name == "GDN",
+                scheme="chain" if self.chain else "dv_split" if self.dv_split else "warmup" if self.split else "uncut",
+                batch_invariant=self.batch_invariant,
+                tail=self.tail is not None,
+                ragged_pieces=bool(self.ragged_pieces),
+                state_in_place=bool(
+                    self.overwrite_initial_state
+                    and self.has_final_state
+                    and "initial_state" in node.inputs
+                    and node.inputs["initial_state"].get_data_type().name == "FLOAT"
+                ),
+                folded_seed="preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs,
+                checkpoints=bool(self.checkpoint or self.has_state_checkpoints),
+            ),
+        )
+        self.level_plan = self.level_refusal is None
+        if self.level_plan:
+            self.tail = None
+        self.uncut_launch = None
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=self.q_rows, batch_invariant=self.batch_invariant) if self.chain else B
         self.tinv_pass = self.chain
@@ -319,16 +442,22 @@ class CompiledGdn:
         else:
             self.tensormap_words = tensormap_workspace_bytes(kernel_module, B, self.num_householder) // 8
             regions.append(("tensormaps", layout.add(self.tensormap_words * 8), "int64", (self.tensormap_words,)))
-            regions.append(("scheduler", layout.add(8), "int32", (2,)))
+            # the levelled table: a level word per CTA behind the two ticket words
+            scheduler_words = level_scheduler_words(self.num_sm) if self.level_plan else 2
+            regions.append(("scheduler", layout.add(4 * scheduler_words), "int32", (scheduler_words,)))
             self.n_tiles = B * HO * self.tiles_per_head
             if self.split:
                 self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
                 self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
             else:
                 self.ideal = None
-                self.work_item_rows = self.n_tiles
+                # the levelled table: one more row per share border that cuts a tile, at most num_sm - 1
+                self.work_item_rows = self.n_tiles + (self.num_sm - 1 if self.level_plan else 0)
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
+            if self.level_plan:
+                # the levelled table's order entries, one per work-item row
+                regions.append(("level_order", layout.add(self.work_item_rows * 4), "int32", (self.work_item_rows,)))
             if self.tail is not None or self.ragged_pieces:
                 off_gate = layout.add(4 * GATE_WORDS, align=16)
                 regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
@@ -565,7 +694,13 @@ class CompiledGdn:
             context_views = context.carve(self.context.carve) if self.has_context else ()
             merged = (*views, *carved, *context_views, None)
             cpp_launcher.launch(
-                self.chain_launch, *self.chain_scalars, *self.chain_buffers(merged), self.stream_type(int(stream or 0)), None, *self.chain_lead(merged)
+                self.chain_launch,
+                *self.chain_scalars,
+                *self.chain_buffers(merged),
+                self.stream_type(require_stream(stream, type(self).__name__)),
+                None,
+                *self.chain_lead(merged),
+                self.qk_l2norm_eps,
             )
             return
         k = views[self.index_k]
@@ -580,7 +715,7 @@ class CompiledGdn:
         state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
         a_log = views[self.index_a_log] if self.index_a_log is not None else None
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
-        stream = stream if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_context else {}
         fold = self.index_preceding_state_update is not None
@@ -637,13 +772,19 @@ class CompiledGdn:
                 else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
             ),
             lead_buffers=lead_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
             ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
             ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
             ragged_buffers=self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
         )
-        if self.warmup_launch is None:
+        # A cut tile's second item starts from the row its first item stored: the plan is levelled only while ONE buffer
+        # is bound as the seed and as the final state.  Two buffers run the uncut build over the same regions.
+        level_plan = self.level_plan and data_ptr(state0) == data_ptr(final_state)
+        buffers["level_order"] = region.get("level_order") if level_plan else None
+        launch = self.warmup_launch if level_plan == self.level_plan else self.uncut_launch
+        if launch is None:
             tail = self.tail
-            self.warmup_launch = self.build_warmup_forward(
+            launch = self.build_warmup_forward(
                 **buffers,
                 ragged_pieces=self.ragged_pieces,
                 ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
@@ -671,8 +812,14 @@ class CompiledGdn:
                 scale=self.scale,
                 device=self.device,
                 stream=stream,
+                level_plan=level_plan,
+                level_group=self.level_group,
             )
-        self.run_warmup_forward(*self.warmup_launch, **buffers, checkpoint_every_n_tokens=self.checkpoint, scale=self.scale, stream=stream)
+            if level_plan == self.level_plan:
+                self.warmup_launch = launch
+            else:
+                self.uncut_launch = launch
+        self.run_warmup_forward(*launch, **buffers, checkpoint_every_n_tokens=self.checkpoint, scale=self.scale, stream=stream)
 
     def run_chain(
         self, q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream, lead_buffers
@@ -716,6 +863,7 @@ class CompiledGdn:
             final_indices=state_indices,
             checkpoints=state_checkpoints,
             lead_buffers=lead_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_forward(
@@ -788,6 +936,7 @@ class CompiledGdnBwd:
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_eps = qk_l2norm_eps(node.params)
         self.safe_gate = bool(node.params.get("safe_gate", False))
         self.log_gate = (node.params.get("gate_domain") or "log") == "log"
         self.wants_d_a_log = "d_a_log" in node.outputs
@@ -1298,7 +1447,7 @@ class CompiledGdnBwd:
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         d_a_log = views[self.index_d_a_log] if self.index_d_a_log is not None else None
         d_dt_bias = views[self.index_d_dt_bias] if self.index_d_dt_bias is not None else None
-        stream = stream if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_context else {}
@@ -1440,6 +1589,7 @@ class CompiledGdnBwd:
                 ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
                 ragged_buffers=self.ragged_buffers((*views, *region.values(), *context_region.values(), None)) if self.ragged_pieces else (),
                 lead_buffers=lead_buffers,
+                l2norm_eps=self.qk_l2norm_eps,
                 gate_blocks=self.gate_bwd_blocks,
                 post_buffers=post_buffers,
             )
@@ -1592,6 +1742,7 @@ class CompiledGdnBwd:
             inv_q=inv_q,
             inv_k=inv_k,
             lead_buffers=lead_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
             gate_blocks=self.gate_bwd_blocks,
             post_buffers=post_buffers,
             m_count=region.get("m_count"),
@@ -1667,10 +1818,7 @@ class GdnSummaryFrostEngine(BaseEngine):
         summary_support_gates("GdnSummaryFrostEngine", facts, graph)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            return FrostLaPlan(build_gdn_summary(graph))
+        return FrostLaPlan(build_gdn_summary(graph))
 
 
 class CompiledGdnSummary:
@@ -1703,6 +1851,7 @@ class CompiledGdnSummary:
         self.device = current_device()
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_eps = qk_l2norm_eps(node.params)
         self.safe_gate = bool(node.params.get("safe_gate", False))
         self.log_gate = (node.params.get("gate_domain") or "log") == "log"
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
@@ -1749,6 +1898,7 @@ class CompiledGdnSummary:
                 b_t=self.b_t,
                 expand_num=self.num_householder,
                 unit_chunks=self.unit_chunks,
+                uncut=self.overwrite_initial_state,
             )
         )
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
@@ -1919,7 +2069,7 @@ class CompiledGdnSummary:
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         final_state = views[self.index_final_state]
         transition = views[self.index_transition] if self.index_transition is not None else None
-        stream = stream if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_k_normalized else {}
@@ -1955,6 +2105,7 @@ class CompiledGdnSummary:
             tinv_row_count=region["tinv_row_count"],
             item_limit_word=region.get("gate"),
             l2norm_k=l2norm_k,
+            l2norm_eps=self.qk_l2norm_eps,
             tail_scalars=self.tail_scalars if tail is not None else (),
             tail_buffers=self.tail_buffers((*views, *region.values(), None)) if tail is not None else (),
         )
@@ -2010,6 +2161,7 @@ class CompiledGdnSummary:
             final_state=final_state,
             transition=transition,
             l2norm_k=l2norm_k,
+            l2norm_eps=self.qk_l2norm_eps,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_summary(
@@ -2067,6 +2219,7 @@ class CompiledGdnSummaryBwd:
         self.device = current_device()
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_eps = qk_l2norm_eps(node.params)
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.safe_gate = bool(node.params.get("safe_gate", False))
@@ -2312,7 +2465,7 @@ class CompiledGdnSummaryBwd:
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         dstate0 = views[self.index_d_initial_state]
         transition = views[self.index_transition] if self.index_transition is not None else None
-        stream = stream if stream is not None else 0
+        stream = require_stream(stream, type(self).__name__)
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_context else {}
@@ -2358,6 +2511,7 @@ class CompiledGdnSummaryBwd:
             transition_words=region.get("recompute_tensormaps"),
             item_limit_word=region.get("gate"),
             l2norm_buffers=l2norm_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
             tail_scalars=self.tail_scalars if tail is not None else (),
             tail_buffers=self.tail_buffers((*views, *region.values(), None)) if tail is not None else (),
         )
@@ -2418,6 +2572,7 @@ class CompiledGdnSummaryBwd:
             dstate0=dstate0,
             transition=transition,
             l2norm_buffers=l2norm_buffers,
+            l2norm_eps=self.qk_l2norm_eps,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_summary_backward(
