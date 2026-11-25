@@ -37,3 +37,98 @@ set_compute_data_type(DataType_t value)
     - B
     - name
     - compute_data_type
+
+### Batch-invariant BF16 forward
+
+The Python graph API offers the `batch_invariant_gemm` engine on SM100, SM103 and SM107.
+Request it with the `BATCH_INVARIANT` numerical note on both the rollout and training forward graphs.
+
+```python
+g = cudnn.pygraph(
+    io_data_type=cudnn.data_type.BFLOAT16,
+    intermediate_data_type=cudnn.data_type.FLOAT,
+    compute_data_type=cudnn.data_type.FLOAT,
+)
+a = g.tensor(dim=[1, m, k], stride=[m * k, k, 1], data_type=cudnn.data_type.BFLOAT16)
+b = g.tensor(dim=[1, k, n], stride=[n * k, 1, k], data_type=cudnn.data_type.BFLOAT16)
+y = g.matmul(A=a, B=b)
+y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+g.select_numeric_notes([cudnn.numerical_note.BATCH_INVARIANT])
+g.build()
+```
+
+On the same architecture and software stack, a row with identical inputs, weights
+and bias follows the same K16 FP32 accumulation order at any batch size or row
+position. The weight shape fixes the number and order of K chunks. The engine
+can change the tile shape, cluster layout and number of resident clusters to
+suit the GPU and the number of rows. To include
+a BF16 column bias, keep the matmul intermediate in FP32 and use `g.add` with
+FP32 compute before the BF16 output conversion.
+
+The engine accepts rank-2 matrices or rank-3 matrices with a singleton batch
+dimension, positive M, and positive K and N divisible by eight. A has row-major
+layout with a leading dimension divisible by eight. B is compact row-major or
+column-major. Output is contiguous row-major and the operand pointers require
+16-byte alignment. Build a graph for each distinct shape. Allocate
+`g.get_workspace_size()` bytes of scratch for execution, with separate scratch
+for concurrent launches. Requesting the note on an unsupported graph raises
+`cudnnGraphNotSupportedError`. For a linear layer `Y = X @ W.T + bias`, training
+can use native cuDNN matmul plans to compute `dX = dY @ W` and `dW = dY.T @ X`,
+and an FP32 sum over the rows of `dY` for the bias gradient. The backward graphs
+use the saved input and weight and do not require the `BATCH_INVARIANT` note.
+See the [determinism support matrix](https://docs.nvidia.com/cudnn/operations/determinism).
+
+### Batch-invariant FP8 and FP4 forward
+
+Select `cudnn.numerical_note.BATCH_INVARIANT` on the training graph and pass
+`batch_invariant=True` to the corresponding FlashInfer rollout operation.
+Use FP32 compute and intermediate tensors, then set the final output to
+`BFLOAT16` or `HALF`. The input dtype, scale format and graph operations
+identify the numerical recipe.
+
+| FlashInfer operation | Inputs | Scale operations in the training graph |
+| --- | --- | --- |
+| `bmm_fp8` | E4M3 × E4M3 or E5M2 × E5M2 | Multiply two FP32 device scalars, then multiply the FP32 matmul result by their product. Supports multiple independent batch elements. |
+| `gemm_fp8_nt_groupwise` | E4M3 × E4M3 | Dequantize A in [1, 128] blocks and B in [128, 128] blocks with FP32 scales. The engine scales each K-block product before adding it to the running sum. |
+| `mm_mxfp8` | E4M3 × E4M3 | E8M0 block scales along K, 32 elements per scale. |
+| `mm_fp4` (NVFP4) | E2M1 × E2M1 | E4M3 block scales along K, 16 elements per scale. Optional FP32 output multiplier. |
+| `mm_fp4` (MXFP4) | E2M1 × E2M1 | E8M0 block scales along K, 32 elements per scale. Optional FP32 output multiplier. |
+| `mm_mxfp8_mxfp4` | E4M3 × E2M1 | E8M0 block scales along K, 32 elements per scale. Optional FP32 output multiplier. |
+
+All these paths require N divisible by 8. Per-tensor FP8 requires K divisible
+by 16 (and N divisible by 16 for row-major B). Groupwise FP8 requires a whole
+number of 128-element K blocks. MX/NV paths take K-contiguous operands and K
+divisible by 32. Mixed MXFP8 × MXFP4 additionally requires K divisible by
+128 on SM100/103. To request programmatic dependent launch for that mixed
+projection, pass `enable_pdl=True` to `g.matmul`.
+
+For example, given descriptors for MXFP4 A, B and their two scale buffers,
+build the training forward as follows.
+
+```python
+x = g.block_scale_dequantize(input=a, descale=sa, block_size=[1, 32])
+w = g.block_scale_dequantize(input=b, descale=sb, block_size=[32, 1])
+p = g.matmul(A=x, B=w)
+y = g.mul(a=p, b=alpha)  # Omit the multiply when alpha is absent.
+y.set_output(True).set_data_type(cudnn.data_type.HALF)
+g.select_numeric_notes([cudnn.numerical_note.BATCH_INVARIANT])
+g.build()
+```
+
+Describe A and B with logical dimensions `[M, K]` and `[K, N]`. For FP4,
+each byte stores two adjacent K elements. For MX and NV block scales, use
+`tensor_reordering.F8_128x4`. Round the number of rows up to 128 and the
+number of K blocks up to 4. For A, describe this padded scale buffer as
+`[padded_M, padded_blocks]` with strides `[padded_blocks, 1]`. For B, use
+`[padded_blocks, padded_N]` with strides `[1, padded_blocks]`.
+When extracting or permuting rows for rollout, move their logical activation
+scales together with the quantized payload and repack the scale buffer.
+
+The bitwise forward contract applies on the same GPU architecture and software
+stack with fixed weights, scales, output dtype and logical input rows. Training
+can compute gradients for the effective floating-point operands using native
+cuDNN matmuls. A scalar output multiplier also multiplies the upstream gradient.
+See the [batch-invariant tests](../../test/python/gemm/batch_invariant/README.md) for executable graphs.
+The [forward benchmark](../../benchmark/gemm/benchmark_batch_invariant.py) measures the selected
+engine and the native cuDNN plan for the same graph. Pass `--flashinfer-legacy` to include
+the original FlashInfer kernels.

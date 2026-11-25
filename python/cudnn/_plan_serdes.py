@@ -217,6 +217,7 @@ def serialize(graph: "pygraph", include_kernels: bool) -> bytes:
             "format": FORMAT,
             "frontend_version": str(getattr(cudnn, "__version__", "unknown")),
             "graph": _encode_graph(graph),
+            "note_filters": [[kind, note.name, keep] for kind, note, keep in graph._note_filters],
             "plan": {
                 "engine_id": int(engine_id),
                 "engine_name": engine.name,
@@ -279,11 +280,16 @@ def deserialize(graph: "pygraph", data: Any, handle: Any = None, enforce_precomp
 
 
 def _rebuild(graph: "pygraph", header: Dict[str, Any], handle: Any, enforce_precompiled: bool, seeded_note: str) -> None:
+    import cudnn
+
     from .frost import compiled_cache
 
     if handle is not None:
         graph._handle = handle
     _decode_graph(graph, header["graph"])
+    for kind, name, keep in header.get("note_filters", ()):
+        note_type = {"behavior": cudnn.behavior_note, "numerical": cudnn.numerical_note}[kind]
+        graph._filter_notes(kind, [note_type[name]], keep=keep)
     plan = header["plan"]
     knobs = {_decode(k, {}): int(v) for k, v in plan["knobs"]}
     graph.validate()

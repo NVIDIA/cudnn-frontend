@@ -16,6 +16,12 @@ SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 Third-party attributions are in [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt).
 
+The BF16 and quantized kernels in `python/cudnn/gemm/batch_invariant/` adapt
+FlashInfer's batch-invariant GEMMs. The kernels and the adapted BF16 input
+generator in `test/python/gemm/batch_invariant/test_flashinfer_integration.py`
+retain the upstream Apache-2.0 license and attribution. Entry 12 in
+[THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) identifies the sources.
+
 ## Apache-2.0 modifications to existing licensed code
 
 The OSS warning cleanup licenses its NVIDIA modifications under Apache-2.0,
