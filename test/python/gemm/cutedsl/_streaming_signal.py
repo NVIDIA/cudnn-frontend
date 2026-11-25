@@ -151,4 +151,7 @@ def signal_ready(kernel):
 # Rows per expert.  More than 32 experts take the batch opener several lane rounds; an expert of more than 16 M tiles
 # (EXPERT_BATCH_MAX_M_TILES) needs several batches.
 MANY_EXPERTS_64 = [(0, 1, 255, 256, 257, 700, 1300)[i % 7] for i in range(64)]
+# 64 small experts of 0 to 3 M tiles: with every M tile ready, most lanes of a batch opening hold a run that ends
+# their expert, so one opening publishes many batches.
+SMALL_EXPERTS_64 = [(0, 1, 256, 300, 512, 600, 768)[i % 7] for i in range(64)]
 BIG_EXPERT = [256, 5000, 0, 513, 1]
