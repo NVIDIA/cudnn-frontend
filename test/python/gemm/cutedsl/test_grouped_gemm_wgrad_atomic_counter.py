@@ -409,16 +409,23 @@ def test_counter_mxfp8_overlapping_streams(output_mode):
 
 _CHILD_ENV = "CUDNN_WGRAD_COUNTER_TEST_CHILD"
 
+# Multi-CTA clusters that are not a single 2-CTA pair: every CTA releases each broadcast claim with a remote arrive on the
+# leader CTA, and nothing else (no 2-CTA TMEM dealloc handshake across the whole cluster) holds the leader until the
+# peers' release of the last, invalid claim has landed.
+CLUSTERED_EXHAUSTION_CONFIGS = [((128, 128), (1, 2)), ((128, 256), (2, 1)), ((256, 256), (2, 2))]
+
 
 @pytest.mark.L0
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
-@pytest.mark.parametrize("config", L0_CONFIGS, ids=_config_id)
+@pytest.mark.parametrize("config", L0_CONFIGS + CLUSTERED_EXHAUSTION_CONFIGS, ids=_config_id)
 def test_more_clusters_than_tiles(request, precision, config):
-    """4 experts x 512 x 512 = 16 tiles of 256 x 256 (32 of 128 x 256) on every cluster the GPU holds: most clusters'
-    first claim is already past the last tile. Such a cluster must publish only the sentinel and exit (publishing its
-    invalid first claim ahead of the sentinel left the sentinel's stage unreleased: a hang). Bytes equal CLC's.
+    """4 experts x 512 x 512 = 8 to 32 cluster tiles on every cluster the GPU holds: most clusters' first claim is
+    already past the last tile. Such a cluster must publish only the sentinel and exit (publishing its invalid first
+    claim ahead of the sentinel left the sentinel's stage unreleased: a hang), and in a multi-CTA cluster its leader must
+    not exit before every CTA has released that claim. Bytes equal CLC's.
 
-    The case runs in a child pytest with a deadline, so a hang fails this test instead of stalling the session."""
+    The case runs in a child pytest with a deadline, so a hang (or a launch failure that poisons the CUDA context) fails
+    this test instead of stalling or breaking the session."""
     if os.environ.get(_CHILD_ENV) == "1":
         if precision == "mxfp8":
             problem = _make_mxfp8_problem((384, 0, 128, 640), 512, 512, seed=17)
@@ -456,6 +463,64 @@ def test_more_clusters_than_tiles(request, precision, config):
         out, _ = proc.communicate()
         pytest.fail(f"timed out after {timeout:.0f} s: the kernel hangs\n{out[-4000:]}")
     assert proc.returncode == 0 and "1 passed" in out, out[-8000:]
+
+
+EXHAUSTION_LAUNCHES = 1000
+
+
+def _cluster_tiles(config, experts, m, n):
+    """Output tiles of a whole cluster: a 2-CTA MMA tile of 256 rows is 128 rows per CTA."""
+    (tile_m, tile_n), (cluster_m, cluster_n) = config
+    cluster_tile_m = (tile_m // 2 if tile_m == 256 else tile_m) * cluster_m
+    cluster_tile_n = tile_n * cluster_n
+    return experts * -(-m // cluster_tile_m) * -(-n // cluster_tile_n)
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("precision", [pytest.param("bf16", marks=pytest.mark.L0), pytest.param("mxfp8", marks=pytest.mark.L1)])
+@pytest.mark.parametrize("config", CLUSTERED_EXHAUSTION_CONFIGS, ids=_config_id)
+def test_counter_clustered_exhaustion_stress(monkeypatch, precision, config):
+    """Fewer cluster tiles than persistent clusters, launched again and again with a cold L2. Every cluster ends on an
+    invalid claim: most at their first claim (initial_work_tile_info), the rest after one tile (advance_to_next_work).
+    Each CTA of a cluster releases that last claim with a remote arrive on the leader CTA's shared memory, and the
+    leader waits for those arrives before it exits. Each launch must finish, take exactly one invalid claim per cluster
+    (the counter ends at tiles + clusters) and match CLC's bytes.
+
+    This is exhaustion coverage for the wgrad counter path, not a reproducer of the exit race: a 2Dx2D claim maps to a
+    tile without loading the expert offsets, so a peer's release follows its read closely. The race reproducer is
+    test_grouped_gemm_dynamic_sched_cluster_exit.py (2Dx3D, offset walks over 1024 experts)."""
+    import cutlass
+
+    monkeypatch.delenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", raising=False)
+    m = n = 512
+    if precision == "mxfp8":
+        groups = (384, 0, 128, 640)
+        problem = _make_mxfp8_problem(groups, m, n, seed=17)
+        expected = snapshot({"wgrad": _mxfp8_wrapper(problem, config, counter=False)})
+    else:
+        groups = (512, 0, 256, 768)
+        problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=groups, m=m, n=n)
+        expected = snapshot({"wgrad": _bf16_wrapper(problem, config, counter=False)})
+    tiles = _cluster_tiles(config, len(groups), m, n)
+    _, (cluster_m, cluster_n) = config
+    clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_m * cluster_n)
+    if clusters <= tiles:
+        pytest.skip(f"{clusters} persistent clusters do not outnumber {tiles} cluster tiles on this GPU")
+
+    op = _class_op(precision, problem, config, counter=True)
+    output = torch.full_like(problem["output"], float("nan"))
+    flush = torch.empty(128 << 20, dtype=torch.float32, device="cuda")  # 512 MB, larger than the L2
+    for launch in range(EXHAUSTION_LAUNCHES):
+        flush.fill_(float(launch))
+        output.fill_(float("nan"))
+        _class_execute(precision, op, problem, output)
+        torch.cuda.synchronize()
+        # The counter is the workspace's last 4 bytes (a view of the kernel's storage, not a copy).
+        claims = int(op._implementation._workspace[-4:].view(torch.int32).item())
+        assert claims == tiles + clusters, f"launch {launch}: the counter ended at {claims}, not {tiles} tiles + {clusters} clusters"
+        if launch % 100 == 0 or launch == EXHAUSTION_LAUNCHES - 1:
+            assert_bitwise({"wgrad": output}, expected, f"launch {launch}: atomic counter vs CLC")
 
 
 # ---------------------------------------------------------------------------
