@@ -6,8 +6,8 @@ for block selection, bitmap training and the backward engine.
 
 `cudnn.ops.qsa_indexed_forward` and `qsa_indexed_backward` accept packed token
 indices directly. The implementation lives in `cudnn.QSA.indexed` and shares
-QSA's attention kernels. It supports BF16
-12Q/1KV and 6Q/1KV (one KV head shared by twelve or six query heads) with head
+QSA's attention kernels. It supports BF16 or FP16
+24Q/2KV, 12Q/1KV and 6Q/1KV (each KV head shared by twelve or six query heads) with head
 dimension 256 on SM100/SM103 with CuTeDSL >= 4.7 and on SM107 with
 CuTeDSL >= 4.8 (the backward needs the CUDA 13 build of the DSL).
 
@@ -20,7 +20,7 @@ dq, dk, dv = qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, sca
 
 These explicit calls return `TupleDict` objects in the order shown. They do not
 register an autograd function. Save the original FP32 output and natural-log
-LSE; casting the BF16 output back to FP32 is insufficient. Packed documents
+LSE; casting the BF16 or FP16 output back to FP32 is insufficient. Packed documents
 reach the backward through `cu_seqlens` (int32 `[B + 1]` prefix sums) and
 `max_seq_len` with `selection_mode="causal_topk"` (below). Without `cu_seqlens`
 the rows are one sequence, which stays exact for packed documents but serves
@@ -28,13 +28,13 @@ only the first document on the dense prefix path.
 
 | Tensor | Shape | Dtype |
 |---|---|---|
-| Q, output, grad_out, dQ | `[T, Hq, 256]` | BF16 |
-| K, V, dK, dV | `[T, 1, 256]` | BF16 |
+| Q, output, grad_out, dQ | `[T, Hq, 256]` | BF16 or FP16 |
+| K, V, dK, dV | `[T, Hkv, 256]` | Same as Q |
 | indices | `[T, W]` | int32 |
 | out_fp32 | `[T, Hq, 256]` | FP32 |
 | lse | `[Hq, T]` | FP32 |
 
-`Hq` is 12 or 6. All tensors are contiguous on one CUDA device. Data tensors
+`Hq` / `Hkv` is 24 / 2, 12 / 1 or 6 / 1. All tensors are contiguous on one CUDA device. Data tensors
 require 16-byte alignment; indices and LSE require four-byte alignment. `T > 0`
 and `T * Hq * 256 <= INT32_MAX`. Scale is a finite host scalar.
 
@@ -126,7 +126,7 @@ backward engine described in QSA ([docs](/operations/sparse_attention/qsa), [Git
 which also describes `deterministic` and gives the record
 and workspace sizing.
 
-The 12Q/1KV and 6Q/1KV backward requires the **CUDA 13 CuTeDSL compiler** in
+The backward (every head geometry) requires the **CUDA 13 CuTeDSL compiler** in
 addition to the CuTeDSL versions and architectures above. A CUDA 13 PyTorch
 build alone does not establish the DSL compiler version; unsupported compiler
 builds are rejected before kernel compilation.

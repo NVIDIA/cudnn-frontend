@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Packed 12:1 and 6:1 QSA from four-token groups, without a quadratic bitmap."""
+"""Packed 24:2, 12:1 and 6:1 QSA from four-token groups, without a quadratic bitmap."""
 
 from functools import lru_cache
 import importlib
@@ -12,19 +12,21 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn._torch_stream import stream_context
-from cudnn.QSA._contract import check_tensor
+from cudnn.QSA._contract import DTYPES, HEAD_GEOMETRIES, check_tensor
 
-QUERY_HEADS = (6, 12)  # per single KV head: the four-way and two-way tensor-parallel shards of the 24Q/2KV model
+KV_HEADS = dict(HEAD_GEOMETRIES)  # query heads -> KV heads
 
 
 def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None, cu_seqlens=None):
     if not isinstance(q, torch.Tensor) or not q.is_cuda or q.ndim != 3:
         raise ValueError("q must be a CUDA tensor with shape [T, Hq, 256]")
     total, hq = q.shape[0], q.shape[1]
-    if total < 1 or hq not in QUERY_HEADS or q.shape[2] != 256 or q.numel() > 2**31 - 1:
-        raise NotImplementedError("Indexed QSA requires T > 0, 12Q/1KV or 6Q/1KV, D256 and T * Hq * 256 <= INT32_MAX")
-    for name, tensor, heads in (("q", q, hq), ("k", k, 1), ("v", v, 1)):
-        check_tensor(name, tensor, (total, heads, 256), torch.bfloat16, q.device, 16)
+    if total < 1 or hq not in KV_HEADS or q.shape[2] != 256 or q.numel() > 2**31 - 1:
+        raise NotImplementedError("Indexed QSA requires T > 0, 24Q/2KV, 12Q/1KV or 6Q/1KV, D256 and T * Hq * 256 <= INT32_MAX")
+    if q.dtype not in DTYPES:
+        raise NotImplementedError("Indexed QSA requires BF16 or FP16 q, k, v and grad_out")
+    for name, tensor, heads in (("q", q, hq), ("k", k, KV_HEADS[hq]), ("v", v, KV_HEADS[hq])):
+        check_tensor(name, tensor, (total, heads, 256), q.dtype, q.device, 16)
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale):
         raise ValueError("scale must be a finite host scalar")
     if not isinstance(indices, torch.Tensor) or indices.ndim != 2:
@@ -34,7 +36,7 @@ def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None, cu_seqle
         raise NotImplementedError("Indexed QSA requires an index width divisible by four in [4, 2052]")
     check_tensor("indices", indices, (total, width), torch.int32, q.device)
     if grad is not None:
-        check_tensor("grad_out", grad, q.shape, torch.bfloat16, q.device, 16)
+        check_tensor("grad_out", grad, q.shape, q.dtype, q.device, 16)
         check_tensor("out_fp32", out32, q.shape, torch.float32, q.device, 16)
         check_tensor("lse", lse, (hq, total), torch.float32, q.device)
     if cu_seqlens is not None:
@@ -48,17 +50,19 @@ class _QsaIndexedPlan(APIBase):
     """Immutable geometry and compiled kernels. Execute uses caller storage only.
 
     The backward runs the dense-prefix and two-pass launch sequence of ``cudnn.QSA._backward`` behind the per-query
-    compaction, for 12 or 6 query heads per KV head, with the documents of a packed buffer described by ``cu_seqlens``
+    compaction, for 12 or 6 query heads per KV head and one or two KV heads, with the documents of a packed buffer described by ``cu_seqlens``
     when the caller has them.
     """
 
-    def __init__(self, total, width, device, direction, num_seqs=0, hq=12, max_seq_len=None, deterministic=False):
+    def __init__(self, total, width, device, direction, num_seqs=0, hq=12, max_seq_len=None, deterministic=False, dtype=torch.bfloat16):
         with torch.cuda.device(device):
             super().__init__()
         self.total, self.width, self.device, self.direction, self.hq = total, width, device, direction, hq
+        self.hkv = KV_HEADS[hq]
         self.num_seqs = num_seqs
         self.max_seq_len = max_seq_len
         self.deterministic = deterministic
+        self.dtype = dtype
         self.layouts = [
             ("ids", (total, width // 4), torch.int32),
             ("counts", (total,), torch.int32),
@@ -92,7 +96,9 @@ class _QsaIndexedPlan(APIBase):
                     "Indexed QSA backward requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.7.0' with a CUDA 13 compatible driver"
                 )
             mode = engine.SEQ_CU if self.num_seqs else engine.SEQ_SINGLE
-            self.engine_plan = engine.plan_for(self.total, self.device, 1, mode, max(self.num_seqs, 1), self.hq, self.max_seq_len, self.deterministic)
+            self.engine_plan = engine.plan_for(
+                self.total, self.device, self.hkv, mode, max(self.num_seqs, 1), self.hq // self.hkv, self.max_seq_len, self.deterministic
+            )
             self.workspace_bytes += self.engine_plan.workspace_bytes()
         self._is_supported = True
         return True
@@ -104,19 +110,20 @@ class _QsaIndexedPlan(APIBase):
         import cutlass
         from . import _metadata
 
+        dtype = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}[self.dtype]
         with torch.cuda.device(self.device):
             self._metadata = _metadata.compile_metadata(self.arch, self.width // 4)
             if self.direction == "fprop":
                 module = "fprop_sm100"
-                if self.arch == 107 and self.total >= 32768 and self.hq == 12:
+                if self.arch == 107 and self.total >= 32768 and self.hq == 12 * self.hkv:
                     module = "fprop_n64_sm107"  # specialised for 12 heads per KV head
                 self.impl = importlib.import_module(f"cudnn.QSA.kernels.{module}")
-                self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, self.hq, 1, self.arch)
+                self._compiled_kernel = self.impl.compile_kernel(dtype, self.hq, self.hkv, self.arch)
             else:
                 from cudnn.QSA import _backward as engine
 
                 self.impl = engine
-                self._compiled_kernel = engine.compile_kernels(self.engine_plan)
+                self._compiled_kernel = engine.compile_kernels(self.engine_plan, dtype)
 
     def scratch_workspace_bytes(self):
         return self.workspace_bytes
@@ -129,8 +136,8 @@ class _QsaIndexedPlan(APIBase):
         if self.direction == "fprop" and any(value is not None for value in (grad, out32, lse, cu_seqlens)):
             raise ValueError("forward does not accept backward saved state")
         total, width = _validate(q, k, v, indices, scale, grad, out32, lse, cu_seqlens)
-        if (total, width, q.shape[1], q.device) != (self.total, self.width, self.hq, self.device):
-            raise ValueError("Inputs must match the compiled token count, index width, query heads and device")
+        if (total, width, q.shape[1], q.device, q.dtype) != (self.total, self.width, self.hq, self.device, self.dtype):
+            raise ValueError("Inputs must match the compiled token count, index width, query heads, device and dtype")
         if (0 if cu_seqlens is None else cu_seqlens.shape[0] - 1) != self.num_seqs:
             raise ValueError("cu_seqlens must match the compiled sequence count")
         if len(outputs) != 3:
@@ -189,8 +196,8 @@ class _QsaIndexedPlan(APIBase):
 
 
 @lru_cache(maxsize=32)
-def _plan(total, width, device, direction, num_seqs=0, hq=12, max_seq_len=None, deterministic=False):
-    plan = _QsaIndexedPlan(total, width, device, direction, num_seqs, hq, max_seq_len, deterministic)
+def _plan(total, width, device, direction, num_seqs=0, hq=12, max_seq_len=None, deterministic=False, dtype=torch.bfloat16):
+    plan = _QsaIndexedPlan(total, width, device, direction, num_seqs, hq, max_seq_len, deterministic, dtype)
     plan.check_support()
     plan.compile()
     return plan
@@ -199,7 +206,7 @@ def _plan(total, width, device, direction, num_seqs=0, hq=12, max_seq_len=None, 
 def qsa_indexed_forward(q, k, v, indices, scale=1 / 16):
     """Return ``(out, out_fp32, lse)`` from complete four-token groups and a tail."""
     total, width = _validate(q, k, v, indices, scale)
-    plan = _plan(total, width, q.device, "fprop", 0, q.shape[1])
+    plan = _plan(total, width, q.device, "fprop", 0, q.shape[1], dtype=q.dtype)
     with torch.cuda.device(q.device):
         outputs = (torch.empty_like(q), torch.empty_like(q, dtype=torch.float32), torch.empty((q.shape[1], total), dtype=torch.float32, device=q.device))
         workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
@@ -222,7 +229,7 @@ def qsa_indexed_backward(
     max_seq_len=None,
     deterministic=False,
 ):
-    """Return BF16 ``(dq, dk, dv)`` using forward's FP32 output and LSE.
+    """Return ``(dq, dk, dv)`` in the input type using forward's FP32 output and LSE.
 
     ``general`` preserves arbitrary group ordering, padding holes and empty rows and treats the rows as one sequence,
     which stays exact for packed documents (the selection says which keys a query sees) but serves only the first
@@ -253,7 +260,7 @@ def qsa_indexed_backward(
             raise ValueError("max_seq_len times the number of documents in cu_seqlens must be at least the token count")
     num_seqs = 0 if cu_seqlens is None else cu_seqlens.shape[0] - 1
     # a bound below the crossover on every document plans no sparse path
-    plan = _plan(total, width, q.device, "bprop", num_seqs, q.shape[1], max_seq_len if num_seqs else None, deterministic)
+    plan = _plan(total, width, q.device, "bprop", num_seqs, q.shape[1], max_seq_len if num_seqs else None, deterministic, q.dtype)
     with torch.cuda.device(q.device):
         outputs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
         workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)

@@ -106,7 +106,9 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs, scale=SCALE, dtype=to
     return dq, dk, dv
 
 
-def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2, cu_seqlens=None, width=W, saved_output_dtype=torch.bfloat16, h_q=None):
+def make_inputs(
+    seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2, cu_seqlens=None, width=W, saved_output_dtype=torch.bfloat16, h_q=None, dtype=torch.bfloat16
+):
     """Random QSA backward operands. ``grad_scale`` shrinks dO to training-like gradient magnitudes.
 
     ``cu_seqlens`` (a Python list) packs several sequences into the T rows; the returned dict then carries it as an
@@ -116,10 +118,10 @@ def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_kv=2, cu_seqlens
     h_q = GROUP * h_kv if h_q is None else h_q
 
     def randn(*shape):
-        return torch.randn(shape, device=device, generator=generator, dtype=torch.float32).to(torch.bfloat16)
+        return torch.randn(shape, device=device, generator=generator, dtype=torch.float32).to(dtype)
 
     q, k, v = randn(seq_len, h_q, D), randn(seq_len, h_kv, D), randn(seq_len, h_kv, D)
-    dout = (torch.randn((seq_len, h_q, D), device=device, generator=generator) * grad_scale).to(torch.bfloat16)
+    dout = (torch.randn((seq_len, h_q, D), device=device, generator=generator) * grad_scale).to(dtype)
     topk_idxs = make_topk_idxs(seq_len, generator, cu_seqlens, width)
     out, lse = reference_forward(q, k, v, topk_idxs, saved_output_dtype)
     if saved_output_dtype == torch.float32:

@@ -10,6 +10,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.nvgpu.tcgen05 import OperandSource
+from cutlass._mlir.dialects import nvvm
 
 HADAMARD_SIZE = 16
 TMEM_ROW_STRIDE = 1 << 16
@@ -33,7 +34,28 @@ def hadamard_setup(g_hadamard, s_hadamard, tidx):
 
 
 @cute.jit
-def hadamard_compute(tiled_hmma, tmem_a_ptr, tmem_acc_ptr, s_hadamard, epi_tile, tidx, pipeline_producer):
+def tcgen05_fence_before_thread_sync():
+    """``tcgen05.fence::before_thread_sync``: orders this thread's prior tcgen05 ops before a following thread sync."""
+    nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)
+
+
+@cute.jit
+def tcgen05_fence_after_thread_sync():
+    """``tcgen05.fence::after_thread_sync``: orders this thread's later tcgen05 ops after a preceding thread sync."""
+    nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+
+
+@cute.jit
+def hadamard_compute(tiled_hmma, tmem_a_ptr, tmem_acc_ptr, s_hadamard, epi_tile, tidx, hadamard_pipeline, hadamard_state):
+    """Issue one 2-CTA Hadamard UMMA (leader CTA, warp 0) once both CTAs' operands are in TMEM.
+
+    ``hadamard_pipeline`` is the 1-stage ``PipelineUmmaAsync`` whose empty barrier (on the leader CTA)
+    counts all 256 RHT threads of the CTA pair. Every RHT thread arrives on it after it has finished
+    reading the previous accumulator and written this round's A operand (see ``hadamard_tmem_round``),
+    so waiting on it with the current phase gates the MMA on both CTAs' operands and keeps it from
+    overwriting an accumulator that is still being read. ``hadamard_state`` is owned and advanced by
+    the caller, so its phase is carried across tiles.
+    """
     n = epi_tile[1]
     mma_tiler = (M_PER_CLUSTER, HADAMARD_SIZE, HADAMARD_SIZE)
     cta_rank = cute.arch.block_in_cluster_idx()[0]
@@ -56,7 +78,10 @@ def hadamard_compute(tiled_hmma, tmem_a_ptr, tmem_acc_ptr, s_hadamard, epi_tile,
     )
 
     if cta_rank == 0 and tidx < 32:
-        hadamard_empty = pipeline_producer.acquire_and_advance()
+        # Wait for all 256 RHT threads of the CTA pair.
+        hadamard_pipeline.producer_acquire(hadamard_state)
+        # Order the MMA's TMEM reads/writes after the other threads' tcgen05.st / tcgen05.ld.
+        tcgen05_fence_after_thread_sync()
         for i in cutlass.range_constexpr(cute.size(t_ht_c.shape, mode=[2]), unroll_full=True):
             cute.gemm(
                 tiled_hmma,
@@ -65,7 +90,8 @@ def hadamard_compute(tiled_hmma, tmem_a_ptr, tmem_acc_ptr, s_hadamard, epi_tile,
                 cute.append_ones(t_bs_b[(None, None, 0, 0)], up_to_rank=3),
                 cute.append_ones(t_ht_c[None, None, i], up_to_rank=3),
             )
-        hadamard_empty.commit()
+        # tcgen05.commit multicast to the full barrier of both CTAs.
+        hadamard_pipeline.producer_commit(hadamard_state)
 
 
 @cute.jit
@@ -183,6 +209,9 @@ def hadamard_transpose_out_amax(tmem_ptr, tidx, amax_fp32):
     )
     rmem_dst = cute.make_rmem_tensor(t_d_ld.shape, cutlass.Float32)
     cute.copy(thr_ld, t_d_ld, rmem_dst)
+    # tcgen05.wait::ld: the registers are valid, and this thread's read of the accumulator has completed
+    # before it overwrites the same TMEM columns with the next A operand and arrives on the empty barrier.
+    cute.arch.fence_view_async_tmem_load()
 
     import cutlass._mlir.dialects.math as _math
 
@@ -193,6 +222,52 @@ def hadamard_transpose_out_amax(tmem_ptr, tidx, amax_fp32):
         abs_val = cutlass.Float32(_math.absf(rounded.ir_value()))
         amax_fp32 = cute.arch.fmax(amax_fp32, abs_val)
     return amax_fp32
+
+
+@cute.jit
+def hadamard_tmem_round(
+    sD,
+    d_buffer,
+    feature_offset: cutlass.Constexpr,
+    tiled_hmma,
+    tmem_a_ptr,
+    tmem_acc_ptr,
+    s_hadamard,
+    tidx,
+    hadamard_pipeline,
+    hadamard_state,
+    amax_fp32,
+):
+    """One TMEM post-RHT amax round (16 features) for all 256 RHT threads of the CTA pair.
+
+    The A operand and the accumulator share the same TMEM columns, so each round is:
+      1. tcgen05.st A                       (all threads; the previous round's tcgen05.ld already
+                                             completed via tcgen05.wait::ld)
+      2. tcgen05.wait::st + fence::before_thread_sync, then arrive on the leader's empty barrier
+      3. leader warp 0: wait for all 256 arrivals, fence::after_thread_sync, MMA, commit (multicast)
+      4. all threads: wait full barrier, fence::after_thread_sync, tcgen05.ld + tcgen05.wait::ld
+    Each barrier completes exactly one phase per round, so one ``hadamard_state`` (phase 0 initially)
+    serves both the empty (producer) and the full (consumer) waits; the caller must ``advance()`` it
+    once after every call. No thread arrives for round r+1 before it has passed the full wait of
+    round r, and the MMA of round r+1 needs all 256 arrivals, so neither parity wait can alias.
+    """
+    hadamard_transpose_in(sD, d_buffer, feature_offset, tmem_a_ptr, tidx)
+    cute.arch.fence_view_async_tmem_store()  # tcgen05.wait::st
+    tcgen05_fence_before_thread_sync()
+    hadamard_pipeline.consumer_release(hadamard_state)  # arrive on the leader CTA's empty barrier
+    hadamard_compute(
+        tiled_hmma,
+        tmem_a_ptr,
+        tmem_acc_ptr,
+        s_hadamard,
+        (M_PER_CLUSTER, HADAMARD_SIZE),
+        tidx,
+        hadamard_pipeline,
+        hadamard_state,
+    )
+    hadamard_pipeline.consumer_wait(hadamard_state)
+    tcgen05_fence_after_thread_sync()
+    return hadamard_transpose_out_amax(tmem_acc_ptr, tidx, amax_fp32)
 
 
 @cute.jit

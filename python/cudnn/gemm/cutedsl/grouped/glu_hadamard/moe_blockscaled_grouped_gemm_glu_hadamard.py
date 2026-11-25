@@ -57,12 +57,9 @@ from ..moe_utils import (
 )
 from .hadamard_utils import (
     hadamard_setup,
-    hadamard_compute,
     hadamard_smem_transpose_fwht_amax,
-    hadamard_transpose_in,
-    hadamard_transpose_out_amax,
+    hadamard_tmem_round,
     HADAMARD_SIZE,
-    M_PER_CLUSTER,
 )
 from ..moe_sched_extension import (
     DiscreteWeightScaledGemmSchedExtension,
@@ -874,7 +871,6 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 bias_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_bias_stage * 2]
             if cutlass.const_expr(self.use_tmem_post_rht_amax):
                 hadamard_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1 * 2]
-                hadamard_prerequisite_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1 * 2]
             scheduler: SchedulerStorage
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
@@ -1502,31 +1498,22 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 hadamard_b_layout_staged,
             )
 
-            # Hadamard UMMA pipeline (1 stage)
+            # Hadamard UMMA pipeline (1 stage). Full barrier: tcgen05.commit of the leader's 2-CTA MMA,
+            # multicast to both CTAs. Empty barrier (leader CTA only, via consumer_mask): all 256 RHT
+            # threads of the CTA pair arrive after writing their A operand for the round, which is also
+            # after their tcgen05.ld of the previous accumulator completed (A and the accumulator share
+            # TMEM columns). The MMA is thus gated on both CTAs' operands and on the previous result
+            # having been read. See hadamard_tmem_round().
             hadamard_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
             num_hadamard_consumer_threads = 128 * (2 if use_2cta_instrs else 1)
             hadamard_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_hadamard_consumer_threads)
-            hadamard_producer, hadamard_consumer = pipeline.PipelineUmmaAsync.create(
+            hadamard_pipeline = pipeline.PipelineUmmaAsync.create(
                 barrier_storage=storage.hadamard_mbar_ptr.data_ptr(),
                 num_stages=1,
                 producer_group=hadamard_pipeline_producer_group,
                 consumer_group=hadamard_pipeline_consumer_group,
                 cta_layout_vmnk=cluster_layout_vmnk,
-            ).make_participants()
-
-            # Hadamard prerequisite pipeline (cross-CTA sync, 1 stage)
-            num_hadamard_prerequisite_threads = 128
-            hadamard_prerequisite_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_hadamard_prerequisite_threads)
-            hadamard_prerequisite_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_hadamard_prerequisite_threads)
-            peer_rank = cutlass.Int32(1) - cta_rank
-            hadamard_prerequisite_producer, hadamard_prerequisite_consumer = pipeline.PipelineAsync.create(
-                barrier_storage=storage.hadamard_prerequisite_mbar_ptr.data_ptr(),
-                num_stages=1,
-                producer_group=hadamard_prerequisite_pipeline_producer_group,
-                consumer_group=hadamard_prerequisite_pipeline_consumer_group,
-                producer_mask=peer_rank,
-                defer_sync=True,
-            ).make_participants()
+            )
 
         # Pingpong pipeline
         pingpong_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, len(self.epilog_act_warp_id) * self.threads_per_warp)
@@ -2577,6 +2564,10 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                     reverse_subtile = cutlass.Boolean(False)
 
                 num_prev_subtiles = cutlass.Int32(0)
+                # Loop-carried Hadamard round state, shared by the leader's empty-barrier wait and every
+                # thread's full-barrier wait. Its phase starts at 0 so the first MMA waits for the
+                # round-0 operand arrivals. Advanced once per hadamard_tmem_round().
+                hadamard_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             num_prev_d_subtiles = cutlass.Int32(0)
             while is_valid_tile:
                 # sInfo format: (expert_idx, tile_m_idx, tile_n_idx, k_tile_cnt)
@@ -2624,58 +2615,21 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                         if cutlass.const_expr(self.use_tmem_post_rht_amax):
                             hadamard_tmem_a_ptr = self.query_hadamard_tmem_a_ptr(subtile_idx, reverse_subtile, tmem_ptr)
                             hadamard_tmem_out_ptr = self.query_hadamard_tmem_acc_ptr(subtile_idx, reverse_subtile, tmem_ptr)
-                            hadamard_transpose_in(
-                                sD,
-                                d_buffer,
-                                0,
-                                hadamard_tmem_a_ptr,
-                                epi_tidx,
-                            )
-                            hadamard_prerequisite_empty = hadamard_prerequisite_producer.acquire_and_advance()
-                            hadamard_prerequisite_empty.commit()
-                            hadamard_prerequisite_empty = hadamard_prerequisite_consumer.wait_and_advance()
-                            hadamard_prerequisite_consumer.release(hadamard_prerequisite_empty)
-                            hadamard_compute(
-                                tiled_hmma,
-                                hadamard_tmem_a_ptr,
-                                hadamard_tmem_out_ptr,
-                                storage.sHadamard,
-                                (M_PER_CLUSTER, HADAMARD_SIZE),
-                                epi_tidx,
-                                hadamard_producer,
-                            )
-                            hadamard_consumer.wait_and_advance()
-                            thread_tile_post_rht_amax = hadamard_transpose_out_amax(
-                                hadamard_tmem_out_ptr,
-                                epi_tidx,
-                                thread_tile_post_rht_amax,
-                            )
-                            hadamard_transpose_in(
-                                sD,
-                                d_buffer,
-                                HADAMARD_SIZE,
-                                hadamard_tmem_a_ptr,
-                                epi_tidx,
-                            )
-                            hadamard_prerequisite_empty = hadamard_prerequisite_producer.acquire_and_advance()
-                            hadamard_prerequisite_empty.commit()
-                            hadamard_prerequisite_empty = hadamard_prerequisite_consumer.wait_and_advance()
-                            hadamard_prerequisite_consumer.release(hadamard_prerequisite_empty)
-                            hadamard_compute(
-                                tiled_hmma,
-                                hadamard_tmem_a_ptr,
-                                hadamard_tmem_out_ptr,
-                                storage.sHadamard,
-                                (M_PER_CLUSTER, HADAMARD_SIZE),
-                                epi_tidx,
-                                hadamard_producer,
-                            )
-                            hadamard_consumer.wait_and_advance()
-                            thread_tile_post_rht_amax = hadamard_transpose_out_amax(
-                                hadamard_tmem_out_ptr,
-                                epi_tidx,
-                                thread_tile_post_rht_amax,
-                            )
+                            for feature_offset in cutlass.range_constexpr(0, 2 * HADAMARD_SIZE, HADAMARD_SIZE):
+                                thread_tile_post_rht_amax = hadamard_tmem_round(
+                                    sD,
+                                    d_buffer,
+                                    feature_offset,
+                                    tiled_hmma,
+                                    hadamard_tmem_a_ptr,
+                                    hadamard_tmem_out_ptr,
+                                    storage.sHadamard,
+                                    epi_tidx,
+                                    hadamard_pipeline,
+                                    hadamard_state,
+                                    thread_tile_post_rht_amax,
+                                )
+                                hadamard_state.advance()
                         else:
                             thread_tile_post_rht_amax = hadamard_smem_transpose_fwht_amax(
                                 sD,

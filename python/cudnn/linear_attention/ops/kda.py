@@ -43,12 +43,14 @@ from .common import (
     check_composed_state,
     check_composed_summaries,
     check_context,
+    eager_backward,
     eager_dispatch,
     execute_graph,
     make_execution_resources,
     make_summary_cache_key,
     select_plan,
     summary_backward,
+    summary_dispatch,
     summary_setup_context,
     torch_dtype_to_cudnn,
 )
@@ -1476,8 +1478,9 @@ class EagerKda(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
-        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range
-        return kda_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else run_kda_bwd)
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range, and a
+        # trace or mode that started after the forward has to see the op
+        return kda_backward(ctx, *grads, bwd=run_kda_bwd if eager_backward(grads) else None)
 
 
 # ---------------------------------------------------------------------------
@@ -2388,7 +2391,9 @@ def kimi_delta_attention_summary(
     """
     if k.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
-    final_state, transition = torch.ops.cudnn.kimi_delta_attention_summary(
+    final_state, transition = summary_dispatch(
+        torch.ops.cudnn.kimi_delta_attention_summary,
+        run_kda_summary,
         k,
         v,
         g,
@@ -2460,7 +2465,9 @@ def kimi_delta_attention_summary_bwd(
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    d_initial_state, transition, context = torch.ops.cudnn.kimi_delta_attention_summary_bwd(
+    d_initial_state, transition, context = summary_dispatch(
+        torch.ops.cudnn.kimi_delta_attention_summary_bwd,
+        run_kda_summary_bwd,
         dO,
         q,
         k,

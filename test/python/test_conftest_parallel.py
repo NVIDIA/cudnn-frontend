@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -347,3 +348,57 @@ def test_a_measurement_reaches_the_controllers_summary(workers):
     assert re.search(r"^=+ measured =+$", out, re.M), f"no 'measured' section:\n{out[-3000:]}"
     assert f"  pin {tag}: alpha=crash beta=planned(3) gamma=declined" in out, out[-3000:]  # one line, whitespace collapsed
     assert "CAPTURED STDOUT OF A PASSING TEST" not in out, "the channel exists because this line is NOT in the log"
+
+
+# ---- gpu_exclusive covers the complete pytest protocol
+
+_LOCK_PROBE = """
+import fcntl
+import sys
+with open(sys.argv[1], "a") as lock:
+    try:
+        fcntl.flock(lock, int(sys.argv[2]) | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(1)
+"""
+
+
+def _probe_lock(path, mode):
+    return subprocess.run([sys.executable, "-c", _LOCK_PROBE, str(path), str(mode)], capture_output=True, text=True, timeout=10).returncode
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX GPU test locking")
+@pytest.mark.parametrize("exclusive", [False, True], ids=["shared", "exclusive"])
+@pytest.mark.parametrize("body_raises", [False, True], ids=["return", "raise"])
+def test_gpu_exclusive_protocol_blocks_conflicts_and_releases(top_conftest, monkeypatch, tmp_path, exclusive, body_raises):
+    import fcntl
+
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setattr(top_conftest, "_FROST_ROUTING_DIR", str(tmp_path))
+    item = SimpleNamespace(get_closest_marker=lambda name: object() if exclusive else None)
+    protocol = top_conftest.pytest_runtest_protocol(item, None)
+    next(protocol)
+    path = tmp_path / "gpu.lock"
+    try:
+        assert _probe_lock(path, fcntl.LOCK_SH) == int(exclusive)
+        assert _probe_lock(path, fcntl.LOCK_EX) == 1
+    finally:
+        if body_raises:
+            with pytest.raises(RuntimeError, match="test body failed"):
+                protocol.throw(RuntimeError("test body failed"))
+        else:
+            with pytest.raises(StopIteration):
+                protocol.send(None)
+    assert _probe_lock(path, fcntl.LOCK_EX) == 0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX GPU test locking")
+def test_gpu_exclusive_protocol_keeps_torchrun_ranks_concurrent(top_conftest, monkeypatch, tmp_path):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(top_conftest, "_FROST_ROUTING_DIR", str(tmp_path))
+    item = SimpleNamespace(get_closest_marker=lambda name: object())
+    protocol = top_conftest.pytest_runtest_protocol(item, None)
+    next(protocol)
+    with pytest.raises(StopIteration):
+        protocol.send(None)
+    assert not (tmp_path / "gpu.lock").exists()

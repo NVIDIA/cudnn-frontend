@@ -63,7 +63,7 @@ Choose an entry by its input and saved-state contract:
 | Need | Entry point | Contract |
 |---|---|---|
 | Packed training with a block-selection bitmap | `cudnn.ops.qsa_forward`, `qsa_backward` | The bitmap API documented on this page; 24Q/2KV, 12Q/1KV or 6Q/1KV |
-| Packed training with selected token IDs | `cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward` ([docs](/operations/sparse_attention/qsa/qsa_indexed), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md)) | 12Q/1KV or 6Q/1KV on SM100/SM103/SM107; shares the QSA attention kernels |
+| Packed training with selected token IDs | `cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward` ([docs](/operations/sparse_attention/qsa/qsa_indexed), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md)) | 24Q/2KV, 12Q/1KV or 6Q/1KV on SM100/SM103/SM107; shares the QSA attention kernels |
 | Generate selected blocks from indexer Q and compressed K | `cudnn.ops.qsa_select_forward`, `qsa_select_decode_forward` | QSA selector over the shared DSA scorer and top-k; returns local block IDs, not token IDs |
 | Decode selection over a paged compressed-key cache | `cudnn.ops.qsa_select_decode_paged_forward` | BF16 indexer cache; see the paged selector's architecture and layout requirements in its docstring |
 | Integrated projection, compression, selection and attention | `GatedAttentionBlockFwd` with `QsaSpec(index_source="indexer")` ([docs](/operations/Attention/gated_attention_block), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/attention/gated_attention_block.md)) | Use the integrated block's own architecture, layout and inference support matrix |
@@ -126,19 +126,19 @@ all sequences. All tensors must be contiguous and on the same CUDA device.
 
 | Tensor | Shape | Dtype | Meaning |
 |---|---|---|---|
-| `q` | `[T, Hq, 256]` | BF16 | Query vectors |
-| `k`, `v` | `[T, Hkv, 256]` | BF16 | Key and value vectors |
+| `q` | `[T, Hq, 256]` | BF16 or FP16 | Query vectors |
+| `k`, `v` | `[T, Hkv, 256]` | Same as `q` | Key and value vectors |
 | `sel_blocks` | `[T, NB]` | uint8 | Nonzero selects a global block for that query |
 | `lo`, `hi` | `[T]` | int32 | Inclusive allowed key-token bounds |
 | `blk_base` | `[T]` | int32 | First global block of the query's sequence |
 | `tok_base` | `[T]` | int32 | First global token of the query's sequence |
 | `block_first`, `block_last` | `[NB]` | int32 | Inclusive global token span of each block |
-| `out` | `[T, Hq, 256]` | BF16 | Attention output |
-| `out_fp32` | `[T, Hq, 256]` | FP32 | Output before its BF16 cast; save for backward |
+| `out` | `[T, Hq, 256]` | Same as `q` | Attention output |
+| `out_fp32` | `[T, Hq, 256]` | FP32 | Output before its cast to the input type; save for backward |
 | `lse` | `[Hq, T]` | FP32 | Natural-log softmax normalizer; save for backward |
-| `grad_out` | `[T, Hq, 256]` | BF16 | Upstream output gradient |
-| `dq` | Same as `q` | BF16 | Query gradient |
-| `dk`, `dv` | Same as `k`, `v` | BF16 | Key/value gradients, summed over query heads |
+| `grad_out` | `[T, Hq, 256]` | Same as `q` | Upstream output gradient |
+| `dq` | Same as `q` | Same as `q` | Query gradient |
+| `dk`, `dv` | Same as `k`, `v` | Same as `q` | Key/value gradients, summed over query heads |
 
 Q/K/V, `grad_out`, and `out_fp32` must be 16-byte aligned. FP32 LSE and int32
 metadata must be 4-byte aligned. The implementation rejects unsupported layouts
@@ -164,19 +164,19 @@ other tiles. GPU preparation checks the current K/V values and bounds, then
 builds exact masks. Nonfinite K/V uses the gather path to exclude unused values
 before arithmetic. Both paths compute scaled QK scores, apply the bounds, and
 use online softmax followed by PV. They write FP32 output and natural-log LSE,
-then cast output to BF16. Empty rows produce zero output and negative-infinity LSE.
+then cast output to the input type. Empty rows produce zero output and negative-infinity LSE.
 
 Backward compacts the current selection, computes
 `delta = sum(grad_out * out_fp32, dim=-1)`, reconstructs probabilities from QK
-and LSE, and forms dQ/dK/dV. Accumulation uses FP32; output gradients use BF16.
+and LSE, and forms dQ/dK/dV. Accumulation uses FP32; output gradients use the input type.
 K/V gradient contributions from all query heads are summed. Without
 `deterministic=True`, floating-point reductions of the dense prefix can change
 low bits between runs. The dense prefix of each sequence
 runs on a key-tile kernel whose two CTAs share a key tile and accumulate dK / dV
-on chip; the remaining queries write bf16 P / dS records that a key-major pass
+on chip; the remaining queries write P / dS records in the input type that a key-major pass
 sums per block, so no per-pair floating-point atomics are issued. dS reaches
-the dQ MMAs rounded to BF16. The dense prefix forms it from a P that one CTA
-sends the other in BF16, the remaining queries from an FP32 P. A nonfinite
+the dQ MMAs rounded to the input type. The dense prefix forms it from a P that one CTA
+sends the other in the input type, the remaining queries from an FP32 P. A nonfinite
 K / V value of a masked token adds exact zeros. One of a selected token poisons
 the queries that select it and that block's dK / dV, nothing else. A nonfinite
 Q or dO value is not contained: it can also reach the dQ of neighboring sparse
@@ -206,7 +206,7 @@ full score or probability matrices.
 | Forward | Dense or gathered QK, online softmax, PV | `out`, `out_fp32`, `lse` |
 | Backward | Preparation | FP32 `delta`; cleared gradient accumulators |
 | Backward | Gather, probability reconstruction, gradient products | FP32 dQ/dK/dV accumulators |
-| Backward | Final cast | BF16 `dq`, `dk`, `dv` |
+| Backward | Final cast | `dq`, `dk`, `dv` in the input type |
 
 The selection bitmap must include any desired causal tail. The implementation
 does not add a tail automatically. The forward does not truncate the selection
@@ -226,7 +226,7 @@ and a plan without a sparse path carries two more FP32 dK / dV accumulators.
 
 ## Support and execution
 
-Supported geometry is BF16, head dimension 256, head counts 24Q/2KV, 12Q/1KV or
+Supported geometry is BF16 or FP16, head dimension 256, head counts 24Q/2KV, 12Q/1KV or
 6Q/1KV (the full model and its two- and four-way tensor-parallel shards, the KV
 head replicated at four-way), and `block_size=4`. `T > 0`, `NB > 0`, and `T * Hq * 256 <= INT32_MAX` are required.
 `scale` is a finite host scalar, normally `1 / sqrt(256)`.

@@ -40,11 +40,14 @@ from .common import (
     check_composed_state,
     check_composed_summaries,
     check_context,
+    eager_backward,
+    eager_dispatch,
     execute_graph,
     make_execution_resources,
     make_summary_cache_key,
     select_plan,
     summary_backward,
+    summary_dispatch,
     summary_setup_context,
     torch_dtype_to_cudnn,
 )
@@ -1383,7 +1386,7 @@ def gdn2_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(output[2], output[3], output[4])
 
 
-def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, d_context):
+def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, d_context, bwd=None):
     # Non-reentrant activation checkpointing allows one saved-tensor unpack.
     saved_tensors = ctx.saved_tensors
     if ctx.checkpoint_reuse:
@@ -1401,7 +1404,7 @@ def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state,
     if dO is None:
         dO = torch.zeros(q.shape[0], max(q.shape[1], v.shape[1]), v.shape[2], dtype=q.dtype, device=q.device)
     dstate_in = dFinal if (dFinal is not None and dFinal.numel() > 0) else None
-    dq, dk, dv, dg, dbeta, dw, dstate0, d_a_log, d_dt_bias = torch.ops.cudnn.gated_delta_net_v2_bwd(
+    dq, dk, dv, dg, dbeta, dw, dstate0, d_a_log, d_dt_bias = (bwd or torch.ops.cudnn.gated_delta_net_v2_bwd)(
         dO,
         q,
         k,
@@ -1466,6 +1469,59 @@ torch.library.register_autograd(
     gdn2_backward,
     setup_context=gdn2_setup_context,
 )
+
+
+# ---------------------------------------------------------------------------
+# Eager path: the forward op and its autograd formula without the custom op's dispatch
+# ---------------------------------------------------------------------------
+
+FWD_ARGS = (
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "w",
+    "cu_seqlens",
+    "scale",
+    "initial_state",
+    "output_final_state",
+    "use_qk_l2norm_in_kernel",
+    "batch_invariant",
+    "use_beta_sigmoid_in_kernel",
+    "allow_neg_eigval",
+    "beta_guard",
+    "safe_gate",
+    "gate_domain",
+    "gate_lower_bound",
+    "a_log",
+    "dt_bias",
+    "checkpoint_every_n_tokens",
+    "checkpoint_dtype",
+    "plan_name",
+    "preceding_state_update",
+    "preceding_transition",
+    "checkpoint_after_block",
+    "output_context",
+)
+
+
+class EagerGdn2(torch.autograd.Function):
+    """``cudnn::gated_delta_net_v2_fwd`` with its registered autograd formula (:func:`gdn2_setup_context`,
+    :func:`gdn2_backward`), applied directly."""
+
+    @staticmethod
+    def forward(*args):
+        return run_gdn2_fwd(**dict(zip(FWD_ARGS, args)))
+
+    setup_context = staticmethod(gdn2_setup_context)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range, and a
+        # trace or mode that started after the forward has to see the op
+        return gdn2_backward(ctx, *grads, bwd=run_gdn2_bwd if eager_backward(grads) else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1674,7 +1730,7 @@ def gated_delta_net_v2(
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
-        o, final_state, state_checkpoints, composed_initial_state, context_out = torch.ops.cudnn.gated_delta_net_v2_fwd(
+        args = (
             q,
             k,
             v,
@@ -1683,26 +1739,33 @@ def gated_delta_net_v2(
             w,
             cu_seqlens,
             float(scale),
-            initial_state=initial_state,
-            output_final_state=bool(output_final_state),
-            use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
-            batch_invariant=bool(batch_invariant),
-            use_beta_sigmoid_in_kernel=bool(use_beta_sigmoid_in_kernel),
-            allow_neg_eigval=bool(allow_neg_eigval),
-            beta_guard=bool(beta_guard),
-            safe_gate=bool(safe_gate),
-            gate_domain=str(gate_domain),
-            gate_lower_bound=float(gate_lower_bound) if gate_lower_bound is not None else None,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
-            checkpoint_dtype=checkpoint_dtype,
-            plan_name=plan_name,
-            preceding_state_update=preceding_state_update,
-            preceding_transition=preceding_transition,
-            checkpoint_after_block=bool(checkpoint_after_block),
-            output_context=bool(output_context),
+            initial_state,
+            bool(output_final_state),
+            bool(use_qk_l2norm_in_kernel),
+            bool(batch_invariant),
+            bool(use_beta_sigmoid_in_kernel),
+            bool(allow_neg_eigval),
+            bool(beta_guard),
+            bool(safe_gate),
+            str(gate_domain),
+            float(gate_lower_bound) if gate_lower_bound is not None else None,
+            a_log,
+            dt_bias,
+            int(checkpoint_every_n_tokens),
+            checkpoint_dtype,
+            plan_name,
+            preceding_state_update,
+            preceding_transition,
+            bool(checkpoint_after_block),
+            bool(output_context),
         )
+        if not eager_dispatch(args):
+            outputs = torch.ops.cudnn.gated_delta_net_v2_fwd(*args)
+        elif torch.is_grad_enabled() and any(a.requires_grad for a in args if isinstance(a, torch.Tensor)):
+            outputs = EagerGdn2.apply(*args)
+        else:
+            outputs = run_gdn2_fwd(**dict(zip(FWD_ARGS, args)))
+        o, final_state, state_checkpoints, composed_initial_state, context_out = outputs
         if preceding_state_update is not None:
             if output_context:
                 return o, final_state, state_checkpoints, composed_initial_state, context_out
@@ -2377,7 +2440,9 @@ def gated_delta_net_v2_summary(
     """
     if k.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
-    final_state, transition = torch.ops.cudnn.gated_delta_net_v2_summary(
+    final_state, transition = summary_dispatch(
+        torch.ops.cudnn.gated_delta_net_v2_summary,
+        run_gdn2_summary,
         k,
         v,
         g,
@@ -2446,7 +2511,9 @@ def gated_delta_net_v2_summary_bwd(
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    d_initial_state, transition, context = torch.ops.cudnn.gated_delta_net_v2_summary_bwd(
+    d_initial_state, transition, context = summary_dispatch(
+        torch.ops.cudnn.gated_delta_net_v2_summary_bwd,
+        run_gdn2_summary_bwd,
         dO,
         q,
         k,
