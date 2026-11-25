@@ -1326,6 +1326,57 @@ def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, determini
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
+@pytest.mark.parametrize("tie_break", [0, 1, 2])
+def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, tie_break):
+    """Check FP32 cutoff keys at the FP16 rounding boundaries used by coarse filtering."""
+    dsa = _import_dsa()
+    width, k, rows = 32773, 2048, 156
+    columns = torch.arange(width, device="cuda", dtype=torch.int32)
+    delta = columns * 17 % 127 - 63
+    # Below and above 1.0 share the FP32 high byte. Around 2.0 it changes.
+    # 2.5 lies in an interior mantissa group. Subnormal and overflow bins
+    # also need the full refinement.
+    centers = torch.tensor([0x3F800000, 0x40000000, 0x40200000, 0x33800000, 0x477FF080], device="cuda", dtype=torch.int32)
+    magnitudes = (centers[:, None] + delta).view(torch.float32)
+    patterns = torch.cat((magnitudes, -magnitudes, torch.zeros_like(magnitudes[:1])))
+    pattern_count = len(patterns)
+    first = [3, 11, 8, 17, 30, 1, 19, 24, 7, 12, 5] if has_starts else [0] * pattern_count
+    last = [width, width, width, width, width, width, width, first[7] + 16383, first[8] + 16384, width, width]
+    patterns[-1, first[-1] : first[-1] + k] = 32
+    order = torch.arange(rows, device="cuda") % pattern_count
+    starts = torch.tensor(first, device="cuda", dtype=torch.int32)[order]
+    ends = torch.tensor(last, device="cuda", dtype=torch.int32)[order]
+    scores = patterns[order]
+    scores.masked_fill_((columns < starts[:, None]) | (columns >= ends[:, None]), torch.inf)
+
+    def run(data=scores, lower=starts, upper=ends):
+        result = dsa.indexer_top_k_wrapper(data, upper, k, starts=lower if has_starts else None, tie_break=tie_break, deterministic=True)
+        return {"indices": result["indices"], "values": result["values"]}
+
+    expected_indices = []
+    expected_values = []
+    for pattern, (start, end) in zip(patterns, zip(first, last)):
+        candidates = torch.arange(start, end, device="cuda")
+        if tie_break == 2:
+            candidates = candidates.flip(0)
+        indices = candidates[pattern[candidates].argsort(descending=True, stable=True)[:k]].sort().values
+        expected_indices.append(indices.int())
+        expected_values.append(pattern[indices])
+    expected = {"indices": torch.stack(expected_indices)[order], "values": torch.stack(expected_values)[order]}
+    actual = assert_replays(run)
+    assert_bitwise(actual, expected, "FP32 interval oracle")
+    for rows_to_check in ([0], [7, 2, 1, 7, 6, 10]):
+        assert_bitwise(
+            run(scores[rows_to_check], starts[rows_to_check], ends[rows_to_check]),
+            {name: values[rows_to_check] for name, values in expected.items()},
+            "isolated and reordered rows",
+        )
+    if has_starts and tie_break == 2:
+        assert_golden("dsa-indexer-top-k-fp32-coarse-bin-refinement", {"scores": scores, "starts": starts, "ends": ends}, actual)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
 @pytest.mark.parametrize("tie_break", [0, 1, 2])

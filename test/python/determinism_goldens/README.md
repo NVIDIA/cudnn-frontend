@@ -4869,6 +4869,20 @@ DSL versions, the L0/L1 command above reported 237 passed,
 regression reported 17 passed. The zero-scratch path is unverified on
 cc 10.0, cc 10.7 and SM12x.
 
+After `ad22d43a`, wide deterministic FP32 K=2048 rows can skip the first
+exact radix digit when the FP16 coarse bin determines all candidates'
+FP32 high byte.
+Six L0 cases cover both interval modes and all tie policies, including
+normal FP16 bins where rounding does and does not cross an FP32 high-byte
+boundary, subnormal and overflow bins, and exact coarse cutoffs. The
+cases compare against an independent stable sort and check replay,
+isolation and batch reordering with duplicated rows. The new H20
+golden has the same input and output hashes as the previous kernel.
+On the H20-3e stack above, the L0/L1 command reported 243 passed, 9
+SM120/121 skips and 6 deselected. Refill stress observed zero differences
+in 128 warm and 128 poisoned launches. The current radix path remains
+unverified on cc 10.0, cc 10.3, cc 10.7 and SM12x.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
