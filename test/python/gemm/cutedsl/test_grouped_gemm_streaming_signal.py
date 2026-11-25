@@ -13,7 +13,7 @@ release orders and chunk shapes are L1.
 import pytest
 import torch
 
-from gemm.cutedsl._streaming_signal import BIG_EXPERT, MANY_EXPERTS_64, ROWS_ALIGNMENT, compile_once, kernel_args, launch_args
+from gemm.cutedsl._streaming_signal import BIG_EXPERT, MANY_EXPERTS_64, ROWS_ALIGNMENT, SMALL_EXPERTS_64, compile_once, kernel_args, launch_args
 from gemm.cutedsl._streaming_signal import make_kernel as build_kernel
 from gemm.cutedsl._streaming_signal import make_problem, new_buffers, signal_ready
 
@@ -98,12 +98,13 @@ def valid_rows(problem):
 
 
 # Rows per expert.  More than 32 experts take the batch opener several lane rounds; an expert of more than 16 M tiles
-# (EXPERT_BATCH_MAX_M_TILES) needs several batches.
+# (EXPERT_BATCH_MAX_M_TILES) needs several batches; with many small experts one opening publishes several batches.
 ROUTINGS = {
     "uneven": [700, 0, 256, 1],
     "one_expert": [1300, 0, 0, 0],
     "many_experts_64": MANY_EXPERTS_64,
     "many_experts_128_small": [(256, 300, 512, 600, 768)[i % 5] for i in range(128)],
+    "small_experts_64": SMALL_EXPERTS_64,
     "big_expert": BIG_EXPERT,
     "mostly_empty": [700 if i == 5 else 300 if i == 31 else 0 for i in range(32)],
     "rows_not_aligned": [255, 257, 511, 1025],
@@ -115,7 +116,13 @@ def experts_of(routing):
 
 
 MATCH_CASES = [(glu, variant, routing) for glu in (False, True) for variant in ("signal", "signal_layout_pdl") for routing in sorted(ROUTINGS)]
-MATCH_L0 = {(False, "signal", "many_experts_64"), (True, "signal", "big_expert"), (False, "signal_layout_pdl", "big_expert")}
+MATCH_L0 = {
+    (False, "signal", "many_experts_64"),
+    (True, "signal", "big_expert"),
+    (False, "signal_layout_pdl", "big_expert"),
+    (False, "signal", "small_experts_64"),
+    (True, "signal", "small_experts_64"),
+}
 
 
 @pytest.mark.parametrize(
