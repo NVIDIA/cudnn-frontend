@@ -9598,7 +9598,7 @@ cluster and one with the (128, 256) tile. Racecheck ran the two default-tile
 launches. SM103 and SM107 were not run, only compiled: ptxas 13.4.92 reports
 0 spills for the deterministic configurations, 26 on sm_100a and 24 on sm_107a.
 
-### Phase 1 SM103 replay expectation — 2026-11-24
+### Phase 1 SM100/SM103 loss-byte expectations — 2026-11-24
 
 Pipeline 85038338, job 569171688, reports `replay 2 loss: 1/4 bytes differ`
 for `test_replay[bf16-h32-tail-fprop-cutedsl]` on SM103 with cuDNN 9.28.1.4
@@ -9606,10 +9606,13 @@ and CuTe DSL 4.8.0. The independent numerical reference passed before the
 byte comparison failed. The fused loss uses unordered FP32 atomic additions;
 its determinism status remains **Not guaranteed**.
 
-The test now treats only this case and one-byte loss replay mismatch as an
-expected failure on SM103. Numerical, non-finite, gradient, other-case and
-other-architecture failures remain strict. Existing SM100 expectations stay
-in place. No kernel, tolerance or golden changes.
+The test treats only this case and one-byte loss replay mismatch as an
+expected failure on SM103. On SM100, the H32 fused forward batch case also
+reports `packed slot 0 loss: 1/4 bytes differ` under CUDA 13.4. Restoring the
+old expectation handler reproduces that failure on the second isolated run.
+That case has a separate one-byte scalar-loss exception. Numerical,
+non-finite, gradient and other-case checks remain strict. No kernel,
+tolerance or golden changes.
 
 On SM100 with cuDNN 9.30.0.12, Torch 2.11.0+cu128 and CuTe DSL
 4.9.0a0+20261121230000.ecb3b50, the harness suite, eight expectation checks
@@ -9625,5 +9628,25 @@ python -m pytest test/python/test_conftest_parallel.py \
 
 Disabling the protocol lock and restoring the old SM103 expectation makes
 five regression checks fail. The same 13 checks pass with the changes.
-Native SM103 validation is pending in pipeline 85191475; its API variables
-select cuDNN 9.28.1.4 and CuTe DSL 4.8.0 despite the default job labels.
+
+With Torch 2.14.0a0+b2c75dd062.nv26.09 / CUDA 13.4 and the same SM100,
+backend and DSL, both MoK suites pass with four workers sharing one GPU:
+37 passed, 1 skipped. The wider initial run exposed the SM100 loss-byte
+case above. After its scoped expectation change, the full harness and
+Phase 1 suites report 50 passed, 7 skipped and 11 xfailed in 58.40 s:
+
+```bash
+python -m pytest test/python/test_conftest_parallel.py \
+  test/python/simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py \
+  -n 4 --dist loadfile -q -rsx --tb=short
+```
+
+The seven skips are two existing determinism exclusions, four missing
+runtime goldens and the two-device guard. The 12 expectation-policy checks
+run within this result. All xfails remain byte-comparison failures.
+
+Native SM103 pipeline 85191475 stopped before tests because Enroot pulled
+the private image anonymously and received HTTP 403. Pipelines 85192768
+(cuDNN 9.28.1.4 / CuTe DSL 4.8.0) and 85192784 (9.30.0.9 / 4.9.0a0)
+retry the affected suites with the public PyTorch 26.09 base image. Their
+results are pending. The version overrides differ from the default job names.

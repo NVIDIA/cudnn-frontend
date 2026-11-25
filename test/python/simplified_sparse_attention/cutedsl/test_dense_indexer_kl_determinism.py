@@ -40,6 +40,8 @@ def known_byte_failure(request):
             pattern = r"(?:replay \d+|packed slot \d+) (?:loss|(?:saved_)?d[qk]_idx): \d+/\d+ bytes differ"
         elif capability == (10, 3) and request.node.name == "test_replay[bf16-h32-tail-fprop-cutedsl]":
             pattern = r"replay \d+ loss: 1/4 bytes differ"
+        elif capability == (10, 0) and request.node.name == "test_batch_invariance[bf16-h32-tail-fprop-cutedsl]":
+            pattern = r"packed slot [01] loss: 1/4 bytes differ"
         else:
             raise
         if not re.fullmatch(pattern, str(error)):
@@ -117,6 +119,10 @@ def test_golden(use_kf, backward):
         ((10, 3), "test_replay[bf16-h32-tail-bprop-cutedsl]", "replay 2 loss: 1/4 bytes differ", False),
         ((10, 7), "test_replay[bf16-h32-tail-fprop-cutedsl]", "replay 2 loss: 1/4 bytes differ", False),
         ((10, 0), "test_replay[bf16-h32-tail-fprop-cutedsl]", "replay 2 loss: 1/4 bytes differ", True),
+        ((10, 0), "test_batch_invariance[bf16-h32-tail-fprop-cutedsl]", "packed slot 0 loss: 1/4 bytes differ", True),
+        ((10, 0), "test_batch_invariance[bf16-h32-tail-fprop-cutedsl]", "packed slot 0 loss: 2/4 bytes differ", False),
+        ((10, 0), "test_batch_invariance[bf16-h32-tail-fprop-cutedsl]", "packed slot 0 saved_dq_idx: 1/4 bytes differ", False),
+        ((10, 3), "test_batch_invariance[bf16-h32-tail-fprop-cutedsl]", "packed slot 0 loss: 1/4 bytes differ", False),
     ],
 )
 def test_known_byte_failure_scope(monkeypatch, capability, case, message, expected):
