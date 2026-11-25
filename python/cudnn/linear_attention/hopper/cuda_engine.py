@@ -80,9 +80,7 @@ HEAD_DIM = 128
 class KdaHopperCudaPlan(CompiledPlan):
     """Bind the node's ports and launch the fused kernel.
 
-    Destination-passing: ``o`` and ``final_state`` are written in place. The
-    kernel always produces a final state, so a graph that did not ask for one
-    gets a scratch buffer whose result is dropped.
+    Destination-passing: ``o`` and the requested ``final_state`` are written in place.
     """
 
     takes_variant_pack = True
@@ -103,15 +101,12 @@ class KdaHopperCudaPlan(CompiledPlan):
     def __init__(self, graph):
         (node,) = graph.nodes
         q, v, cu = (node.inputs[p] for p in ("q", "v", "cu_seqlens"))
-        self.total, self.h_qk, self.k = (int(d) for d in q.dim)
-        self.v_dim = int(v.dim[2])
+        self.total, self.h_qk = (int(d) for d in q.dim[:2])
         # cuDNN carries the gate, beta, state and output at HO = max(H_q, H_v).
         # The kernel's head grid is HO; q and k address themselves at h_qk.
         self.h = max(self.h_qk, int(v.dim[1]))
         self.n_seqs = int(cu.dim[0]) - 1
         self.ports = None
-        self._scratch_state = None
-        self._zero_state = None
         self._device = None
 
         # In-kernel input fusions, fixed per node: the kernel applies them to the
@@ -166,41 +161,10 @@ class KdaHopperCudaPlan(CompiledPlan):
         addr, _keepalive = marshal.resolve_inputs(self.names, views, "KdaHopperCudaEngine", stream, self._WANT_FWD)
         view_of = dict(zip(self.names, views))
 
+        final_state = 0
         staged_fs = caller_fs = None
         if "final_state" in addr:
             final_state, staged_fs, caller_fs = marshal.stage_output(view_of["final_state"], "float32", stream)
-        else:
-            if self._scratch_state is None:
-                self._scratch_state = torch.empty(
-                    self.n_seqs,
-                    self.h,
-                    self.v_dim,
-                    self.k,
-                    dtype=torch.float32,
-                    device=self._device,
-                )
-            final_state = int(self._scratch_state.data_ptr())
-
-        # A graph without initial_state means "seed from zero". The buffer is
-        # cached but re-zeroed ON THE EXECUTION STREAM every call: torch.zeros
-        # would order the fill on the ambient stream, which has no dependency on
-        # ctx.stream, and a cached "already zero" buffer is a lie under graph
-        # capture, where the allocation happens at capture time but the replay
-        # is what has to see zeros.
-        if "initial_state" in addr:
-            initial_state = addr["initial_state"]
-        else:
-            if self._zero_state is None:
-                self._zero_state = torch.empty(
-                    self.n_seqs,
-                    self.h,
-                    self.v_dim,
-                    self.k,
-                    dtype=torch.float32,
-                    device=self._device,
-                )
-            initial_state = int(self._zero_state.data_ptr())
-            buffers.memset_zero_async(initial_state, self._zero_state.nbytes, stream)
 
         cuda_host.launch(
             device=self._device.index if self._device.index is not None else 0,
@@ -211,7 +175,7 @@ class KdaHopperCudaPlan(CompiledPlan):
             g=addr["g"],
             beta=addr["beta"],
             cu_seqlens=addr["cu_seqlens"],
-            initial_state=initial_state,
+            initial_state=addr.get("initial_state", 0),
             o=addr["O"],
             final_state=final_state,
             total_tokens=self.total,
@@ -254,39 +218,17 @@ class KdaHopperCudaBwdPlan(CompiledPlan):
 
         (node,) = graph.nodes
         q, cu = (node.inputs[p] for p in ("q", "cu_seqlens"))
-        self.total, self.h, self.k = (int(d) for d in q.dim)
+        self.total, self.h = (int(d) for d in q.dim[:2])
         self.n_seqs = int(cu.dim[0]) - 1
         scale = node.params.get("scale", None)
         self.q_scale = cuda_host.DEFAULT_Q_SCALE if scale is None else float(scale)
         self.ports = None
-        self._zeros = {}
-        self._scratch_dis = None
         self._device = None
 
     def get_workspace_size(self) -> int:
         from . import cuda_bwd_host
 
         return cuda_bwd_host.workspace_bytes(self.total, self.h, self.n_seqs)
-
-    def _zero(self, key, shape, torch, stream):
-        """A zero buffer standing in for an absent optional input.
-
-        The ALLOCATION is cached; the fill is not. ``torch.zeros`` would order
-        the fill on the ambient stream, which has no dependency on the stream
-        the kernel runs on, so a caller executing through a handle bound to
-        another stream can read the allocation's previous contents. Caching the
-        fill is wrong for a second reason: under graph capture the allocation
-        happens once at capture time, while every replay is what actually has to
-        see zeros. Re-filling on the execution stream is correct in both cases
-        and costs one memset of a few hundred KB.
-        """
-        buf = self._zeros.get(key)
-        if buf is None:
-            buf = torch.empty(*shape, dtype=torch.float32, device=self._device)
-            self._zeros[key] = buf
-        ptr = int(buf.data_ptr())
-        buffers.memset_zero_async(ptr, buf.nbytes, stream)
-        return ptr
 
     def execute(self, graph, variant_pack, ctx) -> None:
         import torch
@@ -310,20 +252,10 @@ class KdaHopperCudaBwdPlan(CompiledPlan):
         addr, _keepalive = marshal.resolve_inputs(self.names, views, "KdaHopperCudaEngine", stream, self._WANT_BWD)
         view_of = dict(zip(self.names, views))
 
-        state_shape = (self.n_seqs, self.h, self.k, self.k)
-        # initial_state and d_final_state are optional; absent means "zero".
-        initial_state = addr.get("initial_state") or self._zero("s0", state_shape, torch, stream)
-        d_final_state = addr.get("d_final_state") or self._zero("dfs", state_shape, torch, stream)
-
-        # The kernel always writes d_initial_state; a graph that did not ask for
-        # it gets a scratch buffer whose result is dropped.
+        d_initial_state = 0
         staged_dis = caller_dis = None
         if "d_initial_state" in addr:
             d_initial_state, staged_dis, caller_dis = marshal.stage_output(view_of["d_initial_state"], "float32", stream)
-        else:
-            if self._scratch_dis is None:
-                self._scratch_dis = torch.empty(*state_shape, dtype=torch.float32, device=self._device)
-            d_initial_state = int(self._scratch_dis.data_ptr())
 
         cuda_bwd_host.launch(
             device=self._device.index if self._device.index is not None else 0,
@@ -336,8 +268,8 @@ class KdaHopperCudaBwdPlan(CompiledPlan):
             g=addr["g"],
             beta=addr["beta"],
             cu_seqlens=addr["cu_seqlens"],
-            initial_state=initial_state,
-            d_final_state=d_final_state,
+            initial_state=addr.get("initial_state", 0),
+            d_final_state=addr.get("d_final_state", 0),
             dq=addr["dQ"],
             dk=addr["dK"],
             dv=addr["dV"],

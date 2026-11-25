@@ -1163,6 +1163,26 @@ For a runtime without an existing golden environment, use the standard
 parent-record/strict-compare protocol. Never record the old paths from the
 candidate merely to remove a missing-golden failure.
 
+### Hopper CUDA KDA optional recurrent states
+
+On H200, BF16 KDA forward and backward matched bit for bit for all four
+combinations of supplying an initial state and requesting a final state. The
+control supplied the initial state explicitly (zeros for an absent seed) and
+requested the final state (with zero upstream gradient for an unused result).
+The pack had lengths 0, 65 and 63. The check covers the output, all five input
+gradients, and each requested state or state gradient.
+
+With both states omitted, two CUDA Graph replays with different query values
+also matched eager output and dQ bit for bit. On H200 with CUDA 13.4,
+cuDNN 9.26.0 and PyTorch 2.14.0a0, the following command passed all 24 tests.
+A separate comparison with `0e6176e1` produced identical output and gradient
+hashes for all four state combinations.
+
+```bash
+cd test/python
+python -m pytest linear_attention/hopper/test_kda_sm90_cuda.py
+```
+
 ### KDA compact batch-invariant workspace — B300, 2026-11-13–14
 
 The FROST KDA length rule preserves each document's pieces while reserving
