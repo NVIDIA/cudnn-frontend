@@ -118,15 +118,18 @@ def trigger_options(kind):
 
 def variant_options(kind, problem, variant):
     """Options of an input-signal ``variant``: "signal" (one flag per M tile), "trigger" (the signal and
-    ``trigger_options``), "entry" (the dGLU's entry trigger alone); a "compact" prefix adds ``compact_sfa_sf_warp``
-    ("compact" alone: on the stock dynamic scheduler)."""
+    ``trigger_options``), "entry" (the dGLU's entry trigger alone, on the stock dynamic scheduler: without use_pdl,
+    which helper_kernel would be the primary of); a "compact" prefix adds ``compact_sfa_sf_warp`` ("compact" alone: on
+    the stock dynamic scheduler)."""
     options = dict(use_dynamic_sched=True)
     if variant.startswith("compact"):
         options["compact_sfa_sf_warp"] = True
     if variant.endswith(("signal", "trigger")):
         options["streaming_signal_capacity"] = problem["rows"] // ROWS_ALIGNMENT
-    if variant.endswith(("trigger", "entry")):
+    if variant.endswith("trigger"):
         options.update(trigger_options(kind))
+    if variant.endswith("entry"):
+        options["launch_pdl_dependents_at_entry"] = True
     return options
 
 

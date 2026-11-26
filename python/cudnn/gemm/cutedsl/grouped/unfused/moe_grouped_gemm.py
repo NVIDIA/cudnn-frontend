@@ -222,6 +222,14 @@ class MoEGroupedGemmBf16Kernel:
             raise ValueError("streaming_output_notify requires use_dynamic_sched=True")
         if self.use_streaming_signal_sched or self.streaming_output_notify.enabled:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
+        launches_helper = weight_mode == MoEWeightMode.DISCRETE or (use_dynamic_sched and not self.use_streaming_signal_sched)
+        own_n_chunk_reset = self.streaming_output_notify.enabled and not self.streaming_output_notify.caller_reset
+        if use_pdl and launches_helper and not own_n_chunk_reset:
+            raise ValueError(
+                "use_pdl=True: the host launch puts helper_kernel (discrete B descriptors, dynamic claim counter reset) "
+                "right before this kernel, so the helper would be its programmatic primary, which it waits for only at exit. "
+                "Use use_pdl with streaming_signal_capacity, or with N_CHUNK and its own reset."
+            )
 
     # ------------------------------------------------------------------
     # _setup_attributes
