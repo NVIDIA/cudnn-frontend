@@ -47,8 +47,11 @@ halving the chain length keeps that error under an atol-bound tolerance for
 long reductions. When both chains of two work items fit in the 512-column TMEM
 (cta_tile_n <= 128), two accumulator stages double-buffer consecutive work
 items; epilogue slots release TMEM immediately after tcgen05.ld and register
-consumption, before SMEM staging and TMA stores, and the A/B SMEM ring scales
-up to 6 stages within the device's per-block shared-memory capacity.
+consumption, before SMEM staging and TMA stores. Producer and MMA warps release
+registers to the epilogue warps via setmaxnreg so 64-column x64 LDTM subtiles
+fit in registers, and each epilogue warp stages and TMA-stores its own M slice
+without intra-loop CTA barriers. The A/B SMEM ring scales up to 6 stages within
+the device's per-block shared-memory capacity.
 
 Coverage: test/python/conv/frost/test_frost_conv_wgrad.py (numerics against an
 independent FP64 contraction, every dtype/tile/CTA-group combination, geometry,
@@ -56,7 +59,7 @@ epilogues, release rendering) and test_frost_conv_wgrad_determinism.py (replay,
 CUDA-graph capture, no allocation and no host sync on the execute path).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, Callable, Type
 
@@ -68,6 +71,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.experimental import primitives as prims
 import cutlass.experimental.cuda as cuda
+from cudnn._cutlass_compat import setmaxregister_decrease, setmaxregister_increase
 from cudnn._cutlass_helpers import static_persistent_tile_scheduler as scheduler
 
 from cudnn.frost.device import build_target, device_context, shared_memory_per_block_optin
@@ -110,6 +114,8 @@ _TMEM_ALLOC_SYNC_THREADS = (_NUM_EPI_WARPS + 1) * _WARP_SIZE
 _TMEM_ALLOC_BAR_ID = 1
 _EPI_SYNC_BAR_ID = 2
 _MBAR_WAIT_TIMEOUT = 10_000_000
+_NON_EPI_REG_COUNT = 64
+_EPI_REG_COUNT = 232
 
 # Epilogue staging constants
 _STMATRIX_ROW_LANES = 16
@@ -119,6 +125,7 @@ _STMATRIX_ALIGN_BYTES = 32
 _SWIZZLE_32B_MASK = 128
 _SWIZZLE_32B_SHIFT = 3
 _LDTM_CONTIGUOUS_CHANNELS = 32
+_WIDE_SUBTILE_N = 64
 _STORE_SWIZZLED_ALIGN_BYTES = 64
 
 
@@ -243,6 +250,13 @@ def _select_acc_stages(cta_tile_n: int) -> int:
     return min(_MAX_ACC_STAGES, _TMEM_COLS // (_NUM_ACC_CHAINS * cta_tile_n))
 
 
+def _select_wgrad_epi_datapath(config: ConvTileConfig, output_dtype: Type[Numeric]) -> _EpiDatapath:
+    epi_datapath = _select_epi_datapath(config.cta_tile_m, config.use_2cta_instrs, output_dtype)
+    if epi_datapath.store_kind == "swizzled" and output_dtype.width <= 16 and config.cta_tile_n % (epi_datapath.warp_n_count * _WIDE_SUBTILE_N) == 0:
+        return replace(epi_datapath, subtile_n=_WIDE_SUBTILE_N, ldtm_repx=_WIDE_SUBTILE_N)
+    return epi_datapath
+
+
 def check_config(config: ConvTileConfig, output_dtype: Type[Numeric]) -> None:
     """The TMEM bands must contain complete output-store subtiles."""
     # The reducer loop issues cta_tile_k_bytes // 32 MMAs per stage, so only the
@@ -251,7 +265,7 @@ def check_config(config: ConvTileConfig, output_dtype: Type[Numeric]) -> None:
         raise ValueError("frost_conv_wgrad requires 64- or 128-byte reduction stages")
     # The epilogue walks the accumulator in (warp_n_count x subtile_n) N bands;
     # a partial band would need a masked TMEM read and a masked store.
-    epi_datapath = _select_epi_datapath(config.cta_tile_m, config.use_2cta_instrs, output_dtype)
+    epi_datapath = _select_wgrad_epi_datapath(config, output_dtype)
     n_band_width = epi_datapath.warp_n_count * epi_datapath.subtile_n
     if config.cta_tile_n % n_band_width:
         raise ValueError(f"frost_conv_wgrad: TILE_N must be divisible by {n_band_width} for this epilogue datapath")
@@ -358,7 +372,8 @@ def _kernel(
 
     # ======================== TMA producer warp =============================
     if warp_idx == _TMA_WARP_ID:
-        ab_stage_idx = 0  # index into the 3-deep operand ring
+        setmaxregister_decrease(_NON_EPI_REG_COUNT)
+        ab_stage_idx = 0  # index into the operand ring
         ab_empty_phase = 1  # parity of the empty-barrier phase being awaited; flips when the ring wraps
         z_divisor, p_divisor, q_divisor = zpq_divisors
         r_divisor, s_divisor = rs_divisors
@@ -432,6 +447,7 @@ def _kernel(
 
     # =========================== MMA warp ==================================
     elif warp_idx == _MMA_WARP_ID:
+        setmaxregister_decrease(_NON_EPI_REG_COUNT)
         # Waits for the TMEM token the allocator warp (epilogue warp 0) publishes.
         # Named barrier 1 is a 5-warp subset barrier (warps 0-4), never an
         # all-CTA one, so it uses the non-aligned form.
@@ -539,11 +555,14 @@ def _kernel(
 
     # ========================= Epilogue warps ==============================
     elif warp_idx < _NUM_EPI_WARPS:
+        setmaxregister_increase(_EPI_REG_COUNT)
         # This warp's position in the (M sub-band, N band) grid. The TMEM rows
-        # are selected by the warp's own TMEM sub-partition; the split decides
-        # which staging slot and which N band the result is written to.
+        # are selected by the warp's own TMEM sub-partition; each warp owns a
+        # disjoint warp_rows x subtile_n slice of smem_c and issues its own TMA
+        # store, so no CTA barrier is needed inside the subtile loop.
         warp_m_idx = warp_idx % epi_datapath.warp_m_count
         warp_n_idx = warp_idx // epi_datapath.warp_m_count
+        warp_rows = cta_tile_m // epi_datapath.warp_m_count
         vec_size = _TENSOR_ALIGN_BITS // c_dtype.width  # one 128-bit store per lane step
         # Thread -> staging placement for the 16-row fragment datapaths: thread
         # (warp w, low lane L = thread_idx % 16, half H = (thread_idx // 16) % 2) owns staging
@@ -616,11 +635,10 @@ def _kernel(
                         consume_then_arrive(acc_empty_mbar.subview(slot_idx), chain_regs[chain_idx], release_zero_mask)
                 # Elementwise epilogue on the FP32 accumulator before the cast.
                 epi_regs = epilogue_op(acc_regs)
-                if warp_m_idx == 0:
-                    # Ensure the previous bulk read from this staging slot has
-                    # completed before overwriting it.
-                    prims.cp_async_bulk_wait_group(_NUM_C_STAGES - 1, read=True)
-                prims.barrier_cta_sync(_EPI_SYNC_BAR_ID, thread_count=_EPI_THREADS)
+                # Ensure this warp's previous bulk read from this staging slot
+                # has completed before any lane of the warp overwrites it.
+                prims.cp_async_bulk_wait_group(_NUM_C_STAGES - 1, read=True)
+                cute.arch.sync_warp()
                 # This fragment's staging slot: two of them, swapped per subtile.
                 smem_c_stage = smem_c.subview(c_stage_idx * c_stage_elements)
                 if cutlass.const_expr(epi_datapath.use_stmatrix):
@@ -637,39 +655,36 @@ def _kernel(
                     words = cutlass.Array(packed.ir_value(), dtype=cutlass.Int32, shape=(_STMATRIX_WORDS,), addrspace=packed.space)[0:_STMATRIX_WORDS]
                     prims.stmatrix(ptr, [words[0], words[1], words[2], words[3]], prims.MMALayout.ROW, shape="m8n8")
                 else:
-                    # 32x32b: thread thread_idx holds 32 contiguous channels of one
-                    # staging row. Cast, then write in 128-bit swizzled chunks
+                    # 32x32b: thread thread_idx holds subtile_n contiguous channels
+                    # of one staging row. Cast, then write in 128-bit swizzled chunks
                     # with the same swizzle the host dW descriptor uses.
                     base_offset = smem_thread_offset if cutlass.const_expr(epi_datapath.use_fp8_simt) else thread_idx * epi_datapath.subtile_n
-                    for vec_idx in cutlass.range_constexpr(_LDTM_CONTIGUOUS_CHANNELS // vec_size):
+                    epilogue_lane_columns = _LDTM_CONTIGUOUS_CHANNELS if cutlass.const_expr(epi_datapath.use_fp8_simt) else epi_datapath.subtile_n
+                    for vec_idx in cutlass.range_constexpr(epilogue_lane_columns // vec_size):
                         smem_c_stage.subview(base_offset + vec_idx * vec_size).data_ptr().store_swizzled(
                             epi_regs[vec_idx * vec_size : vec_idx * vec_size + vec_size].to(c_dtype),
                             alignment=_STORE_SWIZZLED_ALIGN_BYTES,
                             swizzle=_c_smem_swizzle(c_dtype, epi_datapath.subtile_n),
                         )
-                # Make the generic-proxy stores visible to the async proxy (TMA).
+                # Make this warp's generic-proxy stores visible to its async proxy (TMA).
+                cute.arch.sync_warp()
                 cute.arch.fence_view_async_shared()
-                prims.barrier_cta_sync(_EPI_SYNC_BAR_ID, thread_count=_EPI_THREADS)
-                if warp_m_idx == 0:
-                    # One warp per N band commits that band: the staging fragment
-                    # holds cta_tile_m rows per band, and this CTA's copy of the
-                    # band is complete once all four epilogue warps have written.
-                    if prims.elect_sync():
-                        prims.cp_async_bulk_tensor_global_shared_cta(
-                            dw_map.get_ptr(),
-                            smem_c_stage.subview(warp_n_idx * cta_tile_m * epi_datapath.subtile_n),
-                            (
-                                c_tile_idx * cta_tile_n + warp_n_idx * (cta_tile_n // epi_datapath.warp_n_count) + subtile_idx * epi_datapath.subtile_n,
-                                s_idx,
-                                r_idx,
-                                t_idx,
-                                k_tile_idx * cta_tile_m,
-                            ),
-                        )
-                    # Leave the just-issued store in flight; the wait at the
-                    # top of the next staging write guarantees the previous
-                    # fragment's SMEM reads are done before reuse.
-                    prims.cp_async_bulk_commit_group()
+                if prims.elect_sync():
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        dw_map.get_ptr(),
+                        smem_c_stage.subview(warp_idx * warp_rows * epi_datapath.subtile_n),
+                        (
+                            c_tile_idx * cta_tile_n + warp_n_idx * (cta_tile_n // epi_datapath.warp_n_count) + subtile_idx * epi_datapath.subtile_n,
+                            s_idx,
+                            r_idx,
+                            t_idx,
+                            k_tile_idx * cta_tile_m + warp_m_idx * warp_rows,
+                        ),
+                    )
+                # Leave the just-issued store in flight; the wait at the top of
+                # the next staging write guarantees the previous fragment's SMEM
+                # reads are done before reuse.
+                prims.cp_async_bulk_commit_group()
                 c_stage_idx ^= 1  # swap staging fragments for the next subtile
             acc_stage_idx += 1
             if acc_stage_idx == num_acc_stages:
@@ -677,9 +692,8 @@ def _kernel(
                 acc_full_phase ^= 1
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
-        if warp_m_idx == 0:
-            # Drain the last bulk read before this CTA's SMEM is released.
-            prims.cp_async_bulk_wait_group(0, read=True)
+        # Drain the last bulk read before this CTA's SMEM is released.
+        prims.cp_async_bulk_wait_group(0, read=True)
         prims.barrier_cta_sync(_EPI_SYNC_BAR_ID, thread_count=_EPI_THREADS)
         if warp_idx == _ALLOCATOR_WARP_ID:
             # Every allocation must be released, and a CTA that relinquishes the
@@ -731,7 +745,7 @@ class _WgradKernel:
         # One descriptor for the epilogue datapath: staging width, LDTM form,
         # store kind and the epilogue warp split. The device SMEM sizing and the
         # host dW descriptor both read it, so they cannot drift.
-        self.epi_datapath = _select_epi_datapath(config.cta_tile_m, config.use_2cta_instrs, c_dtype)
+        self.epi_datapath = _select_wgrad_epi_datapath(config, c_dtype)
         self.ab_stages = _select_ab_stages(
             self.a_layout,
             self.b_layout,
@@ -788,12 +802,13 @@ class _WgradKernel:
             traversal_strides=(1, stride[2], stride[1], stride[0], 1),
             swizzle=b_layout.swizzle,
         )
-        # C: one box is (cta_tile_m k rows x subtile_n c channels) at a single
-        # filter position; stride_order makes the channel axis innermost. The
-        # swizzle comes from the same helper the device store uses.
+        # C: one box per epilogue warp is (cta_tile_m // warp_m_count k rows x
+        # subtile_n c channels) at a single filter position; stride_order makes
+        # the channel axis innermost. The swizzle comes from the same helper the
+        # device store uses.
         dw_map = cuda.create_tensor_map_tiled_from_view(
             dw,
-            box_dims=(config.cta_tile_m, 1, 1, 1, epi_datapath.subtile_n),
+            box_dims=(config.cta_tile_m // epi_datapath.warp_m_count, 1, 1, 1, epi_datapath.subtile_n),
             stride_order=(4, 3, 2, 1, 0),
             swizzle=_to_tensor_map_swizzle(_c_smem_swizzle(self.c_dtype, epi_datapath.subtile_n)),
         )
@@ -837,6 +852,7 @@ class _WgradKernel:
             cluster=(config.cta_group, 1, 1),
             stream=stream,
             smem_merge_branch_allocs=True,
+            min_blocks_per_mp=1,
         )
 
 
@@ -859,7 +875,7 @@ def compile(
         ab_dtype.width,
         minimum_tma_box_bytes=_MAX_SWIZZLE_BYTES,
     )
-    epi_datapath = _select_epi_datapath(config.cta_tile_m, config.use_2cta_instrs, c_dtype)
+    epi_datapath = _select_wgrad_epi_datapath(config, c_dtype)
     ab_stages = _select_ab_stages(a_layout, b_layout, epi_datapath, c_dtype, smem_capacity_bytes, stages)
     return _compile_cached(device, target, ab_dtype, c_dtype, config, epilogue, epilogue_attrs, smem_capacity_bytes, ab_stages)
 

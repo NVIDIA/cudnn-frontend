@@ -361,8 +361,14 @@ def test_frost_wgrad_release_rendering(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     renders = list(Path(tmp_path).glob("*.ptx"))
     assert len(renders) == 1
-    # Two accumulation slots, so one release site per slot, each folding its own fragment.
-    assert_release_dependence(renders[0].read_text(), sites=2, words=32)
+    ptx = renders[0].read_text()
+    # Two accumulation slots, so one release site per slot, each folding its 64-word fragment.
+    assert_release_dependence(ptx, sites=2, words=64)
+    assert "setmaxnreg.dec.sync.aligned.u32" in ptx
+    assert "setmaxnreg.inc.sync.aligned.u32" in ptx
+    assert "tcgen05.ld.sync.aligned.32x32b.x64.b32" in ptx
+    # Epilogue barrier 2 is used only once (at kernel exit before TMEM dealloc), never inside the subtile loop.
+    assert ptx.count("barrier.sync \t2, 128;") == 1
 
 
 def test_frost_wgrad_slot_and_ranking(monkeypatch):
@@ -536,12 +542,15 @@ def test_frost_wgrad_operand_descriptor_swizzles():
             assert layout.stage_bytes >= channels * 128
             assert layout.stride_bytes == (512 if bits == 32 else 8 * layout.tma_box_bytes)
 
-    from cudnn.conv.frost.templates.sm100_conv_wgrad import _WgradKernel, _select_acc_stages
+    from cudnn.conv.frost.templates.sm100_conv_wgrad import _WgradKernel, _select_acc_stages, _select_wgrad_epi_datapath
     from cudnn.conv.frost.tile_config import ConvTileConfig
     import cutlass
 
     for n in range(32, 257, 32):
         assert _select_acc_stages(n) == (2 if n <= 128 else 1)
+    assert _select_wgrad_epi_datapath(ConvTileConfig(128, 256, 128, 2), cutlass.BFloat16).subtile_n == 64
+    assert _select_wgrad_epi_datapath(ConvTileConfig(128, 256, 128, 2), cutlass.Float32).subtile_n == 32
+    assert _select_wgrad_epi_datapath(ConvTileConfig(128, 96, 128, 1), cutlass.BFloat16).subtile_n == 32
     smem_cap = 227 * 1024
     assert _WgradKernel(ConvTileConfig(128, 128, 128, 1), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 6
     assert _WgradKernel(ConvTileConfig(128, 256, 128, 2), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 6
