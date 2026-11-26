@@ -1309,20 +1309,3 @@ forward/backward calls on SM90 and SM100. This case has no bias. General batch
 invariance, dBias determinism, FP16 byte determinism, concurrency, golden hashes,
 and other GPUs (including SM103) remain unverified.
 This does not establish determinism for frontend kernel plans.
-
-## FROST convolution weight gradients
-
-`frost_conv_wgrad` always completes each output tile's reduction within one MMA
-CTA group, without split-K or atomic output accumulation: the reduction is
-accumulated as two fixed chains in that CTA group's tensor memory and folded
-once in FP32, so replay is byte-identical. Each spatial axis must
-satisfy `(filter_extent - 1) * dilation <= 31`. Replay status refers
-to fixed inputs, shapes, geometry, epilogue, and public knobs. dW sums over batch;
-reordering or splitting batch changes addition order and is not guaranteed to
-preserve its bytes. This engine implements weight gradients only; forward uses
-the separate `frost_conv` engine, and dgrad/higher derivatives are unsupported.
-
-The current SM100 evidence covers all five input and output types, single and
-paired CTAs, fresh allocations, concurrent work, and capture/replay. SM103 and
-other compiler/dependency lanes remain unverified. See the [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#frost-convolution-weight-gradient)
-for measured configurations and coverage gaps.
