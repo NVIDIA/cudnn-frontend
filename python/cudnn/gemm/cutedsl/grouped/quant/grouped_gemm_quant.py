@@ -40,6 +40,7 @@ from ..moe_utils import (
     compute_expert_token_range,
     MoEWeightMode,
     TensormapWorkspace,
+    reject_pdl_behind_helper,
     store_tma_desc,
 )
 from ..moe_sched_extension import (
@@ -59,6 +60,8 @@ from ..moe_kernel_helpers import (
     check_dynamic_sched_cluster_shape,
 )
 from ..moe_streaming_output_chunk_tile_scheduler import StreamingOutputNotifyConfig
+
+QUANT_PDL_USE_INSTEAD = "N_CHUNK and its own reset, or a scheduler_counter that the caller resets"
 
 
 class BlockScaledMoEGroupedGemmQuantKernel:
@@ -84,7 +87,9 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         dense weights, BF16 D with no SFD or amax, and cluster (2, 1) with the 2-CTA MMA or (1, 1) with the 1-CTA MMA.
     :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
         for that grid before it exits. With ``N_CHUNK`` and its own reset (not ``caller_reset``), that grid is the
-        reset, and every thread waits for it at entry instead, before any signal[] update or dependent launch.
+        reset, and every thread waits for it at entry instead, before any signal[] update or dependent launch. Rejected
+        whenever the helper kernel would be that grid (discrete weights, or the dynamic scheduler with no
+        ``scheduler_counter``) other than with that own reset.
     :param launch_pdl_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
     """
 
@@ -234,6 +239,13 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             if generate_sfd or weight_mode != MoEWeightMode.DENSE or use_single_group_runtime_offsets:
                 raise ValueError("streaming_output_notify requires BF16 D without SFD, dense weights and padded_offsets in global memory")
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
+        # Discrete weights and N_CHUNK with caller_reset always launch the helper; the dynamic counter reset otherwise also
+        # needs no scheduler_counter (__call__).  With its own N_CHUNK reset, the reset is the primary, waited for at entry.
+        reject_pdl_behind_helper(
+            use_pdl,
+            weight_mode == MoEWeightMode.DISCRETE or (self.streaming_output_notify.enabled and self.streaming_output_notify.caller_reset),
+            QUANT_PDL_USE_INSTEAD,
+        )
 
     # ------------------------------------------------------------------
     # _setup_attributes
@@ -799,6 +811,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
 
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
         _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and scheduler_counter is None))
+        _own_n_chunk_reset = self.streaming_output_notify.enabled and not self.streaming_output_notify.caller_reset
+        reject_pdl_behind_helper(self.use_pdl, _need_helper and not _own_n_chunk_reset, QUANT_PDL_USE_INSTEAD)
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (

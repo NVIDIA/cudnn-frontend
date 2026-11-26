@@ -337,6 +337,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
             ),
             use_pdl=use_pdl,
             launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
+            launches_helper=weight_mode == MoEWeightMode.DISCRETE or (use_dynamic_sched and streaming_signal_capacity is None),
         )
         check_compact_sfa_options(compact_sfa_sf_warp, sf_vec_size, use_2cta_instrs, cluster_shape_mn)
         self.compact_sfa_sf_warp = compact_sfa_sf_warp
