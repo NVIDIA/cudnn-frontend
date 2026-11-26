@@ -15,7 +15,7 @@ import torch
 
 from gemm.cutedsl._streaming_signal import BIG_EXPERT, MANY_EXPERTS_64, ROWS_ALIGNMENT, SMALL_EXPERTS_64, compile_once, kernel_args, launch_args
 from gemm.cutedsl._streaming_signal import make_kernel as build_kernel
-from gemm.cutedsl._streaming_signal import make_problem, new_buffers, signal_ready
+from gemm.cutedsl._streaming_signal import make_problem, new_buffers, signal_ready, spin_before_pdl_launch
 
 EXPERTS = 4
 HIDDEN = 512
@@ -75,6 +75,7 @@ def run(kernel, problem, glu, prepare_workspace=None, max_active_clusters=None, 
     cu_stream = cuda.CUstream(stream.cuda_stream)
 
     def launch():
+        spin_before_pdl_launch(kernel, stream)
         compiled(*runtime_args, cu_stream)
 
     if defer_launch:
