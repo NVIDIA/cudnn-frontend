@@ -8,6 +8,8 @@ A producer kernel, such as an expert-parallel dispatch, fills A while the GEMM r
 
 ``signal[]``: int32, one entry per cluster M tile of A.
 - Entry ``t`` covers A rows ``[t * cluster tile M, (t + 1) * cluster tile M)``; experts are padded to whole M tiles.
+- The rows per entry (slot rows) are ``min(cluster tile M, rows_alignment)``, from the kernel's expert row alignment.
+  Here ``rows_alignment`` must be a multiple of the cluster tile M (no tail tile), so a slot is always one M tile.
 - ``t`` is in ``[0, padded_offsets[E - 1] / cluster tile M)``, at most ``streaming_signal_capacity``.
 - Reset to -1 before launch (never 0: any value >= 0 reads as ready).
 - The producer stores ``signal[t] = t`` with a gpu-scope release once M tile ``t`` is in memory.
@@ -215,6 +217,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         sched_storage,
         cluster_pipeline,
         streaming_signal_capacity: int,
+        rows_alignment: int,
         device_layout: bool,
         release_zero: ReleaseZero,
     ):
@@ -229,6 +232,15 @@ class MoEStreamingInputBlockSignalTileScheduler:
         self.device_layout = device_layout
         # The kernel's release-zero (consume-then-arrive slot release), wrapped once at kernel entry; never serialized.
         self.release_zero = release_zero
+        # Rows per signal[] slot, derived from the expert row alignment and the tile (never serialized).  Experts are
+        # padded to whole M tiles here (there is no tail tile under the cluster tile M), so a slot is one M tile.
+        assert isinstance(rows_alignment, int), f"rows_alignment must be a build-time int, not {rows_alignment}"
+        self.rows_alignment = rows_alignment
+        self.slot_rows = min(params.cluster_tile_m, rows_alignment)
+        assert rows_alignment >= params.cluster_tile_m and rows_alignment % params.cluster_tile_m == 0, (
+            f"rows_alignment {rows_alignment} must be a multiple of the cluster tile M {params.cluster_tile_m}: "
+            "the signal scheduler runs one slot per M tile"
+        )
         check_linear_tile_idx_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity)
         # mapa.shared::cluster at one CTA is an illegal peer store.  check_dynamic_sched_cluster_shape admits (1, 1)
         # with the 1-CTA MMA, so this assert is what rejects it for the signal scheduler.
@@ -261,6 +273,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
             sched_storage=self._sched_storage,
             cluster_pipeline=self.cluster_pipeline,
             streaming_signal_capacity=self.streaming_signal_capacity,
+            rows_alignment=self.rows_alignment,
             device_layout=const_expr(self.device_layout),
             release_zero=self.release_zero,
         )
@@ -273,10 +286,13 @@ class MoEStreamingInputBlockSignalTileScheduler:
         sched_storage,
         *,
         streaming_signal_capacity: int,
+        rows_alignment: int,
         release_zero: ReleaseZero,
         device_layout: bool = False,
     ) -> "MoEStreamingInputBlockSignalTileScheduler":
         """Create the scheduler from the claim counter ``counter_ptr``; ``signal[]`` and the scheduler state follow it.
+        ``rows_alignment``: the kernel's expert row alignment (every ``padded_offsets`` entry is a multiple of it); the
+        scheduler derives the rows per signal slot from it and the cluster tile M.
         ``device_layout``: wait for the dispatch-written layout before the first claim (see the module docstring).
         ``release_zero``: ``release_zero(<the kernel's release-zero argument>)``, which orders each slot release after the
         read of the slot (consume-then-arrive slot release)."""
@@ -306,6 +322,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
             sched_storage=sched_storage,
             cluster_pipeline=None,
             streaming_signal_capacity=streaming_signal_capacity,
+            rows_alignment=rows_alignment,
             device_layout=device_layout,
             release_zero=release_zero,
         )
@@ -382,8 +399,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
     @cute.jit
     def _expert_end_m_tile(self, expert: Int32) -> Int32:
         """One past the last M tile of ``expert``: the offsets are padded to whole M tiles and each one is where its
-        expert ENDS, so an expert starts where the one before it ends."""
-        return self.expert_freq_offsets[expert] // const_expr(self.params.cluster_tile_m)
+        expert ENDS, so an expert starts where the one before it ends.  A slot is one M tile (see ``__init__``)."""
+        return self.expert_freq_offsets[expert] // const_expr(self.slot_rows)
 
     @cute.jit
     def _expert_first_m_tile(self, expert: Int32) -> Int32:
