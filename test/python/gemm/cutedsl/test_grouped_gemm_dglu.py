@@ -2965,8 +2965,9 @@ def _skip_unless_sm100():
 @torch_fork_set_rng(seed=41)
 @pytest.mark.parametrize("dynamic_mnkl", ["1", "0"], ids=["dynamic_mnkl", "static_mnkl"])
 def test_grouped_gemm_dglu_wrapper_generate_h(request, monkeypatch, dynamic_mnkl):
-    """generate_h=True returns the default results unchanged plus h_tensor and sfh_col_tensor (checked against the
-    reference), from one plan keyed as the default plan plus "h" that a call with other data reuses."""
+    """generate_h=True with the deterministic dprob returns the default results unchanged (dprob to FP32 rounding) plus
+    h_tensor and sfh_col_tensor (checked against the reference), from one plan keyed as the default plan plus "h" that a
+    call with other data reuses."""
     _skip_unless_sm100()
     from cudnn.gemm.cutedsl.grouped.dglu import api as dglu_api
 
@@ -2977,8 +2978,8 @@ def test_grouped_gemm_dglu_wrapper_generate_h(request, monkeypatch, dynamic_mnkl
     plans = None
     for _ in range(2):
         inputs, cfg = case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
-        default = _run_dglu_case(case)
-        outputs = _run_dglu_case(case, generate_h=True)
+        default = _run_dglu_case(case, deterministic=True)
+        outputs = _run_dglu_case(case, deterministic=True, generate_h=True)
         torch.cuda.synchronize()
         assert list(outputs.keys()) == list(default.keys()) + ["h_tensor", "sfh_col_tensor"]
         (default_key,) = [key for key in cache if key[-1] != "h"]
@@ -2988,6 +2989,9 @@ def test_grouped_gemm_dglu_wrapper_generate_h(request, monkeypatch, dynamic_mnkl
         assert all(cache[key] is plan for key, plan in plans.items()), "the second call reuses both plans"
         for name in ("d_row_tensor", "d_col_tensor", "sfd_row_tensor", "sfd_col_tensor"):
             assert torch.equal(bitwise_bits(outputs[name]), bitwise_bits(default[name])), f"{name} changes with h"
+        # dprob sums products of large terms, so FP32 rounding is relative to the largest of them.
+        dprob_atol = 2.0**-20 * default["dprob_tensor"].abs().max().item()
+        torch.testing.assert_close(outputs["dprob_tensor"], default["dprob_tensor"], rtol=2.0**-20, atol=dprob_atol)
         check_ref_grouped_gemm_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
 
 
