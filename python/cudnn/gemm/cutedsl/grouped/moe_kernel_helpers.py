@@ -10,7 +10,7 @@ This module contains:
 - CPU-side reference and validation utilities
 - Kernel configuration and validation functions
 - Kernel helper functions that don't depend on kernel instance state
-- Streaming signal schedulers: cluster fences, mbarrier ops, the signal workspace byte map and its reset
+- Streaming signal schedulers: the signal pointer, the signal workspace byte map and its reset
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from cudnn._cutlass_helpers.warp_reduce import target_needs_shuffle_amax, warp_a
 from cudnn._cutlass_compat import LayoutEnum
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import Boolean, T, dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
@@ -1347,7 +1347,7 @@ def epilog_gmem_copy_and_partition(
 
 
 # ---------------------------------------------------------------------------
-# Streaming signal schedulers: device-side cluster fences and mbarrier ops, host-side workspace byte map and reset
+# Streaming signal schedulers: device-side signal pointer, host-side workspace byte map and reset
 # ---------------------------------------------------------------------------
 
 #: Bytes from the claim counter to ``signal[]``.  ``streaming_signal_workspace_offsets`` is the host's
@@ -1364,36 +1364,6 @@ def streaming_signal_ptr(counter_ptr, *, loc=None, ip=None):
         counter_ptr.toint() + STREAMING_SIGNAL_OFFSET,
         AddressSpace.gmem,
         assumed_align=4,
-    )
-
-
-@dsl_user_op
-def mbarrier_arrive_expect_tx_on_peer_relaxed_cluster(mbar_ptr, tx_count: Int32, cta_rank_in_cluster: cutlass.Constexpr, *, loc=None, ip=None) -> None:
-    """Arrive + expect_tx on a peer CTA's mbarrier, ``.relaxed.cluster`` (the default would be ``.release.cta``)."""
-    cute.arch.mbarrier_arrive_and_expect_tx(
-        mbar_ptr, tx_count, peer_cta_rank_in_cluster=cta_rank_in_cluster, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER, loc=loc, ip=ip
-    )
-
-
-@dsl_user_op
-def fence_release_cluster(*, loc=None, ip=None) -> None:
-    """``fence.release.cluster``: orders this CTA's earlier stores before a peer observes the next arrive."""
-    llvm.fence(llvm.AtomicOrdering.release, syncscope="cluster", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def mbarrier_try_wait_parity_acquire_cluster(mbar_ptr, phase: Int32, *, loc=None, ip=None) -> Boolean:
-    """``mbarrier.try_wait.parity.acquire.cluster``: the default ``.acquire.cta`` does not synchronize with a peer's arrive."""
-    return Boolean(
-        nvvm.mbarrier_wait_parity(
-            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
-            Int32(phase).ir_value(loc=loc, ip=ip),
-            nvvm.MBarrierWaitKind.TRY,
-            scope=nvvm.MemScopeKind.CLUSTER,
-            order=nvvm.MemOrderKind.ACQUIRE,
-            loc=loc,
-            ip=ip,
-        )
     )
 
 
