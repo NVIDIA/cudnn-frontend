@@ -169,6 +169,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel(StreamingInputSignalMixin):
             unmet_requirement=None if weight_mode == MoEWeightMode.DENSE else "dense weights",
             use_pdl=use_pdl,
             launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
+            launches_helper=weight_mode == MoEWeightMode.DISCRETE or (use_dynamic_sched and streaming_signal_capacity is None),
         )
 
         self.glu_layout = validate_glu_layout(glu_layout)
