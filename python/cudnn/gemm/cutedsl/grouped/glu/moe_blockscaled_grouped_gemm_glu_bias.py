@@ -42,6 +42,7 @@ from ..moe_utils import (
     compute_expert_token_range,
     MoEWeightMode,
     TensormapWorkspace,
+    reject_pdl_behind_helper,
     store_tma_desc,
     tensormap_ptr_for_copy,
 )
@@ -381,6 +382,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
             device_layout=device_layout,
             use_pdl=use_pdl,
             launch_pdl_dependents_at_all_streaming_signal_slots_ready=launch_pdl_dependents_at_all_streaming_signal_slots_ready,
+            # Discrete weights always launch the helper; the dynamic counter reset also needs no scheduler_counter (__call__).
+            launches_helper=weight_mode == MoEWeightMode.DISCRETE,
         )
         check_compact_sfa_options(compact_sfa_sf_warp, sf_vec_size, use_2cta_instrs, cluster_shape_mn)
         self.compact_sfa_sf_warp = compact_sfa_sf_warp
@@ -1082,6 +1085,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         _need_helper = cutlass.const_expr(
             self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and not self.use_streaming_signal_sched and scheduler_counter is None)
         )
+        reject_pdl_behind_helper(self.use_pdl, _need_helper, "streaming_signal_capacity, or a scheduler_counter that the caller resets")
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (

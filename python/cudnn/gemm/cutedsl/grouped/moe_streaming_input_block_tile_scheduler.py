@@ -74,7 +74,7 @@ from .moe_kernel_helpers import (
     fence_release_cluster,
     mbarrier_try_wait_parity_acquire_cluster,
 )
-from .moe_utils import ceil_div
+from .moe_utils import ceil_div, reject_pdl_behind_helper
 from cudnn.frost.tile_dsl.consume import ReleaseZero, consume_then_arrive_on_peer
 from .moe_persistent_scheduler import (
     atomic_add_i32,
@@ -704,8 +704,8 @@ class StreamingInputSignalMixin:
         """Check and keep the options.  ``unmet_requirement``: what this kernel configuration lacks for a producer (for
         example "dense weights"), or None.  ``cluster_barrier_at_exit``: the kernel has no 2-CTA MMA and every CTA passes
         a cluster barrier before it exits (the SM90 kernels), so a peer's last arrive always lands; a producer then needs
-        cluster (2, 1).  ``launches_helper``: the host launch puts the kernel's helper_kernel (the claim counter reset)
-        right before it; ``use_pdl`` is then rejected, since the kernel waits for its programmatic primary only at exit."""
+        cluster (2, 1).  ``launches_helper``: the host launch puts the kernel's helper_kernel right before it
+        (``reject_pdl_behind_helper``)."""
         self.streaming_signal_capacity = streaming_signal_capacity
         self.use_streaming_signal_sched = streaming_signal_capacity is not None
         if self.use_streaming_signal_sched and not use_dynamic_sched:
@@ -714,12 +714,7 @@ class StreamingInputSignalMixin:
             raise ValueError(f"streaming_signal_capacity requires {unmet_requirement}")
         if device_layout and not self.use_streaming_signal_sched:
             raise ValueError("device_layout requires streaming_signal_capacity")
-        if use_pdl and launches_helper:
-            raise ValueError(
-                "use_pdl=True: the host launch puts helper_kernel (dynamic claim counter reset) right before this kernel, so "
-                "the helper would be its programmatic primary, which it waits for only at exit. Use use_pdl with "
-                "streaming_signal_capacity."
-            )
+        reject_pdl_behind_helper(use_pdl, launches_helper, "streaming_signal_capacity (dense weights)")
         if launch_pdl_dependents_at_all_streaming_signal_slots_ready and not self.use_streaming_signal_sched:
             raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
         if self.use_streaming_signal_sched and cluster_barrier_at_exit:
