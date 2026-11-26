@@ -64,19 +64,28 @@ def _non_tile_wide_products(ptx, max_tile_id):
     Tile offsets originate at ctaid.x and may be copied or scaled in Int32
     while their full range fits. Adding a batch/head/row offset invalidates
     this proof: a subsequent widening multiply cannot undo an earlier wrap.
-    Unknown instructions also invalidate the destination's proof.
+    Tensor-copy coordinates are reads. Unknown writes invalidate the proof;
+    only single-definition registers qualify, including across branches/loops.
     """
+    definitions = {}
+    for destination in re.findall(r"(?:^|[;\n{}])\s*(?:@!?%\w+\s+)?[a-z]\w*(?:\.[\w:]+)+\s+(\{[^}]+\}|%\w+(?:\|%\w+)?)\s*,", ptx):
+        for register in re.findall(r"%r\w+", destination):
+            definitions[register] = definitions.get(register, 0) + 1
     tile_max = {"%ctaid.x": max_tile_id}
     products = []
     for instruction in ptx.split(";"):
         if "mul.wide.s32" in instruction:
             products.append(instruction.strip())
-        match = re.search(r"(?:^|[\n{}])\s*(@!?%\w+\s+)?([a-z]\w*(?:\.[\w:]+)+)\s+([^;{}]+)$", instruction)
+        match = re.search(r"(?:^|[\n{}])\s*(@!?%\w+\s+)?([a-z]\w*(?:\.[\w:]+)+)\s+([^;]+)$", instruction)
         if match is None:
             for register in re.findall(r"%r\w+", instruction):
                 tile_max.pop(register, None)
             continue
         predicate, op, operands = match.groups()
+        if operands.lstrip().startswith("{"):
+            for register in re.findall(r"%r\w+", operands.split("}", 1)[0]):
+                tile_max.pop(register, None)
+            continue
         dst, *args = [arg.strip() for arg in operands.split(",")]
         bound = None
         if op == "mul.wide.s32":
@@ -96,8 +105,9 @@ def _non_tile_wide_products(ptx, max_tile_id):
                 if arg in tile_max and re.fullmatch(r"\d+", args[1 - index]):
                     bound = tile_max[arg] * int(args[1 - index])
                     break
-        tile_max.pop(dst, None)
-        if predicate is None and bound is not None and bound <= 2**31 - 1:
+        for register in re.findall(r"%r\w+", dst):
+            tile_max.pop(register, None)
+        if predicate is None and definitions.get(dst) == 1 and bound is not None and bound <= 2**31 - 1:
             tile_max[dst] = bound
     return products
 
@@ -112,8 +122,20 @@ def _non_tile_wide_products(ptx, max_tile_id):
         ("shl.b32 %r2, %r1, 6;\nadd.s32 %r2, %r2, %r_batch;", 1),
         ("@%p1 mov.u32 %r2, %r1;", 1),
         ("shl.b32 %r2, %r1, 6;\nmov.b64 {%r2, %r3}, %rd_batch;", 1),
+        ("shl.b32 %r2, %r1, 6;\ncp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%r_smem], [%rd_map, {%r2}], [%r_barrier];", 0),
+        ("shl.b32 %r2, %r1, 6;\nmul.wide.s32 %rd2, %r2, 16384;\nadd.s32 %r2, %r2, %r_batch;", 2),
     ],
-    ids=["tile_shift", "tile_multiply", "wrapped_tile", "mixed_offset", "redefined_offset", "predicated_definition", "vector_definition"],
+    ids=[
+        "tile_shift",
+        "tile_multiply",
+        "wrapped_tile",
+        "mixed_offset",
+        "redefined_offset",
+        "predicated_definition",
+        "vector_definition",
+        "tensor_copy_read",
+        "later_redefinition",
+    ],
 )
 def test_wide_product_filter_requires_bounded_tile_offset(offset, count):
     ptx = "mov.u32 %r1, %ctaid.x;\n" + offset + "\nmul.wide.s32 %rd1, %r2, 16384;"
