@@ -14,7 +14,7 @@ This module contains:
 
 from __future__ import annotations
 
-from typing import Type, Tuple, Union
+from typing import Optional, Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -917,16 +917,19 @@ def compute_stages(
     generate_sfd: bool,
     num_epilog_warps: int = 4,
     bias_dtype=None,
+    num_c_stage: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int, int]:
     """Compute the number of pipeline stages for A/B/D operands based on heuristics.
 
     :param num_epilog_warps: Number of epilogue warps (default 4, may differ for DGLU).
     :param bias_dtype: Bias element type (e.g. cutlass.BFloat16) when bias enabled, None otherwise.
+    :param num_c_stage: C stages (None: 2 with ``generate_sfd``, else 1); the smem freed goes to A/B stages.
     :return: (num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage)
     """
     num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
 
-    num_c_stage = 2 if generate_sfd else 1
+    if num_c_stage is None:
+        num_c_stage = 2 if generate_sfd else 1
     num_d_stage = 2 if generate_sfd else 1
 
     num_tile_stage = 2
