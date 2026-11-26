@@ -83,8 +83,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         buffer that the caller sets to -1 before the producer starts (``layout[0]`` is read too).
     :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
         for that grid before it exits.
-    :param launch_pdl_dependents_at_all_streaming_signal_slots_ready: With ``streaming_signal_capacity``: one extra warp per CTA lets this kernel's
-        programmatic dependent launch once it has seen every ``signal[]`` entry (M tile) ready.
+    :param launch_pdl_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -144,7 +143,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         streaming_signal_capacity: Optional[int] = None,
         device_layout: bool = False,
         use_pdl: bool = False,
-        launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -189,10 +188,6 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         if enable_bias:
             all_warps.append(self.bias_load_warp_id)
             warps_wo_sched.append(self.bias_load_warp_id)
-        # launch_pdl_dependents_at_all_streaming_signal_slots_ready: one more warp, which only waits for every signal[] entry and then triggers.
-        self.trigger_warp_id = len(all_warps) if launch_pdl_dependents_at_all_streaming_signal_slots_ready else None
-        if launch_pdl_dependents_at_all_streaming_signal_slots_ready:
-            all_warps.append(self.trigger_warp_id)
         self.threads_per_cta = self.threads_per_warp * len(all_warps)
         self.threads_wo_sched = self.threads_per_warp * len(warps_wo_sched)
 
@@ -229,8 +224,6 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             raise ValueError("streaming_signal_capacity requires use_dynamic_sched=True")
         if device_layout and not self.use_streaming_signal_sched:
             raise ValueError("device_layout requires streaming_signal_capacity")
-        if launch_pdl_dependents_at_all_streaming_signal_slots_ready and not self.use_streaming_signal_sched:
-            raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
         if self.use_streaming_signal_sched:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
         self.device_layout = device_layout
@@ -241,7 +234,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
                 "Use use_pdl with streaming_signal_capacity."
             )
         self.use_pdl = use_pdl
-        self.launch_pdl_dependents_at_all_streaming_signal_slots_ready = launch_pdl_dependents_at_all_streaming_signal_slots_ready
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1024,6 +1017,8 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        if cutlass.const_expr(self.launch_pdl_dependents_at_entry):
+            cute.arch.griddepcontrol_launch_dependents()
 
         #
         # Prefetch tma desc
@@ -1200,11 +1195,6 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         # device_layout: total_token may predate the producer's layout write, so no CTA exits early here.
         if not self.device_layout and total_token <= 0:
             cute.arch.nvvm.exit()
-
-        if cutlass.const_expr(self.launch_pdl_dependents_at_all_streaming_signal_slots_ready):
-            if warp_idx == self.trigger_warp_id:
-                scheduler.wait_all_streaming_signal_slots_ready()
-                cute.arch.griddepcontrol_launch_dependents()
 
         #
         # Specialized Schedule warp (MoE Persistent Tile Scheduler)

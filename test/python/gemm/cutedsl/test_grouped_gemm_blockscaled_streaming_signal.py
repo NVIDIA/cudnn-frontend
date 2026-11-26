@@ -169,7 +169,7 @@ def test_with_no_rows_exits(kind, variant):
 # ---- The input signal (FC1 GLU, dGLU) ----
 
 # (kind, variant, routing) beside the replay determinism cases (64 experts, a 5000-row expert): the uneven routing (an
-# empty and a one-row expert), the compact SF warp on the stock dynamic scheduler, the dGLU's entry trigger alone, and
+# empty and a one-row expert), the compact SF warp on the stock dynamic scheduler, the entry trigger alone, and
 # 64 small experts on the signal scheduler (batch openings that publish several batches).
 MATCH_CASES = [
     ("glu", "signal", "uneven"),
@@ -179,6 +179,7 @@ MATCH_CASES = [
     ("glu", "compact", "uneven"),
     ("glu", "compact_signal", "uneven"),
     ("glu", "compact_trigger", "uneven"),
+    ("glu", "entry", "uneven"),
     ("dglu_bf16", "entry", "uneven"),
     ("dglu", "entry", "uneven"),
     ("dglu_bf16", "signal", "big_expert"),
@@ -196,6 +197,7 @@ MATCH_CASES = [
 MATCH_L0 = [
     ("glu", "trigger", "uneven"),
     ("glu", "compact", "big_expert"),
+    ("glu", "entry", "uneven"),
     ("dglu_bf16", "entry", "uneven"),
     ("dglu", "entry", "uneven"),
     ("dglu", "compact_trigger", "uneven"),
@@ -266,11 +268,10 @@ def rejected(kind, compact):
         (dict(signal, weight_mode=MoEWeightMode.DISCRETE), ValueError, "dense weights"),
         (dict(signal, cluster_shape_mn=(4, 1)), ValueError, "cluster"),
     ]
-    slots_ready = "launch_pdl_dependents_at_all_streaming_signal_slots_ready"
     if kind == "glu":
-        return cases + [(dict(use_dynamic_sched=True, **{name: True}), ValueError, name) for name in ("device_layout", slots_ready)]
-    # The forward GLU's device layout and slots-ready trigger are not dGLU options.
-    return cases + [(dict(signal, **{name: True}), TypeError, name) for name in ("device_layout", slots_ready)]
+        return cases + [(dict(use_dynamic_sched=True, device_layout=True), ValueError, "device_layout")]
+    # The forward GLU's device layout is not a dGLU option.
+    return cases + [(dict(signal, device_layout=True), TypeError, "device_layout")]
 
 
 REJECT_CASES = [("glu", False), ("glu", True), ("dglu_bf16", False), ("dglu", False), ("dglu", True)]

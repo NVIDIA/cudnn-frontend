@@ -88,6 +88,10 @@ from .moe_persistent_scheduler import (
 #: of weights they multiply.
 EXPERT_BATCH_MAX_M_TILES = 16
 
+#: Named barrier id of the batch opener's publish (its one warp).  Every kernel on this scheduler keeps its own named
+#: barriers in ids 1-8 (the SM90 kernels use all of them), so 9 collides with none.
+OPENER_PUBLISH_BARRIER_ID = 9
+
 
 def _state_region_offsets(streaming_signal_capacity: int, local_expert_count: int) -> dict:
     """Int32 offset of each region of the scheduler state, and the total.  The reset is all zero; a batch record
@@ -131,15 +135,6 @@ def _spin_until_at_least(ptr, floor: Int32) -> Int32:
     while value < floor:
         value = cute.arch.load(ptr.llvm_ptr, Int32, sem="acquire", scope="gpu")
     return value
-
-
-@cute.jit
-def _poll_until_at_least(ptr, floor: cutlass.Constexpr) -> None:
-    """Block, without bound, until ``*ptr >= floor``.  Relaxed gpu-scope loads (no L1 invalidation per poll): the
-    caller reads nothing the writer published, so it needs no acquire."""
-    value = Int32(floor - 1)
-    while value < floor:
-        value = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
 
 
 class MoEInputBlockSignalSchedulerParams:
@@ -343,19 +338,6 @@ class MoEStreamingInputBlockSignalTileScheduler:
         return self.advance_to_next_work()
 
     @cute.jit
-    def wait_all_streaming_signal_slots_ready(self) -> None:
-        """From the trigger warp: wait until the dispatch has delivered every row (``device_layout``: layout first).
-        ``signal[]`` entries are polled, not acquired (the warp reads no row; each claim acquires its own)."""
-        if const_expr(self.device_layout):
-            self._wait_for_producer_layout()
-        total_m_tiles = self._total_m_tiles()
-        signal = streaming_signal_ptr(self._dynamic_state.counter_ptr)
-        lane_idx = cute.arch.lane_idx()
-        for j in cutlass.range(0, ceil_div(total_m_tiles, cute.arch.WARP_SIZE), 1, unroll=1):
-            _poll_until_at_least(signal + cutlass.min(lane_idx + j * cute.arch.WARP_SIZE, total_m_tiles - 1), 0)
-        cute.arch.sync_warp()
-
-    @cute.jit
     def _wait_for_producer_layout(self) -> None:
         """Each lane waits for its layout_entries[0:E+1] (entry e on lane e % 32) to leave the reset value -1, in every CTA
         (each SM drops stale L1); extra lanes re-wait the last entry (a branch makes ptxas emulate warp collectives)."""
@@ -546,7 +528,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
             other_m_tiles = Int32(0)
         prefix = other_m_tiles
         for shift in cutlass.range_constexpr(5):
-            up = cute.arch.shuffle_sync_up(prefix, 1 << shift)
+            # mask_and_clamp=0: lanes below ``1 << shift`` read their own value back (and drop it below), not lane 0's.
+            up = cute.arch.shuffle_sync_up(prefix, 1 << shift, mask_and_clamp=0)
             if lane_idx >= (1 << shift):
                 prefix = prefix + up
         total_m_tiles = m_tile_count + cute.arch.warp_redux_sync(other_m_tiles, "add")
@@ -565,8 +548,9 @@ class MoEStreamingInputBlockSignalTileScheduler:
             for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
                 if m_tile_offset < lane_m_tiles:
                     self._set_expert_consecutive_m_batch_record(first_m_tile_order + m_tile_offset, (batch_claim_idx, first_m_tile, lane_m_tiles))
-        # bar.warp.sync orders every lane's stores above before the elected lane's release below.
-        cute.arch.sync_warp()
+        # A 32-thread named barrier (bar.sync, a synchronizing operation of the PTX memory model, unlike bar.warp.sync)
+        # orders every lane's stores above before the elected lane's release below.
+        cute.arch.barrier(barrier_id=OPENER_PUBLISH_BARRIER_ID, number_of_threads=cute.arch.WARP_SIZE)
         with cute.arch.elect_one():
             # Published LAST, and that order is load-bearing: the release is what hands the
             # records to the claimers and ``expert_assigned_m_tiles[]`` to the next opener.
@@ -680,7 +664,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
 
 class StreamingInputSignalMixin:
     """The streaming input signal wiring of a MoE grouped GEMM kernel whose A (and SFA) a producer fills while it runs: the
-    options, the workspace, the scheduler, the trigger warp, entry and exit.  Contract and options:
+    options, the workspace, the scheduler, entry and exit.  Contract and options:
     docs/operations/moe/streaming_signal_contract.md.
 
     The kernel calls ``init_streaming_input_signal`` in ``__init__``; with ``streaming_signal_capacity`` None every method
@@ -696,7 +680,6 @@ class StreamingInputSignalMixin:
         unmet_requirement: Optional[str] = None,
         device_layout: bool = False,
         use_pdl: bool = False,
-        launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
         cluster_barrier_at_exit: bool = False,
         launches_helper: bool = False,
@@ -715,8 +698,6 @@ class StreamingInputSignalMixin:
         if device_layout and not self.use_streaming_signal_sched:
             raise ValueError("device_layout requires streaming_signal_capacity")
         reject_pdl_behind_helper(use_pdl, launches_helper, "streaming_signal_capacity (dense weights)")
-        if launch_pdl_dependents_at_all_streaming_signal_slots_ready and not self.use_streaming_signal_sched:
-            raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
         if self.use_streaming_signal_sched and cluster_barrier_at_exit:
             if tuple(cluster_shape_mn) != (2, 1):
                 raise ValueError(f"streaming_signal_capacity requires cluster_shape_mn=(2, 1) on this kernel, got {tuple(cluster_shape_mn)}")
@@ -724,17 +705,7 @@ class StreamingInputSignalMixin:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
         self.device_layout = device_layout
         self.use_pdl = use_pdl
-        self.launch_pdl_dependents_at_all_streaming_signal_slots_ready = launch_pdl_dependents_at_all_streaming_signal_slots_ready
         self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
-        self.trigger_warp_id = None
-
-    def streaming_input_trigger_warps(self, first_free_warp_id: int) -> List[int]:
-        """``launch_pdl_dependents_at_all_streaming_signal_slots_ready``: one more warp, which only waits for every
-        ``signal[]`` entry and then triggers; its id in a list (else empty), for the kernel's warp list."""
-        if not self.launch_pdl_dependents_at_all_streaming_signal_slots_ready:
-            return []
-        self.trigger_warp_id = first_free_warp_id
-        return [first_free_warp_id]
 
     def streaming_input_workspace_bytes(self) -> int:
         """Workspace bytes after the claim counter: ``signal[]`` and the scheduler state (0 without a producer)."""
@@ -786,14 +757,6 @@ class StreamingInputSignalMixin:
         """At kernel entry: ``launch_pdl_dependents_at_entry`` lets this kernel's own dependent launch."""
         if const_expr(self.launch_pdl_dependents_at_entry):
             cute.arch.griddepcontrol_launch_dependents()
-
-    @cute.jit
-    def streaming_input_trigger_warp(self, warp_idx, scheduler) -> None:
-        """The trigger warp's whole job: wait until every ``signal[]`` entry is ready, then launch the dependent."""
-        if const_expr(self.launch_pdl_dependents_at_all_streaming_signal_slots_ready):
-            if warp_idx == self.trigger_warp_id:
-                scheduler.wait_all_streaming_signal_slots_ready()
-                cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def streaming_input_tile_fence(self) -> None:
