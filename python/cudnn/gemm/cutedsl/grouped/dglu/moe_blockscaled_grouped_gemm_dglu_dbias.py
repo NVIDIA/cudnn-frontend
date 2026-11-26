@@ -521,6 +521,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             self.occupancy,
             self.store_d_directly,
             self.generate_dbias,
+            # The h output's column scale scratch: 64 FP32 per epilogue warp.
+            4 * 64 * self.num_epilog_warps if self.generate_h else 0,
         )
 
         # Compute A/B/D/Scale shared memory layout
@@ -749,6 +751,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         glu_clamp_min: cutlass.Constexpr = -7.0,
         situ_beta1: cutlass.Constexpr = 4.0,
         situ_beta2: cutlass.Constexpr = 25.0,
+        h_tensor: Optional[cute.Tensor] = None,
+        sfh_col_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM.
 
@@ -766,6 +770,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         clamp masks. ``situ_beta1`` and ``situ_beta2`` configure the SiTU-GLU
         derivative. GeGLU parameters are ignored unless ``act_func == "dgeglu"``
         and SiTU parameters are ignored unless ``act_func == "dsituglu"``.
+
+        ``h_tensor`` and ``sfh_col_tensor`` (dswiglu with FP8 dH, both or neither): the epilogue also writes the
+        forward activation it recomputes, h = prob * silu(beta * gate) * (beta * up), column-quantized for the FC2
+        weight gradient: ``h_tensor`` row-major codes [rows, N] in D's FP8 dtype, each 32-row block of a column scaled
+        by one E8M0 scale; ``sfh_col_tensor`` the scales, per expert (rows s .. s + n, n a multiple of 128) in the
+        block-scaled MMA scale-factor layout of an N x n operand with K = rows: byte N * s / 32 + (c // 128) * 4 * n +
+        (r // 128) * 512 + (c % 32) * 16 + ((c // 32) % 4) * 4 + (r // 32) % 4 for column c and expert-local row r.
+        dH and the other outputs are unchanged.
         """
         a = kernel_facing_mx(a)
         c = kernel_facing_mx(c)
@@ -795,6 +807,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         self.dbias_cross_warp_reduce = self.generate_dbias  # always cross-warp reduce
         self.has_prob = prob is not None
         self.generate_dprob = dprob is not None
+        self.generate_h = h_tensor is not None
+        h_tensor = kernel_facing_mx(h_tensor)
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -839,6 +853,13 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             and self.sf_dtype == cutlass.Float8E8M0FNU
             and self.d_dtype in (cutlass.Float8E5M2, cutlass.Float8E4M3FN)
         )
+        if cutlass.const_expr(self.generate_h):
+            if cutlass.const_expr(sfh_col_tensor is None):
+                raise ValueError("h_tensor needs sfh_col_tensor, its column scales")
+            if cutlass.const_expr(self.act_func != "dswiglu" or not self.generate_sfd or h_tensor.element_type != self.d_dtype):
+                raise ValueError("h: dswiglu with an MXFP8 dH (FP8 D with E8M0 scales), h in D's dtype")
+            if cutlass.const_expr(self.glu_layout != "interleaved_32"):
+                raise ValueError("h: the interleaved_32 GLU layout")
         # discrete_col_sfd is enabled via __init__, padded_offsets contains the same info as m_split_cumsum
         if cutlass.const_expr(self.generate_sfd == False):
             self.discrete_col_sfd = False
@@ -1077,6 +1098,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 ],
                 128 if self.generate_dbias else 4,
             ]
+            # The h output's column scales: per epilogue warp, 32 column maxima then 32 column scales
+            sColScratch: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, 64 * self.num_epilog_warps if self.generate_h else 0],
+                16 if self.generate_h else 4,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -1154,6 +1180,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             self.epi_tile,
             sched_params,
             epilogue_op,
+            h_tensor,
+            sfh_col_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1427,6 +1455,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         norm_const,
         rcp_limit,
         tRSrD,
+        scratch=None,
     ):
         # Get absolute max across a vector and Compute SFD
         tCompute = cute.make_rmem_tensor(src.shape, self.acc_dtype)
@@ -1440,90 +1469,118 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         fp32_max = cutlass.Float32(3.40282346638528859812e38)
         tidx, _, _ = cute.arch.thread_idx()
 
-        for vi in cutlass.range_constexpr(0, acc_frg.shape[0], 4):
-            max_value0 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0]))
-            max_value1 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 1, 0]))
-            max_value2 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 2, 0]))
-            max_value3 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 3, 0]))
-
+        if cutlass.const_expr(scratch is not None):
+            # With a warp's 64-float smem scratch (the h output): one warp redux per column (NaN-propagating max), then
+            # lane l computes only column l's scale (rn products, E8M0 round trip, rcp, fmin) and shares it through the
+            # scratch.  Without it, every lane computes every column's scale.
+            lane = cute.arch.lane_idx()
+            col_max = cute.make_rmem_tensor(cute.make_layout(self.sf_vec_size), cutlass.Float32)
+            for vi in cutlass.range_constexpr(self.sf_vec_size):
+                col_max[vi] = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+            scratch_max = cute.make_tensor(scratch.iterator, cute.make_layout(self.sf_vec_size))
+            scratch_scale = cute.make_tensor(scratch.iterator + self.sf_vec_size, cute.make_layout(self.sf_vec_size))
+            cute.arch.sync_warp()
+            cute.autovec_copy(col_max, scratch_max)
+            cute.arch.sync_warp()
             scale = rcp_limit * norm_const
-            max_value0, max_value1 = cute.arch.mul_packed_f32x2(
-                (max_value0, max_value1),
-                (scale, scale),
-                rnd="rn",
-                ftz=False,
-            )
-            max_value2, max_value3 = cute.arch.mul_packed_f32x2(
-                (max_value2, max_value3),
-                (scale, scale),
-                rnd="rn",
-                ftz=False,
-            )
+            max_value, _ = cute.arch.mul_packed_f32x2((scratch_max[lane], scratch_max[lane]), (scale, scale), rnd="rn", ftz=False)
+            pvscale[None, None, tile_idx][0] = max_value
+            max_value_rcp = cute.arch.rcp_approx(self.cvt_f32_to_f8_to_f32(max_value, self.sf_dtype))
+            max_value_rcp = fmin(max_value_rcp, fp32_max, nan=True)
+            acc_scale_col, _ = cute.arch.mul_packed_f32x2((norm_const, norm_const), (max_value_rcp, max_value_rcp), rnd="rn", ftz=False)
+            scratch_scale[lane] = acc_scale_col
+            cute.arch.sync_warp()
+            col_scale = cute.make_rmem_tensor(cute.make_layout(self.sf_vec_size), cutlass.Float32)
+            cute.autovec_copy(scratch_scale, col_scale)
+            for vi in cutlass.range_constexpr(0, self.sf_vec_size, 2):
+                tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1] = cute.arch.mul_packed_f32x2(
+                    (tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1]), (col_scale[vi], col_scale[vi + 1]), rnd="rn", ftz=False
+                )
+        else:
+            for vi in cutlass.range_constexpr(0, acc_frg.shape[0], 4):
+                max_value0 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0]))
+                max_value1 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 1, 0]))
+                max_value2 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 2, 0]))
+                max_value3 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 3, 0]))
 
-            if tidx % 32 == vi:
-                tmp_fp32 = max_value0
-            if tidx % 32 == vi + 1:
-                tmp_fp32 = max_value1
-            if tidx % 32 == vi + 2:
-                tmp_fp32 = max_value2
-            if tidx % 32 == vi + 3:
-                tmp_fp32 = max_value3
+                scale = rcp_limit * norm_const
+                max_value0, max_value1 = cute.arch.mul_packed_f32x2(
+                    (max_value0, max_value1),
+                    (scale, scale),
+                    rnd="rn",
+                    ftz=False,
+                )
+                max_value2, max_value3 = cute.arch.mul_packed_f32x2(
+                    (max_value2, max_value3),
+                    (scale, scale),
+                    rnd="rn",
+                    ftz=False,
+                )
 
-            max_value_tensor = cute.make_rmem_tensor(4, cutlass.Float32)
-            max_value_tensor[0] = max_value0
-            max_value_tensor[1] = max_value1
-            max_value_tensor[2] = max_value2
-            max_value_tensor[3] = max_value3
+                if tidx % 32 == vi:
+                    tmp_fp32 = max_value0
+                if tidx % 32 == vi + 1:
+                    tmp_fp32 = max_value1
+                if tidx % 32 == vi + 2:
+                    tmp_fp32 = max_value2
+                if tidx % 32 == vi + 3:
+                    tmp_fp32 = max_value3
 
-            if cutlass.const_expr(not self.use_fp8_ptx_cvt):
-                max_value_vec_f8 = max_value_tensor.load().to(self.sf_dtype)
-            else:
-                max_value_vec_f8 = cute.make_rmem_tensor(4, self.sf_dtype)
-                self.cvt_f32x4_to_f8x4(max_value_tensor, max_value_vec_f8)
-                max_value_vec_f8 = max_value_vec_f8.load()
-            max_value_vec_f32_chunked = max_value_vec_f8.to(cutlass.Float32)
-            max_value0 = max_value_vec_f32_chunked[0]
-            max_value1 = max_value_vec_f32_chunked[1]
-            max_value2 = max_value_vec_f32_chunked[2]
-            max_value3 = max_value_vec_f32_chunked[3]
+                max_value_tensor = cute.make_rmem_tensor(4, cutlass.Float32)
+                max_value_tensor[0] = max_value0
+                max_value_tensor[1] = max_value1
+                max_value_tensor[2] = max_value2
+                max_value_tensor[3] = max_value3
 
-            max_value_rcp0 = cute.arch.rcp_approx(max_value0)
-            max_value_rcp1 = cute.arch.rcp_approx(max_value1)
-            max_value_rcp2 = cute.arch.rcp_approx(max_value2)
-            max_value_rcp3 = cute.arch.rcp_approx(max_value3)
+                if cutlass.const_expr(not self.use_fp8_ptx_cvt):
+                    max_value_vec_f8 = max_value_tensor.load().to(self.sf_dtype)
+                else:
+                    max_value_vec_f8 = cute.make_rmem_tensor(4, self.sf_dtype)
+                    self.cvt_f32x4_to_f8x4(max_value_tensor, max_value_vec_f8)
+                    max_value_vec_f8 = max_value_vec_f8.load()
+                max_value_vec_f32_chunked = max_value_vec_f8.to(cutlass.Float32)
+                max_value0 = max_value_vec_f32_chunked[0]
+                max_value1 = max_value_vec_f32_chunked[1]
+                max_value2 = max_value_vec_f32_chunked[2]
+                max_value3 = max_value_vec_f32_chunked[3]
 
-            max_value_rcp0 = fmin(max_value_rcp0, fp32_max, nan=True)
-            max_value_rcp1 = fmin(max_value_rcp1, fp32_max, nan=True)
-            max_value_rcp2 = fmin(max_value_rcp2, fp32_max, nan=True)
-            max_value_rcp3 = fmin(max_value_rcp3, fp32_max, nan=True)
+                max_value_rcp0 = cute.arch.rcp_approx(max_value0)
+                max_value_rcp1 = cute.arch.rcp_approx(max_value1)
+                max_value_rcp2 = cute.arch.rcp_approx(max_value2)
+                max_value_rcp3 = cute.arch.rcp_approx(max_value3)
 
-            acc_scale_col0, acc_scale_col1 = cute.arch.mul_packed_f32x2(
-                (norm_const, norm_const),
-                (max_value_rcp0, max_value_rcp1),
-                rnd="rn",
-                ftz=False,
-            )
-            acc_scale_col2, acc_scale_col3 = cute.arch.mul_packed_f32x2(
-                (norm_const, norm_const),
-                (max_value_rcp2, max_value_rcp3),
-                rnd="rn",
-                ftz=False,
-            )
+                max_value_rcp0 = fmin(max_value_rcp0, fp32_max, nan=True)
+                max_value_rcp1 = fmin(max_value_rcp1, fp32_max, nan=True)
+                max_value_rcp2 = fmin(max_value_rcp2, fp32_max, nan=True)
+                max_value_rcp3 = fmin(max_value_rcp3, fp32_max, nan=True)
 
-            tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1] = cute.arch.mul_packed_f32x2(
-                (tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1]),
-                (acc_scale_col0, acc_scale_col1),
-                rnd="rn",
-                ftz=False,
-            )
-            tTR_rAcc_frg[vi + 2], tTR_rAcc_frg[vi + 3] = cute.arch.mul_packed_f32x2(
-                (tTR_rAcc_frg[vi + 2], tTR_rAcc_frg[vi + 3]),
-                (acc_scale_col2, acc_scale_col3),
-                rnd="rn",
-                ftz=False,
-            )
+                acc_scale_col0, acc_scale_col1 = cute.arch.mul_packed_f32x2(
+                    (norm_const, norm_const),
+                    (max_value_rcp0, max_value_rcp1),
+                    rnd="rn",
+                    ftz=False,
+                )
+                acc_scale_col2, acc_scale_col3 = cute.arch.mul_packed_f32x2(
+                    (norm_const, norm_const),
+                    (max_value_rcp2, max_value_rcp3),
+                    rnd="rn",
+                    ftz=False,
+                )
 
-            pvscale[None, None, tile_idx][0] = tmp_fp32
+                tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1] = cute.arch.mul_packed_f32x2(
+                    (tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1]),
+                    (acc_scale_col0, acc_scale_col1),
+                    rnd="rn",
+                    ftz=False,
+                )
+                tTR_rAcc_frg[vi + 2], tTR_rAcc_frg[vi + 3] = cute.arch.mul_packed_f32x2(
+                    (tTR_rAcc_frg[vi + 2], tTR_rAcc_frg[vi + 3]),
+                    (acc_scale_col2, acc_scale_col3),
+                    rnd="rn",
+                    ftz=False,
+                )
+
+                pvscale[None, None, tile_idx][0] = tmp_fp32
 
         acc_vec = tiled_copy_r2s.retile(tCompute).load()
         if cutlass.const_expr(not self.use_fp8_ptx_cvt):
@@ -1579,6 +1636,35 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         src_vf32x8 = cute.logical_divide(src_f32, vec_shape)
         for ei in cutlass.range_constexpr(dst_vf32x8.shape[1]):
             self.stg_256(dst_vf32x8[None, ei].iterator.llvm_ptr, src_vf32x8[None, ei].load())
+
+    @cute.jit
+    def store_h_subtile(self, mH_mnl, mSFHCol, tRS_rH, pvscale, epi_ext, mPosition, tidx, warp_idx, work_tile_info, subtile_idx):
+        """One 128 x 32 h subtile: each thread's row as one 32-byte store of its codes, each lane its column's E8M0
+        scale (``pvscale`` slot 0, from quant_sfd_col) at the scale-factor byte given in ``__call__``."""
+        n_h = cute.size(mH_mnl, mode=[1])
+        column0 = work_tile_info.tile_n_idx * self.cta_tile_shape_mnk[1] + subtile_idx * self.epi_tile[1]
+        if column0 < n_h:
+            row = cutlass.Int64(epi_ext.token_offset + mPosition)
+            code_addr = mH_mnl.iterator.toint() + row * cutlass.Int64(n_h) + cutlass.Int64(column0)
+            code_dst = cute.make_tensor(cute.make_ptr(cutlass.Int32, code_addr, AddressSpace.gmem, assumed_align=32), cute.make_layout(8))
+            self.store_global_memory_256b(code_dst, cute.recast_tensor(tRS_rH, cutlass.Int32))
+            scale_f32 = cute.make_rmem_tensor(4, cutlass.Float32)
+            scale_f32[0] = pvscale[None, None, 0][0]
+            for i in cutlass.range_constexpr(1, 4):
+                scale_f32[i] = cutlass.Float32(0.0)
+            scale_e8m0 = cute.make_rmem_tensor(4, self.sf_dtype)
+            self.cvt_f32x4_to_f8x4(scale_f32, scale_e8m0)
+            column = column0 + cute.arch.lane_idx()
+            local_row0 = mPosition - tidx
+            block = warp_idx % self.num_epilog_warps
+            scale_addr = (
+                mSFHCol.iterator.toint()
+                + cutlass.Int64(epi_ext.token_offset) * cutlass.Int64(n_h // 32)
+                + cutlass.Int64(column // 128) * cutlass.Int64(4 * epi_ext.tokens_i)
+                + cutlass.Int64((local_row0 // 128) * 512 + (column % 32) * 16 + ((column // 32) % 4) * 4 + block)
+            )
+            scale_dst = cute.make_tensor(cute.make_ptr(cutlass.Uint8, scale_addr, AddressSpace.gmem, assumed_align=1), cute.make_layout(1))
+            scale_dst[0] = cute.recast_tensor(scale_e8m0, cutlass.Uint8)[0]
 
     @cute.jit
     def create_and_partition_new_SFDCol(
@@ -1720,10 +1806,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         square_alpha: Float32,
         dprob_swiglu: Optional[cute.Tensor] = None,
     ):
+        """(d1, d2, dprob, h): h = prob * swish(beta * gate) * (beta * up) with ``generate_h``, else None."""
         LOG2_E = cutlass.Float32(1.4426950408889634)
+        h_vec = None
         if cutlass.const_expr(self.vectorized_f32):
             d1_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
             d2_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
+            if cutlass.const_expr(self.generate_h):
+                h_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
             for i in cutlass.range(0, cute.size(acc_vec), 2, unroll_full=True):
                 # Apply scaling factors for FP8
                 (
@@ -1794,6 +1884,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                         (dprob_swiglu[i + 0], dprob_swiglu[i + 1]),
                         (acc_vec[i + 0], acc_vec[i + 1]),
                     )
+                # h = prob * swish * (beta * up), the forward's FC2 input
+                if cutlass.const_expr(self.generate_h):
+                    h_vec[i + 0], h_vec[i + 1] = cute.arch.mul_packed_f32x2((ab2_vec_acc_type[0], ab2_vec_acc_type[1]), swish, rnd="rn", ftz=False)
+                    if cutlass.const_expr(self.has_prob):
+                        h_vec[i + 0], h_vec[i + 1] = cute.arch.mul_packed_f32x2((h_vec[i + 0], h_vec[i + 1]), (mProb, mProb), rnd="rn", ftz=False)
                 # calculate dswiglu
                 acc_vec_prob = (acc_vec[i + 0], acc_vec[i + 1])
                 if cutlass.const_expr(self.has_prob):
@@ -1861,7 +1956,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             d2_vec = d2_vec.load()
             if cutlass.const_expr(self.generate_dprob):
                 dprob_swiglu = dprob_swiglu.load()
-            return d1_vec, d2_vec, dprob_swiglu
+            if cutlass.const_expr(self.generate_h):
+                h_vec = h_vec.load()
+            return d1_vec, d2_vec, dprob_swiglu, h_vec
         else:
             acc_vec = acc_vec.load()
             ab1_vec_load = ab1_vec_load.load()
@@ -1884,13 +1981,19 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 dprob_swiglu = ab2_vec_load * swish
                 dprob_swiglu = acc_vec * dprob_swiglu
 
+            # h = prob * swish * (beta * up), the forward's FC2 input
+            if cutlass.const_expr(self.generate_h):
+                h_vec = ab2_vec_load * swish
+                if cutlass.const_expr(self.has_prob):
+                    h_vec = h_vec * mProb
+
             # calculate dswiglu
             acc_vec_prob = acc_vec
             if cutlass.const_expr(self.has_prob):
                 acc_vec_prob = acc_vec * mProb
             d1_vec = acc_vec_prob * ab2_vec_load * sig * (1 + ab1_vec_load * (1 - sig))
             d2_vec = acc_vec_prob * swish
-            return d1_vec, d2_vec, dprob_swiglu
+            return d1_vec, d2_vec, dprob_swiglu, h_vec
 
     @cute.jit
     def dsituglu(
@@ -2234,9 +2337,13 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         epi_tile: cute.Tile,
         sched_params: MoESchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        mH_mnl: Optional[cute.Tensor] = None,
+        mSFHCol: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
+
+        ``mH_mnl`` / ``mSFHCol``: the activation h and its column scales (see ``__call__``), or None.
         """
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = tidx // 32
@@ -2926,9 +3033,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                     tRS_rD2_col,
                     tRS_sD_col,
                 ) = self.epilog_smem_copy_and_partition_store(tiled_copy_t2r, tTR_rD1_col, tTR_rD2_col, epi_tidx, sD_col)
+                if cutlass.const_expr(self.generate_h):
+                    tRS_rH = cute.make_rmem_tensor_like(tRS_rD1_col)
 
                 norm_const = cutlass.Float32(norm_const_tensor[0])
                 d_rcp_limits = get_dtype_rcp_limits(self.d_dtype)
+                if cutlass.const_expr(self.generate_h):
+                    sColScratch = storage.sColScratch.get_tensor(cute.make_layout((64, self.num_epilog_warps), stride=(1, 64)))
+                    column_scratch = sColScratch[(None, warp_idx % self.num_epilog_warps)]
 
             # Extension for per-expert domain conversion in epilogue
             epi_ext = self._make_extension(workspace_ptr)
@@ -3060,6 +3172,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                         tCgSFDCol_mnl = self.create_and_partition_new_SFDCol(real_sfd_col)
                     tCrSFDCol = cute.make_rmem_tensor(tCrSFDRow.layout, tCrSFDRow.element_type)
                     tCrSFDCol_pvscale = cute.make_rmem_tensor_like(tCrSFDRow_pvscale.layout, cutlass.Float32)
+                    if cutlass.const_expr(self.generate_h):
+                        tCrSFHCol_pvscale = cute.make_rmem_tensor_like(tCrSFDRow_pvscale.layout, cutlass.Float32)
                     tCgSFDCol_mn = tCgSFDCol_mnl[(None, None, None, None, None, 0)]
                     if cutlass.const_expr(self.glu_layout == "gate_then_up" and self.discrete_col_sfd):
                         # Discrete column scales use expert-local M atom capacity.
@@ -3194,7 +3308,13 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                     #
                     square_alpha = alpha_val * alpha_val
                     if cutlass.const_expr(self.act_func == "dswiglu"):
-                        d1_vec, d2_vec, dprob_swiglu = self.dswiglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu)
+                        d1_vec, d2_vec, dprob_swiglu, h_vec = self.dswiglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu)
+                        if cutlass.const_expr(self.generate_h):
+                            # h's column scales (one per lane's column), its codes, then both stores.
+                            self.quant_sfd_col(0, tiled_copy_r2s, h_vec, tCrSFHCol_pvscale, norm_const, d_rcp_limits, tRS_rH, column_scratch)
+                            self.store_h_subtile(
+                                mH_mnl, mSFHCol, tRS_rH, tCrSFHCol_pvscale, epi_ext, mPosition, tidx, warp_idx, epi_work_tile_info, real_subtile_idx
+                            )
                     elif cutlass.const_expr(self.act_func == "dgeglu"):
                         d1_vec, d2_vec, dprob_swiglu = self.dgeglu(
                             acc_vec,
@@ -3813,6 +3933,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         occupancy: int,
         store_d_directly: bool,
         generate_dbias: bool = False,
+        epi_scratch_bytes: int = 0,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/D operands based on heuristics.
 
@@ -3917,7 +4038,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         # dBias transpose buffer: (128, 64) column-major FP32 = 32 KB
         dbias_bytes = 128 * 64 * cute.size_in_bytes(cutlass.Float32, cute.make_layout((1,))) if generate_dbias else 0
         # Epilogue bytes
-        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes
+        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes + epi_scratch_bytes
 
         # Calculate A/B stages:
         # Start with total smem per CTA (capacity / occupancy)
