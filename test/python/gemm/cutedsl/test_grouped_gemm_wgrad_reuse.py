@@ -18,7 +18,12 @@ import cudnn
 from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
 from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel
 from determinism_utils import assert_bitwise, snapshot
-from gemm.cutedsl.test_grouped_gemm_wgrad_global_desc import M, _problem, _run, force_kernel
+from gemm.cutedsl.test_grouped_gemm_wgrad import (
+    _GLOBAL_DESC_M as M,
+    _global_desc_force_kernel as force_kernel,
+    _global_desc_problem as _problem,
+    _global_desc_run as _run,
+)
 from gemm.cutedsl.test_grouped_gemm_wgrad_utils import check_ref_grouped_gemm_wgrad
 
 

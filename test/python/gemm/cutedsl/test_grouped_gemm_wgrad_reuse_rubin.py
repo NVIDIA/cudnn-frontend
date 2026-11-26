@@ -14,7 +14,7 @@ import torch
 from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
 from cudnn.gemm.cutedsl.grouped.wgrad import _blockscaled_api
 from determinism_utils import assert_bitwise, snapshot
-from gemm.cutedsl.test_grouped_gemm_wgrad_global_desc import _problem, _run
+from gemm.cutedsl.test_grouped_gemm_wgrad import _global_desc_problem as _problem, _global_desc_run as _run
 
 
 @pytest.fixture(autouse=True)
