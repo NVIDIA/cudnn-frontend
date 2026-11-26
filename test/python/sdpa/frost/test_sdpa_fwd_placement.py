@@ -1591,7 +1591,8 @@ def test_sm103_fp8_d192_long_causal_chunks_lead():
 @pytest.mark.L0
 def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
     """SM100 per-tensor FP8 decode-shaped GQA (module docstring): 2 <= s_q <= 16 leads at d128 / d256 and d64 with a sink,
-    s_q == 1 only for the d64 sink graph under a window or from 32 KV units; outside the measured box the backend leads."""
+    s_q == 1 only for the d64 sink graph over a whole cache it splits, under a window, or from 32 KV units; outside the measured
+    box the backend leads."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100_fp8")
@@ -1610,7 +1611,9 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
     assert place(**{**paged_swa, "s_q": 4, "b": 32}) == placement.LEAD
     assert place(**sink, s_q=1, causal=False, bottom_right=False, b=4) == placement.LEAD  # 32 KV units
     assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1, window_left=128) == placement.LEAD
-    assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1) == placement.TRAIL  # 8 units over a full cache: 1.20-1.23x
+    assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1) == placement.LEAD  # 8 units over a full cache it splits
+    # an unaligned dense KV tail keeps the unsplit plan (heuristics._synth_kv_padding), which loses below 32 units
+    assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1, s_kv=8191) == placement.TRAIL
     assert place(s_q=1, causal=False, bottom_right=False) == placement.TRAIL  # d128 decode still loses
     assert place(h_q=2) == placement.TRAIL  # MHA not measured
     assert place(d_qk=64, d_v=64, h_q=64, h_kv=8) == placement.TRAIL  # d64 without a sink not measured
@@ -1619,6 +1622,17 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
     assert place(s_kv=512) == placement.TRAIL  # below the measured caches
     assert place(dtype=cudnn.data_type.FP8_E5M2) == placement.TRAIL  # E5M2 inputs not measured
     assert place(right_band_widening=True, right_bound=4) == placement.TRAIL  # widened band not measured
+
+
+@pytest.mark.L0
+def test_sm100_fp8_sink_lead_follows_the_proposed_split():
+    """Below 32 KV units the whole-cache d64 FP8 sink graph leads only on a split plan: a proposal that runs it unsplit
+    (mode B's fallback knobs) keeps the backend first."""
+    facts = _facts(**{**_SM107_FP8_QUANT, "dtype_o": cudnn.data_type.FP8_E4M3, "device_sm_count": 148}, d_qk=64, d_v=64, has_sink=True, s_q=4, s_kv=32768)
+    lead = heuristics.propose("A", facts, _OFFERED)[0]
+    assert not is_backend_block(lead) and (lead.knobs.split_kv or 1) >= 2, lead
+    plans = heuristics.propose("B", facts, _OFFERED)
+    assert is_backend_block(plans[0]) and all((p.knobs.split_kv or 1) == 1 for p in plans if not is_backend_block(p)), plans
 
 
 @pytest.mark.L0

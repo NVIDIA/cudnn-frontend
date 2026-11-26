@@ -162,8 +162,13 @@ engine. Decode-shaped GQA (``s_q <= 16``, dense or paged, measured 2026-10-26 ag
 cases: d64 sink +/- SWA128, d128, d256; q 1-16; kv 4k/64k; b 1/32/128; plus the 120 paged d64 sink cases
 FROST serves since #1874): ``2 <= s_q <= 16`` FROST wins every d128 (0.03-0.37) and d256 (0.01-0.25) cell ->
 LEAD. d64 with a sink wins from 32 KV units (0.06-0.98) and a single SWA query row wins at any batch
-(0.06-0.90) -> LEAD; below 32 units the full-cache single row loses 1.20-1.23 and paged SWA ``s_q >= 2``
-1.09-1.49 (dense ``s_q >= 2`` is 0.88-1.06 parity) -> TRAIL. d128 ``s_q == 1`` still loses (1.48 dense, 1.88
+(0.06-0.90) -> LEAD; below 32 units the full-cache single row loses 1.20-1.23 unsplit and paged SWA ``s_q >= 2``
+1.09-1.49 (dense ``s_q >= 2`` is 0.88-1.06 parity) -> TRAIL. Over the whole cache the per-tensor FP8 sink graph splits
+(``heuristics._split_points``; the combine folds the sink once), and where the proposed plan splits it leads at any batch
+(studies sm100_fp8_sink_split_20261126 and sm100_fp8_sink_place_v2_20261126, B200 and B300, S_q 1-16, b 1-128, dense and
+paged, cuDNN 9.24.0.43 and a newer build: 0.03-0.36 of the backend). An unsplit plan keeps the bound: a dense KV tail the
+chooser leaves unsplit, or mode B's fallback knobs.
+d128 ``s_q == 1`` still loses (1.48 dense, 1.88
 paged geo) -> TRAIL. THD, MHA, d64 without a sink, a window off the d64 sink graph and block-scaled O were not measured
 -> TRAIL, as do other O dtypes than E4M3 and caches below 1k. FROST declines paged d256 today, so leading it
 changes nothing. d512 MTP rows (``2 <= s_q <= 16`` under the bottom-right diagonal, dense unpadded E4M3 KV,
@@ -709,7 +714,7 @@ SM100_FP8_DECODE_MIN_KV = 1024  # the measured decode caches: 4k / 64k grid, 1k-
 # 64 heads or 8 requests (0.12-0.69) and a 2k cache (0.43-0.89) win. Each floor sits halfway (log2) to the first win.
 SM100_FP8_D512_MTP_FLOOR_HEADS = 45  # b * h_q
 SM100_FP8_D512_MTP_FLOOR_KV = 1448
-SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
+SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units, unsplit: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
 # _sm100_fp8_decode_gap (study sm100_fp8_decode_gaps_20261118): each bound sits halfway between measured train values
 SM100_FP8_GAP_MAX_GROUP = 16  # measured GQA groups 2-16
 SM100_FP8_GAP_PAGE = 16  # measured page size
@@ -997,7 +1002,7 @@ def place(spec, facts, knobs=None) -> str:
     if spec.name == "sdpa_fwd_prefill_sm90":
         return _place_sm90_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm100_fp8":
-        return _place_sm100_fp8(spec.capabilities, facts)
+        return _place_sm100_fp8(spec.capabilities, facts, knobs)
     if spec.name == "sdpa_fwd_prefill_sm107_fp8":
         return _place_sm107_fp8(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm120_fp8":
@@ -1244,7 +1249,19 @@ def _place_sm107_mxfp8(caps: Capabilities, facts) -> str:
     return LEAD if facts.device_cc == (10, 7) else TRAIL
 
 
-def _sm100_fp8_decode_leads(facts) -> bool:
+def _sm100_fp8_planned_split(facts, knobs=None) -> int:
+    """The KV split the SM100 per-tensor FP8 plan runs on ``facts`` (1 = unsplit): the proposed plan's ``knobs``, or
+    without them the row's first knob set."""
+    if knobs is not None:
+        return knobs.split_kv or 1
+    from .engines import sm100_legacy_policy_spec
+    from .heuristics import _knob_sets
+
+    sets = _knob_sets(sm100_legacy_policy_spec("sdpa_fwd_prefill_sm100_fp8"), facts)
+    return (sets[0].split_kv or 1) if sets else 1
+
+
+def _sm100_fp8_decode_leads(facts, knobs=None) -> bool:
     """SM100 per-tensor FP8 decode-shaped GQA graphs FROST leads (module docstring, "SM100 per-tensor FP8 row")."""
     shape = (facts.d_qk, facts.d_v)
     sink_d64 = shape == (64, 64) and facts.has_sink
@@ -1268,6 +1285,8 @@ def _sm100_fp8_decode_leads(facts) -> bool:
     if (facts.window_left is not None and not sink_d64) or (facts.has_sink and not sink_d64):
         return False
     if sink_d64:
+        if facts.window_left is None and _sm100_fp8_planned_split(facts, knobs) >= 2:
+            return True  # the whole cache splits (heuristics._split_points), at any batch (sm100_fp8_sink_place_v2_20261126)
         # a single SWA query row wins at any batch; otherwise a few KV units lose (paged SWA b=1 to 1.49x)
         return facts.b * facts.h_kv >= SM100_FP8_SINK_DECODE_MIN_KV_UNITS or (facts.s_q == 1 and facts.window_left is not None)
     return facts.s_q >= 2 and shape in ((128, 128), (256, 256))
@@ -1324,13 +1343,13 @@ def _sm100_fp8_decode_gap(caps: Capabilities, facts) -> Optional[str]:
     return LEAD if lead else None
 
 
-def _place_sm100_fp8(caps: Capabilities, facts) -> str:
+def _place_sm100_fp8(caps: Capabilities, facts, knobs=None) -> str:
     # Measured: dense per-tensor E4M3, O E4M3 + Amax_O, no sink / block-scaled O, a window only inside _d512_swa;
     # decode-shaped GQA (s_q <= 16) also paged and with a d64 sink.
     gap = _sm100_fp8_decode_gap(caps, facts)
     if gap is not None:
         return gap
-    if facts.s_q <= DECODE_SHAPED_MAX_S_Q and _sm100_fp8_decode_leads(facts):
+    if facts.s_q <= DECODE_SHAPED_MAX_S_Q and _sm100_fp8_decode_leads(facts, knobs):
         return LEAD
     if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or facts.o_block_scale:
         return TRAIL

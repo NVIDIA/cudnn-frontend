@@ -78,6 +78,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_supported,
     supports_paged_d256_pack_gqa,
     supports_paged_prefill_cga1,
+    supports_quantized_split_sink,
 )
 from cudnn.sdpa.fwd.sparse_tile_rules import (
     LEAN_SPARSE_MAX_SUB_TILES_PER_CTA,
@@ -2879,15 +2880,25 @@ def _split_points(
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
-    # A sink splits on the SM100 / SM120 half flavors (the combine folds it once); FP8 keeps
-    # the per-tile fold, and a gated graph's split (the gate rides its combine) carries no sink.
+    # A sink splits on the SM100 / SM120 half flavors and, over the whole cache, on the per-tensor
+    # FP8 plans mismatch() admits (the combine folds it once). Under a window the FP8 model counts
+    # the whole cache, so a windowed FP8 sink graph keeps the unsplit plan; MXFP8 keeps it too, and
+    # a gated graph's split (the gate rides its combine) carries no sink.
     if (
         (facts.thd and not ragged_decode)
         or (
             facts.has_sink
             and (
-                facts.is_fp8
-                or facts.is_mxfp8
+                facts.is_mxfp8
+                or (
+                    facts.is_fp8
+                    and (
+                        facts.window_left is not None
+                        or not supports_quantized_split_sink(
+                            device_cc=facts.device_cc, pertensor=True, thd=facts.thd, d_shape=(facts.d_qk, facts.d_v), paged=facts.has_paged_kv
+                        )
+                    )
+                )
                 or facts.has_epilogue_gate
                 or caps.sm_lo not in (100, 107, 120)
                 # cc 10.7: a window already bounds the KV walk, and the split's combine measured slower there (sink-split study 2026-11-01)

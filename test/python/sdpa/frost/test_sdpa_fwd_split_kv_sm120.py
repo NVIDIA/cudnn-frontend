@@ -341,7 +341,8 @@ def test_sm120_split_sink_is_eligible_on_half_and_exact_fp8_d128(d):
 @pytest.mark.parametrize("over", [dict(), dict(h_q=32, h_kv=8, d_qk=128, d_v=128, s_kv=65536), dict(h_q=16, h_kv=2, d_qk=256, d_v=256, s_kv=16384)])
 def test_sm120_sink_sets_carry_the_split_choice(monkeypatch, over):
     """The half row hands a sink graph to the split chooser (mocked) and carries its answer, and every set it proposes
-    is admissible; the FP8 row keeps a sink graph unsplit whatever the chooser answers."""
+    is admissible; the FP8 row does the same on the exact D128 dense graph, whose split folds the sink once in the
+    combine (``config_sm100.supports_quantized_split_sink``), and keeps every other FP8 sink graph unsplit."""
     import cudnn
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
@@ -355,7 +356,16 @@ def test_sm120_sink_sets_carry_the_split_choice(monkeypatch, over):
     for knobs in sets:
         assert mismatch(half.capabilities, facts, knobs) is None, knobs
     fp8 = _sink_decode_facts(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True, **over)
-    assert all((knobs.split_kv or 1) == 1 for knobs in heuristics._knob_sets(rows["sdpa_fwd_prefill_sm120_fp8"], fp8))
+    fp8_sets = heuristics._knob_sets(rows["sdpa_fwd_prefill_sm120_fp8"], fp8)
+    if (fp8.d_qk, fp8.d_v) != (128, 128):
+        assert all((knobs.split_kv or 1) == 1 for knobs in fp8_sets), fp8_sets
+        return
+    from frost_test_utils import sm120_owner
+
+    assert 4 in {knobs.split_kv for knobs in fp8_sets}, fp8_sets
+    owner = rows[sm120_owner("sdpa_fwd_prefill_sm120_fp8", 128, 128)]
+    for knobs in fp8_sets:
+        assert mismatch(owner.capabilities, fp8, knobs) is None, knobs
 
 
 # --- FP8, including a QUANTIZED O ------------------------------------------
