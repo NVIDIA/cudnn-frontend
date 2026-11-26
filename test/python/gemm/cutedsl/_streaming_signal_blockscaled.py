@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from gemm.cutedsl import _streaming_signal as bf16
-from gemm.cutedsl._streaming_signal import ROWS_ALIGNMENT, frozen, padded, signal_ready
+from gemm.cutedsl._streaming_signal import ROWS_ALIGNMENT, frozen, padded, signal_ready, spin_before_pdl_launch
 from gemm.cutedsl.test_grouped_gemm_streaming_signal import levels, release_order, require_sm10x  # noqa: F401  (re-exported)
 
 HIDDEN = 512
@@ -306,6 +306,7 @@ class Launcher:
 
     def launch(self, problem, buffers, stream=None):
         skip = b_major_arg(self.kernel)
+        spin_before_pdl_launch(self.kernel, stream or torch.cuda.current_stream())
         self._compiled(*[x for i, x in enumerate(kernel_args(self.kernel, problem, *buffers)) if i != skip], cu_stream(stream))
 
     def __call__(self, problem, prepare_workspace=None):
