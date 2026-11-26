@@ -279,10 +279,8 @@ class MoEGroupedGemmWgradWideBF16Kernel:
         cute.copy(sched_copy_atom, sched_buf_tensor[(None, sched_consumer_state.index)], rmem)
         work_tile_info = MoEWorkTileInfo.from_rmem_tensor(rmem)
         cute.arch.fence_acq_rel_cta()
-        # one elected arrive per consumer warp
-        cute.arch.sync_warp()
-        if cute.arch.lane_idx() == 0:
-            sched_pipeline.consumer_release(sched_consumer_state)
+        # Every thread that read the slot arrives on its empty barrier, so its read is ordered before the refill.
+        sched_pipeline.consumer_release(sched_consumer_state)
         # The caller advances sched_consumer_state in its own loop body (loop-carried state must be visibly
         # mutated there for the DSL to carry it across iterations).
         return work_tile_info
@@ -414,7 +412,7 @@ class MoEGroupedGemmWgradWideBF16Kernel:
             defer_sync=True,
         )
 
-        num_sched_consumer_threads = len((self.tma_warp_id, self.mma_warp_id, *self.epilogue_warp_id))
+        num_sched_consumer_threads = 32 * len((self.tma_warp_id, self.mma_warp_id, *self.epilogue_warp_id))
         sched_pipeline = pipeline.PipelineAsync.create(
             num_stages=self.num_sched_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
