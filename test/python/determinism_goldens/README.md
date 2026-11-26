@@ -2640,7 +2640,7 @@ as part of this addition.
 options of the SM100 block-scaled kernels (dense weights, dynamic scheduler, E4M3/E8M0 inputs quantized once and reused
 unchanged): `streaming_output_notify=N_CHUNK` on the MXFP8 quant kernel (FC2, BF16 D, cluster (2, 1) with the 256 x 256
 2-CTA tile and (1, 1) with the 128 x 256 1-CTA tile), and `streaming_signal_capacity` on the MXFP8 SwiGLU kernel (FC1,
-BF16 C and D, host or `device_layout` expert layout with the all-slots-ready PDL trigger; stock SF atoms or
+BF16 C and D, host or `device_layout` expert layout with the PDL entry trigger; stock SF atoms or
 `compact_sfa_sf_warp`, compact E8M0 rows from which the SF warp builds the atoms) and on the BF16 and MXFP8 dSwiGLU
 kernels (FC1's backward, `deterministic=True`: one FP32 dprob slot per N tile; optional PDL entry trigger). The options
 reorder tiles only, so every case compares raw bytes (FC2 D; FC1 C and D; dGLU D and dprob) with the stock dynamic

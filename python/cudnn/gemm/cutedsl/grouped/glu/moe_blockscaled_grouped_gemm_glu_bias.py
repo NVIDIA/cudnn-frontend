@@ -254,7 +254,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
           of expert[i] in the padded A tensor.
         - Expert i processes A[padded_offsets[i-1]:padded_offsets[i], :] (with padded_offsets[-1]=0)
 
-    :param streaming_signal_capacity, device_layout, use_pdl, launch_pdl_dependents_at_all_streaming_signal_slots_ready:
+    :param streaming_signal_capacity, device_layout, use_pdl, launch_pdl_dependents_at_entry:
         a streaming input producer of A and SFA; see docs/operations/moe/streaming_signal_contract.md (section 4a).
     :param compact_sfa_sf_warp: ``sfa`` is compact E8M0 rows ``[M, K / 32]`` (as an EP dispatch delivers them), not SF
         atoms; a dedicated SF warp builds the atoms (MXFP8, ``K % 512 == 0``, cluster (2, 1); contract section 4a).
@@ -323,7 +323,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         streaming_signal_capacity: Optional[int] = None,
         device_layout: bool = False,
         use_pdl: bool = False,
-        launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
         compact_sfa_sf_warp: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
@@ -381,7 +381,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
             ),
             device_layout=device_layout,
             use_pdl=use_pdl,
-            launch_pdl_dependents_at_all_streaming_signal_slots_ready=launch_pdl_dependents_at_all_streaming_signal_slots_ready,
+            launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
             # Discrete weights always launch the helper; the dynamic counter reset also needs no scheduler_counter (__call__).
             launches_helper=weight_mode == MoEWeightMode.DISCRETE,
         )
@@ -429,7 +429,6 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         if self.use_sfb_reorder_warp:
             all_warps.append(self.sfb_reorder_warp_id)
             warps_wo_sched.append(self.sfb_reorder_warp_id)
-        all_warps += self.streaming_input_trigger_warps(len(all_warps))
         # compact_sfa_sf_warp: the SF warp goes last; it consumes tile_info like the TMA warp.
         self.sf_warp_id = len(all_warps) if compact_sfa_sf_warp else None
         if compact_sfa_sf_warp:
@@ -1813,6 +1812,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        self.streaming_input_entry()
         lane_idx = cute.arch.lane_idx()
 
         #
@@ -2030,8 +2030,6 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         # device_layout: total_token may predate the producer's layout write, so no CTA exits early here.
         if not self.device_layout and total_token <= 0:
             cute.arch.nvvm.exit()
-
-        self.streaming_input_trigger_warp(warp_idx, scheduler)
 
         #
         # Specialized Schedule warp (MoE Persistent Tile Scheduler)

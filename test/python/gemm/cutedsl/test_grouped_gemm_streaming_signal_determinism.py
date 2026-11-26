@@ -80,8 +80,7 @@ class Launcher:
 def signal_options(glu, capacity, variant):
     options = dict(streaming_signal_capacity=capacity)
     if variant == "signal_layout_pdl":
-        options.update(device_layout=True, use_pdl=True)
-        options["launch_pdl_dependents_at_all_streaming_signal_slots_ready" if glu else "launch_pdl_dependents_at_entry"] = True
+        options.update(device_layout=True, use_pdl=True, launch_pdl_dependents_at_entry=True)
     return options
 
 

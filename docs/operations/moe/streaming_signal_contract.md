@@ -186,7 +186,7 @@ output direction yet.
 The MXFP8 / NVFP4 block-scaled GLU kernel `BlockScaledMoEGroupedGemmGluBiasKernel` (`glu/`, FC1 forward, SM100) and its
 Rubin twin `BlockScaledMoEGroupedGemmGluKernel` (`glu/moe_blockscaled_grouped_gemm_glu_rubin.py`, SM107) take the BF16
 GLU kernel's input-direction options: `streaming_signal_capacity`, `device_layout`, `use_pdl` and
-`launch_pdl_dependents_at_all_streaming_signal_slots_ready`. Sections 1 and 2 hold unchanged, and `signal[t]` also covers
+`launch_pdl_dependents_at_entry`. Sections 1 and 2 hold unchanged, and `signal[t]` also covers
 M tile t's scale factors:
 
 | Item | Contract |
@@ -239,7 +239,7 @@ ordinary inputs that must be complete before the GEMM starts.
 
 | Item | Contract |
 |---|---|
-| options | `streaming_signal_capacity`, `use_pdl` and `launch_pdl_dependents_at_entry`; MXFP8 on SM100 also `compact_sfa_sf_warp` (as above). No `device_layout` and no all-slots-ready trigger: the expert layout is known before the backward dispatch. |
+| options | `streaming_signal_capacity`, `use_pdl` and `launch_pdl_dependents_at_entry`; MXFP8 on SM100 also `compact_sfa_sf_warp` (as above). No `device_layout`: the expert layout is known before the backward dispatch. |
 | M tile t | dY rows `[256 t, 256 (t + 1))`; MXFP8: their SF atoms or compact scale rows, as for the GLU. |
 | outputs | D, the row and column SFD and dprob are written per tile as without a producer. With `deterministic=True` (SM100) dprob has one slot per N tile, so it is bitwise independent of the release order. The Rubin kernel adds dprob partials with fp32 atomics in tile arrival order: its dprob is not deterministic (not even across replays without a producer); D is. |
 | other | Dense weights, `padded_offsets` in global memory, cluster (2, 1) with the 2-CTA MMA; on Rubin no B-reuse. |
@@ -262,8 +262,7 @@ holds unchanged, with these limits. The Rubin (SM107) quant kernel does not take
 | Option | Effect | Use |
 |---|---|---|
 | `use_pdl=True` | The GEMM launches as the programmatic dependent of the kernel before it on the stream, so it can start before that kernel ends; at exit every thread waits for that grid (`griddepcontrol.wait`). With `N_CHUNK` and its own reset, that kernel is the reset, and the wait moves to entry (see §3, Reset). It is rejected whenever the GEMM call enqueues its helper kernel right before the GEMM (discrete weights, or the dynamic scheduler with neither `streaming_signal_capacity` nor a caller's `scheduler_counter`), other than that own reset: the GEMM reads what the helper writes (B descriptors, the claim counter) before its exit wait. The constructor rejects what it can tell; the dependence on `scheduler_counter` is rejected at trace time. | The GEMM runs beside its producer on one stream (`streaming_signal_capacity`), or `N_CHUNK` with its own reset. |
-| `launch_pdl_dependents_at_entry=True` (plain, block-scaled quant and dGLU kernels) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
-| `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernels, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
+| `launch_pdl_dependents_at_entry=True` (plain, GLU, block-scaled quant and dGLU kernels) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter, an `N_CHUNK` consumer, or the next GEMM of a chain takes the SMs this grid leaves. |
 
 ## 6. Sketches
 
@@ -323,8 +322,7 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
   `ValueError`, because a CTA could exit while a peer still arrives on its shared memory.
 - `streaming_signal_capacity` and `N_CHUNK` cannot be combined in one kernel; both need `use_dynamic_sched=True`.
 - N must be known at build time (dense B).
-- `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
-  exists on the GLU kernels only and requires `streaming_signal_capacity`.
+- `device_layout` requires `streaming_signal_capacity`.
 - Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3); the input direction on the
   block-scaled GLU forward kernel and the BF16 and MXFP8 dGLU kernels, SM100 and the Rubin twins (section 4a); and
   `N_CHUNK` on the SM100 block-scaled quant forward kernel with BF16 D (section 4b; not the Rubin quant kernel yet).
