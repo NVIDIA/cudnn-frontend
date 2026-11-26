@@ -1770,7 +1770,10 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                 #
                 real_d, _ = epi_ext.get_gmem_tensor("d", mD_mnl, padded_offsets, epi_work_tile_info)
                 if cutlass.const_expr(self.generate_activation):
-                    real_activation, _ = epi_ext.get_gmem_tensor("d", mActivation, padded_offsets, epi_work_tile_info)
+                    # The activation takes SIMT stores from a memory tensor: offset it to this tile's first row in 64 bits,
+                    # since row x N passes 2^31 elements at large M (a 32-bit expert or tile offset would wrap).
+                    activation_row = cutlass.Int64(epi_ext.token_offset) + cutlass.Int64(epi_work_tile_info.tile_m_idx) * 128
+                    real_activation = cute.domain_offset((activation_row, 0, 0), mActivation)
                     activation_subtile = (cute.make_layout(128), cute.make_layout(self.mma_tiler[1]))
                     g_activation = cute.local_tile(real_activation, activation_subtile, (None, None, None))
                     t_activation = cute.filter_zeros(tiled_copy_t2r.get_slice(epi_tidx).partition_D(g_activation))
@@ -1913,7 +1916,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                         r_activation.store(primal.to(cutlass.BFloat16))
                         activation_n = epi_work_tile_info.tile_n_idx * self.mma_tiler[1] + real_subtile_idx * self.epi_tile[1]
                         if activation_n < cute.size(real_activation, mode=[1]):
-                            dst = t_activation[(None, 0, real_subtile_idx, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx, 0)]
+                            dst = t_activation[(None, 0, real_subtile_idx, 0, epi_work_tile_info.tile_n_idx, 0)]
                             self.store_global_memory_256b(dst, r_activation)
 
                     #
