@@ -3065,6 +3065,30 @@ def test_grouped_gemm_dglu_h_rejections(request, monkeypatch):
     with pytest.raises(ValueError, match="presence"):
         api.execute(**tensors)
 
+    # Replacement h buffers are checked against the current rows and N before the launch: a recorder stands in for
+    # the compiled kernel of the block-scaled implementation, so a malformed buffer never reaches the GPU.
+    api = make_api()
+    assert api.check_support()
+    launches = []
+    api._implementation._compiled_kernel = lambda **kwargs: launches.append(kwargs)
+    api.execute(**tensors, workspace=ws(api))
+    assert len(launches) == 1
+    h, sfh = tensors["h_tensor"], tensors["sfh_col_tensor"]
+    h_strided = torch.empty((rows, 2 * n, *h.shape[2:]), dtype=h.dtype, device=h.device)[:, :n]
+    sfh_strided = torch.empty(2 * sfh.numel(), dtype=sfh.dtype, device=sfh.device)[::2]
+    for match, overrides in [
+        ("h_tensor must have shape", {"h_tensor": h[:1]}),
+        ("h_tensor must have shape", {"h_tensor": h[:, : n // 2]}),
+        ("h_tensor must be dense", {"h_tensor": h_strided}),
+        ("h_tensor must have dtype", {"h_tensor": h.view(torch.float8_e5m2)}),
+        ("sfh_col_tensor must have shape", {"sfh_col_tensor": sfh[:1]}),
+        ("sfh_col_tensor must be contiguous", {"sfh_col_tensor": sfh_strided}),
+        ("sfh_col_tensor must have dtype", {"sfh_col_tensor": sfh.view(torch.uint8)}),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            api.execute(**{**tensors, **overrides}, workspace=ws(api))
+    assert len(launches) == 1, "a malformed h buffer reached the launch"
+
     # The wrapper: an h request the kernel cannot serve.
     with pytest.raises(ValueError, match="dswiglu"):
         _run_dglu_case(case, act_func="dgeglu", generate_h=True)

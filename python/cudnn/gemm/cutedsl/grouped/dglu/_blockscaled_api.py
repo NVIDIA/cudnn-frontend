@@ -428,6 +428,28 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         )
         return dict(h_tensor=canonical_mx_fake(h_fake, self.canonical_h), sfh_col_tensor=make_flat_sf_fake(self, self.sfh_col_desc))
 
+    def _check_h_buffers(self, a_tensor, c_tensor, h_tensor, sfh_col_tensor) -> None:
+        """Check the h outputs of one execute against its rows and N.
+
+        The kernel writes h and SFH_col at dense offsets from their base pointers (the compiled scale
+        argument carries no usable shape or stride), so a short or strided buffer would be written out of
+        bounds or at the wrong positions. Same contract as check_support, on the current dimensions.
+        """
+        rows, n = a_tensor.shape[0], c_tensor.shape[1] // 2
+        h_shape = (rows, n) if self.canonical_h else (rows, n, 1)
+        self._value_error_if(tuple(h_tensor.shape) != h_shape, f"h_tensor must have shape {h_shape}, got {tuple(h_tensor.shape)}")
+        self._value_error_if(not h_tensor.is_contiguous(), f"h_tensor must be dense and n-major, got stride {tuple(h_tensor.stride())}")
+        self._value_error_if(h_tensor.dtype != self.h_desc.dtype, f"h_tensor must have dtype {self.h_desc.dtype}, got {h_tensor.dtype}")
+        sfh_shape = (rows * n // 32,)
+        self._value_error_if(tuple(sfh_col_tensor.shape) != sfh_shape, f"sfh_col_tensor must have shape {sfh_shape}, got {tuple(sfh_col_tensor.shape)}")
+        self._value_error_if(not sfh_col_tensor.is_contiguous(), f"sfh_col_tensor must be contiguous, got stride {tuple(sfh_col_tensor.stride())}")
+        self._value_error_if(
+            sfh_col_tensor.dtype != self.sfh_col_desc.dtype,
+            f"sfh_col_tensor must have dtype {self.sfh_col_desc.dtype}, got {sfh_col_tensor.dtype}",
+        )
+        for name, tensor in (("h_tensor", h_tensor), ("sfh_col_tensor", sfh_col_tensor)):
+            self._value_error_if(tensor.device != a_tensor.device, f"{name} must be on {a_tensor.device}, got {tensor.device}")
+
     # --------------------------------------------------------------------- #
     #  check_support
     # --------------------------------------------------------------------- #
@@ -1490,6 +1512,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self._logger.debug("Entering execute")
         if (h_tensor is None) != (self.h_desc is None) or (sfh_col_tensor is None) != (self.sfh_col_desc is None):
             raise ValueError("h_tensor / sfh_col_tensor presence must match sample_h / sample_sfh_col at construction")
+        if h_tensor is not None:
+            self._check_h_buffers(a_tensor, c_tensor, h_tensor, sfh_col_tensor)
         if self.glu_layout == "gate_then_up":
             n_weight = (
                 b_nkl(b_tensor, self.b_major)[0]
