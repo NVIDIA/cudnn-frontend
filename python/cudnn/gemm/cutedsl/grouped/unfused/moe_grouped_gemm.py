@@ -898,6 +898,7 @@ class MoEGroupedGemmBf16Kernel:
                 counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
                 sched_storage=sched_storage,
                 streaming_signal_capacity=self.streaming_signal_capacity,
+                rows_alignment=self.FIX_PAD_SIZE,
                 release_zero=release_zero(release_zero_arg),
                 device_layout=self.device_layout,
             )
