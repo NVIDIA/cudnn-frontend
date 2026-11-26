@@ -328,7 +328,7 @@ def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta, 
 
 @pytest.mark.L0
 def test_signal_slot_release_warm_stress():
-    """The claim slot each cluster broadcasts is released only after every lane read it (python/cudnn/AGENTS.md Rule 11):
+    """The claim slot each cluster broadcasts is released only after every lane read it (consume-then-arrive slot release):
     back-to-back and shared-memory-poisoned launches of a shape with many claims per cluster, every byte against stock."""
     from warm_stress import StressCase, assert_warm_stress
 

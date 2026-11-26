@@ -144,7 +144,7 @@ class CompactSfaSfWarpMixin:
 
     @cute.jit
     def _sf_warp_next_tile(self, sInfo, tile_info, tile_info_pipeline, tile_info_consumer_state, zero):
-        """Read the next tile_info slot and release it with an arrive that depends on the values read (Rule 11)."""
+        """Read the next tile_info slot and release it with an arrive that depends on the values read (consume-then-arrive slot release)."""
         tile_info_pipeline.consumer_wait(tile_info_consumer_state)
         for idx in cutlass.range(4, unroll_full=True):
             tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
