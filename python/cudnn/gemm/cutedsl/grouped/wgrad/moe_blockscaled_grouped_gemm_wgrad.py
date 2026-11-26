@@ -86,6 +86,18 @@ def _cutlass_dsl_needs_fp4_layout_workaround() -> bool:
 
 _NEEDS_FP4_LAYOUT_WORKAROUND = _cutlass_dsl_needs_fp4_layout_workaround()
 
+#: ``pdl_mode`` values (see ``BlockScaledMoEGroupedGemmWgradKernel``); the first is the default.
+PDL_MODES = ("wait_at_start", "wait_then_trigger", "trigger_then_wait_at_exit")
+
+
+def check_pdl_mode(pdl_mode: str, use_pdl: bool, launch_pdl_dependents_at_entry: bool) -> None:
+    """Raise ``ValueError`` for a ``pdl_mode`` the PDL options exclude: a non-default mode needs ``use_pdl`` and places the
+    trigger itself, so it excludes ``launch_pdl_dependents_at_entry``."""
+    if pdl_mode not in PDL_MODES:
+        raise ValueError(f"pdl_mode must be one of {PDL_MODES}, got {pdl_mode!r}")
+    if pdl_mode != "wait_at_start" and (not use_pdl or launch_pdl_dependents_at_entry):
+        raise ValueError(f"pdl_mode={pdl_mode!r} requires use_pdl and sets the trigger itself (no launch_pdl_dependents_at_entry)")
+
 
 class BlockScaledMoEGroupedGemmWgradKernel:
     """Block-scaled grouped GEMM kernel for MoE weight gradient (2Dx2D).
@@ -106,7 +118,34 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         of the kernel before it on the stream, and this kernel as the helper's: the helper waits for its predecessor at
         its start, this kernel waits for the helper before its first global memory access, and the launches overlap.
     :param launch_pdl_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
+    :param pdl_mode: Where the GEMM waits for the grid before it on the stream (its programmatic primary) and where it
+        lets its own programmatic dependent launch. ``use_pdl`` turns PDL on; ``pdl_mode`` only moves the wait and the
+        trigger, so a non-default mode requires ``use_pdl=True``. The non-default modes place the trigger themselves, so
+        they exclude ``launch_pdl_dependents_at_entry`` (which only adds a trigger at entry to the default mode).
+
+        * ``"wait_at_start"`` (default): the placement described for ``use_pdl`` (wait before the first global memory
+          access); a trigger at entry only with ``launch_pdl_dependents_at_entry``. Without ``use_pdl`` nothing waits.
+        * ``"wait_then_trigger"``: the same wait, then every thread lets the dependent launch. The dependent therefore
+          starts only once the primary (and everything the primary waited for) has ended.
+        * ``"trigger_then_wait_at_exit"``: the dependent may launch at entry. There is no wait in front of the first
+          global memory access; every thread waits for the primary as its last instruction, so this grid still ends
+          after the primary. The GEMM reads A, B, the scale factors, the offsets and the claim counter while the
+          primary may still be running, so **the caller guarantees that no input of this GEMM is written by the grid
+          right before it**: each input must come from a grid that had ended before that grid let this one launch
+          (for example, the grid before it waited for the producer and only then triggered, as in
+          ``"wait_then_trigger"``). The kernel cannot check this; an input that grid writes is read stale. The mode
+          needs a call that launches no helper kernel in front of the GEMM (the helper would be the grid before it):
+          the global-descriptor and A-reuse kernels with CLC, or with ``atomic_counter_claim`` and a caller's
+          ``scheduler_counter``. This kernel always launches its descriptor helper, so it rejects the mode.
+
+    ``__call__`` also takes ``scheduler_counter`` (with ``atomic_counter_claim``): a caller-owned 1-D int32 tensor the
+    clusters claim from instead of the workspace counter. The kernel never resets it (no helper launch resets it), so
+    several launches with their own grids (``max_active_clusters``) can split one tile list: the caller zeroes it once
+    before the first of them, and each tile runs once. The workspace's own counter slot is then unused.
     """
+
+    #: The call launches a helper kernel in front of the GEMM on every call (it builds the per-expert descriptors).
+    CALL_LAUNCHES_HELPER = True
 
     def __init__(
         self,
@@ -123,7 +162,11 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         atomic_counter_claim: bool = False,
         use_pdl: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
+        pdl_mode: str = "wait_at_start",
     ):
+        check_pdl_mode(pdl_mode, use_pdl, launch_pdl_dependents_at_entry)
+        if pdl_mode == "trigger_then_wait_at_exit" and self.CALL_LAUNCHES_HELPER:
+            raise ValueError("pdl_mode='trigger_then_wait_at_exit': this kernel reads what its helper kernel writes; use a global-descriptor kernel")
         self.sf_vec_size = sf_vec_size
         self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.expert_cnt = expert_cnt
@@ -137,6 +180,14 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.atomic_counter_claim = atomic_counter_claim
         self.use_pdl = use_pdl
         self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
+        self.pdl_mode = pdl_mode
+        # Where the main kernel triggers and waits (const_expr flags; the default keeps the use_pdl placement).
+        self._trigger_at_entry = launch_pdl_dependents_at_entry or pdl_mode == "trigger_then_wait_at_exit"
+        self._wait_at_start = use_pdl and pdl_mode != "trigger_then_wait_at_exit"
+        self._wait_at_exit = pdl_mode == "trigger_then_wait_at_exit"
+        self._trigger_after_wait = pdl_mode == "wait_then_trigger"
+        # Set per trace by __call__: the helper resets the workspace counter only without a caller's scheduler_counter.
+        self._caller_counter = False
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -172,6 +223,23 @@ class BlockScaledMoEGroupedGemmWgradKernel:
     def get_workspace_bytes(self) -> int:
         # atomic_counter_claim: the scheduler's int32 tile counter follows the TMA descriptors.
         return self.get_desc_workspace_bytes() + (4 if self.atomic_counter_claim else 0)
+
+    def _check_scheduler_counter(self, scheduler_counter) -> bool:
+        """Trace time: whether the call claims from a caller's ``scheduler_counter``."""
+        if scheduler_counter is None:
+            return False
+        if not self.atomic_counter_claim:
+            raise ValueError("scheduler_counter requires atomic_counter_claim")
+        if scheduler_counter.element_type != cutlass.Int32:
+            raise ValueError("scheduler_counter must be int32")
+        return True
+
+    @cute.jit
+    def _claim_counter_ptr(self, workspace_ptr, scheduler_counter_ptr):
+        """The counter the clusters claim from: the caller's, else the workspace's."""
+        if cutlass.const_expr(scheduler_counter_ptr is not None):
+            return scheduler_counter_ptr
+        return self._get_sched_counter_ptr(workspace_ptr)
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):
@@ -368,7 +436,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         global_scale_b: Optional[cute.Tensor] = None,
         # Discrete-only: template tensor for a single expert's output (M, N) or (M, N, 1)
         out_single_expert: Optional[cute.Tensor] = None,
+        scheduler_counter: Optional[cute.Tensor] = None,
     ) -> None:
+        self._caller_counter = self._check_scheduler_counter(scheduler_counter)
         scale_a = kernel_facing_wgrad_sf(scale_a, mat_a.shape[0], mat_a.shape[1], self.sf_vec_size)
         scale_b = kernel_facing_wgrad_sf(scale_b, mat_b.shape[1], mat_b.shape[0], self.sf_vec_size)
 
@@ -661,6 +731,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             self.epi_tile,
             global_scale_a,
             global_scale_b,
+            scheduler_counter.iterator if cutlass.const_expr(scheduler_counter is not None) else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -765,7 +836,8 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         )
         expert_idx = cute.arch.block_idx()[0]
         ctor.construct_and_write(expert_idx)
-        if cutlass.const_expr(self.atomic_counter_claim):
+        # A caller's scheduler_counter is never reset here: launches sharing it split one tile list.
+        if cutlass.const_expr(self.atomic_counter_claim and not self._caller_counter):
             if expert_idx == cutlass.Int32(0):
                 counter = cute.make_tensor(self._get_sched_counter_ptr(workspace_ptr), cute.make_layout(1))
                 counter[0] = cutlass.Int32(0)
@@ -809,6 +881,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         epi_tile: cute.Tile,
         global_scale_a: Optional[cute.Tensor],
         global_scale_b: Optional[cute.Tensor],
+        scheduler_counter_ptr=None,
     ):
         """GPU device kernel for MoE wgrad with block scaling and CLC or atomic-counter scheduling."""
 
@@ -823,7 +896,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
         is_leader_cta = block_in_cluster_coord_vmnk[0] == 0
         tidx, _, _ = cute.arch.thread_idx()
-        if cutlass.const_expr(self.launch_pdl_dependents_at_entry):
+        if cutlass.const_expr(self._trigger_at_entry):
             cute.arch.griddepcontrol_launch_dependents()
 
         # =================================================================
@@ -904,7 +977,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             offs,
             cute.arch.block_idx(),
             cute.arch.grid_dim(),
-            counter_ptr=self._get_sched_counter_ptr(workspace_ptr) if cutlass.const_expr(self.atomic_counter_claim) else None,
+            counter_ptr=self._claim_counter_ptr(workspace_ptr, scheduler_counter_ptr) if cutlass.const_expr(self.atomic_counter_claim) else None,
             sched_storage=sched_storage,
         )
         scheduler.internal_init()
@@ -978,8 +1051,10 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         # use_pdl: the setup above touches no global memory; the helper kernel before this one may still be writing
         # the descriptors, so every thread waits for it here. The helper itself waited for its predecessor.
-        if cutlass.const_expr(self.use_pdl):
+        if cutlass.const_expr(self._wait_at_start):
             cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self._trigger_after_wait):
+            cute.arch.griddepcontrol_launch_dependents()
 
         # =================================================================
         # Scheduler warp (warp 6)

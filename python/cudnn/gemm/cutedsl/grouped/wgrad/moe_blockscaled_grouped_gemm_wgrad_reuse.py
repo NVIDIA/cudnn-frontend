@@ -249,6 +249,7 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
         global_scale_a=None,
         global_scale_b=None,
         out_single_expert=None,
+        scheduler_counter: Optional[cute.Tensor] = None,
     ) -> None:
         assert global_scale_a is None and global_scale_b is None and out_single_expert is None
         scale_a = kernel_facing_wgrad_sf(scale_a, mat_a.shape[0], mat_a.shape[1], self.sf_vec_size)
@@ -361,15 +362,7 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
             self.c_box,
         )
 
-        # No per-expert descriptor build: a helper launch only resets the atomic-counter-claim counter.
-        if cutlass.const_expr(self.atomic_counter_claim):
-            self.counter_reset_kernel(workspace.iterator).launch(
-                grid=(1, 1, 1),
-                block=(1, 1, 1),
-                stream=stream,
-                min_blocks_per_mp=1,
-                use_pdl=self.use_pdl,
-            )
+        self._launch_counter_reset(workspace, stream, scheduler_counter)
 
         # ======== Step 7: Launch main kernel ========
         self.kernel(
@@ -398,6 +391,7 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
             self.sfb_smem_layout_staged,
             self.c_smem_layout_staged,
             self.epi_tile,
+            scheduler_counter.iterator if cutlass.const_expr(scheduler_counter is not None) else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -435,9 +429,10 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
+        scheduler_counter_ptr=None,
     ):
         """GPU device kernel: MXFP8 wgrad with A reused across a unit's N tiles, CLC or atomic-counter scheduling."""
-        if cutlass.const_expr(self.launch_pdl_dependents_at_entry):
+        if cutlass.const_expr(self._trigger_at_entry):
             cute.arch.griddepcontrol_launch_dependents()
 
         warp_idx = cute.arch.warp_idx()
@@ -535,7 +530,7 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
             offs,
             cute.arch.block_idx(),
             cute.arch.grid_dim(),
-            counter_ptr=self._get_sched_counter_ptr(workspace_ptr) if cutlass.const_expr(self.atomic_counter_claim) else None,
+            counter_ptr=self._claim_counter_ptr(workspace_ptr, scheduler_counter_ptr) if cutlass.const_expr(self.atomic_counter_claim) else None,
             sched_storage=sched_storage,
         )
         scheduler.internal_init()
@@ -600,9 +595,11 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         # use_pdl: the setup above touches no global memory; the kernel before this one on the stream (the counter
         # reset, or the producer of A, B, the scale factors or the offsets) may still be running, so every thread
-        # waits for it here.
-        if cutlass.const_expr(self.use_pdl):
+        # waits for it here. pdl_mode='trigger_then_wait_at_exit' moves this wait to the kernel's end.
+        if cutlass.const_expr(self._wait_at_start):
             cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self._trigger_after_wait):
+            cute.arch.griddepcontrol_launch_dependents()
 
         # TMEM: epilogue warp 0 allocates, and the MMA and epilogue warps wait at this one site: the allocation
         # barrier is aligned, so every warp must reach it at the same instruction
@@ -1259,5 +1256,10 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
             tmem.relinquish_alloc_permit()
             epilog_sync_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
+
+        # pdl_mode='trigger_then_wait_at_exit': every thread waits for the grid before this one last, so this grid ends
+        # after it (the caller guarantees no input of this GEMM comes from that grid).
+        if cutlass.const_expr(self._wait_at_exit):
+            cute.arch.griddepcontrol_wait()
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

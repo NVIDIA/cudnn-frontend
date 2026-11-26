@@ -8,6 +8,9 @@
   with TensorRagged inputs, discrete output or ``atomic_counter_claim``), the helper launches the same way and waits for its
   predecessor at its start, so the chain is: producer, helper, main kernel.
 * ``launch_pdl_dependents_at_entry``: the main kernel lets its own dependent launch at its entry.
+* ``pdl_mode`` (MXFP8): ``"wait_at_start"`` is the ``use_pdl`` placement above; ``"wait_then_trigger"`` waits, then lets the
+  dependent launch; ``"trigger_then_wait_at_exit"`` lets it launch at entry and waits only at the end, so the caller
+  guarantees that no input comes from the grid right before it.
 
 MXFP8 with dense output at 2-CTA 256x256 tiles in a (2, 1) cluster runs the global-descriptor variant: no helper kernel
 (only the counter reset with ``atomic_counter_claim``), and for an expert whose token count is not a multiple of the K tile
@@ -70,6 +73,110 @@ def test_pdl_options_accepted_by_every_kernel():
         for weight_mode in (MoEWeightMode.DENSE, MoEWeightMode.DISCRETE):
             kernel = kernel_class(32, mma_tiler_mn=(128, 128), expert_cnt=4, weight_mode=weight_mode, **pdl)
             assert kernel.use_pdl and kernel.launch_pdl_dependents_at_entry
+
+
+def _mxfp8_kernel_classes():
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense_rubin import BlockScaledMoEGroupedGemmWgradDenseRubinKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse_rubin import BlockScaledMoEGroupedGemmWgradReuseRubinKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin import BlockScaledMoEGroupedGemmWgradRubinKernel
+
+    stock = (BlockScaledMoEGroupedGemmWgradKernel, BlockScaledMoEGroupedGemmWgradRubinKernel)
+    descriptor_free = (
+        BlockScaledMoEGroupedGemmWgradDenseKernel,
+        BlockScaledMoEGroupedGemmWgradReuseKernel,
+        BlockScaledMoEGroupedGemmWgradDenseRubinKernel,
+        BlockScaledMoEGroupedGemmWgradReuseRubinKernel,
+    )
+    return stock, descriptor_free
+
+
+@pytest.mark.L0
+def test_pdl_mode_kernel_rejections():
+    """pdl_mode on the MXFP8 kernel classes (SM100/SM103 and their Rubin subclasses): a known value; a non-default mode
+    needs use_pdl and excludes launch_pdl_dependents_at_entry; trigger_then_wait_at_exit is refused by the stock kernels,
+    whose descriptor helper always launches in front of the GEMM."""
+    import cutlass
+
+    stock, descriptor_free = _mxfp8_kernel_classes()
+    common = dict(sf_vec_size=32, acc_dtype=cutlass.Float32, use_2cta_instrs=True, mma_tiler_mn=(256, 256), cluster_shape_mn=(2, 1), expert_cnt=4)
+    for cls in stock + descriptor_free:
+        assert cls(**common).pdl_mode == "wait_at_start"
+        assert cls(**common, use_pdl=True, launch_pdl_dependents_at_entry=True).pdl_mode == "wait_at_start"
+        with pytest.raises(ValueError, match="pdl_mode must be one of"):
+            cls(**common, use_pdl=True, pdl_mode="exit")
+        for mode in ("wait_then_trigger", "trigger_then_wait_at_exit"):
+            with pytest.raises(ValueError, match="requires use_pdl"):
+                cls(**common, pdl_mode=mode)
+            with pytest.raises(ValueError, match="requires use_pdl"):
+                cls(**common, use_pdl=True, launch_pdl_dependents_at_entry=True, pdl_mode=mode)
+        assert cls(**common, use_pdl=True, pdl_mode="wait_then_trigger").pdl_mode == "wait_then_trigger"
+    for cls in stock:
+        with pytest.raises(ValueError, match="helper kernel"):
+            cls(**common, use_pdl=True, pdl_mode="trigger_then_wait_at_exit")
+    for cls in descriptor_free:
+        assert cls(**common, use_pdl=True, pdl_mode="trigger_then_wait_at_exit").pdl_mode == "trigger_then_wait_at_exit"
+
+
+def _cpu_mxfp8_sample(experts=4, m=256, n=256, tokens=1024):
+    cols = -(-(-(-tokens // 32)) // 4) * 4
+    return dict(
+        sample_a=torch.zeros((m, tokens), dtype=torch.float8_e4m3fn),
+        sample_b=torch.zeros((n, tokens), dtype=torch.float8_e4m3fn).t(),
+        sample_sfa=torch.zeros((m, cols), dtype=torch.float8_e8m0fnu),
+        sample_sfb=torch.zeros((n, cols), dtype=torch.float8_e8m0fnu),
+        sample_offsets=torch.arange(1, experts + 1, dtype=torch.int32) * (tokens // experts),
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+    )
+
+
+@pytest.mark.L0
+def test_pdl_mode_and_scheduler_counter_api_rejections():
+    """The class API refuses what the kernels would: at construction, a bad pdl_mode and a caller counter without
+    atomic_counter_claim; when the backend is chosen (check_support), the BF16 backend, trigger_then_wait_at_exit where the
+    stock kernel is selected (discrete output, accumulate_on_output), and trigger_then_wait_at_exit with
+    atomic_counter_claim but no caller counter. No device needed."""
+    import cudnn
+
+    sample = _cpu_mxfp8_sample()
+    dense = dict(sample, sample_wgrad=torch.empty((4, 256, 256), dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="pdl_mode must be one of"):
+        cudnn.GroupedGemmWgradSm100(**dense, use_pdl=True, pdl_mode="later")
+    for mode in ("wait_then_trigger", "trigger_then_wait_at_exit"):
+        with pytest.raises(ValueError, match="requires use_pdl"):
+            cudnn.GroupedGemmWgradSm100(**dense, pdl_mode=mode)
+        with pytest.raises(ValueError, match="requires use_pdl"):
+            cudnn.GroupedGemmWgradSm100(**dense, use_pdl=True, launch_pdl_dependents_at_entry=True, pdl_mode=mode)
+    with pytest.raises(ValueError, match="requires atomic_counter_claim"):
+        cudnn.GroupedGemmWgradSm100(**dense, sample_scheduler_counter=torch.zeros(1, dtype=torch.int32))
+
+    exit_mode = dict(use_pdl=True, pdl_mode="trigger_then_wait_at_exit")
+    discrete = dict(
+        sample, sample_wgrad_expert=torch.empty((256, 256), dtype=torch.bfloat16), num_experts=4, wgrad_shape=(256, 256), wgrad_dtype=torch.bfloat16
+    )
+    for kwargs, match in (
+        (dict(dense, atomic_counter_claim=True, **exit_mode), "needs sample_scheduler_counter"),
+        (dict(discrete, **exit_mode), "selects the stock kernel"),
+        (dict(dense, accumulate_on_output=True, **exit_mode), "selects the stock kernel"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            cudnn.GroupedGemmWgradSm100(**kwargs).check_support()
+
+    bf16 = dict(
+        sample_a=torch.zeros((256, 1024), dtype=torch.bfloat16),
+        sample_b=torch.zeros((1024, 256), dtype=torch.bfloat16),
+        sample_sfa=None,
+        sample_sfb=None,
+        sample_offsets=torch.arange(1, 5, dtype=torch.int32) * 256,
+        sample_wgrad=torch.empty((4, 256, 256), dtype=torch.bfloat16),
+    )
+    with pytest.raises(ValueError, match="require the block-scaled WGrad backend"):
+        cudnn.GroupedGemmWgradSm100(**bf16, use_pdl=True, pdl_mode="wait_then_trigger").check_support()
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +257,7 @@ class _Op:
         select = getattr(self.op._implementation, "_select_kernel", None)
         self.kernel_class = select() if select is not None else self.op._kernel
 
-    def __call__(self, a, out, offsets=None):
+    def __call__(self, a, out, offsets=None, counter=None):
         if self.discrete and out.data_ptr() not in self._ptrs:
             self._ptrs[out.data_ptr()] = torch.tensor([e.data_ptr() for e in out], dtype=torch.int64, device="cuda")
         self.op.execute(
@@ -161,6 +268,7 @@ class _Op:
             offsets_tensor=self.problem["offsets"] if offsets is None else offsets,
             wgrad_tensor=None if self.discrete else out,
             wgrad_ptrs=self._ptrs.get(out.data_ptr()) if self.discrete else None,
+            scheduler_counter_tensor=counter,
         )
 
 
@@ -397,3 +505,184 @@ def test_launch_dependents_at_entry_with_dependent_copy(config, variant):
     finally:
         graph.reset()
     assert all(o and s for o, s in results), f"(output, dependent copy) bitwise equal per run: {results}"
+
+
+# ---------------------------------------------------------------------------
+# pdl_mode behind a producer of A (MXFP8)
+# ---------------------------------------------------------------------------
+#
+# The kernel classes run through the split helpers of test_grouped_gemm_wgrad_atomic_counter (own grids, a caller-owned
+# counter); "api" runs the same chains through GroupedGemmWgradSm100. The producer is EarlyReleaseWriter: it lets its
+# dependents start at once and writes A slowly.
+
+# The trigger_then_wait_at_exit GEMM may read A before the grid right before it ends, so A must not come from that grid.
+EXIT_ARRANGEMENTS = {
+    # producer -> first launch (wait_then_trigger) -> second launch (exit wait): the first launch releases the second
+    # only after its wait for the producer, so A is final. The documented use.
+    "producer_tail_base": "correct",
+    # producer -> exit-wait launch: the producer is its direct predecessor (breaks the contract).
+    "producer_base": "unsafe",
+    # producer -> first launch that triggers at entry, before its wait -> exit-wait launch (breaks the contract).
+    "producer_tail_at_entry_base": "unsafe",
+}
+
+
+class _ApiSplit:
+    """The split chain through the class API on the problem of the class-level split tests."""
+
+    def __init__(self):
+        from gemm.cutedsl.test_grouped_gemm_wgrad_atomic_counter import split_problem
+
+        problem = split_problem()
+        self.counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+        config = ((256, 256), (2, 1))
+        ctr = dict(sample_scheduler_counter=self.counter)
+        self.single = _Op(problem, "mxfp8", config)
+        self.start = _Op(problem, "mxfp8", config, use_pdl=True)
+        self.tail = _Op(problem, "mxfp8_counter", config, use_pdl=True, pdl_mode="wait_then_trigger", **ctr)
+        self.base = _Op(problem, "mxfp8_counter", config, use_pdl=True, pdl_mode="trigger_then_wait_at_exit", **ctr)
+        self.entry_tail = _Op(problem, "mxfp8_counter", config, use_pdl=True, launch_pdl_dependents_at_entry=True, **ctr)
+        self.wtt = _Op(problem, "mxfp8", config, use_pdl=True, pdl_mode="wait_then_trigger")
+        for op in (self.single, self.start, self.tail, self.base, self.wtt):
+            _check_global_descriptor_path(op, "mxfp8", config)
+
+
+_API_SPLIT = {}
+
+
+def _launches(impl):
+    """(reference dW, {role: launch(a, out, counter)}) for a kernel class name or "api"."""
+    if impl == "api":
+        if "s" not in _API_SPLIT:
+            _API_SPLIT["s"] = _ApiSplit()
+        api = _API_SPLIT["s"]
+        expected = torch.full_like(api.single.problem["output"], float("nan"))
+        api.single(api.single.problem["a"], expected)
+        torch.cuda.synchronize()
+
+        def counted(op):
+            return lambda a, out, counter: op(a, out, counter=counter)
+
+        roles = {
+            "wait_at_start": lambda a, out, counter=None: api.start(a, out),
+            "wait_then_trigger": lambda a, out, counter=None: api.wtt(a, out),
+            "tail": counted(api.tail),
+            "base": counted(api.base),
+            "tail_at_entry": counted(api.entry_tail),
+        }
+        return expected, roles
+    from gemm.cutedsl.test_grouped_gemm_wgrad_atomic_counter import TAIL_CLUSTERS, split_base, split_launch, split_reference, split_tail
+
+    roles = {
+        "wait_at_start": split_launch("pdl_start", impl, use_pdl=True),
+        "wait_then_trigger": split_launch("pdl_wtt", impl, use_pdl=True, pdl_mode="wait_then_trigger"),
+        "tail": split_tail(impl),
+        "base": split_base(impl),
+        "tail_at_entry": split_launch("tail_at_entry", impl, clusters=TAIL_CLUSTERS, counter=True, use_pdl=True, launch_pdl_dependents_at_entry=True),
+    }
+    return split_reference(impl), roles
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mode", ["wait_at_start", "wait_then_trigger", "trigger_then_wait_at_exit"])
+@pytest.mark.parametrize("impl", ["dense", "reuse", "api"])
+def test_pdl_mode_behind_producer_of_a(impl, mode):
+    """Each pdl_mode behind an early-releasing producer of A, eager and replayed from a CUDA graph; dW must be the
+    single plain launch's every time.
+
+    * wait_at_start: producer -> GEMM.
+    * wait_then_trigger: producer -> GEMM -> a dependent copy of A that does NOT wait: it starts only when the GEMM
+      triggers, which is after the GEMM's wait, so it must copy the final A.
+    * trigger_then_wait_at_exit: producer -> first launch (wait_then_trigger) -> exit-wait launch, on one caller counter;
+      the producer is not the exit-wait launch's direct predecessor, as the contract requires. Two arrangements that
+      break the contract (the producer right before the exit-wait launch, or a first launch that triggers before its
+      wait; the latter only on the kernel classes' small first grid) must read stale A whenever the positive control
+      shows a dependent starting early.
+    """
+    _require_sm100()
+    if impl != "api":
+        from gemm.cutedsl.test_grouped_gemm_wgrad_atomic_counter import require_sm100_sm103
+
+        require_sm100_sm103()
+    elif torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("The global-descriptor wgrad is SM100/SM103/SM107 only")
+    from pdl_dependent_copy import DependentCopy, EarlyReleaseWriter
+    from gemm.cutedsl.test_grouped_gemm_wgrad_atomic_counter import split_problem
+
+    expected, roles = _launches(impl)
+    p = split_problem()
+    a_final = p["a"].clone()
+    a_buf = torch.empty_like(a_final)
+    stale = torch.empty_like(a_final)
+    stale.view(torch.uint8).copy_(~a_final.view(torch.uint8))  # zero-free and far from A
+    writer = EarlyReleaseWriter(torch.device("cuda"))
+    unwaited = DependentCopy(torch.device("cuda"), wait=False)
+    seen = torch.empty_like(a_final)
+    counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+    out = torch.empty_like(expected)
+
+    def chain_for(arrangement):
+        def chain():
+            counter.zero_()
+            writer(a_final, a_buf)
+            if arrangement in ("wait_at_start", "wait_then_trigger"):
+                roles[arrangement](a_buf, out)
+                if arrangement == "wait_then_trigger":
+                    unwaited(a_buf, seen)
+                return
+            if arrangement == "producer_tail_base":
+                roles["tail"](a_buf, out, counter)
+            elif arrangement == "producer_tail_at_entry_base":
+                roles["tail_at_entry"](a_buf, out, counter)
+            roles["base"](a_buf, out, counter)
+
+        return chain
+
+    def control():
+        writer(a_final, a_buf)
+        unwaited(a_buf, seen)
+
+    arrangements = EXIT_ARRANGEMENTS if mode == "trigger_then_wait_at_exit" else {mode: "correct"}
+    if impl == "api" and mode == "trigger_then_wait_at_exit":
+        # The API sizes both launches to the whole device, so the exit-wait launch's CTAs find SMs only as CTAs of the
+        # first launch exit, which happens after their wait for the producer: an early trigger there cannot show.
+        arrangements = {k: v for k, v in arrangements.items() if k != "producer_tail_at_entry_base"}
+    for arrangement in arrangements:  # warm every launch
+        chain_for(arrangement)()
+    control()
+    torch.cuda.synchronize()
+
+    def run(launch, check):
+        a_buf.copy_(stale)
+        out.fill_(float("nan"))
+        seen.copy_(stale)
+        torch.cuda.synchronize()
+        launch()
+        torch.cuda.synchronize()
+        return check()
+
+    def a_final_seen():
+        return torch.equal(seen.view(torch.uint8), a_final.view(torch.uint8))
+
+    def check(arrangement):
+        if arrangement == "wait_then_trigger":
+            return lambda: _same(out, expected) and a_final_seen()
+        return lambda: _same(out, expected)
+
+    early_starts = sum(run(control, lambda: not a_final_seen()) for _ in range(3))
+    report = {}
+    for arrangement in arrangements:
+        chain = chain_for(arrangement)
+        graph = _graph(chain)
+        try:
+            report[arrangement] = [run(launch, check(arrangement)) for launch in (chain, chain, chain, graph.replay, graph.replay)]
+        finally:
+            graph.reset()
+    for arrangement, kind in arrangements.items():
+        if kind == "correct":
+            assert all(report[arrangement]), f"{arrangement}: differs from the single plain launch: {report}"
+    if early_starts == 0:
+        pytest.skip(f"no early start reproduced on this device (coverage gap); runs: {report}")
+    for arrangement, kind in arrangements.items():
+        if kind == "unsafe":
+            assert not all(report[arrangement]), f"{arrangement}: no stale read although dependents start early: {report}"

@@ -542,8 +542,12 @@ def test_atomic_counter_claim_api_surface():
     # Appended after input_order, so earlier positional calls keep their meaning; only the PDL options follow it.
     names = [p.name for p in init]
     at = names.index("atomic_counter_claim")
-    assert names[at - 1] == "input_order" and names[at + 1 :] == ["use_pdl", "launch_pdl_dependents_at_entry"]
-    assert all(p.default is False for p in init[at:])
+    after = ["use_pdl", "launch_pdl_dependents_at_entry", "pdl_mode", "sample_scheduler_counter"]
+    assert names[at - 1] == "input_order" and names[at + 1 :] == after
+    assert all(p.default is False for p in init[at : at + 3])
+    assert init[at + 3].default == "wait_at_start" and init[at + 4].default is None
+    counter = inspect.signature(cudnn.grouped_gemm_wgrad_wrapper_sm100).parameters["scheduler_counter_tensor"]
+    assert counter.kind is inspect.Parameter.KEYWORD_ONLY and counter.default is None
     size = inspect.signature(cudnn.get_grouped_gemm_wgrad_workspace_size_sm100).parameters["atomic_counter_claim"]
     assert size.kind is inspect.Parameter.KEYWORD_ONLY and size.default is False
     for mode in ("dense", "discrete"):
@@ -607,3 +611,340 @@ def test_atomic_counter_claim_rejected_on_the_jax_mxfp8_path():
     a = jnp.zeros((128, 128), dtype=jnp.float8_e4m3fn)
     with pytest.raises(ValueError, match="atomic_counter_claim is unsupported for the JAX MXFP8 path"):
         wgrad_api.grouped_gemm_wgrad_wrapper_sm100(a, a, a, a, jnp.zeros((1,), dtype=jnp.int32), sf_vec_size=32, atomic_counter_claim=True)
+
+
+# ---------------------------------------------------------------------------
+# A caller-owned claim counter (scheduler_counter): one wgrad split across launches
+# ---------------------------------------------------------------------------
+#
+# With atomic_counter_claim, the MXFP8 kernel classes take a caller's int32 ``scheduler_counter`` in ``__call__`` (the
+# class API: ``sample_scheduler_counter`` / ``scheduler_counter_tensor``). Nothing but the caller resets it, so launches
+# with their own persistent grids claim from one tile list and each tile runs once: for example a weight gradient split
+# across two launches that overlap other work, one on the SMs another kernel leaves free and one on the rest. The kernels
+# are called through their classes here, which take ``max_active_clusters`` per launch. dW of every split must be
+# byte-equal to one default launch of the same kernel class.
+
+SPLIT_M, SPLIT_N = 1024, 1024
+# Uneven experts in whole 128-token K tiles, two of them empty.
+SPLIT_GROUPS = (256, 0, 768, 2048, 0, 256, 512, 1024)
+SPLIT_TILE, SPLIT_CLUSTER = (256, 256), (2, 1)
+TAIL_CLUSTERS, BASE_CLUSTERS = 2, 6
+
+
+def require_sm100_sm103():
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor not in (100, 103):
+        pytest.skip("The split tests call the SM100/SM103 kernel classes")
+
+
+def split_kernel_classes():
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel
+
+    return {
+        "stock": BlockScaledMoEGroupedGemmWgradKernel,
+        "dense": BlockScaledMoEGroupedGemmWgradDenseKernel,
+        "reuse": BlockScaledMoEGroupedGemmWgradReuseKernel,
+    }
+
+
+_SPLIT_PROBLEM = {}
+
+
+def split_problem():
+    if "p" not in _SPLIT_PROBLEM:
+        _SPLIT_PROBLEM["p"] = _make_mxfp8_problem(SPLIT_GROUPS, SPLIT_M, SPLIT_N, seed=17)
+    return _SPLIT_PROBLEM["p"]
+
+
+def split_units(name):
+    """Work units the scheduler hands out: output tiles, or for the A-reuse kernel units of N tiles."""
+    tiles = len(SPLIT_GROUPS) * (SPLIT_M // SPLIT_TILE[0]) * (SPLIT_N // SPLIT_TILE[1])
+    if name == "reuse":
+        return tiles // split_kernel_classes()["reuse"].n_group_for(SPLIT_N)
+    return tiles
+
+
+def _cute(t, align=16):
+    from cutlass.cute.runtime import from_dlpack
+
+    return from_dlpack(t, assumed_align=align)
+
+
+class SplitLaunch:
+    """One compiled kernel class instance on ``clusters`` persistent clusters (None: the device's), called on caller
+    tensors on the current stream. ``counter``: compiled for a caller ``scheduler_counter``. Own workspace."""
+
+    def __init__(self, name, clusters=None, counter=False, **options):
+        import cutlass
+        import cutlass.cute as cute
+        from cutlass.cute.runtime import make_fake_stream
+        from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode, WGradInputOrder
+
+        claim = options.pop("atomic_counter_claim", False) or counter
+        kernel = split_kernel_classes()[name](
+            sf_vec_size=32,
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=True,
+            mma_tiler_mn=SPLIT_TILE,
+            cluster_shape_mn=SPLIT_CLUSTER,
+            expert_cnt=len(SPLIT_GROUPS),
+            weight_mode=MoEWeightMode.DENSE,
+            input_order=WGradInputOrder.Tensor2D,
+            atomic_counter_claim=claim,
+            **options,
+        )
+        if clusters is None:
+            clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(SPLIT_CLUSTER[0] * SPLIT_CLUSTER[1])
+        self.kernel, self.clusters, self.counter = kernel, clusters, counter
+        self.workspace = torch.zeros(max(kernel.get_workspace_bytes(), 128), dtype=torch.uint8, device="cuda")
+        p = split_problem()
+        args = self._args(p["a"], p["output"], torch.zeros(1, dtype=torch.int32, device="cuda") if counter else None)
+        self.compiled = cute.compile(kernel, *args[:7], clusters, make_fake_stream(), *args[7:])
+
+    def _args(self, a, out, counter):
+        p = split_problem()
+        args = [_cute(a), _cute(p["b"]), _cute(p["sfa"]), _cute(p["sfb"]), _cute(out), _cute(p["offsets"], 4), _cute(self.workspace, 128)]
+        tail = [None, None, None]
+        if counter is not None:
+            tail.append(_cute(counter, 4))
+        return args + tail
+
+    def __call__(self, a, out, counter=None):
+        import cuda.bindings.driver as cuda
+
+        assert (counter is not None) == self.counter
+        args = self._args(a, out, counter)
+        self.compiled(*args[:7], cuda.CUstream(torch.cuda.current_stream().cuda_stream), *args[7:])
+
+
+_SPLIT_LAUNCHES = {}
+
+
+def split_launch(key, name, **kwargs):
+    """A cached ``SplitLaunch`` (compiled once per test session)."""
+    if (key, name) not in _SPLIT_LAUNCHES:
+        _SPLIT_LAUNCHES[key, name] = SplitLaunch(name, **kwargs)
+    return _SPLIT_LAUNCHES[key, name]
+
+
+def split_reference(name):
+    """dW of one default launch of the kernel class."""
+    out = torch.full_like(split_problem()["output"], float("nan"))
+    split_launch("single", name)(split_problem()["a"], out)
+    torch.cuda.synchronize()
+    return out
+
+
+def split_tail(name):
+    """The first launch of a split: waits for its predecessor, then lets the second launch start."""
+    return split_launch("tail", name, clusters=TAIL_CLUSTERS, counter=True, use_pdl=True, pdl_mode="wait_then_trigger")
+
+
+def split_base(name):
+    """The second launch of a split: reads at once and waits for the first launch at its exit."""
+    return split_launch("base", name, clusters=BASE_CLUSTERS, counter=True, use_pdl=True, pdl_mode="trigger_then_wait_at_exit")
+
+
+def same_bits(x, y):
+    return torch.equal(x.view(torch.int16), y.view(torch.int16))
+
+
+def capture(chain):
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        chain()
+    return graph
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("name", ["dense", "reuse"])
+def test_scheduler_counter_split_matches_single_launch(name):
+    """Two launches with different grids (2 and 6 clusters) on one caller-zeroed counter, eager and replayed from a CUDA
+    graph (the zeroing inside it): dW byte-equal to one default launch, and the counter at one claim per work unit plus
+    each cluster's final empty claim. A counter preset past every unit runs no tile at all."""
+    require_sm100_sm103()
+    expected = split_reference(name)
+    p = split_problem()
+    tail, base = split_tail(name), split_base(name)
+    counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+    out = torch.empty_like(expected)
+    claims = split_units(name) + TAIL_CLUSTERS + BASE_CLUSTERS
+
+    def chain():
+        counter.zero_()
+        tail(p["a"], out, counter)
+        base(p["a"], out, counter)
+
+    results = []
+    graph = None
+    try:
+        for run in ("eager", "eager", "graph", "graph"):
+            out.fill_(float("nan"))
+            torch.cuda.synchronize()
+            if run == "graph":
+                graph = graph or capture(chain)
+                graph.replay()
+            else:
+                chain()
+            torch.cuda.synchronize()
+            results.append((run, same_bits(out, expected), int(counter.item())))
+    finally:
+        if graph is not None:
+            graph.reset()
+    assert all(ok and c == claims for _, ok, c in results), f"(run, dW bitwise equal, counter) per run, counter expected {claims}: {results}"
+
+    # Preclaimed: every unit already taken, so neither launch writes dW (no launch resets the counter).
+    out.fill_(float("nan"))
+    counter.fill_(split_units(name))
+    tail(p["a"], out, counter)
+    base(p["a"], out, counter)
+    torch.cuda.synchronize()
+    assert bool(out.isnan().all()), "a launch ran a tile the counter had already given out"
+    assert int(counter.item()) == claims
+
+
+@pytest.mark.L0
+def test_scheduler_counter_stock_kernel_across_streams():
+    """The stock kernel keeps its descriptor helper (per launch, own workspace) but leaves a caller's counter alone: two
+    launches with different grids on two streams split one tile list."""
+    require_sm100_sm103()
+    name = "stock"
+    expected = split_reference(name)
+    p = split_problem()
+    first = split_launch("s1", name, clusters=TAIL_CLUSTERS, counter=True)
+    second = split_launch("s2", name, clusters=BASE_CLUSTERS, counter=True)
+    counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+    out = torch.full_like(expected, float("nan"))
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    first(p["a"], out, counter)
+    with torch.cuda.stream(side):
+        second(p["a"], out, counter)
+    torch.cuda.synchronize()
+    assert same_bits(out, expected)
+    assert int(counter.item()) == split_units(name) + TAIL_CLUSTERS + BASE_CLUSTERS
+
+
+def _counter_op(problem, counter, output_mode="dense", **options):
+    kwargs = dict(
+        sample_a=problem["a"],
+        sample_b=problem["b"],
+        sample_sfa=problem["sfa"],
+        sample_sfb=problem["sfb"],
+        sample_offsets=problem["offsets"],
+        acc_dtype=torch.float32,
+        mma_tiler_mn=SPLIT_TILE,
+        cluster_shape_mn=SPLIT_CLUSTER,
+        sf_vec_size=32,
+        atomic_counter_claim=True,
+        sample_scheduler_counter=counter,
+        **options,
+    )
+    if output_mode == "dense":
+        kwargs["sample_wgrad"] = problem["output"]
+    else:
+        out = problem["output"]
+        kwargs.update(sample_wgrad_expert=out[0], num_experts=out.shape[0], wgrad_shape=tuple(out.shape[1:]), wgrad_dtype=out.dtype)
+    op = cudnn.GroupedGemmWgradSm100(**kwargs)
+    assert op.check_support()
+    op.compile()
+    return op
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("output_mode", ["dense", "discrete"])
+def test_scheduler_counter_class_api_and_wrapper(output_mode):
+    """The class API and the wrapper take the caller's counter. Two class-API objects (in the wait_then_trigger /
+    trigger_then_wait_at_exit pair for dense output) split one tile list, eager and from a CUDA graph; a second call on
+    the same counter without zeroing it runs no tile, so no launch resets it. The presence of the counter must match
+    construction."""
+    problem = split_problem()
+    discrete = output_mode == "discrete"
+    expected = torch.full_like(problem["output"], float("nan"))
+    plain = _counter_op(problem, None, output_mode)
+    _class_execute_out = dict(wgrad_ptrs=_expert_ptrs(expected)) if discrete else dict(wgrad_tensor=expected)
+    plain.execute(problem["a"], problem["b"], problem["sfa"], problem["sfb"], problem["offsets"], **_class_execute_out)
+    torch.cuda.synchronize()
+    check_ref_grouped_gemm_wgrad(expected, problem["reference"])
+
+    counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+    pdl = {} if discrete else dict(use_pdl=True)
+    first = _counter_op(problem, counter, output_mode, **pdl, **({} if discrete else dict(pdl_mode="wait_then_trigger")))
+    second = _counter_op(problem, counter, output_mode, **pdl, **({} if discrete else dict(pdl_mode="trigger_then_wait_at_exit")))
+    out = torch.empty_like(expected)
+    target = dict(wgrad_ptrs=_expert_ptrs(out)) if discrete else dict(wgrad_tensor=out)
+
+    def run(op):
+        op.execute(problem["a"], problem["b"], problem["sfa"], problem["sfb"], problem["offsets"], **target, scheduler_counter_tensor=counter)
+
+    def chain():
+        counter.zero_()
+        run(first)
+        run(second)
+
+    results = []
+    graph = None
+    try:
+        for mode in ("eager", "eager", "graph", "graph"):
+            out.fill_(float("nan"))
+            torch.cuda.synchronize()
+            if mode == "graph":
+                graph = graph or capture(chain)
+                graph.replay()
+            else:
+                chain()
+            torch.cuda.synchronize()
+            results.append((mode, same_bits(out, expected)))
+    finally:
+        if graph is not None:
+            graph.reset()
+    assert all(ok for _, ok in results), results
+
+    out.fill_(float("nan"))
+    run(first)  # the counter is already past every unit
+    torch.cuda.synchronize()
+    assert bool(out.isnan().all()), "a launch reset the caller's counter"
+
+    with pytest.raises(ValueError, match="presence must match"):
+        first.execute(problem["a"], problem["b"], problem["sfa"], problem["sfb"], problem["offsets"], **target)
+    with pytest.raises(ValueError, match="presence must match"):
+        plain.execute(problem["a"], problem["b"], problem["sfa"], problem["sfb"], problem["offsets"], **target, scheduler_counter_tensor=counter)
+    with pytest.raises(ValueError, match="CUDA int32"):
+        run_bad = counter.to(torch.int64)
+        first.execute(problem["a"], problem["b"], problem["sfa"], problem["sfb"], problem["offsets"], **target, scheduler_counter_tensor=run_bad)
+
+    # The wrapper: the counter goes into its cache key; it is used, not reset.
+    def wrapper(c):
+        cudnn.grouped_gemm_wgrad_wrapper_sm100(
+            a_tensor=problem["a"],
+            b_tensor=problem["b"],
+            sfa_tensor=problem["sfa"],
+            sfb_tensor=problem["sfb"],
+            offsets_tensor=problem["offsets"],
+            output_mode=output_mode,
+            wgrad_tensor=None if discrete else out,
+            wgrad_ptrs=target.get("wgrad_ptrs"),
+            acc_dtype=torch.float32,
+            wgrad_dtype=out.dtype,
+            mma_tiler_mn=SPLIT_TILE,
+            cluster_shape_mn=SPLIT_CLUSTER,
+            sf_vec_size=32,
+            atomic_counter_claim=True,
+            scheduler_counter_tensor=c,
+        )
+        torch.cuda.synchronize()
+
+    for attempt in range(2):
+        counter.zero_()
+        out.fill_(float("nan"))
+        wrapper(counter)
+        assert same_bits(out, expected), f"wrapper call {attempt}"
+    out.fill_(float("nan"))
+    wrapper(counter)
+    assert bool(out.isnan().all()), "the wrapper reset the caller's counter"
+    with pytest.raises(ValueError, match="requires atomic_counter_claim"):
+        cudnn.grouped_gemm_wgrad_wrapper_sm100(
+            problem["a"], problem["b"], problem["sfa"], problem["sfb"], problem["offsets"], wgrad_tensor=out, sf_vec_size=32, scheduler_counter_tensor=counter
+        )

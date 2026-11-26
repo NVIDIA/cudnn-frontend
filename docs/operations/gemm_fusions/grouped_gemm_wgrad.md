@@ -299,6 +299,55 @@ generates the same code as without them):
 | `use_pdl=True` | The main kernel launches as the programmatic dependent of the kernel before it on the stream, so its setup (shared memory, barriers, scheduler state) overlaps that kernel's tail; every thread waits for that grid (`griddepcontrol.wait`) before its first global memory access. When the call launches the helper kernel (every block-scaled call; BF16 with TensorRagged inputs, discrete output or `atomic_counter_claim`), the helper launches the same way and waits for its predecessor at its start, and the main kernel waits for the helper: previous kernel, helper, main kernel. | Every configuration, BF16 and block-scaled. |
 | `launch_pdl_dependents_at_entry=True` | The main kernel lets its own programmatic dependent launch at its entry. The dependent must wait (`griddepcontrol.wait`) before it reads the wgrad output. | Every configuration, BF16 and block-scaled. |
 
+### Split launches on a caller-owned counter (MXFP8, experimental)
+
+One MXFP8 wgrad can run as several launches that share one tile list, for
+example a weight gradient split across two launches that overlap other work:
+a first launch on the SMs another kernel leaves free and a second on the rest,
+each with its own persistent grid. Two options do this. They are block-scaled
+only; BF16 rejects them.
+
+- **A caller-owned claim counter.** `GroupedGemmWgradSm100(...,
+  atomic_counter_claim=True, sample_scheduler_counter=counter)` compiles for a
+  contiguous 1-D CUDA int32 tensor, passed to every call as
+  `execute(..., scheduler_counter_tensor=counter)` (the wrapper takes
+  `scheduler_counter_tensor=` directly). The kernel classes take it as the
+  `scheduler_counter` argument of `__call__`.
+  - The clusters claim from `counter[0]`, and no launch resets it. The caller
+    zeroes it on the stream once before the first launch of a group. Launches
+    that share it split one tile list, and each tile runs once.
+  - The global-descriptor and A-reuse kernels then launch nothing in front of
+    the GEMM. The stock kernel still launches its descriptor helper, so
+    concurrent launches of it need their own workspaces.
+- **`pdl_mode`** (constructor; default `"wait_at_start"`). `use_pdl` turns PDL
+  on and `pdl_mode` only moves the wait and the trigger, so the other two values
+  require `use_pdl=True`. They place the trigger themselves, so they exclude
+  `launch_pdl_dependents_at_entry`:
+  - `"wait_at_start"`: the placement in the table above.
+  - `"wait_then_trigger"`: the same wait, then every thread lets the dependent
+    launch. The dependent starts only once this kernel's predecessor has ended.
+  - `"trigger_then_wait_at_exit"`: the dependent may launch at entry. There is
+    no wait in front; every thread waits for the predecessor as its last
+    instruction, so the grid still ends after it.
+    - **The caller guarantees that no input of this GEMM (A, B, scale factors,
+      offsets, counter) is written by the grid right before it on the stream.**
+      Each input must come from a grid that had ended before that grid let this
+      one launch, for example a predecessor in `"wait_then_trigger"` mode
+      behind the producer. The kernel cannot check this; an input the
+      predecessor writes is read stale.
+    - It needs the global-descriptor or A-reuse kernel (MXFP8 with E8M0 scale
+      factors, dense output, float32 accumulation, no `accumulate_on_output`).
+      It raises `ValueError` where a helper kernel would be that predecessor:
+      when the stock kernel is selected, and with `atomic_counter_claim` but no
+      caller counter.
+
+A split as one chain on one stream, with the counter zeroed before the
+producers: the producers of A and B, then the first launch
+(`pdl_mode="wait_then_trigger"`), then the second
+(`pdl_mode="trigger_then_wait_at_exit"`). The wrapper and the class API size
+the grid from the device; the kernel classes take `max_active_clusters` per
+launch.
+
 The BF16 kernel uses dynamic persistent scheduling. The token dimension is
 compiled dynamically, and the wrapper cache abstracts the token-sized axes of A
 and B while retaining static dimensions, layouts, dtypes, output descriptors,

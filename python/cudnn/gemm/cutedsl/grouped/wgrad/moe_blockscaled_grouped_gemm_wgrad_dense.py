@@ -50,6 +50,9 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
     """
 
     K_TILE = 128
+    #: No descriptor helper: only the atomic-counter-claim reset launches in front of the GEMM, and not with a caller's
+    #: ``scheduler_counter``.
+    CALL_LAUNCHES_HELPER = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -168,6 +171,7 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
         global_scale_a: Optional[cute.Tensor] = None,
         global_scale_b: Optional[cute.Tensor] = None,
         out_single_expert: Optional[cute.Tensor] = None,
+        scheduler_counter: Optional[cute.Tensor] = None,
     ) -> None:
         assert global_scale_a is None and global_scale_b is None and out_single_expert is None
         scale_a = kernel_facing_wgrad_sf(scale_a, mat_a.shape[0], mat_a.shape[1], self.sf_vec_size)
@@ -236,15 +240,7 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
         )
         grid = MoESchedulerParams.get_grid_shape(sched_params, max_active_clusters)
 
-        # No per-expert descriptor build: a helper launch only resets the atomic-counter-claim counter.
-        if cutlass.const_expr(self.atomic_counter_claim):
-            self.counter_reset_kernel(workspace.iterator).launch(
-                grid=(1, 1, 1),
-                block=(1, 1, 1),
-                stream=stream,
-                min_blocks_per_mp=1,
-                use_pdl=self.use_pdl,
-            )
+        self._launch_counter_reset(workspace, stream, scheduler_counter)
 
         self.kernel(
             tiled_mma,
@@ -271,6 +267,7 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.c_smem_layout_staged,
+            scheduler_counter.iterator if cutlass.const_expr(scheduler_counter is not None) else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -279,6 +276,24 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
             min_blocks_per_mp=1,
             use_pdl=self.use_pdl,
         )
+
+    def _launch_counter_reset(self, workspace, stream, scheduler_counter):
+        """Trace time. No per-expert descriptor build: a helper launch only resets the atomic-counter-claim counter, and
+        not a caller's ``scheduler_counter`` (launches sharing it split one tile list)."""
+        self._caller_counter = self._check_scheduler_counter(scheduler_counter)
+        if cutlass.const_expr(self.atomic_counter_claim and not self._caller_counter):
+            if cutlass.const_expr(self._wait_at_exit):
+                raise ValueError(
+                    "pdl_mode='trigger_then_wait_at_exit' with atomic_counter_claim needs a caller's scheduler_counter: "
+                    "the GEMM would claim before its counter reset ends"
+                )
+            self.counter_reset_kernel(workspace.iterator).launch(
+                grid=(1, 1, 1),
+                block=(1, 1, 1),
+                stream=stream,
+                min_blocks_per_mp=1,
+                use_pdl=self.use_pdl,
+            )
 
     @cute.kernel
     def counter_reset_kernel(self, workspace_ptr):
@@ -371,6 +386,7 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: cute.ComposedLayout,
+        scheduler_counter_ptr=None,
     ):
         """GPU device kernel: MXFP8 wgrad from global descriptors with CLC or atomic-counter scheduling."""
         warp_idx = cute.arch.warp_idx()
@@ -382,7 +398,7 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         is_leader_cta = block_in_cluster_coord_vmnk[0] == 0
         tidx, _, _ = cute.arch.thread_idx()
-        if cutlass.const_expr(self.launch_pdl_dependents_at_entry):
+        if cutlass.const_expr(self._trigger_at_entry):
             cute.arch.griddepcontrol_launch_dependents()
 
         SchedulerStorage = MoEPersistentTileScheduler.make_storage_struct(self.num_sched_stages, use_dynamic_sched=True)
@@ -445,7 +461,7 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
             offs,
             cute.arch.block_idx(),
             cute.arch.grid_dim(),
-            counter_ptr=self._get_sched_counter_ptr(workspace_ptr) if cutlass.const_expr(self.atomic_counter_claim) else None,
+            counter_ptr=self._claim_counter_ptr(workspace_ptr, scheduler_counter_ptr) if cutlass.const_expr(self.atomic_counter_claim) else None,
             sched_storage=sched_storage,
         )
         scheduler.internal_init()
@@ -474,9 +490,11 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         # use_pdl: the setup above touches no global memory; the kernel before this one on the stream (the counter
         # reset, or the producer of A, B, the scale factors or the offsets) may still be running, so every thread
-        # waits for it here.
-        if cutlass.const_expr(self.use_pdl):
+        # waits for it here. pdl_mode='trigger_then_wait_at_exit' moves this wait to the kernel's end.
+        if cutlass.const_expr(self._wait_at_start):
             cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self._trigger_after_wait):
+            cute.arch.griddepcontrol_launch_dependents()
 
         # TMEM: epilogue warp 0 allocates, and the MMA and epilogue warps wait at this one site: the allocation
         # barrier is aligned, so every warp must reach it at the same instruction.
@@ -869,5 +887,10 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
             tmem.relinquish_alloc_permit()
             pipeline.NamedBarrier(barrier_id=self.epilog_sync_bar_id, num_threads=32 * len(self.epilogue_warp_id)).arrive_and_wait()
             tmem.free(acc_tmem_ptr)
+
+        # pdl_mode='trigger_then_wait_at_exit': every thread waits for the grid before this one last, so this grid ends
+        # after it (the caller guarantees no input of this GEMM comes from that grid).
+        if cutlass.const_expr(self._wait_at_exit):
+            cute.arch.griddepcontrol_wait()
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
