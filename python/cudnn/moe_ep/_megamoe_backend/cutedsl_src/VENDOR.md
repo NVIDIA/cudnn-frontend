@@ -7,20 +7,40 @@ documented in the parent backend `README.md`.
 ## Upstream
 
 - **Project**: `cutedsl_megamoe` (NVIDIA-internal repository; URL omitted).
+- **Source tree**: `sources` at the repository root (formerly
+  `next/sources`).
 - **Current synchronized commit**:
-  `e8df888670a44b099e9d7009d5338a4ab45bf848`.
+  `1fd8c51fd64640da21c8cc45e95c19d0de35da19`.
 - **Discrete-weight implementation ancestor**:
   `7cc8d2eb2fb2fc9643ccd6244d6c810ed9f4341b`.
-- **Last synced**: 2026-09-22.
+- **Last synced**: 2026-11-18; the WGrad closure was added on 2026-11-19 at
+  the same commit.
 - **Vendored subset**: the exact export closure produced for
-  `RubinTrainingFwdGluMegaMoE` and `RubinTrainingBwdDgluMegaMoE`, including
-  materialized source-copy modules.
-- **Raw exported source files**: 37 (plus 15 generated package markers).
-- **Expected vendored Python files**: 48 after the local overlay.
+  `RubinTrainingFwdGluMegaMoE`, `RubinTrainingBwdDgluMegaMoE`, and
+  `RubinTrainingWgrad`, including the materialized source copy
+  `kernel_src/rubin/custom_mix_cga_helpers.py` (from
+  `kernel_src/blackwell/custom_mix_cga_helpers.py`).
+- **Raw exported source files**: 46 (plus 14 generated package markers).
+- **Expected vendored Python files**: 60 after the local overlay.
 - **Expected vendored Python tree SHA256**:
-  `5c000a4c2824b71ea669415a35c27f0ac678a076b6b3d4f586595d6b2d1796d4`.
+  `40f0913abd57b3ccccf885e84d0ed450abef6152e6985056e7d905fad3077233`.
   This uses the same relative-path-and-content algorithm as
   `_megamoe_backend.mxfp8._fingerprint.source_tree_sha256`.
+
+The export command, run from the upstream repository root, is:
+
+```bash
+python export_src.py \
+  --kernels RubinTrainingFwdGluMegaMoE RubinTrainingBwdDgluMegaMoE \
+    RubinTrainingWgrad \
+  --dst_dir <empty-directory>
+```
+
+The WGrad closure adds `helpers/cute_py_helpers.py`,
+`kernel_src/schedulers/wgrad_mapping.py`,
+`kernel_src/schedulers/wgrad_scheduler.py`, and the four
+`kernel_src/rubin/training/traditional/wgrad/block_scaled_moe_wgrad_*.py`
+modules.
 
 ## Policy
 
@@ -29,7 +49,10 @@ documented in the parent backend `README.md`.
 - Repository-required copyright and BSD-3-Clause SPDX headers may be added
   where the upstream snapshot did not carry them.
 - Local kernel fixes should go upstream first and then be synchronized here.
-  Any unavoidable local source difference must be listed below.
+  Any unavoidable local code difference must be listed below.
+- Comments, docstrings and error-message text may be worded differently from
+  upstream, for example to keep them self-contained. Such wording-only
+  differences are not listed below.
 
 The synchronized Python sources use BSD-3-Clause SPDX identifiers.
 `LICENSE.Apache-2.0` is retained as historical snapshot metadata.
@@ -50,20 +73,32 @@ The synchronized Python sources use BSD-3-Clause SPDX identifiers.
   always supplies its exact caller-prescribed pool rows. Upstream topology
   clamps remain intact, and the component rejects physical capacity below the
   padded requirement for the clamped logical limit.
-- Overflow policy is group-consistent without a post-kernel collective:
-  every rank derives the same group-wide overflow bit from the replicated
-  pre-truncation destination totals, while only the overflowing destination
-  truncates its local expert sizes.
-- The materialized Rubin training TMEM helper replaces two unused Blackwell
-  swap-AB extension annotations with `Any`; the extension and its now-empty
-  local `kernel_src/blackwell` package tree are omitted from the vendored
-  closure.
-- Forward epilogue comments that referenced unavailable external design
-  material are replaced with self-contained dataflow descriptions.
 - Repository-required copyright and BSD-3-Clause SPDX headers are added to
   generated empty package markers.
 
-No other vendored Python source-body differences are expected.
+No other vendored Python code differences are expected.
+
+The group-consistent overflow policy, previously a local difference, is
+upstream as of this snapshot: every rank derives the same group-wide overflow
+bit from the replicated pre-truncation destination totals, while only the
+overflowing destination truncates its local expert sizes. The export closure
+no longer reaches Blackwell swap-AB extension types, so the former `Any`
+annotation overlay and the omitted `kernel_src/blackwell` package tree are no
+longer needed.
+
+Public `nvidia-cutlass-dsl` 4.8.0 and 4.8.1 do not provide
+`PipelineUmmaAsync.create(defer_init=...)`. Upstream's forward fused FC1/FC2
+kernel feature-detects that keyword at import: without it, the kernel keeps
+the per-create mbarrier initialization that mixed-CGA launches already use
+instead of the folded initialization. No local overlay is needed for this.
+
+The Rubin WGrad kernel builds its TMA descriptor overrides through
+`helpers/dsl_helpers.py` (`make_override_tma_atom`, `make_tma_residue_tensor`)
+from the DSL's override copy ops and traits and its residue-tensor MLIR op.
+Public `nvidia-cutlass-dsl` 4.8.0 and 4.8.1 provide all of them, so WGrad
+compiles and runs on the public wheels.
+`_cutedsl.rubin_wgrad_cutedsl_error` probes these capabilities before the WGrad
+module is imported.
 
 ## Integration boundary
 
@@ -76,6 +111,10 @@ Discrete mode passes four caller-owned CUDA `int64[E_local]` pointer arrays
 directly to the vendored forward/backward kernels. MoeEP owns neither the
 per-expert buffers nor the pointer tables.
 
+The vendored routing metadata record stores the source token index in 16 bits,
+so the communication component rejects `max_tokens_per_rank > 65536`. The
+MegaMoE capability check declines such configurations before compilation.
+
 The vendored Rubin sources require a CUTLASS DSL distribution that provides
 `cutlass.utils.rubin_helpers`. The executable backend enforces
 `nvidia-cutlass-dsl>=4.8.0` before importing these kernels.
@@ -86,3 +125,10 @@ The vendored Rubin sources require a CUTLASS DSL distribution that provides
   compilation.
 - `_megamoe_backend/mxfp8/_backward_compile.py`: Rubin MXFP8 backward dGLU
   preparation and compilation.
+- `_megamoe_backend/_comm.py`: symmetric-buffer peer mapping.
+- `_megamoe_backend/mxfp8/_training_stage_kernel.py`: MXFP8 staging constants
+  and PTX conversion helpers.
+- `_megamoe_backend/mxfp8/_wgrad_compile.py`: Rubin MXFP8 WGrad preparation,
+  compilation, and launch.
+- `_megamoe_backend/mxfp8/_fingerprint.py` and `_training_resources.py`:
+  vendored source-tree fingerprint.

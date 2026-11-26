@@ -8,7 +8,7 @@ uses (tool schemas, a reasoning block, tool calls and tool results, several turn
 stored strings, and a tokenizer trained in the test, encoded, decoded and streamed.  The requirement file of the area and
 its dependency-update entry are checked as text.  No real tokenizer or template file is committed; no GPU, no weights.
 
-And what a user of a serving engine brings to a sample (``samples/models/qwen_dense/serving_options.py`` and the flags of
+And a request and its options (``samples/models/qwen_dense/serving_options.py`` and the flags of
 ``00_decode.py``): the request body a chat client sends, answered field by field -- every field that is accepted at a
 neutral value, and every refusal by its own sentence; the limit of new tokens of a request against ``--max-model-len``;
 the line that states the decoding rule beside the checkpoint's own generation settings, and the one that says what a
@@ -282,7 +282,7 @@ def test_a_checkpoints_chat_template_renders_tools_reasoning_and_several_turns(t
         text.render_chat([])
     named = _text_directory(tmp_path / "named", template="{{ eos_token }}|{{ pad_token }}|{{ messages[0].content }}")
     assert TextIO.from_checkpoint(str(named)).render_chat(user) == "<|im_end|>|<|endoftext|>|Why is the sky blue?", "a template may name the special tokens"
-    # a tool call as a serving API writes it, with its arguments as one JSON string: the template wants a mapping and says so
+    # a tool call as a chat API writes it, with its arguments as one JSON string: the template wants a mapping and says so
     as_text = {"type": "function", "function": {"name": "weather", "arguments": '{"city": "Paris"}'}}
     with pytest.raises(ValueError, match="chat template refused the messages: "):
         text.render_chat(agent[:2] + [{"role": "assistant", "content": "", "tool_calls": [as_text]}])
@@ -449,7 +449,7 @@ def test_the_requirement_file_has_lower_bounds_a_validated_list_and_an_update_en
         assert "samples/models/requirements.txt" in readme.read_text(), f"{readme.name} names the requirement file"
 
 
-# --------------------------------------------------------------------------- coming from a serving engine
+# --------------------------------------------------------------------------- a request body and its options
 
 CHAT = [{"role": "user", "content": "hi"}]
 #: a request body as a chat client sends it: the fields review of the first design named, and one no sample knows
@@ -515,7 +515,7 @@ REFUSED = {
     "extra_body": {"top_k": 20, "temperature": 0.7},
 }
 #: What the area guide lists as left out of a model sample, and the fields of a request that ask for it: the names of the
-#: public chat request and of the sampling parameters serving engines add to it.  Each is a row of the table.
+#: public chat request and of the sampling parameters commonly sent with it.  Each is a row of the table.
 LEFT_OUT = {
     "sampling": ("temperature", "top_p", "top_k", "min_p", "n", "best_of", "use_beam_search", "length_penalty", "watermarking"),
     "stop strings": ("stop", "include_stop_str_in_output", "stop_token_ids", "repetition_detection"),
@@ -676,7 +676,7 @@ def test_a_field_that_asks_for_what_a_sample_leaves_out_is_a_row_of_the_table_an
 
 
 def test_the_line_of_a_request_body_prints_names_and_the_values_the_table_knows_and_no_path(tmp_path):
-    """What a run prints of a body: of ``model`` the last part (an engine that serves a directory is asked for it by its
+    """What a run prints of a body: of ``model`` the last part (a model that is a directory is named by its
     path); of a field that is not used its name, and its value only where that is a number or a boolean; a name that is
     not a plain word as a JSON string, so that a line break in it cannot put a line of its own into the run."""
     import serving_options
@@ -856,14 +856,6 @@ def test_the_limit_of_new_tokens_of_a_request_is_held_against_the_context_before
             f"--prompt 1: the prompt is {prompt_tokens:,} tokens and --max-model-len is 2,051: a prompt and its new tokens share the context, "
             "and no position is left for a new token; raise --max-model-len"
         )
-
-
-def test_the_default_context_length_is_the_one_the_census_of_the_target_kernel_set_was_recorded_with():
-    import serving_options
-
-    census = json.loads((MODELS / "model_samples" / "qwen_dense" / "kernel_census.json").read_text())
-    recorded = [section["recorded"]["max_model_len"] for sections in census["configurations"].values() for section in sections.values()]
-    assert recorded and set(recorded) == {serving_options.MAX_MODEL_LEN}, "--max-model-len defaults to the context length of the recorded sections"
 
 
 def test_the_decoding_rule_is_said_beside_the_checkpoints_own_generation_settings(tmp_path):
@@ -1129,7 +1121,7 @@ def _sample_script(monkeypatch, script="00_decode.py"):
     return sample
 
 
-def test_the_serving_style_flags_of_the_sample(monkeypatch, capsys):
+def test_the_request_flags_of_the_sample(monkeypatch, capsys):
     """``--max-tokens`` and its older spelling, ``--max-model-len``, ``--temperature``, ``--messages -``, ``--text-out``,
     ``--no-stream``: their defaults, what each applies to, and every refusal by its sentence."""
     import serving_options
@@ -1724,14 +1716,170 @@ def test_a_request_beyond_the_context_is_an_error_before_the_load(tmp_path, monk
     assert "served by (decided before the load" in err and err.index("[00] first token: ") < err.index("served by (decided before the load")
 
 
+def test_both_scripts_hand_the_context_length_to_every_session_they_build(monkeypatch, capsys):
+    """``--max-model-len`` is a constant of the run: every session a script builds is handed it (``Session(max_model_len=)``),
+    the default and a typed one.  The speculative script builds its sessions for the positions its last verify step
+    writes, which lie behind the last new token: a request that fills the context with them reaches the load."""
+    import serving_options
+
+    model_samples = importlib.import_module("model_samples")
+    for script in ("00_decode.py", "02_speculative_decode.py"):
+        with monkeypatch.context() as patched:
+            sample = _sample_on_the_cpu(patched, loads=False, script=script)
+            through, built = model_samples.Session, []
+            patched.setattr(model_samples, "Session", lambda model, text, **options: built.append(through(model, text, **options)) or built[-1])
+            for typed, length in (([], serving_options.MAX_MODEL_LEN), (["--max-model-len", "300"], 300)):
+                built.clear()
+                with pytest.raises(AssertionError, match="reached a load"):
+                    sample.main(["--stack", "reference", *typed])
+                assert len(built) == 2 and {session.max_model_len for session in built} == {length}, (script, typed)
+            capsys.readouterr()
+            if script.startswith("02"):  # its sessions hold more positions than the prompt and its new tokens
+                fits = max(session.capacity for session in built)
+                with pytest.raises(AssertionError, match="reached a load"):
+                    sample.main(["--stack", "reference", "--max-model-len", str(fits)])
+                assert {session.max_model_len for session in built[-2:]} == {fits} and "ERROR" not in capsys.readouterr().err
+
+
+def _speculative_script_and_its_sessions(monkeypatch):
+    """``02_speculative_decode.py`` on the CPU, where a load is an ``AssertionError``, and the list that every session a
+    call of its ``main()`` builds is added to."""
+    sample = _sample_on_the_cpu(monkeypatch, loads=False, script="02_speculative_decode.py")
+    model_samples = importlib.import_module("model_samples")
+    through, built = model_samples.Session, []
+    monkeypatch.setattr(model_samples, "Session", lambda model, text, **options: built.append(through(model, text, **options)) or built[-1])
+    return sample, built
+
+
+def _a_request_of_a_drafting_checkpoint(tmp_path):
+    """The arguments of a speculative run on the reference stack with a generated checkpoint that carries a drafter, its
+    draft vocabulary and one prompt."""
+    directory = _checkpoint_directory(tmp_path / "tiny-checkpoint", drafter=True)
+    (tmp_path / "draft_vocab.json").write_text(json.dumps(list(range(0, WORDS + 1, 2))))
+    return ["--model", str(directory), "--stack", "reference", "--draft-vocab", str(tmp_path / "draft_vocab.json"), "--prompt", "w1 w2 w3"]
+
+
+def _prompt_and_rows(line):
+    """The prompt tokens a line of the limit counts and the rows behind the last new token it counts beside them."""
+    (prompt,) = re.findall(r"(\d+) prompt tokens|the prompt is (\d+) tokens", line)
+    (rows,) = re.findall(r"verify step writes behind the last new token \((\d+)\)", line)
+    return int(prompt[0] or prompt[1]), int(rows)
+
+
+def test_a_speculative_request_that_names_no_limit_is_cut_to_what_fits_with_its_last_verify_step(tmp_path, monkeypatch, capsys):
+    """The last verify step of a speculative run writes a row for every drafted token, all but one of them behind the
+    last new token: the limit of new tokens is held against the context together with those rows.  A request that
+    names no limit, under a context its default limit does not fit, has the default cut to what fits: the run says so
+    in one line and reaches the load with sessions that hold exactly the context length.  The count that line names is
+    the limit: asked for, it fills the context the same way, and one more does not fit."""
+    sample, built = _speculative_script_and_its_sessions(monkeypatch)
+    request = [*_a_request_of_a_drafting_checkpoint(tmp_path), "--max-model-len", "100"]
+    capsys.readouterr()
+    with pytest.raises(AssertionError, match="reached a load"):
+        sample.main(request)
+    err = capsys.readouterr().err
+    assert "ERROR" not in err and len(built) == 2 and {(session.capacity, session.max_model_len) for session in built} == {(100, 100)}
+    (said,) = [line for line in err.splitlines() if "not the default" in line]
+    assert said.startswith("[02] --prompt 1: ") and "--max-model-len 100" in said, said
+    (cut,) = re.findall(r"up to (\d+) new tokens", said)
+    assert sum(_prompt_and_rows(said)) + int(cut) == 100, said  # the prompt, the rows behind the last new token and the cut fill the context
+    built.clear()
+    with pytest.raises(AssertionError, match="reached a load"):
+        sample.main([*request, "--max-tokens", cut])
+    assert {session.capacity for session in built} == {100} and "not the default" not in capsys.readouterr().err
+    assert sample.main([*request, "--max-tokens", str(int(cut) + 1)]) == 1
+
+
+def test_the_count_an_error_line_of_the_speculative_script_names_reaches_the_load_and_one_more_does_not(tmp_path, monkeypatch, capsys):
+    """A limit of new tokens somebody asked for that does not fit the context together with the rows of the last verify
+    step is one ``[02] ERROR`` line before anything is planned.  The count that line names is the largest that fits:
+    asked for, it reaches the load with sessions that hold exactly the context length, and one more is the line again,
+    with the same count.  With a checkpoint (``--max-tokens``) and in the seeded run (``--force-tokens``)."""
+    sample, built = _speculative_script_and_its_sessions(monkeypatch)
+    checkpoint = [*_a_request_of_a_drafting_checkpoint(tmp_path), "--max-model-len", "100"]
+    for arguments, flag in ((checkpoint, "--max-tokens"), (["--stack", "reference", "--max-model-len", "50"], "--force-tokens")):
+        length = int(arguments[-1])
+
+        def refused(asked):
+            capsys.readouterr()
+            code = sample.main([*arguments, flag, str(asked)])
+            out, err = capsys.readouterr()
+            last = err.splitlines()[-1]
+            assert code == 1 and out == "" and "served by" not in err and err.count(" ERROR ") == 1, (flag, asked, err[-600:])
+            assert last.startswith("[02] ERROR ") and f"({flag} {asked})" in last and f"--max-model-len is {length}" in last, last
+            (most,) = re.findall(r"ask for at most (\d+) new tokens", last)
+            (positions,) = re.findall(r"are (\d+) positions", last)
+            return int(most), int(positions), last
+
+        most, positions, line = refused(200)
+        built.clear()
+        with pytest.raises(AssertionError, match="reached a load"):
+            sample.main([*arguments, flag, str(most)])
+        assert "ERROR" not in capsys.readouterr().err, (flag, most)
+        assert len(built) == 2 and {(session.capacity, session.max_model_len) for session in built} == {(length, length)}, (flag, most)
+        assert positions == 200 + length - most == 200 + sum(_prompt_and_rows(line)), line  # the prompt, the tokens asked for, the rows behind them
+        assert refused(most + 1)[:2] == (most, length + 1), (flag, most)
+
+
+def test_a_speculative_request_no_count_fits_for_is_one_error_line_that_names_none(tmp_path, monkeypatch, capsys):
+    """Where the prompt and the rows of the last verify step leave no position for a new token, a request -- one that
+    names no limit and one that names one -- is one ``[02] ERROR`` line before anything is planned.  No line of that
+    run names a count of new tokens, neither to decode nor to ask for; the line says to raise ``--max-model-len``.
+    One position more, and one new token fits."""
+    sample, built = _speculative_script_and_its_sessions(monkeypatch)
+    request = _a_request_of_a_drafting_checkpoint(tmp_path)
+    with pytest.raises(AssertionError, match="reached a load"):
+        sample.main([*request, "--max-tokens", "1"])
+    full = max(session.capacity for session in built) - 1  # the prompt and the rows behind the last new token: a context they fill
+    for limit in ([], ["--max-tokens", "1"]):
+        capsys.readouterr()
+        code = sample.main([*request, "--max-model-len", str(full), *limit])
+        out, err = capsys.readouterr()
+        last = err.splitlines()[-1]
+        assert code == 1 and out == "" and "served by" not in err and err.count(" ERROR ") == 1, (limit, err[-600:])
+        assert last.startswith("[02] ERROR --prompt 1: ") and last.endswith("raise --max-model-len") and sum(_prompt_and_rows(last)) == full, last
+        assert re.findall(r"\d+ new tokens", err) == [], (limit, err[-600:])
+    built.clear()
+    with pytest.raises(AssertionError, match="reached a load"):
+        sample.main([*request, "--max-model-len", str(full + 1), "--max-tokens", "1"])
+    assert {(session.capacity, session.max_model_len) for session in built} == {(full + 1, full + 1)}
+
+
+def test_the_rows_the_speculative_limit_holds_are_one_fewer_than_the_tokens_the_configuration_drafts(tmp_path, monkeypatch, capsys):
+    """The rows the limit of new tokens is held with are the ones the last verify step writes behind the last new
+    token: one fewer than the tokens ``--speculative-config`` drafts.  A step that drafts one token writes none, and
+    the line of a limit that does not fit names none; a step that drafts two writes one, and the line names it.  At
+    either count the count the line names reaches the load with sessions that hold exactly the context length, one
+    more does not, and one more drafted token leaves one new token fewer."""
+    sample, built = _speculative_script_and_its_sessions(monkeypatch)
+    request = [*_a_request_of_a_drafting_checkpoint(tmp_path), "--max-model-len", "100"]
+    fits = {}
+    for drafted in (1, 2):
+        config = json.dumps({"method": "mtp", "num_speculative_tokens": drafted, "use_local_argmax_reduction": True})
+        arguments = [*request, "--speculative-config", config]
+        capsys.readouterr()
+        assert sample.main([*arguments, "--max-tokens", "200"]) == 1
+        last = capsys.readouterr().err.splitlines()[-1]
+        rows = re.findall(r"verify step writes behind the last new token \((\d+)\)", last)
+        assert last.startswith("[02] ERROR ") and rows == [str(drafted - 1)][: drafted - 1], last  # a run that writes no row names none
+        (most,) = re.findall(r"ask for at most (\d+) new tokens", last)
+        built.clear()
+        with pytest.raises(AssertionError, match="reached a load"):
+            sample.main([*arguments, "--max-tokens", most])
+        assert len(built) == 2 and {(session.capacity, session.max_model_len) for session in built} == {(100, 100)}, drafted
+        assert sample.main([*arguments, "--max-tokens", str(int(most) + 1)]) == 1
+        fits[drafted] = int(most)
+    assert fits[1] - fits[2] == 1, fits
+
+
 def test_the_family_readme_says_of_a_request_what_the_data_and_the_run_say():
-    """The section "Coming from a serving engine": the table of fields that would change the output is the data, row for
+    """The section "A request body and its options": the table of fields that would change the output is the data, row for
     row; every other field the sample answers is named; the lines the README quotes are the lines a run prints; and the
     flags of the section are rows of the flag table."""
     import serving_options
 
     readme = (FAMILY / "README.md").read_text()
-    section = readme.split("## Coming from a serving engine", 1)[1].split("\n## ", 1)[0]
+    section = readme.split("## A request body and its options", 1)[1].split("\n## ", 1)[0]
     table = section.split("| field | accepted | another value is refused because |\n|---|---|---|\n", 1)[1].split("\n\n", 1)[0].splitlines()
     rows = []
     for name, (values, reason) in serving_options.NEUTRAL.items():
@@ -1838,7 +1986,7 @@ def test_the_speculative_configuration_is_one_json_object_answered_key_by_key():
     for reason in (*(why for _, why in read.values()), *(why for _, why in neutral.values()), *refused.values()):
         assert reason and reason[0].islower() and not reason.endswith("."), reason
     drafted, line = serving_options.parse_speculative_config(serving_options.SPECULATIVE_DEFAULT, f"{SHOWN} (the default)")
-    said = f'{SHOWN} (the default): the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 5, '
+    said = f'{SHOWN} (the default): read: method "mtp", num_speculative_tokens 5, '
     assert (drafted, line) == (5, said + "use_local_argmax_reduction true.") and json.loads(serving_options.SPECULATIVE_DEFAULT) == SPECULATIVE
     # the count is any whole number from 1: which counts a stack serves is its rows' answer, at the plan
     assert [_configured(num_speculative_tokens=count)[0] for count in (1, 3, 7, 12)] == [1, 3, 7, 12]
@@ -1892,7 +2040,7 @@ def test_the_speculative_configuration_is_one_json_object_answered_key_by_key():
     # the rule the guide states for such an object, beside the rule for a request body
     guide = " ".join((MODELS / "AGENTS.md").read_text().split())
     assert (
-        "A configuration object of a serving engine that selects what is launched is answered key by key in the same module; "
+        "A configuration object that selects what is launched (`--speculative-config`) is answered key by key in the same module; "
         "a key it does not hold is an `ERROR` that names it."
     ) in guide
 
@@ -1966,9 +2114,10 @@ def test_the_speculative_scripts_flags_say_what_they_apply_to(tmp_path, monkeypa
     from model_samples import loop
 
     sample = _sample_on_the_cpu(monkeypatch, loads=False, script="02_speculative_decode.py")
-    assert sample.serving_options is serving_options and sample.TAG == "[02]" and sample.STACKS == loop.STACKS
+    assert sample.serving_options is serving_options and sample.TAG == "[02]" and set(sample.STACKS) == set(loop.STACKS)
+    assert sample.STACKS == (sample.SAMPLE_STACK, *sample.VALIDATION_STACKS) and sample.SAMPLE_STACK == "native", "the sample's stack first, the default"
     seeded = sample._arguments([])
-    assert (seeded.model, seeded.sequences, seeded.layers, seeded.force_tokens, seeded.stack) == (None, 1, 2, 32, "fe-cublas")
+    assert (seeded.model, seeded.sequences, seeded.layers, seeded.force_tokens, seeded.stack) == (None, 1, 2, 32, "native")
     assert (seeded.speculative_config, seeded.draft_vocab, seeded.max_new_tokens, seeded.max_model_len) == (None, None, 256, 2051)
     config = '{"method": "mtp", "num_speculative_tokens": 3, "use_local_argmax_reduction": true}'
     real = sample._arguments(["--model", "d", "--draft-vocab", "ids.json", "--speculative-config", config, "--max-tokens", "8", "--stack", "native"])
@@ -1981,7 +2130,7 @@ def test_the_speculative_scripts_flags_say_what_they_apply_to(tmp_path, monkeypa
         ),
         (
             ["--dump-census", "census.json"],
-            "--dump-census: the launch records of a draft pass have no kernel census to be held against yet; 00_decode.py writes those of a decode step",
+            "--dump-census: not in this script; 00_decode.py writes the launch records of a decode step",
         ),
         (["--check-kernels", "--stack", "reference"], "--check-kernels is for a provider stack; --stack reference checks no kernel"),
         (["--sequences", "1,4"], "argument --sequences: invalid int value: '1,4'"),
@@ -2025,7 +2174,7 @@ def test_the_speculative_scripts_flags_say_what_they_apply_to(tmp_path, monkeypa
         (
             ["--speculative-config", '{"method": "mtp", "num_speculative_tokens": 5}'],
             '[02] ERROR --speculative-config: "use_local_argmax_reduction" is not named: the draft token is the largest of the listed rows of the '
-            "head; without it an engine launches another set. Accepted: true",
+            "head: the one form of the drafter's head this sample runs. Accepted: true",
         ),
         (["--dump-tokens", str(tmp_path / "nowhere" / "ids.json")], "[02] ERROR --dump-tokens ids.json: cannot be written there"),
         (["--model", "d", "--text-out", str(tmp_path / "nowhere" / "answer.txt")], "[02] ERROR --text-out answer.txt: cannot be written there"),
@@ -2127,7 +2276,7 @@ def test_the_speculative_sample_runs_to_its_last_line_on_the_cpu(tmp_path, monke
     checkpoint.close()
     # before the load: the configuration key by key, the list, the rule and the counts of a prompt and a step
     said = (
-        '[02] --speculative-config: the speculative configuration of a serving engine. Read: method "mtp", num_speculative_tokens 3, '
+        '[02] --speculative-config: read: method "mtp", num_speculative_tokens 3, '
         'use_local_argmax_reduction true. At the value that changes nothing: draft_sample_method "greedy".'
     )
     listed = "[02] draft vocabulary draft_vocab.json: 136 ids of the model's 272, in ascending order (136 entries listed, none dropped)"
@@ -2174,7 +2323,7 @@ def test_the_speculative_sample_runs_to_its_last_line_on_the_cpu(tmp_path, monke
     )
     # ... on the steps the header names: the comparison on what the run recorded (16 steps), the block check on the first 8 of them
     assert steps > 16, "the seeded drafter of this checkpoint is seldom accepted: twenty tokens are more steps than a run records"
-    assert lines[against].startswith("speculative against decode (1 sequence x 4 tokens per sequence, 16 engine steps behind a prompt of 5 tokens; ")
+    assert lines[against].startswith("speculative against decode (1 sequence x 4 tokens per sequence, 16 speculative steps behind a prompt of 5 tokens; ")
     assert any(
         line.startswith("checks (1 sequence x 4 tokens per sequence, the first 8 verify steps; ") and line.endswith("; behind a prompt of 5 decode steps)")
         for line in lines
@@ -2201,7 +2350,7 @@ def test_the_speculative_sample_runs_to_its_last_line_on_the_cpu(tmp_path, monke
     assert code == 0 and both_out == "" and [(each["prompt"], len(each["prompt_ids"][0])) for each in runs] == [(0, 5), (1, 2)]
     texts = [" ".join(f"w{token}" for token in each["ids"][0] if token != WORDS) + "\n" for each in runs]
     assert target.read_text(encoding="utf-8") == texts[0] + texts[1] and all(len(each["ids"][0]) <= 9 for each in runs)
-    assert "[02] --speculative-config (the default): the speculative configuration of a serving engine. Read: method" in both_err
+    assert "[02] --speculative-config (the default): read: method" in both_err
     assert (
         "[02] prompt of 5 tokens (--prompt 1) = 5 decode steps and 4 passes of the drafter before the first token; prompt of 2 tokens (--prompt 2) = "
         "2 decode steps and 1 passes of the drafter before the first token; then every step is 5 draft passes and one verify step of 6 tokens, "
@@ -2220,7 +2369,7 @@ def test_the_speculative_sample_runs_to_its_last_line_on_the_cpu(tmp_path, monke
     code = sample.main(["--model", str(ending), *two[2:], "--prompt", "w3 w1 w4 w1 w5", "--max-tokens", "20"])
     ended = capsys.readouterr().err.splitlines()
     assert code == 0 and "text out              11 tokens in 10 steps, ended at the end token: written to stdout as it was generated" in ended
-    assert any(line.startswith("speculative against decode (1 sequence x 6 tokens per sequence, 10 engine steps behind ") for line in ended)
+    assert any(line.startswith("speculative against decode (1 sequence x 6 tokens per sequence, 10 speculative steps behind ") for line in ended)
     assert _compared(ended, "position").endswith("the session's own run ended there    PASS") and nothing not in ended
 
     # what a user of the script can get wrong about the drafter: one line each, before the plan
@@ -2365,7 +2514,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     import shlex
 
     import serving_options
-    from model_samples import blocks, loop, tie_out
+    from model_samples import blocks, loop
     from model_samples.qwen_dense import QwenDense
 
     sample = _sample_script(monkeypatch, "02_speculative_decode.py")
@@ -2385,14 +2534,14 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         reasons.setdefault(reason, []).append(f"`{name}`")
     rows += [f"| {', '.join(names)} | refused at any value | `null` | {reason} |" for reason, names in reasons.items()]
     assert table == rows, "the three tables of serving_options.py, in their order, with their values and reasons"
-    assert "The key names and the values of this table were read in the public release 0.33.0 of a serving engine (2026-10-31)." in text
-    assert "**The speculative configuration of a serving engine.**" in section and "A key no row holds is an `ERROR` that names it." in text
+    assert "The key names and the values of this table are those of the public JSON object of this name as it stood on 2026-10-31." in text
+    assert "**The speculative configuration.**" in section and "A key no row holds is an `ERROR` that names it." in text
     # the commands, as they are written: each is parsed by the script, and the object of the third is the default one
     block = section.split("```bash\n", 1)[1].split("```", 1)[0].replace("\\\n", " ")
     commands = [shlex.split(line, comments=True) for line in block.splitlines() if line.startswith("python samples/models/qwen_dense/02_speculative_decode.py")]
     assert len(commands) == 3 and all(command[:2] == ["python", "samples/models/qwen_dense/02_speculative_decode.py"] for command in commands)
     default, native, real = (sample._arguments([word for word in command[2:] if word not in (">", "answer.txt")]) for command in commands)
-    assert (default.model, default.stack, native.stack, default.speculative_config) == (None, "fe-cublas", "native", None)
+    assert (default.model, default.stack, native.stack, default.speculative_config) == (None, "native", "fe-entries", None)
     assert (real.model, real.stack, real.draft_vocab, real.messages, real.max_new_tokens) == (
         "/data/Qwen3.8-27B-NVFP4",
         "native",
@@ -2408,7 +2557,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     with pytest.raises(ValueError) as refusal:
         serving_options.parse_speculative_config('{"method": "mtp", "num_speculative_tokens": 5}', "--speculative-config")
     assert f"[02] ERROR {refusal.value}\n" in section
-    assert f'"{loop.ONE_SEQUENCE}"' in text and f'"{tie_out.DRAFTER_KERNELS}"' in text
+    assert f'"{loop.ONE_SEQUENCE}"' in text
     assert '"the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)"' in text
     source = (FAMILY / "02_speculative_decode.py").read_text()
     assert "the drafter ran on reference blocks: none of its blocks was compared with a provider (no provider serves them yet)" in source
@@ -2456,7 +2605,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     paragraph = (  # about the two texts, word for word; and the blocks it names: where the two kinds of step are served by other kernels
         "Every token of a speculative run after the first is a greedy token of a verify step; the first is the greedy token of the prompt's last "
         "decode step. The drafter decides how many tokens a step keeps, never which. In the stacks `native` and `fe-entries` on compute capability "
-        "10.0 a verify step and a decode step launch different kernels for two blocks (the sections `plain` and `verify` of the kernel census: the "
+        "10.0 a verify step and a decode step launch different kernels for two blocks (the "
         "linear-attention step, and the out-projection of the linear-attention layers up to 16 rows of a step); in `fe-cublas` for one, the "
         "linear-attention step. The speculative run is compared with decode steps of the same tokens at the steps the family's declared band "
         "decides. On a checkpoint, which declares no band, the comparison is reported: there a verify step and a decode step of the same tokens do "
@@ -2483,7 +2632,6 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     assert differing("native", 2, 8) == {"linear_attention.step", "projection.fp8.out"} and differing("native", 3, 6) == {
         "linear_attention.step"
     }, "16 rows, 18 rows"
-    assert set(json.loads((MODELS / "model_samples" / "qwen_dense" / "kernel_census.json").read_text())["configurations"]) >= {"plain", "verify"}
     # what a run reports, and what is not here
     for sentence in (
         "The acceptance length is a figure of this run's prompts and of this draft-vocabulary list; it is not comparable with a figure made with another list.",
@@ -2494,28 +2642,22 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "ends in `[02] RAN reference stack (no provider checked)`, or in `[02] FAIL`",
         "A prompt of N tokens is N decode steps and N - 1 passes of the drafter before the first token; then every step is five draft passes and one "
         "verify step of six tokens, and keeps one to six of them.",
-        "**What is not here.** The drafter on target kernels: every block of it but its embedding lookup is a reference chain,",
-        "More than one request: `--sequences` is accepted at 1. A rate. A count or a position per sequence. A captured step. `--dump-census`.",
+        "**What is not here.** The drafter on kernels: every block of it but its embedding lookup is a reference chain.",
+        "More than one request: `--sequences` is accepted at 1. A rate. A count or a position per sequence. A recorded step: every step of this "
+        "script is launched from Python, and a run says so in one line. `--dump-census`.",
         "Any GPU class but compute capability 10.0: the script has run there only, and a class it has not run on is uncovered, not passing.",
     ):
         assert sentence in text, sentence
     assert "tokens per second" not in text and not re.search(r"\d(?:\.\d+)? (?:ms|tokens/s)\b", text), "the section states no speed"
     # what ran, as the runs printed it: a figure of a run is changed with the run, here and there
     for sentence in (
-        "on the 64-layer model 467 of the 484 launches of a verify step are target kernels (130 the target's own compiled kernels + 337 cuDNN Frontend "
-        "entries with byte-equal results), on the two-layer model of the default run 18 of 20 (6 the target's own compiled kernels + 12 cuDNN Frontend "
-        "entries with byte-equal results); on `fe-entries`, without the library rows, 386 of the 484 (49 the target's own compiled kernels + 337 cuDNN "
-        "Frontend entries with byte-equal results) and 14 of 20 (2 the target's own compiled kernels + 12 cuDNN Frontend entries with byte-equal results)",
+        "on the 64-layer model 484 of the 485 block calls of a verify step on kernels, on the two-layer model of the default run 20 of 21; on `fe-entries`, "
+        "without the library rows, 387 of the 485 and 15 of 21",
         "Nor with a figure of another stack: a greedy run follows the first token its stack chooses otherwise (this section's last runs have three).",
         # a dated run names its rows, and the run of native with the rows a library serves stands beside it with its versions
         "correctness only; `native` on the cuDNN Frontend rows -- the rows it selected when these runs were made and `fe-entries` selects today without the attention preparation's row).",
         "With its library rows (2026-11-20; `native` in PyTorch 2.14.0 with FlashInfer 0.7.2.post1; the same GPU class; the attention preparation on its reference chain) the default run on `native` "
         "ended in `[02] PASS` with the same 32 new tokens: ids hash `11bfb9f9bcf5`, the plain run's of its process.",
-        "Every gated line of the table above passed, `acceptance` with 10 of 10 steps on their scheduled count, "
-        "and the kernel check passed over 10 traced steps, "
-        "with 17 of 20 launches of the verify step target kernels (6 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal "
-        "results; the attention layer's out-projection among them held by membership, on the library's own CUTLASS multiply). Three drafted tokens",
-        'Three drafted tokens passed in 13 steps, with "kernel identity: not stated for this run".',
         "The memory sentence of the default run asked for about 5.7 GiB. Without FlashInfer installed the same command ended in `[02] SKIP "
         "flashinfer.gemm.bmm_fp8 needs flashinfer-python 0.7.2.post1, which is not installed: ...` before anything was loaded, exit code 0.",
         # the records of two row sets, and where the last runs with a checkpoint are
@@ -2528,14 +2670,10 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "accepted in 62 of 71 steps, the second in 46 of those 62, the third in 26 of 46, the fourth in 17 of 26, "
         'the fifth in 10 of 17 -- the counts of the library loop on `native` in the section "The verify step".',
         "`tokens` was reported -- 39 of 45 kept tokens were the decode steps' on the same tokens, the first that differs kept token 17.",
-        "The kernel check passed over 16 traced steps, with "
-        "451 of 484 launches of the verify step target kernels (130 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal "
-        "results): 435 of them in the launch shape the census records (114 the target's own compiled kernels + 321 cuDNN Frontend entries with "
-        "byte-equal results), the 16 out-projections of the attention layers by membership, on the library's own CUTLASS multiply; nothing is stated "
-        "about the kernels of the passes. The memory sentence asked for about 32.2 GiB.",
-        '| for `--stack native` on compute capability 10.x | also FlashInfer at a validated version (the section "The rows a library serves"): the '
-        "verify step and the decode steps call its multiplies on the stored weights. Without it the run ends in `[02] SKIP` before anything is loaded, "
-        "exit code 0; `--stack fe-entries` runs the cuDNN Frontend rows without the package |",
+        '| for the stack `native` on compute capability 10.x | FlashInfer at a validated version (the section "The rows a library serves"): the '
+        "verify step and the decode steps call its multiplies on the stored weights. Without it the run stops before anything is loaded with "
+        "`[02] ERROR the stack native cannot run:` and the package's name, exit code 1; `--stack fe-entries`, a functional-validation stack, runs "
+        "the cuDNN Frontend rows without the package |",
         "so the tokens a checkpoint run writes are held by no line of that run: the loop that writes them is the one the default run proves.",
         "the stack `reference` serves any count (the seeded run as far as the new tokens its schedule needs fit the context length).",
         "a prompt of 26 tokens, then 32 new tokens in 10 steps scheduled to keep 0, 1, 2, 3, 4, 5, 0, 1, 2 and 3 drafted tokens -- ended in `[02] PASS` on "
@@ -2543,10 +2681,8 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "In each of the four the 32 new tokens were the plain run's of the same process (ids hash `11bfb9f9bcf5`, which is also what `00_decode.py "
         "--sequences 1 --force-tokens 32 --stack native` printed), nothing was written to standard output, and every gated line of the table above "
         "passed, `acceptance` with 10 of 10 steps on their scheduled count. `bytes` passed on `reference` and was reported on the other three.",
-        "On `native` and `fe-entries` the kernel check passed over 10 traced steps, with 13 of 20 launches of the verify step target kernels "
-        "(2 the target's own compiled kernels + 11 cuDNN Frontend entries with byte-equal results).",
         "eight ended in `[02] SKIP cudnn.GdnVerifyFused serves 8 tokens per sequence of 2-8, sequences 1-4; this run has 1 sequences x 9 tokens per "
-        "sequence` before anything was loaded. The four-layer model (`--layers 4`, on the default stack) passed.",
+        "sequence` before anything was loaded. The four-layer model (`--layers 4`, on the stack `fe-cublas`) passed.",
         "asked for about 6.3 GiB on `fe-cublas` and `reference` and about 6.1 GiB on `native` and `fe-entries`; PyTorch reserved between 3.8 and 4.6 GiB "
         "in the four runs, and the device grew by about 0.2 GiB more in each.",
         "A drafted token written out where the verify step chose another failed `ids` alone; one drafted token kept beyond the compared count failed "
@@ -2557,8 +2693,6 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
         "the second in 38 of those 49, the third in 27 of 38, the fourth in 18 of 27, the fifth in 8 of 18",
         "on `native` 38 of 46 kept tokens were the decode steps' on the same tokens, the first that differs kept token 13; on `fe-cublas` 43 of 49, the "
         "first kept token 30.",
-        "On `native` the kernel check passed over 16 traced steps, with 370 of 484 launches of the verify step target kernels "
-        "(49 the target's own compiled kernels + 321 cuDNN Frontend entries with byte-equal results) and nothing stated",
         "asked for about 43.3 GiB on `native`, where PyTorch reserved 39.8 GiB and the device grew by 40.0 GiB, and for about 61.0 GiB on `fe-cublas`, "
         "where PyTorch reserved 58.5 GiB and the device grew by 58.7 GiB; the GPU was otherwise empty at the start of each.",
     ):
@@ -2566,9 +2700,7 @@ def test_the_family_readme_says_of_the_speculative_script_what_the_data_and_the_
     # the other documents name the script, and their commands run its first form
     family = (FAMILY / "README.md").read_text()
     assert "| `02_speculative_decode.py` | speculative decoding with the checkpoint's drafter, one request in one process: " in family
-    assert (
-        "| a speculative configuration: the JSON object that asks an engine to draft tokens | `02_speculative_decode.py --speculative-config JSON` | " in family
-    )
+    assert "| a speculative configuration: the JSON object that says how tokens are drafted | `02_speculative_decode.py --speculative-config JSON` | " in family
     area = " ".join((MODELS / "README.md").read_text().split())
     assert "The second sample, `02_speculative_decode.py`, runs that step for one request:" in area and "no script drafts yet" not in area + family
     assert "No block of the drafter is on a kernel yet, and the sample prints no rate." in area

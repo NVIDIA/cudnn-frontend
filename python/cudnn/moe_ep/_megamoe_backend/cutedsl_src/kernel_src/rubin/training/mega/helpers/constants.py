@@ -4,7 +4,7 @@
 
 These are consumed only by the training GLU/dGLU FC12 kernels, so they live in the
 training mega ``helpers`` package rather than the cross-inference/training
-``next/sources/helpers/constants.py``.
+``sources/helpers/constants.py``.
 """
 
 

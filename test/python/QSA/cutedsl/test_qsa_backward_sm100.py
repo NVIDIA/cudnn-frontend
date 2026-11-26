@@ -40,11 +40,11 @@ def _skip_cu12(h_kv):
         pytest.skip("the 12Q/1KV sparse path requires the CUDA 13 build of CuTe DSL")
 
 
-def _inputs(lengths, h_kv, seed, grad_scale=1.0, h_q=None):
+def _inputs(lengths, h_kv, seed, grad_scale=1.0, h_q=None, dtype=torch.bfloat16):
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
-    return make_inputs(cu[-1], seed=seed, h_kv=h_kv, cu_seqlens=cu, width=2052, saved_output_dtype=torch.float32, grad_scale=grad_scale, h_q=h_q)
+    return make_inputs(cu[-1], seed=seed, h_kv=h_kv, cu_seqlens=cu, width=2052, saved_output_dtype=torch.float32, grad_scale=grad_scale, h_q=h_q, dtype=dtype)
 
 
 def _miles_metadata(idx, lengths):
@@ -133,10 +133,11 @@ def test_bitmap_entry_matches_reference(seq_len, grad_scale, h_kv):
     _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (seq_len,))))
 
 
+@pytest.mark.parametrize("h_kv", [1, 2])
 @pytest.mark.parametrize("seq_len, grad_scale", LENGTHS)
-def test_indexed_entry_matches_reference(seq_len, grad_scale):
+def test_indexed_entry_matches_reference(seq_len, grad_scale, h_kv):
     _skip_cu12(1)
-    inputs = _inputs((seq_len,), 1, seed=seq_len, grad_scale=grad_scale)
+    inputs = _inputs((seq_len,), h_kv, seed=seq_len, grad_scale=grad_scale)
     _check(inputs, _indexed_backward(inputs))
 
 
@@ -148,13 +149,31 @@ def test_bitmap_entry_packed_sequences(lengths, h_kv):
     _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], lengths)))
 
 
+@pytest.mark.parametrize("h_kv, h_q", [(2, None), (1, None), (1, 6)])
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        pytest.param((4099,), marks=pytest.mark.L0),  # the dense pair kernel alone
+        pytest.param((22528,), marks=pytest.mark.L0),  # dense, query-major and key-major kernels
+        pytest.param((3, 2051, 22529), marks=pytest.mark.L1),
+    ],
+)
+def test_bitmap_entry_fp16(lengths, h_kv, h_q):
+    _skip_cu12(h_kv)
+    inputs = _inputs(lengths, h_kv, seed=sum(lengths), h_q=h_q, dtype=torch.float16)
+    grads = _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], lengths))
+    assert all(grad.dtype == torch.float16 for grad in grads)
+    _check(inputs, grads)
+
+
+@pytest.mark.parametrize("h_kv", [1, 2])
 @pytest.mark.parametrize("described", [True, False])
 @pytest.mark.parametrize("lengths", PACKED)
-def test_indexed_entry_packed_sequences(lengths, described):
+def test_indexed_entry_packed_sequences(lengths, described, h_kv):
     _skip_cu12(1)
     # Without cu_seqlens the documents stay exact: the selection says which keys a query sees, the inverted index
     # keys are block-start tokens, and the dense bitmap masks per token, so blocks off the 4-token grid are fine.
-    inputs = _inputs(lengths, 1, seed=sum(lengths))
+    inputs = _inputs(lengths, h_kv, seed=sum(lengths))
     _check(inputs, _indexed_backward(inputs, inputs["cu_seqlens"] if described else None))
 
 

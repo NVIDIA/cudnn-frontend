@@ -54,7 +54,7 @@ def frost_qsa_fprop_dense(
     tile = mOrder[slot]
     if mMode[tile] == 0:
         acc_dtype = Float32
-        mma_dtype = cutlass.BFloat16
+        mma_dtype = mOF.element_type
 
         coord_q = tile
         head_kv = head // h_r
@@ -366,8 +366,8 @@ def frost_qsa_fprop_dense(
                     ooff = (Int64(row) * n_heads + head) * HEAD_DIM + c * TILE_N
                     g32 = cute.make_tensor(mO32F.iterator + ooff, cute.make_layout(TILE_N))
                     cute.autovec_copy(tOrO, g32)
-                    tOb = cute.make_rmem_tensor(tOrO_shape, cutlass.BFloat16)
-                    tOb.store(vals.to(cutlass.BFloat16))
+                    tOb = cute.make_rmem_tensor(tOrO_shape, mma_dtype)
+                    tOb.store(vals.to(mma_dtype))
                     gbf = cute.make_tensor(mOF.iterator + ooff, cute.make_layout(TILE_N))
                     cute.autovec_copy(tOb, gbf)
             oh.release()
@@ -398,7 +398,7 @@ def _attn_launch(
     h_r: cutlass.Constexpr,
     n_heads: cutlass.Constexpr,
 ):
-    mma_dtype = cutlass.BFloat16
+    mma_dtype = mQ.element_type
     acc_dtype = Float32
 
     mma_tile_qk = (TILE_M, TILE_N, HEAD_DIM)

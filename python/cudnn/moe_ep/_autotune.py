@@ -46,12 +46,6 @@ def normalize_candidates(
     for index, candidate in enumerate(candidates):
         if not isinstance(candidate, MoeEpTuningConfig):
             raise TypeError("candidates must contain only MoeEpTuningConfig values; " f"candidates[{index}] is {type(candidate).__name__}")
-        if candidate.reduce_topk_in_kernel != baseline.reduce_topk_in_kernel:
-            raise ValueError(
-                "autotune does not sweep reduce_topk_in_kernel; "
-                f"candidate {index} has {candidate.reduce_topk_in_kernel}, "
-                f"baseline has {baseline.reduce_topk_in_kernel}"
-            )
         if candidate not in seen:
             ordered.append(candidate)
             seen.add(candidate)

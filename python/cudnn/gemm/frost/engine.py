@@ -111,7 +111,12 @@ class FrostGemmEngine(BaseEngine):
 def FrostGemmEngines(ids):
     """The gemm engines the manifest asked for, with the ids it assigned."""
     out = []
-    for cls in (FrostGemmEngine,):
+    classes = [FrostGemmEngine]
+    if "batch_invariant_gemm" in ids:
+        from ..batch_invariant.engine import BatchInvariantGemmEngine
+
+        classes.append(BatchInvariantGemmEngine)
+    for cls in classes:
         if cls.name in ids:
             engine = cls()
             engine.engine_id = ids[cls.name]

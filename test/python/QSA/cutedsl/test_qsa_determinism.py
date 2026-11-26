@@ -12,7 +12,7 @@ from QSA.cutedsl.test_qsa import assert_close, make_inputs, reference, supported
 from QSA.cutedsl.test_qsa_backward_sm100 import _check, _entry_backward, _inputs, _skip_cu12
 
 
-def sequences(lengths, heads, *, mask="random", seed=20261104):
+def sequences(lengths, heads, *, mask="random", seed=20261104, dtype=torch.bfloat16):
     samples = []
     for index, length in enumerate(lengths):
         sample = make_inputs((length,), *heads, empty=mask == "empty-rows", all_selected=mask == "all-selected")
@@ -20,8 +20,8 @@ def sequences(lengths, heads, *, mask="random", seed=20261104):
             sample["sel_blocks"].zero_()
         rng = torch.Generator().manual_seed(seed + index)
         for name in ("q", "k", "v"):
-            sample[name] = torch.randn(sample[name].shape, generator=rng).to(torch.bfloat16).cuda()
-        sample["do"] = torch.randn(sample["q"].shape, generator=rng).to(torch.bfloat16).cuda()
+            sample[name] = torch.randn(sample[name].shape, generator=rng).to(dtype).cuda()
+        sample["do"] = torch.randn(sample["q"].shape, generator=rng).to(dtype).cuda()
         samples.append(sample)
     return samples
 
@@ -84,8 +84,9 @@ class TestQSA:
     @pytest.mark.L0
     @pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)], ids=["q12-kv1", "q24-kv2", "q6-kv1"])
     @pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
-    def test_replay(self, heads, backward):
-        inputs = pack(sequences((65, 3, 17), heads))
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+    def test_replay(self, heads, backward, dtype):
+        inputs = pack(sequences((65, 3, 17), heads, dtype=dtype))
         tensors = {name: value for name, value in inputs.items() if isinstance(value, torch.Tensor)}
         before = snapshot(tensors)
         assert_replays(lambda: run(inputs, backward))
@@ -94,10 +95,11 @@ class TestQSA:
     @pytest.mark.L0
     @pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)], ids=["q12-kv1", "q24-kv2", "q6-kv1"])
     @pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
-    def test_batch_invariance(self, heads, backward):
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+    def test_batch_invariance(self, heads, backward, dtype):
         if backward:
             pytest.skip("skip until fix: QSA backward gradients change with batch layout (PR #2266)")
-        samples = sequences((65, 3, 17), heads)
+        samples = sequences((65, 3, 17), heads, dtype=dtype)
         expected = split(run(pack(samples), backward), samples)
         for order in ((0,), (1, 0), (2, 1, 0)):
             selected = [samples[index] for index in order]
@@ -211,6 +213,7 @@ ENGINE_REPLAYS = [
     pytest.param("indexed", (26632,), 12, 1, id="sparse-windows-indexed-q12-kv1"),
     # a sparse sequence packed between dense ones, origins off the 4-token grid
     pytest.param("indexed", (3, 26633, 2051), 12, 1, id="sparse-packed-indexed-q12-kv1"),
+    pytest.param("indexed", (26632,), 24, 2, id="sparse-windows-indexed-q24-kv2"),
 ]
 
 

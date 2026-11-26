@@ -1,8 +1,12 @@
 # Constraints for the stack `native` of a model sample; used with `pip install -c`, it installs nothing by itself.
-# The versions the launch records of a family's kernel census were recorded with (kernel_census.json: validated.recorded).
-# The library's own pick of a kernel is data of these versions, so the adapters run on a validated version alone.
-# The maintainers of this area own this list: a version joins it with a recorded run, never with an update of a pin alone.
+# The versions the stack `native` was last run and checked with.
+# Which kernel the library launches for a call follows these versions, so the adapters run on a validated version alone.
+# The maintainers of this area own this list: a version joins it with a run of the stack on it, never with an update of
+# a pin alone.
+# The last line is the library's kernel-binary package, which the library reads at its own version alone: a run reads
+# the kernel binaries it holds and never fetches one.
 torch==2.14.0
 nvidia-cutlass-dsl==4.8.0
 flashinfer-python==0.7.2.post1
 apache-tvm-ffi==0.1.11
+flashinfer-cubin==0.7.2.post1

@@ -4,8 +4,8 @@
 """Every block of a model in plain PyTorch: the reference of the tie-out, and the provider of the blocks that have no kernel yet
 -- among them every block of a drafter's pass.
 
-The functions keep the quantisation rules and every intermediate cast of a serving chain (a norm output, a SiLU, a gate, the
-conv taps and the core output of the linear-attention step are each rounded to bf16 where the chain rounds them), and they
+The functions keep the quantisation rules and every intermediate cast of the kernels on the stored formats (a norm output,
+a SiLU, a gate, the conv taps and the core output of the linear-attention step are each rounded to bf16 where those round them), and they
 accumulate every multiply and every reduction in ``acc`` -- fp64 by default.  fp64 is deliberate: an fp32 reference changes with
 the matmul precision mode of the environment, and a small accumulation error can cross a bf16 rounding midpoint.
 
@@ -114,7 +114,7 @@ def pre_fc_norm_quantize(embedding: torch.Tensor, hidden: torch.Tensor, weight_e
 
 
 def rope_cos_sin(position: int, rotary_dim: int, theta: float, device):
-    """cos and sin of the rotary angles of one position, rounded to bf16 as a serving chain's table is."""
+    """cos and sin of the rotary angles of one position, rounded to bf16 as the table a kernel reads is."""
     inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim))
     angle = position * inv_freq
     return angle.cos().to(BF16), angle.sin().to(BF16)
@@ -243,6 +243,34 @@ def attention_tokens(q: torch.Tensor, cache, position: int, tokens: int, acc) ->
     return torch.stack([attention(rows[:, t], cache, position + t, acc) for t in range(tokens)], dim=1).flatten(0, 1)
 
 
+def attention_bound(q: torch.Tensor, cache, position: int, tokens: int = 1):
+    """The reference attention of a step BEFORE its rounding to bf16, and the weighted magnitude of the values it attends to:
+    ``(chain, spread)``, each ``[rows, heads * D]`` in fp64.  For token ``t`` of a sequence, a query head and an element
+    ``d``, with ``p_j`` the softmax weight of the attended position ``j = 0 .. position + t`` of that sequence (its own
+    included, the later tokens' of the step not), formed as :func:`attention` forms it::
+
+        chain  = sum_j p_j * v[j, d]
+        spread = sum_j p_j * |v[j, d]|
+
+    The operand terms of the band ``attention_bf16_weights`` (``tie_out``).  Both are formed in fp64 on the bf16 operands
+    cast exactly, whatever precision the run's reference accumulates in: the band is stated against this evaluation, and
+    the chain is never rounded here.  The cache is read through its own accessors with host integers, on either layout,
+    and through no table of the state.  The rows of a step of several tokens stand sequence by sequence."""
+    rows = q.unflatten(0, (-1, tokens))
+    sequences, _, H, D = rows.shape
+    chains, spreads = [], []
+    for token in range(tokens):
+        count = position + token + 1  # the positions this token attends to: every earlier one and its own
+        k = cache.keys(count, torch.float64)
+        v = cache.values(count, torch.float64)
+        HK = k.shape[1]
+        qg = rows[:, token].to(torch.float64).reshape(sequences, HK, H // HK, D)
+        p = torch.softmax(torch.einsum("bhgd,bhtd->bhgt", qg, k) * D**-0.5, dim=-1)
+        chains.append(torch.einsum("bhgt,bhtd->bhgd", p, v).reshape(sequences, H * D))
+        spreads.append(torch.einsum("bhgt,bhtd->bhgd", p, v.abs()).reshape(sequences, H * D))
+    return torch.stack(chains, dim=1).flatten(0, 1), torch.stack(spreads, dim=1).flatten(0, 1)
+
+
 def gate_quantize(o: torch.Tensor, gate: torch.Tensor, quant):
     """``sigmoid(gate) * attention output`` with the chain's bf16 roundings, then the static 8-bit quantisation."""
     return quantize((o.float() * torch.sigmoid(gate.float()).to(BF16).float()).to(BF16), quant)
@@ -319,7 +347,9 @@ def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
 FP4_SIXTH_BITS = 0x3E2AAAAB
 #: the relative bound of the encode scale of ``cudnn.AddNormQuantDecode``'s NVFP4 codes, which goes through two approximate
 #: reciprocals: one unit in the last place each, doubled, and one fp32 unit for the two multiplications -- the bound the
-#: entry's own suite holds its codes to (``test/python/norm/frost/add_norm_quant_utils.py``)
+#: entry's own suite holds its codes to (``test/python/norm/frost/add_norm_quant_utils.py``).  ``cudnn.RowQuantizeFp4Decode``
+#: writes the same codes by the same chain, and its page states the same bound
+#: (``docs/operations/block_scaling/row_quantize_fp4_decode.md``)
 NVFP4_ENCODE_BOUND = 5 * 2.0**-23
 
 
@@ -517,6 +547,7 @@ class Embedding(_Reference):
     """One gather per call: an exact kernel, known by its name.  Its launch shape is PyTorch's and is declared nowhere."""
 
     kernels = (Kernel("embedding_gather", "PyTorch", "exact", launches=1),)
+    captures = True  # one gather on the ids it is handed
 
     def __call__(self, ids, table):
         return table.index_select(0, ids)
@@ -526,6 +557,7 @@ class TokenChoice(_Reference):
     """The sample's host path: what it launches is listed by the kernel check and compared with nothing."""
 
     kernels = (Kernel("pytorch", "PyTorch", "host"),)
+    captures = True  # the reduction and the cast, on the device: greedy choice holds no state on the host
 
     def __call__(self, logits):
         return greedy(logits)
@@ -549,6 +581,28 @@ class PreFcNormQuantize(_Reference):
 class Quantize(_Reference):
     def __call__(self, rows, quant):
         return quantize(rows, quant)
+
+
+class QuantizeBracket(_Reference):
+    """The 4-bit quantisation of bf16 rows at the rounding points of a kernel that scales a block by ``fp32(1 / 6)`` of its
+    largest magnitude under the global scale and encodes through two approximate reciprocals
+    (``cudnn.RowQuantizeFp4Decode``).  The reference chain (``quantize``) divides where that kernel multiplies by
+    reciprocals and writes the code 0 for a negative value that rounds to zero, where the kernel keeps the sign: its own
+    codes are not inside the entry's contract.  This block is the twin of that entry's adapter, not a row of any table:
+    per block of sixteen it writes the block-scale byte of the kernel's rule (:func:`nvfp4_block_scales`) and the LOW code
+    of every element's bracket under that byte (:func:`nvfp4_code_bracket`), and keeps of the last call what the band of
+    the entry is judged with (``tie_out``: ``row_quantize_fp4``): ``bracket`` = the low and the high code of every element,
+    one nibble each.  At an exact rounding tie the bracket holds the two codes around the midpoint, and the low one is
+    not always the kernel's."""
+
+    entry = "torch_ref.quantize at the kernel's rounding points"
+    bracket = None
+
+    def __call__(self, rows, quant):
+        scales = nvfp4_block_scales(rows.float().abs().unflatten(-1, (-1, BLOCK)).amax(-1), quant.scale)
+        low, high = nvfp4_code_bracket(rows, scales, quant.scale)
+        self.bracket = (low, high)
+        return BlockScaledTensor(low[..., 0::2] | (low[..., 1::2] << 4), scales, float(quant.scale))
 
 
 class SiluMul(_Reference):
@@ -682,6 +736,30 @@ class Attention(_Reference):
 
     def __call__(self, q, cache, position):
         tokens = getattr(cache, "tokens", 1)
+        if tokens > 1:
+            return attention_tokens(q, cache, position, tokens, self.acc)
+        return attention(q, cache, position, self.acc)
+
+
+class AttentionBound(_Reference):
+    """The attention core as the reference chain itself, which also keeps the operand terms of a bound: the twin of an
+    adapter to a library attention kernel that documents no numerics contract and whose rounding points are not
+    established.  No reference block can be written at rounding points nobody has stated, so this block returns the
+    bytes of the reference chain (``attention`` / ``attention_tokens``, in the run's accumulation precision) and keeps
+    of the last call what the band of such a kernel is judged with (``tie_out``: ``attention_bf16_weights``): ``bound`` =
+    the chain of every element before its rounding to bf16 and the weighted magnitude of the values it attends to, both
+    in fp64 (:func:`attention_bound`).  It works from the host integer the step hands it and reads the cache through
+    its accessors, on either layout; it reads no table of the state, so a wrong length or page-table row cannot move
+    it.  It writes nothing.  Not a row of any table."""
+
+    entry = "torch_ref.attention with the operand terms of its bound"
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
+    per_row = (0, 1)
+    bound = None
+
+    def __call__(self, q, cache, position):
+        tokens = getattr(cache, "tokens", 1)
+        self.bound = attention_bound(q, cache, position, tokens)
         if tokens > 1:
             return attention_tokens(q, cache, position, tokens, self.acc)
         return attention(q, cache, position, self.acc)
