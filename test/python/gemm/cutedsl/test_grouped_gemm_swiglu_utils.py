@@ -594,7 +594,8 @@ def run_grouped_gemm_swiglu_ref(
         start = 0
         for i, group_m in enumerate(aligned_group_m_list):
             end = start + group_m
-            amax_ref[i] = compute_reference_amax(ref_after_swiglu[start:end, :, 0].clone())
+            # An empty expert leaves its amax at the initial -inf.
+            amax_ref[i] = compute_reference_amax(ref_after_swiglu[start:end, :, 0].clone()) if end > start else float("-inf")
             start = end
         ref_tensors["amax_ref"] = amax_ref
 
@@ -788,14 +789,15 @@ def check_ref_grouped_gemm_swiglu(
 
     torch.cuda.synchronize()
 
-    c_gpu = outputs["c_tensor"][: inputs["valid_m"]]
-    c_ref = ref_tensors["c_ref"]
-    torch.testing.assert_close(
-        c_gpu.cpu().float(),
-        c_ref.cpu().to(cfg["c_dtype"]).to(torch.float32),
-        atol=atol,
-        rtol=rtol,
-    )
+    if outputs["c_tensor"] is not None:
+        c_gpu = outputs["c_tensor"][: inputs["valid_m"]]
+        c_ref = ref_tensors["c_ref"]
+        torch.testing.assert_close(
+            c_gpu.cpu().float(),
+            c_ref.cpu().to(cfg["c_dtype"]).to(torch.float32),
+            atol=atol,
+            rtol=rtol,
+        )
 
     if cfg["d_dtype"] in [torch.float32, torch.float16, torch.bfloat16]:
         if ref_tensors.get("amax_ref") is not None:
