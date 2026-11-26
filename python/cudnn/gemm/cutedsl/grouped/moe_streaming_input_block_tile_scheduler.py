@@ -67,7 +67,6 @@ from cutlass.cutlass_dsl import (
 from cutlass.cute.typing import AddressSpace
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm
-from cutlass.experimental import primitives as nvvm_primitives
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineUserType, make_pipeline_state
 from .moe_kernel_helpers import (
@@ -75,7 +74,7 @@ from .moe_kernel_helpers import (
     streaming_signal_ptr,
 )
 from .moe_utils import ceil_div
-from cudnn.frost.tile_dsl.consume import ReleaseZero
+from cudnn.frost.tile_dsl.consume import ReleaseZero, consume_then_arrive_on_peer
 from .moe_persistent_scheduler import (
     atomic_add_i32,
     MoEWorkTileInfo,
@@ -331,11 +330,14 @@ class MoEStreamingInputBlockSignalTileScheduler:
         """Claim the cluster's next linear tile index and return its work tile, invalid past the last."""
         claimed_linear_tile_idx = self._broadcast_claimed_tile()
         work_tile_info = self._get_work_tile_for_linear_idx(claimed_linear_tile_idx)
-        # Consume-then-arrive slot release: a full warp per CTA arrives on the leader's empty barrier, each lane at an address
-        # offset by the slot word it read & release_zero (0), so the read completes before the leader may refill the slot.
-        empty_barrier_ptr = self.cluster_pipeline.sync_object_empty.get_barrier(self._dynamic_state.consumer_state.index)
-        leader_empty_barrier = nvvm_primitives.mapa(empty_barrier_ptr + (claimed_linear_tile_idx & self.release_zero.word), 0)
-        nvvm_primitives.mbarrier_arrive(leader_empty_barrier, scope=nvvm_primitives.MemScope.CTA, relaxed=False)
+        # The broadcast value is consumed: a full warp per CTA arrives on the leader's empty barrier, each lane at an
+        # address computed from the slot word it read, so the read completes before the leader may refill the slot (consume-then-arrive slot release).
+        consume_then_arrive_on_peer(
+            self.cluster_pipeline.sync_object_empty.get_barrier(self._dynamic_state.consumer_state.index),
+            0,
+            claimed_linear_tile_idx,
+            self.release_zero,
+        )
         self._dynamic_state.consumer_state.advance()
         return work_tile_info
 
