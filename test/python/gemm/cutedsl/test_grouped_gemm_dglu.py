@@ -2867,3 +2867,77 @@ def test_grouped_gemm_dglu_dbias_cache_keys_on_n(request, monkeypatch):
     torch.cuda.synchronize()
     assert len(dglu_api._cache_of_GroupedGemmDgluSm100Objects) == 2
     check_ref_grouped_gemm_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+
+
+# BF16 dSwiGLU recomputed activation past 2^31 elements (rows x N).
+_LARGE_ROWS, _LARGE_K, _LARGE_N = 532480, 128, 4096  # rows x N = 2,181,038,080 > 2^31
+_LARGE_BLOCK = 16384
+_LARGE_NEEDED_BYTES = 30 * 2**30
+
+
+def _require_sm100_and_large_memory():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 is required")
+    if torch.cuda.mem_get_info()[0] < _LARGE_NEEDED_BYTES:
+        pytest.skip("needs about 30 GB of free device memory")
+
+
+def _large_repeated_rows(columns, scale, generator):
+    block = (torch.randn((_LARGE_BLOCK, columns), generator=generator, device="cuda") * scale).to(torch.bfloat16)
+    out = torch.empty((_LARGE_ROWS, columns), device="cuda", dtype=torch.bfloat16)
+    for row in range(0, _LARGE_ROWS, _LARGE_BLOCK):
+        out[row : row + _LARGE_BLOCK] = block[: min(_LARGE_BLOCK, _LARGE_ROWS - row)]
+    return out
+
+
+def _large_expected_activation(c, beta, prob, rows):
+    pair = (c[rows].float() * beta[:, None]).reshape(len(rows), _LARGE_N // 32, 2, 32)
+    gate, up = pair[:, :, 0].reshape(len(rows), _LARGE_N), pair[:, :, 1].reshape(len(rows), _LARGE_N)
+    return (torch.nn.functional.silu(gate) * up * prob[rows, None]).bfloat16()
+
+
+@pytest.mark.L1
+def test_dglu_bf16_activation_rows_past_2g_elements():
+    """BF16 dSwiGLU recomputed activation with rows x N past 2^31 elements (about 24 GB of device memory).
+
+    The activation is written with per-thread stores from a memory tensor, so its row offsets must be 64-bit: expert 0
+    covers rows 0 .. M - 2048 (its tiles past 2^31 / N rows need a 64-bit tile offset) and expert 1 starts past 2^31 / N
+    rows (a 64-bit expert offset).  A and C repeat one block of rows, so any stray store into them is detected.
+    """
+    _require_sm100_and_large_memory()
+    generator = torch.Generator(device="cuda").manual_seed(2031)
+    a = _large_repeated_rows(_LARGE_K, 0.125, generator)
+    c = _large_repeated_rows(2 * _LARGE_N, 2.0, generator)
+    weights = (torch.randn((2, _LARGE_N, _LARGE_K), generator=generator, device="cuda") * 0.125).to(torch.bfloat16)
+    prob = torch.rand(_LARGE_ROWS, generator=generator, device="cuda") * 0.9 + 0.1
+    split = _LARGE_ROWS - 2048
+    offsets = torch.tensor([split, _LARGE_ROWS], dtype=torch.int32, device="cuda")
+    beta = torch.tensor([0.5, 1.5], device="cuda")
+    activation = torch.full((_LARGE_ROWS, _LARGE_N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    cudnn.grouped_gemm_dglu_wrapper_sm100(
+        a_tensor=a,
+        c_tensor=c,
+        sfa_tensor=None,
+        padded_offsets=offsets,
+        alpha_tensor=torch.tensor([1.0, 0.5], device="cuda"),
+        beta_tensor=beta,
+        prob_tensor=prob,
+        dprob_tensor=torch.zeros(_LARGE_ROWS, device="cuda"),
+        b_tensor=weights,
+        d_dtype=torch.bfloat16,
+        act_func="dswiglu",
+        activation_tensor=activation,
+    )
+    torch.cuda.synchronize()
+
+    boundary = 2**31 // _LARGE_N
+    for first, last in ((0, 512), (boundary - 512, boundary + 512), (split - 256, split), (split, _LARGE_ROWS)):
+        rows = torch.arange(first, last, device="cuda")
+        expert_beta = beta[(rows >= split).long()]
+        expected = _large_expected_activation(c, expert_beta, prob, rows)
+        torch.testing.assert_close(activation[first:last], expected, rtol=0.008, atol=2e-5, msg=f"rows {first}..{last}")
+    assert not torch.isnan(activation).any(), "activation rows left unwritten"
+    for name, tensor in (("a", a), ("c", c)):
+        for row in range(_LARGE_BLOCK, _LARGE_ROWS, _LARGE_BLOCK):
+            count = min(_LARGE_BLOCK, _LARGE_ROWS - row)
+            assert torch.equal(tensor[row : row + count], tensor[:count]), f"{name} rows {row}.. changed by a stray store"
