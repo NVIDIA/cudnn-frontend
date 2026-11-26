@@ -417,6 +417,53 @@ $$
                     D_row, SFD_row         D_col, SFD_col
 ```
 
+### Optional h output (MXFP8 dSwiGLU)
+
+The dSwiGLU epilogue recomputes the forward activation from the saved C to
+form D. On request it also writes that activation, column-quantized for the
+FC2 weight gradient, which removes a separate requantization pass before
+that GEMM:
+
+```text
+h = prob * silu(beta * gate) * (beta * up)
+```
+
+- `h`: FP8 codes in D's dtype (E4M3 for MXFP8), shape `(valid_m, N, 1)`
+  (or `(valid_m, N)` with canonical layouts), N-major. Each 32-row block of
+  a column is scaled by one E8M0 scale.
+- `sfh_col`: the column scales, a contiguous 1-D E8M0 buffer of
+  `valid_m * N / 32` bytes, per expert in the block-scaled MMA scale-factor
+  layout of an `N x rows` operand (the layout the FC2 weight gradient reads).
+  For an expert covering rows `s .. s + n` (`n` a multiple of 128, which the
+  256-row padding guarantees), the scale of expert-local row `r` and column
+  `c` is at byte
+  `N*s/32 + (c//128)*4*n + (r//128)*512 + (c%32)*16 + ((c//32)%4)*4 + (r//32)%4`.
+
+Requires SM100/SM103, `act_func="dswiglu"`, `glu_layout="interleaved_32"`,
+FP8 A/B with E8M0 scales and an FP8 D with row and column SFD (MXFP8), and N
+divisible by 128; anything else, including SM107, raises `ValueError`. D_row,
+D_col and both SFD planes are byte-equal with and without h. With
+deterministic dprob, dprob agrees with the run without h to FP32 rounding.
+
+- Class API: pass `sample_h` and `sample_sfh_col` (both or neither) at
+  construction and the matching `h_tensor` and `sfh_col_tensor` at every
+  `execute()`. Without them the compiled kernel and its cache key are
+  unchanged.
+- Wrapper: `generate_h=True` allocates both and returns them as
+  `h_tensor` and `sfh_col_tensor` after the seven default results.
+  The default `generate_h=False` returns the original seven results.
+
+```python
+outputs = grouped_gemm_dglu_wrapper_sm100(
+    a_tensor=a, c_tensor=c, sfa_tensor=sfa, padded_offsets=padded_offsets,
+    alpha_tensor=alpha, beta_tensor=beta, prob_tensor=prob, dprob_tensor=dprob,
+    b_tensor=b, sfb_tensor=sfb, norm_const_tensor=norm_const,
+    d_dtype=torch.float8_e4m3fn, sf_vec_size=32, act_func="dswiglu",
+    generate_h=True,
+)
+h, sfh_col = outputs["h_tensor"], outputs["sfh_col_tensor"]
+```
+
 ---
 
 ## API usage
@@ -710,6 +757,11 @@ Providing both or neither raises `ValueError`.
 
 - **Scaling tensors**: `alpha` shape `(L,)`, `beta` shape `(L,)`, `amax` shape `(L, 2, 1)`, `norm_const` shape `(1,)`
 
+- **Optional output h**: `h_tensor` / `sample_h`, with its column scales `sfh_col_tensor` / `sample_sfh_col`
+  - h: shape `(valid_m, N, 1)`, stride `(N, 1, valid_m·N)`, dtype must match D_row
+  - sfh_col: shape `(valid_m·N/32,)`, contiguous, dtype `float8_e8m0fnu`
+  - See [Optional h output](#optional-h-output-mxfp8-dswiglu)
+
 ### Common Parameters
 
 - `acc_dtype`: Must be `torch.float32`
@@ -742,6 +794,8 @@ Providing both or neither raises `ValueError`.
 - `b_dtype` (discrete only): B weight data type
 - `deterministic`: Makes `dprob` bit-exact run to run — see [Deterministic dprob](#deterministic-dprob).
   Default: `False`
+- `generate_h`: Also return the column-quantized activation h and its scales — see
+  [Optional h output](#optional-h-output-mxfp8-dswiglu). Default: `False`
 
 ### Deterministic dprob
 
@@ -767,6 +821,7 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 - `amax_tensor`: Per-group amax (when `d_dtype` is bf16/fp16)
 - `sfd_row_tensor`: Row scale factors (when SFD enabled)
 - `sfd_col_tensor`: Column scale factors (when SFD enabled)
+- `h_tensor`, `sfh_col_tensor`: The activation h and its column scales (only with `generate_h=True`)
 
 ---
 
