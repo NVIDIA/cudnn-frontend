@@ -1012,7 +1012,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         """
         GPU device kernel performing the Persistent batched GEMM computation.
 
-        ``release_zero_arg``: with the signal scheduler, the release-zero (python/cudnn/AGENTS.md Rule 11): the host passes
+        ``release_zero_arg``: with the signal scheduler, the release-zero (consume-then-arrive slot release): the host passes
         the literal 0 and its only use is ``release_zero()``; None otherwise.
         """
         warp_idx = cute.arch.warp_idx()

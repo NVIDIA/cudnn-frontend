@@ -2241,7 +2241,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         """
         GPU device kernel performing the Persistent batched GEMM computation.
 
-        ``release_zero_arg``: with the signal scheduler or the SF warp, the release-zero (python/cudnn/AGENTS.md Rule 11): the
+        ``release_zero_arg``: with the signal scheduler or the SF warp, the release-zero (consume-then-arrive slot release): the
         host passes the literal 0 and its only use is ``release_zero()``; None otherwise.
         ``compact_sfa_words``: with ``compact_sfa_sf_warp``, the compact SFA rows as int32 words (4 scales each).
         """
