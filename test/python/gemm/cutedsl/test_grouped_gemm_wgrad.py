@@ -13,8 +13,12 @@ import cudnn
 
 from test_utils import torch_fork_set_rng
 from core.cutedsl.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
+from determinism_utils import assert_bitwise, snapshot
 from gemm.cutedsl.test_grouped_gemm_wgrad_utils import (
     _skip_unless_e5m3_supported,
+    _wgrad_assemble_scales_2d2d,
+    _wgrad_create_scale_tensor,
+    _wgrad_independent_reference,
     grouped_gemm_wgrad_init,
     with_grouped_gemm_wgrad_params_fp4,
     with_grouped_gemm_wgrad_params_fp8,
@@ -1283,3 +1287,134 @@ def test_wgrad_scheduler_advances_before_producer_tail(kernel):
                     tails += 1
                     assert previous is not None and calls(previous, "sched_producer_state", "advance"), f"{source}:{statement.lineno}"
     assert tails == 1
+
+
+# MXFP8 wgrad from global descriptors (dense output, Tensor2D input, 2-CTA 256x256 tiles in a (2, 1) cluster).
+#
+# The API picks this variant of the SM100 block-scaled wgrad on its own. Its dW must be the stock kernel's byte for byte,
+# for every offsets value the stock kernel accepts: an expert whose token count is not a multiple of the 128-token K tile
+# reads its last K tile through its own descriptors, so tokens past its end (the next expert's, or data past the last
+# offset) never enter its sum. The discrete output mode runs the stock kernel on the same inputs.
+
+_GLOBAL_DESC_M, _GLOBAL_DESC_N = 512, 768
+
+
+def _global_desc_require_sm100():
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
+        pytest.skip("Requires SM100+ for grouped GEMM wgrad")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("The global-descriptor wgrad is SM100/SM103 only")
+
+
+def _global_desc_problem(data_groups, num_experts, *, seed):
+    """MXFP8 operands over ``data_groups`` token groups; the first ``num_experts`` are experts, the rest is nonzero data
+    past the last offset. Scale factors are blocked per group when every group is whole K tiles but the last (the
+    layout the reference reads), else random bytes of the size the API checks."""
+    M, N = _GLOBAL_DESC_M, _GLOBAL_DESC_N
+    torch.manual_seed(seed)
+    tokens = sum(data_groups)
+    groups = list(data_groups[:num_experts])
+    offsets = torch.tensor(groups, dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32)
+    if tokens == 0:
+        a = torch.empty_strided((M, 0), (16, 1), dtype=torch.float8_e4m3fn, device="cuda")
+        b = torch.empty_strided((0, N), (1, 16), dtype=torch.float8_e4m3fn, device="cuda")
+        sfa = torch.empty_strided((M, 0), (16, 1), dtype=torch.float8_e8m0fnu, device="cuda")
+        sfb = torch.empty_strided((N, 0), (16, 1), dtype=torch.float8_e8m0fnu, device="cuda")
+        return {"a": a, "b": b, "sfa": sfa, "sfb": sfb, "offsets": offsets, "reference": None, "experts": num_experts}
+    logical_a = torch.randint(-1, 2, (M, tokens), device="cuda").to(torch.bfloat16)
+    logical_b = torch.randint(-1, 2, (tokens, N), device="cuda").to(torch.bfloat16)
+    logical_a[logical_a == 0] = 1
+    logical_b[logical_b == 0] = -1
+    blocked = all(k % 128 == 0 for k in data_groups[:-1])
+    if blocked:
+        raw_sfa = [_wgrad_create_scale_tensor((M, -(-k // 32)), torch.float8_e8m0fnu) for k in data_groups]
+        raw_sfb = [_wgrad_create_scale_tensor((N, -(-k // 32)), torch.float8_e8m0fnu) for k in data_groups]
+        sfa, sfb = _wgrad_assemble_scales_2d2d(raw_sfa, M), _wgrad_assemble_scales_2d2d(raw_sfb, N)
+        reference = _wgrad_independent_reference(logical_a.float(), logical_b.float(), raw_sfa[:num_experts], raw_sfb[:num_experts], groups, 32, torch.bfloat16)
+    else:
+        cols = -(-(-(-tokens // 32)) // 4) * 4
+        sfa = _wgrad_create_scale_tensor((M, cols), torch.float8_e8m0fnu)
+        sfb = _wgrad_create_scale_tensor((N, cols), torch.float8_e8m0fnu)
+        reference = None
+    return {
+        "a": logical_a.to(torch.float8_e4m3fn).contiguous(),
+        "b": logical_b.to(torch.float8_e4m3fn).t().contiguous().t(),
+        "sfa": sfa,
+        "sfb": sfb,
+        "offsets": offsets,
+        "reference": reference,
+        "experts": num_experts,
+    }
+
+
+def _global_desc_run(problem, output_mode, *, counter=False):
+    output = torch.full((problem["experts"], _GLOBAL_DESC_M, _GLOBAL_DESC_N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    discrete = output_mode == "discrete"
+    cudnn.grouped_gemm_wgrad_wrapper_sm100(
+        a_tensor=problem["a"],
+        b_tensor=problem["b"],
+        sfa_tensor=problem["sfa"],
+        sfb_tensor=problem["sfb"],
+        offsets_tensor=problem["offsets"],
+        output_mode=output_mode,
+        wgrad_tensor=None if discrete else output,
+        wgrad_ptrs=torch.tensor([e.data_ptr() for e in output], dtype=torch.int64, device="cuda") if discrete else None,
+        acc_dtype=torch.float32,
+        wgrad_dtype=torch.bfloat16,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        atomic_counter_claim=counter,
+    )
+    torch.cuda.synchronize()
+    return output
+
+
+@pytest.mark.L0
+def test_dense_mxfp8_wgrad_picks_global_descriptors(monkeypatch):
+    _global_desc_require_sm100()
+    from cudnn.gemm.cutedsl.grouped.wgrad import _blockscaled_api
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
+
+    picked = []
+    original = _blockscaled_api.GroupedGemmWgradBlockScaledAPI._select_kernel
+
+    def record(self):
+        kernel = original(self)
+        picked.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(_blockscaled_api.GroupedGemmWgradBlockScaledAPI, "_select_kernel", record)
+    monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_wgrad_wrapper_memo", {})
+    monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_cache_of_GroupedGemmWgradSm100Objects", {})
+    problem = _global_desc_problem((256, 128), 2, seed=1)
+    _global_desc_run(problem, "dense")
+    _global_desc_run(problem, "discrete")
+    assert picked[0] is BlockScaledMoEGroupedGemmWgradDenseKernel
+    assert picked[1] is not BlockScaledMoEGroupedGemmWgradDenseKernel
+
+
+# (data groups, experts): partial last K tiles with nonzero data after them, empty experts, and starts that are not
+# multiples of 128 (the stock kernel addresses an expert's scale factors at rows * start / 32 bytes and reads whole
+# 512-byte atoms, so each case keeps those reads inside the scale-factor buffer).
+_GLOBAL_DESC_CASES = [
+    pytest.param((256, 0, 192, 128), 3, id="partial-last-expert-then-data", marks=pytest.mark.L0),
+    pytest.param((128, 64, 0, 384, 96, 256), 5, id="partial-experts-then-data", marks=pytest.mark.L0),
+    pytest.param((0, 0, 0), 3, id="all-empty", marks=pytest.mark.L1),
+    pytest.param((96, 160, 32, 0, 224, 256), 5, id="unaligned-starts", marks=pytest.mark.L1),
+]
+
+
+@pytest.mark.parametrize("groups, experts", _GLOBAL_DESC_CASES)
+@pytest.mark.parametrize("counter", [False, True], ids=["clc", "counter"])
+def test_global_descriptor_wgrad_matches_stock(groups, experts, counter):
+    _global_desc_require_sm100()
+    problem = _global_desc_problem(groups, experts, seed=7)
+    dense = _global_desc_run(problem, "dense", counter=counter)
+    stock = _global_desc_run(problem, "discrete", counter=counter)
+    assert_bitwise({"wgrad": dense}, snapshot({"wgrad": stock}), "global descriptors vs stock")
+    if problem["reference"] is not None and all(k % 128 == 0 for k in groups[: experts - 1]):
+        # Blocked scale factors match the stock addressing only when every earlier expert is whole K tiles.
+        check_ref_grouped_gemm_wgrad(dense, problem["reference"])
