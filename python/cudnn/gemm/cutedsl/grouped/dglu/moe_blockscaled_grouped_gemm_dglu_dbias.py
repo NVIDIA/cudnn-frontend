@@ -222,6 +222,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
     FIX_PAD_SIZE = 256
 
+    # compact_sfa_sf_warp: per-thread register counts (producer warpgroup, epilogue warpgroup) set with setmaxnreg.  The
+    # 9-warp CTA puts 3 warps on SM sub-partition 0, so it launches with 168 registers per thread, which caps the
+    # epilogue at the launch count.  After the prologue warps 4-7 (MMA, TMA, C load, scheduler) drop to 96
+    # and the epilogue warps 0-3 rise to 240; the SF warp 8 keeps 168.  The increase is served per sub-partition, so
+    # it must stay within what the producer warpgroup frees: epilogue + producer <= 2 * 168.  Measured on GB200:
+    # 240 + 96 runs and gives the epilogue its registers; 256 hangs; 208 and 224 leave the epilogue at the launch count.
+    COMPACT_SFA_SETMAXNREG = (96, 240)
+
     @staticmethod
     def can_implement(
         ab_dtype: Type[cutlass.Numeric],
@@ -849,6 +857,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         self.dbias_cross_warp_reduce = self.generate_dbias  # always cross-warp reduce
         self.has_prob = prob is not None
         self.generate_dprob = dprob is not None
+        # The 9-warp compact-SFA CTA rebalances registers between its warpgroups (see COMPACT_SFA_SETMAXNREG).
+        self.compact_sfa_setmaxnreg = self.COMPACT_SFA_SETMAXNREG if self.compact_sfa_sf_warp else None
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -2463,6 +2473,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
             cute.arch.nvvm.exit()
         k_tile_cnt = cute.ceil_div(cute.size(mB_nkl, mode=[1]), self.mma_tiler[2])
 
+        # Compact SFA: warpgroup 1 (warps 4-7) gives up registers for the epilogue warpgroup (see
+        # COMPACT_SFA_SETMAXNREG).  setmaxnreg is executed by every warp of its warpgroup.  The decrease comes here, the
+        # epilogue's increase at the top of its branch, so that ptxas compiles only the epilogue's code with the larger
+        # count.
+        if cutlass.const_expr(self.compact_sfa_setmaxnreg is not None):
+            if warp_idx >= self.mma_warp_id and warp_idx < self.mma_warp_id + 4:
+                cute.arch.setmaxregister_decrease(self.compact_sfa_setmaxnreg[0])
+
         #
         # Specialized Schedule warp (MoE Persistent Tile Scheduler)
         #
@@ -2910,6 +2928,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
+            if cutlass.const_expr(self.compact_sfa_setmaxnreg is not None):
+                cute.arch.setmaxregister_increase(self.compact_sfa_setmaxnreg[1])
             #
             # Alloc tensor memory buffer
             #
