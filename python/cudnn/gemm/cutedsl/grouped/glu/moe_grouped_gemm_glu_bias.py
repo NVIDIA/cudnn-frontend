@@ -234,6 +234,12 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         if self.use_streaming_signal_sched:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
         self.device_layout = device_layout
+        if use_pdl and (weight_mode == MoEWeightMode.DISCRETE or (use_dynamic_sched and not self.use_streaming_signal_sched)):
+            raise ValueError(
+                "use_pdl=True: the host launch puts helper_kernel (discrete B descriptors, dynamic claim counter reset) "
+                "right before this kernel, so the helper would be its programmatic primary, which it waits for only at exit. "
+                "Use use_pdl with streaming_signal_capacity."
+            )
         self.use_pdl = use_pdl
         self.launch_pdl_dependents_at_all_streaming_signal_slots_ready = launch_pdl_dependents_at_all_streaming_signal_slots_ready
 

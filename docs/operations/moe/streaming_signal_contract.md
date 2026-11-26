@@ -160,8 +160,9 @@ routing.
   previous launch's `signal[u] == u`.
 - `caller_reset=True`: the caller runs `streaming_output_notify.reset(workspace_ptr, kernel.get_workspace_bytes(), stream)`
   before each GEMM, on the GEMM's stream. The caller then owns the ordering: the reset's stores must be visible before
-  the GEMM starts counting, which holds when the reset completes before the GEMM launches (a plain launch in between,
-  or no `use_pdl` on the GEMM). The consumer is still the GEMM's programmatic dependent (see below).
+  the GEMM starts counting, which holds when the reset completes before the GEMM launches. The SM100 BF16 plain
+  kernel's constructor rejects `use_pdl=True` here (see §5). The consumer is still the GEMM's programmatic dependent
+  (see below).
 
 ### Extra clusters and liveness
 
@@ -273,7 +274,7 @@ The SM90 plain, GLU and dGLU kernels take the input direction with sections 1 an
 
 | Option | Effect | Use |
 |---|---|---|
-| `use_pdl=True` | The GEMM launches as the programmatic dependent of the kernel before it on the stream, so it can start before that kernel ends; at exit every thread waits for that grid (`griddepcontrol.wait`). With `N_CHUNK` and its own reset, that kernel is the reset, and the wait moves to entry (see §3, Reset). | The GEMM runs beside its producer on one stream. |
+| `use_pdl=True` | The GEMM launches as the programmatic dependent of the kernel before it on the stream, so it can start before that kernel ends; at exit every thread waits for that grid (`griddepcontrol.wait`). With `N_CHUNK` and its own reset, that kernel is the reset, and the wait moves to entry (see §3, Reset). The SM100 BF16 plain and GLU kernels and the SM90 kernels reject it whenever the GEMM call enqueues its helper kernel right before the GEMM (discrete weights, or the dynamic scheduler without `streaming_signal_capacity`), other than that own reset: the GEMM reads what the helper writes (B descriptors, the claim counter) before its exit wait. | The GEMM runs beside its producer on one stream (`streaming_signal_capacity`), or `N_CHUNK` with its own reset. |
 | `launch_pdl_dependents_at_entry=True` (plain, block-scaled quant and dGLU kernels) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
 | `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernels, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
 

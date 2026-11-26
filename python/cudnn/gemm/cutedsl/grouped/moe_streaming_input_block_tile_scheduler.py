@@ -699,11 +699,13 @@ class StreamingInputSignalMixin:
         launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
         cluster_barrier_at_exit: bool = False,
+        launches_helper: bool = False,
     ) -> None:
         """Check and keep the options.  ``unmet_requirement``: what this kernel configuration lacks for a producer (for
         example "dense weights"), or None.  ``cluster_barrier_at_exit``: the kernel has no 2-CTA MMA and every CTA passes
         a cluster barrier before it exits (the SM90 kernels), so a peer's last arrive always lands; a producer then needs
-        cluster (2, 1)."""
+        cluster (2, 1).  ``launches_helper``: the host launch puts the kernel's helper_kernel (the claim counter reset)
+        right before it; ``use_pdl`` is then rejected, since the kernel waits for its programmatic primary only at exit."""
         self.streaming_signal_capacity = streaming_signal_capacity
         self.use_streaming_signal_sched = streaming_signal_capacity is not None
         if self.use_streaming_signal_sched and not use_dynamic_sched:
@@ -712,6 +714,12 @@ class StreamingInputSignalMixin:
             raise ValueError(f"streaming_signal_capacity requires {unmet_requirement}")
         if device_layout and not self.use_streaming_signal_sched:
             raise ValueError("device_layout requires streaming_signal_capacity")
+        if use_pdl and launches_helper:
+            raise ValueError(
+                "use_pdl=True: the host launch puts helper_kernel (dynamic claim counter reset) right before this kernel, so "
+                "the helper would be its programmatic primary, which it waits for only at exit. Use use_pdl with "
+                "streaming_signal_capacity."
+            )
         if launch_pdl_dependents_at_all_streaming_signal_slots_ready and not self.use_streaming_signal_sched:
             raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
         if self.use_streaming_signal_sched and cluster_barrier_at_exit:

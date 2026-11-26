@@ -151,6 +151,7 @@ class MoEGroupedGemmDgluBf16KernelSm90(StreamingInputSignalMixin):
             use_pdl=use_pdl,
             launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
             cluster_barrier_at_exit=True,
+            launches_helper=streaming_signal_capacity is None,
         )
         self.act_func = act_func
         self.geglu_alpha = geglu_alpha

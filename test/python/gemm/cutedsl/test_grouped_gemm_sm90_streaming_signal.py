@@ -153,6 +153,12 @@ def test_streaming_options_reject_invalid():
         with pytest.raises(ValueError, match="device_layout"):
             make_kernel(kind, 4, device_layout=True)
     for kind in sig.KINDS:
+        # Without a producer the host launch puts helper_kernel (the claim counter reset) right before the GEMM, which
+        # waits for its programmatic primary only at exit: use_pdl is rejected there and kept with streaming_signal_capacity.
+        with pytest.raises(ValueError, match="helper_kernel"):
+            make_kernel(kind, 4, use_pdl=True)
+        make_kernel(kind, 4, streaming_signal_capacity=4, use_pdl=True)
+    for kind in sig.KINDS:
         common = dict(acc_dtype=cutlass.Float32, use_2cta_instrs=False, vectorized_f32=False, expert_cnt=4, weight_mode=MoEWeightMode.DENSE)
         common.update(use_dynamic_sched=True, streaming_signal_capacity=4)
         extra = dict(act_func="dswiglu") if kind == "dglu" else dict(generate_c=True, enable_bias=False)
