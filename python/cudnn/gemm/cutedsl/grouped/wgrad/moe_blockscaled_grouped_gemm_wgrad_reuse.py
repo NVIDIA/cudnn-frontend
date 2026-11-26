@@ -7,9 +7,10 @@ across N tiles.
 
 A work unit is up to four N tiles of one (expert, M tile). When the expert's K tiles fit the A ring (``a_stages``
 stages), A and its scale factors are loaded once per unit and reused for every N tile of it; B streams through its own
-ring. Otherwise A is reloaded per N tile. Loads, MMA, tile claims and dW bits are those of
-``BlockScaledMoEGroupedGemmWgradDenseKernel``: A, B and the scale factors are read through global descriptors (an
-expert's partial last K tile through its own A and B descriptors), and each epilogue warp stores its own 32 x 64 boxes.
+ring. Otherwise A is reloaded per N tile. The scheduler (CLC or atomic counter) claims work units. Loads, MMA and dW
+bits are those of ``BlockScaledMoEGroupedGemmWgradDenseKernel``: A, B and the scale factors are read through global
+descriptors (an expert's partial last K tile through its own A and B descriptors), and each epilogue warp stores its
+own 32 x 64 boxes.
 On a unit's start the load warp prefetches into L2 the B columns of the next N unit (and, when that unit opens the next
 expert, this M tile's A rows of it); a hint only.
 """
