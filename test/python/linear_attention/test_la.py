@@ -814,7 +814,9 @@ def test_fwd_bwd_correlated_keys(backend, variant, T, request):
         # rms 0.085 against the doubled 0.08 budget, on every backend version (9.24 through 9.28).
         request.node.add_marker(
             pytest.mark.xfail(
-                strict=True, raises=AssertionError, reason="cutile: KDA fwd non-finite O, GDN dg over budget on correlated keys (NVIDIA/cudnn-frontend#1160)"
+                strict=torch.cuda.get_device_capability() == (10, 0),
+                raises=AssertionError,
+                reason="cutile: KDA fwd non-finite O, GDN dg over budget on correlated keys (NVIDIA/cudnn-frontend#1160)",
             )
         )
     case = correlated_keys_case(variant, torch.bfloat16, T=T, H=2)
@@ -845,6 +847,14 @@ def test_bwd_head_dims_states_varlen(backend, variant, K, V):
     if backend.name == "cutile" and (K, V) != (128, 128):
         pytest.skip("cuTile autotunes per shape; one head-dim pair covers it")
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=[64, 128], K=K, V=V), use_initial_state=True, use_dfs=True, l2norm=True)
+
+
+@pytest.mark.parametrize("K", [32, 96])
+def test_gdn_head_dim_off_the_64_blocks_declines(K):
+    """No engine serves a GDN K off the 64-column blocks the cuTile backward's state pass reads whole."""
+    case = make_case("gdn", torch.bfloat16, T=192, K=K)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        op("gdn")(*op_args(case))
 
 
 @pytest.mark.parametrize("H,HK,HV", GQA_CONFIGS)
@@ -1701,6 +1711,20 @@ def test_cutile_rejects_strided_inputs(backend, variant):
     args[0] = strided_copy(args[0])
     with waive_unsupported(backend, variant):
         with pytest.raises(ValueError, match="must be contiguous"):
+            pinned_op(backend, variant)(*args, *op_tail(case))
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_frost_rejects_views_off_the_16_byte_pitch(backend, variant):
+    """A THD view whose row pitch is not a multiple of 16 bytes is refused (TMA needs aligned outer strides) instead of
+    being read at a truncated pitch."""
+    case = make_case(variant, torch.bfloat16, T=64)
+    args = thd_tensors(case)
+    wide = torch.empty(args[2].shape[0], args[2].shape[1] * args[2].shape[2] + 4, device="cuda", dtype=args[2].dtype)
+    args[2] = wide[:, :-4].view(args[2].shape).copy_(args[2])
+    with waive_unsupported(backend, variant):
+        with pytest.raises(ValueError, match="16-byte aligned"):
             pinned_op(backend, variant)(*args, *op_tail(case))
 
 
@@ -4214,6 +4238,23 @@ def test_bwd_householder_ragged_l2norm(backend, variant):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=[68, 100], V=64), l2norm=True)
 
 
+@pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
+@pytest.mark.parametrize("K", [128, 64])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_bwd_householder_count_past_smem_limit_declines(backend, K, l2norm):
+    """The d_v = 64 backward keeps 2 n gate stages of factor planes in shared memory, so n is bounded (8 at d_k 128, 16 at
+    d_k 64).  The forward runs at the first n past the bound; its backward is declined by the engine instead of failing at
+    the launch."""
+    limit = {128: 8, 64: 16}[K]
+    case = make_case("gdp", torch.bfloat16, T=64, K=K, V=64, n=limit + 1)
+    kw = dict(use_qk_l2norm_in_kernel=True) if l2norm else {}
+    leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
+    with waive_unsupported(backend, "gdp"):
+        out = pinned_op(backend, "gdp")(*leaves, *op_tail(case), **kw)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="num_householder must be <="):
+        torch.autograd.grad(out[0], leaves, torch.randn_like(out[0]))
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
 @pytest.mark.parametrize("n", (2, 3, 4))
@@ -5626,6 +5667,16 @@ def run_summary_bwd(case, d_o, *, d_final_state=None, **kw):
         raise pytest.skip.Exception(f"{case.variant} frost summary engine declined: {e}")
 
 
+@pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
+def test_summary_bwd_cadence_off_the_chunk_declines(variant):
+    """The summary backward declines a checkpoint_every_n_tokens the backward of the same tokens declines."""
+    case = make_case(variant, torch.bfloat16, T=256)
+    args = op_args(case)
+    tail = args[len(LEAF_NAMES[variant]) :]
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        getattr(la_ops, SUMMARY_BWD_OPS[variant])(args[0], args[1], args[3], args[4], summary_bwd_inputs(case)[0], *tail, checkpoint_every_n_tokens=24)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("variant", SUMMARY_VARIANTS)
 @pytest.mark.parametrize("dim_k", [64, 128])
@@ -6250,6 +6301,33 @@ def mamba2_summary(case, *, initial_state=None, **kw):
     q, k, v, g, cu, A, dt_bias = op_args(case)
     with waive_engine_less("mamba2 frost summary engine"):
         return la_ops.mamba2_summary(v, g, A, k, cu, initial_state=initial_state, dt_bias=dt_bias, plan_name="mamba2_summary_frost", **kw)
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_mamba2_summary_graph_declines_grouped_x_and_fp64_a(backend):
+    """A hand-built Mamba-2 summary graph gets the FROST plan with x at every head and ``a`` in fp32, and none with x at
+    fewer heads than dt or ``a`` in fp64, as the forward's does (the op rejects both before the graph)."""
+    q, k, v, g, cu, A, dt_bias = op_args(make_case("mamba2", torch.bfloat16, T=256, H=2))
+
+    def plans(x_heads, a_dtype):
+        inputs = dict(k=k, v=v[:, :x_heads], g=g, a=A, dt_bias=dt_bias, cu_seqlens=cu)
+        graph = cudnn.pygraph()
+        ports = {name: graph.tensor(list(t.shape), data_type=a_dtype if name == "a" else CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
+        fs_t, transition_t = graph.mamba2_summary(**ports, output_transition=True, name="summary")
+        fs_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        transition_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        graph.validate()
+        graph.build_operation_graph()
+        try:
+            graph.create_execution_plans([cudnn.heur_mode.A])
+        except cudnn.cudnnGraphNotSupportedError:
+            return []
+        return [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+
+    if "mamba2_summary_frost" not in plans(2, cudnn.data_type.FLOAT):
+        pytest.skip("no mamba2_summary_frost plan for this graph")
+    assert "mamba2_summary_frost" not in plans(1, cudnn.data_type.FLOAT), "mamba2_summary_frost serves x at fewer heads than dt"
+    assert "mamba2_summary_frost" not in plans(2, cudnn.data_type.DOUBLE), "mamba2_summary_frost serves a in fp64"
 
 
 def mamba2_summary_bwd(case, dO, *, d_final_state=None, **kw):
@@ -7011,7 +7089,8 @@ def sm_groups(N, heads):
         g += 1
     base, extra = divmod(N, g)
     sizes = [base + 1] * extra + [base] * (g - extra)
-    assert min(sizes) * heads > S // 2, f"no SM-count grouping of {N} sequences x {heads} heads on {S} SMs"
+    if min(sizes) * heads <= S // 2:
+        pytest.skip(f"no SM-count grouping of {N} sequences x {heads} heads on {S} SMs")
     bounds = [0]
     for size in sizes:
         bounds.append(bounds[-1] + size)
@@ -7749,7 +7828,9 @@ def test_half_sm_remainder_mamba2(backend, variant):
     """Mamba-2 (d_v 64) on a half-SM remainder: outputs bitwise the whole run."""
     S = sm_count()
     heads = 16
-    B = next(B for B in range(S // heads + 1, (2 * S) // heads + 1) if heads * B - S > 0 and S // (heads * B - S) == 2)
+    B = next((B for B in range(S // heads + 1, (2 * S) // heads + 1) if heads * B - S > 0 and S // (heads * B - S) == 2), None)
+    if B is None:
+        pytest.skip(f"no half-SM remainder shape at {heads} heads on {S} SMs")
     case = long_case(variant, [16384] * B, H=heads, HK=heads, HV=heads)
     state0 = random_state(case)
     o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
@@ -7958,7 +8039,8 @@ def test_over_sm_bwd_controls_invariant(backend, variant, shape):
         B = -(-(sm_count() + 2 * sm_count() // 3) // heads)
     elif shape == "half_sm_remainder":
         B = -(-(sm_count() + 2 * sm_count() // 5) // heads)
-        assert sm_count() // (B * heads - sm_count()) == 2, "the remainder must lie between a third and a half of the SM count"
+        if sm_count() // (B * heads - sm_count()) != 2:
+            pytest.skip(f"the remainder of {B} x {heads} tiles does not lie between a third and a half of {sm_count()} SMs")
     else:
         heads, B, _, _ = over_sm_shape()
         T = 4096

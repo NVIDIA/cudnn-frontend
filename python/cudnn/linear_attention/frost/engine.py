@@ -109,16 +109,17 @@ def summary_support_gates(engine: str, facts, graph) -> None:
         raise NotImplementedError(f"{engine}: d_final_state and d_initial_state dtypes must match")
 
 
-def dense_layout_message(plan_name, ports, offender) -> str:
+def dense_layout_message(plan_name, ports, offender, rule="must have a stride-1 innermost dim (buffers pass straight to the kernel)") -> str:
     """Name the port behind ``all_dense_layout``'s failing slot. Buffers pass
-    straight to the stride-plumbed kernels, so the one execute-time rule is a
-    stride-1 innermost dim; this walk only runs on the way to raising."""
+    straight to the stride-plumbed kernels, so the execute-time rules are a
+    stride-1 innermost dim and, for the operands the kernels fetch through TMA,
+    16-byte aligned outer strides and base; this walk only runs on the way to raising."""
     for slots in ports.values():
         for direction in (slots.inputs, slots.outputs):
             for port, slot in direction.items():
                 if slot == offender:
-                    return f"{plan_name}: buffer for {port!r} must have a stride-1 innermost dim (buffers pass straight to the kernel)"
-    return f"{plan_name}: the buffer at variant-pack slot {offender} must have a stride-1 innermost dim"
+                    return f"{plan_name}: buffer for {port!r} {rule}"
+    return f"{plan_name}: the buffer at variant-pack slot {offender} {rule}"
 
 
 class FrostLaPlan(CompiledPlan):
@@ -156,6 +157,9 @@ class FrostLaPlan(CompiledPlan):
         ok, offender = variant_pack.all_dense_layout()
         if not ok:
             raise ValueError(dense_layout_message(self.compiled.plan_name, ports, offender))
+        ok, offender = variant_pack.all_tma_layout()
+        if not ok:
+            raise ValueError(dense_layout_message(self.compiled.plan_name, ports, offender, "needs 16-byte aligned outer strides and base (TMA)"))
         views = variant_pack.operands(self.indices)
         workspace = Workspace.over(variant_pack, self.compiled.workspace_size, type(self.compiled).__name__)
         if not self.context_size:

@@ -458,7 +458,7 @@ def tcgen05_mma_warp(
     elect_one = nvvm.elect_sync()
 
     nvvm.tcgen05_alloc(tmem_base_slot, cutlass.Int32(512), group=nvvm.CTAGroup.CTA_1)
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
 
     # ---- chunk-invariant GEMM descriptors --------------------------------------------
     bytes_per_element = cfg.io_dtype.width // 8
@@ -886,7 +886,7 @@ def compute1_warp_group(
     sV_base = sV_trans[0].base
     num_vals = 32
 
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -1074,16 +1074,6 @@ def compute1_warp_group(
                 cumprod_vals = []
                 for k in cutlass.range_constexpr(num_vals):
                     cumprod_vals.append(sCumprod[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx])
-                last_cumsumlog = sCumsumlog[cfg.b_t - 1, 0, gate_idx]
-                cumsumlog_vals = []
-                for k in cutlass.range_constexpr(num_vals):
-                    cumsumlog_vals.append(sCumsumlog[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx])
-                decay_scale_vals = []
-                for k in cutlass.range_constexpr(0, num_vals, 2):
-                    d0, d1 = fadd2(last_cumsumlog, last_cumsumlog, -cumsumlog_vals[k], -cumsumlog_vals[k + 1])
-                    decay_scale_vals.append(cute.math.exp2(d0, fastmath=True))
-                    decay_scale_vals.append(cute.math.exp2(d1, fastmath=True))
-                bars.mb_gate_done[gate_idx].arrive()
 
                 # ---- Y = V - k state (packed 16-bit) ---------------------------------
                 if cutlass.const_expr(cfg.v_is_zero):
@@ -1136,6 +1126,18 @@ def compute1_warp_group(
                     )
                 nvvm.tcgen05_wait("store")
                 bars.mb_y_input_ready[0].arrive()
+
+                # ---- gate decay build, hidden under the U MMA ------------------------
+                last_cumsumlog = sCumsumlog[cfg.b_t - 1, 0, gate_idx]
+                cumsumlog_vals = []
+                for k in cutlass.range_constexpr(num_vals):
+                    cumsumlog_vals.append(sCumsumlog[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, gate_idx])
+                decay_scale_vals = []
+                for k in cutlass.range_constexpr(0, num_vals, 2):
+                    d0, d1 = fadd2(last_cumsumlog, last_cumsumlog, -cumsumlog_vals[k], -cumsumlog_vals[k + 1])
+                    decay_scale_vals.append(cute.math.exp2(d0, fastmath=True))
+                    decay_scale_vals.append(cute.math.exp2(d1, fastmath=True))
+                bars.mb_gate_done[gate_idx].arrive()
 
                 # ---- U epilogue + decayed-U publish ----------------------------------
                 bars.mb_u_acc_ready[0].wait(u_acc_ready_index.phase)

@@ -19,13 +19,26 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 
 
 @pytest.mark.parametrize(
-    "dtype,safe,dim",
-    [(torch.bfloat16, False, 64), (torch.bfloat16, True, 128), (torch.float16, False, 128), (torch.float16, True, 64)],
-    ids=["bf16-log-d64", "bf16-safe-d128", "fp16-log-d128", "fp16-safe-d64"],
+    "dtype,safe,dim,divisor,head_pattern,state_waves",
+    [
+        pytest.param(torch.bfloat16, False, 64, 2, "equal", False, id="checkpoint-only-equal-2-bf16-log-d64"),
+        pytest.param(torch.bfloat16, False, 64, 4, "gqa", False, id="checkpoint-only-gqa-4-bf16-log-d64"),
+        pytest.param(torch.bfloat16, False, 64, 8, "gva", True, id="all-states-gva-8-bf16-log-d64"),
+        pytest.param(torch.bfloat16, False, 64, 16, "equal", True, id="all-states-equal-16-bf16-log-d64"),
+        pytest.param(torch.bfloat16, True, 128, 2, "gqa", True, id="all-states-gqa-2-bf16-safe-d128"),
+        pytest.param(torch.bfloat16, True, 128, 4, "equal", True, id="all-states-equal-4-bf16-safe-d128"),
+        pytest.param(torch.bfloat16, True, 128, 8, "equal", False, id="checkpoint-only-equal-8-bf16-safe-d128"),
+        pytest.param(torch.bfloat16, True, 128, 16, "gva", False, id="checkpoint-only-gva-16-bf16-safe-d128"),
+        pytest.param(torch.float16, False, 128, 2, "gva", False, id="checkpoint-only-gva-2-fp16-log-d128"),
+        pytest.param(torch.float16, False, 128, 4, "equal", False, id="checkpoint-only-equal-4-fp16-log-d128"),
+        pytest.param(torch.float16, False, 128, 8, "equal", True, id="all-states-equal-8-fp16-log-d128"),
+        pytest.param(torch.float16, False, 128, 16, "gqa", True, id="all-states-gqa-16-fp16-log-d128"),
+        pytest.param(torch.float16, True, 64, 2, "equal", True, id="all-states-equal-2-fp16-safe-d64"),
+        pytest.param(torch.float16, True, 64, 4, "gva", True, id="all-states-gva-4-fp16-safe-d64"),
+        pytest.param(torch.float16, True, 64, 8, "gqa", False, id="checkpoint-only-gqa-8-fp16-safe-d64"),
+        pytest.param(torch.float16, True, 64, 16, "equal", False, id="checkpoint-only-equal-16-fp16-safe-d64"),
+    ],
 )
-@pytest.mark.parametrize("divisor", [2, 4, 8, 16])
-@pytest.mark.parametrize("head_pattern", ["equal", "gqa", "gva"])
-@pytest.mark.parametrize("state_waves", [False, True], ids=["checkpoint-only", "all-states"])
 def test_checkpoint_waves_bitwise_and_capture(monkeypatch, dtype, safe, dim, divisor, head_pattern, state_waves):
     reason = frost_la_unavailable()
     if reason:

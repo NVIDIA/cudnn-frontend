@@ -1789,6 +1789,9 @@ class KdaSummaryFrostEngine(BaseEngine):
             raise NotImplementedError(f"KdaSummaryFrostEngine: v head dim must be 64 or 128, got {facts.d_v}")
         if facts.gate_channels != facts.d_qk:
             raise NotImplementedError(f"KdaSummaryFrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
+        checkpoint = facts.checkpoint_every_n_tokens
+        if checkpoint and checkpoint % 16 != 0:
+            raise NotImplementedError(f"KdaSummaryFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         summary_support_gates("KdaSummaryFrostEngine", facts, graph)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:

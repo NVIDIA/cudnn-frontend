@@ -1815,6 +1815,9 @@ class GdnSummaryFrostEngine(BaseEngine):
             raise NotImplementedError(f"GdnSummaryFrostEngine: k head dim must be 64 or 128, got {facts.d_qk}")
         if facts.d_v not in (64, 128):
             raise NotImplementedError(f"GdnSummaryFrostEngine: v head dim must be 64 or 128, got {facts.d_v}")
+        checkpoint = facts.checkpoint_every_n_tokens
+        if checkpoint and checkpoint % 64 != 0:
+            raise NotImplementedError(f"GdnSummaryFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 64 (got {checkpoint})")
         summary_support_gates("GdnSummaryFrostEngine", facts, graph)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:

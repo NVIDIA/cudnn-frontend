@@ -530,7 +530,7 @@ def tcgen05_mma_warp(
     elect_one = nvvm.elect_sync()
 
     nvvm.tcgen05_alloc(tmem_base_slot, cutlass.Int32(512), group=nvvm.CTAGroup.CTA_1)
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
 
     # ---- chunk-invariant GEMM descriptors --------------------------------------------
     bytes_per_element = cfg.io_dtype.width // 8
@@ -1051,7 +1051,7 @@ def compute0_warp_group(
     sQ_base = sQ_raw.data_ptr()
     tile_idx = cutlass.Int32(bidx)
 
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -1260,7 +1260,7 @@ def compute1_warp_group(
     d_scalar = cutlass.Float32(0.0)
     zero = opaque_f32_zero()
 
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -1282,7 +1282,7 @@ def compute1_warp_group(
                 if n_local > 0:
                     if cg1_tidx < cfg.d_v:
                         sD[cg1_tidx] = mD[head_o, cg1_tidx + v_offset].to(cutlass.Float32)
-                    nvvm.barrier_cta_sync_aligned(cfg.cg1_sync_barrier_id, thread_count=num_threads_cg1)
+                    nvvm.barrier_cta_sync(cfg.cg1_sync_barrier_id, thread_count=num_threads_cg1)
             else:
                 if n_local > 0:
                     d_scalar = mD[head_o].to(cutlass.Float32)
@@ -1519,7 +1519,7 @@ def compute2_warp_group(
     lane_word_offset = lane_idx * 4
     word_layout = cute.make_layout(1)
     zero = opaque_f32_zero()
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -1698,7 +1698,7 @@ def compute2_warp_group(
                 if cutlass.const_expr(cfg.use_dstate_in):
                     bars.mb_dv_scaled_done[0].wait(dv_scaled_index.phase)
                     dv_scaled_index = advance(dv_scaled_index, 1)
-                nvvm.barrier_cta_sync_aligned(cfg.cg2_sync_barrier_id, thread_count=num_threads_cg2)
+                nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=num_threads_cg2)
                 if cg2_tidx == 0:
                     exit_slot = exit_base + chunk_idx
                     if chunk_idx < write_end:
@@ -1708,7 +1708,7 @@ def compute2_warp_group(
                         if cutlass.const_expr(cfg.use_dstate_in):
                             final_sum = final_sum + (((sExit[8] + sExit[9]) + sExit[10]) + sExit[11])
                         mExit[exit_slot + 1, head_o] = final_sum
-                nvvm.barrier_cta_sync_aligned(cfg.cg2_sync_barrier_id, thread_count=num_threads_cg2)
+                nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=num_threads_cg2)
 
                 if chunk_idx > write_start:
                     for q in cutlass.range_constexpr(num_vectors):

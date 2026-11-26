@@ -25,6 +25,8 @@ Target arch: SM100 / SM103 / SM107.
 from dataclasses import dataclass
 from typing import Tuple
 
+MAX_EXPAND_NUM = {128: 8, 64: 16}
+
 
 @dataclass(frozen=True)
 class Cfg:

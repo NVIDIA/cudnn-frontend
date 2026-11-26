@@ -537,3 +537,6 @@ def chain_prologue(
         m_count,
         summary_skip,
     ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+
+
+frost_kda_chain_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)

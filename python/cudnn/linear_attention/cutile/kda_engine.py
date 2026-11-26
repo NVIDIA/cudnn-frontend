@@ -243,6 +243,10 @@ class KdaCuTileEngine(BaseEngine):
             raise NotImplementedError(
                 f"KdaCuTileEngine: bwd requires v head dim 128 (the cuda.tile runtime rejects the fused wy/dqkg kernel otherwise), got {facts.d_v}"
             )
+        if facts.d_qk > 128 and buffers.current_sm() in (120, 121):
+            raise NotImplementedError(
+                f"KdaCuTileEngine: head dim K > 128 miscomputes on SM120 (full-width BK tiles; NVIDIA/cudnn-frontend#2777), got {facts.d_qk}"
+            )
         low, high = GATE_LOWER_BOUND_RANGE
         gate_lower_bound = facts.gate_lower_bound
         if gate_lower_bound is not None and not (low <= gate_lower_bound < high):
