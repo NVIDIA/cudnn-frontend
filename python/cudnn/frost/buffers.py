@@ -760,8 +760,6 @@ def current_device_id():
     except Exception:  # noqa: BLE001 — fall through to the driver
         pass
     try:
-        import ctypes
-
         lib = ctypes.CDLL("libcuda.so.1")
         if lib.cuInit(0) != 0:
             return None
@@ -790,8 +788,6 @@ def _sm_via_cuda_bindings():
 
 def _sm_via_driver():
     """The same query through libcuda directly — no python package needed."""
-    import ctypes
-
     lib = ctypes.CDLL("libcuda.so.1")
     if lib.cuInit(0) != 0:
         return None

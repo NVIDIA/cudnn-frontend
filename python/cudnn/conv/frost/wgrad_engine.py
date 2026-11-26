@@ -10,7 +10,7 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cudnn.engines.base import BaseEngine, CompiledPlan, require_stream
 from cudnn.frost.buffers import reordering_name as _reordering_name
-from cudnn.frost.device import build_device, current_device
+from cudnn.frost.device import current_device
 from .checks import (
     DENSE_CUTEDSL_MIN_VERSION,
     _check_cutedsl,
@@ -58,7 +58,8 @@ class _WgradPlan(CompiledPlan):
                 raise ValueError(f"frost_conv_wgrad: {role} must match the declared compact channels-last shape and stride")
             if operand.dtype != dtype or operand.data_ptr() % 16:
                 raise ValueError(f"frost_conv_wgrad: {role} requires {dtype} storage and 16-byte alignment")
-        self._compiled(*(v.permute(0, 2, 3, 4, 1) for v in operands), cuda.CUstream(require_stream(ctx.stream, "frost_conv_wgrad")), *self._geometry)
+        stream = cuda.CUstream(require_stream(ctx.stream, "frost_conv_wgrad"))
+        self._compiled(*(v.permute(0, 2, 3, 4, 1) for v in operands), stream, *self._geometry)
 
 
 class FrostConvWgradEngine(BaseEngine):
@@ -130,19 +131,16 @@ class FrostConvWgradEngine(BaseEngine):
     def build_plan(self, graph, plan, ctx=None):
         knobs = self.knobs_to_public(plan.knobs)
         a = analyze_wgrad(graph)
-        handle = ctx.handle if ctx is not None else None
-        device = handle.device.ordinal if hasattr(handle, "device") else None
-        with build_device(device):
-            self.check_support(graph)
-            # Load compiler primitives only after the DSL version/support gate.
-            from .templates.sm100_conv_wgrad import compile
-            from .tile_config import ConvTileConfig
+        self.check_support(graph)
+        # Load compiler primitives only after the DSL version/support gate.
+        from .templates.sm100_conv_wgrad import compile
+        from .tile_config import ConvTileConfig
 
-            k = cudnn.knob_type
-            config = ConvTileConfig(knobs[k.TILE_M], knobs[k.TILE_N], knobs[k.TILEK], knobs[k.CTA_GROUP])
-            ab_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(a.image.data_type)]
-            output_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(a.weight.data_type)]
-            return _WgradPlan(compile(ab_dtype, output_dtype, config, a.epilogue, a.epilogue_attrs, knobs[k.STAGES]), a, current_device())
+        k = cudnn.knob_type
+        config = ConvTileConfig(knobs[k.TILE_M], knobs[k.TILE_N], knobs[k.TILEK], knobs[k.CTA_GROUP])
+        ab_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(a.image.data_type)]
+        output_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(a.weight.data_type)]
+        return _WgradPlan(compile(ab_dtype, output_dtype, config, a.epilogue, a.epilogue_attrs, knobs[k.STAGES]), a, current_device())
 
 
 def FrostConvWgradEngines(ids: dict[str, int]) -> list[BaseEngine]:

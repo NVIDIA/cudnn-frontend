@@ -21,7 +21,6 @@ from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
 from cudnn.frost.device import current_device
 from cudnn.conv.frost.graph_analyzer import analyze_fprop, ConvGraph
-from cudnn._pygraph import pygraph
 
 from .checks import (
     BLOCK_SCALE_CUTEDSL_MIN_VERSION,

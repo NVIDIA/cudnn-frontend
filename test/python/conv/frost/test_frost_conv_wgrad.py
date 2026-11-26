@@ -4,7 +4,6 @@
 """Public graph coverage; dgrad and higher derivatives are unsupported."""
 
 import builtins
-from contextlib import nullcontext
 import os
 from pathlib import Path
 import subprocess
@@ -160,7 +159,6 @@ def test_frost_wgrad_rejections(monkeypatch, change, match):
 def test_frost_wgrad_filter_offset_limit(monkeypatch, axis, filter_extent, value):
     monkeypatch.setattr(engine, "_check_sm100", lambda: None)
     monkeypatch.setattr(engine, "_check_cutedsl", lambda *a: None)
-    monkeypatch.setattr(engine, "build_device", lambda device: nullcontext())
     dilation = tuple(value if i == axis else 1 for i in range(3))
     filter_shape = tuple(filter_extent if i == axis else 1 for i in range(3))
     # Keep corners and output dimensions legal so only the offset gate can
@@ -339,7 +337,7 @@ def test_frost_wgrad_binding_rejection(monkeypatch, role, field):
     operands = []
     for i, tensor in enumerate(tensors):
         stride = tuple(tensor.stride)
-        v = SimpleNamespace(shape=tuple(tensor.dim), stride=lambda stride=stride: stride, dtype="bfloat16", data_ptr=lambda: 16)
+        v = SimpleNamespace(shape=tuple(tensor.dim), stride=lambda stride=stride: stride, dtype="bfloat16", data_ptr=lambda: 16, permute=lambda *a: None)
         if i == role:
             if field == "shape":
                 v.shape = (1,)

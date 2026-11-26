@@ -77,7 +77,6 @@ from typing import Optional, Sequence
 os.environ.setdefault("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
 
 import cudnn
-import cudnn.conv.frost  # noqa: F401 -- make the optional implementation available
 import cutlass
 import torch
 
