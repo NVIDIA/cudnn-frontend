@@ -230,7 +230,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         # Never serialized: a build-time int that only places the scheduler state.
         self.streaming_signal_capacity = streaming_signal_capacity
         self.device_layout = device_layout
-        # The kernel's release-zero (python/cudnn/AGENTS.md Rule 11), wrapped once at kernel entry; never serialized.
+        # The kernel's release-zero (consume-then-arrive slot release), wrapped once at kernel entry; never serialized.
         self.release_zero = release_zero
         check_linear_tile_idx_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity)
         # mapa.shared::cluster at one CTA is an illegal peer store.  check_dynamic_sched_cluster_shape admits (1, 1)
@@ -282,7 +282,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         """Create the scheduler from the claim counter ``counter_ptr``; ``signal[]`` and the scheduler state follow it.
         ``device_layout``: wait for the dispatch-written layout before the first claim (see the module docstring).
         ``release_zero``: ``release_zero(<the kernel's release-zero argument>)``, which orders each slot release after the
-        read of the slot (python/cudnn/AGENTS.md Rule 11)."""
+        read of the slot (consume-then-arrive slot release)."""
         # %cluster_ctarank, hinted warp-uniform so it lands in a uniform register; CTAs are x-fastest in the cluster.
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cta_id_in_cluster = (
@@ -319,7 +319,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         claimed_linear_tile_idx = self._broadcast_claimed_tile()
         work_tile_info = self._get_work_tile_for_linear_idx(claimed_linear_tile_idx)
         # The broadcast value is consumed: a full warp per CTA arrives on the leader's empty barrier, each lane at an
-        # address computed from the slot word it read, so the read completes before the leader may refill the slot (Rule 11).
+        # address computed from the slot word it read, so the read completes before the leader may refill the slot (consume-then-arrive slot release).
         consume_then_arrive_on_peer(
             self.cluster_pipeline.sync_object_empty.get_barrier(self._dynamic_state.consumer_state.index),
             0,
