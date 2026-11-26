@@ -140,6 +140,7 @@ class GroupedGemmGluSm100(APIBase):
 
     supports_glu_layouts = GLU_LAYOUTS
     supports_gate_then_up_precisions = ("bf16", "nvfp4", "mxfp8")
+    supports_gate_then_up_archs = ((10, 0), (10, 3), (10, 7))
     preferred_gate_then_up_mma_tiler = (256, 256)
 
     # BF16 implementation
@@ -1553,6 +1554,7 @@ def grouped_gemm_glu_wrapper_sm100(
 
 
 grouped_gemm_glu_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
+grouped_gemm_glu_wrapper_sm100.supports_gate_then_up_archs = GroupedGemmGluSm100.supports_gate_then_up_archs
 grouped_gemm_glu_wrapper_sm100.supports_gate_then_up_precisions = GroupedGemmGluSm100.supports_gate_then_up_precisions
 grouped_gemm_glu_wrapper_sm100.supports_canonical_layouts = True
 grouped_gemm_glu_wrapper_sm100.supports_bf16_canonical_layouts = True

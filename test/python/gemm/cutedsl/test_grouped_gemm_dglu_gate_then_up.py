@@ -22,7 +22,7 @@ pytestmark = pytest.mark.L0
 @pytest.fixture(autouse=True)
 def require_blackwell():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("canonical GLU branches require SM100/103")
+        pytest.skip("This suite includes deterministic dprob, which requires SM100/103; see the Rubin suite for atomic dprob")
 
 
 def unpair(tensor, axis=1, block=32):
@@ -96,7 +96,7 @@ def problem(n=256, group_m=(256, 0, 512), b_major="k", precision="mxfp8"):
     return cfg, inputs
 
 
-def run(cfg, inputs, *, canonical, discrete=False, discrete_col_sfd=False, dbias=False, dprob=None):
+def run(cfg, inputs, *, canonical, discrete=False, discrete_col_sfd=False, dbias=False, dprob=None, deterministic=None):
     from cudnn import grouped_gemm_dglu_wrapper_sm100
 
     b, sfb = inputs["b_tensor"], inputs["sfb_tensor"]
@@ -130,7 +130,7 @@ def run(cfg, inputs, *, canonical, discrete=False, discrete_col_sfd=False, dbias
         b_major=cfg["b_major"],
         discrete_col_sfd=discrete_col_sfd,
         generate_dbias=dbias,
-        deterministic=not dbias,
+        deterministic=not dbias if deterministic is None else deterministic,
         use_dynamic_sched=True,
         glu_layout="gate_then_up" if canonical else "interleaved_32",
         **weight_args,

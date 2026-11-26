@@ -91,6 +91,8 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
     supports_canonical_layouts = True
     supports_glu_layouts = GLU_LAYOUTS
     supports_gate_then_up_precisions = ("nvfp4",)
+    supports_gate_then_up_archs = ((10, 0), (10, 3), (10, 7))
+    preferred_gate_then_up_mma_tiler_by_arch = {(10, 0): (128, 256), (10, 3): (128, 256), (10, 7): (256, 256)}
     supports_gate_then_up_mma_tilers = ((128, 256),)
 
     def __init__(
@@ -380,8 +382,8 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         )
         if self.glu_layout == "gate_then_up":
             self._value_error_if(
-                self.mma_tiler_mn != (128, 256) or self.cluster_shape_mn != (1, 1),
-                "gate_then_up RHT quant requires mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1)",
+                (self.mma_tiler_mn, self.cluster_shape_mn) != (((256, 256), (2, 1)) if self._is_rubin_kernel else ((128, 256), (1, 1))),
+                "gate_then_up RHT quant requires tile/cluster (256,256)/(2,1) on SM107 or (128,256)/(1,1) on SM100/103",
             )
             self._value_error_if(
                 n % 256 != 0
@@ -422,7 +424,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
 
         major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
         compute_capability = major * 10 + minor
-        self._value_error_if(self.glu_layout == "gate_then_up" and compute_capability not in (100, 103), "gate_then_up RHT quant requires SM100/103")
+        self._value_error_if(self.glu_layout == "gate_then_up" and compute_capability not in (100, 103, 107), "gate_then_up RHT quant requires SM100/103/107")
         if not has_tcgen05(major):
             raise RuntimeError(f"GroupedGemmGluHadamardQuantSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
@@ -1245,6 +1247,10 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
 
 grouped_gemm_glu_hadamard_quant_wrapper_sm100.supports_canonical_layouts = True
 grouped_gemm_glu_hadamard_quant_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
+grouped_gemm_glu_hadamard_quant_wrapper_sm100.supports_gate_then_up_archs = GroupedGemmGluHadamardQuantSm100.supports_gate_then_up_archs
+grouped_gemm_glu_hadamard_quant_wrapper_sm100.preferred_gate_then_up_mma_tiler_by_arch = (
+    GroupedGemmGluHadamardQuantSm100.preferred_gate_then_up_mma_tiler_by_arch
+)
 grouped_gemm_glu_hadamard_quant_wrapper_sm100.supports_gate_then_up_precisions = ("nvfp4",)
 
 grouped_gemm_glu_hadamard_quant_wrapper_sm100.supports_gate_then_up_mma_tilers = ((128, 256),)

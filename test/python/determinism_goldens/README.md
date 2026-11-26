@@ -4,6 +4,31 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Rubin canonical GLU integration (2026-11-26)
+
+On NVIDIA VR NVL72 (SM107), the canonical GLU branch, Hadamard, Hadamard+quant,
+and Rubin dGLU suites passed 143 cases. The Hadamard determinism suite passed
+another 23 cases, including deliberately asymmetric CTA arrival, stage reuse,
+and warm/shared-memory-poisoned replay. The environment was PyTorch
+2.14.0a0+b2c75dd062.nv26.09, CUDA 13.4, CuTe DSL 4.8.0, cuDNN 9.26.1,
+and driver 620.70.10. These results use FE changes based on `7de9d76a174c`.
+
+The numerical suites use independent references as well as cross-layout
+comparisons. They cover BF16, MXFP8 E4M3/E8M0 and NVFP4 E2M1/E4M3;
+saved pre-activation, output data/scales, dense/discrete weights, empty experts,
+and changed-input CUDA graph replay. Canonical block-scaled GLU/dGLU use
+N tiles of 256 without Rubin's M512 B-reuse specialization. Canonical
+Hadamard+quant is restricted to 256x256 tiles and a 2x1 cluster. UE5M3 and
+deterministic atomic dprob/dbias are not enabled by this change.
+
+The warm-stress cells performed 3,000 warm and 3,000 poisoned launches per
+tested configuration without mismatches. Their cold reference checks replay
+stability, not independent mathematical correctness; independent references
+are supplied by the separate numerical suites. The stress geometry has one
+thread block per SM, so this does not establish arbitrary scheduling or
+batch-invariance guarantees. No new golden files were generated. Blackwell
+regression execution and SM103 execution were not performed in this run.
+
 ### Quantized batch-invariant matmul (2026-11-24)
 
 The [batch-invariant suite](../gemm/batch_invariant/README.md) passed on SM100 (P2021, 68 SMs) and SM107

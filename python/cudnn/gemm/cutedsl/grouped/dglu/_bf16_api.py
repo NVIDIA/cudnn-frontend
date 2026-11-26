@@ -398,8 +398,8 @@ class GroupedGemmDgluBf16API(APIBase):
         major, minor = get_compute_capability()
         capability = major * 10 + minor
         if self.glu_layout == "gate_then_up":
-            if (major, minor) not in ((10, 0), (10, 3)) or self._framework != "torch":
-                raise NotImplementedError("gate_then_up BF16 dGLU requires torch tensors on SM100/103")
+            if (major, minor) not in ((10, 0), (10, 3), (10, 7)) or self._framework != "torch":
+                raise NotImplementedError("gate_then_up BF16 dGLU requires torch tensors on SM100/103/107")
             if self.act_func != "dswiglu" or self.c_desc.dtype != cutlass.BFloat16 or self.d_row_desc.dtype != cutlass.BFloat16:
                 raise NotImplementedError("gate_then_up BF16 dGLU requires dswiglu with BF16 C/D")
             if self.c_desc.shape[1] % 256 != 0:

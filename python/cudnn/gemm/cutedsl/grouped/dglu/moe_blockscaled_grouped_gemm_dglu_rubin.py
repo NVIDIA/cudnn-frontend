@@ -39,6 +39,7 @@ from cutlass._mlir.dialects import math, llvm
 from cutlass._mlir.dialects import vector, arith
 
 from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
+from ..glu_layout import interleaved_glu_view, validate_glu_layout
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -243,6 +244,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         act_func: str = "dswiglu",
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         use_single_group_runtime_offsets: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -309,6 +311,9 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         if not isinstance(weight_mode, MoEWeightMode):
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
+        self.glu_layout = validate_glu_layout(glu_layout)
+        if self.glu_layout == "gate_then_up" and (mma_tiler_mn[1] != 256 or enable_breuse or sf_fp8_dtype_override is not None):
+            raise ValueError("Rubin gate_then_up requires tile N=256, no B-reuse, and UE8M0/E4M3 scales")
         self.sf_vec_size = sf_vec_size
         self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.expert_cnt = expert_cnt
@@ -1015,6 +1020,13 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size) * atom_thr_size
 
+        # Map saved pre-activations and gradients, not the FC2 GEMM weight.
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            c = interleaved_glu_view(c, axis=1)
+            d = interleaved_glu_view(d, axis=1)
+            if cutlass.const_expr(d_col is not None):
+                d_col = interleaved_glu_view(d_col, axis=1)
+
         # Setup TMA store for C
         c_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
         self.tma_c_load_bytes = cute.size_in_bytes(self.c_dtype, c_smem_layout)
@@ -1678,6 +1690,11 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         return tCgSFDCol_mnl
 
     @cute.jit
+    def canonical_glu_column(self, column, two_n):
+        """Map an internal interleave32 column to its persistent gate/up half."""
+        return (column // 64) * 32 + column % 32 + ((column // 32) % 2) * (two_n // 2)
+
+    @cute.jit
     def dbias_reduction(
         self,
         d1_vec,
@@ -1728,6 +1745,8 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                 sum_b = sum_b + rDst_b[i]
 
         n_offset = (n_base_d1 + 2 * lane_idx) if lane_idx < 16 else (n_base_d2 + 2 * (lane_idx - 16))
+        if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+            n_offset = self.canonical_glu_column(n_offset, dbias_n_total)
 
         if cutlass.const_expr(self.dbias_cross_warp_reduce):
             reduce_base = sDbias.iterator
@@ -3072,6 +3091,16 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                     tCrSFDCol = cute.make_rmem_tensor(tCrSFDRow.layout, tCrSFDRow.element_type)
                     tCrSFDCol_pvscale = cute.make_rmem_tensor_like(tCrSFDRow_pvscale.layout, cutlass.Float32)
                     tCgSFDCol_mn = tCgSFDCol_mnl[(None, None, None, None, None, 0)]
+                    if cutlass.const_expr(self.glu_layout == "gate_then_up" and self.discrete_col_sfd):
+                        # Discrete column scales use expert-local M atom capacity.
+                        # The extension provides the plane pointer; quantization
+                        # indexes the transposed scale atom layout within it.
+                        canonical_sfd_col_layout = cute.tile_to_shape(
+                            blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size, OperandMajorMode.MN).layout,
+                            (cute.size(real_sfd_col, mode=[0]), cute.size(real_sfd_col, mode=[1]), real_sfd_col.shape[2]),
+                            (1, 2, 3),
+                        )
+                        real_sfd_col = cute.make_tensor(real_sfd_col.iterator, canonical_sfd_col_layout)
 
                 if cutlass.const_expr(self.generate_amax):
                     thread_tile_amax = cutlass.Float32(0.0)
@@ -3340,10 +3369,23 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                             else:
                                 self.cvt_f32x4_to_f8x4(tCrSFDRow_pvscale, tCrSFDRow)
                                 self.cvt_f32x4_to_f8x4(tCrSFDCol_pvscale, tCrSFDCol)
-                            if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
-                                cute.autovec_copy(tCrSFDRow, tCgSFDRow)
-                            if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
-                                cute.autovec_copy(tCrSFDCol, tCgSFDCol)
+                            if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                                # Each thread owns one row scale and one column
+                                # scale per 32-column branch tile. Scatter only
+                                # these scale bytes to canonical atoms; payloads
+                                # use TMA above. No global scale repack is needed.
+                                two_n = cute.size(mSFDRow_mnl, mode=[1])
+                                for scale_slot in cutlass.range_constexpr(4):
+                                    paired_n = sfd_row_idx_mn[1] * 128 + scale_slot * 32
+                                    canonical_n = self.canonical_glu_column(paired_n, two_n)
+                                    if paired_n < two_n:
+                                        real_sfd_row[(mPosition, canonical_n, 0)] = tCrSFDRow[scale_slot]
+                                        real_sfd_col[(mPosition - tidx % 32, canonical_n + tidx % 32, 0)] = tCrSFDCol[scale_slot]
+                            else:
+                                if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
+                                    cute.autovec_copy(tCrSFDRow, tCgSFDRow)
+                                if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
+                                    cute.autovec_copy(tCrSFDCol, tCgSFDCol)
                     else:
                         #
                         # Convert to D type

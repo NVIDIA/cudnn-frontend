@@ -369,7 +369,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 weight_mode=self.weight_mode,
                 act_func=self.act_func,
                 use_dynamic_sched=self.use_dynamic_sched,
-                **({"situ_beta1": self.situ_beta1, "glu_layout": self.glu_layout} if not self._is_rubin_kernel else {}),
+                glu_layout=self.glu_layout,
+                **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
                 **({"deterministic": True} if self._deterministic else {}),
                 **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
                 # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
@@ -444,8 +445,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         if self.glu_layout == "gate_then_up":
             if self.act_func != "dswiglu":
                 raise NotImplementedError("gate_then_up dGLU currently supports dswiglu only")
-            if self._is_rubin_kernel:
-                raise NotImplementedError("gate_then_up dGLU is implemented only for SM100/103")
+            if self._is_rubin_kernel and (self.mma_tiler_mn[1] != 256 or self.mma_tiler_mn[0] == 512):
+                raise NotImplementedError("Rubin gate_then_up dGLU requires tile N=256 without M512 B-reuse")
             canonical_mxfp8 = self.a_desc.dtype == torch.float8_e4m3fn and self.sf_vec_size == 32 and self.sfa_desc.dtype == torch.float8_e8m0fnu
             canonical_nvfp4 = (
                 self.a_desc.dtype in (torch.float4_e2m1fn_x2, torch.uint8) and self.sf_vec_size == 16 and self.sfa_desc.dtype == torch.float8_e4m3fn
@@ -813,8 +814,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         major, minor = torch.cuda.get_device_capability(device)
         compute_capability = major * 10 + minor
-        if self.glu_layout == "gate_then_up" and (major, minor) not in ((10, 0), (10, 3)):
-            raise NotImplementedError(f"gate_then_up dGLU is implemented only for SM100/103, found SM{compute_capability}")
+        if self.glu_layout == "gate_then_up" and (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+            raise NotImplementedError(f"gate_then_up dGLU is implemented only for SM100/103/107, found SM{compute_capability}")
         if not has_tcgen05(major):
             raise RuntimeError(
                 f"GroupedGemmDglu requires SM100+ compute capability with tcgen05 (not cc 12.x), " f"but found SM{compute_capability} on device {device}"

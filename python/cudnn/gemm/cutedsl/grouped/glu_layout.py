@@ -8,6 +8,47 @@ parameter/checkpoint layout; ``interleaved_32`` is the existing MMA/epilogue ord
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import llvm
+
+
+@dsl_user_op
+def release_sfb_shared(*, loc=None, ip=None):
+    """Publish local SFB stores before a relaxed remote barrier arrival.
+
+    The handoff contains shared-memory scale data only. PTX permits a
+    shared-restricted release fence followed by a relaxed cluster arrival;
+    the consumer pairs this with an acquire at cluster scope. Restricting the
+    fence avoids ordering unrelated global-memory work from the GEMM pipeline.
+    """
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.release.sync_restrict::shared::cta.cluster;",
+        "~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def wait_sfb_cluster(ptr, phase, *, loc=None, ip=None):
+    """Acquire the peer CTA's shared-only release, including across stage wraps."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(ptr.toint()).ir_value(loc=loc, ip=ip), cutlass.Int32(phase).ir_value(loc=loc, ip=ip)],
+        "{ .reg .pred done; WAIT: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 done, [$0], $1, 10000000; @!done bra WAIT; }",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
 
 GLU_LAYOUTS = ("interleaved_32", "gate_then_up")
 
@@ -37,7 +78,7 @@ def paired_glu_sfb_view(tensor: cute.Tensor):
     """Pair whole canonical F8_128x4 scale atoms for one 256-column tile.
 
     TMA cannot gather the 4-byte quarters needed by interleave32. Load one
-    gate128/up128 pair and let the MMA warp rearrange those quarters in SMEM.
+    gate128/up128 pair and let the consumer rearrange those quarters in SMEM.
     This view preserves all 16-byte contiguous pieces required by TMA.
     """
     rest_n = tensor.shape[0][1]

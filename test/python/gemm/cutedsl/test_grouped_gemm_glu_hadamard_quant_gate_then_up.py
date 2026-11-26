@@ -25,9 +25,9 @@ pytestmark = pytest.mark.L0
 
 
 @pytest.fixture(autouse=True)
-def require_blackwell():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Canonical RHT quant requires SM100/103")
+def require_canonical_glu_device():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Canonical RHT quant requires SM100/103/107")
 
 
 def sf_view(sf):
@@ -60,8 +60,8 @@ def kwargs_for(problem, mode, discrete=False, layout="gate_then_up"):
         norm_const=16.0,
         rht_norm_const=16.0,
         glu_layout=layout,
-        mma_tiler_mn=(128, 256) if layout == "gate_then_up" else (256, 256),
-        cluster_shape_mn=(1, 1) if layout == "gate_then_up" else (2, 1),
+        mma_tiler_mn=(128, 256) if layout == "gate_then_up" and torch.cuda.get_device_capability() != (10, 7) else (256, 256),
+        cluster_shape_mn=(1, 1) if layout == "gate_then_up" and torch.cuda.get_device_capability() != (10, 7) else (2, 1),
         use_dynamic_sched=True,
     )
     if discrete:
@@ -200,7 +200,7 @@ def test_canonical_rht_quant_rejects_unsupported(option):
     if option == "layout":
         kwargs["glu_layout"] = "invalid"
     elif option == "tile":
-        kwargs["mma_tiler_mn"], kwargs["cluster_shape_mn"] = (256, 256), (2, 1)
+        kwargs["mma_tiler_mn"], kwargs["cluster_shape_mn"] = ((128, 256), (1, 1)) if torch.cuda.get_device_capability() == (10, 7) else ((256, 256), (2, 1))
     elif option == "branch":
         kwargs["b_tensor"] = kwargs["b_tensor"][:128]
     else:
