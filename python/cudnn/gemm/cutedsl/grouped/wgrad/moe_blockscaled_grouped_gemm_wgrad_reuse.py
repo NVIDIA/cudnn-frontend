@@ -82,6 +82,15 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
             and cls.short_experts(tokens, experts, a_stages)
         )
 
+    @staticmethod
+    def _sf_atom(k_tile, sf_k, sf_k_atoms: int, k_atoms):
+        """The expert's SF atom (within a 128-row block) for atom ``sf_k`` of K tile ``k_tile``. With more than one
+        atom per K tile, a partial last K tile can end inside its first atom: its later atoms repeat the expert's
+        last one, whose scale factors then multiply only the zeros the bounded A and B loads put there."""
+        if sf_k_atoms == 1:
+            return k_tile
+        return cutlass.min(k_tile * sf_k_atoms + sf_k, k_atoms - 1)
+
     def _setup_attributes(self) -> None:
         self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
         self.mma_inst_shape_mn_sfb = (
@@ -665,11 +674,21 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
             sched_pipeline.consumer_release(sched_consumer_state)
             sched_consumer_state.advance()
 
-            # SF in shared memory as 16-byte rows: SFA one 512-byte atom per stage, SFB two (its 256 columns).
-            sSFA_rows = cute.make_tensor(cute.recast_ptr(sSFA.iterator, dtype=cutlass.Int64), cute.make_layout((2, 32, self.num_a_stage), stride=(1, 2, 64)))
-            sSFB_rows = cute.make_tensor(
-                cute.recast_ptr(sSFB.iterator, dtype=cutlass.Int64), cute.make_layout((2, 32, 2, self.num_b_stage), stride=(1, 2, 64, 128))
+            # SF in shared memory as 16-byte rows: per stage, SFA one 512-byte atom per 128 K rows of the K tile, SFB
+            # two per 128 K rows (its 256 columns), K atoms inner as make_smem_layout_sfb tiles them.
+            sf_k_atoms = self.cta_tile_shape_mnk[2] // 128
+            sSFA_rows = cute.make_tensor(
+                cute.recast_ptr(sSFA.iterator, dtype=cutlass.Int64), cute.make_layout((2, 32, sf_k_atoms * self.num_a_stage), stride=(1, 2, 64))
             )
+            if cutlass.const_expr(sf_k_atoms == 1):
+                sSFB_rows = cute.make_tensor(
+                    cute.recast_ptr(sSFB.iterator, dtype=cutlass.Int64), cute.make_layout((2, 32, 2, self.num_b_stage), stride=(1, 2, 64, 128))
+                )
+            else:
+                sSFB_rows = cute.make_tensor(
+                    cute.recast_ptr(sSFB.iterator, dtype=cutlass.Int64),
+                    cute.make_layout((2, 32, sf_k_atoms, 2, self.num_b_stage), stride=(1, 2, 64, 64 * sf_k_atoms, 128 * sf_k_atoms)),
+                )
             hidden = cute.size(a_gemm, mode=[0])
             intermediate = cute.size(b_gemm, mode=[0])
             n_tiles_total = intermediate // self.cta_tile_shape_mnk[1]
@@ -736,10 +755,13 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
                 tAgA_own_slice = tAgA_own[(None, mma_tile_m, None, 0)]
 
                 # SF: the expert's atoms start at byte rows * token_offset / 32 (the stock kernel's per-expert SF
-                # descriptor base), k_tile_cnt 512-byte atoms per 128 rows (or columns) of A (B).
+                # descriptor base), k_atoms 512-byte atoms (one per 128 tokens) per 128 rows (or columns) of A (B).
+                k_atoms = k_tile_cnt
+                if cutlass.const_expr(sf_k_atoms > 1):
+                    k_atoms = (tokens_i + 127) // 128
                 sfa_first_row = cutlass.Int32((cutlass.Int64(hidden) * cutlass.Int64(token_offset)) // (self.sf_vec_size * 16)) + (
                     mma_tile_m * cute.size(tiled_mma.thr_id.shape) + mma_tile_coord_v
-                ) * (k_tile_cnt * 32)
+                ) * (k_atoms * 32)
                 sfb_expert_row = cutlass.Int32((cutlass.Int64(intermediate) * cutlass.Int64(token_offset)) // (self.sf_vec_size * 16))
 
                 prefetch_linear_unit = expert_idx * n_units + work_tile_info.tile_n_idx + self.L2_PREFETCH_UNITS
@@ -789,7 +811,7 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
                     n_idx = first_n_tile + unit_tile
                     tBgB_slice = tBgB[(None, n_idx, None, 0)]
                     tBgB_own_slice = tBgB_own[(None, n_idx, None, 0)]
-                    sfb_first_row = sfb_expert_row + n_idx * 2 * (k_tile_cnt * 32)
+                    sfb_first_row = sfb_expert_row + n_idx * 2 * (k_atoms * 32)
                     load_a = (unit_tile == 0) | stream_a
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         partial_k_tile = has_partial_k_tile & (k_tile + 1 == k_tile_cnt)
@@ -813,15 +835,23 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
                                     tma_bar_ptr=a_barrier,
                                     mcast_mask=a_full_mcast_mask,
                                 )
-                            gSFA = cute.local_tile(cute.domain_offset((0, sfa_first_row + k_tile * 32), mSFA_mkl), (2, 32), (None, None))
-                            tsSFA, tgSFA = cpasync.tma_partition(
-                                tma_atom_sfa,
-                                0,
-                                cute.make_layout(1),
-                                cute.group_modes(sSFA_rows[(None, None, a_producer_state.index)], 0, 2),
-                                cute.group_modes(gSFA, 0, 2),
-                            )
-                            cute.copy(tma_atom_sfa, tgSFA[(None, 0, 0)], tsSFA, tma_bar_ptr=a_barrier)
+                            for sf_k in cutlass.range_constexpr(sf_k_atoms):
+                                gSFA = cute.local_tile(
+                                    cute.domain_offset((0, sfa_first_row + self._sf_atom(k_tile, sf_k, sf_k_atoms, k_atoms) * 32), mSFA_mkl),
+                                    (2, 32),
+                                    (None, None),
+                                )
+                                sfa_stage = a_producer_state.index
+                                if cutlass.const_expr(sf_k_atoms > 1):
+                                    sfa_stage = a_producer_state.index * sf_k_atoms + sf_k
+                                tsSFA, tgSFA = cpasync.tma_partition(
+                                    tma_atom_sfa,
+                                    0,
+                                    cute.make_layout(1),
+                                    cute.group_modes(sSFA_rows[(None, None, sfa_stage)], 0, 2),
+                                    cute.group_modes(gSFA, 0, 2),
+                                )
+                                cute.copy(tma_atom_sfa, tgSFA[(None, 0, 0)], tsSFA, tma_bar_ptr=a_barrier)
                             a_producer_state.advance()
                         b_pipeline.producer_acquire(b_producer_state)
                         b_barrier = b_pipeline.producer_get_barrier(b_producer_state)
@@ -843,17 +873,26 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
                                 mcast_mask=b_full_mcast_mask,
                             )
                         for sfb_half in cutlass.range_constexpr(2):
-                            gSFB = cute.local_tile(
-                                cute.domain_offset((0, sfb_first_row + sfb_half * (k_tile_cnt * 32) + k_tile * 32), mSFB_nkl), (2, 32), (None, None)
-                            )
-                            tsSFB, tgSFB = cpasync.tma_partition(
-                                tma_atom_sfb,
-                                0,
-                                cute.make_layout(1),
-                                cute.group_modes(sSFB_rows[(None, None, sfb_half, b_producer_state.index)], 0, 2),
-                                cute.group_modes(gSFB, 0, 2),
-                            )
-                            cute.copy(tma_atom_sfb, tgSFB[(None, 0, 0)], tsSFB, tma_bar_ptr=b_barrier)
+                            for sf_k in cutlass.range_constexpr(sf_k_atoms):
+                                gSFB = cute.local_tile(
+                                    cute.domain_offset(
+                                        (0, sfb_first_row + sfb_half * (k_atoms * 32) + self._sf_atom(k_tile, sf_k, sf_k_atoms, k_atoms) * 32), mSFB_nkl
+                                    ),
+                                    (2, 32),
+                                    (None, None),
+                                )
+                                if cutlass.const_expr(sf_k_atoms == 1):
+                                    sSFB_atom = sSFB_rows[(None, None, sfb_half, b_producer_state.index)]
+                                else:
+                                    sSFB_atom = sSFB_rows[(None, None, sf_k, sfb_half, b_producer_state.index)]
+                                tsSFB, tgSFB = cpasync.tma_partition(
+                                    tma_atom_sfb,
+                                    0,
+                                    cute.make_layout(1),
+                                    cute.group_modes(sSFB_atom, 0, 2),
+                                    cute.group_modes(gSFB, 0, 2),
+                                )
+                                cute.copy(tma_atom_sfb, tgSFB[(None, 0, 0)], tsSFB, tma_bar_ptr=b_barrier)
                         b_producer_state.advance()
 
                 sched_pipeline.consumer_wait(sched_consumer_state)

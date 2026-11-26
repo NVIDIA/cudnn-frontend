@@ -24,11 +24,12 @@ from gemm.cutedsl.test_grouped_gemm_wgrad_utils import check_ref_grouped_gemm_wg
 
 @pytest.fixture(autouse=True)
 def require_sm100():
+    from cudnn.api_base import get_device_type
     from cudnn.tensor_adapter import has_tcgen05
 
     if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM wgrad")
-    if torch.cuda.get_device_capability()[0] != 10:
+    if torch.cuda.get_device_capability()[0] != 10 or get_device_type() == "rubin":
         pytest.skip("The A-reuse wgrad is SM100/SM103 only")
 
 
