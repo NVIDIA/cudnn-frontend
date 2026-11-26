@@ -531,6 +531,11 @@ def test_frost_wgrad_operand_descriptor_swizzles():
             assert layout.stage_bytes >= channels * 128
             assert layout.stride_bytes == (512 if bits == 32 else 8 * layout.tma_box_bytes)
 
+    from cudnn.conv.frost.templates.sm100_conv_wgrad import _select_acc_stages
+
+    for n in range(32, 257, 32):
+        assert _select_acc_stages(n) == (2 if n <= 128 else 1)
+
 
 @pytest.mark.parametrize(
     "mutation,match",
