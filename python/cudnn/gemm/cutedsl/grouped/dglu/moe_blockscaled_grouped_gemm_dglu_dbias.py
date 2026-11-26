@@ -1476,7 +1476,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             lane = cute.arch.lane_idx()
             col_max = cute.make_rmem_tensor(cute.make_layout(self.sf_vec_size), cutlass.Float32)
             for vi in cutlass.range_constexpr(self.sf_vec_size):
-                col_max[vi] = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+                col_max[vi] = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0]))
             scratch_max = cute.make_tensor(scratch.iterator, cute.make_layout(self.sf_vec_size))
             scratch_scale = cute.make_tensor(scratch.iterator + self.sf_vec_size, cute.make_layout(self.sf_vec_size))
             cute.arch.sync_warp()
