@@ -19,6 +19,7 @@ from cudnn.tensor_adapter import is_torch_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
 from .moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
+from .moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel
 from ..canonical import check_sf_shape, make_flat_sf_fake
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 
@@ -392,12 +393,17 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             del self.sample_b_tensor
 
     def _select_kernel(self):
-        """The stock kernel, or on SM100/SM103 its global-descriptor variant (same dW bits) where it applies."""
+        """The stock kernel, or on SM100/SM103 one of its variants with the same dW bits where it applies: the
+        A-reuse variant when the sample's experts are short on average (mean tokens per expert within its A ring,
+        computed from the token extent of A and the expert count) and dW has more than one N tile per work unit,
+        else the global-descriptor variant."""
         import torch
 
         if self._is_rubin_kernel or self.weight_mode != MoEWeightMode.DENSE:
             return self._kernel
         m, n = self.a_desc.shape[0], self.b_desc.shape[1]
+        c_bits = self.wgrad_dtype.itemsize * 8
+        has_global_scale = self.global_scale_a_desc is not None or self.global_scale_b_desc is not None
         fp8 = (torch.float8_e4m3fn, torch.float8_e5m2)
         if (
             self.a_desc.dtype in fp8
@@ -414,14 +420,12 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 input_order=self.input_order,
                 sf_fp8_dtype_override=self.sf_fp8_dtype_override,
             )
-            and BlockScaledMoEGroupedGemmWgradDenseKernel.can_implement(
-                m,
-                n,
-                ab_bits=8,
-                c_bits=self.wgrad_dtype.itemsize * 8,
-                has_global_scale=self.global_scale_a_desc is not None or self.global_scale_b_desc is not None,
-            )
+            and BlockScaledMoEGroupedGemmWgradDenseKernel.can_implement(m, n, ab_bits=8, c_bits=c_bits, has_global_scale=has_global_scale)
         ):
+            if BlockScaledMoEGroupedGemmWgradReuseKernel.can_implement(
+                m, n, ab_bits=8, c_bits=c_bits, has_global_scale=has_global_scale, tokens=self.a_desc.shape[1], experts=self.expert_cnt
+            ):
+                return BlockScaledMoEGroupedGemmWgradReuseKernel
             return BlockScaledMoEGroupedGemmWgradDenseKernel
         return self._kernel
 

@@ -14,6 +14,8 @@ On a unit's start the load warp prefetches into L2 the B columns of the next N u
 expert, this M tile's A rows of it); a hint only.
 """
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -45,8 +47,9 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
 
     MAX_N_GROUP = 4  # N tiles per work unit, at most
     L2_PREFETCH_UNITS = 1  # units ahead the load warp prefetches into L2
+    A_STAGES = 6  # default A / SFA ring depth
 
-    def __init__(self, *args, a_stages: int = 6, **kwargs):
+    def __init__(self, *args, a_stages: int = A_STAGES, **kwargs):
         super().__init__(*args, **kwargs)
         self.a_stages = a_stages
         self.num_epi_warps = len(self.epilogue_warp_id)
@@ -61,14 +64,22 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
         return max(candidate for candidate in range(1, max_n_group + 1) if n_tiles % candidate == 0)
 
     @classmethod
-    def can_implement(cls, m: int, n: int, ab_bits: int, c_bits: int, has_global_scale: bool, tokens: int, experts: int, a_stages: int = 6) -> bool:
-        """The global-descriptor wgrad's shapes, more than one N tile per unit, and ``tokens`` over ``experts`` short
-        enough on average that an expert's K tiles fit the A ring."""
+    def short_experts(cls, tokens: int, experts: int, a_stages: Optional[int] = None) -> bool:
+        """``tokens`` (the token extent of A and B) over ``experts`` short enough on average that an expert's K tiles
+        fit the A ring."""
+        a_stages = cls.A_STAGES if a_stages is None else a_stages
+        return experts > 0 and -(-tokens // experts) <= a_stages * cls.K_TILE
+
+    @classmethod
+    def can_implement(
+        cls, m: int, n: int, ab_bits: int, c_bits: int, has_global_scale: bool, tokens: int, experts: int, a_stages: Optional[int] = None
+    ) -> bool:
+        """The global-descriptor wgrad's shapes, more than one N tile per unit, and short experts on average
+        (``short_experts``). Any other token split is still computed correctly, with A reloaded per N tile."""
         return (
             BlockScaledMoEGroupedGemmWgradDenseKernel.can_implement(m, n, ab_bits, c_bits, has_global_scale)
             and cls.n_group_for(n, cls.MAX_N_GROUP) > 1
-            and experts > 0
-            and -(-tokens // experts) <= a_stages * cls.K_TILE
+            and cls.short_experts(tokens, experts, a_stages)
         )
 
     def _setup_attributes(self) -> None:
