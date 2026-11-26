@@ -83,6 +83,10 @@ from .moe_persistent_scheduler import (
 #: of weights they multiply.
 EXPERT_BATCH_MAX_M_TILES = 16
 
+#: Named barrier id of the batch opener's publish (its one warp).  Every kernel on this scheduler keeps its own named
+#: barriers in ids 1-8 (the SM90 kernels use all of them), so 9 collides with none.
+OPENER_PUBLISH_BARRIER_ID = 9
+
 
 def _state_region_offsets(streaming_signal_capacity: int, local_expert_count: int) -> dict:
     """Int32 offset of each region of the scheduler state, and the total.  The reset is all zero; a batch record
@@ -541,7 +545,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
             other_m_tiles = Int32(0)
         prefix = other_m_tiles
         for shift in cutlass.range_constexpr(5):
-            up = cute.arch.shuffle_sync_up(prefix, 1 << shift)
+            # mask_and_clamp=0: lanes below ``1 << shift`` read their own value back (and drop it below), not lane 0's.
+            up = cute.arch.shuffle_sync_up(prefix, 1 << shift, mask_and_clamp=0)
             if lane_idx >= (1 << shift):
                 prefix = prefix + up
         total_m_tiles = m_tile_count + cute.arch.warp_redux_sync(other_m_tiles, "add")
@@ -560,8 +565,9 @@ class MoEStreamingInputBlockSignalTileScheduler:
             for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
                 if m_tile_offset < lane_m_tiles:
                     self._set_expert_consecutive_m_batch_record(first_m_tile_order + m_tile_offset, (batch_claim_idx, first_m_tile, lane_m_tiles))
-        # bar.warp.sync orders every lane's stores above before the elected lane's release below.
-        cute.arch.sync_warp()
+        # A 32-thread named barrier (bar.sync, a synchronizing operation of the PTX memory model, unlike bar.warp.sync)
+        # orders every lane's stores above before the elected lane's release below.
+        cute.arch.barrier(barrier_id=OPENER_PUBLISH_BARRIER_ID, number_of_threads=cute.arch.WARP_SIZE)
         with cute.arch.elect_one():
             # Published LAST, and that order is load-bearing: the release is what hands the
             # records to the claimers and ``expert_assigned_m_tiles[]`` to the next opener.
