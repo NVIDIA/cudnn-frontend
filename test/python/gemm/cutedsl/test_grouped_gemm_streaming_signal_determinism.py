@@ -19,7 +19,7 @@ import torch
 from determinism_utils import assert_bitwise, assert_replays, snapshot
 from gemm.cutedsl._streaming_signal import BIG_EXPERT, MANY_EXPERTS_64, ROWS_ALIGNMENT, compile_once, kernel_args, launch_args
 from gemm.cutedsl._streaming_signal import make_kernel as build_kernel
-from gemm.cutedsl._streaming_signal import make_problem, new_buffers, padded, signal_ready
+from gemm.cutedsl._streaming_signal import make_problem, new_buffers, padded, signal_ready, spin_before_pdl_launch
 
 HIDDEN = 512
 FFN = 512
@@ -65,6 +65,7 @@ class Launcher:
         import cuda.bindings.driver as cuda
 
         stream = stream or torch.cuda.current_stream()
+        spin_before_pdl_launch(self.kernel, stream)
         self._compiled(*launch_args(kernel_args(problem, self.glu, *buffers)), cuda.CUstream(stream.cuda_stream))
 
     def __call__(self, problem, prepare_workspace=None):
