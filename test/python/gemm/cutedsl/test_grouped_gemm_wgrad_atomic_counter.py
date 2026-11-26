@@ -333,7 +333,9 @@ def test_counter_claim_slot_warm_stress(monkeypatch, precision):
     counter = op._implementation._workspace[-4:]
 
     clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
-    tiles = len(groups) * (M // 256) * (N // 256)
+    # One claim per work tile: 256 x 256, or 256 x 512 where the BF16 API picks its wide-tile kernel.
+    tile_n = 512 if precision == "bf16" and op._implementation._wide_applies() else 256
+    tiles = len(groups) * (M // 256) * (N // tile_n)
     reference = {"wgrad": expected.clone(), "counter": torch.tensor([tiles + clusters], dtype=torch.int32, device="cuda").view(torch.uint8)}
     assert_bitwise({"wgrad": output}, {"wgrad": reference["wgrad"]}, "cold counter launch vs CLC")
     claims = int(counter.view(torch.int32).item())
