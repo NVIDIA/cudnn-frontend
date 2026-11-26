@@ -142,6 +142,16 @@ def compile_once(kernel, problem, glu, buffers, max_active_clusters=None):
     return compiled
 
 
+def spin_before_pdl_launch(kernel, stream):
+    """With ``use_pdl`` the GEMM waits for the launch right before it on ``stream`` only at exit, after it has read the
+    signal workspace, so that launch must not be the workspace reset (a torch op).  Enqueue a short spin kernel there:
+    it starts once the reset is complete and writes nothing the GEMM reads, as the producer does in the contract's
+    order (reset, producer, GEMM)."""
+    if getattr(kernel, "use_pdl", False):
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(1000)
+
+
 def signal_ready(kernel):
     from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace
 
