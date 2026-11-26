@@ -47,7 +47,7 @@ def glu_buffers(problem, kernel):
     )
 
 
-def glu_args(kernel, problem, buf, col):
+def glu_args(kernel, problem, buf, col, c=True):
     import cutlass
     from cutlass.cute.nvgpu import OperandMajorMode
     from cutlass.cute.runtime import from_dlpack
@@ -69,22 +69,36 @@ def glu_args(kernel, problem, buf, col):
     d_col = e4m3(buf["d_col"]) if col else None
     sfd_col = e8m0(buf["sfd_col"]) if col else None
     # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, prob, bias)
-    return head + [tensor(buf["c"]), e4m3(buf["d"]), d_col, sfa, e8m0(buf["sfd_row"]), sfd_col, None, tensor(buf["norm_const"]), offsets, alpha, prob, None]
+    return head + [
+        tensor(buf["c"]) if c else None,
+        e4m3(buf["d"]),
+        d_col,
+        sfa,
+        e8m0(buf["sfd_row"]),
+        sfd_col,
+        None,
+        tensor(buf["norm_const"]),
+        offsets,
+        alpha,
+        prob,
+        None,
+    ]
 
 
 COMPILED = {}
 
 
-def run_glu(problem, col=True, **options):
-    """One launch with E4M3 D and SFD (and the column pair unless ``col`` is False); returns the outputs by name."""
+def run_glu(problem, col=True, c=True, **options):
+    """One launch with E4M3 D and SFD (and the column pair unless ``col`` is False, C unless ``c`` is False); returns
+    the outputs by name."""
     import cutlass.cute as cute
     from cutlass.utils import HardwareInfo
 
     kernel = bs.make_kernel("glu", len(problem["layout"]) - 1, generate_sfd=True, **options)
     buf = glu_buffers(problem, kernel)
-    args = glu_args(kernel, problem, buf, col)
+    args = glu_args(kernel, problem, buf, col, c)
     clusters = HardwareInfo().get_max_active_clusters(kernel.test_cluster_size)
-    key = (kernel.test_compile_key, col, problem["rows"], problem["n"])
+    key = (kernel.test_compile_key, col, c, problem["rows"], problem["n"])
     if key not in COMPILED:
         COMPILED[key] = cute.compile(kernel, *args, clusters, bs.cu_stream())
     if kernel.test_signal:
@@ -92,7 +106,7 @@ def run_glu(problem, col=True, **options):
     COMPILED[key](*[x for i, x in enumerate(args) if i != bs.b_major_arg(kernel)], bs.cu_stream())
     torch.cuda.synchronize()
     rows = bs.valid_rows(problem)
-    names = ["d", "sfd_row", "c"] + (["d_col", "sfd_col"] if col else [])
+    names = ["d", "sfd_row"] + (["c"] if c else []) + (["d_col", "sfd_col"] if col else [])
     return {name: buf[name][:rows] if name in ("c", "d", "d_col") else buf[name] for name in names}
 
 
