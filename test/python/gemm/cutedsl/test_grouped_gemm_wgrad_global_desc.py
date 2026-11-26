@@ -3,10 +3,12 @@
 
 """MXFP8 wgrad from global descriptors (dense output, Tensor2D input, 2-CTA 256x256 tiles in a (2, 1) cluster).
 
-The API picks this variant of the SM100 block-scaled wgrad on its own. Its dW must be the stock kernel's byte for byte,
-for every offsets value the stock kernel accepts: an expert whose token count is not a multiple of the 128-token K tile
-reads its last K tile through its own descriptors, so tokens past its end (the next expert's, or data past the last
-offset) never enter its sum. The discrete output mode runs the stock kernel on the same inputs.
+The API picks this variant of the SM100 block-scaled wgrad on its own when the experts are not short on average (for
+short experts it picks the A-reuse variant, test_grouped_gemm_wgrad_reuse.py); the cases here force it. Its dW must be
+the stock kernel's byte for byte, for every offsets value the stock kernel accepts: an expert whose token count is not
+a multiple of the 128-token K tile reads its last K tile through its own descriptors, so tokens past its end (the next
+expert's, or data past the last offset) never enter its sum. The discrete output mode runs the stock kernel on the
+same inputs.
 """
 
 import pytest
@@ -15,6 +17,7 @@ import torch
 import cudnn
 from cudnn.gemm.cutedsl.grouped.wgrad import _blockscaled_api
 from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
+from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel
 from determinism_utils import assert_bitwise, snapshot
 from gemm.cutedsl.test_grouped_gemm_wgrad_utils import (
     _wgrad_assemble_scales_2d2d,
@@ -26,22 +29,24 @@ from gemm.cutedsl.test_grouped_gemm_wgrad_utils import (
 
 @pytest.fixture(autouse=True)
 def require_sm100():
+    from cudnn.api_base import get_device_type
     from cudnn.tensor_adapter import has_tcgen05
 
     if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM wgrad")
-    if torch.cuda.get_device_capability()[0] != 10:
+    if torch.cuda.get_device_capability()[0] != 10 or get_device_type() == "rubin":
         pytest.skip("The global-descriptor wgrad is SM100/SM103 only")
 
 
 M, N = 512, 768
 
 
-def _problem(data_groups, num_experts, *, seed):
+def _problem(data_groups, num_experts, *, seed, n=N):
     """MXFP8 operands over ``data_groups`` token groups; the first ``num_experts`` are experts, the rest is nonzero data
     past the last offset. Scale factors are blocked per group when every group is whole K tiles but the last (the
     layout the reference reads), else random bytes of the size the API checks."""
     torch.manual_seed(seed)
+    N = n
     tokens = sum(data_groups)
     groups = list(data_groups[:num_experts])
     offsets = torch.tensor(groups, dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32)
@@ -50,7 +55,7 @@ def _problem(data_groups, num_experts, *, seed):
         b = torch.empty_strided((0, N), (1, 16), dtype=torch.float8_e4m3fn, device="cuda")
         sfa = torch.empty_strided((M, 0), (16, 1), dtype=torch.float8_e8m0fnu, device="cuda")
         sfb = torch.empty_strided((N, 0), (16, 1), dtype=torch.float8_e8m0fnu, device="cuda")
-        return {"a": a, "b": b, "sfa": sfa, "sfb": sfb, "offsets": offsets, "reference": None, "experts": num_experts}
+        return {"a": a, "b": b, "sfa": sfa, "sfb": sfb, "offsets": offsets, "reference": None, "experts": num_experts, "n": N}
     logical_a = torch.randint(-1, 2, (M, tokens), device="cuda").to(torch.bfloat16)
     logical_b = torch.randint(-1, 2, (tokens, N), device="cuda").to(torch.bfloat16)
     logical_a[logical_a == 0] = 1
@@ -74,11 +79,12 @@ def _problem(data_groups, num_experts, *, seed):
         "offsets": offsets,
         "reference": reference,
         "experts": num_experts,
+        "n": N,
     }
 
 
 def _run(problem, output_mode, *, counter=False):
-    output = torch.full((problem["experts"], M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    output = torch.full((problem["experts"], M, problem["n"]), float("nan"), dtype=torch.bfloat16, device="cuda")
     discrete = output_mode == "discrete"
     cudnn.grouped_gemm_wgrad_wrapper_sm100(
         a_tensor=problem["a"],
@@ -100,24 +106,35 @@ def _run(problem, output_mode, *, counter=False):
     return output
 
 
-@pytest.mark.L0
-def test_dense_mxfp8_wgrad_picks_global_descriptors(monkeypatch):
+def force_kernel(monkeypatch, kernel_class):
+    """Make the API pick ``kernel_class`` wherever it would pick the global-descriptor or A-reuse variant, on fresh
+    wrapper caches; returns the list of kernel classes picked."""
     picked = []
     original = _blockscaled_api.GroupedGemmWgradBlockScaledAPI._select_kernel
+    variants = (BlockScaledMoEGroupedGemmWgradDenseKernel, BlockScaledMoEGroupedGemmWgradReuseKernel)
 
-    def record(self):
+    def select(self):
         kernel = original(self)
+        if kernel_class is not None and kernel in variants:
+            kernel = kernel_class
         picked.append(kernel)
         return kernel
 
-    monkeypatch.setattr(_blockscaled_api.GroupedGemmWgradBlockScaledAPI, "_select_kernel", record)
+    monkeypatch.setattr(_blockscaled_api.GroupedGemmWgradBlockScaledAPI, "_select_kernel", select)
     monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_wgrad_wrapper_memo", {})
     monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_cache_of_GroupedGemmWgradSm100Objects", {})
-    problem = _problem((256, 128), 2, seed=1)
+    return picked
+
+
+@pytest.mark.L0
+def test_dense_mxfp8_wgrad_picks_global_descriptors(monkeypatch):
+    picked = force_kernel(monkeypatch, None)
+    # 832 tokens per expert on average: more than the A-reuse variant's 6 K tiles.
+    problem = _problem((1024, 640), 2, seed=1)
     _run(problem, "dense")
     _run(problem, "discrete")
     assert picked[0] is BlockScaledMoEGroupedGemmWgradDenseKernel
-    assert picked[1] is not BlockScaledMoEGroupedGemmWgradDenseKernel
+    assert picked[1] not in (BlockScaledMoEGroupedGemmWgradDenseKernel, BlockScaledMoEGroupedGemmWgradReuseKernel)
 
 
 # (data groups, experts): partial last K tiles with nonzero data after them, empty experts, and starts that are not
@@ -133,7 +150,8 @@ CASES = [
 
 @pytest.mark.parametrize("groups, experts", CASES)
 @pytest.mark.parametrize("counter", [False, True], ids=["clc", "counter"])
-def test_global_descriptor_wgrad_matches_stock(groups, experts, counter):
+def test_global_descriptor_wgrad_matches_stock(monkeypatch, groups, experts, counter):
+    force_kernel(monkeypatch, BlockScaledMoEGroupedGemmWgradDenseKernel)
     problem = _problem(groups, experts, seed=7)
     dense = _run(problem, "dense", counter=counter)
     stock = _run(problem, "discrete", counter=counter)
