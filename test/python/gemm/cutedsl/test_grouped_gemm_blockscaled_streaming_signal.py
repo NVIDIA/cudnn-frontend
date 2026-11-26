@@ -299,24 +299,26 @@ def test_pdl_rejected_behind_helper_kernel():
     launch is the GEMM's own helper_kernel (discrete B descriptors, dynamic claim counter reset) the kernel would read
     them unsynchronized: rejected at construction where the constructor can tell, else (the GLU and quant kernels, whose
     helper also depends on ``scheduler_counter``) at trace time.  The input signal and the quant kernel's own N_CHUNK
-    reset keep use_pdl."""
+    reset keep use_pdl.  On SM107 the GLU and dGLU are the Rubin twins; the quant kernel takes no N_CHUNK there."""
     import cutlass.cute as cute
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
 
+    kinds = ("glu", "dglu_bf16", "dglu") if bs.is_rubin() else ("glu", "dglu_bf16", "dglu", "quant")
     discrete = dict(use_dynamic_sched=True, weight_mode=MoEWeightMode.DISCRETE, use_pdl=True)
-    for kind in ("glu", "dglu_bf16", "dglu", "quant"):
+    for kind in kinds:
         with pytest.raises(ValueError, match="helper_kernel"):
             bs.make_kernel(kind, 4, **discrete)
     for kind in ("dglu_bf16", "dglu"):
         with pytest.raises(ValueError, match="helper_kernel"):
             bs.make_kernel(kind, 4, use_dynamic_sched=True, use_pdl=True)
         bs.make_kernel(kind, 4, use_dynamic_sched=True, streaming_signal_capacity=4, use_pdl=True)
-    with pytest.raises(ValueError, match="helper_kernel"):
-        bs.notify_kernel(4, 1024, 256, caller_reset=True, use_pdl=True)
-    bs.notify_kernel(4, 1024, 256, use_pdl=True)
+    if not bs.is_rubin():
+        with pytest.raises(ValueError, match="helper_kernel"):
+            bs.notify_kernel(4, 1024, 256, caller_reset=True, use_pdl=True)
+        bs.notify_kernel(4, 1024, 256, use_pdl=True)
     bs.make_kernel("glu", 4, use_dynamic_sched=True, streaming_signal_capacity=4, use_pdl=True)
     # The dynamic scheduler with no scheduler_counter: the helper resets the claim counter, known only at trace time.
-    for kind in ("glu", "quant"):
+    for kind in [kind for kind in ("glu", "quant") if kind in kinds]:
         problem = bs.make_problem(kind, [256, 256, 0, 0])
         kernel = bs.make_kernel(kind, 4, use_dynamic_sched=True, use_pdl=True)
         with pytest.raises(ValueError, match="helper_kernel"):

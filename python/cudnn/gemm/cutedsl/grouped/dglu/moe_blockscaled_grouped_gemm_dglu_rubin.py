@@ -328,6 +328,7 @@ class BlockScaledMoEGroupedGemmDgluKernel(StreamingInputSignalMixin):
             ),
             use_pdl=use_pdl,
             launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
+            launches_helper=weight_mode == MoEWeightMode.DISCRETE or (use_dynamic_sched and streaming_signal_capacity is None),
         )
 
         self.sf_vec_size = sf_vec_size
