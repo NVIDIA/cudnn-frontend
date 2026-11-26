@@ -134,15 +134,6 @@ def _spin_until_at_least(ptr, floor: Int32) -> Int32:
     return value
 
 
-@cute.jit
-def _poll_until_at_least(ptr, floor: cutlass.Constexpr) -> None:
-    """Block, without bound, until ``*ptr >= floor``.  Relaxed gpu-scope loads (no L1 invalidation per poll): the
-    caller reads nothing the writer published, so it needs no acquire."""
-    value = Int32(floor - 1)
-    while value < floor:
-        value = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
-
-
 class MoEInputBlockSignalSchedulerParams:
     """Parameters for MoE tile scheduler, used on host (grid shape) and on device: expert_shape is
     (local_expert_count, intermediate, hidden), a GEMM (M=expert_i_row_count, N=intermediate, K=hidden) per expert."""
@@ -342,19 +333,6 @@ class MoEStreamingInputBlockSignalTileScheduler:
         if const_expr(self.device_layout):
             self._wait_for_producer_layout()
         return self.advance_to_next_work()
-
-    @cute.jit
-    def wait_all_streaming_signal_slots_ready(self) -> None:
-        """From the trigger warp: wait until the dispatch has delivered every row (``device_layout``: layout first).
-        ``signal[]`` entries are polled, not acquired (the warp reads no row; each claim acquires its own)."""
-        if const_expr(self.device_layout):
-            self._wait_for_producer_layout()
-        total_m_tiles = self._total_m_tiles()
-        signal = streaming_signal_ptr(self._dynamic_state.counter_ptr)
-        lane_idx = cute.arch.lane_idx()
-        for j in cutlass.range(0, ceil_div(total_m_tiles, cute.arch.WARP_SIZE), 1, unroll=1):
-            _poll_until_at_least(signal + cutlass.min(lane_idx + j * cute.arch.WARP_SIZE, total_m_tiles - 1), 0)
-        cute.arch.sync_warp()
 
     @cute.jit
     def _wait_for_producer_layout(self) -> None:

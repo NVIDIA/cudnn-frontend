@@ -169,8 +169,7 @@ routing.
 | Option | Effect | Use |
 |---|---|---|
 | `use_pdl=True` | The GEMM launches as the programmatic dependent of the kernel before it on the stream, so it can start before that kernel ends; at exit every thread waits for that grid (`griddepcontrol.wait`). With `N_CHUNK` and its own reset, that kernel is the reset, and the wait moves to entry (see §3, Reset). The constructor rejects it whenever the GEMM call enqueues its helper kernel right before the GEMM (discrete weights, or the dynamic scheduler without `streaming_signal_capacity`), other than that own reset: the GEMM reads what the helper writes (B descriptors, the claim counter) before its exit wait. | The GEMM runs beside its producer on one stream (`streaming_signal_capacity`), or `N_CHUNK` with its own reset. |
-| `launch_pdl_dependents_at_entry=True` (plain kernel) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
-| `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernel, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
+| `launch_pdl_dependents_at_entry=True` (plain and GLU kernels) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter, an `N_CHUNK` consumer, or the next GEMM of a chain takes the SMs this grid leaves. |
 
 ## 5. Sketches
 
@@ -230,8 +229,7 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
   `ValueError`, because a CTA could exit while a peer still arrives on its shared memory.
 - `streaming_signal_capacity` and `N_CHUNK` cannot be combined in one kernel; both need `use_dynamic_sched=True`.
 - N must be known at build time (dense B).
-- `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
-  exists on the GLU kernel only and requires `streaming_signal_capacity`.
+- `device_layout` requires `streaming_signal_capacity`.
 - Covered today: the BF16 plain and GLU grouped GEMM forward kernels. Other recipes are not wired up yet.
 
 ## Acknowledgements
