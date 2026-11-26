@@ -74,7 +74,9 @@ producer does not need a proxy fence of its own.
 
 - **Who resets:** the caller, before every launch, ordered before both the producer and the GEMM. Use
   `moe_kernel_helpers.reset_streaming_signal_workspace(workspace, kernel)`: counter and state 0, `signal[]` -1. With
-  `all_complete=True` it sets `signal[t] = t`, which runs the GEMM with no producer (tests, warm-up).
+  `all_complete=True` it sets `signal[t] = t`, which runs the GEMM with no producer (tests, warm-up). With `use_pdl`
+  the reset must not be the GEMM's immediate predecessor on its stream, since the GEMM waits for that launch only at
+  exit (section 4).
 - **No GEMM-side reset:** the GEMM never resets the signal workspace, and on this path its helper kernel does not reset
   the claim counter either.
 - **Unbounded wait:** waits have no timeout; a bounded wait could return with the M tile not ready. A cluster stops once
