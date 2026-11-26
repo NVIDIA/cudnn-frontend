@@ -18,6 +18,7 @@ from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tenso
 from cudnn.tensor_adapter import is_torch_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
+from .moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
 from ..canonical import check_sf_shape, make_flat_sf_fake
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 
@@ -357,7 +358,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         if self._compiled_kernel is not None:
             return
 
-        kernel = self._kernel(
+        kernel = self._select_kernel()(
             sf_vec_size=self.sf_vec_size,
             acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
             use_2cta_instrs=self.use_2cta_instrs,
@@ -389,6 +390,40 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             del self.sample_a_tensor
         if self.sample_b_tensor is not None:
             del self.sample_b_tensor
+
+    def _select_kernel(self):
+        """The stock kernel, or on SM100/SM103 its global-descriptor variant (same dW bits) where it applies."""
+        import torch
+
+        if self._is_rubin_kernel or self.weight_mode != MoEWeightMode.DENSE:
+            return self._kernel
+        m, n = self.a_desc.shape[0], self.b_desc.shape[1]
+        fp8 = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if (
+            self.a_desc.dtype in fp8
+            and self.sfa_desc.dtype == torch.float8_e8m0fnu
+            and self.sfb_desc.dtype == torch.float8_e8m0fnu
+            and self.acc_dtype == torch.float32
+            and BlockScaledMoEGroupedGemmWgradDenseKernel.supports_config(
+                sf_vec_size=self.sf_vec_size,
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                accumulate_on_output=self.accumulate_on_output,
+                weight_mode=self.weight_mode,
+                input_order=self.input_order,
+                sf_fp8_dtype_override=self.sf_fp8_dtype_override,
+            )
+            and BlockScaledMoEGroupedGemmWgradDenseKernel.can_implement(
+                m,
+                n,
+                ab_bits=8,
+                c_bits=self.wgrad_dtype.itemsize * 8,
+                has_global_scale=self.global_scale_a_desc is not None or self.global_scale_b_desc is not None,
+            )
+        ):
+            return BlockScaledMoEGroupedGemmWgradDenseKernel
+        return self._kernel
 
     def _compile_dense(self, kernel, max_active_clusters, fake_stream) -> None:
         a_fake = (
