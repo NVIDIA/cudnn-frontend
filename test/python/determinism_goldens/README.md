@@ -9799,3 +9799,24 @@ the workspace (`Operation not permitted`), and `scontrol` cannot read
 `/etc/slurm/slurm.conf`. The 4.9.0a0 attempt fails at the same mount step.
 Native SM103 execution remains unverified. The version overrides differ
 from the default job names.
+
+### Rubin canonical GLU with UE5M3 scales
+
+The SM107 UE5M3 extension is covered by the existing branch-layout suites:
+
+```bash
+python -m pytest \
+  test/python/gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py \
+  test/python/gemm/cutedsl/test_grouped_gemm_dglu_gate_then_up_rubin.py \
+  test/python/gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py \
+  -k ue5m3 -q
+```
+
+On Rubin with CUDA 13.4 and CuTe DSL 4.8.0, this selection passed 36 cases;
+the three complete suites passed 166 cases. UE5M3 coverage includes dense
+and discrete weights, independent scale decoding, cross-layout comparisons,
+replay, changed-input graphs, empty experts, K tails, and RHT output scales.
+Payload and scale replay retain exact byte comparisons. Atomic dprob/dbias
+are checked numerically, not claimed bitwise deterministic. This does not
+qualify new tiles, M512/B-reuse, other activations, or deterministic dprob
+on SM107. No new golden bytes are introduced.

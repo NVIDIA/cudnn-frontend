@@ -79,12 +79,12 @@ arbitrary user callbacks.
 | `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
 | `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
-| `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Numerical and replay checks passed; general batch invariance unverified |
+| `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; additionally NVFP4/UE5M3 on SM107; BF16 saved C | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Numerical and replay checks passed; general batch invariance unverified |
 | `grouped_gemm_wgrad_wrapper_sm100`, empty-expert output contract | wgrad | NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 or FP32 dW | Unsupported | Supported for empty experts (SM100); general nonempty determinism and SM103 unverified | Unverified |
-| `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | bprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported with reduction limits below (SM100); SM103 unverified | Numerical and replay checks passed; atomic dprob/dbias not deterministic |
+| `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | bprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; additionally NVFP4/UE5M3 on SM107; BF16 saved C | Unsupported | Supported with reduction limits below (SM100); SM103 unverified | Numerical and replay checks passed; atomic dprob/dbias not deterministic |
 | `grouped_gemm_dglu_wrapper_sm100` and `GroupedGemmDgluSm100`, `activation_tensor` (`dgeglu`, `dswiglu`) | bprop | BF16 C/D_row and activation | Unsupported | Supported for `activation_tensor` and `D_row` (SM100, tested configurations); atomic dprob/dbias are not guaranteed; SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3; BF16 C/D | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Numerical, replay and stage-reuse stress passed; general batch invariance unverified |
-| `grouped_gemm_glu_hadamard_quant_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3; BF16 saved C; BF16 or NVFP4 rowwise RHT | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Numerical and replay checks passed at 256x256, cluster 2x1; general batch invariance unverified |
+| `grouped_gemm_glu_hadamard_quant_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3, or UE5M3 on SM107; BF16 saved C; BF16 or NVFP4 rowwise RHT | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Numerical and replay checks passed at 256x256, cluster 2x1; general batch invariance unverified |
 | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` (Torch); colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales; both GLU input layouts | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Independent decoded-scale checks and replay passed at 256x256, cluster 2x1; general batch invariance unverified |
 | `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified; gate/up unsupported | Unverified for interleaved input; gate/up unsupported |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -431,7 +431,9 @@ for replay, batch-invariance, and stress-test results.
   qualified by the branch-layout suites, including saved C, output payloads,
   scales and retained changed-input graphs. The block-scaled GLU path uses
   N=256 tiles without M512 B-reuse. Hadamard+quant uses a 256x256 tile and
-  a 2x1 cluster on SM107 (128x256, 1x1 on SM100/103). UE5M3 is not admitted.
+  a 2x1 cluster on SM107 (128x256, 1x1 on SM100/103). NVFP4/UE5M3 on
+  SM107 is covered by the same GLU, dGLU and Hadamard+quant suites, with
+  independently decoded UE5M3 scale references and unchanged byte comparisons.
   The SM107 dGLU suite checks payload/scale bytes and independent references;
   atomic dprob/dbias receive numerical checks only. Block-scaled
   deterministic dprob remains unsupported on SM107. These tests do not

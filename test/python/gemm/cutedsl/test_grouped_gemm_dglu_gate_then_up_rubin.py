@@ -37,7 +37,7 @@ def compare_outputs(actual, expected, precision, cfg, *, canonicalize=False, dis
         shared.assert_bytes(actual["amax_tensor"], expected["amax_tensor"])
 
 
-@pytest.mark.parametrize("precision,b_major", [("mxfp8", "k"), ("mxfp8", "n"), ("nvfp4", "k")])
+@pytest.mark.parametrize("precision,b_major", [("mxfp8", "k"), ("mxfp8", "n"), ("nvfp4", "k"), ("nvfp4_ue5m3", "k")])
 @pytest.mark.parametrize("discrete", [False, True])
 @pytest.mark.parametrize("n", [128, 256])
 def test_rubin_dglu_reference_and_replay(precision, discrete, b_major, n):
@@ -54,14 +54,14 @@ def test_rubin_dglu_reference_and_replay(precision, discrete, b_major, n):
         compare_outputs(actual, saved, precision, cfg)
 
 
-@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
+@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4", "nvfp4_ue5m3"])
 def test_rubin_empty_expert(precision):
     cfg, inputs = shared.problem(precision=precision)
     legacy = shared.run(cfg, inputs, canonical=False, deterministic=False)
     natural = {**inputs, "c_tensor": shared.unpair(inputs["c_tensor"]).squeeze(-1).contiguous()}
     actual = shared.run(cfg, natural, canonical=True, deterministic=False)
     compare_outputs(actual, legacy, precision, cfg, canonicalize=True)
-    if precision == "nvfp4":
+    if precision.startswith("nvfp4"):
         # An expert with no tiles retains the reduction identity.
         assert torch.isneginf(actual["amax_tensor"][1]).all().item()
 
@@ -76,7 +76,7 @@ def test_rubin_expert_column_scales(discrete):
     compare_outputs(actual, legacy, "mxfp8", cfg, canonicalize=True, discrete_col=True)
 
 
-@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
+@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4", "nvfp4_ue5m3"])
 def test_rubin_changed_input_graph(precision):
     cfg, inputs = shared.problem(n=128, group_m=(256,), precision=precision)
     inputs["c_tensor"] = shared.unpair(inputs["c_tensor"]).squeeze(-1).contiguous()

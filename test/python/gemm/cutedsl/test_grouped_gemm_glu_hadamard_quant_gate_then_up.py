@@ -13,6 +13,7 @@ from gemm.cutedsl.test_grouped_gemm_glu_branch_layout import (
     canonicalize_c,
     snapshot_inputs,
     select_experts,
+    decode_scales,
 )
 from gemm.cutedsl.test_grouped_gemm_glu_hadamard_quant import (
     _rht_ref,
@@ -63,6 +64,7 @@ def kwargs_for(problem, mode, discrete=False, layout="gate_then_up"):
         mma_tiler_mn=(128, 256) if layout == "gate_then_up" and torch.cuda.get_device_capability() != (10, 7) else (256, 256),
         cluster_shape_mn=(1, 1) if layout == "gate_then_up" and torch.cuda.get_device_capability() != (10, 7) else (2, 1),
         use_dynamic_sched=True,
+        sf_fp8_dtype_override=options.get("sf_fp8_dtype_override"),
     )
     if discrete:
         kwargs.update(
@@ -92,8 +94,8 @@ def live_bits(out):
 def check_reference(problem, out, mode):
     options, b, sb, sa, counts = problem
     f = b.shape[1] // 2
-    a_deq = unpack_fp4(options["a_tensor"]) * sa[0].float().repeat_interleave(16, dim=1)
-    b_deq = unpack_fp4(b) * sb.float().repeat_interleave(16, dim=2)
+    a_deq = unpack_fp4(options["a_tensor"]) * decode_scales(sa[0], options).repeat_interleave(16, dim=1)
+    b_deq = unpack_fp4(b) * decode_scales(sb, options).repeat_interleave(16, dim=2)
     ref_d = torch.empty((a_deq.shape[0], f), device=b.device)
     start = 0
     for expert, count in enumerate(counts):
@@ -108,18 +110,21 @@ def check_reference(problem, out, mode):
         torch.testing.assert_close(out["d_tensor"][:, :, 0].float(), ref_d, atol=0.005, rtol=0.015)
         torch.testing.assert_close(out["rht_rowwise_tensor"][:, :, 0].float(), rht.float(), atol=0.01, rtol=0.03)
     else:
-        _check_nvfp4_output(unpack_fp4(out["d_tensor"][:, :, 0]), out["sfd_tensor"], ref_d, 16.0, "D")
+        _check_nvfp4_output(unpack_fp4(out["d_tensor"][:, :, 0]), decode_scales(out["sfd_tensor"], options), ref_d, 16.0, "D")
         if mode == "row_fp4":
-            _check_nvfp4_output(unpack_fp4(out["rht_rowwise_tensor"][:, :, 0]), out["sfrht_rowwise_tensor"], rht.float(), 16.0, "RHT rowwise")
+            _check_nvfp4_output(
+                unpack_fp4(out["rht_rowwise_tensor"][:, :, 0]), decode_scales(out["sfrht_rowwise_tensor"], options), rht.float(), 16.0, "RHT rowwise"
+            )
         else:
-            _check_colwise_rht({"aligned_group_m_list": counts}, out, rht.cpu(), 16.0, None)
+            _check_colwise_rht({"aligned_group_m_list": counts}, out, rht.cpu(), 16.0, options.get("sf_fp8_dtype_override"))
 
 
 @pytest.mark.parametrize("mode", ["row_bf16", "row_fp4", "col_fp4"])
 @pytest.mark.parametrize("discrete", [False, True], ids=["dense", "discrete"])
 @pytest.mark.parametrize("f", [128, 1024])
-def test_canonical_rht_quant_reference_legacy_replay(mode, discrete, f):
-    problem = make_problem(f=f, precision="nvfp4")
+@pytest.mark.parametrize("precision", ["nvfp4", "nvfp4_ue5m3"])
+def test_canonical_rht_quant_reference_legacy_replay(mode, discrete, f, precision):
+    problem = make_problem(f=f, precision=precision)
     original = snapshot_inputs(problem)
     old = run(problem, mode, discrete, "interleaved_32")
     old["c_tensor"] = canonicalize_c(old["c_tensor"][:, :, 0]).unsqueeze(-1)
@@ -132,17 +137,18 @@ def test_canonical_rht_quant_reference_legacy_replay(mode, discrete, f):
     for _ in range(3):
         with torch.cuda.stream(noise_stream):
             noise.mul_(1.001).add_(0.001)
-        fresh = make_problem(f=f, precision="nvfp4")
+        fresh = make_problem(f=f, precision=precision)
         assert_bitwise(live_bits(run(fresh, mode, discrete)), expected, "fresh allocation / noise replay")
     torch.cuda.current_stream().wait_stream(noise_stream)
     assert_bitwise(snapshot_inputs(problem), original, "inputs preserved")
 
 
 @pytest.mark.parametrize("mode", ["row_bf16", "row_fp4", "col_fp4"])
-def test_canonical_rht_quant_graph_changed_weights_scales(mode):
+@pytest.mark.parametrize("precision", ["nvfp4", "nvfp4_ue5m3"])
+def test_canonical_rht_quant_graph_changed_weights_scales(mode, precision):
     from cudnn import grouped_gemm_glu_hadamard_quant_wrapper_sm100 as call
 
-    problem = make_problem(f=128, precision="nvfp4")
+    problem = make_problem(f=128, precision=precision)
     kwargs, owners = kwargs_for(problem, mode)
     call(**kwargs)
     torch.cuda.synchronize()
@@ -155,6 +161,7 @@ def test_canonical_rht_quant_graph_changed_weights_scales(mode):
         graph.replay()
         torch.cuda.synchronize()
         assert_bitwise(live_bits(captured), live_bits(expected), key)
+    graph.reset()
 
 
 def expert_outputs(out, start, count, f):
@@ -174,8 +181,9 @@ def expert_outputs(out, start, count, f):
 
 
 @pytest.mark.parametrize("mode", ["row_bf16", "row_fp4", "col_fp4"])
-def test_canonical_rht_quant_batch_invariance(mode):
-    problem = make_problem(f=128, counts=(256, 512, 256), precision="nvfp4")
+@pytest.mark.parametrize("precision", ["nvfp4", "nvfp4_ue5m3"])
+def test_canonical_rht_quant_batch_invariance(mode, precision):
+    problem = make_problem(f=128, counts=(256, 512, 256), precision=precision)
     target = select_experts(problem, (0,))
     expected = expert_outputs(run(target, mode), 0, 256, 128)
     for selected in ((0, 1, 2), (2, 0, 1), (0, 0, 2), (0, 2)):

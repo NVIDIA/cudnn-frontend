@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from determinism_utils import assert_bitwise
+from core.cutedsl.test_fe_api_utils import reencode_sf_tensor_as_ue5m3, ue5m3_bytes_to_fp32
+from gemm.cutedsl.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 
 pytestmark = pytest.mark.L0
 
@@ -27,11 +29,15 @@ def make_problem(f=256, k=512, counts=(256, 0, 512), precision="mxfp8"):
     # Fixed quantized payloads and independently varying per-row/K block scales.
     torch.manual_seed(401)
     e, m, n = len(counts), sum(counts), 2 * f
-    if precision == "nvfp4":
+    if precision.startswith("nvfp4"):
         a = torch.randint(0, 256, (m, k // 2), device="cuda", dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
         b = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
         sa = torch.exp2(torch.randint(-5, -2, (1, m, k // 16), device="cuda").float()).to(torch.float8_e4m3fn)
         sb = torch.exp2(torch.randint(-5, -2, (e, n, k // 16), device="cuda").float()).to(torch.float8_e4m3fn)
+        if precision == "nvfp4_ue5m3":
+            _skip_unless_e5m3_supported()
+            reencode_sf_tensor_as_ue5m3(sa)
+            reencode_sf_tensor_as_ue5m3(sb)
     else:
         dtype = torch.bfloat16 if precision == "bf16" else torch.float8_e4m3fn
         a = (torch.randn(m, k, device="cuda") * 0.1).to(dtype)
@@ -54,7 +60,15 @@ def make_problem(f=256, k=512, counts=(256, 0, 512), precision="mxfp8"):
         d_dtype=torch.float8_e4m3fn if precision == "mxfp8" else torch.bfloat16,
         generate_c=True,
     )
+    if precision == "nvfp4_ue5m3":
+        options["sf_fp8_dtype_override"] = "e5m3"
     return options, b, sb, sa, counts
+
+
+def decode_scales(scales, options):
+    if options.get("sf_fp8_dtype_override") == "e5m3":
+        return ue5m3_bytes_to_fp32(scales)
+    return scales.float()
 
 
 def call_problem(problem, *, layout, discrete=False, tile_m=128):
@@ -142,7 +156,7 @@ def test_gate_then_up_matches_interleaved(discrete, tile_m, f, dynamic):
 
 
 @pytest.mark.parametrize("tile_m", [128, 256])
-@pytest.mark.parametrize("precision", ["bf16", "nvfp4", "mxfp8"])
+@pytest.mark.parametrize("precision", ["bf16", "nvfp4", "nvfp4_ue5m3", "mxfp8"])
 def test_gate_then_up_replay_fresh_allocations(tile_m, precision):
     problem = make_problem(f=256, counts=(256, 512, 768, 256), precision=precision)
     expected = {name: value.clone() if value is not None else None for name, value in call_problem(problem, layout="gate_then_up", tile_m=tile_m).items()}
@@ -311,7 +325,7 @@ def unpack_fp4(tensor):
     return torch.stack((table[(bits & 15).long()], table[(bits >> 4).long()]), dim=-1).flatten(-2)
 
 
-@pytest.mark.parametrize("precision", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("precision", ["bf16", "nvfp4", "nvfp4_ue5m3"])
 @pytest.mark.parametrize("discrete", [False, True], ids=["dense", "discrete"])
 @pytest.mark.parametrize("tile_m", [128, 256])
 @pytest.mark.parametrize("f", [128, 1024])
@@ -325,9 +339,9 @@ def test_gate_then_up_bf16_nvfp4_reference_replay(precision, discrete, tile_m, f
     assert_bitwise({k: v for k, v in actual.items() if v is not None}, {k: v for k, v in expected.items() if v is not None}, precision)
     saved = {name: tensor.clone() for name, tensor in actual.items() if tensor is not None}
     options, b, sb, sa, counts = problem
-    if precision == "nvfp4":
-        a_deq = unpack_fp4(options["a_tensor"]) * sa[0].float().repeat_interleave(16, dim=1)
-        b_deq = unpack_fp4(b) * sb.float().repeat_interleave(16, dim=2)
+    if precision.startswith("nvfp4"):
+        a_deq = unpack_fp4(options["a_tensor"]) * decode_scales(sa[0], options).repeat_interleave(16, dim=1)
+        b_deq = unpack_fp4(b) * decode_scales(sb, options).repeat_interleave(16, dim=2)
     else:
         a_deq, b_deq = options["a_tensor"].float(), b.float()
     start = 0
@@ -400,7 +414,7 @@ def test_gate_then_up_legacy_swiglu_aliases(precision, discrete):
     assert_bitwise({name: outputs[name] for name in live}, {name: expected[name] for name in live}, "preallocated alias")
 
 
-@pytest.mark.parametrize("precision", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("precision", ["nvfp4", "nvfp4_ue5m3", "mxfp8"])
 @pytest.mark.parametrize("discrete", [False, True], ids=["dense", "discrete"])
 def test_gate_then_up_two_cta_scale_pipeline_tail(precision, discrete):
     # K=1664 wraps the five AB stages and leaves an NVFP4 K-tile tail.
@@ -414,11 +428,11 @@ def test_gate_then_up_two_cta_scale_pipeline_tail(precision, discrete):
     assert_bitwise(saved, {name: tensor for name, tensor in expected.items() if tensor is not None}, precision)
 
     options, b, sb, sa, counts = problem
-    sf_vec = 16 if precision == "nvfp4" else 32
-    a_data = unpack_fp4(options["a_tensor"]) if precision == "nvfp4" else options["a_tensor"].float()
-    b_data = unpack_fp4(b) if precision == "nvfp4" else b.float()
-    a_deq = a_data * sa[0].float().repeat_interleave(sf_vec, dim=1)
-    b_deq = b_data * sb.float().repeat_interleave(sf_vec, dim=2)
+    sf_vec = 16 if precision.startswith("nvfp4") else 32
+    a_data = unpack_fp4(options["a_tensor"]) if precision.startswith("nvfp4") else options["a_tensor"].float()
+    b_data = unpack_fp4(b) if precision.startswith("nvfp4") else b.float()
+    a_deq = a_data * decode_scales(sa[0], options).repeat_interleave(sf_vec, dim=1)
+    b_deq = b_data * decode_scales(sb, options).repeat_interleave(sf_vec, dim=2)
     reference_d = torch.empty_like(actual["d_tensor"], dtype=torch.float32)
     start = 0
     for expert, count in enumerate(counts):
@@ -428,7 +442,7 @@ def test_gate_then_up_two_cta_scale_pipeline_tail(precision, discrete):
         reference_d[start:end] = (torch.nn.functional.silu(pre[:, :128]) * pre[:, 128:] * options["prob_tensor"][start:end, None]).float()
         torch.testing.assert_close(actual["c_tensor"][start:end].float(), pre.float(), rtol=0.01, atol=0.005)
         start = end
-    if precision == "nvfp4":
+    if precision.startswith("nvfp4"):
         torch.testing.assert_close(actual["d_tensor"].float(), reference_d, rtol=0.015, atol=0.005)
     else:
         m = reference_d.shape[0]

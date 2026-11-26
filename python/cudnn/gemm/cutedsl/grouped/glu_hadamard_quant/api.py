@@ -92,6 +92,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
     supports_glu_layouts = GLU_LAYOUTS
     supports_gate_then_up_precisions = ("nvfp4",)
     supports_gate_then_up_archs = ((10, 0), (10, 3), (10, 7))
+    supports_gate_then_up_sf_fp8_dtype_overrides = ("e5m3",)
     preferred_gate_then_up_mma_tiler_by_arch = {(10, 0): (128, 256), (10, 3): (128, 256), (10, 7): (256, 256)}
     supports_gate_then_up_mma_tilers = ((128, 256),)
 
@@ -391,9 +392,8 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                 or self.b_major != "k"
                 or self.ab_dtype != torch.float4_e2m1fn_x2
                 or self.sf_dtype != torch.float8_e4m3fn
-                or self.c_dtype != torch.bfloat16
-                or self.sf_fp8_dtype_override is not None,
-                "gate_then_up RHT quant requires SwiGLU, NVFP4/E4M3, BF16 saved C, K-major B and F divisible by 128",
+                or self.c_dtype != torch.bfloat16,
+                "gate_then_up RHT quant requires SwiGLU, NVFP4, BF16 saved C, K-major B and F divisible by 128",
             )
         else:
             self._value_error_if(
@@ -1248,6 +1248,9 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
 grouped_gemm_glu_hadamard_quant_wrapper_sm100.supports_canonical_layouts = True
 grouped_gemm_glu_hadamard_quant_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
 grouped_gemm_glu_hadamard_quant_wrapper_sm100.supports_gate_then_up_archs = GroupedGemmGluHadamardQuantSm100.supports_gate_then_up_archs
+grouped_gemm_glu_hadamard_quant_wrapper_sm100.supports_gate_then_up_sf_fp8_dtype_overrides = (
+    GroupedGemmGluHadamardQuantSm100.supports_gate_then_up_sf_fp8_dtype_overrides
+)
 grouped_gemm_glu_hadamard_quant_wrapper_sm100.preferred_gate_then_up_mma_tiler_by_arch = (
     GroupedGemmGluHadamardQuantSm100.preferred_gate_then_up_mma_tiler_by_arch
 )

@@ -298,8 +298,8 @@ class BlockScaledMoEGroupedGemmGluKernel:
 
         self.glu_layout = validate_glu_layout(glu_layout)
         if self.glu_layout == "gate_then_up":
-            if mma_tiler_mn[1] != 256 or enable_breuse or sf_fp8_dtype_override is not None:
-                raise ValueError("gate_then_up requires tile_N=256, no B-reuse, and E4M3/E8M0 scales")
+            if mma_tiler_mn[1] != 256 or enable_breuse:
+                raise ValueError("gate_then_up requires tile_N=256 and no B-reuse")
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
         self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None

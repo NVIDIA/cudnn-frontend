@@ -12,6 +12,8 @@ import torch
 
 from test_utils import torch_fork_set_rng
 from determinism_utils import assert_bitwise, assert_replays
+from core.cutedsl.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
+from gemm.cutedsl.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from gemm.cutedsl.test_grouped_gemm_canonical_layouts import SF_PHYSICAL_PERMUTE
 from gemm.cutedsl.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_input_tensors
 from gemm.cutedsl.test_grouped_gemm_dswiglu_utils import allocate_grouped_gemm_dswiglu_tensors, check_ref_grouped_gemm_dswiglu, run_grouped_gemm_dswiglu_ref
@@ -80,11 +82,17 @@ def problem(n=256, group_m=(256, 0, 512), b_major="k", precision="mxfp8"):
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
     )
-    if precision == "nvfp4":
+    if precision.startswith("nvfp4"):
         cfg.update(ab_dtype=torch.float4_e2m1fn_x2, sf_dtype=torch.float8_e4m3fn, sf_vec_size=16, d_dtype=torch.bfloat16)
     inputs = allocate_grouped_gemm_input_tensors(
         **{key: cfg[key] for key in ("n", "k", "l", "group_m_list", "ab_dtype", "sf_dtype", "sf_vec_size", "m_aligned", "b_major")}
     )
+    if precision == "nvfp4_ue5m3":
+        _skip_unless_e5m3_supported()
+        cfg["sf_fp8_dtype_override"] = "e5m3"
+        # Preserve the independent FP32 scale references; only recode storage.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
     inputs["alpha_tensor"].fill_(1)
     inputs["beta_tensor"].fill_(1)
     inputs["prob_tensor"].fill_(1)
@@ -133,6 +141,7 @@ def run(cfg, inputs, *, canonical, discrete=False, discrete_col_sfd=False, dbias
         deterministic=not dbias if deterministic is None else deterministic,
         use_dynamic_sched=True,
         glu_layout="gate_then_up" if canonical else "interleaved_32",
+        sf_fp8_dtype_override=cfg.get("sf_fp8_dtype_override"),
         **weight_args,
     )
     if discrete:

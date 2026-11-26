@@ -261,8 +261,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
         self.glu_layout = validate_glu_layout(glu_layout)
-        if self.glu_layout == "gate_then_up" and (mma_tiler_mn != (256, 256) or cluster_shape_mn != (2, 1) or sf_fp8_dtype_override is not None):
-            raise ValueError("Rubin gate_then_up RHT quant requires tile (256, 256), cluster (2, 1), and E4M3 scales")
+        if self.glu_layout == "gate_then_up" and (mma_tiler_mn != (256, 256) or cluster_shape_mn != (2, 1)):
+            raise ValueError("Rubin gate_then_up RHT quant requires tile (256, 256) and cluster (2, 1)")
         self.sf_vec_size = sf_vec_size
         self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.expert_cnt = expert_cnt
