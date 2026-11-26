@@ -1625,6 +1625,17 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
 
 
 @pytest.mark.L0
+def test_sm100_fp8_sink_lead_follows_the_proposed_split():
+    """Below 32 KV units the whole-cache d64 FP8 sink graph leads only on a split plan: a proposal that runs it unsplit
+    (mode B's fallback knobs) keeps the backend first."""
+    facts = _facts(**{**_SM107_FP8_QUANT, "dtype_o": cudnn.data_type.FP8_E4M3, "device_sm_count": 148}, d_qk=64, d_v=64, has_sink=True, s_q=4, s_kv=32768)
+    lead = heuristics.propose("A", facts, _OFFERED)[0]
+    assert not is_backend_block(lead) and (lead.knobs.split_kv or 1) >= 2, lead
+    plans = heuristics.propose("B", facts, _OFFERED)
+    assert is_backend_block(plans[0]) and all((p.knobs.split_kv or 1) == 1 for p in plans if not is_backend_block(p)), plans
+
+
+@pytest.mark.L0
 def test_sm107_fp8_d192_decode_gap_follows_the_study():
     """Study sm107_fp8_d192_decode_20261118 (module docstring): on cc 10.7, dense FP8 d192 x 128 verify / MTP leads where the row packs
     the whole GQA group, with the full cache always and with a window + sink from 3208 KV tokens in flight. Unpacked groups, S_q 1 and
