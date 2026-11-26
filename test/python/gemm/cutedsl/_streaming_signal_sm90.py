@@ -15,7 +15,7 @@ process.
 import pytest
 import torch
 
-from gemm.cutedsl._streaming_signal import BIG_EXPERT, MANY_EXPERTS_64, ROWS_ALIGNMENT, as_mkl, frozen
+from gemm.cutedsl._streaming_signal import BIG_EXPERT, MANY_EXPERTS_64, ROWS_ALIGNMENT, as_mkl, frozen, spin_before_pdl_launch
 from gemm.cutedsl._streaming_signal import make_problem as make_base_problem
 
 HIDDEN = 512
@@ -231,6 +231,7 @@ class Launcher:
         import cuda.bindings.driver as cuda
 
         stream = stream or torch.cuda.current_stream()
+        spin_before_pdl_launch(self.kernel, stream)
         self._compiled(*launch_args(kernel_args(problem, buffers)), cuda.CUstream(stream.cuda_stream))
 
     def __call__(self, problem, prepare_workspace=None):
