@@ -64,17 +64,16 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass.cute.typing import AddressSpace
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm, nvvm
+from cutlass.experimental import primitives as nvvm_primitives
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineUserType, make_pipeline_state
 from .moe_kernel_helpers import (
     streaming_scheduler_state_offset,
     streaming_signal_ptr,
-    mbarrier_arrive_expect_tx_on_peer_relaxed_cluster,
-    fence_release_cluster,
-    mbarrier_try_wait_parity_acquire_cluster,
 )
 from .moe_utils import ceil_div
-from cudnn.frost.tile_dsl.consume import ReleaseZero, consume_then_arrive_on_peer
+from cudnn.frost.tile_dsl.consume import ReleaseZero
 from .moe_persistent_scheduler import (
     atomic_add_i32,
     MoEWorkTileInfo,
@@ -315,14 +314,11 @@ class MoEStreamingInputBlockSignalTileScheduler:
         """Claim the cluster's next linear tile index and return its work tile, invalid past the last."""
         claimed_linear_tile_idx = self._broadcast_claimed_tile()
         work_tile_info = self._get_work_tile_for_linear_idx(claimed_linear_tile_idx)
-        # The broadcast value is consumed: a full warp per CTA arrives on the leader's empty barrier, each lane at an
-        # address computed from the slot word it read, so the read completes before the leader may refill the slot (consume-then-arrive slot release).
-        consume_then_arrive_on_peer(
-            self.cluster_pipeline.sync_object_empty.get_barrier(self._dynamic_state.consumer_state.index),
-            0,
-            claimed_linear_tile_idx,
-            self.release_zero,
-        )
+        # Consume-then-arrive slot release: a full warp per CTA arrives on the leader's empty barrier, each lane at an address
+        # offset by the slot word it read & release_zero (0), so the read completes before the leader may refill the slot.
+        empty_barrier_ptr = self.cluster_pipeline.sync_object_empty.get_barrier(self._dynamic_state.consumer_state.index)
+        leader_empty_barrier = nvvm_primitives.mapa(empty_barrier_ptr + (claimed_linear_tile_idx & self.release_zero.word), 0)
+        nvvm_primitives.mbarrier_arrive(leader_empty_barrier, scope=nvvm_primitives.MemScope.CTA, relaxed=False)
         self._dynamic_state.consumer_state.advance()
         return work_tile_info
 
@@ -609,14 +605,27 @@ class MoEStreamingInputBlockSignalTileScheduler:
                 cute.arch.store_async_dsmem(dynamic_state.broadcast_ptr, linear_tile_idx, full_barrier_ptr, lane_idx)
             # Fan out one arrive per CTA to the full barrier.
             with cute.arch.elect_one():
-                fence_release_cluster()
+                # fence.release.cluster: orders the slot's st.async and earlier stores before the peers' arrives.
+                llvm.fence(llvm.AtomicOrdering.release, syncscope="cluster")
                 for peer in cutlass.range_constexpr(cluster_size):
-                    mbarrier_arrive_expect_tx_on_peer_relaxed_cluster(full_barrier_ptr, Int32(4), peer)
+                    # Arrive + expect_tx on each peer's full barrier, .relaxed.cluster (the fence above releases).
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        full_barrier_ptr, Int32(4), peer_cta_rank_in_cluster=peer, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER
+                    )
         dynamic_state.producer_state.advance()
         consumer_full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(dynamic_state.consumer_state.index)
         broadcast_arrived = Boolean(False)
         while not broadcast_arrived:
-            broadcast_arrived = mbarrier_try_wait_parity_acquire_cluster(consumer_full_barrier_ptr, dynamic_state.consumer_state.phase)
+            # try_wait.parity.acquire.cluster: the default .acquire.cta does not synchronize with a peer's arrive.
+            broadcast_arrived = Boolean(
+                nvvm.mbarrier_wait_parity(
+                    consumer_full_barrier_ptr.to_llvm_ptr(),
+                    Int32(dynamic_state.consumer_state.phase).ir_value(),
+                    nvvm.MBarrierWaitKind.TRY,
+                    scope=nvvm.MemScopeKind.CLUSTER,
+                    order=nvvm.MemOrderKind.ACQUIRE,
+                )
+            )
         return broadcast_tensor[0]
 
     @cute.jit
