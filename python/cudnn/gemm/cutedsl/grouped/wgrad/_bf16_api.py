@@ -302,12 +302,18 @@ class GroupedGemmWgradBf16API(APIBase):
             raise ValueError(f"single expert placeholder layout {desc.stride} is not expressible as a C-contiguous JAX array")
         self._single_expert_placeholder = jax.block_until_ready(jnp.empty(desc.shape, dtype=framework_dtype(desc.dtype, "jax")))
 
+    # The wide kernel is not faster than the stock one on GB200 at the MoE wgrad shapes measured (dW1 + dW2 geomean
+    # 1.006, per GEMM 0.96-1.05), so the API does not pick it by default.
+    _use_wide_tiles = False
+
     def _wide_applies(self) -> bool:
-        """The wide kernel (256 x 512 tiles per CTA pair, the same dW bits) replaces the stock one at the default 2-CTA
-        256x256 tile on SM100/SM103 for dense output, Tensor2D input, no accumulation, 16-bit dW and n % 512 == 0."""
+        """Whether the wide kernel (256 x 512 tiles per CTA pair, the same dW bits) replaces the stock one: when enabled,
+        at the default 2-CTA 256x256 tile on SM100/SM103 for dense output, Tensor2D input, no accumulation, 16-bit dW
+        and n % 512 == 0."""
         m, n = self.wgrad_shape
         return (
-            not self._is_rubin_kernel
+            self._use_wide_tiles
+            and not self._is_rubin_kernel
             and self.weight_mode == MoEWeightMode.DENSE
             and self.input_order == WGradInputOrder.Tensor2D
             and not self.accumulate_on_output

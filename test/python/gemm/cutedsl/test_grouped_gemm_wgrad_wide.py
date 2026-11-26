@@ -3,9 +3,9 @@
 
 """BF16 wgrad with wide tiles (256 x 512 per CTA pair, each A tile shared by both 256-column halves).
 
-The API picks the wide kernel on its own for dense output, Tensor2D input and n % 512 == 0 at the default 2-CTA
-256x256 tile. Its dW must be the stock kernel's byte for byte: the discrete output mode runs the stock kernel on the
-same inputs.
+The API can run the wide kernel for dense output, Tensor2D input and n % 512 == 0 at the default 2-CTA 256x256 tile;
+it is off by default, so these tests turn it on. Its dW must be the stock kernel's byte for byte: the discrete output
+mode runs the stock kernel on the same inputs.
 """
 
 import pytest
@@ -19,6 +19,15 @@ from gemm.cutedsl.test_grouped_gemm_wgrad_bf16_utils import (
     grouped_gemm_wgrad_bf16_reference,
     make_grouped_gemm_wgrad_bf16_problem,
 )
+
+
+@pytest.fixture(autouse=True)
+def wide_tiles_on(request, monkeypatch):
+    if request.node.name == "test_wide_tiles_are_off_by_default":
+        return
+    monkeypatch.setattr(_bf16_api.GroupedGemmWgradBf16API, "_use_wide_tiles", True)
+    monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_wgrad_wrapper_memo", {})
+    monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_cache_of_GroupedGemmWgradSm100Objects", {})
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +60,12 @@ def _run(problem, output_mode, *, counter=False, tile=(256, 256), cluster=(2, 1)
     )
     torch.cuda.synchronize()
     return output
+
+
+@pytest.mark.L0
+def test_wide_tiles_are_off_by_default():
+    # Measured not faster than the stock kernel on GB200 (see the class attribute's comment).
+    assert _bf16_api.GroupedGemmWgradBf16API._use_wide_tiles is False
 
 
 @pytest.mark.L0
