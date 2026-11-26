@@ -134,7 +134,7 @@ WARM_CASES = [("quant", "n_chunk"), ("glu", "signal"), ("glu", "compact_signal")
 @pytest.mark.parametrize("kind, variant", WARM_CASES, ids=case_ids(WARM_CASES))
 def test_claim_slot_release_warm_stress(kind, variant):
     """The claim slot each cluster broadcasts, and with the SF warp its tile_info slot, are released only after every
-    lane read them (python/cudnn/AGENTS.md Rule 11): back-to-back and shared-memory-poisoned launches of a 5000-row
+    lane read them (consume-then-arrive slot release): back-to-back and shared-memory-poisoned launches of a 5000-row
     expert on 4 clusters (many claims per cluster), every byte against stock."""
     from warm_stress import StressCase, assert_warm_stress
 

@@ -2656,7 +2656,7 @@ scheduler:
   random order (64 experts).
 - Batch invariance (6): a 700-row target expert alone, with neighbors, behind empty experts, among 1/255/257-row
   experts, reordered and duplicated: FC2 at both cluster shapes, the GLU under host and device layout, both dGLUs.
-- Claim-slot warm stress (6, Rule 11; the compact cases also cover the SF warp's tile_info slot): 0 wrong of 500 warm
+- Claim-slot warm stress (6, consume-then-arrive slot release; the compact cases also cover the SF warp's tile_info slot): 0 wrong of 500 warm
   and 0 of 500 poisoned launches each.
 
 `test_grouped_gemm_blockscaled_streaming_signal.py` holds the functional cases: every N_CHUNK chunk published with stock
