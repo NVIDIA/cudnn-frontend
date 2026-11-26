@@ -1373,36 +1373,6 @@ def streaming_signal_ptr(counter_ptr, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def mbarrier_arrive_expect_tx_on_peer_relaxed_cluster(mbar_ptr, tx_count: Int32, cta_rank_in_cluster: cutlass.Constexpr, *, loc=None, ip=None) -> None:
-    """Arrive + expect_tx on a peer CTA's mbarrier, ``.relaxed.cluster`` (the default would be ``.release.cta``)."""
-    cute.arch.mbarrier_arrive_and_expect_tx(
-        mbar_ptr, tx_count, peer_cta_rank_in_cluster=cta_rank_in_cluster, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER, loc=loc, ip=ip
-    )
-
-
-@dsl_user_op
-def fence_release_cluster(*, loc=None, ip=None) -> None:
-    """``fence.release.cluster``: orders this CTA's earlier stores before a peer observes the next arrive."""
-    llvm.fence(llvm.AtomicOrdering.release, syncscope="cluster", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def mbarrier_try_wait_parity_acquire_cluster(mbar_ptr, phase: Int32, *, loc=None, ip=None) -> Boolean:
-    """``mbarrier.try_wait.parity.acquire.cluster``: the default ``.acquire.cta`` does not synchronize with a peer's arrive."""
-    return Boolean(
-        nvvm.mbarrier_wait_parity(
-            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
-            Int32(phase).ir_value(loc=loc, ip=ip),
-            nvvm.MBarrierWaitKind.TRY,
-            scope=nvvm.MemScopeKind.CLUSTER,
-            order=nvvm.MemOrderKind.ACQUIRE,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
 def mbarrier_try_wait_parity_relaxed_cluster(mbar_ptr, phase: Int32, *, loc=None, ip=None) -> Boolean:
     """``mbarrier.try_wait.parity.relaxed.cluster``: a strong read of a peer's arrive with no acquire, so no L1
     invalidation per poll.  Follow the successful poll with an acquire fence (an acquire pattern)."""
