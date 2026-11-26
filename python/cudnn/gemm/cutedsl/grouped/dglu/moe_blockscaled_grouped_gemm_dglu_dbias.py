@@ -802,6 +802,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         glu_clamp_min: cutlass.Constexpr = -7.0,
         situ_beta1: cutlass.Constexpr = 4.0,
         situ_beta2: cutlass.Constexpr = 25.0,
+        h_tensor: Optional[cute.Tensor] = None,
+        sfh_col_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM.
 
@@ -819,6 +821,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         clamp masks. ``situ_beta1`` and ``situ_beta2`` configure the SiTU-GLU
         derivative. GeGLU parameters are ignored unless ``act_func == "dgeglu"``
         and SiTU parameters are ignored unless ``act_func == "dsituglu"``.
+
+        ``h_tensor`` and ``sfh_col_tensor`` (dswiglu with FP8 dH, both or neither): the epilogue also writes the
+        forward activation it recomputes, h = prob * silu(beta * gate) * (beta * up), column-quantized for the FC2
+        weight gradient: ``h_tensor`` row-major codes [rows, N] in D's FP8 dtype, each 32-row block of a column scaled
+        by one E8M0 scale; ``sfh_col_tensor`` the scales, per expert (rows s .. s + n, n a multiple of 128) in the
+        block-scaled MMA scale-factor layout of an N x n operand with K = rows: byte N * s / 32 + (c // 128) * 4 * n +
+        (r // 128) * 512 + (c % 32) * 16 + ((c // 32) % 4) * 4 + (r // 32) % 4 for column c and expert-local row r.
+        dH and the other outputs are unchanged.
         """
         a = kernel_facing_mx(a)
         c = kernel_facing_mx(c)
@@ -848,6 +858,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         self.dbias_cross_warp_reduce = self.generate_dbias  # always cross-warp reduce
         self.has_prob = prob is not None
         self.generate_dprob = dprob is not None
+        self.generate_h = h_tensor is not None
+        h_tensor = kernel_facing_mx(h_tensor)
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -859,6 +871,13 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
         self.check_compact_sfa_attributes(a)
+        if cutlass.const_expr(self.generate_h):
+            if cutlass.const_expr(sfh_col_tensor is None):
+                raise ValueError("h_tensor needs sfh_col_tensor, its column scales")
+            if cutlass.const_expr(self.act_func != "dswiglu" or not self.generate_sfd or h_tensor.element_type != self.d_dtype):
+                raise ValueError("h: dswiglu with an MXFP8 dH (FP8 D with E8M0 scales), h in D's dtype")
+            if cutlass.const_expr(self.glu_layout != "interleaved_32"):
+                raise ValueError("h: the interleaved_32 GLU layout")
 
         # ---- B / SFB setup (mode-dependent) ----
         b_from_call_arg = b
@@ -1213,6 +1232,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
             epilogue_op,
             Int32(0) if self.use_streaming_signal_sched or self.compact_sfa_sf_warp else None,
             cute.recast_ptr(sfa.iterator, dtype=cutlass.Int32) if cutlass.const_expr(self.compact_sfa_sf_warp) else None,
+            h_tensor,
+            sfh_col_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1581,6 +1602,35 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
             self.stg_256(dst_vf32x8[None, ei].iterator.llvm_ptr, src_vf32x8[None, ei].load())
 
     @cute.jit
+    def store_h_subtile(self, mH_mnl, mSFHCol, tRS_rH, pvscale, epi_ext, mPosition, tidx, warp_idx, work_tile_info, subtile_idx):
+        """One 128 x 32 h subtile: each thread's row as one 32-byte store of its codes, each lane its column's E8M0
+        scale (``pvscale`` slot 0, from quant_sfd_col) at the scale-factor byte given in ``__call__``."""
+        n_h = cute.size(mH_mnl, mode=[1])
+        column0 = work_tile_info.tile_n_idx * self.cta_tile_shape_mnk[1] + subtile_idx * self.epi_tile[1]
+        if column0 < n_h:
+            row = cutlass.Int64(epi_ext.token_offset + mPosition)
+            code_addr = mH_mnl.iterator.toint() + row * cutlass.Int64(n_h) + cutlass.Int64(column0)
+            code_dst = cute.make_tensor(cute.make_ptr(cutlass.Int32, code_addr, AddressSpace.gmem, assumed_align=32), cute.make_layout(8))
+            self.store_global_memory_256b(code_dst, cute.recast_tensor(tRS_rH, cutlass.Int32))
+            scale_f32 = cute.make_rmem_tensor(4, cutlass.Float32)
+            scale_f32[0] = pvscale[None, None, 0][0]
+            for i in cutlass.range_constexpr(1, 4):
+                scale_f32[i] = cutlass.Float32(0.0)
+            scale_e8m0 = cute.make_rmem_tensor(4, self.sf_dtype)
+            self.cvt_f32x4_to_f8x4(scale_f32, scale_e8m0)
+            column = column0 + cute.arch.lane_idx()
+            local_row0 = mPosition - tidx
+            block = warp_idx % self.num_epilog_warps
+            scale_addr = (
+                mSFHCol.iterator.toint()
+                + cutlass.Int64(epi_ext.token_offset) * cutlass.Int64(n_h // 32)
+                + cutlass.Int64(column // 128) * cutlass.Int64(4 * epi_ext.tokens_i)
+                + cutlass.Int64((local_row0 // 128) * 512 + (column % 32) * 16 + ((column // 32) % 4) * 4 + block)
+            )
+            scale_dst = cute.make_tensor(cute.make_ptr(cutlass.Uint8, scale_addr, AddressSpace.gmem, assumed_align=1), cute.make_layout(1))
+            scale_dst[0] = cute.recast_tensor(scale_e8m0, cutlass.Uint8)[0]
+
+    @cute.jit
     def create_and_partition_new_SFDCol(
         self,
         mSFDCol_gemm_domain: cute.Tensor,
@@ -1720,10 +1770,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         square_alpha: Float32,
         dprob_swiglu: Optional[cute.Tensor] = None,
     ):
+        """(d1, d2, dprob, h): h = prob * swish(beta * gate) * (beta * up) with ``generate_h``, else None."""
         LOG2_E = cutlass.Float32(1.4426950408889634)
+        h_vec = None
         if cutlass.const_expr(self.vectorized_f32):
             d1_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
             d2_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
+            if cutlass.const_expr(self.generate_h):
+                h_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
             for i in cutlass.range(0, cute.size(acc_vec), 2, unroll_full=True):
                 # Apply scaling factors for FP8
                 (
@@ -1794,6 +1848,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                         (dprob_swiglu[i + 0], dprob_swiglu[i + 1]),
                         (acc_vec[i + 0], acc_vec[i + 1]),
                     )
+                # h = prob * swish * (beta * up), the forward's FC2 input
+                if cutlass.const_expr(self.generate_h):
+                    h_vec[i + 0], h_vec[i + 1] = cute.arch.mul_packed_f32x2((ab2_vec_acc_type[0], ab2_vec_acc_type[1]), swish, rnd="rn", ftz=False)
+                    if cutlass.const_expr(self.has_prob):
+                        h_vec[i + 0], h_vec[i + 1] = cute.arch.mul_packed_f32x2((h_vec[i + 0], h_vec[i + 1]), (mProb, mProb), rnd="rn", ftz=False)
                 # calculate dswiglu
                 acc_vec_prob = (acc_vec[i + 0], acc_vec[i + 1])
                 if cutlass.const_expr(self.has_prob):
@@ -1861,7 +1920,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
             d2_vec = d2_vec.load()
             if cutlass.const_expr(self.generate_dprob):
                 dprob_swiglu = dprob_swiglu.load()
-            return d1_vec, d2_vec, dprob_swiglu
+            if cutlass.const_expr(self.generate_h):
+                h_vec = h_vec.load()
+            return d1_vec, d2_vec, dprob_swiglu, h_vec
         else:
             acc_vec = acc_vec.load()
             ab1_vec_load = ab1_vec_load.load()
@@ -1884,13 +1945,19 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                 dprob_swiglu = ab2_vec_load * swish
                 dprob_swiglu = acc_vec * dprob_swiglu
 
+            # h = prob * swish * (beta * up), the forward's FC2 input
+            if cutlass.const_expr(self.generate_h):
+                h_vec = ab2_vec_load * swish
+                if cutlass.const_expr(self.has_prob):
+                    h_vec = h_vec * mProb
+
             # calculate dswiglu
             acc_vec_prob = acc_vec
             if cutlass.const_expr(self.has_prob):
                 acc_vec_prob = acc_vec * mProb
             d1_vec = acc_vec_prob * ab2_vec_load * sig * (1 + ab1_vec_load * (1 - sig))
             d2_vec = acc_vec_prob * swish
-            return d1_vec, d2_vec, dprob_swiglu
+            return d1_vec, d2_vec, dprob_swiglu, h_vec
 
     @cute.jit
     def dsituglu(
@@ -2236,6 +2303,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         epilogue_op: cutlass.Constexpr,
         release_zero_arg: Optional[Int32] = None,
         compact_sfa_words: Optional[cute.Pointer] = None,
+        mH_mnl: Optional[cute.Tensor] = None,
+        mSFHCol: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2243,6 +2312,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         ``release_zero_arg``: with the signal scheduler or the SF warp, the release-zero (python/cudnn/AGENTS.md Rule 11): the
         host passes the literal 0 and its only use is ``release_zero()``; None otherwise.
         ``compact_sfa_words``: with ``compact_sfa_sf_warp``, the compact SFA rows as int32 words (4 scales each).
+        ``mH_mnl`` / ``mSFHCol``: the activation h and its column scales (see ``__call__``), or None.
         """
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = tidx // 32
@@ -2951,6 +3021,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                     tRS_rD2_col,
                     tRS_sD_col,
                 ) = self.epilog_smem_copy_and_partition_store(tiled_copy_t2r, tTR_rD1_col, tTR_rD2_col, epi_tidx, sD_col)
+                if cutlass.const_expr(self.generate_h):
+                    tRS_rH = cute.make_rmem_tensor_like(tRS_rD1_col)
 
                 norm_const = cutlass.Float32(norm_const_tensor[0])
                 d_rcp_limits = get_dtype_rcp_limits(self.d_dtype)
@@ -3087,6 +3159,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                         tCgSFDCol_mnl = self.create_and_partition_new_SFDCol(real_sfd_col)
                     tCrSFDCol = cute.make_rmem_tensor(tCrSFDRow.layout, tCrSFDRow.element_type)
                     tCrSFDCol_pvscale = cute.make_rmem_tensor_like(tCrSFDRow_pvscale.layout, cutlass.Float32)
+                    if cutlass.const_expr(self.generate_h):
+                        tCrSFHCol_pvscale = cute.make_rmem_tensor_like(tCrSFDRow_pvscale.layout, cutlass.Float32)
                     tCgSFDCol_mn = tCgSFDCol_mnl[(None, None, None, None, None, 0)]
                     if cutlass.const_expr(self.glu_layout == "gate_then_up" and self.discrete_col_sfd):
                         # Discrete column scales use expert-local M atom capacity.
@@ -3221,7 +3295,13 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                     #
                     square_alpha = alpha_val * alpha_val
                     if cutlass.const_expr(self.act_func == "dswiglu"):
-                        d1_vec, d2_vec, dprob_swiglu = self.dswiglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu)
+                        d1_vec, d2_vec, dprob_swiglu, h_vec = self.dswiglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu)
+                        if cutlass.const_expr(self.generate_h):
+                            # h's column scales (one per lane's column), its codes, then both stores.
+                            self.quant_sfd_col(0, tiled_copy_r2s, h_vec, tCrSFHCol_pvscale, norm_const, d_rcp_limits, tRS_rH, column_scratch)
+                            self.store_h_subtile(
+                                mH_mnl, mSFHCol, tRS_rH, tCrSFHCol_pvscale, epi_ext, mPosition, tidx, warp_idx, epi_work_tile_info, real_subtile_idx
+                            )
                     elif cutlass.const_expr(self.act_func == "dgeglu"):
                         d1_vec, d2_vec, dprob_swiglu = self.dgeglu(
                             acc_vec,
