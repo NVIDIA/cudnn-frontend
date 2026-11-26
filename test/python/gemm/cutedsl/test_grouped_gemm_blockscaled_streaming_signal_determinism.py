@@ -60,8 +60,8 @@ def test_mxfp8_output_notify_chunk_size_invariance():
 
 # ---- The input signal (FC1 GLU, dGLU) ----
 
-# Variants (``variant_options``): the signal, with its trigger (the GLU's device layout and all-slots-ready trigger, the
-# dGLU's entry trigger), and with the compact SF warp.
+# Variants (``variant_options``): the signal, with its trigger (the PDL trigger at entry, the GLU's also with its device
+# layout), and with the compact SF warp.
 REPLAY_CASES = [("glu", v, r) for v in ("signal", "trigger", "compact_signal", "compact_trigger") for r in ("many_experts_64", "big_expert")]
 REPLAY_CASES += [
     (k, v, "many_experts_64")

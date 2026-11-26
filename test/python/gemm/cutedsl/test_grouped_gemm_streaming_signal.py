@@ -134,9 +134,7 @@ def test_signal_consumer_matches_dynamic(glu, variant, routing):
     capacity = problem["rows"] // ROWS_ALIGNMENT
     options = dict(use_dynamic_sched=True, streaming_signal_capacity=capacity)
     if variant == "signal_layout_pdl":
-        options.update(device_layout=True, use_pdl=True)
-        trigger = "launch_pdl_dependents_at_all_streaming_signal_slots_ready" if glu else "launch_pdl_dependents_at_entry"
-        options[trigger] = True
+        options.update(device_layout=True, use_pdl=True, launch_pdl_dependents_at_entry=True)
     experts = experts_of(routing)
     stock_c, stock_d, _, _ = run(make_kernel(glu, experts=experts, use_dynamic_sched=True), problem, glu)
     signal_kernel = make_kernel(glu, experts=experts, **options)
@@ -237,7 +235,7 @@ def test_signal_consumer_waits_for_producer(glu, routing, order):
 @pytest.mark.parametrize("glu", levels([(False,), (True,)], {(True,)}, lambda glu: "glu" if glu else "plain"))
 def test_device_layout_waits_for_producer(glu):
     """The GEMM starts while the layout reads -1, every signal[] entry reads not-ready and A holds NaN; a later kernel on
-    another stream writes the layout, then A one M tile at a time with its signal[] entry.  The GLU also triggers once every M tile is ready."""
+    another stream writes the layout, then A one M tile at a time with its signal[] entry.  The GLU also lets its dependent launch at entry."""
     n = 2 * FFN if glu else FFN
     # Many experts: the layout has 65 entries to wait for, and the stock kernel is the one the other tests built.
     experts = len(MANY_EXPERTS_64)
@@ -246,7 +244,7 @@ def test_device_layout_waits_for_producer(glu):
     final_a, final_layout = problem["a"].clone(), problem["layout"].clone()
     options = dict(use_dynamic_sched=True, streaming_signal_capacity=capacity, device_layout=True)
     if glu:
-        options["launch_pdl_dependents_at_all_streaming_signal_slots_ready"] = True
+        options["launch_pdl_dependents_at_entry"] = True
     kernel = make_kernel(glu, experts=experts, **options)
     stock_c, stock_d, _, _ = run(make_kernel(glu, experts=experts, use_dynamic_sched=True), problem, glu)
     torch.cuda.synchronize()
@@ -366,8 +364,8 @@ def test_streaming_options_reject_invalid():
         make_kernel(False, streaming_signal_capacity=4)
     with pytest.raises(ValueError, match="device_layout"):
         make_kernel(False, use_dynamic_sched=True, device_layout=True)
-    with pytest.raises(ValueError, match="launch_pdl_dependents_at_all_streaming_signal_slots_ready"):
-        make_kernel(True, use_dynamic_sched=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
+    # The GLU's entry trigger needs neither a producer nor use_pdl (rejected here, behind the helper kernel).
+    make_kernel(True, use_dynamic_sched=True, launch_pdl_dependents_at_entry=True)
     notify = StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, 256, 4, clusters_beside_consumer=1)
     with pytest.raises(ValueError, match="use_dynamic_sched"):
         make_kernel(False, streaming_output_notify=notify)

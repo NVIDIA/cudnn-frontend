@@ -110,15 +110,15 @@ def make_kernel(kind, experts, one_cta=False, **options):
 
 
 def trigger_options(kind):
-    """The GLU's device layout with the all-slots-ready PDL trigger; the dGLU's trigger at entry."""
+    """The PDL trigger at entry; the GLU also with its device layout."""
     if kind == "glu":
-        return dict(device_layout=True, use_pdl=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
+        return dict(device_layout=True, use_pdl=True, launch_pdl_dependents_at_entry=True)
     return dict(use_pdl=True, launch_pdl_dependents_at_entry=True)
 
 
 def variant_options(kind, problem, variant):
     """Options of an input-signal ``variant``: "signal" (one flag per M tile), "trigger" (the signal and
-    ``trigger_options``), "entry" (the dGLU's entry trigger alone, on the stock dynamic scheduler: without use_pdl,
+    ``trigger_options``), "entry" (the entry trigger alone, on the stock dynamic scheduler: without use_pdl,
     which helper_kernel would be the primary of); a "compact" prefix adds ``compact_sfa_sf_warp`` ("compact" alone: on
     the stock dynamic scheduler)."""
     options = dict(use_dynamic_sched=True)
