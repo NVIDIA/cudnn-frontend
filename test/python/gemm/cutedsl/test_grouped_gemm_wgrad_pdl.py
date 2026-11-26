@@ -20,6 +20,10 @@ import torch
 M, N = 512, 512
 BF16_GROUPS = (256, 0, 512, 256, 0, 1024)
 MXFP8_GROUPS = (128, 0, 384, 1024, 0, 128)
+# Other valid group sizes with the same total: what a kernel that read the offsets in front of its wait would see.
+STALE_GROUPS = {"bf16": (1024, 256, 0, 512, 0, 256), "mxfp8": (1024, 128, 0, 384, 128, 0)}
+# The offsets operand sits at the end of a buffer of this many int32: a one-pass writer reaches it last.
+OFFSETS_PREFIX = 1 << 20
 # (mma_tiler_mn, cluster_shape_mn): one-CTA and a (2, 1) pair. MXFP8 takes the 128x128 tile for the one-CTA case.
 CONFIGS = [((128, 256), (1, 1)), ((256, 256), (2, 1))]
 # Without a helper kernel (bf16), and every way the call launches one in front of the main kernel.
@@ -113,7 +117,7 @@ class _Op:
         self.op.compile()
         self._ptrs = {}
 
-    def __call__(self, a, out):
+    def __call__(self, a, out, offsets=None):
         if self.discrete and out.data_ptr() not in self._ptrs:
             self._ptrs[out.data_ptr()] = torch.tensor([e.data_ptr() for e in out], dtype=torch.int64, device="cuda")
         self.op.execute(
@@ -121,7 +125,7 @@ class _Op:
             b_tensor=self.problem["b"],
             sfa_tensor=self.problem.get("sfa"),
             sfb_tensor=self.problem.get("sfb"),
-            offsets_tensor=self.problem["offsets"],
+            offsets_tensor=self.problem["offsets"] if offsets is None else offsets,
             wgrad_tensor=None if self.discrete else out,
             wgrad_ptrs=self._ptrs.get(out.data_ptr()) if self.discrete else None,
         )
@@ -153,15 +157,20 @@ def _graph(chain):
     return graph
 
 
-PRODUCER_CASES = [(v, "a") for v in VARIANTS] + [("bf16", "accumulated_output"), ("mxfp8", "accumulated_output")]
+PRODUCER_CASES = (
+    [(v, "a") for v in VARIANTS]
+    + [("bf16", "accumulated_output"), ("mxfp8", "accumulated_output")]
+    + [("bf16", "offsets"), ("bf16_ragged", "offsets"), ("mxfp8", "offsets")]
+)
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("config", CONFIGS, ids=_config_id)
 @pytest.mark.parametrize("variant,operand", PRODUCER_CASES, ids=[f"{v}-{o}" for v, o in PRODUCER_CASES])
 def test_use_pdl_matches_plain_launch_behind_producers(variant, operand, config):
-    """use_pdl on versus off, bitwise, behind a predecessor that writes an operand: A (its whole storage), or the output that
-    accumulate_on_output reduces into. The predecessor is an ordinary torch kernel (it releases its dependents only when it
+    """use_pdl on versus off, bitwise, behind a predecessor that writes an operand: A (its whole storage), the output that
+    accumulate_on_output reduces into, or the offsets (which the helper kernel reads to build the per-expert descriptors of
+    TensorRagged inputs and of the scale factors; they hold other valid offsets until the writer reaches them). The predecessor is an ordinary torch kernel (it releases its dependents only when it
     completes) or ``EarlyReleaseWriter`` (it releases them first, then writes slowly with one thread block): eager and
     replayed from a CUDA graph. With a helper kernel, the helper is the writer's dependent and the main kernel the helper's;
     a helper or main kernel that read in front of its wait would read other bytes. The positive control (a dependent copy
@@ -175,7 +184,20 @@ def test_use_pdl_matches_plain_launch_behind_producers(variant, operand, config)
     pdl = _Op(problem, variant, config, accumulate_on_output=accumulate, use_pdl=True)
 
     out = torch.empty_like(problem["output"])
-    if accumulate:
+    offsets = None
+    if operand == "offsets":
+        stale_offsets = torch.tensor(STALE_GROUPS["mxfp8" if variant.startswith("mxfp8") else "bf16"], dtype=torch.int32, device="cuda").cumsum(
+            0, dtype=torch.int32
+        )
+        new = torch.zeros(OFFSETS_PREFIX + stale_offsets.numel(), dtype=torch.int32, device="cuda")
+        new[OFFSETS_PREFIX:] = problem["offsets"]
+        stale = new.clone()
+        stale[OFFSETS_PREFIX:] = stale_offsets
+        buf, a = stale.clone(), problem["a"]
+        offsets = buf[OFFSETS_PREFIX:]
+        expected = torch.empty_like(out)
+        plain(problem["a"], expected)
+    elif accumulate:
         new = (torch.randn_like(out, dtype=torch.float32) * 0.25).to(out.dtype)
         buf, a = out, problem["a"]
         expected = new.clone()
@@ -186,20 +208,23 @@ def test_use_pdl_matches_plain_launch_behind_producers(variant, operand, config)
         a = torch.as_strided(buf, problem["a"].size(), problem["a"].stride(), problem["a"].storage_offset())
         expected = torch.empty_like(out)
         plain(problem["a"], expected)
-    stale = _random_like(new, seed=5)
+    if operand != "offsets":
+        stale = _random_like(new, seed=5)
     torch.cuda.synchronize()
 
-    writer, unwaited = EarlyReleaseWriter(torch.device("cuda")), DependentCopy(torch.device("cuda"), wait=False)
+    # One pass for the offsets: every byte the writer stores is then the new one, and the offsets are stored last.
+    writer = EarlyReleaseWriter(torch.device("cuda"), passes=1 if operand == "offsets" else 8)
+    unwaited = DependentCopy(torch.device("cuda"), wait=False)
     seen = torch.empty_like(new)
     new_bytes, buf_bytes = new.view(-1).view(torch.uint8), buf.view(-1).view(torch.uint8)
 
     def ordinary():
         torch.bitwise_or(new_bytes, 0, out=buf_bytes)  # an ordinary kernel: no early release
-        pdl(a, out)
+        pdl(a, out, offsets)
 
     def early():
         writer(new, buf)
-        pdl(a, out)
+        pdl(a, out, offsets)
 
     def control():
         writer(new, buf)
@@ -213,7 +238,7 @@ def test_use_pdl_matches_plain_launch_behind_producers(variant, operand, config)
         results = []
         for _ in range(count):
             buf.copy_(stale)
-            if not accumulate:
+            if operand != "accumulated_output":
                 out.fill_(float("nan"))
             torch.cuda.synchronize()
             run()
