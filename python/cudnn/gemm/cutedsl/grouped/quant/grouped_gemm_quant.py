@@ -396,10 +396,21 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         self.overlapping_accum = self.num_acc_stage == 1 and self.mma_tiler[1] == 256
         self.epilogue_prefetch_more = False
 
-        sf_atom_mn = 32
-        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
-        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
-        self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
+        # The footprints of the SF TMEM layouts the MMA warp builds (what tcgen05.cp writes, every SF address an MMA of the
+        # K tile reads), not mma_inst_tile_k columns per 32 rows: MXFP8 at 256 x 256 takes 4 + 8 columns, 16 with the
+        # granule, instead of 48.  The overlapping accumulator then overlaps the SF region by 16 columns and releases
+        # after the first epilogue subtile.
+        sfa_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
+            tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+        )
+        sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
+            tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+        )
+        self.num_sfa_tmem_cols = utils.compute_tmem_cols_from_layout(sfa_tmem_layout, self.sf_dtype)
+        self.num_sfb_tmem_cols = utils.compute_tmem_cols_from_layout(sfb_tmem_layout, self.sf_dtype)
+        # tcgen05.cp writes 4-column groups: SFB starts on one.
+        assert self.num_sfa_tmem_cols % 4 == 0, f"SFA's {self.num_sfa_tmem_cols} TMEM columns misalign SFB's tcgen05.cp"
+        self.num_sf_tmem_cols = -(-(self.num_sfa_tmem_cols + self.num_sfb_tmem_cols) // 16) * 16
         self.num_accumulator_tmem_cols = (
             self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
         )
