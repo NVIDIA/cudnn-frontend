@@ -1690,16 +1690,15 @@ def test_mxfp8_sink_keeps_the_unsplit_plan():
     assert _split_points(_row_caps("sdpa_fwd_prefill_sm100_mxfp8"), facts, 128, 128, 1, 8) == [1]
 
 
-@pytest.mark.parametrize("sink", [False, True])
-def test_sm100_fp8_split_sees_only_the_window(sink):
-    """The SM100 FP8 kernels bound the KV loop to the window (compute_kv_loop_bounds), so the split model counts the window's tiles, not
-    the cache's: one decode row under a 128-token window walks one or two KV tiles and does not split."""
+def test_windowed_fp8_sink_keeps_the_unsplit_plan():
+    """Only a full-cache FP8 sink graph splits: under a window the FP8 split model counts the whole cache, and a window-clipped
+    model lost on short windows (sm100_fp8_sink_split_20261126)."""
     from dataclasses import replace
 
     from cudnn.sdpa.fwd.heuristics import _split_points
 
     caps = _row_caps("sdpa_fwd_prefill_sm100_fp8")
-    full = _fp8_sink_decode((10, 0), has_sink=sink)
+    full = _fp8_sink_decode((10, 0))
     windowed = replace(full, window_left=128, causal=True, bottom_right=True)
     assert _split_points(caps, full, 128, 128, 1, 8)[0] > 1
     assert _split_points(caps, windowed, 128, 128, 1, 8) == [1]

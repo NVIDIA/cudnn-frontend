@@ -2817,10 +2817,8 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
     kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
     ctas = cga or 1
     sm120_f16 = 120 <= caps.sm_lo and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
-    sm100_fp8 = 100 <= caps.sm_lo and caps.sm_hi < 107 and facts.is_fp8
-    if _sm100_f16(caps, facts) or sm120_f16 or sm100_fp8:
+    if _sm100_f16(caps, facts) or sm120_f16:
         # SM120 kernels clip the KV loop to the window too: the whole cache split 4 ways ran 2x (study sm120_swa_split_20261117).
-        # So do the SM100 per-tensor FP8 kernels (compute_kv_loop_bounds).
         kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
     if _sm100_f16(caps, facts) and physical:
         ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
@@ -2882,9 +2880,10 @@ def _split_points(
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
-    # A sink splits on the SM100 / SM120 half flavors and on the per-tensor FP8 plans mismatch()
-    # admits (the combine folds it once); MXFP8 keeps the unsplit sink, and a gated graph's split
-    # (the gate rides its combine) carries no sink.
+    # A sink splits on the SM100 / SM120 half flavors and, over the whole cache, on the per-tensor
+    # FP8 plans mismatch() admits (the combine folds it once). Under a window the FP8 model counts
+    # the whole cache, so a windowed FP8 sink graph keeps the unsplit plan; MXFP8 keeps it too, and
+    # a gated graph's split (the gate rides its combine) carries no sink.
     if (
         (facts.thd and not ragged_decode)
         or (
@@ -2893,8 +2892,11 @@ def _split_points(
                 facts.is_mxfp8
                 or (
                     facts.is_fp8
-                    and not supports_quantized_split_sink(
-                        device_cc=facts.device_cc, pertensor=True, thd=facts.thd, d_shape=(facts.d_qk, facts.d_v), paged=facts.has_paged_kv
+                    and (
+                        facts.window_left is not None
+                        or not supports_quantized_split_sink(
+                            device_cc=facts.device_cc, pertensor=True, thd=facts.thd, d_shape=(facts.d_qk, facts.d_v), paged=facts.has_paged_kv
+                        )
                     )
                 )
                 or facts.has_epilogue_gate

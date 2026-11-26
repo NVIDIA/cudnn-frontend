@@ -1591,7 +1591,8 @@ def test_sm103_fp8_d192_long_causal_chunks_lead():
 @pytest.mark.L0
 def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
     """SM100 per-tensor FP8 decode-shaped GQA (module docstring): 2 <= s_q <= 16 leads at d128 / d256 and d64 with a sink,
-    s_q == 1 only for the d64 sink graph under a window or from 32 KV units; outside the measured box the backend leads."""
+    s_q == 1 only for the d64 sink graph (over the whole cache at any batch, as it splits; under a window as a single row or from
+    32 KV units); outside the measured box the backend leads."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100_fp8")
@@ -1610,7 +1611,7 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
     assert place(**{**paged_swa, "s_q": 4, "b": 32}) == placement.LEAD
     assert place(**sink, s_q=1, causal=False, bottom_right=False, b=4) == placement.LEAD  # 32 KV units
     assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1, window_left=128) == placement.LEAD
-    assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1) == placement.TRAIL  # 8 units over a full cache: 1.20-1.23x
+    assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1) == placement.LEAD  # 8 units over a full cache: the split leads
     assert place(s_q=1, causal=False, bottom_right=False) == placement.TRAIL  # d128 decode still loses
     assert place(h_q=2) == placement.TRAIL  # MHA not measured
     assert place(d_qk=64, d_v=64, h_q=64, h_kv=8) == placement.TRAIL  # d64 without a sink not measured
