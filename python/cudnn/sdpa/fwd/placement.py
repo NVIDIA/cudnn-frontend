@@ -1004,7 +1004,7 @@ def place(spec, facts, knobs=None) -> str:
     if spec.name == "sdpa_fwd_prefill_sm100_fp8":
         return _place_sm100_fp8(spec.capabilities, facts, knobs)
     if spec.name == "sdpa_fwd_prefill_sm107_fp8":
-        return _place_sm107_fp8(spec.capabilities, facts)
+        return _place_sm107_fp8(spec.capabilities, facts, knobs)
     if spec.name == "sdpa_fwd_prefill_sm120_fp8":
         return _place_sm120_fp8(facts)
     if spec.name == "sdpa_fwd_prefill_sm120_mxfp8":
@@ -1249,15 +1249,15 @@ def _place_sm107_mxfp8(caps: Capabilities, facts) -> str:
     return LEAD if facts.device_cc == (10, 7) else TRAIL
 
 
-def _sm100_fp8_planned_split(facts, knobs=None) -> int:
-    """The KV split the SM100 per-tensor FP8 plan runs on ``facts`` (1 = unsplit): the proposed plan's ``knobs``, or
-    without them the row's first knob set."""
+def _planned_split(row: str, facts, knobs=None) -> int:
+    """The KV split the plan of ``row`` runs on ``facts`` (1 = unsplit): the proposed plan's ``knobs``, or without them
+    the row's first knob set."""
     if knobs is not None:
         return knobs.split_kv or 1
     from .engines import sm100_legacy_policy_spec
     from .heuristics import _knob_sets
 
-    sets = _knob_sets(sm100_legacy_policy_spec("sdpa_fwd_prefill_sm100_fp8"), facts)
+    sets = _knob_sets(sm100_legacy_policy_spec(row), facts)
     return (sets[0].split_kv or 1) if sets else 1
 
 
@@ -1285,7 +1285,7 @@ def _sm100_fp8_decode_leads(facts, knobs=None) -> bool:
     if (facts.window_left is not None and not sink_d64) or (facts.has_sink and not sink_d64):
         return False
     if sink_d64:
-        if facts.window_left is None and _sm100_fp8_planned_split(facts, knobs) >= 2:
+        if facts.window_left is None and _planned_split("sdpa_fwd_prefill_sm100_fp8", facts, knobs) >= 2:
             return True  # the whole cache splits (heuristics._split_points), at any batch (sm100_fp8_sink_place_v2_20261126)
         # a single SWA query row wins at any batch; otherwise a few KV units lose (paged SWA b=1 to 1.49x)
         return facts.b * facts.h_kv >= SM100_FP8_SINK_DECODE_MIN_KV_UNITS or (facts.s_q == 1 and facts.window_left is not None)
@@ -1437,14 +1437,14 @@ def _sm107_fp8_d192_decode_gap(caps: Capabilities, facts) -> Optional[str]:
     return None
 
 
-def _place_sm107_fp8(caps: Capabilities, facts) -> str:
+def _place_sm107_fp8(caps: Capabilities, facts, knobs=None) -> str:
     # Measured: exact cc 10.7, dense per-tensor E4M3, causal (TL / BR) or mask-free, Stats on or off; and paged D512 decode.
     gap = _sm107_fp8_d192_decode_gap(caps, facts)
     if gap is not None:
         return gap
     if _sm107_fp8_paged_d512_decode(facts):
         return LEAD
-    if _sm107_fp8_d64_sink_decode_leads(facts):
+    if _sm107_fp8_d64_sink_decode_leads(facts, knobs):
         return LEAD
     if (
         facts.device_cc != (10, 7)
@@ -1468,7 +1468,7 @@ def _place_sm107_fp8(caps: Capabilities, facts) -> str:
     return LEAD  # d256 0.16-0.96, d512 0.13-0.81 (module docstring); the backend does not build s_q == 1 here (NVRTC)
 
 
-def _sm107_fp8_d64_sink_decode_leads(facts) -> bool:
+def _sm107_fp8_d64_sink_decode_leads(facts, knobs=None) -> bool:
     """cc 10.7 per-tensor FP8 dense d64 decode / MTP with a sink, no window or a short one (module docstring, "SM107 per-tensor FP8 row")."""
     if (
         facts.device_cc != (10, 7)
@@ -1489,7 +1489,9 @@ def _sm107_fp8_d64_sink_decode_leads(facts) -> bool:
     if facts.window_left is not None:
         group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
         return group > 0 and not group & (group - 1) and facts.b * facts.h_kv >= SM107_FP8_D64_SINK_DECODE_MIN_UNITS
-    return facts.s_q > 1 or facts.b * facts.h_kv >= SM107_FP8_D64_SINK_DECODE_MIN_UNITS
+    if facts.s_q > 1 or facts.b * facts.h_kv >= SM107_FP8_D64_SINK_DECODE_MIN_UNITS:
+        return True
+    return _planned_split("sdpa_fwd_prefill_sm107_fp8", facts, knobs) >= 2  # the whole cache splits (sm107_fp8_sink_place_20261126)
 
 
 def _sm107_fp8_d128_chunk_leads(caps: Capabilities, facts) -> bool:
