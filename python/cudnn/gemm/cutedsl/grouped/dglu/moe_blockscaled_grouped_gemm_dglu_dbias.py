@@ -1500,12 +1500,13 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
 
         fp32_max = cutlass.Float32(3.40282346638528859812e38)
 
-        # One warp redux per column (NaN-propagating max), then lane l computes only column l's scale (rn products, E8M0
-        # round trip, rcp, fmin) and shares it through the warp's scratch.
+        # One warp amax per column (NaN-propagating max), then lane l computes only column l's scale (rn products, E8M0
+        # round trip, rcp, fmin) and shares it through the warp's scratch.  The amax goes through the shared helper:
+        # redux.sync.max.NaN.f32 on SM100/SM103/SM107, a butterfly shuffle on SM110 (no redux.f32 there, #1686).
         lane = cute.arch.lane_idx()
         col_max = cute.make_rmem_tensor(cute.make_layout(self.sf_vec_size), cutlass.Float32)
         for vi in cutlass.range_constexpr(self.sf_vec_size):
-            col_max[vi] = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+            col_max[vi] = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0]))
         scratch_max = cute.make_tensor(scratch.iterator, cute.make_layout(self.sf_vec_size))
         scratch_scale = cute.make_tensor(scratch.iterator + self.sf_vec_size, cute.make_layout(self.sf_vec_size))
         cute.arch.sync_warp()
