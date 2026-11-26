@@ -726,7 +726,7 @@ class StreamingInputSignalMixin:
 
     def create_streaming_input_scheduler(self, sched_params, padded_offsets, counter_ptr, sched_storage, zero):
         """In the kernel: the signal scheduler, or the stock persistent one.  ``zero``: ``release_zero(<the kernel's
-        release-zero argument>)``, which the host passes with the signal scheduler (python/cudnn/AGENTS.md Rule 11)."""
+        release-zero argument>)``, which the host passes with the signal scheduler (consume-then-arrive slot release)."""
         if self.use_streaming_signal_sched:
             return MoEStreamingInputBlockSignalTileScheduler.create(
                 sched_params,
