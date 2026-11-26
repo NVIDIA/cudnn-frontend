@@ -709,7 +709,7 @@ Providing both or neither raises `ValueError`.
   - `TILE_N = 256`; dense block-scaled weights on SM100 also accept `TILE_N = 128`
 - `cluster_shape_mn`: Thread Block cluster shape. Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 - `sf_vec_size`: Scale factor vector size. `{16, 32}`. Default: `16`
-- `vector_f32`: Enable packed f32 operations. Default: `False`
+- `vector_f32`: Enable packed f32x2 operations in the epilogue. Default: `None`, which selects `True` on the block-scaled backend and `False` on BF16
 - `m_aligned`: Must be `256` (FIX_PAD_SIZE). Default: `256`
 - `discrete_col_sfd`: Generate discrete col-major scale factors. Default: `False`
 - `act_func`: Activation function. `"swiglu"` (default), `"geglu"`, or block-scaled `"situglu"`
