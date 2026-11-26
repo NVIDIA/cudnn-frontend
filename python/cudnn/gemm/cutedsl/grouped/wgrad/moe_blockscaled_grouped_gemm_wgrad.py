@@ -55,7 +55,6 @@ from ..moe_utils import (
     WGradInputOrder,
     WgradSfTensormapConstructor,
     acquire_tma_desc,
-    reject_pdl_behind_helper,
 )
 from ..moe_sched_extension import (
     WgradScaledGemmSchedExtension,
@@ -103,8 +102,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         tiles from a 4-byte int32 counter in the workspace, which the helper
         kernel resets before every launch, instead of a grid of every tile
         rebalanced by cluster launch control (CLC, the default).
-    :param use_pdl: Rejected: every call launches the helper kernel (the SFA/SFB descriptors) right before this
-        kernel, so the helper would be its programmatic primary. Use ``use_pdl`` with the BF16 wgrad kernel.
+    :param use_pdl: Launch the helper kernel (it builds the descriptors on every call) as the programmatic dependent
+        of the kernel before it on the stream, and this kernel as the helper's: the helper waits for its predecessor at
+        its start, this kernel waits for the helper before its first global memory access, and the launches overlap.
     :param launch_pdl_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
     """
 
@@ -135,8 +135,6 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.weight_mode = weight_mode
         self.input_order = input_order
         self.atomic_counter_claim = atomic_counter_claim
-        # The helper kernel builds the SFA/SFB descriptors on every call, dense or discrete output.
-        reject_pdl_behind_helper(use_pdl, True, "the BF16 wgrad kernel (dense output, Tensor2D inputs, atomic_counter_claim=False)")
         self.use_pdl = use_pdl
         self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
 
@@ -574,6 +572,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             block=(1, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
 
         # Build A, B, SFA, SFB, C TMA atoms AFTER the helper kernel launch.
@@ -668,6 +667,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=self.occupancy,
+            use_pdl=self.use_pdl,
         )
 
     # ------------------------------------------------------------------
@@ -708,6 +708,10 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         ``atomic_counter_claim``, block 0 also resets the scheduler's tile counter.
         """
         from ..moe_utils import WgradSfTensormapConstructor
+
+        # use_pdl: the kernel before this one on the stream may still be writing the offsets or the operands.
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
         # Rubin requires C's TMA operation and static layout to be built in
         # the helper-kernel IR context. Blackwell receives host-built values
@@ -972,6 +976,10 @@ class BlockScaledMoEGroupedGemmWgradKernel:
 
         # Cluster wait
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+        # use_pdl: the setup above touches no global memory; the helper kernel before this one may still be writing
+        # the descriptors, so every thread waits for it here. The helper itself waited for its predecessor.
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
         # =================================================================
         # Scheduler warp (warp 6)

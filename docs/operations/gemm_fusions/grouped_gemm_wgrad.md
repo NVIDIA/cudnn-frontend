@@ -296,7 +296,7 @@ generates the same code as without them):
 
 | Option | Effect | Use |
 |---|---|---|
-| `use_pdl=True` | The main kernel launches as the programmatic dependent of the kernel before it on the stream, so its setup (shared memory, barriers, scheduler state) overlaps that kernel's tail. Every thread waits for that grid (`griddepcontrol.wait`) before its first global memory access. Rejected with `ValueError` whenever the call launches the helper kernel right before the main kernel: TensorRagged inputs, discrete output, `atomic_counter_claim`, and every block-scaled call (the helper builds the scale-factor descriptors). | BF16, dense output, Tensor2D inputs, the CLC schedule. |
+| `use_pdl=True` | The main kernel launches as the programmatic dependent of the kernel before it on the stream, so its setup (shared memory, barriers, scheduler state) overlaps that kernel's tail; every thread waits for that grid (`griddepcontrol.wait`) before its first global memory access. When the call launches the helper kernel (every block-scaled call; BF16 with TensorRagged inputs, discrete output or `atomic_counter_claim`), the helper launches the same way and waits for its predecessor at its start, and the main kernel waits for the helper: previous kernel, helper, main kernel. | Every configuration, BF16 and block-scaled. |
 | `launch_pdl_dependents_at_entry=True` | The main kernel lets its own programmatic dependent launch at its entry. The dependent must wait (`griddepcontrol.wait`) before it reads the wgrad output. | Every configuration, BF16 and block-scaled. |
 
 The BF16 kernel uses dynamic persistent scheduling. The token dimension is
