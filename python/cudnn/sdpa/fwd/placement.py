@@ -1244,6 +1244,15 @@ def _place_sm107_mxfp8(caps: Capabilities, facts) -> str:
     return LEAD if facts.device_cc == (10, 7) else TRAIL
 
 
+def _sm100_fp8_planned_split(facts) -> int:
+    """The KV split the SM100 per-tensor FP8 row leads with on ``facts`` (its first knob set; 1 = unsplit)."""
+    from .engines import sm100_legacy_policy_spec
+    from .heuristics import _knob_sets
+
+    sets = _knob_sets(sm100_legacy_policy_spec("sdpa_fwd_prefill_sm100_fp8"), facts)
+    return (sets[0].split_kv or 1) if sets else 1
+
+
 def _sm100_fp8_decode_leads(facts) -> bool:
     """SM100 per-tensor FP8 decode-shaped GQA graphs FROST leads (module docstring, "SM100 per-tensor FP8 row")."""
     shape = (facts.d_qk, facts.d_v)
@@ -1268,6 +1277,8 @@ def _sm100_fp8_decode_leads(facts) -> bool:
     if (facts.window_left is not None and not sink_d64) or (facts.has_sink and not sink_d64):
         return False
     if sink_d64:
+        if facts.window_left is None and _sm100_fp8_planned_split(facts) >= 2:
+            return True  # the whole cache splits (heuristics._split_points), at any batch (sm100_fp8_sink_place_v2_20261126)
         # a single SWA query row wins at any batch; otherwise a few KV units lose (paged SWA b=1 to 1.49x)
         return facts.b * facts.h_kv >= SM100_FP8_SINK_DECODE_MIN_KV_UNITS or (facts.s_q == 1 and facts.window_left is not None)
     return facts.s_q >= 2 and shape in ((128, 128), (256, 256))
