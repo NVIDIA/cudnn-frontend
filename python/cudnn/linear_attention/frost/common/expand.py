@@ -253,3 +253,7 @@ def build_gather_dq(dq_x, dq, num_householder, stream) -> GatherDqRecipe:
     r = GatherDqRecipe(compiled_cache[key], grid_x, dq_heads)
     run_gather_dq(r, dq_x, dq, stream)
     return r
+
+
+pack_bwd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=False)
+gather_dq_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=False)

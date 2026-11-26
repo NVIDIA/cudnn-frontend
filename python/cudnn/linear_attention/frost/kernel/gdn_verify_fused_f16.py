@@ -1391,7 +1391,7 @@ def frost_gdn_verify_fused(
         _tail_null(cfg, tid, head, r, bos, ntok, out, qout, raw, T)
 
 
-frost_gdn_verify_fused.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_gdn_verify_fused.set_name_prefix("cudnn", remove_cutlass_symbol=False)
 
 
 @cute.jit

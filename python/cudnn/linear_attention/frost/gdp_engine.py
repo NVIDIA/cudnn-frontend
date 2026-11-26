@@ -13,6 +13,7 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 from ..graph_analyzer import analyze
 from .engine import FrostLaPlan, frost_la_gate, summary_support_gates
 from .gdn_engine import build_gdn, build_gdn_summary, gdn_support_gates
+from .kernel.gdp_bprop_v64_config import MAX_EXPAND_NUM
 
 
 class GdpFrostEngine(BaseEngine):
@@ -28,6 +29,11 @@ class GdpFrostEngine(BaseEngine):
             raise NotImplementedError(f"GdpFrostEngine: q/k head dim must be 64 or 128, got {facts.d_qk}")
         if facts.d_v not in (64, 128):
             raise NotImplementedError(f"GdpFrostEngine: v head dim must be 64 or 128, got {facts.d_v}")
+        if facts.is_bwd and facts.d_v == 64 and facts.num_householder > MAX_EXPAND_NUM[facts.d_qk]:
+            raise NotImplementedError(
+                f"GdpFrostEngine: the d_v = 64 backward keeps 2 * num_householder gate stages in shared memory: num_householder must be "
+                f"<= {MAX_EXPAND_NUM[facts.d_qk]} at q/k head dim {facts.d_qk}, got {facts.num_householder}"
+            )
         gdn_support_gates("GdpFrostEngine", facts)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
@@ -48,6 +54,9 @@ class GdpSummaryFrostEngine(BaseEngine):
             raise NotImplementedError(f"GdpSummaryFrostEngine: k head dim must be 64 or 128, got {facts.d_qk}")
         if facts.d_v not in (64, 128):
             raise NotImplementedError(f"GdpSummaryFrostEngine: v head dim must be 64 or 128, got {facts.d_v}")
+        checkpoint = facts.checkpoint_every_n_tokens
+        if checkpoint and checkpoint % 64 != 0:
+            raise NotImplementedError(f"GdpSummaryFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 64 (got {checkpoint})")
         summary_support_gates("GdpSummaryFrostEngine", facts, graph)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:

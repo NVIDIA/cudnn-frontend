@@ -1120,7 +1120,7 @@ def tcgen05_mma_warp(
     elect_one = nvvm.elect_sync()
 
     nvvm.tcgen05_alloc(tmem_base_slot, cutlass.Int32(512), group=nvvm.CTAGroup.CTA_1)
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
 
     # ---- chunk-invariant GEMM descriptors --------------------------------------------
     instruction_descriptor_qk = nvvm.Tcgen05InstrDesc.build(
@@ -1758,7 +1758,7 @@ def compute0_warp_group_gmem(
     mask_zero = opaque_f32_zero()
     tile_idx, scheduler_state = scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz)
 
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -1931,18 +1931,40 @@ def cg0_pair(
             chunk_col = (lane_idx % 4) * 2 + g * 8 + b
             kk_cumsumlog_cols.append(sCumsumlog[chunk_col, 0, kk_gate_idx])
 
-    decay_t_kk = []
-    for u in cutlass.range_constexpr(2):
-        for k in cutlass.range_constexpr(num_vals):
-            hi_row = ((k // 2) % 2) == 1
-            chunk_row_u0 = row_u0_hi if cutlass.const_expr(hi_row) else row_u0_lo
-            chunk_row_u1 = row_u1_hi if cutlass.const_expr(hi_row) else row_u1_lo
-            chunk_row = chunk_row_u1 if cutlass.const_expr(u == 1) else chunk_row_u0
-            chunk_col = (lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2)
-            is_lower = chunk_row >= chunk_col
-            kk_row_cumsumlog = kk_cumsumlog_rows[u * 2 + (1 if hi_row else 0)]
-            col = (k // 4) * 2 + (k % 2)
-            decay_t_kk.append(cute.math.exp2(kk_row_cumsumlog - kk_cumsumlog_cols[col], fastmath=True) if is_lower else mask_zero)
+    kk_rows = [row_u0_lo, row_u0_hi, row_u1_lo, row_u1_hi]
+    decay_t_kk = [mask_zero] * (2 * num_vals)
+    if half_row_base == 0:
+        decay_t_kk = []
+        for u in cutlass.range_constexpr(2):
+            for k in cutlass.range_constexpr(num_vals):
+                ri = u * 2 + (k // 2) % 2
+                row0 = u * 16 + ((k // 2) % 2) * 8
+                g = k // 4
+                if cutlass.const_expr(8 * g > row0):
+                    decay_t_kk.append(mask_zero)
+                else:
+                    val = cute.math.exp2(kk_cumsumlog_rows[ri] - kk_cumsumlog_cols[g * 2 + k % 2], fastmath=True)
+                    if cutlass.const_expr(8 * g < row0):
+                        decay_t_kk.append(val)
+                    else:
+                        chunk_col = (lane_idx % 4) * 2 + (g * 8 + k % 2)
+                        decay_t_kk.append(val if chunk_col <= kk_rows[ri] else mask_zero)
+    else:
+        decay_t_kk = []
+        for u in cutlass.range_constexpr(2):
+            for k in cutlass.range_constexpr(num_vals):
+                ri = u * 2 + (k // 2) % 2
+                row0 = 32 + u * 16 + ((k // 2) % 2) * 8
+                g = k // 4
+                if cutlass.const_expr(8 * g > row0):
+                    decay_t_kk.append(mask_zero)
+                else:
+                    val = cute.math.exp2(kk_cumsumlog_rows[ri] - kk_cumsumlog_cols[g * 2 + k % 2], fastmath=True)
+                    if cutlass.const_expr(8 * g < row0):
+                        decay_t_kk.append(val)
+                    else:
+                        chunk_col = (lane_idx % 4) * 2 + (g * 8 + k % 2)
+                        decay_t_kk.append(val if chunk_col <= kk_rows[ri] else mask_zero)
     beta0_idx = beta_index.idx
     bars.mb_beta_ready[beta0_idx].wait(beta_index.phase)
     beta_index = advance(beta_index, cfg.smem_beta_stages)
@@ -2013,13 +2035,13 @@ def cg0_pair(
     do_inv = have_m1 or warp_id < 2
 
     # ---- diagonal 8x8 inverse --------------------------------------------------------
-    nvvm.barrier_cta_sync_aligned(
+    nvvm.barrier_cta_sync(
         cfg.inverse_barrier_id,
         thread_count=cfg.inverse_barrier_threads,
     )
     if do_inv:
         invert_diagonal_NxN(cfg, inv_base, inv_base, (inverse_local_warp * cfg.threads_per_warp + lane_idx) // 8, cg0_tidx, 8)
-    nvvm.barrier_cta_sync_aligned(
+    nvvm.barrier_cta_sync(
         cfg.inverse_barrier_id,
         thread_count=cfg.inverse_barrier_threads,
     )
@@ -2028,7 +2050,7 @@ def cg0_pair(
     blockwise_diagonal_8x8_to_16x16(cfg, tinv0_base, tinv0_base, warp_id * 16, lane_idx)
     if have_m1:
         blockwise_diagonal_8x8_to_16x16(cfg, tinv1_base, tinv1_base, warp_id * 16, lane_idx)
-    nvvm.barrier_cta_sync_aligned(
+    nvvm.barrier_cta_sync(
         cfg.inverse_barrier_id,
         thread_count=cfg.inverse_barrier_threads,
     )
@@ -2036,14 +2058,14 @@ def cg0_pair(
     # ---- 16x16 -> 32x32 --------------------------------------------------------------
     if do_inv:
         blockwise_diagonal_16x16_to_32x32(cfg, inv_base, inv_base, inverse_local_warp * 32, lane_idx)
-    nvvm.barrier_cta_sync_aligned(
+    nvvm.barrier_cta_sync(
         cfg.inverse_barrier_id,
         thread_count=cfg.inverse_barrier_threads,
     )
 
     # ---- 32x32 -> 64x64 --------------------------------------------------------------
     blockwise_diagonal_32x32_to_64x64(cfg, inv_base, inv_base, inverse_local_warp, lane_idx, cfg.inverse_barrier_id, cfg.inverse_barrier_threads)
-    nvvm.barrier_cta_sync_aligned(
+    nvvm.barrier_cta_sync(
         cfg.inverse_barrier_id,
         thread_count=cfg.inverse_barrier_threads,
     )
@@ -2244,7 +2266,7 @@ def compute0_warp_group(
     chunk_row_lo + 8
     tile_idx, scheduler_state = scheduler_first_tile(cfg, bars, sScheduler, scheduler_state, bidx, elect_one, rz)
 
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -2555,7 +2577,7 @@ def compute1_warp_group(
         xfer_gmem_col = (lane_idx % xfer_pieces) * 4
         xfer_co_off, xfer_row_off = state_scratch_maps(lane_idx)
 
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16

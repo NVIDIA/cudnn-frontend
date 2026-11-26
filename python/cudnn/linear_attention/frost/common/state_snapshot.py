@@ -52,7 +52,7 @@ def frost_state_snapshot(mSrc: cute.Tensor, mDst: cute.Tensor, mIdx: Optional[cu
         st_global_v4(dst, (w0, w1, w2, w3), cutlass.Int32)
 
 
-frost_state_snapshot.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_state_snapshot.set_name_prefix("cudnn", remove_cutlass_symbol=False)
 
 
 @cute.jit

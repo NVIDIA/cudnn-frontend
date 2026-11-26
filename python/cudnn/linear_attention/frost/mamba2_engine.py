@@ -1814,6 +1814,10 @@ class Mamba2SummaryFrostEngine(BaseEngine):
             raise NotImplementedError(f"Mamba2SummaryFrostEngine: the state dimension must be 128, got {facts.d_qk}")
         if facts.d_v != 64:
             raise NotImplementedError(f"Mamba2SummaryFrostEngine: the head dim must be 64, got {facts.d_v}")
+        if facts.h_v != facts.h_o:
+            raise NotImplementedError(f"Mamba2SummaryFrostEngine: x (v) must carry every head ({facts.h_o}); B / C (k / q) may be grouped")
+        if facts.a_dtype not in (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF, None):
+            raise NotImplementedError(f"Mamba2SummaryFrostEngine: 'a' must be fp32/bf16/fp16, got {facts.a_dtype}")
         summary_support_gates("Mamba2SummaryFrostEngine", facts, graph)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:

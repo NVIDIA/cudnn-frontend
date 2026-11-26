@@ -213,6 +213,12 @@ class GdnCuTileEngine(BaseEngine):
             raise NotImplementedError("GdnCuTileEngine: gate_domain='linear' has no cuTile path (the FROST GDN engine serves it)")
         if facts.use_beta_sigmoid:
             raise NotImplementedError("GdnCuTileEngine: use_beta_sigmoid has no cuTile path (the FROST GDN engine serves it)")
+        if facts.d_qk % 64:
+            raise NotImplementedError(
+                f"GdnCuTileEngine: head dim K must be a multiple of 64 (the backward's state pass reads k and dH in whole 64-column blocks), got {facts.d_qk}"
+            )
+        if facts.d_qk > 128 and buffers.current_sm() in (120, 121):
+            raise NotImplementedError(f"GdnCuTileEngine: head dim K > 128 is validated on SM100 only (NVIDIA/cudnn-frontend#2777), got {facts.d_qk}")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
         return GdnCuTilePlan(graph)

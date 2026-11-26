@@ -1030,7 +1030,7 @@ def frost_gdn_decode_fused(
             _role_body(cfg, 3, True, *role_args)
 
 
-frost_gdn_decode_fused.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_gdn_decode_fused.set_name_prefix("cudnn", remove_cutlass_symbol=False)
 
 
 @cute.jit

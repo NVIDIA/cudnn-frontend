@@ -1907,3 +1907,6 @@ def run_uncut_summary_backward(
         *tail_scalars,
         *tail_buffers,
     )
+
+
+frost_kda_regenerate_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)

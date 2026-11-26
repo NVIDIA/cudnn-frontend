@@ -1990,3 +1990,6 @@ def run_uncut_summary_backward(
         *tail_scalars,
         *tail_buffers,
     )
+
+
+frost_gdn2_regenerate_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)
