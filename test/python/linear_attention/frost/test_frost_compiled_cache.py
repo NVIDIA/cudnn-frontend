@@ -47,6 +47,9 @@ class _VariantPack:
     def all_dense_layout(self):
         return True, -1
 
+    def all_tma_layout(self):
+        return True, -1
+
     def operands(self, indices):
         assert indices == []
         return ()

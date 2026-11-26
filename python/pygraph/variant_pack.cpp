@@ -1053,9 +1053,12 @@ class VariantPackNative {
             if (!operand.filled || operand.ndim < 3) continue;
             const int64_t bytes = (static_cast<int64_t>(operand.dtype.bits) * operand.dtype.lanes) / 8;
             if (bytes <= 0 || 16 % bytes != 0) continue;
-            bool aligned = reinterpret_cast<uintptr_t>(operand.data) % 16 == 0;
-            for (int d = 0; aligned && !operand.stride.empty() && d < operand.ndim - 1; d++) {
-                if (operand.shape[d] != 1 && operand.stride[d] % (16 / bytes) != 0) aligned = false;
+            bool aligned    = reinterpret_cast<uintptr_t>(operand.data) % 16 == 0;
+            int64_t compact = 1;
+            for (int d = operand.ndim - 1; aligned && d >= 0; d--) {
+                const int64_t stride = operand.stride.empty() ? compact : operand.stride[d];
+                if (d < operand.ndim - 1 && operand.shape[d] != 1 && stride % (16 / bytes) != 0) aligned = false;
+                compact *= operand.shape[d];
             }
             if (!aligned) {
                 offender = std::to_string(i);

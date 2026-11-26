@@ -633,25 +633,25 @@ def compute_warp_group(
         do_inv = have_m1 or warp_id < 2
 
         # ---- diagonal 8x8 inverse ----------------------------------------------------
-        nvvm.barrier_cta_sync_aligned(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
+        nvvm.barrier_cta_sync(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
         if do_inv:
             invert_diagonal_NxN(cfg, inv_base, inv_base, (inverse_local_warp * cfg.threads_per_warp + lane_idx) // 8, tidx, 8)
-        nvvm.barrier_cta_sync_aligned(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
+        nvvm.barrier_cta_sync(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
 
         # ---- 8x8 -> 16x16 ------------------------------------------------------------
         blockwise_diagonal_8x8_to_16x16(cfg, tinv0_base, tinv0_base, warp_id * 16, lane_idx)
         if have_m1:
             blockwise_diagonal_8x8_to_16x16(cfg, tinv1_base, tinv1_base, warp_id * 16, lane_idx)
-        nvvm.barrier_cta_sync_aligned(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
+        nvvm.barrier_cta_sync(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
 
         # ---- 16x16 -> 32x32 ----------------------------------------------------------
         if do_inv:
             blockwise_diagonal_16x16_to_32x32(cfg, inv_base, inv_base, inverse_local_warp * 32, lane_idx)
-        nvvm.barrier_cta_sync_aligned(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
+        nvvm.barrier_cta_sync(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
 
         # ---- 32x32 -> 64x64 ----------------------------------------------------------
         blockwise_diagonal_32x32_to_64x64(cfg, inv_base, inv_base, inverse_local_warp, lane_idx, cfg.inverse_barrier_id, cfg.inverse_barrier_threads)
-        nvvm.barrier_cta_sync_aligned(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
+        nvvm.barrier_cta_sync(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
 
         # ---- Beta column scaling, member 0: T^-1[i,j] *= Beta[j] ---------------------
         beta_col = []
@@ -698,7 +698,7 @@ def compute_warp_group(
 
         # ---- publish the finished tiles to the epilogue warp -------------------------
         nvvm.fence_proxy("async.shared", space="cta")
-        nvvm.barrier_cta_sync_aligned(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
+        nvvm.barrier_cta_sync(cfg.inverse_barrier_id, thread_count=cfg.inverse_barrier_threads)
         if storer:
             bars.mb_tile_ready[tile_slot0].arrive()
             if have_m1:

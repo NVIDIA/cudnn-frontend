@@ -786,7 +786,7 @@ def tcgen05_mma_warp(
     elect_one = nvvm.elect_sync()
 
     nvvm.tcgen05_alloc(tmem_base_slot, cutlass.Int32(512), group=nvvm.CTAGroup.CTA_1)
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -1736,7 +1736,7 @@ def compute0_warp_group(
     mask_zero = opaque_f32_zero()
     DSTATE_IN0 = 1 if cfg.use_dstate_in else 0
 
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -1850,26 +1850,26 @@ def compute0_warp_group(
 
             if cutlass.const_expr(cfg.tinv_source == "compute"):
                 # ---- blockwise inverse -----------------------------------------------
-                nvvm.barrier_cta_sync_aligned(
+                nvvm.barrier_cta_sync(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
                 )
                 if warp_id < 2:
                     invert_diagonal_NxN(cfg, kk_base, tinv_base, cg0_tidx // 8, cg0_tidx, 8)
-                nvvm.barrier_cta_sync_aligned(
+                nvvm.barrier_cta_sync(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
                 )
 
                 blockwise_diagonal_8x8_to_16x16(cfg, tinv_base, kk_base, warp_id * 16, lane_idx)
-                nvvm.barrier_cta_sync_aligned(
+                nvvm.barrier_cta_sync(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
                 )
 
                 if warp_id < 2:
                     blockwise_diagonal_16x16_to_32x32(cfg, tinv_base, kk_base, warp_id * 32, lane_idx)
-                nvvm.barrier_cta_sync_aligned(
+                nvvm.barrier_cta_sync(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
                 )
@@ -1878,7 +1878,7 @@ def compute0_warp_group(
                     blockwise_diagonal_32x32_to_64x64(
                         cfg, tinv_base, kk_base, warp_id, lane_idx, cfg.inverse_inner_barrier_id, cfg.inverse_inner_barrier_threads
                     )
-                nvvm.barrier_cta_sync_aligned(
+                nvvm.barrier_cta_sync(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
                 )
@@ -1912,7 +1912,7 @@ def compute0_warp_group(
                 bars.mb_t_inv_ready[tinv_idx].arrive()
             else:
                 # ---- KK write -> M-terms read handoff --------------------------------
-                nvvm.barrier_cta_sync_aligned(
+                nvvm.barrier_cta_sync(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
                 )
@@ -2033,7 +2033,7 @@ def compute0_warp_group(
                     row_part[rp] += nvvm.shfl_sync(0xFFFFFFFF, row_part[rp], off, 31, kind=nvvm.Shfl.BFLY)
 
             # ---- dGate column fold ---------------------------------------------------
-            nvvm.barrier_cta_sync_aligned(cfg.cg0_barrier_id, thread_count=cfg.cg0_barrier_threads)
+            nvvm.barrier_cta_sync(cfg.cg0_barrier_id, thread_count=cfg.cg0_barrier_threads)
             col_lo, col_hi = warp_reduce_scatter_sum_16_elements(col_part, lane_idx)
             tok0 = (lane_idx // 4) * 8 + (lane_idx % 4) * 2
             (skk_reduction + warp_id * 64 + tok0).store(col_lo)
@@ -2043,7 +2043,7 @@ def compute0_warp_group(
                 for rp in cutlass.range_constexpr(2):
                     crow_r = warp_id * 16 + lane_idx // 4 + rp * 8
                     sCumsumlog[crow_r, 0, gate_idx] = acc_zero - row_part[rp]
-            nvvm.barrier_cta_sync_aligned(cfg.cg0_barrier_id, thread_count=cfg.cg0_barrier_threads)
+            nvvm.barrier_cta_sync(cfg.cg0_barrier_id, thread_count=cfg.cg0_barrier_threads)
             if cg0_tidx < 64:
                 col_sum = (
                     (skk_reduction + cg0_tidx).load()
@@ -2168,7 +2168,7 @@ def compute1_warp_group(
     tile_idx = cutlass.Int32(bidx)
     FIRST_STATE_CHUNK = 0 if cfg.use_initial_state else 1
 
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -2545,7 +2545,7 @@ def compute1_warp_group(
                 (sdq_reduction + 256 + cg1_warp_id * 64 + vt_tok0 + 1).store(pg_hi)
             (sdq_reduction + cg1_warp_id * 64 + vt_tok0).store(py_lo)
             (sdq_reduction + cg1_warp_id * 64 + vt_tok0 + 1).store(py_hi)
-            nvvm.barrier_cta_sync_aligned(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
+            nvvm.barrier_cta_sync(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
             if cg1_tidx < 64:
                 binv_t = cute.math.rcp(sBeta[cg1_tidx, 0, beta_idx] + cutlass.Float32(1e-10), approx=True, ftz=True)
                 ysum = (
@@ -2564,7 +2564,7 @@ def compute1_warp_group(
                 sBeta[cg1_tidx, 0, beta_idx] = ysum * binv_t
             bars.mb_beta_done[beta_idx].arrive()
             bars.mb_dbeta_cg1_ready[0].arrive()
-            nvvm.barrier_cta_sync_aligned(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
+            nvvm.barrier_cta_sync(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
 
             # ---- Q fragments held in registers ---------------------------------------
             q_frag = []
@@ -2632,7 +2632,7 @@ def compute1_warp_group(
             tok0 = (lane_idx // 4) * 8 + (lane_idx % 4) * 2
             (sdk_reduction + PART_Q_SCRATCH_OFF + (cg1_tidx // 32) * 64 + tok0).store(part_q_lo)
             (sdk_reduction + PART_Q_SCRATCH_OFF + (cg1_tidx // 32) * 64 + tok0 + 1).store(part_q_hi)
-            nvvm.barrier_cta_sync_aligned(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
+            nvvm.barrier_cta_sync(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
             bars.mb_dgate_cg0_ready[0].wait(cg1_dgate_cg0_index.phase)
             cg1_dgate_cg0_index = advance(cg1_dgate_cg0_index, 1)
             if cutlass.const_expr(cfg.fused_l2norm and cfg.d_v == 128):
@@ -2654,7 +2654,7 @@ def compute1_warp_group(
 
             # ---- dQ l2norm projection ------------------------------------------------
             if cutlass.const_expr(cfg.fused_l2norm):
-                nvvm.barrier_cta_sync_aligned(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
+                nvvm.barrier_cta_sync(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
                 for dq_l2_it in cutlass.range(dk_halves * 4, unroll=1):
                     dq_l2_row = frag_row + (dq_l2_it & 3) * 16
                     dq_l2_addr = dk_frag_segment + dq_l2_row * 64 + swizzle_xor_128b(dq_l2_row, dk_frag_col + (dq_l2_it >> 2) * 16)
@@ -2781,7 +2781,7 @@ def compute2_warp_group(
     tile_idx = cutlass.Int32(bidx)
     FIRST_STATE_CHUNK = 0 if cfg.use_initial_state else 1
 
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
@@ -3015,7 +3015,7 @@ def compute2_warp_group(
 
             bars.mb_dgate_cg1_ready[0].wait(cg2_dgate_index.phase)
             cg2_dgate_index = advance(cg2_dgate_index, 1)
-            nvvm.barrier_cta_sync_aligned(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
+            nvvm.barrier_cta_sync(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
             if cg2_tidx < 64:
                 dgate_sum = (
                     (sdk_reduction + cg2_tidx).load()
@@ -3024,7 +3024,7 @@ def compute2_warp_group(
                     + (sdk_reduction + 192 + cg2_tidx).load()
                 )
                 sCumsumlog[cg2_tidx, 0, gate_idx] = sCumsumlog[cg2_tidx, 0, gate_idx] - dgate_sum
-            nvvm.barrier_cta_sync_aligned(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
+            nvvm.barrier_cta_sync(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
 
             # ---- dK fold -------------------------------------------------------------
             if abs_chunk >= FIRST_STATE_CHUNK:
@@ -3078,7 +3078,7 @@ def compute2_warp_group(
 
             # ---- dK l2norm projection ------------------------------------------------
             if cutlass.const_expr(cfg.fused_l2norm):
-                nvvm.barrier_cta_sync_aligned(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
+                nvvm.barrier_cta_sync(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
                 neg_zero = opaque_f32_bits(0x80000000)
                 part_pk = [neg_zero] * 16
                 for dk_l2_half in cutlass.range(dk_halves, unroll=1):
@@ -3096,7 +3096,7 @@ def compute2_warp_group(
                 pk_tok0 = (lane_idx // 4) * 8 + (lane_idx % 4) * 2
                 (sL2ReductionK + warp_id * 64 + pk_tok0).store(part_pk_lo)
                 (sL2ReductionK + warp_id * 64 + pk_tok0 + 1).store(part_pk_hi)
-                nvvm.barrier_cta_sync_aligned(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
+                nvvm.barrier_cta_sync(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
                 if cg2_tidx < 64:
                     pk_sum = (
                         (sL2ReductionK + cg2_tidx).load()
@@ -3106,7 +3106,7 @@ def compute2_warp_group(
                     )
                     (sL2ReductionK + cg2_tidx).store(fused_inv_k)
                     (sL2ReductionK + 64 + cg2_tidx).store(-(fused_inv_k * pk_sum))
-                nvvm.barrier_cta_sync_aligned(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
+                nvvm.barrier_cta_sync(cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads)
                 for dk_l2_it in cutlass.range(dk_halves * 4, unroll=1):
                     dk_l2_row = frag_row + (dk_l2_it & 3) * 16
                     dk_l2_addr = dk_frag_segment + dk_l2_row * 64 + swizzle_xor_128b(dk_l2_row, dk_frag_col + (dk_l2_it >> 2) * 16)

@@ -288,7 +288,7 @@ def tcgen05_mma_warp(
     elect_one = nvvm.elect_sync()
 
     nvvm.tcgen05_alloc(tmem_base_slot, cutlass.Int32(cfg.tmem_columns), group=nvvm.CTAGroup.CTA_1)
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
 
     # ---- dS += Q^T @ dO' descriptor --------------------------------------------------------------
     bytes_per_element = cfg.io_dtype.width // 8
@@ -553,7 +553,7 @@ def compute2_warp_group(
     ldtm_width = 32
     num_dv_pieces = cutlass.const_expr(cfg.d_v // ldtm_width)
     zero = opaque_f32_zero()
-    nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
+    nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16

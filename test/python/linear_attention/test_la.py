@@ -4249,7 +4249,8 @@ def test_bwd_householder_count_past_smem_limit_declines(backend, K, l2norm):
     case = make_case("gdp", torch.bfloat16, T=64, K=K, V=64, n=limit + 1)
     kw = dict(use_qk_l2norm_in_kernel=True) if l2norm else {}
     leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
-    out = pinned_op(backend, "gdp")(*leaves, *op_tail(case), **kw)
+    with waive_unsupported(backend, "gdp"):
+        out = pinned_op(backend, "gdp")(*leaves, *op_tail(case), **kw)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="num_householder must be <="):
         torch.autograd.grad(out[0], leaves, torch.randn_like(out[0]))
 
