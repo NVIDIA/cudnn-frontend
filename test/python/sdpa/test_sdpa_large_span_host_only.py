@@ -6,8 +6,8 @@ Rule S7 (``python/cudnn/sdpa/AGENTS.md``): promote the index to Int64 BEFORE the
 lowers the kernel for a declared geometry past the limit and inspects what was generated, so it runs on any lane
 (no SM120 / SM100 part needed):
 
-* SM120 backward, compact path: ``dq_accum`` / dQ / dK-dV-workspace addressing. A wrapped Int32 index shows up as a
-  ``mul.wide.s32`` on the address path; the widened form is Int64 arithmetic.
+* SM120 backward, compact path: ``dq_accum`` / dQ / dK-dV-workspace addressing. Distinguish widening after a
+  potentially wrapped Int32 offset from a safe full 32x32-to-64 product.
 * Triton QAT kernels: the batch*head offset must be a 64-bit product.
 * FlexAttention varlen / Sage FP8 BSA: the host declines instead of letting an Int32 offset wrap.
 """
@@ -58,19 +58,84 @@ def _lower_sm120_bwd(b, s, h, kvh):
     return entries
 
 
-@pytest.mark.parametrize("kvh", [0, 16], ids=["mha", "gqa"])
-def test_sm120_bwd_compact_dq_and_workspace_addressing_is_64_bit(kvh):
-    """B4 S32K H128 D128 is exactly 2**31 elements per BSHD tensor (and per fp32 dq_accum / dK-dV workspace).
+def _non_tile_wide_products(ptx, max_tile_id):
+    """Exclude widening products of a proven, non-wrapping tile-only index.
 
-    Before the fix the convert kernel and the main kernel formed ``(batch * S + row) * H ...`` in Int32 and widened
-    only at the byte multiply (``mul.wide.s32``); only the already-wide sites (and two small fp32 stats/semaphore
-    indices in the main kernel) may keep that instruction now.
+    Tile offsets originate at ctaid.x and may be copied or scaled in Int32
+    while their full range fits. Adding a batch/head/row offset invalidates
+    this proof: a subsequent widening multiply cannot undo an earlier wrap.
+    Unknown instructions also invalidate the destination's proof.
     """
-    entries = _lower_sm120_bwd(4, 32768, 128, kvh)
+    tile_max = {"%ctaid.x": max_tile_id}
+    products = []
+    for instruction in ptx.split(";"):
+        if "mul.wide.s32" in instruction:
+            products.append(instruction.strip())
+        match = re.search(r"(?:^|[\n{}])\s*(@!?%\w+\s+)?([a-z]\w*(?:\.[\w:]+)+)\s+([^;{}]+)$", instruction)
+        if match is None:
+            for register in re.findall(r"%r\w+", instruction):
+                tile_max.pop(register, None)
+            continue
+        predicate, op, operands = match.groups()
+        dst, *args = [arg.strip() for arg in operands.split(",")]
+        bound = None
+        if op == "mul.wide.s32":
+            for index, arg in enumerate(args):
+                other = args[1 - index]
+                if arg in tile_max and re.fullmatch(r"-?\d+", other) and -(2**31) <= int(other) < 2**31:
+                    products.pop()  # The two Int32 operands produce the full Int64 product.
+                    break
+        elif op in ("mov.u32", "mov.b32", "mov.s32") and args[0] in tile_max:
+            bound = tile_max[args[0]]
+        elif op == "shl.b32" and args[0] in tile_max and re.fullmatch(r"\d+", args[1]):
+            shift = int(args[1])
+            if shift < 32:
+                bound = tile_max[args[0]] << shift
+        elif op in ("mul.lo.s32", "mul.lo.u32"):
+            for index, arg in enumerate(args):
+                if arg in tile_max and re.fullmatch(r"\d+", args[1 - index]):
+                    bound = tile_max[arg] * int(args[1 - index])
+                    break
+        tile_max.pop(dst, None)
+        if predicate is None and bound is not None and bound <= 2**31 - 1:
+            tile_max[dst] = bound
+    return products
+
+
+@pytest.mark.parametrize(
+    "offset, count",
+    [
+        ("shl.b32 %r2, %r1, 6;", 0),
+        ("mul.lo.s32 %r2, %r1, 64;", 0),
+        ("shl.b32 %r2, %r1, 17;", 1),
+        ("add.s32 %r2, %r1, %r_batch;", 1),
+        ("shl.b32 %r2, %r1, 6;\nadd.s32 %r2, %r2, %r_batch;", 1),
+        ("@%p1 mov.u32 %r2, %r1;", 1),
+        ("shl.b32 %r2, %r1, 6;\nmov.b64 {%r2, %r3}, %rd_batch;", 1),
+    ],
+    ids=["tile_shift", "tile_multiply", "wrapped_tile", "mixed_offset", "redefined_offset", "predicated_definition", "vector_definition"],
+)
+def test_wide_product_filter_requires_bounded_tile_offset(offset, count):
+    ptx = "mov.u32 %r1, %ctaid.x;\n" + offset + "\nmul.wide.s32 %rd1, %r2, 16384;"
+    assert len(_non_tile_wide_products(ptx, 32767)) == count
+
+
+@pytest.mark.parametrize("b, kvh", [(4, 0), (4, 16), (5, 0), (5, 16)], ids=["mha", "gqa", "mha_past_int32", "gqa_past_int32"])
+def test_sm120_bwd_compact_dq_and_workspace_addressing_is_64_bit(b, kvh):
+    """Compile compact tensors at and beyond 2**31 elements without allocating them.
+
+    Only the two small stats/semaphore indices may retain unproven widening
+    products in the main kernel. A tile-only offset that fits Int32 may also
+    use mul.wide.s32: the product itself is Int64, even when its operand is not.
+    Batch/row/head combinations remain subject to the original regression check.
+    """
+    entries = _lower_sm120_bwd(b, 32768, 128, kvh)
     convert = next(v for k, v in entries.items() if "convert_dq_kernel" in k)
     main = next(v for k, v in entries.items() if "SM120FusedMultiHeadAttentionFP16Backward" in k)
     assert convert.count("mul.wide.s32") == 0
-    assert main.count("mul.wide.s32") <= 2
+    # Each KV tile covers at least one row, so gridDim.x <= S_KV.
+    products = _non_tile_wide_products(main, 32768 - 1)
+    assert len(products) <= 2, "\n".join(products)
 
 
 def test_qat_triton_batch_head_offset_is_64_bit():
