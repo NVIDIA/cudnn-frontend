@@ -135,6 +135,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         tie_break: int = 0,
         deterministic: bool = False,
         deterministic_ordering: str = "auto",
+        narrow_directed_prefix: bool = False,
     ):
         """Configure one decode specialization and its per-row resources."""
         super().__init__(
@@ -159,6 +160,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         self.enable_dynamic_multi_cta = enable_dynamic_multi_cta
         self.varlen_merge_input = varlen_merge_input
         self.num_sms = num_sms
+        self.narrow_directed_prefix = narrow_directed_prefix
 
         if cutlass.const_expr(large_occupancy):
             # tuned value, could be tuned further.
@@ -441,6 +443,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     s_index_bits,
                     standalone=True,
                     has_starts=cutlass.const_expr(starts is not None),
+                    narrow_directed_prefix=self.narrow_directed_prefix,
                 )
         else:
             num_rows = input.shape[0]
@@ -796,6 +799,8 @@ def compile_topk_kernel(
             output_values_fake = None
         fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
+        directed_fp32_indices = large_occupancy and dtype == cutlass.Float32 and tie_break != 0 and not deterministic and not return_val
+        hopper_k2048_8k = capability == (9, 0) and top_k == 2048 and bucketed_num_cols == 8192
         indexer_topk_func = IndexerTopKKernelVarlenDecode(
             dtype,
             bucketed_num_cols,
@@ -807,17 +812,15 @@ def compile_topk_kernel(
             tie_break=tie_break,
             deterministic=deterministic,
             deterministic_ordering=deterministic_ordering,
+            narrow_directed_prefix=directed_fp32_indices and hopper_k2048_8k and not has_starts and tie_break == 1,
         )
 
         min_blocks_per_mp = 1
-        if large_occupancy and dtype == cutlass.Float32 and tie_break != 0 and not deterministic and not return_val:
+        if directed_fp32_indices:
             # Preserve CTA residency for directed tie selection.
             if capability == (9, 0) and top_k == 2048 and bucketed_num_cols >= 131072:
                 min_blocks_per_mp = 3
-            if not has_starts and (
-                (capability in ((9, 0), (10, 3)) and top_k == 1024 and bucketed_num_cols == 131072)
-                or (capability == (9, 0) and top_k == 2048 and bucketed_num_cols == 8192)
-            ):
+            if not has_starts and ((capability in ((9, 0), (10, 3)) and top_k == 1024 and bucketed_num_cols == 131072) or hopper_k2048_8k):
                 min_blocks_per_mp = 4
 
         # Compile the kernel

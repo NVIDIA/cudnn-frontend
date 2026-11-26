@@ -887,6 +887,7 @@ class IndexerTopKKernelVarlen:
         s_index_bits,
         standalone: cutlass.Constexpr = False,
         has_starts: cutlass.Constexpr = False,
+        narrow_directed_prefix: cutlass.Constexpr = False,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
         # # Thread and block indexing
@@ -1011,14 +1012,17 @@ class IndexerTopKKernelVarlen:
                 and self.enable_gmem_store
                 and not self.deterministic
                 and not self.return_val
-                and self.max_num_cols >= 32768
                 and not self.enable_multi_cta
                 and not self.merge_blocks
             )
-            directed_prefix = standalone_fp32_indices and self.top_k == 2048 and self.tie_break == 1 and not has_starts
-            skip_default_k512_digit = standalone_fp32_indices and self.top_k == 512 and self.tie_break == 0
+            wide_fp32_indices = standalone_fp32_indices and self.max_num_cols >= 32768
+            spill_reuse_min_length = 16384
+            narrow_fp32_indices = standalone_fp32_indices and narrow_directed_prefix and self.max_num_cols < spill_reuse_min_length
+            directed_prefix = (wide_fp32_indices or narrow_fp32_indices) and self.top_k == 2048 and self.tie_break == 1 and not has_starts
+            skip_default_k512_digit = wide_fp32_indices and self.top_k == 512 and self.tie_break == 0
             skip_without_spill_reuse = directed_prefix or skip_default_k512_digit
-            can_reuse_spilled_planes = self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048
+            # The narrow plan's column bucket is below the spill reuse threshold.
+            can_reuse_spilled_planes = self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048 and not narrow_fp32_indices
             needs_spill_to_reuse = not self.deterministic and not self.return_val and self.tie_break != 0
             skip_with_spill_reuse = (
                 can_reuse_spilled_planes
@@ -1091,7 +1095,7 @@ class IndexerTopKKernelVarlen:
             if threshold_bin > 0:
                 topk_remaining -= s_histogram[threshold_bin - 1]
 
-            long_row = length >= 16384
+            long_row = length >= spill_reuse_min_length
             first_round = cutlass.Int32(0)
             fp32_prefix = cutlass.Uint32(0)
             if cutlass.const_expr(skip_without_spill_reuse or skip_with_spill_reuse):

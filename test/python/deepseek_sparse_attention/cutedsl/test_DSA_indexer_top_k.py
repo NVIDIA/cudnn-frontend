@@ -1339,15 +1339,23 @@ def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, determini
 @pytest.mark.L0
 @pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
 @pytest.mark.parametrize(
-    "k,tie_break,deterministic",
-    [(2048, 0, True), (2048, 1, True), (2048, 2, True), (2048, 0, False), (512, 0, False), (2048, 1, False)],
-    ids=["0", "1", "2", "arbitrary", "arbitrary-k512", "directed-k2048"],
+    "k,tie_break,deterministic,width",
+    [
+        (2048, 0, True, 32773),
+        (2048, 1, True, 32773),
+        (2048, 2, True, 32773),
+        (2048, 0, False, 32773),
+        (512, 0, False, 32773),
+        (2048, 1, False, 65539),
+        (2048, 1, False, 8189),
+    ],
+    ids=["0", "1", "2", "arbitrary", "arbitrary-k512", "directed-k2048", "directed-k2048-8k"],
 )
-def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, k, tie_break, deterministic):
+def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, k, tie_break, deterministic, width):
     """Check FP32 cutoff keys at the FP16 rounding boundaries used by coarse filtering."""
     dsa = _import_dsa()
     directed = not deterministic and tie_break == 1
-    width, rows = (65539 if directed else 32773), 156
+    rows = 156
     columns = torch.arange(width, device="cuda", dtype=torch.int32)
     delta = columns * 17 % 127 - 63
     # Below and above 1.0 share the FP32 high byte. Around 2.0 it changes.
@@ -1358,7 +1366,7 @@ def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, k, tie_break, dete
     patterns = torch.cat((magnitudes, -magnitudes, torch.zeros_like(magnitudes[:1])))
     pattern_count = len(patterns)
     first = [3, 11, 8, 17, 30, 1, 19, 24, 7, 12, 5] if has_starts else [0] * pattern_count
-    last = [width, width, width, width, width, width, width, first[7] + 16383, first[8] + 16384, width, width]
+    last = [width, width, width, width, width, width, width, min(width, first[7] + 16383), min(width, first[8] + 16384), width, width]
     if directed:
         last[0] = first[0] + 4093
         last[1] = first[1] + 4093

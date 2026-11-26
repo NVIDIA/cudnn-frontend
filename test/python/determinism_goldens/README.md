@@ -4971,6 +4971,21 @@ The coarse-bin golden for this run came from the preceding kernel in a
 temporary directory. Its input and output hashes matched the tracked
 cuDNN 9.19.0 record before checking the follow-up.
 
+The SM90 8K follow-up extends directed FP32 K=2048 indices-only selection to
+the narrow column bucket. Two L0 cases compare the selected scores and
+columns against the independent reference at width 8,189, with and without
+explicit starts. On H200 (cc 9.0, 132 SMs) with PyTorch 2.12.1 cu130,
+cuDNN 9.20.0 and CuTe DSL 4.8.0, the L0/L1 command above reported
+258 passed, 9 SM120/121 skips and 6 deselected. The seven comparison records
+were produced from the preceding kernel in a temporary directory and matched
+the tracked input and output hashes. Refill stress observed zero differences
+in 128 warm and 128 poisoned launches.
+
+The same memcheck selection reported 41 passed and zero errors on H200 with
+the native PyTorch allocator. On B300, the L0 subset selected by
+`-k "coarse_bin_refinement or spilled_candidate_planes or zero_scratch_cache_boundary"`
+reported 33 passed. The JAX Top-K command above reported 8 passed on B300.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
