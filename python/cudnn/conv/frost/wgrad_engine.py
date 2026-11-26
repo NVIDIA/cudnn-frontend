@@ -8,7 +8,7 @@ from math import prod
 import cudnn
 import cutlass
 from cuda.bindings import driver as cuda
-from cudnn.engines.base import BaseEngine, CompiledPlan
+from cudnn.engines.base import BaseEngine, CompiledPlan, require_stream
 from cudnn.frost.buffers import reordering_name as _reordering_name
 from cudnn.frost.device import build_device, current_device
 from .checks import (
@@ -58,7 +58,7 @@ class _WgradPlan(CompiledPlan):
                 raise ValueError(f"frost_conv_wgrad: {role} must match the declared compact channels-last shape and stride")
             if operand.dtype != dtype or operand.data_ptr() % 16:
                 raise ValueError(f"frost_conv_wgrad: {role} requires {dtype} storage and 16-byte alignment")
-        self._compiled(*(v.permute(0, 2, 3, 4, 1) for v in operands), cuda.CUstream(ctx.stream or 0), *self._geometry)
+        self._compiled(*(v.permute(0, 2, 3, 4, 1) for v in operands), cuda.CUstream(require_stream(ctx.stream, "frost_conv_wgrad")), *self._geometry)
 
 
 class FrostConvWgradEngine(BaseEngine):
@@ -122,7 +122,7 @@ class FrostConvWgradEngine(BaseEngine):
 
     def knobs_from_public(self, public):
         k = cudnn.knob_type
-        domains = {k.TILE_M: (64, 128), k.TILE_N: range(32, 257, 32), k.TILEK: (64, 128), k.CTA_GROUP: (1, 2), k.STAGES: range(3, 7)}
+        domains = {k.TILE_M: (64, 128), k.TILE_N: range(32, 257, 32), k.TILEK: (64, 128, 256), k.CTA_GROUP: (1, 2), k.STAGES: range(2, 7)}
         if any(key not in domains or type(value) is not int or value not in domains[key] for key, value in public.items()):
             raise ValueError("frost_conv_wgrad: unsupported configuration or knob")
         return fixed_knobs() | public

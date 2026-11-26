@@ -161,7 +161,7 @@ def test_block_scale_k_width_names_are_complete_catalog_entries(cta_k_bytes) -> 
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("cta_k_bytes", (32, 64, 96))
+@pytest.mark.parametrize("cta_k_bytes", (32, 64, 96, 256))
 @requires_dense_cutedsl
 def test_dense_compile_rejects_block_scale_only_k_widths_before_cute_compile(monkeypatch, cta_k_bytes) -> None:
     from cudnn.conv.frost.templates import sm100_conv
@@ -262,6 +262,7 @@ def test_block_scale_2cta_96_byte_k_filters_small_n_tiles() -> None:
         (ConvTileConfig(128, 128, 32, 1), 128, "64-byte K tile requires C=128"),
         (ConvTileConfig(128, 128, 128, 1), 192, "96-byte K tile requires C=192"),
         (ConvTileConfig(128, 128, 64, 1), 512, "128-byte K tile requires C divisible by 256"),
+        (ConvTileConfig(128, 128, 256, 1), 512, "128-byte K tile requires C divisible by 256.*CTA K=256"),
         (ConvTileConfig(128, 32, 64, 1), 128, "CTA N>=64"),
         (ConvTileConfig(128, 128, 96, 2), 192, "2-CTA.*CTA N>=192"),
     ),

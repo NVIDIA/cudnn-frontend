@@ -1324,5 +1324,5 @@ the separate `frost_conv` engine, and dgrad/higher derivatives are unsupported.
 
 The current SM100 evidence covers all five input and output types, single and
 paired CTAs, fresh allocations, concurrent work, and capture/replay. SM103 and
-other compiler/dependency lanes remain unverified. See the [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#frost-convolution-weight-gradient-milestone-2)
+other compiler/dependency lanes remain unverified. See the [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#frost-convolution-weight-gradient)
 for measured configurations and coverage gaps.

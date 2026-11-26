@@ -239,11 +239,14 @@ The functional implementation accepts:
   and materialized intermediates are declined.
 
 The conservative default remains `TILE_M=128`, `TILE_N=128`, `TILEK=128`
-(bytes), `CTA_GROUP=1`, and `STAGES=3`. Public knob replay permits M=64/128,
-N=32 through 256 in steps of 32, reduction stages of 64/128 bytes, and
-one-/two-CTA MMA groups. M is per CTA; N is the output width of the MMA
-(the paired CTAs stage half of operand X's N channels each). Two accumulator
-stages and two output-store stages remain fixed.
+(bytes), `CTA_GROUP=1`, and `STAGES=6`. Public knob replay permits M=64/128,
+N=32 through 256 in steps of 32, reduction stages of 64/128/256 bytes,
+one-/two-CTA MMA groups, and `STAGES` from 2 through 6 (clamped to the
+device's per-block opt-in shared-memory capacity). M is per CTA; N is the
+output width of the MMA (the paired CTAs stage half of operand X's N
+channels each). Each work item folds two accumulation chains in TMEM (two
+inter-tile accumulator stages when `TILE_N <= 128`, one when `TILE_N > 128`),
+with two output-store stages.
 
 The implemented TMEM load/store paths impose these epilogue restrictions:
 
@@ -271,4 +274,4 @@ configuration selector in this milestone.
 Replay determinism and batch-reduction invariance are separate: dW reduces the
 batch axis, so splitting or reordering that reduction can change FP32 rounding.
 See the [determinism support page](/operations/determinism) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/determinism.md))
-and [qualification report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#frost-convolution-weight-gradient-milestone-2).
+and [qualification report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#frost-convolution-weight-gradient).

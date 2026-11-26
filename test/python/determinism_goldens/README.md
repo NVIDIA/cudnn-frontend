@@ -9316,6 +9316,20 @@ Im2col-only requalification in the same environment:
 The full run includes all 1,600 configuration/dtype cases, 18 offset-admission
 cases, 40 native offset-boundary cases, and all 10 pipeline stress cases.
 
+Requalification on 2026-11-26 after adding inter-tile TMEM double buffering
+(`TILE_N <= 128`) with early TMEM release, device-capacity A/B stage selection
+(`STAGES` in `2..6`), register-reallocated `x64` epilogue subtiles without
+intra-loop CTA barriers, and 256-byte reduction stages (`TILEK=256`), on SM100
+(`NVIDIA Graphics Device`, 148 SMs), Torch `2.15.0+cu132`, cuDNN 9.26.0,
+`nvidia-cutlass-dsl 4.9.0.dev1` (compiler CUDA 12.9), TVM FFI `0.1.15.post2`:
+`test_frost_conv_wgrad_determinism.py` passed 56/56 in 25.28 s (including five
+matching golden records in `2d8971bb92aee719/` with identical input and output
+SHA256 hashes to `aa4e49df98a7640e/`), `test_frost_wgrad_warm_refill` passed
+10/10 in 13.55 s (both cluster-1 and cluster-2 unsafe controls failed 200/200),
+non-sweep `test_frost_conv_wgrad.py` + determinism passed 248/248, the `R256`
+configuration sweep passed 224/224, `synccheck` passed 30/30 with 0 errors, and
+`racecheck` passed 5/5 with 0 hazards.
+
 Initial qualification below includes the former per-pixel X-load path. The
 current kernel uses only im2col X loads and rejects graphs where
 `(filter_extent - 1) * dilation > 31` on any axis, even with legal corners.

@@ -36,7 +36,7 @@ class ConvTileConfig:
 
     ``cta_tile_k_bytes`` is dtype-independent.  The tcgen05 instruction always
     consumes 32 bytes of GEMM-K per issue; a CTA K tile therefore contains one
-    to four MMA issues.  A 2-CTA instruction spans two adjacent M CTAs, so its
+    to eight MMA issues.  A 2-CTA instruction spans two adjacent M CTAs, so its
     minimal legal cluster is derived as ``(2, 1)``.
     """
 
@@ -50,8 +50,8 @@ class ConvTileConfig:
             raise ValueError(f"cta_tile_m must be 64 or 128, got {self.cta_tile_m}")
         if self.cta_tile_n not in range(32, 257, 32):
             raise ValueError(f"cta_tile_n must be in [32, 256] with step 32, got {self.cta_tile_n}")
-        if self.cta_tile_k_bytes not in (32, 64, 96, 128):
-            raise ValueError(f"cta_tile_k_bytes must be 32, 64, 96, or 128, got {self.cta_tile_k_bytes}")
+        if self.cta_tile_k_bytes not in (32, 64, 96, 128, 256):
+            raise ValueError(f"cta_tile_k_bytes must be 32, 64, 96, 128, or 256, got {self.cta_tile_k_bytes}")
         if self.cta_group not in (1, 2):
             raise ValueError(f"cta_group must be 1 or 2, got {self.cta_group}")
 
@@ -133,7 +133,7 @@ def by_name(name: str) -> ConvTileConfig:
     ):
         raise KeyError(f"convolution tile config {name!r} is not canonical")
 
-    return _CATALOG_BY_NAME[candidate.name]
+    return _CATALOG_BY_NAME.get(candidate.name, candidate)
 
 
 DEFAULT_CONFIG = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")

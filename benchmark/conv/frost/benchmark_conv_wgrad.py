@@ -97,9 +97,9 @@ from benchmark_utils import (
     validate_args,
 )
 
-# Default tile configuration for ``--configs default``: 128x256x128 CTA tile,
+# Default tile configuration for ``--configs default``: 128x256x256 CTA tile,
 # 128x256x32 MMA shape, 2x1 cluster, 2-CTA MMA.
-FIXED_CONFIG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+FIXED_CONFIG = "CONFIG_sm100_128x256x256_128x256x32_cluster2x1_2ctamma"
 
 # torch dtype -> (cuDNN data type)
 DTYPES = {

@@ -241,7 +241,11 @@ def test_frost_wgrad_dynamic_replay(monkeypatch):
 @pytest.mark.parametrize("group", (1, 2))
 def test_frost_wgrad_warm_refill(monkeypatch, dtype, group):
     g, pack, ws, (x, dy, dw) = prepare(
-        monkeypatch, (2, 384, 5, 10, 10), (384, 384, 4, 3, 3), dtype=dtype, knobs={cudnn.knob_type.CTA_GROUP: group, cudnn.knob_type.TILEK: 64}
+        monkeypatch,
+        (2, 384, 5, 10, 10),
+        (384, 384, 4, 3, 3),
+        dtype=dtype,
+        knobs={cudnn.knob_type.CTA_GROUP: group, cudnn.knob_type.TILEK: 64, cudnn.knob_type.STAGES: 3},
     )
     # L=256: operand slots wrap for every dtype with the 64-byte stage below.
     out = dw.permute(0, 2, 3, 4, 1)
@@ -307,9 +311,11 @@ def test_frost_wgrad_dependency_gate(monkeypatch, version):
 def test_frost_wgrad_knob_rejection():
     engine = FrostConvWgradEngine()
     assert engine.knobs_to_public(engine.knobs_from_public(fixed_knobs())) == fixed_knobs()
-    for stages in range(3, 7):
+    for tile_k in (64, 128, 256):
+        assert engine.knobs_from_public({cudnn.knob_type.TILEK: tile_k})[cudnn.knob_type.TILEK] == tile_k
+    for stages in range(2, 7):
         assert engine.knobs_from_public({cudnn.knob_type.STAGES: stages})[cudnn.knob_type.STAGES] == stages
-    for stages in (2, 7):
+    for stages in (1, 7):
         with pytest.raises(ValueError, match="configuration"):
             engine.knobs_from_public({cudnn.knob_type.STAGES: stages})
     for key in fixed_knobs():
@@ -323,7 +329,7 @@ def test_frost_wgrad_knob_rejection():
 
 
 @pytest.mark.parametrize("role", [0, 1, 2])
-@pytest.mark.parametrize("field", ["shape", "stride", "dtype", "alignment"])
+@pytest.mark.parametrize("field", ["shape", "stride", "dtype", "alignment", "stream"])
 def test_frost_wgrad_binding_rejection(monkeypatch, role, field):
     graph, tensors = declaration((1, 128, 1, 8, 8), (128, 128, 1, 1, 1))
     analysis = engine.analyze_wgrad(graph)
@@ -341,13 +347,13 @@ def test_frost_wgrad_binding_rejection(monkeypatch, role, field):
                 v.stride = lambda: (1,) * 5
             elif field == "dtype":
                 v.dtype = "float16"
-            else:
+            elif field == "alignment":
                 v.data_ptr = lambda: 17
         operands.append(v)
     indices = {t.uid: i for i, t in enumerate(tensors)}
     pack = SimpleNamespace(index_of=lambda uid: indices[uid], operands=lambda i: operands)
     with pytest.raises(ValueError):
-        plan.execute(graph, pack, ExecutionContext(stream=0))
+        plan.execute(graph, pack, ExecutionContext(stream=None if field == "stream" else 0))
     assert not calls
 
 
@@ -406,7 +412,7 @@ def test_frost_wgrad_all_dtypes(monkeypatch, dtype, output_dtype, minimal):
 
 
 # All geometric knob combinations, including dtype-dependent epilogue refusals.
-CONFIGS = [(m, n, red, group) for m in (64, 128) for n in range(32, 257, 32) for red in (64, 128) for group in (1, 2)]
+CONFIGS = [(m, n, red, group) for m in (64, 128) for n in range(32, 257, 32) for red in (64, 128, 256) for group in (1, 2)]
 
 
 @requires_dense_cutedsl
@@ -555,6 +561,8 @@ def test_frost_wgrad_operand_descriptor_swizzles():
     assert _WgradKernel(ConvTileConfig(128, 128, 128, 1), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 6
     assert _WgradKernel(ConvTileConfig(128, 256, 128, 2), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 6
     assert _WgradKernel(ConvTileConfig(128, 256, 128, 1), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 4
+    assert _WgradKernel(ConvTileConfig(128, 256, 256, 2), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 3
+    assert _WgradKernel(ConvTileConfig(128, 256, 256, 1), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 2
     assert _WgradKernel(ConvTileConfig(128, 256, 128, 2), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap, stages=3).ab_stages == 3
 
 

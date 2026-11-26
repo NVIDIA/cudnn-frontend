@@ -95,7 +95,7 @@ _SMEM_ALIGNMENT = 1024
 _TMEM_COLS = 512
 
 # Pipeline stage counts, warp roles, and synchronization constants
-_MIN_AB_STAGES = 3
+_MIN_AB_STAGES = 2
 _MAX_AB_STAGES = 6
 # Accumulation chains folded per dW element in TMEM (Rule 12). When two pairs
 # of chains fit in 512 TMEM columns (cta_tile_n <= 128), two inter-tile
@@ -260,9 +260,9 @@ def _select_wgrad_epi_datapath(config: ConvTileConfig, output_dtype: Type[Numeri
 def check_config(config: ConvTileConfig, output_dtype: Type[Numeric]) -> None:
     """The TMEM bands must contain complete output-store subtiles."""
     # The reducer loop issues cta_tile_k_bytes // 32 MMAs per stage, so only the
-    # 64- and 128-byte stages are implemented (the catalog also lists 32/96).
-    if config.cta_tile_k_bytes not in (64, 128):
-        raise ValueError("frost_conv_wgrad requires 64- or 128-byte reduction stages")
+    # 64-, 128-, and 256-byte stages are implemented (the catalog also lists 32/96).
+    if config.cta_tile_k_bytes not in (64, 128, 256):
+        raise ValueError("frost_conv_wgrad requires 64-, 128-, or 256-byte reduction stages")
     # The epilogue walks the accumulator in (warp_n_count x subtile_n) N bands;
     # a partial band would need a masked TMEM read and a masked store.
     epi_datapath = _select_wgrad_epi_datapath(config, output_dtype)
