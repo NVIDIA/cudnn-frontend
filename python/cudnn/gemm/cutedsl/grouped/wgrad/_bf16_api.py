@@ -38,6 +38,7 @@ from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug
 from ..canonical import validate_once
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
+from .moe_grouped_gemm_wgrad_wide import MoEGroupedGemmWgradWideBF16Kernel
 
 
 def _output_dtypes():
@@ -301,23 +302,48 @@ class GroupedGemmWgradBf16API(APIBase):
             raise ValueError(f"single expert placeholder layout {desc.stride} is not expressible as a C-contiguous JAX array")
         self._single_expert_placeholder = jax.block_until_ready(jnp.empty(desc.shape, dtype=framework_dtype(desc.dtype, "jax")))
 
+    def _wide_applies(self) -> bool:
+        """The wide kernel (256 x 512 tiles per CTA pair, the same dW bits) replaces the stock one at the default 2-CTA
+        256x256 tile on SM100/SM103 for dense output, Tensor2D input, no accumulation, 16-bit dW and n % 512 == 0."""
+        m, n = self.wgrad_shape
+        return (
+            not self._is_rubin_kernel
+            and self.weight_mode == MoEWeightMode.DENSE
+            and self.input_order == WGradInputOrder.Tensor2D
+            and not self.accumulate_on_output
+            and self.use_2cta_instrs
+            and tuple(self.mma_tiler_mn) == (256, 256)
+            and tuple(self.cluster_shape_mn) == (2, 1)
+            and _convert_to_cutlass_data_type(self.acc_dtype) == cutlass.Float32
+            and _convert_to_cutlass_data_type(self.wgrad_dtype).width == 16
+            and MoEGroupedGemmWgradWideBF16Kernel.can_implement(m, n)
+        )
+
     def compile(self) -> None:
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        kernel = self._kernel(
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            accumulate_on_output=self.accumulate_on_output,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            input_order=self.input_order,
-            atomic_counter_claim=self.atomic_counter_claim,
-            use_pdl=self.use_pdl,
-            launch_pdl_dependents_at_entry=self.launch_pdl_dependents_at_entry,
-        )
+        if self._wide_applies():
+            kernel = MoEGroupedGemmWgradWideBF16Kernel(
+                expert_cnt=self.expert_cnt,
+                atomic_counter_claim=self.atomic_counter_claim,
+                use_pdl=self.use_pdl,
+                launch_pdl_dependents_at_entry=self.launch_pdl_dependents_at_entry,
+            )
+        else:
+            kernel = self._kernel(
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                accumulate_on_output=self.accumulate_on_output,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                input_order=self.input_order,
+                atomic_counter_claim=self.atomic_counter_claim,
+                use_pdl=self.use_pdl,
+                launch_pdl_dependents_at_entry=self.launch_pdl_dependents_at_entry,
+            )
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
         if max_active_clusters <= 0:
