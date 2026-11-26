@@ -587,8 +587,10 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             self.enable_multi_cta and enable_persistent_dynamic_scheduling
         ), "enable_multi_cta and enable_persistent_dynamic_scheduling cannot both be True"
 
-        if cutlass.const_expr(starts is not None):
-            assert not (self.enable_multi_cta or self.merge_blocks or enable_persistent_dynamic_scheduling)
+        if cutlass.const_expr(starts is not None or extra_buffer is None):
+            assert not (
+                self.enable_multi_cta or self.merge_blocks or enable_persistent_dynamic_scheduling
+            ), "starts and zero-scratch Top-K require the single-CTA decode path"
         num_rows = input_values.shape[0]
         if cutlass.const_expr(extra_buffer is None):
             self._copy_all_columns(input_values, seqlen, output_indices, output_values, starts).launch(

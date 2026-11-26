@@ -772,6 +772,10 @@ for replay, batch-invariance, and stress-test results.
   into `sm_scale`, a launch argument, so they do not change the plan.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
+- Standalone indexer Top-K is forward-only. The PyTorch API supports
+  `deterministic=True` with prefix lengths or explicit `starts`. The JAX
+  API returns unsorted indices and exposes `tie_break` for selecting
+  columns at the cutoff. It has no deterministic output-order mode.
 - SM90 combined Indexer Forward + Top-K requires packed THD, ratio 4, head
   dimension 128, 64 query heads per single KV head, and `deterministic=True`
   for the documented tie policy. Its indices, logits, optional selected-logit

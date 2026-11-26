@@ -1017,6 +1017,17 @@ class IndexerTopKKernelVarlen:
             )
             directed_prefix = standalone_fp32_indices and self.top_k == 2048 and self.tie_break == 1 and not has_starts
             skip_default_k512_digit = standalone_fp32_indices and self.top_k == 512 and self.tie_break == 0
+            skip_without_spill_reuse = directed_prefix or skip_default_k512_digit
+            can_reuse_spilled_planes = self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048
+            needs_spill_to_reuse = not self.deterministic and not self.return_val and self.tie_break != 0
+            skip_with_spill_reuse = (
+                can_reuse_spilled_planes
+                and not needs_spill_to_reuse
+                and (
+                    self.deterministic
+                    or (self.tie_break == 0 and not self.return_val and self.max_num_cols >= 32768 and not self.enable_multi_cta and not self.merge_blocks)
+                )
+            )
 
             for tile_idx in range(num_sub_tiles):
                 tXpX_tile = self.predicate_tile(
@@ -1080,25 +1091,15 @@ class IndexerTopKKernelVarlen:
             if threshold_bin > 0:
                 topk_remaining -= s_histogram[threshold_bin - 1]
 
+            long_row = length >= 16384
             first_round = cutlass.Int32(0)
             fp32_prefix = cutlass.Uint32(0)
-            if cutlass.const_expr(
-                skip_default_k512_digit
-                or directed_prefix
-                or (
-                    self.dtype == cutlass.Float32
-                    and self.enable_gmem_store
-                    and self.top_k == 2048
-                    and (
-                        self.deterministic
-                        or (self.tie_break == 0 and not self.return_val and self.max_num_cols >= 32768 and not self.enable_multi_cta and not self.merge_blocks)
-                    )
-                )
-            ):
+            if cutlass.const_expr(skip_without_spill_reuse or skip_with_spill_reuse):
+                # A long-row skip that requires spill reuse shares its length gate with refinement.
                 if cutlass.const_expr(directed_prefix):
-                    try_skip = length < 16384
+                    try_skip = not long_row
                 else:
-                    try_skip = length >= 16384
+                    try_skip = long_row
                 if try_skip:
                     positive = threshold_bin < 128
                     half_magnitude = (threshold_bin ^ 0x7F) & 0x7F if positive else threshold_bin & 0x7F
@@ -1257,18 +1258,18 @@ class IndexerTopKKernelVarlen:
                     threshold_bin,
                 )
                 # Keep the spill-buffer read out of shared-memory-only specializations.
-                if cutlass.const_expr(self.dtype == cutlass.Float32 and self.enable_gmem_store and self.top_k == 2048):
-                    reuse_spilled_planes = length >= 16384
-                    if cutlass.const_expr(not self.deterministic and not self.return_val and self.tie_break != 0):
+                if cutlass.const_expr(can_reuse_spilled_planes):
+                    reuse_spilled_planes = long_row
+                    if cutlass.const_expr(needs_spill_to_reuse):
                         # The candidate set only shrinks after the coarse pass.
                         reuse_spilled_planes = reuse_spilled_planes and s_num_input[0] > self.indexer_topk_smem_input_size
                     if reuse_spilled_planes:
                         self._refine_topk_candidates(*refine_args, True, first_round, fp32_prefix)
-                    elif cutlass.const_expr(directed_prefix):
+                    elif cutlass.const_expr(skip_without_spill_reuse):
                         self._refine_topk_candidates(*refine_args, False, first_round, fp32_prefix)
                     else:
                         self._refine_topk_candidates(*refine_args, False, 0, cutlass.Uint32(0))
-                elif cutlass.const_expr(skip_default_k512_digit):
+                elif cutlass.const_expr(skip_without_spill_reuse):
                     self._refine_topk_candidates(*refine_args, False, first_round, fp32_prefix)
                 else:
                     self._refine_topk_candidates(*refine_args, False, 0, cutlass.Uint32(0))

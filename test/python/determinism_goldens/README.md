@@ -4944,6 +4944,33 @@ memcheck on the exact-value, cutoff and spill controls reported 30
 passed and zero errors per GPU. The B300 pooled DSA subset reported
 17 passed.
 
+The radix dispatch follow-up uses the same long-row eligibility in histogram
+construction and refinement. On B300 (cc 10.3, 148 SMs), the L0/L1 command
+above reported 256 passed, 9 SM120/121 skips and 6 deselected with the same
+software stack and binding revision. All seven golden comparisons matched.
+Refill stress observed zero differences in 128 warm and 128 poisoned launches.
+The pooled DSA subset above reported 17 passed. H200 execution of this
+follow-up is unverified.
+
+On the same B300, JAX 0.9.1 with NumPy 2.2.6 reported 8 passed and 6
+deselected with the command below. The six new FP32 cases cover K=512 and
+K=2048 with all three tie policies, lengths around 16,384, a cutoff near a
+radix-byte boundary, and rows with enough equal scores to spill. They
+compare the selected values or column sets against an independent sort.
+JAX does not expose the deterministic output-order mode.
+
+```sh
+python -m pytest -s -q -rs -m L0 \
+  deepseek_sparse_attention/jax/test_dsa_jax.py -k indexer_top_k
+```
+
+Compute Sanitizer memcheck with cuDNN 9.20.0 and the native PyTorch allocator
+reported 39 passed and zero errors with `-n0 -o addopts= -m L0` and
+`-k "coarse_bin_refinement or spilled_candidate_planes or zero_scratch_cache_boundary or deterministic_random_exact"`.
+The coarse-bin golden for this run came from the preceding kernel in a
+temporary directory. Its input and output hashes matched the tracked
+cuDNN 9.19.0 record before checking the follow-up.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
