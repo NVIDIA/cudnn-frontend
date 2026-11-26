@@ -161,11 +161,9 @@ d128 0.98-1.03 squares -> TRAIL. ``s_q == 1``: d128 loses 1.3-2.7x; for d192-d51
 engine. Decode-shaped GQA (``s_q <= 16``, dense or paged, measured 2026-10-26 against cuDNN 9.28.0.38, 540
 cases: d64 sink +/- SWA128, d128, d256; q 1-16; kv 4k/64k; b 1/32/128; plus the 120 paged d64 sink cases
 FROST serves since #1874): ``2 <= s_q <= 16`` FROST wins every d128 (0.03-0.37) and d256 (0.01-0.25) cell ->
-LEAD. d64 with a sink and a window wins from 32 KV units (0.06-0.98) and a single SWA query row wins at any batch
-(0.06-0.90) -> LEAD; below 32 units paged SWA ``s_q >= 2`` loses 1.09-1.49 (dense ``s_q >= 2`` is 0.88-1.06 parity) -> TRAIL.
-Over the whole cache the d64 sink graph splits (``heuristics._split_points``, per-tensor FP8 sink partials fold the sink once
-in the combine) and leads at any batch: study sm100_fp8_sink_split_20261126 on a B200, S_q 1-8, b 1-128, KV 8k-128k, dense and
-paged, 0.03-0.34 of the backend on cuDNN 9.24.0.43 and 9.30.0.15. Unsplit, the single row below 32 units lost 1.20-1.23. d128 ``s_q == 1`` still loses (1.48 dense, 1.88
+LEAD. d64 with a sink wins from 32 KV units (0.06-0.98) and a single SWA query row wins at any batch
+(0.06-0.90) -> LEAD; below 32 units the full-cache single row loses 1.20-1.23 and paged SWA ``s_q >= 2``
+1.09-1.49 (dense ``s_q >= 2`` is 0.88-1.06 parity) -> TRAIL. d128 ``s_q == 1`` still loses (1.48 dense, 1.88
 paged geo) -> TRAIL. THD, MHA, d64 without a sink, a window off the d64 sink graph and block-scaled O were not measured
 -> TRAIL, as do other O dtypes than E4M3 and caches below 1k. FROST declines paged d256 today, so leading it
 changes nothing. d512 MTP rows (``2 <= s_q <= 16`` under the bottom-right diagonal, dense unpadded E4M3 KV,
@@ -711,7 +709,7 @@ SM100_FP8_DECODE_MIN_KV = 1024  # the measured decode caches: 4k / 64k grid, 1k-
 # 64 heads or 8 requests (0.12-0.69) and a 2k cache (0.43-0.89) win. Each floor sits halfway (log2) to the first win.
 SM100_FP8_D512_MTP_FLOOR_HEADS = 45  # b * h_q
 SM100_FP8_D512_MTP_FLOOR_KV = 1448
-SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # windowed d64 sink below 32 KV units: paged SWA s_q >= 2 loses 1.09-1.49
+SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
 # _sm100_fp8_decode_gap (study sm100_fp8_decode_gaps_20261118): each bound sits halfway between measured train values
 SM100_FP8_GAP_MAX_GROUP = 16  # measured GQA groups 2-16
 SM100_FP8_GAP_PAGE = 16  # measured page size
@@ -1270,10 +1268,8 @@ def _sm100_fp8_decode_leads(facts) -> bool:
     if (facts.window_left is not None and not sink_d64) or (facts.has_sink and not sink_d64):
         return False
     if sink_d64:
-        if facts.window_left is None:
-            return True  # the whole cache splits (heuristics._split_points), at any batch (sm100_fp8_sink_split_20261126)
         # a single SWA query row wins at any batch; otherwise a few KV units lose (paged SWA b=1 to 1.49x)
-        return facts.b * facts.h_kv >= SM100_FP8_SINK_DECODE_MIN_KV_UNITS or facts.s_q == 1
+        return facts.b * facts.h_kv >= SM100_FP8_SINK_DECODE_MIN_KV_UNITS or (facts.s_q == 1 and facts.window_left is not None)
     return facts.s_q >= 2 and shape in ((128, 128), (256, 256))
 
 
