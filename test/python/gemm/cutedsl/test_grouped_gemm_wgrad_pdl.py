@@ -9,6 +9,10 @@
   predecessor at its start, so the chain is: producer, helper, main kernel.
 * ``launch_pdl_dependents_at_entry``: the main kernel lets its own dependent launch at its entry.
 
+MXFP8 with dense output at 2-CTA 256x256 tiles in a (2, 1) cluster runs the global-descriptor variant: no helper kernel
+(only the counter reset with ``atomic_counter_claim``), and for an expert whose token count is not a multiple of the K tile
+the load warp builds that expert's descriptors in the workspace, after its wait.
+
 The stream neighbours come from ``pdl_dependent_copy`` (``test/python``): a predecessor that releases its dependents first and
 only then writes, and a dependent that waits before it copies. The eager launches are warm ones: the first launch of a freshly
 compiled kernel returns to the host only when the work in flight on the stream has completed, so it never starts early.
@@ -21,7 +25,10 @@ M, N = 512, 512
 BF16_GROUPS = (256, 0, 512, 256, 0, 1024)
 MXFP8_GROUPS = (128, 0, 384, 1024, 0, 128)
 # Other valid group sizes with the same total: what a kernel that read the offsets in front of its wait would see.
-STALE_GROUPS = {"bf16": (1024, 256, 0, 512, 0, 256), "mxfp8": (1024, 128, 0, 384, 128, 0)}
+# Experts that end inside a K tile (the global-descriptor variant builds their descriptors in the kernel), long enough on
+# average that the API picks that variant for them.
+MXFP8_PARTIAL_GROUPS = (1120, 0, 1696, 1376, 0, 736)
+STALE_GROUPS = {"bf16": (1024, 256, 0, 512, 0, 256), "mxfp8": (1024, 128, 0, 384, 128, 0), "mxfp8_partial": (1696, 1120, 0, 736, 1376, 0)}
 # The offsets operand sits at the end of a buffer of this many int32: a one-pass writer reaches it last.
 OFFSETS_PREFIX = 1 << 20
 # (mma_tiler_mn, cluster_shape_mn): one-CTA and a (2, 1) pair. MXFP8 takes the 128x128 tile for the one-CTA case.
@@ -70,7 +77,31 @@ def test_pdl_options_accepted_by_every_kernel():
 # ---------------------------------------------------------------------------
 
 
+def _partial_mxfp8_problem(groups, m, n, *, seed):
+    """MXFP8 operands for experts with partial K tiles; random scale-factor bytes of the size the API checks (the output
+    is compared between two launches of the same kernel, not with a reference)."""
+    from gemm.cutedsl.test_grouped_gemm_wgrad_utils import _wgrad_create_scale_tensor
+
+    torch.manual_seed(seed)
+    tokens = sum(groups)
+    cols = -(-(-(-tokens // 32)) // 4) * 4
+    return {
+        "a": torch.randint(-1, 2, (m, tokens), device="cuda").to(torch.float8_e4m3fn),
+        "b": torch.randint(-1, 2, (n, tokens), device="cuda").to(torch.float8_e4m3fn).t(),
+        "sfa": _wgrad_create_scale_tensor((m, cols), torch.float8_e8m0fnu),
+        "sfb": _wgrad_create_scale_tensor((n, cols), torch.float8_e8m0fnu),
+        "offsets": torch.tensor(groups, dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32),
+        "output": torch.empty((len(groups), m, n), dtype=torch.bfloat16, device="cuda"),
+    }
+
+
+def _stale_key(variant):
+    return "mxfp8_partial" if variant.startswith("mxfp8_partial") else "mxfp8" if variant.startswith("mxfp8") else "bf16"
+
+
 def _problem(variant):
+    if variant.startswith("mxfp8_partial"):
+        return _partial_mxfp8_problem(MXFP8_PARTIAL_GROUPS, M, N, seed=9)
     if variant.startswith("mxfp8"):
         from gemm.cutedsl.test_grouped_gemm_wgrad_atomic_counter import _make_mxfp8_problem
 
@@ -116,6 +147,8 @@ class _Op:
         assert self.op.check_support()
         self.op.compile()
         self._ptrs = {}
+        select = getattr(self.op._implementation, "_select_kernel", None)
+        self.kernel_class = select() if select is not None else self.op._kernel
 
     def __call__(self, a, out, offsets=None):
         if self.discrete and out.data_ptr() not in self._ptrs:
@@ -150,6 +183,20 @@ def _random_like(t, seed):
     return torch.randint(0, 256, (t.numel() * t.element_size(),), dtype=torch.uint8, device="cuda", generator=g).view(t.dtype).view(t.shape)
 
 
+def _check_global_descriptor_path(op, variant, config, *, exact=False):
+    """MXFP8 at 2-CTA 256x256 tiles in a (2, 1) cluster with dense output and no accumulation runs the global-descriptor
+    variant (or, with ``exact=False``, a variant built on it)."""
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel as Dense
+
+    if variant.startswith("mxfp8") and not variant.endswith("discrete") and config == CONFIGS[1] and torch.cuda.get_device_capability()[0] == 10:
+        from cudnn.api_base import get_device_type
+
+        if get_device_type() == "rubin" or op.op._implementation.accumulate_on_output:
+            return
+        picked = op.kernel_class
+        assert (picked is Dense) if exact else issubclass(picked, Dense), f"{variant}: the API picked {picked.__name__}"
+
+
 def _graph(chain):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -176,19 +223,39 @@ def test_use_pdl_matches_plain_launch_behind_producers(variant, operand, config)
     a helper or main kernel that read in front of its wait would read other bytes. The positive control (a dependent copy
     without a wait behind the same writer) shows the early start reproduces."""
     _require_sm100()
+    _check_behind_producers(variant, operand, config)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("operand", ["a", "offsets"])
+@pytest.mark.parametrize("variant", ["mxfp8_partial", "mxfp8_partial_counter"])
+def test_use_pdl_global_descriptor_partial_k_tiles_behind_producers(variant, operand):
+    """As above for the MXFP8 global-descriptor variant with experts that end inside a K tile: its load warp builds those
+    experts' descriptors from the offsets and A in the workspace, which must happen after its wait."""
+    _require_sm100()
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("The global-descriptor wgrad is SM100/SM103 only")
+    from cudnn.api_base import get_device_type
+
+    if get_device_type() == "rubin":
+        pytest.skip("The global-descriptor wgrad is SM100/SM103 only")
+    _check_behind_producers(variant, operand, CONFIGS[1], exact=True)
+
+
+def _check_behind_producers(variant, operand, config, exact=False):
     from pdl_dependent_copy import DependentCopy, EarlyReleaseWriter
 
     problem = _problem(variant)
     accumulate = operand == "accumulated_output"
     plain = _Op(problem, variant, config, accumulate_on_output=accumulate)
     pdl = _Op(problem, variant, config, accumulate_on_output=accumulate, use_pdl=True)
+    for op in (plain, pdl):
+        _check_global_descriptor_path(op, variant, config, exact=exact)
 
     out = torch.empty_like(problem["output"])
     offsets = None
     if operand == "offsets":
-        stale_offsets = torch.tensor(STALE_GROUPS["mxfp8" if variant.startswith("mxfp8") else "bf16"], dtype=torch.int32, device="cuda").cumsum(
-            0, dtype=torch.int32
-        )
+        stale_offsets = torch.tensor(STALE_GROUPS[_stale_key(variant)], dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32)
         new = torch.zeros(OFFSETS_PREFIX + stale_offsets.numel(), dtype=torch.int32, device="cuda")
         new[OFFSETS_PREFIX:] = problem["offsets"]
         stale = new.clone()
@@ -274,9 +341,14 @@ def test_use_pdl_matches_plain_launch_behind_producers(variant, operand, config)
         pytest.skip("the outputs match, but the early start of a dependent did not reproduce on this device (a coverage gap)")
 
 
+# Partial K tiles only at the (2, 1) pair: the global-descriptor variant's in-kernel descriptor build.
+ENTRY_CASES = [(c, v) for v in ("bf16", "bf16_counter", "bf16_pdl", "mxfp8", "mxfp8_pdl") for c in CONFIGS] + [
+    (CONFIGS[1], v) for v in ("mxfp8_partial", "mxfp8_partial_pdl")
+]
+
+
 @pytest.mark.L0
-@pytest.mark.parametrize("config", CONFIGS, ids=_config_id)
-@pytest.mark.parametrize("variant", ["bf16", "bf16_counter", "bf16_pdl", "mxfp8", "mxfp8_pdl"])
+@pytest.mark.parametrize("config,variant", ENTRY_CASES, ids=[f"{_config_id(c)}-{v}" for c, v in ENTRY_CASES])
 def test_launch_dependents_at_entry_with_dependent_copy(config, variant):
     """launch_pdl_dependents_at_entry lets the next launch start at the wgrad kernel's entry: a dependent that waits before
     it copies the wgrad output reads the finished output, eager and replayed from a CUDA graph. Also behind the helper kernel
@@ -288,6 +360,8 @@ def test_launch_dependents_at_entry_with_dependent_copy(config, variant):
     problem = _problem(base)
     plain = _Op(problem, base, config)
     entry = _Op(problem, base, config, launch_pdl_dependents_at_entry=True, use_pdl=variant.endswith("_pdl"))
+    for op in (plain, entry):
+        _check_global_descriptor_path(op, base, config)
     expected = torch.empty_like(problem["output"])
     plain(problem["a"], expected)
     torch.cuda.synchronize()
