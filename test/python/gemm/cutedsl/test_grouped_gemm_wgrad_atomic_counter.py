@@ -533,7 +533,11 @@ def test_atomic_counter_claim_api_surface():
     wrapper = inspect.signature(cudnn.grouped_gemm_wgrad_wrapper_sm100).parameters["atomic_counter_claim"]
     assert wrapper.kind is inspect.Parameter.KEYWORD_ONLY and wrapper.default is False
     init = list(inspect.signature(cudnn.GroupedGemmWgradSm100.__init__).parameters.values())
-    assert init[-1].name == "atomic_counter_claim" and init[-1].default is False
+    # Appended after input_order, so earlier positional calls keep their meaning; only the PDL options follow it.
+    names = [p.name for p in init]
+    at = names.index("atomic_counter_claim")
+    assert names[at - 1] == "input_order" and names[at + 1 :] == ["use_pdl", "launch_pdl_dependents_at_entry"]
+    assert all(p.default is False for p in init[at:])
     size = inspect.signature(cudnn.get_grouped_gemm_wgrad_workspace_size_sm100).parameters["atomic_counter_claim"]
     assert size.kind is inspect.Parameter.KEYWORD_ONLY and size.default is False
     for mode in ("dense", "discrete"):

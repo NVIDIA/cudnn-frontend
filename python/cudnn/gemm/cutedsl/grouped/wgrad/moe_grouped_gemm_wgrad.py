@@ -49,6 +49,7 @@ from ..moe_utils import (
     MoEWeightMode,
     WGradInputOrder,
     WgradTensormapConstructor,
+    reject_pdl_behind_helper,
 )
 from ..moe_sched_extension import (
     WgradGemmSchedExtension,
@@ -56,6 +57,8 @@ from ..moe_sched_extension import (
 from ..moe_kernel_helpers import (
     compute_stages_wgrad_bf16,
 )
+
+WGRAD_BF16_PDL_USE_INSTEAD = "dense output, Tensor2D inputs and atomic_counter_claim=False"
 
 
 class MoEGroupedGemmWgradBF16Kernel:
@@ -77,6 +80,11 @@ class MoEGroupedGemmWgradBF16Kernel:
         tiles from a 4-byte int32 counter in the workspace, which the helper
         kernel resets before every launch, instead of a grid of every tile
         rebalanced by cluster launch control (CLC, the default).
+    :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream, so this kernel's setup
+        (shared memory, barriers, scheduler state) overlaps that kernel's tail; every thread waits for that grid before
+        its first global memory access. Rejected whenever the call launches the helper kernel right before this kernel
+        (TensorRagged inputs, discrete output, ``atomic_counter_claim``).
+    :param launch_pdl_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
     """
 
     FIX_PAD_SIZE = 256
@@ -171,6 +179,8 @@ class MoEGroupedGemmWgradBF16Kernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
         atomic_counter_claim: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         self.expert_cnt = expert_cnt
         self.acc_dtype = acc_dtype
@@ -181,6 +191,9 @@ class MoEGroupedGemmWgradBF16Kernel:
         self.weight_mode = weight_mode
         self.input_order = input_order
         self.atomic_counter_claim = atomic_counter_claim
+        reject_pdl_behind_helper(use_pdl, self._launches_helper(), WGRAD_BF16_PDL_USE_INSTEAD)
+        self.use_pdl = use_pdl
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -208,6 +221,13 @@ class MoEGroupedGemmWgradBF16Kernel:
     # ------------------------------------------------------------------
     # Workspace
     # ------------------------------------------------------------------
+
+    def _needs_descriptors(self) -> bool:
+        return self.input_order == WGradInputOrder.TensorRagged or self.weight_mode == MoEWeightMode.DISCRETE
+
+    def _launches_helper(self) -> bool:
+        """The call launches helper_kernel right before the main kernel: descriptors, or the claim counter reset."""
+        return self._needs_descriptors() or self.atomic_counter_claim
 
     def get_desc_workspace_bytes(self) -> int:
         return WgradTensormapConstructor.get_workspace_size(self.input_order, self.weight_mode, self.expert_cnt)
@@ -463,8 +483,9 @@ class MoEGroupedGemmWgradBF16Kernel:
             a_op_helper = None
             b_op_helper = None
 
-        needs_descriptors = self.input_order == WGradInputOrder.TensorRagged or self.weight_mode == MoEWeightMode.DISCRETE
-        if cutlass.const_expr(needs_descriptors or self.atomic_counter_claim):
+        needs_descriptors = self._needs_descriptors()
+        reject_pdl_behind_helper(self.use_pdl, self._launches_helper(), WGRAD_BF16_PDL_USE_INSTEAD)
+        if cutlass.const_expr(self._launches_helper()):
             self.helper_kernel(
                 offs,
                 workspace.iterator,
@@ -552,6 +573,7 @@ class MoEGroupedGemmWgradBF16Kernel:
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=self.occupancy,
+            use_pdl=self.use_pdl,
         )
 
     # ------------------------------------------------------------------
@@ -660,6 +682,8 @@ class MoEGroupedGemmWgradBF16Kernel:
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(self.launch_pdl_dependents_at_entry):
+            cute.arch.griddepcontrol_launch_dependents()
 
         # =================================================================
         # SharedStorage
@@ -786,6 +810,10 @@ class MoEGroupedGemmWgradBF16Kernel:
 
         # Cluster wait
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+        # use_pdl: the setup above touches no global memory; the kernel before this one on the stream may still be
+        # writing A, B, the offsets or the output, so every thread waits for it here.
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
         # =================================================================
         # Scheduler warp (warp 6)

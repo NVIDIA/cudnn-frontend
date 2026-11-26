@@ -81,6 +81,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
         atomic_counter_claim: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         if sample_a is not None and not is_torch_tensor(sample_a):
             raise ValueError(
@@ -177,6 +179,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         if not isinstance(atomic_counter_claim, bool):
             raise ValueError(f"atomic_counter_claim must be a bool, got {atomic_counter_claim!r}")
         self.atomic_counter_claim = atomic_counter_claim
+        self.use_pdl = use_pdl
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
         self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmWgradKernel
         self._workspace = None
         self._workspace_bytes = None
@@ -365,6 +369,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             input_order=self.input_order,
             sf_fp8_dtype_override=self.sf_fp8_dtype_override,
             atomic_counter_claim=self.atomic_counter_claim,
+            use_pdl=self.use_pdl,
+            launch_pdl_dependents_at_entry=self.launch_pdl_dependents_at_entry,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()

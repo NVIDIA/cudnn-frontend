@@ -55,6 +55,7 @@ from ..moe_utils import (
     WGradInputOrder,
     WgradSfTensormapConstructor,
     acquire_tma_desc,
+    reject_pdl_behind_helper,
 )
 from ..moe_sched_extension import (
     WgradScaledGemmSchedExtension,
@@ -102,6 +103,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         tiles from a 4-byte int32 counter in the workspace, which the helper
         kernel resets before every launch, instead of a grid of every tile
         rebalanced by cluster launch control (CLC, the default).
+    :param use_pdl: Rejected: every call launches the helper kernel (the SFA/SFB descriptors) right before this
+        kernel, so the helper would be its programmatic primary. Use ``use_pdl`` with the BF16 wgrad kernel.
+    :param launch_pdl_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
     """
 
     def __init__(
@@ -117,6 +121,8 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         atomic_counter_claim: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         self.sf_vec_size = sf_vec_size
         self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
@@ -129,6 +135,10 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.weight_mode = weight_mode
         self.input_order = input_order
         self.atomic_counter_claim = atomic_counter_claim
+        # The helper kernel builds the SFA/SFB descriptors on every call, dense or discrete output.
+        reject_pdl_behind_helper(use_pdl, True, "the BF16 wgrad kernel (dense output, Tensor2D inputs, atomic_counter_claim=False)")
+        self.use_pdl = use_pdl
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -809,6 +819,8 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
         is_leader_cta = block_in_cluster_coord_vmnk[0] == 0
         tidx, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(self.launch_pdl_dependents_at_entry):
+            cute.arch.griddepcontrol_launch_dependents()
 
         # =================================================================
         # SharedStorage

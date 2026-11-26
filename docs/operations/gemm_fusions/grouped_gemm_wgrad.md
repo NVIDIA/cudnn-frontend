@@ -271,7 +271,7 @@ op.execute(
 By default the SM100 wgrad kernels (BF16, and block-scaled on SM100 and SM107)
 launch a grid of every output tile and rebalance uneven expert token counts with
 cluster launch control (CLC). `atomic_counter_claim=True` (a keyword of
-`grouped_gemm_wgrad_wrapper_sm100` and the last argument of
+`grouped_gemm_wgrad_wrapper_sm100` and of
 `GroupedGemmWgradSm100`) launches persistent clusters instead, which claim output
 tiles from a 4-byte int32 counter in the kernel workspace; a helper kernel resets
 it on the launch stream before every launch. Each output tile is still computed
@@ -288,6 +288,16 @@ bytes as the CLC path. The default, `False`, generates the same code as before.
 - Dense and discrete output, both input orders, and `accumulate_on_output` are
   supported. The JAX MXFP8 path does not take the option: the wrapper raises
   `ValueError` there.
+
+### Programmatic dependent launch (PDL)
+
+Keywords of `GroupedGemmWgradSm100`, both `False` by default (the default
+generates the same code as without them):
+
+| Option | Effect | Use |
+|---|---|---|
+| `use_pdl=True` | The main kernel launches as the programmatic dependent of the kernel before it on the stream, so its setup (shared memory, barriers, scheduler state) overlaps that kernel's tail. Every thread waits for that grid (`griddepcontrol.wait`) before its first global memory access. Rejected with `ValueError` whenever the call launches the helper kernel right before the main kernel: TensorRagged inputs, discrete output, `atomic_counter_claim`, and every block-scaled call (the helper builds the scale-factor descriptors). | BF16, dense output, Tensor2D inputs, the CLC schedule. |
+| `launch_pdl_dependents_at_entry=True` | The main kernel lets its own programmatic dependent launch at its entry. The dependent must wait (`griddepcontrol.wait`) before it reads the wgrad output. | Every configuration, BF16 and block-scaled. |
 
 The BF16 kernel uses dynamic persistent scheduling. The token dimension is
 compiled dynamically, and the wrapper cache abstracts the token-sized axes of A

@@ -143,6 +143,8 @@ class GroupedGemmWgradSm100(APIBase):
         accumulate_on_output: bool = False,
         input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
         atomic_counter_claim: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ) -> None:
         super().__init__()
         self._pending_init_kwargs = dict(locals())

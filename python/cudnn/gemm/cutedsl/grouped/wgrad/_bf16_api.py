@@ -69,6 +69,8 @@ class GroupedGemmWgradBf16API(APIBase):
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
         atomic_counter_claim: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -111,6 +113,8 @@ class GroupedGemmWgradBf16API(APIBase):
         if not isinstance(atomic_counter_claim, bool):
             raise ValueError(f"atomic_counter_claim must be a bool, got {atomic_counter_claim!r}")
         self.atomic_counter_claim = atomic_counter_claim
+        self.use_pdl = use_pdl
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
         self.sf_vec_size = sf_vec_size
         self.sf_fp8_dtype_override = sf_fp8_dtype_override
         self._scale_controls = (
@@ -311,6 +315,8 @@ class GroupedGemmWgradBf16API(APIBase):
             weight_mode=self.weight_mode,
             input_order=self.input_order,
             atomic_counter_claim=self.atomic_counter_claim,
+            use_pdl=self.use_pdl,
+            launch_pdl_dependents_at_entry=self.launch_pdl_dependents_at_entry,
         )
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
