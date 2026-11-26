@@ -179,7 +179,7 @@ def _knobs(config: ConvTileConfig) -> dict:
         k.TILE_N: config.cta_tile_n,
         k.TILEK: config.cta_tile_k_bytes,
         k.CTA_GROUP: config.cta_group,
-        k.STAGES: 3,
+        k.STAGES: 6,
     }
 
 

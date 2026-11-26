@@ -47,7 +47,8 @@ halving the chain length keeps that error under an atol-bound tolerance for
 long reductions. When both chains of two work items fit in the 512-column TMEM
 (cta_tile_n <= 128), two accumulator stages double-buffer consecutive work
 items; epilogue slots release TMEM immediately after tcgen05.ld and register
-consumption, before SMEM staging and TMA stores.
+consumption, before SMEM staging and TMA stores, and the A/B SMEM ring scales
+up to 6 stages within the device's per-block shared-memory capacity.
 
 Coverage: test/python/conv/frost/test_frost_conv_wgrad.py (numerics against an
 independent FP64 contraction, every dtype/tile/CTA-group combination, geometry,
@@ -69,7 +70,7 @@ from cutlass.experimental import primitives as prims
 import cutlass.experimental.cuda as cuda
 from cudnn._cutlass_helpers import static_persistent_tile_scheduler as scheduler
 
-from cudnn.frost.device import build_target, device_context
+from cudnn.frost.device import build_target, device_context, shared_memory_per_block_optin
 from cudnn.frost.tile_dsl.consume import consume_then_arrive, consume_then_arrive_on_peer, release_zero
 from ..tile_config import ConvTileConfig
 from .epilogue import get_epilogue_op
@@ -90,7 +91,8 @@ _SMEM_ALIGNMENT = 1024
 _TMEM_COLS = 512
 
 # Pipeline stage counts, warp roles, and synchronization constants
-_NUM_AB_STAGES = 3
+_MIN_AB_STAGES = 3
+_MAX_AB_STAGES = 6
 # Accumulation chains folded per dW element in TMEM (Rule 12). When two pairs
 # of chains fit in 512 TMEM columns (cta_tile_n <= 128), two inter-tile
 # accumulator stages double-buffer consecutive work items.
@@ -205,6 +207,38 @@ class OperandLayout:
         return (_MMA_INST_K_BYTES * _BITS_PER_BYTE // self.bits) * self.tma_box_bytes
 
 
+def _align_up(value: int, alignment: int = _SMEM_ALIGNMENT) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _smem_bytes(
+    a_layout: OperandLayout,
+    b_layout: OperandLayout,
+    epi_datapath: _EpiDatapath,
+    c_dtype: Type[Numeric],
+    num_ab_stages: int,
+) -> int:
+    c_bytes = _NUM_C_STAGES * epi_datapath.c_tile_rows * epi_datapath.subtile_n * c_dtype.width // _BITS_PER_BYTE
+    return _SMEM_ALIGNMENT + _align_up(num_ab_stages * a_layout.stage_bytes) + _align_up(num_ab_stages * b_layout.stage_bytes) + _align_up(c_bytes)
+
+
+def _select_ab_stages(
+    a_layout: OperandLayout,
+    b_layout: OperandLayout,
+    epi_datapath: _EpiDatapath,
+    c_dtype: Type[Numeric],
+    smem_capacity_bytes: int,
+    stages: int | None = None,
+) -> int:
+    if stages is not None and (type(stages) is not int or stages not in range(_MIN_AB_STAGES, _MAX_AB_STAGES + 1)):
+        raise ValueError(f"frost_conv_wgrad: stages must be in [{_MIN_AB_STAGES}, {_MAX_AB_STAGES}], got {stages}")
+    cap = _MAX_AB_STAGES if stages is None else stages
+    for candidate in range(cap, _MIN_AB_STAGES - 1, -1):
+        if _smem_bytes(a_layout, b_layout, epi_datapath, c_dtype, candidate) <= smem_capacity_bytes:
+            return candidate
+    raise ValueError("frost_conv_wgrad: operand stages do not fit in shared memory")
+
+
 def _select_acc_stages(cta_tile_n: int) -> int:
     return min(_MAX_ACC_STAGES, _TMEM_COLS // (_NUM_ACC_CHAINS * cta_tile_n))
 
@@ -240,6 +274,7 @@ def _kernel(
     b_layout: cutlass.Constexpr[OperandLayout],
     epi_datapath: cutlass.Constexpr[_EpiDatapath],
     epilogue_op: cutlass.Constexpr[Callable[[Any], Any]],
+    ab_stages: cutlass.Constexpr[int],
     padding: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     stride: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     dilation: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
@@ -288,15 +323,15 @@ def _kernel(
     #                         lane per fragment, from BOTH CTAs, all on the leader's copy.
     #   tmem_ptr_slot[1]      the Int32 TMEM token written by tcgen05.alloc.
     tmem_dealloc_mbar = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
-    ab_full_mbar = cutlass.Array(cutlass.Int64, _NUM_AB_STAGES, space=cutlass.AddressSpace.smem)
-    ab_empty_mbar = cutlass.Array(cutlass.Int64, _NUM_AB_STAGES, space=cutlass.AddressSpace.smem)
+    ab_full_mbar = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
+    ab_empty_mbar = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
     acc_full_mbar = cutlass.Array(cutlass.Int64, num_acc_slots, space=cutlass.AddressSpace.smem)
     acc_empty_mbar = cutlass.Array(cutlass.Int64, num_acc_slots, space=cutlass.AddressSpace.smem)
     tmem_ptr_slot = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem)
-    # Operand rings: 3 stages each, 1024-byte aligned so every TMA-box row starts
-    # on a swizzle boundary.
-    smem_a = cutlass.Array(cutlass.Int8, _NUM_AB_STAGES * a_layout.stage_bytes, space=cutlass.AddressSpace.smem, alignment=_SMEM_ALIGNMENT)
-    smem_b = cutlass.Array(cutlass.Int8, _NUM_AB_STAGES * b_layout.stage_bytes, space=cutlass.AddressSpace.smem, alignment=_SMEM_ALIGNMENT)
+    # Operand rings: ab_stages stages each, 1024-byte aligned so every TMA-box row
+    # starts on a swizzle boundary.
+    smem_a = cutlass.Array(cutlass.Int8, ab_stages * a_layout.stage_bytes, space=cutlass.AddressSpace.smem, alignment=_SMEM_ALIGNMENT)
+    smem_b = cutlass.Array(cutlass.Int8, ab_stages * b_layout.stage_bytes, space=cutlass.AddressSpace.smem, alignment=_SMEM_ALIGNMENT)
     # Epilogue staging: two fragments, alternating, so a bulk store can still be
     # reading one while the next fragment is written.
     smem_c = cutlass.Array(c_dtype, _NUM_C_STAGES * c_stage_elements, space=cutlass.AddressSpace.smem, alignment=_SMEM_ALIGNMENT)
@@ -304,7 +339,7 @@ def _kernel(
         if prims.elect_sync():
             # mbarrier_init is elect-safe: one lane per CTA initializes.
             prims.mbarrier_init(tmem_dealloc_mbar, _WARP_SIZE)
-            for stage_idx in cutlass.range_constexpr(_NUM_AB_STAGES):
+            for stage_idx in cutlass.range_constexpr(ab_stages):
                 prims.mbarrier_init(ab_full_mbar.subview(stage_idx), 1)
                 prims.mbarrier_init(ab_empty_mbar.subview(stage_idx), 1)
             for acc_idx in cutlass.range_constexpr(num_acc_slots):
@@ -389,7 +424,7 @@ def _kernel(
                             group=cta_group,
                         )
                 ab_stage_idx += 1
-                if ab_stage_idx == _NUM_AB_STAGES:
+                if ab_stage_idx == ab_stages:
                     ab_stage_idx = 0
                     ab_empty_phase ^= 1
             tile_sched.advance_to_next_work()
@@ -483,7 +518,7 @@ def _kernel(
                         # producer is released too.
                         prims.tcgen05_commit(ab_empty_mbar.subview(ab_stage_idx), group=cta_group, multicast_mask=commit_multicast_mask)
                     ab_stage_idx += 1
-                    if ab_stage_idx == _NUM_AB_STAGES:
+                    if ab_stage_idx == ab_stages:
                         ab_stage_idx = 0
                         ab_full_phase ^= 1
                 if prims.elect_sync():
@@ -673,6 +708,8 @@ class _WgradKernel:
         c_dtype: Type[Numeric],
         epilogue: str,
         attrs: tuple[tuple[str, float], ...],
+        smem_capacity_bytes: int,
+        stages: int | None = None,
     ) -> None:
         self.config = config
         self.ab_dtype = ab_dtype
@@ -695,6 +732,14 @@ class _WgradKernel:
         # store kind and the epilogue warp split. The device SMEM sizing and the
         # host dW descriptor both read it, so they cannot drift.
         self.epi_datapath = _select_epi_datapath(config.cta_tile_m, config.use_2cta_instrs, c_dtype)
+        self.ab_stages = _select_ab_stages(
+            self.a_layout,
+            self.b_layout,
+            self.epi_datapath,
+            c_dtype,
+            smem_capacity_bytes,
+            stages,
+        )
 
     @cute.jit
     def __call__(
@@ -780,6 +825,7 @@ class _WgradKernel:
             b_layout,
             epi_datapath,
             self.epilogue,
+            self.ab_stages,
             padding,
             stride,
             dilation,
@@ -800,10 +846,22 @@ def compile(
     config: ConvTileConfig = DEFAULT_CONFIG,
     epilogue: str = "identity",
     epilogue_attrs: tuple[tuple[str, float], ...] = (),
+    stages: int | None = None,
 ) -> Any:
     check_config(config, c_dtype)
     device, target = build_target()
-    return _compile_cached(device, target, ab_dtype, c_dtype, config, epilogue, epilogue_attrs)
+    smem_capacity_bytes = shared_memory_per_block_optin(device)
+    reduction_per_stage = config.cta_tile_k(ab_dtype.width)
+    a_layout = OperandLayout(config.cta_tile_m, reduction_per_stage, ab_dtype.width)
+    b_layout = OperandLayout(
+        config.cta_tile_n // config.cta_group,
+        reduction_per_stage,
+        ab_dtype.width,
+        minimum_tma_box_bytes=_MAX_SWIZZLE_BYTES,
+    )
+    epi_datapath = _select_epi_datapath(config.cta_tile_m, config.use_2cta_instrs, c_dtype)
+    ab_stages = _select_ab_stages(a_layout, b_layout, epi_datapath, c_dtype, smem_capacity_bytes, stages)
+    return _compile_cached(device, target, ab_dtype, c_dtype, config, epilogue, epilogue_attrs, smem_capacity_bytes, ab_stages)
 
 
 @lru_cache(maxsize=None)
@@ -815,6 +873,8 @@ def _compile_cached(
     config: ConvTileConfig,
     epilogue: str,
     epilogue_attrs: tuple[tuple[str, float], ...],
+    smem_capacity_bytes: int,
+    ab_stages: int = _MAX_AB_STAGES,
 ) -> Any:
     # Shapes and geometry never enter the artifact identity.
     # Every extent below is symbolic, so one artifact serves any conv of this
@@ -837,7 +897,7 @@ def _compile_cached(
         neutral_coord = (cutlass.Int32(1),) * 3
         geometry = [neutral_coord, neutral_coord, neutral_coord, neutral_coord]
         return cute.compile(
-            _WgradKernel(config, ab_dtype, c_dtype, epilogue, epilogue_attrs),
+            _WgradKernel(config, ab_dtype, c_dtype, epilogue, epilogue_attrs, smem_capacity_bytes, ab_stages),
             *args,
             utils.HardwareInfo().get_max_active_clusters(config.cta_group),  # persistent grid bound
             make_fake_stream(),

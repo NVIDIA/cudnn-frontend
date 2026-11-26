@@ -29,7 +29,7 @@ from .utils import _tuple_param, _ZERO, _ONE, _channels_last_3d_stride, _storage
 
 def fixed_knobs():
     k = cudnn.knob_type
-    return {k.TILE_M: 128, k.TILE_N: 128, k.TILEK: 128, k.CTA_GROUP: 1, k.STAGES: 3}
+    return {k.TILE_M: 128, k.TILE_N: 128, k.TILEK: 128, k.CTA_GROUP: 1, k.STAGES: 6}
 
 
 class _WgradPlan(CompiledPlan):
@@ -122,7 +122,7 @@ class FrostConvWgradEngine(BaseEngine):
 
     def knobs_from_public(self, public):
         k = cudnn.knob_type
-        domains = {k.TILE_M: (64, 128), k.TILE_N: range(32, 257, 32), k.TILEK: (64, 128), k.CTA_GROUP: (1, 2), k.STAGES: (3,)}
+        domains = {k.TILE_M: (64, 128), k.TILE_N: range(32, 257, 32), k.TILEK: (64, 128), k.CTA_GROUP: (1, 2), k.STAGES: range(3, 7)}
         if any(key not in domains or type(value) is not int or value not in domains[key] for key, value in public.items()):
             raise ValueError("frost_conv_wgrad: unsupported configuration or knob")
         return fixed_knobs() | public
@@ -142,7 +142,7 @@ class FrostConvWgradEngine(BaseEngine):
             config = ConvTileConfig(knobs[k.TILE_M], knobs[k.TILE_N], knobs[k.TILEK], knobs[k.CTA_GROUP])
             ab_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(a.image.data_type)]
             output_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(a.weight.data_type)]
-            return _WgradPlan(compile(ab_dtype, output_dtype, config, a.epilogue, a.epilogue_attrs), a, current_device())
+            return _WgradPlan(compile(ab_dtype, output_dtype, config, a.epilogue, a.epilogue_attrs, knobs[k.STAGES]), a, current_device())
 
 
 def FrostConvWgradEngines(ids: dict[str, int]) -> list[BaseEngine]:

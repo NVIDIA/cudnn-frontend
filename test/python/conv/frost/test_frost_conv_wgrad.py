@@ -307,6 +307,11 @@ def test_frost_wgrad_dependency_gate(monkeypatch, version):
 def test_frost_wgrad_knob_rejection():
     engine = FrostConvWgradEngine()
     assert engine.knobs_to_public(engine.knobs_from_public(fixed_knobs())) == fixed_knobs()
+    for stages in range(3, 7):
+        assert engine.knobs_from_public({cudnn.knob_type.STAGES: stages})[cudnn.knob_type.STAGES] == stages
+    for stages in (2, 7):
+        with pytest.raises(ValueError, match="configuration"):
+            engine.knobs_from_public({cudnn.knob_type.STAGES: stages})
     for key in fixed_knobs():
         with pytest.raises(ValueError, match="configuration"):
             engine.knobs_from_public(fixed_knobs() | {key: 99})
@@ -531,10 +536,17 @@ def test_frost_wgrad_operand_descriptor_swizzles():
             assert layout.stage_bytes >= channels * 128
             assert layout.stride_bytes == (512 if bits == 32 else 8 * layout.tma_box_bytes)
 
-    from cudnn.conv.frost.templates.sm100_conv_wgrad import _select_acc_stages
+    from cudnn.conv.frost.templates.sm100_conv_wgrad import _WgradKernel, _select_acc_stages
+    from cudnn.conv.frost.tile_config import ConvTileConfig
+    import cutlass
 
     for n in range(32, 257, 32):
         assert _select_acc_stages(n) == (2 if n <= 128 else 1)
+    smem_cap = 227 * 1024
+    assert _WgradKernel(ConvTileConfig(128, 128, 128, 1), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 6
+    assert _WgradKernel(ConvTileConfig(128, 256, 128, 2), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 6
+    assert _WgradKernel(ConvTileConfig(128, 256, 128, 1), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap).ab_stages == 4
+    assert _WgradKernel(ConvTileConfig(128, 256, 128, 2), cutlass.BFloat16, cutlass.BFloat16, "identity", (), smem_cap, stages=3).ab_stages == 3
 
 
 @pytest.mark.parametrize(
