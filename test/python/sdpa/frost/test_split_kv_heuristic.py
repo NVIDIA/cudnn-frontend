@@ -1621,3 +1621,85 @@ def test_sm107_window_decode_split(d, b, h_q, h_kv, s_q, s_kv, window, split):
         device_cc=(10, 7),
     )
     assert (_knob_sets(spec, facts)[0].split_kv or 1) == split
+
+
+# --- per-tensor FP8 sinks and windows -----------------------------------------
+
+
+def _fp8_sink_decode(device_cc, d=64, **kw):
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+
+    fields = dict(
+        b=1,
+        h_q=8,
+        h_kv=1,
+        s_q=1,
+        s_kv=131072,
+        d_qk=d,
+        d_v=d,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.FP8_E4M3,
+        is_fp8=True,
+        has_sink=True,
+        device_sm_count=B200_SMS,
+        device_cc=device_cc,
+    )
+    fields.update(kw)
+    return ga.SdpaGraphFacts(**fields)
+
+
+def _row_caps(name):
+    """The row's policy domain (exact shapes not delegated), the capabilities the chooser plans with."""
+    from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
+
+    return sm100_legacy_policy_spec(name).capabilities
+
+
+@pytest.mark.parametrize(
+    "row,device_cc,d,proposes",
+    [
+        ("sdpa_fwd_prefill_sm100_fp8", (10, 0), 64, True),
+        ("sdpa_fwd_prefill_sm100_fp8", (10, 3), 64, True),
+        ("sdpa_fwd_prefill_sm107_fp8", (10, 7), 64, True),
+        ("sdpa_fwd_prefill_sm120_fp8", (12, 0), 128, True),
+        ("sdpa_fwd_prefill_sm120_fp8", (12, 0), 64, False),
+    ],
+)
+def test_fp8_sink_split_is_proposed_where_mismatch_admits_it(row, device_cc, d, proposes):
+    """A per-tensor FP8 sink folds once in the split combine wherever supports_quantized_split_sink admits the split (#1929, #2184);
+    the chooser proposes it there and nowhere else. One request over a 128k cache at 8/1 is one packed unit on a 148-SM part."""
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    caps = _row_caps(row)
+    facts = _fp8_sink_decode(device_cc, d)
+    points = _split_points(caps, facts, 128, 128, 1, 8)
+    if not proposes:
+        assert points == [1], points
+        return
+    assert points[0] > 1 and points[-1] == 1, points
+    assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=True, split_kv=points[0])) is None
+
+
+def test_mxfp8_sink_keeps_the_unsplit_plan():
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    facts = replace(_fp8_sink_decode((10, 0)), is_fp8=False, is_mxfp8=True)
+    assert _split_points(_row_caps("sdpa_fwd_prefill_sm100_mxfp8"), facts, 128, 128, 1, 8) == [1]
+
+
+@pytest.mark.parametrize("sink", [False, True])
+def test_sm100_fp8_split_sees_only_the_window(sink):
+    """The SM100 FP8 kernels bound the KV loop to the window (compute_kv_loop_bounds), so the split model counts the window's tiles, not
+    the cache's: one decode row under a 128-token window walks one or two KV tiles and does not split."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    caps = _row_caps("sdpa_fwd_prefill_sm100_fp8")
+    full = _fp8_sink_decode((10, 0), has_sink=sink)
+    windowed = replace(full, window_left=128, causal=True, bottom_right=True)
+    assert _split_points(caps, full, 128, 128, 1, 8)[0] > 1
+    assert _split_points(caps, windowed, 128, 128, 1, 8) == [1]
