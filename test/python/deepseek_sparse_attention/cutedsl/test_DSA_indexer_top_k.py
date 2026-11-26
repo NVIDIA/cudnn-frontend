@@ -73,6 +73,15 @@ def _import_dsa():
     return DSA
 
 
+def _skip_unsupported_deterministic_width(dtype, num_cols):
+    if torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
+        from cudnn.deepseek_sparse_attention.indexer_top_k.api import _SM120_DETERMINISTIC_MAX_NUM_COLS
+
+        limit = _SM120_DETERMINISTIC_MAX_NUM_COLS[dtype]
+        if num_cols > limit:
+            pytest.skip(f"Deterministic Top-K on SM120/121 supports at most {limit} columns for {dtype}")
+
+
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_top_k_params
 def test_DSA_indexer_top_k_compile_execute(
@@ -1216,6 +1225,9 @@ def test_indexer_top_k_starts_spill_warm_stress():
     def launch():
         op.execute(scores, ends, starts=starts, out_indices=indices, out_values=values, workspace=workspace)
 
+    # Atomic reservations can reorder scratch entries, and only the active
+    # slots are written. Reuse the scratch on each launch and compare the
+    # final indices and values for the warm-stress error rate.
     stress = StressCase(
         "standalone DSA Top-K interval candidate refill",
         launch,
@@ -1232,6 +1244,7 @@ def test_indexer_top_k_starts_bf16_mixed_interval_widths():
     """Verify canonical BF16 indices across the bitmap capacity boundary."""
     dsa = _import_dsa()
     rows, width, k = 152, 65539, 512
+    _skip_unsupported_deterministic_width(torch.bfloat16, width)
     columns = torch.arange(width, device="cuda")
     scores = ((columns * 7) % 17).to(torch.bfloat16).repeat(rows, 1)
     intervals = [(11, 4104), (7, 32775), (13, 32782), (39, 6560)]
@@ -1286,6 +1299,8 @@ def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, determini
     """Exercise reuse, filtering, and reuse after switching a candidate plane."""
     dsa = _import_dsa()
     width, k, rows = 32773, 2048, 156
+    if deterministic:
+        _skip_unsupported_deterministic_width(torch.float32, width)
     columns = torch.arange(width, device="cuda", dtype=torch.int32)
     low = columns % 67
     common = (0x3F800000 | low).view(torch.float32)
@@ -1354,6 +1369,8 @@ def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, determini
 def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, k, tie_break, deterministic, width):
     """Check FP32 cutoff keys at the FP16 rounding boundaries used by coarse filtering."""
     dsa = _import_dsa()
+    if deterministic:
+        _skip_unsupported_deterministic_width(torch.float32, width)
     directed = not deterministic and tie_break == 1
     rows = 156
     columns = torch.arange(width, device="cuda", dtype=torch.int32)

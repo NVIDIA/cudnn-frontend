@@ -4986,6 +4986,26 @@ the native PyTorch allocator. On B300, the L0 subset selected by
 `-k "coarse_bin_refinement or spilled_candidate_planes or zero_scratch_cache_boundary"`
 reported 33 passed. The JAX Top-K command above reported 8 passed on B300.
 
+The SM120/121 test gates use the same deterministic width limits as
+`IndexerTopK.check_support()`. On B300, overriding the capability only
+for test admission reported 20 passed and 13 skipped for each emulated
+capability (12.0 and 12.1) in the mixed-interval, spilled-plane and
+coarse-bin cases. The non-deterministic cases ran on B300. Native SM120
+and SM121 execution remains unverified.
+
+On native SM100 (cc 10.0, 148 SMs), the L0/L1 command above reported
+258 passed, 9 SM120/121 skips and 6 deselected with PyTorch 2.12.1 cu130,
+cuDNN 9.20.0 and CuTe DSL 4.8.0. The seven temporary comparison records
+matched the tracked input and output hashes. The suite exercises
+shared-memory radix, radix with spill and zero-scratch paths.
+Refill stress observed zero differences in 128 warm and 128 poisoned launches.
+
+With native device detection, the same three groups plus the refill
+warm-stress and deterministic width rejection cases reported 37 passed
+on both H200 and B300. The refill case reuses the candidate workspace
+and checks the final indices and values byte for byte. Scratch slots
+follow atomic reservation order, and only the active range is written.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
