@@ -129,7 +129,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
-        vector_f32: bool = False,
+        vector_f32: bool = True,
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
         act_func: str = "swiglu",
@@ -172,7 +172,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
             scale tensors are still supplied as ``torch.float8_e4m3fn`` because
             torch has no e5m3 dtype -- only the CuTe element type is overridden.
-        :param vector_f32: Use vectorized f32 operations
+        :param vector_f32: Use packed f32x2 operations in the epilogue (default True)
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
         :param act_func: Activation function, one of "swiglu", "geglu", or "situglu"
