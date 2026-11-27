@@ -3087,6 +3087,12 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
+# Rubin paged D128 / D256 prefix split envelopes: the declared S_kv bound, and the bound on the one-tile extra-wave arm, which lost
+# past it (study paged_thd_long_kv_split_20261127).
+SM107_PAGED_PREFIX_SPLIT_MAX_KV = 131072
+SM107_PAGED_ONE_TILE_EXTRA_WAVE_MAX_KV = 32768
+
+
 def paged_d256_prefix_launch(caps: Capabilities, facts) -> Optional[_SplitKvLaunch]:
     """Qualified two-CTA prefix geometry, shared by placement and split choice."""
     if not (
@@ -3106,7 +3112,7 @@ def paged_d256_prefix_launch(caps: Capabilities, facts) -> Optional[_SplitKvLaun
         and not facts.right_band_widening
         and facts.window_left is None
         and 64 <= facts.s_q <= 1024
-        and 2048 <= facts.s_kv <= 32768
+        and 2048 <= facts.s_kv <= SM107_PAGED_PREFIX_SPLIT_MAX_KV
         and facts.s_kv >= 4 * facts.s_q
         and facts.device_sm_count
     ):
@@ -3120,7 +3126,7 @@ def paged_d256_prefix_launch(caps: Capabilities, facts) -> Optional[_SplitKvLaun
 SM100_PAGED_PACKED_SPLIT_CGA = {(64, 64): 1, (256, 256): 2}  # SM100/103 paged half packed split: D64 decode tile, D256 pair
 SM100_PAGED_PACKED_SPLIT_GROUPS = (2, 4, 8, 16)
 SM100_PAGED_PACKED_SPLIT_Q = (8, 1024)  # declared S_q range measured (B200 study sm100_paged_d64_d256_prefill_20261111)
-SM100_PAGED_PACKED_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
+SM100_PAGED_PACKED_SPLIT_KV = (2048, 131072)  # declared S_kv range measured (to 131072: study paged_thd_long_kv_split_20261127)
 SM100_PAGED_PACKED_SPLIT_KV_PER_Q = 2  # declared S_kv >= this x S_q
 # Past the first wave (study sm100_paged_packed_split_waves_20261112; B200, B300 transfer): the parts timed, the declared S_q up to which the
 # packed split still leads, D64 also to 128 rows over at least this many KV tiles, and at most this many partitions.
@@ -3226,7 +3232,7 @@ SM100_PAGED_TAIL_SPLIT_CGA = {(64, 64): 1, (128, 128): 1, (256, 256): 2}
 SM100_PAGED_TAIL_SPLIT_CCS = frozenset({(10, 0), (10, 3)})
 SM100_PAGED_TAIL_SPLIT_MAX_B = 16
 SM100_PAGED_TAIL_SPLIT_Q = (16, 1024)  # declared S_q range measured
-SM100_PAGED_TAIL_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
+SM100_PAGED_TAIL_SPLIT_KV = (2048, 131072)  # declared S_kv range measured (to 131072: study paged_thd_long_kv_split_20261127)
 SM100_PAGED_TAIL_SPLIT_ONE_TILE_DIMS = frozenset({64, 128})
 SM100_PAGED_TAIL_SPLIT_MULTI_TILE_BREAK_EVEN = {256: 74}
 SM100_PAGED_TAIL_SPLIT_PARTIAL_COST = 16
@@ -3421,7 +3427,7 @@ def _measured_paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: b
         and facts.bottom_right
         and facts.window_left is None
         and (SM100_PAGED_D128_WIDE_MIN_Q if wide else 64) <= facts.s_q <= 1024
-        and 2048 <= facts.s_kv <= (SM100_PAGED_D128_WIDE_MAX_KV if wide else 32768)
+        and 2048 <= facts.s_kv <= (SM100_PAGED_D128_WIDE_MAX_KV if wide else SM107_PAGED_PREFIX_SPLIT_MAX_KV if caps.sm_lo == 107 else 32768)
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
     )
@@ -3466,7 +3472,7 @@ def _measured_paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: b
     if choices:
         _, splits, _, _, pack = min(choices)
         return splits, pack
-    if caps.sm_lo == 107 and facts.b <= 4 and facts.s_q <= 128 and facts.s_kv >= 8192:
+    if caps.sm_lo == 107 and facts.b <= 4 and facts.s_q <= 128 and 8192 <= facts.s_kv <= SM107_PAGED_ONE_TILE_EXTRA_WAVE_MAX_KV:
         # Preserve first-wave choices. One-tile queries can use more waves;
         # longer queries can already use an efficient backend prefill tile.
         return _d128_thd_split_wave_choice(facts, extra_waves=3, prefer_pack=True)
