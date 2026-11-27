@@ -322,6 +322,25 @@ def _sm100_dense_split(row: str, facts) -> bool:
     return heuristics.sm100_dense_split_choice(row, facts) >= 2
 
 
+SM107_PAGED_CGA_TILE_S_Q = (128, 256)  # Rubin paged THD d128 unpacked prefill keyed `prefill_cga_tile` for lo < S_q <= hi
+
+
+def _sm107_paged_unpacked_cga_tile(row: str, facts) -> bool:
+    """Rubin paged THD d128 causal prefill whose plan runs unpacked (MHA and the groups the row does not pack) and unsplit, with
+    each head's queries past one 128-row tile but inside one 2-CTA Q tile. The backend's mid-length engine takes these, and
+    FROST's standing against it moves with the query rows, unlike the one-tile chunks below or the longer chunks above
+    (study rubin_paged_unpacked_prefill_20261127), so they key apart, read from the row's own pack and split decisions."""
+    lo, hi = SM107_PAGED_CGA_TILE_S_Q
+    if row != "sdpa_fwd_prefill_sm107" or not (facts.has_paged_kv and facts.thd) or (facts.d_qk, facts.d_v) != (128, 128) or not lo < facts.s_q <= hi:
+        return False
+    if not (facts.causal and facts.bottom_right) or facts.window_left is not None or facts.has_sink or facts.right_band_widening:
+        return False
+    from cudnn.sdpa.fwd import heuristics
+
+    caps = heuristics.sm100_legacy_policy_spec(row).capabilities
+    return not heuristics._prefer_thd_pack_gqa(caps, facts) and heuristics.paged_thd_split_choice(caps, facts)[0] == 1
+
+
 _VERIFY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90"})
 _VERIFY_MAX_S_Q = 16  # placement.DECODE_SHAPED_MAX_S_Q: the spec-decode verify depth
 
@@ -360,6 +379,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         # per head: FlashInfer's short-row declaration, and SM100 paged D64 (FROST 0.24-0.46 of the backend past a 2k cache,
         # 0.67-1.08 above one Q tile; study sm100_paged_d64_d256_prefill_20261111).
         phase = "prefill_short_q"
+    if phase == "prefill" and _sm107_paged_unpacked_cga_tile(row, facts):
+        phase = "prefill_cga_tile"
     if getattr(facts, "deterministic", False):
         phase += "_det"  # only DETERMINISTIC_KEYED_ROWS get here
     if facts.has_paged_kv:
@@ -882,6 +903,20 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", True): Entry("ge", 29.0, "sm107_window_gaps_20261118"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
+    # study rubin_paged_unpacked_prefill_20261127 (208-SM Rubin, cuDNN 9.30.0.15; the inference harness's paged context graph, gen.py
+    # adapter inference_context, bf16; gen.py --constrained over 280 train cells, 144 keyed prefill_cga_tile. Only those classes ship.)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile", "paged", "causal_br", False, "gqa", False): Entry(
+        "le", 6.953, "rubin_paged_unpacked_prefill_20261127", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile", "paged", "causal_br", False, "gqa", True): Entry(
+        "le", 7.292, "rubin_paged_unpacked_prefill_20261127", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile", "paged", "causal_br", False, "mha", False): Entry(
+        "le", 7.792, "rubin_paged_unpacked_prefill_20261127", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile", "paged", "causal_br", False, "mha", True): Entry(
+        "le", 7.5, "rubin_paged_unpacked_prefill_20261127", "tiles"
+    ),
     # study sm107_thd_prefill_20261111 (208-SM Rubin, cuDNN 9.30.0.3; FlashInfer's cudnn path, recorded graph facts; bf16 HND
     # paged page 16/64 and ragged THD, d64/d128 all masks, D192xV128 / d256 ragged all masks and paged mask-free (paged causal
     # D192/D256 is sm107_paged_prefill_20261109's); short-Q, chunks, squares; GQA groups 3-12 incl. 8/1 and 12/1, MHA 16-128.
