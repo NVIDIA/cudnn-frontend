@@ -10,7 +10,11 @@
                               q*stride[2] - padding[2] + s*dilation[2]]
 
 Input coordinates that fall in the padding contribute zero (the im2col tensor map
-masks them), so no host-side halo handling is needed.
+masks them), so no host-side halo handling is needed. The host entry reads
+(d, h, w) from X, (z, p, q) from dY, and (t, r, s) from dW directly: neither
+(d, h, w) nor (t, r, s) is inferred from the other two, because the forward
+spatial mapping z = floor((d + pad_pre + pad_post - dil*(t - 1) - 1) / stride) + 1
+is not invertible when stride > 1.
 
 The whole weight gradient is one persistent kernel over implicit GEMMs, one per
 output tile:
