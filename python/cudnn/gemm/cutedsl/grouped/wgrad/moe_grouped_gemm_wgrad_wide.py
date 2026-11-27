@@ -84,7 +84,9 @@ class MoEGroupedGemmWgradWideBF16Kernel:
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_sync_bar_id = 2
 
-        self.smem_capacity = get_smem_capacity_in_bytes("sm_100")
+        # The compile target's shared memory, as the stock kernel: 232448 B on SM100/103 (4 A/B stages of one A and two
+        # B k-tiles), 334848 B on SM107 (6 stages).
+        self.smem_capacity = get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
         self.num_sched_stages = 2
 
@@ -731,7 +733,7 @@ class MoEGroupedGemmWgradWideBF16Kernel:
                 if next_tile_info.is_valid_tile:
                     load_cycles_per_k = self.num_tma_load_bytes // 128
                     tile_flops_per_k = self.mma_inst_mn[0] * self.mma_inst_mn[1] * self.N_HALVES * self.mma_tiler[2] * 2
-                    # SM103 BF16 tcgen05 peak is 8192 FLOP/SM/cycle;
+                    # BF16 tcgen05 peak is 8192 FLOP/SM/cycle on SM103 and SM107;
                     # CtaGroup.TWO uses a two-SM pair.
                     mma_cycles_per_k = tile_flops_per_k // (2 * 8192)
                     tile_cycles_per_k = max(load_cycles_per_k, mma_cycles_per_k)
