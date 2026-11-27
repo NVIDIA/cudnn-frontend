@@ -84,6 +84,7 @@ from ._blockscaled_api import (
     GroupedGemmWgradBlockScaledAPI,
     _get_rubin_kernel,
     _is_supported_rubin_quantization,
+    dense_output_token_class,
 )
 
 _BLOCK_SCALED_JAX_ERROR = (
@@ -473,6 +474,12 @@ def grouped_gemm_wgrad_wrapper_sm100(
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
         atomic_counter_claim,
+        # The token count is dynamic in the compiled kernel, but the block-scaled dense kernel choice depends on the
+        # mean tokens per expert (see GroupedGemmWgradBlockScaledAPI._select_kernel), so short and long experts
+        # get separate entries.
+        backend is GroupedGemmBackend.BLOCK_SCALED
+        and output_mode == "dense"
+        and dense_output_token_class(tokens_sum, expert_cnt, get_device_type() == "rubin"),
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:

@@ -315,8 +315,9 @@ def test_counter_replays_on_poisoned_buffers(precision, config):
 def test_counter_claim_slot_warm_stress(monkeypatch, precision):
     """In a (2, 1) cluster the leader CTA broadcasts every claim through a shared-memory slot that each CTA reads and then
     releases to the leader. The references are independent of the counter path: the CLC path's output bytes, and the
-    counter's final value, one claim per tile plus each cluster's final empty claim. The TMA descriptors in front of the
-    counter are rebuilt by the helper kernel on every launch and are not part of the claim; they are not compared."""
+    counter's final value, one claim per tile (per work unit of N tiles for the A-reuse MXFP8 kernel) plus each cluster's
+    final empty claim. The TMA descriptors in front of the counter are rebuilt by the helper kernel on every launch and
+    are not part of the claim; they are not compared."""
     import cutlass
     from warm_stress import StressCase, assert_warm_stress
 
@@ -334,6 +335,11 @@ def test_counter_claim_slot_warm_stress(monkeypatch, precision):
 
     clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
     tiles = len(groups) * (M // 256) * (N // 256)
+    if precision == "mxfp8":
+        from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel as Reuse
+
+        if issubclass(op._implementation._select_kernel(), Reuse):
+            tiles //= Reuse.n_group_for(N)  # the A-reuse kernel claims work units of n_group N tiles
     reference = {"wgrad": expected.clone(), "counter": torch.tensor([tiles + clusters], dtype=torch.int32, device="cuda").view(torch.uint8)}
     assert_bitwise({"wgrad": output}, {"wgrad": reference["wgrad"]}, "cold counter launch vs CLC")
     claims = int(counter.view(torch.int32).item())
