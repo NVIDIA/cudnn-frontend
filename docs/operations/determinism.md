@@ -187,6 +187,8 @@ arbitrary user callbacks.
 | `grouped_gemm_dglu_wrapper_sm100` with `deterministic=True`, BF16 kernel (`dswiglu`, `dgeglu`; Torch; no dbias) | bprop | BF16 A/B/C/D_row; FP32 dprob | Unsupported | Supported for dprob and D_row (SM100, tested configurations); SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
 | `cutemok_forward` / `cutemok_backward` | fprop, bprop | BF16; MXFP8 routed weights | Unsupported | Unverified (SM100 MXFP8 replay checked; batch invariance and SM103 unverified) | Unsupported |
+| BF16 grouped GEMM kernels (`MoEGroupedGemmBf16Kernel`, `MoEGroupedGemmGluBiasBf16Kernel`), `use_dynamic_sched=True` with `streaming_signal_capacity` (host or `device_layout` expert layout, optional PDL triggers), dense weights, (2, 1) cluster | fprop | BF16 A/B/C/D; FP32 accumulate | Unsupported | SM100: Supported (tested configurations; bytes equal the stock dynamic scheduler's for every producer release order); SM103: Unverified | Unverified |
+| `MoEGroupedGemmBf16Kernel`, `use_dynamic_sched=True` with `streaming_output_notify` (`N_CHUNK`), dense weights | fprop | BF16 A/B/C/D; FP32 accumulate | Unsupported | SM100: Supported (tested configurations, early-stopping and non-stopping extra clusters); SM103: Unverified | Unverified |
 
 On SM89 (GeForce RTX 4090), the FP16 width-four `cudnn.ops.causal_conv1d_update`
 passed replay, batch-isolation, and golden checks for both output and state.

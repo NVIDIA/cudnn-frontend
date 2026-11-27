@@ -219,6 +219,13 @@ def tensormap_ptr_for_copy(raw_ptr: Pointer, *, loc=None, ip=None) -> Pointer:
 # =============================================================================
 
 
+@cute.jit
+def ceil_div(a, b: cutlass.Constexpr):
+    """``ceil(a / b)`` for ``a >= 0`` and ``b > 0`` in jit code: two static arguments give a Python int (usable in
+    ``const_expr`` / ``range_constexpr``), a dynamic one gives a device value."""
+    return (a + (b - 1)) // b
+
+
 @dsl_user_op
 @cute.jit
 def compute_expert_token_range(
