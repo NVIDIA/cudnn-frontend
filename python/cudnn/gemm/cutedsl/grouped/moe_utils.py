@@ -49,6 +49,18 @@ class MoEWeightMode(Enum):
     DISCRETE = "discrete"
 
 
+def reject_pdl_behind_helper(use_pdl: bool, launches_helper: bool, use_instead: str) -> None:
+    """``use_pdl`` makes a grouped GEMM the programmatic dependent of the launch right before it, which the GEMM waits
+    for only at exit.  ``launches_helper``: that launch is the GEMM's own helper_kernel (discrete B descriptors, dynamic
+    claim counter reset), whose stores the GEMM reads first, so the combination is rejected."""
+    if use_pdl and launches_helper:
+        raise ValueError(
+            "use_pdl=True: the host launch puts helper_kernel (discrete B descriptors, dynamic claim counter reset) "
+            "right before this kernel, so the helper would be its programmatic primary, which it waits for only at exit. "
+            f"Use use_pdl with {use_instead}."
+        )
+
+
 class WGradInputOrder(Enum):
     """Physical layout of the grouped wgrad activation inputs A/B."""
 
@@ -217,6 +229,13 @@ def tensormap_ptr_for_copy(raw_ptr: Pointer, *, loc=None, ip=None) -> Pointer:
 # =============================================================================
 # MoE Utilities
 # =============================================================================
+
+
+@cute.jit
+def ceil_div(a, b: cutlass.Constexpr):
+    """``ceil(a / b)`` for ``a >= 0`` and ``b > 0`` in jit code: two static arguments give a Python int (usable in
+    ``const_expr`` / ``range_constexpr``), a dynamic one gives a device value."""
+    return (a + (b - 1)) // b
 
 
 @dsl_user_op
