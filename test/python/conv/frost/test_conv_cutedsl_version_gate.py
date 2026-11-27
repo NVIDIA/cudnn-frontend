@@ -31,11 +31,11 @@ def test_cutedsl_4_8_serves_block_scale_but_declines_dense(dsl_state) -> None:
 
 
 def test_plan_support_checks_apply_the_flavor_floor_first(dsl_state) -> None:
-    from cudnn.conv.frost.fprop_engine import _Sm100FrostBlockScaleConvPlan, _Sm100FrostConvPlan
+    from cudnn.conv.frost.fprop_engine import _Sm100FrostBlockScaleConvPlan, _Sm100FrostConvFpropPlan
 
     dsl_state(True, ("nvidia-cutlass-dsl", "4.8.0.dev0"))
     with pytest.raises(NotImplementedError, match=r"dense convolution requires nvidia-cutlass-dsl >= 4\.9; found 4\.8\.0\.dev0"):
-        _Sm100FrostConvPlan.check_support(None)
+        _Sm100FrostConvFpropPlan.check_support(None)
 
     dsl_state(True, ("nvidia-cutlass-dsl", "4.7.0"))
     with pytest.raises(NotImplementedError, match=r"block-scale convolution requires nvidia-cutlass-dsl >= 4\.8; found 4\.7\.0"):
@@ -64,7 +64,7 @@ def test_build_plan_gates_before_importing_the_template(dsl_state, monkeypatch, 
     monkeypatch.setattr(engine, "analyze_fprop", lambda graph: analysis)
 
     with pytest.raises(NotImplementedError, match=error):
-        engine.FrostConvEngine().build_plan(None, None)
+        engine.FrostConvFpropEngine().build_plan(None, None)
 
 
 def test_missing_cutedsl_declines_both_variants(dsl_state) -> None:

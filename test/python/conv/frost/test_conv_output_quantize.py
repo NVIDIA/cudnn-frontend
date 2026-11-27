@@ -6,7 +6,7 @@
 import cudnn
 import pytest
 
-from cudnn.conv.frost.fprop_engine import FrostConvEngine
+from cudnn.conv.frost.fprop_engine import FrostConvFpropEngine
 from utils import requires_dense_cutedsl, requires_sm100
 
 pytestmark = [pytest.mark.L0, requires_sm100, requires_dense_cutedsl]
@@ -55,4 +55,4 @@ def test_dense_conv_rejects_output_block_scale_quantize(epilogue) -> None:
     graph.validate()
 
     with pytest.raises(NotImplementedError, match=r"fused block-scale quantize .* only supported when both convolution inputs"):
-        FrostConvEngine().check_support(graph)
+        FrostConvFpropEngine().check_support(graph)

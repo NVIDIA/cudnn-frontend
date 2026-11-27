@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from cudnn.conv.frost.checks import DENSE_CUTEDSL_MIN_VERSION
-from cudnn.conv.frost.fprop_engine import FrostConvEngine
+from cudnn.conv.frost.fprop_engine import FrostConvFpropEngine
 from cudnn.frost.buffers import cutedsl_requirement_error
 
 pytestmark = pytest.mark.L0
@@ -32,11 +32,11 @@ def test_frost_c96_real_dependency_gate_before_template_import(monkeypatch, k):
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        assert not name.endswith("templates.sm100_conv"), "the version gate must precede dense template import"
+        assert not name.endswith("templates.sm100_conv_fprop"), "the version gate must precede dense template import"
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
-    engine = FrostConvEngine()
+    engine = FrostConvFpropEngine()
     for call in (lambda: engine.check_support(graph), lambda: engine.build_plan(graph, None)):
         with pytest.raises(NotImplementedError) as caught:
             call()

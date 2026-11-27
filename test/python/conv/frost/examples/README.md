@@ -39,7 +39,7 @@ so the convolution can omit their zero products. These plans declare 384 bytes
 of caller workspace through `get_workspace_size()` and refresh the flags on
 every execution. Concurrent executions need separate workspace buffers.
 
-The example explicitly selects `frost_conv` to demonstrate coverage. C96 plans
+The example explicitly selects `frost_conv_fprop` to demonstrate coverage. C96 plans
 follow ordinary cuDNN plans in the default ordering; explicit selection and
 `OPENSOURCE` queries still expose FROST. Compare complete-operation latency
 before selecting a route for an application. Coverage does not imply a speedup.

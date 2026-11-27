@@ -63,7 +63,7 @@ def run(output_channels, provider="frost", tiled_layout=False):
                 graph.build_operation_graph()
                 graph.create_execution_plans([cudnn.heur_mode.A])
                 names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
-                graph.select_plan(next(i for i, name in enumerate(names) if name != "frost_conv"))
+                graph.select_plan(next(i for i, name in enumerate(names) if name != "frost_conv_fprop"))
                 graph.check_support()
                 graph.build_plans()
             workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)

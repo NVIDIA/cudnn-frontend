@@ -68,7 +68,7 @@ class OutputQuantizeData:
 
 
 @dataclass(frozen=True)
-class ConvGraph:
+class FpropGraph:
     """The kernel-relevant tensors and specialization selected from a graph."""
 
     context: GraphContext  # dtypes
@@ -221,7 +221,7 @@ def _match_block_scale_quantize(graph: pygraph, tensor: Tensor) -> Optional[tupl
     return output_quantize_data, graph_output
 
 
-def analyze_fprop(graph: pygraph) -> ConvGraph:
+def analyze_fprop(graph: pygraph) -> FpropGraph:
     """Describe a structurally supported Frost convolution graph.
 
     The accepted graph grammar is one convolution, optionally followed by one
@@ -243,7 +243,7 @@ def analyze_fprop(graph: pygraph) -> ConvGraph:
     materializes both its data and scale outputs. No other operation results may
     be materialized in a block-scaled graph.
 
-    The returned :class:`ConvGraph` always exposes the buffers a plan binds as
+    The returned :class:`FpropGraph` always exposes the buffers a plan binds as
     ``image``, ``weight``, and ``output``. Dense graphs have
     ``block_scale_data=None``. Block-scaled graphs attach SFA/SFB and their
     dequantization nodes/tensors in :class:`BlockScaleData`. ``intermediate``
@@ -254,7 +254,7 @@ def analyze_fprop(graph: pygraph) -> ConvGraph:
 
     This function checks topology and fusion structure only. Device, dtype,
     shape, stride, scale layout, block size, and the narrower executable
-    epilogue contract are validated later by ``FrostConvEngine.check_support``.
+    epilogue contract are validated later by ``FrostConvFpropEngine.check_support``.
 
     Raises:
         NotImplementedError: If the graph does not match one of these forms.
@@ -311,7 +311,7 @@ def analyze_fprop(graph: pygraph) -> ConvGraph:
         if (not is_initial_input and not is_final_output) and not tensor.is_virtual:
             raise NotImplementedError(f"Intermediate tensor {tensor.name} must be virtual")
 
-    return ConvGraph(
+    return FpropGraph(
         context=graph.context,
         conv_node=conv_node,
         image=image,
@@ -325,4 +325,4 @@ def analyze_fprop(graph: pygraph) -> ConvGraph:
     )
 
 
-__all__ = ["BlockScaleData", "ConvGraph", "OutputQuantizeData", "SUPPORTED_UNARY_EPILOGUES", "WgradGraph", "analyze_fprop", "analyze_wgrad"]
+__all__ = ["BlockScaleData", "FpropGraph", "OutputQuantizeData", "SUPPORTED_UNARY_EPILOGUES", "WgradGraph", "analyze_fprop", "analyze_wgrad"]

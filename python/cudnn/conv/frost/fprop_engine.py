@@ -20,7 +20,7 @@ from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanC
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
 from cudnn.frost.device import current_device
-from cudnn.conv.frost.graph_analyzer import analyze_fprop, ConvGraph
+from cudnn.conv.frost.graph_analyzer import analyze_fprop, FpropGraph
 
 from .checks import (
     BLOCK_SCALE_CUTEDSL_MIN_VERSION,
@@ -61,13 +61,13 @@ from .utils import (
 _MISSING_DEVICE = object()
 
 
-class _Sm100FrostConvPlan(CompiledPlan):
+class _Sm100FrostConvFpropPlan(CompiledPlan):
     """A convolution artifact and fixed graph bindings, with runtime geometry."""
 
     takes_variant_pack = True
 
     @staticmethod
-    def check_support(analysis: ConvGraph) -> None:
+    def check_support(analysis: FpropGraph) -> None:
         """Decline unsupported dense graphs before compilation, including unqualified C96 architectures."""
         _check_cutedsl("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
         _check_sm100()
@@ -226,7 +226,7 @@ class _Sm100FrostBlockScaleConvPlan(CompiledPlan):
 
     takes_variant_pack = True
 
-    def __init__(self, compiled, analysis: ConvGraph, geometry, device: int):
+    def __init__(self, compiled, analysis: FpropGraph, geometry, device: int):
         self._compiled = compiled
         block_scale = analysis.block_scale_data
         if block_scale is None:
@@ -481,21 +481,21 @@ class _Sm100FrostBlockScaleConvPlan(CompiledPlan):
             raise NotImplementedError("frost_conv: SFD must use the unswizzled NONE layout")
 
     @classmethod
-    def check_support(cls, analysis: ConvGraph) -> None:
+    def check_support(cls, analysis: FpropGraph) -> None:
         _check_cutedsl("frost_conv block-scale convolution", BLOCK_SCALE_CUTEDSL_MIN_VERSION)
         _check_sm100()
         cls._check_graph_support(analysis)
 
 
-class FrostConvEngine(BaseEngine):
+class FrostConvFpropEngine(BaseEngine):
     """Dispatch graph analysis to a plan-specific Frost convolution contract."""
 
-    name = "frost_conv"
+    name = "frost_conv_fprop"
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph: "pygraph") -> None:
         analysis = analyze_fprop(graph)
-        plan_type = _Sm100FrostBlockScaleConvPlan if analysis.block_scale_data is not None else _Sm100FrostConvPlan
+        plan_type = _Sm100FrostBlockScaleConvPlan if analysis.block_scale_data is not None else _Sm100FrostConvFpropPlan
         plan_type.check_support(analysis)
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
@@ -533,7 +533,7 @@ class FrostConvEngine(BaseEngine):
         else:
             _check_cutedsl("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
             # Keep compiler-template imports lazy so engine discovery does not load them.
-            from .templates.sm100_conv import compile
+            from .templates.sm100_conv_fprop import compile
 
             ab_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(image.data_type)]
             c_dtype = _CUTLASS_STORAGE_DTYPES[_storage_dtype_name(output.data_type)]
@@ -549,13 +549,13 @@ class FrostConvEngine(BaseEngine):
                 ab_dtype=ab_dtype,
                 c_dtype=c_dtype,
             )
-            return _Sm100FrostConvPlan(compiled, (image, weight, output), current_device(), (post_padding, pre_padding, stride, dilation))
+            return _Sm100FrostConvFpropPlan(compiled, (image, weight, output), current_device(), (post_padding, pre_padding, stride, dilation))
 
 
 def FrostConvFpropEngines(ids: dict[str, int]) -> list[BaseEngine]:
     """The forward-convolution engines the manifest asked for, with assigned ids."""
     out = []
-    for cls in (FrostConvEngine,):
+    for cls in (FrostConvFpropEngine,):
         if cls.name in ids:
             engine = cls()
             engine.engine_id = ids[cls.name]

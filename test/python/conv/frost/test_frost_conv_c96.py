@@ -40,7 +40,7 @@ def _plan(image, weight, history_frames=0):
     w = graph.tensor_like(weight)
     y = graph.conv_fprop(x, w, pre_padding=(2 - history_frames, 1, 1), post_padding=(0, 1, 1), stride=(1, 1, 1), dilation=(1, 1, 1))
     y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_dim(output.shape).set_stride(output.stride())
-    select_and_build_frost_plan(graph, "frost_conv")
+    select_and_build_frost_plan(graph, "frost_conv_fprop")
     workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device=image.device)
     return graph, (x, w, y), output, workspace
 
@@ -172,7 +172,7 @@ def test_frost_conv_c96_oracle_detects_wrong_padding_and_missing_tail():
 @pytest.mark.parametrize("unsupported", ["c32", "c80", "c95", "c97", "c112", "c160", "k128", "half", "stride2", "filter1", "symmetric", "ncdhw", "relu"])
 def test_frost_conv_c96_declines_outside_qualified_envelope(unsupported):
     """Reject unsupported channels, types, geometry, layouts, and fused epilogues."""
-    from cudnn.conv.frost.fprop_engine import FrostConvEngine
+    from cudnn.conv.frost.fprop_engine import FrostConvFpropEngine
 
     c = int(unsupported[1:]) if unsupported.startswith("c") else 96
     k = 128 if unsupported == "k128" else 96
@@ -197,7 +197,7 @@ def test_frost_conv_c96_declines_outside_qualified_envelope(unsupported):
     )
     graph.validate()
     with pytest.raises(NotImplementedError, match="frost_conv"):
-        FrostConvEngine().check_support(graph)
+        FrostConvFpropEngine().check_support(graph)
 
 
 @pytest.mark.L0
@@ -259,7 +259,7 @@ def test_frost_conv_c96_default_placement_and_explicit_selection(c, dtype, mode)
     graph.build_operation_graph()
     graph.create_execution_plans([mode])
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
-    index = names.index("frost_conv")
+    index = names.index("frost_conv_fprop")
     if c == 64 or dtype == torch.float32 or mode == cudnn.heur_mode.OPENSOURCE:
         assert index == 0
     else:
@@ -461,10 +461,10 @@ def test_frost_conv_c96_initial_capture_separate_workspaces(cudnn_handle):
 @pytest.mark.parametrize("first_frame", [True, False])
 def test_frost_conv_c96_reuses_artifact_across_shapes(monkeypatch, k, first_frame):
     """Reuse each C96 schedule across batch/spatial/history changes without recompiling."""
-    from cudnn.conv.frost.templates import sm100_conv
+    from cudnn.conv.frost.templates import sm100_conv_fprop
 
     cases = [((1, 96, 1, 17, 19), 0), ((2, 96, 1, 19, 23), 0)] if first_frame else [((1, 96, 4, 7, 9), 1), ((2, 96, 6, 9, 11), 2)]
-    sm100_conv._compile_cached.cache_clear()
+    sm100_conv_fprop._compile_cached.cache_clear()
     try:
         for index, (shape, history) in enumerate((*cases, cases[0])):
             image = make_input(shape, torch.bfloat16, seed=801 + index)
@@ -476,6 +476,6 @@ def test_frost_conv_c96_reuses_artifact_across_shapes(monkeypatch, k, first_fram
             epsilon = float(torch.finfo(torch.bfloat16).eps)
             torch.testing.assert_close(actual.float(), expected.float(), atol=2 * epsilon, rtol=2 * epsilon, equal_nan=True)
             if index == 0:
-                monkeypatch.setattr(sm100_conv.cute, "compile", lambda *args, **kwargs: pytest.fail("C96 geometry change recompiled"))
+                monkeypatch.setattr(sm100_conv_fprop.cute, "compile", lambda *args, **kwargs: pytest.fail("C96 geometry change recompiled"))
     finally:
-        sm100_conv._compile_cached.cache_clear()
+        sm100_conv_fprop._compile_cached.cache_clear()

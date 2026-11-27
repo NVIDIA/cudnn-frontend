@@ -61,7 +61,7 @@ def test_frost_conv_supported_dtype_combinations(monkeypatch, input_dtype, outpu
 
     output_gpu = torch.empty(reference.shape, dtype=output_torch_dtype, device="cuda", memory_format=torch.channels_last_3d)
     output.set_output(True).set_data_type(output_cudnn_dtype).set_dim(output_gpu.shape).set_stride(output_gpu.stride())
-    select_and_build_frost_plan(graph, "frost_conv")
+    select_and_build_frost_plan(graph, "frost_conv_fprop")
 
     workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     graph.execute({image: image_gpu, weight: weight_gpu, output: output_gpu}, workspace)

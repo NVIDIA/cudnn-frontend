@@ -435,7 +435,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "frost_conv_fprop",
         "cudnn.conv.frost.fprop_engine",
         "FrostConvFpropEngines",
-        slots={"frost_conv": EngineSlot(0, opt_in=True)},
+        slots={"frost_conv_fprop": EngineSlot(0, opt_in=True)},
         analyzer=("cudnn.conv.frost.fprop_heuristics", "analyze_facts"),
         heuristics=("cudnn.conv.frost.fprop_heuristics", "propose"),
     ),

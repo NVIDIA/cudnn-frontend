@@ -7,7 +7,7 @@ from cudnn import data_type
 from cudnn.engines.base import PlanConfig
 from cudnn.engines.heuristics import BACKEND
 
-from .graph_analyzer import ConvGraph, analyze_fprop
+from .graph_analyzer import FpropGraph, analyze_fprop
 
 
 def analyze_facts(graph):
@@ -18,9 +18,9 @@ def analyze_facts(graph):
         return None
 
 
-def propose(kind: str, facts: ConvGraph, offered: dict[str, int]) -> list[PlanConfig]:
+def propose(kind: str, facts: FpropGraph, offered: dict[str, int]) -> list[PlanConfig]:
     """Keep BF16 C96 backend-first while preserving existing dtype and channel preferences."""
-    engine_id = offered.get("frost_conv")
+    engine_id = offered.get("frost_conv_fprop")
     if engine_id is None:
         return []
     ours = [PlanConfig(engine_id)]

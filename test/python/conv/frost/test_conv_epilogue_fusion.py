@@ -9,7 +9,7 @@ import cudnn
 import pytest
 import torch
 
-from cudnn.conv.frost.fprop_engine import FrostConvEngine
+from cudnn.conv.frost.fprop_engine import FrostConvFpropEngine
 from cudnn.conv.frost.graph_analyzer import SUPPORTED_UNARY_EPILOGUES
 from epilogue_cases import EPILOGUE_CASES, EpilogueCase
 from utils import make_input, requires_dense_cutedsl, requires_sm100, select_and_build_frost_plan
@@ -77,7 +77,7 @@ def test_plain_conv_does_not_require_a_float_intermediate() -> None:
     output.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_dim(output_gpu.shape).set_stride(output_gpu.stride())
     graph.validate()
 
-    FrostConvEngine().check_support(graph)
+    FrostConvFpropEngine().check_support(graph)
 
 
 @pytest.mark.parametrize(
@@ -111,7 +111,7 @@ def test_frost_conv_rejects_unsupported_precision_contracts(intermediate_dtype, 
     graph.validate()
 
     with pytest.raises(NotImplementedError, match=error):
-        FrostConvEngine().check_support(graph)
+        FrostConvFpropEngine().check_support(graph)
 
 
 @pytest.mark.parametrize("case", EPILOGUE_CASES, ids=lambda case: case.name)
@@ -155,7 +155,7 @@ def test_frost_conv_supported_unary_epilogues(monkeypatch, case: EpilogueCase) -
         memory_format=torch.channels_last_3d,
     )
     output.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_dim(output_gpu.shape).set_stride(output_gpu.stride())
-    select_and_build_frost_plan(graph, "frost_conv")
+    select_and_build_frost_plan(graph, "frost_conv_fprop")
 
     workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     graph.execute({image: image_gpu, weight: weight_gpu, output: output_gpu}, workspace)

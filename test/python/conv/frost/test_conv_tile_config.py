@@ -61,7 +61,7 @@ def test_private_selector_is_not_exported_from_frost_package() -> None:
 
 
 def _get_dense_config(M: int, N: int, K: int, channel_bytes: int, sm_count: int = 148) -> ConvTileConfig:
-    from cudnn.conv.frost.templates.sm100_conv import _is_dense_selection_candidate
+    from cudnn.conv.frost.templates.sm100_conv_fprop import _is_dense_selection_candidate
 
     return _get_config(
         M,
@@ -164,14 +164,14 @@ def test_block_scale_k_width_names_are_complete_catalog_entries(cta_k_bytes) -> 
 @pytest.mark.parametrize("cta_k_bytes", (32, 64, 96, 256))
 @requires_dense_cutedsl
 def test_dense_compile_rejects_block_scale_only_k_widths_before_cute_compile(monkeypatch, cta_k_bytes) -> None:
-    from cudnn.conv.frost.templates import sm100_conv
+    from cudnn.conv.frost.templates import sm100_conv_fprop
 
     def unexpected_compile(*args, **kwargs):
         pytest.fail("cute.compile must not be called for an invalid dense tile config")
 
-    monkeypatch.setattr(sm100_conv.cute, "compile", unexpected_compile)
+    monkeypatch.setattr(sm100_conv_fprop.cute, "compile", unexpected_compile)
     with pytest.raises(ValueError, match=rf"{cta_k_bytes}.*CTA K must be 128|CTA K must be 128.*{cta_k_bytes}"):
-        sm100_conv.compile(
+        sm100_conv_fprop.compile(
             ncdhw=(1, 128, 1, 1, 1),
             ktrs=(128, 1, 1, 1),
             tile_config=ConvTileConfig(128, 128, cta_k_bytes, 1),
@@ -181,15 +181,15 @@ def test_dense_compile_rejects_block_scale_only_k_widths_before_cute_compile(mon
 @pytest.mark.L0
 @requires_dense_cutedsl
 def test_dense_compile_rejects_catalog_geometry_incompatible_with_dense_epilogue(monkeypatch) -> None:
-    from cudnn.conv.frost.templates import sm100_conv
+    from cudnn.conv.frost.templates import sm100_conv_fprop
 
     def unexpected_compile(*args, **kwargs):
         pytest.fail("cute.compile must not be called for an invalid dense tile config")
 
-    monkeypatch.setattr(sm100_conv.cute, "compile", unexpected_compile)
+    monkeypatch.setattr(sm100_conv_fprop.cute, "compile", unexpected_compile)
     config = ConvTileConfig(64, 32, 128, 2)
     with pytest.raises(ValueError, match=rf"{config.name}.*M=64 2-CTA requires CTA N divisible by 64"):
-        sm100_conv.compile(
+        sm100_conv_fprop.compile(
             ncdhw=(1, 64, 1, 1, 1),
             ktrs=(128, 1, 1, 1),
             tile_config=config,
@@ -474,7 +474,7 @@ def _run_bf16_config(tile_config: ConvTileConfig) -> None:
     import torch
     from cuda.bindings import driver as cuda
 
-    from cudnn.conv.frost.templates.sm100_conv import compile
+    from cudnn.conv.frost.templates.sm100_conv_fprop import compile
 
     channels = tile_config.cta_tile_k(16)
     image_shape = (1, channels, 2, 8, 10)
@@ -668,15 +668,15 @@ def test_block_scale_compiler_cache_keys_on_the_build_device(monkeypatch, order)
 @requires_dense_cutedsl
 def test_dense_compiler_cache_keys_on_the_build_device(monkeypatch, order) -> None:
     """The dense template's cache follows the build device and its target the same way."""
-    from cudnn.conv.frost.templates import sm100_conv
+    from cudnn.conv.frost.templates import sm100_conv_fprop
 
-    current, compiled = _model_two_parts(monkeypatch, sm100_conv, order)
-    monkeypatch.setattr(sm100_conv.utils, "HardwareInfo", lambda: type("HardwareInfo", (), {"get_max_active_clusters": lambda self, size: 1})())
-    sm100_conv._compile_cached.cache_clear()
+    current, compiled = _model_two_parts(monkeypatch, sm100_conv_fprop, order)
+    monkeypatch.setattr(sm100_conv_fprop.utils, "HardwareInfo", lambda: type("HardwareInfo", (), {"get_max_active_clusters": lambda self, size: 1})())
+    sm100_conv_fprop._compile_cached.cache_clear()
     try:
         for device in (0, 1, 0, 1):
             current[0] = device
-            assert sm100_conv.compile(ncdhw=(1, 128, 1, 1, 1), ktrs=(128, 1, 1, 1), tile_config=ConvTileConfig(128, 128, 128, 1))[0] == device
+            assert sm100_conv_fprop.compile(ncdhw=(1, 128, 1, 1, 1), ktrs=(128, 1, 1, 1), tile_config=ConvTileConfig(128, 128, 128, 1))[0] == device
     finally:
-        sm100_conv._compile_cached.cache_clear()
+        sm100_conv_fprop._compile_cached.cache_clear()
     assert compiled == [(device, f"--enable-tvm-ffi --gpu-arch {_TARGETS[order[device]]}") for device in (0, 1)]
