@@ -799,7 +799,7 @@ def blockscaled_mma_fold(
             stage = (None, None, None, None, handle.index)
             cute.copy(tiled_copy_sfa, tCsSFA_s2t[stage], tCtSFA_s2t)  # this block's scale factors -> TMEM
             cute.copy(tiled_copy_sfb, tCsSFB_s2t[stage], tCtSFB_s2t)
-            for j in lowering.inner_steps():  # the lowering's issue order inside a block
+            for j in cutlass.range_constexpr(lowering.inner):
                 acc_on = lowering.accumulate(k_tile, j)  # off on the fold's first step only
                 if cutlass.const_expr(st.breuse):
                     for h, mma_h in (

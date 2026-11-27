@@ -40,9 +40,6 @@ class MainloopBlock:
     def lowering(self):
         return self
 
-    def inner_steps(self):
-        return range(self.inner)
-
     @staticmethod
     def accumulate(block, j):
         return True if j > 0 else block != 0
