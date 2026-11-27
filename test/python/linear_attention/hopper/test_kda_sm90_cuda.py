@@ -147,11 +147,8 @@ def test_strided_inputs_are_not_misread():
 def test_absent_initial_state_is_zeroed_on_the_execution_stream():
     """Omitting initial_state must equal passing an explicit zero state.
 
-    The seed buffer is cached but re-zeroed on the execution stream every call.
-    Filling it with torch.zeros on the ambient stream left no dependency on the
-    stream the kernel runs on, so a fresh plan could read whatever the
-    allocation held. Running on a side stream after dirtying the allocator is
-    what makes that visible.
+    Run on a side stream after dirtying the allocator to catch accidental
+    dependence on the contents or initialization order of temporary storage.
     """
     q, k, v, g, beta, cu, s0 = make_case(T=512, H=4)
     zeros = torch.zeros_like(s0)
@@ -169,6 +166,88 @@ def test_absent_initial_state_is_zeroed_on_the_execution_stream():
 
     torch.testing.assert_close(bare_o.float(), seeded_o.float(), atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(bare_fs, seeded_fs, atol=2e-2, rtol=2e-2)
+
+
+@requires_hopper
+def test_cached_plans_do_not_retain_optional_state(monkeypatch):
+    from cudnn.linear_attention.ops import kda
+
+    # Make both sequence counts new to the plan caches, regardless of test order.
+    monkeypatch.setattr(kda, "fprop_cache", {})
+    monkeypatch.setattr(kda, "bprop_cache", {})
+    q, k, v, g, beta, one_seq, _ = make_case(T=256, H=4)
+    q.requires_grad_()
+    dy = torch.ones_like(q)
+    four_seqs = torch.arange(0, 257, 64, device=q.device, dtype=torch.int32)
+
+    def step(cu):
+        out = kimi_delta_attention(q, k, v, g, beta, cu, plan_name=ENGINE)[0]
+        torch.autograd.grad(out, q, dy)
+
+    step(one_seq)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    for cu in (four_seqs, one_seq):
+        step(cu)
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() <= baseline
+
+
+@requires_hopper
+@pytest.mark.parametrize("with_initial", [False, True], ids=["zero_seed", "with_seed"])
+@pytest.mark.parametrize("with_final", [False, True], ids=["no_final", "with_final"])
+def test_optional_states_match_explicit_states(with_initial, with_final):
+    from determinism_utils import assert_bitwise, assert_replays
+
+    q, k, v, g, beta, _, state = make_case(T=128, H=4, N=3)
+    cu = torch.tensor([0, 0, 65, 128], device=q.device, dtype=torch.int32)
+    inputs = tuple(x.requires_grad_() for x in (q, k, v, g, beta))
+    state = (state if with_initial else torch.zeros_like(state)).requires_grad_()
+    dy = torch.ones_like(q)
+    ds = torch.ones_like(state) if with_final else torch.zeros_like(state)
+
+    def run(initial, final):
+        y, s = kimi_delta_attention(*inputs, cu, initial_state=initial, output_final_state=final, plan_name=ENGINE)[:2]
+        leaves = (*inputs, state) if with_initial else inputs
+        grads = torch.autograd.grad((y, s), leaves, (dy, ds)) if final else torch.autograd.grad(y, leaves, dy)
+        result = dict(zip(("dq", "dk", "dv", "dg", "dbeta", "d_initial_state"), grads))
+        result["out"] = y
+        if with_final:
+            result["final_state"] = s
+        return result
+
+    reference = run(state, True)
+    replay = assert_replays(lambda: run(state if with_initial else None, with_final), repeats=2)
+    assert_bitwise(replay, reference)
+
+
+@requires_hopper
+def test_cuda_graph_replays_without_optional_states():
+    from determinism_utils import assert_bitwise
+
+    q, k, v, g, beta, cu, _ = make_case(T=256, H=4, N=2)
+    q.requires_grad_()
+    dy = torch.ones_like(q)
+
+    def step():
+        y = kimi_delta_attention(q, k, v, g, beta, cu, plan_name=ENGINE)[0]
+        return {"out": y, "dq": torch.autograd.grad(y, q, dy)[0]}
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        step()
+    torch.cuda.current_stream().wait_stream(warmup)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    for _ in range(2):
+        with torch.no_grad():
+            q.neg_()
+        expected = step()
+        graph.replay()
+        assert_bitwise(captured, expected)
 
 
 @requires_hopper

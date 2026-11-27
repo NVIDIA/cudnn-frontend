@@ -446,8 +446,8 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
     const int chunks = (s1 - s0 + kChunk - 1) / kChunk;
     const long sbase = (static_cast<long>(seq) * H + head) * kDim * kDim;
     if (chunks == 0) {
-        if (seg == 0)
-            for (int i = tid; i < kDim * kDim; i += 128) gfs[sbase + i] = gis[sbase + i];
+        if (seg == 0 && gfs != nullptr)
+            for (int i = tid; i < kDim * kDim; i += 128) gfs[sbase + i] = gis ? gis[sbase + i] : 0.0f;
         return;
     }
     const int slen = (chunks + P - 1) / P;
@@ -545,7 +545,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
     const bool seeded = (cs == 0);
     float st[4][32];
     if (seeded) {
-        const float* seed = gis + sbase;
+        const float* seed = gis ? gis + sbase : nullptr;
 #pragma unroll
         for (int rh = 0; rh < 2; ++rh)
 #pragma unroll
@@ -554,7 +554,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                 for (int i = 0; i < 32; ++i) {
                     const int row     = 64 * rh + warp * 16 + lg + 8 * ((i & 3) >> 1);
                     const int col     = j * 64 + 8 * (i >> 2) + 2 * tg + (i & 1);
-                    st[2 * rh + j][i] = seed[row * kDim + col];
+                    st[2 * rh + j][i] = seed ? seed[row * kDim + col] : 0.0f;
                 }
     }
 
@@ -1017,7 +1017,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
         pend = -1;
     }
 
-    if (c1 == chunks) {
+    if (c1 == chunks && gfs != nullptr) {
         float* fs = gfs + sbase;
 #pragma unroll
         for (int rh = 0; rh < 2; ++rh)

@@ -1134,7 +1134,7 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
 
     const float* srcst = (dir == 0) ? ist : dfs;
     float acc[TS::TPW][4];
-    {  // seed state, transposed:  S[d][x] = src[n][h][x][d]
+    if (srcst != nullptr) {  // seed state, transposed: S[d][x] = src[n][h][x][d]
         const float* p = srcst + ((size_t)nh * DH + vb * BV) * DH;
         for (int u = tid; u < BV * DH; u += NT) {
             const int x = u >> 7, d = u & 127;
@@ -1146,6 +1146,8 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
 #pragma unroll
             for (int r = 0; r < 4; ++r) acc[j][r] = sF[TS::row(warp, lane, j, r) * 65 + TS::col(warp, lane, j, r)];
         __syncthreads();
+    } else {
+        zero_acc<TS::TPW>(acc);
     }
 
     // ---- prefetch one chunk's operands into stage `st` --------------------
@@ -1284,7 +1286,7 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
         }
     }
 
-    if (dir == 1) {
+    if (dir == 1 && dis != nullptr) {
         __syncthreads();
         for (int j = 0; j < TS::TPW; ++j)
             for (int r = 0; r < 4; ++r) sF[TS::row(warp, lane, j, r) * 65 + TS::col(warp, lane, j, r)] = acc[j][r];
