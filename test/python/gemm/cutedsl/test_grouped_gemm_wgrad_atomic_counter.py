@@ -334,7 +334,9 @@ def test_counter_claim_slot_warm_stress(monkeypatch, precision):
     counter = op._implementation._workspace[-4:]
 
     clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
-    tiles = len(groups) * (M // 256) * (N // 256)
+    # One claim per work tile: 256 x 256, or 256 x 512 where the BF16 API picks its wide-tile kernel.
+    tile_n = 512 if precision == "bf16" and op._implementation._wide_applies() else 256
+    tiles = len(groups) * (M // 256) * (N // tile_n)
     if precision == "mxfp8":
         from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel as Reuse
 

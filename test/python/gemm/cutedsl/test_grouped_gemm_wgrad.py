@@ -1783,3 +1783,219 @@ def test_rubin_api_picks_wgrad_variants(monkeypatch, counter):
         stock = _global_desc_run(problem, "discrete", counter=counter)
         assert picked[start:] == [kernel, BlockScaledMoEGroupedGemmWgradRubinKernel], (n, groups, picked[start:])
         assert_bitwise({"wgrad": variant}, snapshot({"wgrad": stock}), f"Rubin {kernel.__name__} vs Rubin stock")
+
+
+# ---------------------------------------------------------------------------
+# BF16 wide tiles: 256 x 512 per CTA pair, each A tile shared by both 256-column halves. The API runs the wide kernel for
+# dense output, Tensor2D input and n % 512 == 0 at the default 2-CTA 256x256 tile when the dW has enough wide tiles
+# for the device (_wide_tiles_pay_off); its dW must be the stock kernel's byte for byte. The discrete output mode always
+# runs the stock kernel on the same inputs.
+# ---------------------------------------------------------------------------
+
+
+def _bf16_wgrad_api(m, n, experts, *, output_mode="dense", tile=(256, 256), cluster=(2, 1), wgrad_dtype=torch.bfloat16, **kwargs):
+    """A BF16 wgrad API for dW of experts x (m, n) built from CPU tensors: enough for the kernel selection, never compiled."""
+    from cudnn.gemm.cutedsl.grouped.wgrad._bf16_api import GroupedGemmWgradBf16API
+
+    tokens = 256
+    a = torch.empty((tokens, m), dtype=torch.bfloat16).t()
+    b = torch.empty((tokens, n), dtype=torch.bfloat16)
+    offsets = torch.zeros((experts,), dtype=torch.int32)
+    if output_mode == "dense":
+        out = dict(sample_wgrad=torch.empty((experts, m, n), dtype=wgrad_dtype))
+    else:
+        out = dict(num_experts=experts, wgrad_shape=(m, n), wgrad_dtype=wgrad_dtype)
+    return GroupedGemmWgradBf16API(
+        sample_a=a, sample_b=b, sample_sfa=None, sample_sfb=None, sample_offsets=offsets, mma_tiler_mn=tile, cluster_shape_mn=cluster, **out, **kwargs
+    )
+
+
+def _min_wide_experts(m, n, clusters):
+    """The fewest experts of dW (m, n) for which the API picks the wide kernel on `clusters` resident 2-CTA clusters."""
+    from cudnn.gemm.cutedsl.grouped.wgrad._bf16_api import GroupedGemmWgradBf16API
+
+    per_expert = (m // 256) * (n // 512)
+    return -(-GroupedGemmWgradBf16API._WIDE_MIN_TILES_PER_CLUSTER * clusters // per_expert)
+
+
+# The 20 MoE weight gradients at 8192 tokens per rank, (m, n, local experts) of dW1 (2I x H) and dW2 (H x I), and
+# whether the API picks the wide kernel on GB200 (76 resident 2-CTA clusters) and VR200 (106).
+WIDE_RULE_GEMMS = [
+    # name, m, n, experts, wide on GB200, wide on VR200
+    ("deepseek_v3-ep4-dW1", 4096, 7168, 64, True, True),
+    ("deepseek_v3-ep4-dW2", 7168, 2048, 64, True, True),
+    ("qwen35_122b-ep4-dW1", 2048, 3072, 64, True, True),
+    ("qwen35_122b-ep4-dW2", 3072, 1024, 64, True, False),
+    ("qwen35_397b-ep4-dW1", 2048, 4096, 128, True, True),
+    ("qwen35_397b-ep4-dW2", 4096, 1024, 128, True, True),
+    ("glm53_flash-ep4-dW1", 4096, 4096, 72, True, True),
+    ("glm53_flash-ep4-dW2", 4096, 2048, 72, True, True),
+    ("qwen38_2p4t-ep4-dW1", 4096, 8192, 128, True, True),
+    ("qwen38_2p4t-ep4-dW2", 8192, 2048, 128, True, True),
+    ("deepseek_v3-ep8-dW1", 4096, 7168, 32, True, True),
+    ("deepseek_v3-ep8-dW2", 7168, 2048, 32, True, True),
+    ("qwen35_122b-ep8-dW1", 2048, 3072, 32, True, False),
+    ("qwen35_122b-ep8-dW2", 3072, 1024, 32, False, False),
+    ("qwen35_397b-ep8-dW1", 2048, 4096, 64, True, True),
+    ("qwen35_397b-ep8-dW2", 4096, 1024, 64, True, True),
+    ("glm53_flash-ep8-dW1", 4096, 4096, 36, True, True),
+    ("glm53_flash-ep8-dW2", 4096, 2048, 36, True, True),
+    ("qwen38_2p4t-ep8-dW1", 4096, 8192, 64, True, True),
+    ("qwen38_2p4t-ep8-dW2", 8192, 2048, 64, True, True),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("name, m, n, experts, wide_gb200, wide_vr200", WIDE_RULE_GEMMS, ids=[g[0] for g in WIDE_RULE_GEMMS])
+def test_bf16_wgrad_wide_rule_on_moe_shapes(name, m, n, experts, wide_gb200, wide_vr200):
+    """CPU only: the selection rule on the MoE wgrad shapes at the resident cluster counts of GB200 and VR200."""
+    from cudnn.gemm.cutedsl.grouped.wgrad._bf16_api import GroupedGemmWgradBf16API
+
+    assert GroupedGemmWgradBf16API._wide_tiles_pay_off(m, n, experts, 76) is wide_gb200
+    assert GroupedGemmWgradBf16API._wide_tiles_pay_off(m, n, experts, 106) is wide_vr200
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("m, n", [(3072, 1024), (2048, 3072), (4096, 2048), (4096, 7168)])
+@pytest.mark.parametrize("clusters", [1, 76, 106])
+def test_bf16_wgrad_wide_rule_boundary(m, n, clusters):
+    """CPU only: the wide kernel from exactly _WIDE_MIN_TILES_PER_CLUSTER wide tiles per resident cluster."""
+    from cudnn.gemm.cutedsl.grouped.wgrad._bf16_api import GroupedGemmWgradBf16API
+
+    experts = _min_wide_experts(m, n, clusters)
+    assert GroupedGemmWgradBf16API._wide_tiles_pay_off(m, n, experts, clusters)
+    assert not GroupedGemmWgradBf16API._wide_tiles_pay_off(m, n, experts - 1, clusters)
+    assert not GroupedGemmWgradBf16API._wide_tiles_pay_off(m, n, experts, 0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("rubin", [False, True], ids=["sm100", "sm107"])
+@pytest.mark.parametrize("counter", [False, True], ids=["clc", "counter"])
+def test_bf16_wgrad_wide_selection(monkeypatch, rubin, counter):
+    """CPU only: _wide_applies() at the rule's boundary and for every configuration the wide kernel does not cover. The
+    rule is the same on SM107 (with that device's cluster count) and for both claim modes; _use_wide_tiles = False
+    keeps the stock kernel."""
+    from cudnn.gemm.cutedsl.grouped.wgrad._bf16_api import GroupedGemmWgradBf16API
+
+    clusters = 106 if rubin else 76
+    monkeypatch.setattr(GroupedGemmWgradBf16API, "_max_active_clusters", lambda self: clusters)
+    m, n = 2048, 3072
+    experts = _min_wide_experts(m, n, clusters)
+
+    def applies(experts=experts, m=m, n=n, **kwargs):
+        api = _bf16_wgrad_api(m, n, experts, atomic_counter_claim=counter, **kwargs)
+        api._is_rubin_kernel = rubin
+        return api._wide_applies()
+
+    assert applies()
+    assert not applies(experts - 1)
+    assert not applies(n=n - 512 + 256)  # n % 512 != 0
+    assert not applies(output_mode="discrete")
+    assert not applies(accumulate_on_output=True)
+    assert not applies(input_order="tensor_ragged")
+    assert not applies(tile=(128, 256), cluster=(1, 1))
+    assert not applies(cluster=(4, 1))
+    assert not applies(wgrad_dtype=torch.float32)
+    assert applies(wgrad_dtype=torch.float16)
+    monkeypatch.setattr(GroupedGemmWgradBf16API, "_use_wide_tiles", False)
+    assert not applies()
+
+
+def _require_bf16_wide_device():
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
+        pytest.skip("Requires SM100+ for grouped GEMM wgrad")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("The wide BF16 wgrad is SM100/SM103/SM107 only")
+
+
+def _bf16_wgrad_run(problem, output_mode, *, counter=False):
+    output = torch.full_like(problem["output"], float("nan"))
+    discrete = output_mode == "discrete"
+    cudnn.grouped_gemm_wgrad_wrapper_sm100(
+        a_tensor=problem["a"],
+        b_tensor=problem["b"],
+        sfa_tensor=None,
+        sfb_tensor=None,
+        offsets_tensor=problem["offsets"],
+        output_mode=output_mode,
+        wgrad_tensor=None if discrete else output,
+        wgrad_ptrs=torch.tensor([e.data_ptr() for e in output], dtype=torch.int64, device="cuda") if discrete else None,
+        acc_dtype=torch.float32,
+        wgrad_dtype=output.dtype,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        atomic_counter_claim=counter,
+    )
+    torch.cuda.synchronize()
+    return output
+
+
+def _record_wide_picks(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.wgrad import _bf16_api
+
+    picked = []
+    original = _bf16_api.GroupedGemmWgradBf16API._wide_applies
+
+    def record(self):
+        applies = original(self)
+        picked.append(applies)
+        return applies
+
+    monkeypatch.setattr(_bf16_api.GroupedGemmWgradBf16API, "_wide_applies", record)
+    monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_wgrad_wrapper_memo", {})
+    monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_cache_of_GroupedGemmWgradSm100Objects", {})
+    return picked
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("counter", [False, True], ids=["clc", "counter"])
+def test_bf16_wgrad_default_picks_wide_at_rule_boundary(monkeypatch, counter):
+    """With the library defaults, the fewest experts that reach the rule run the wide kernel and one expert fewer runs
+    the stock kernel; both give the stock kernel's dW bytes (the discrete mode)."""
+    _require_bf16_wide_device()
+    import cutlass
+    from determinism_utils import assert_bitwise, snapshot
+
+    picked = _record_wide_picks(monkeypatch)
+    m, n = 2048, 4096
+    experts = _min_wide_experts(m, n, cutlass.utils.HardwareInfo().get_max_active_clusters(2))
+    for count in (experts, experts - 1):
+        groups = (256, 0, 512) * (count // 3) + (256,) * (count % 3)
+        problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=groups, m=m, n=n, a_major="m", b_major="n")
+        dense = _bf16_wgrad_run(problem, "dense", counter=counter)
+        stock = _bf16_wgrad_run(problem, "discrete", counter=counter)
+        assert_bitwise({"wgrad": dense}, snapshot({"wgrad": stock}), f"{count} experts: default vs stock")
+        del problem, dense, stock
+    assert picked == [True, False, False, False]
+
+
+# (groups, m, n): empty experts, uneven groups, and multi-pair clusters (m a multiple of 1024: (8, 2) under CLC).
+WIDE_CASES = [
+    pytest.param((256, 0, 1024, 256, 0, 512), 512, 1024, id="m512-n1024", marks=pytest.mark.L0),
+    pytest.param((512, 0, 256, 2048, 0, 0, 768), 2048, 2048, id="m2048-n2048", marks=pytest.mark.L0),
+    pytest.param((0, 0, 0), 1024, 512, id="all-empty", marks=pytest.mark.L1),
+    pytest.param((1024, 256, 0, 512), 1024, 3072, id="m1024-n3072", marks=pytest.mark.L1),
+]
+
+
+@pytest.mark.parametrize("groups, m, n", WIDE_CASES)
+@pytest.mark.parametrize("counter", [False, True], ids=["clc", "counter"])
+@pytest.mark.parametrize("majors", [("m", "n"), ("k", "k")], ids=["mn-major", "k-major"])
+def test_bf16_wgrad_wide_matches_stock(monkeypatch, groups, m, n, counter, majors):
+    """The wide kernel, forced on these small shapes, gives the stock kernel's dW bytes."""
+    _require_bf16_wide_device()
+    from cudnn.gemm.cutedsl.grouped.wgrad import _bf16_api
+    from determinism_utils import assert_bitwise, snapshot
+
+    if not sum(groups) and majors != ("m", "n"):
+        pytest.skip("an operand without tokens has one layout")
+    picked = _record_wide_picks(monkeypatch)
+    monkeypatch.setattr(_bf16_api.GroupedGemmWgradBf16API, "_WIDE_MIN_TILES_PER_CLUSTER", 0)
+    problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=groups, m=m, n=n, a_major=majors[0], b_major=majors[1])
+    wide = _bf16_wgrad_run(problem, "dense", counter=counter)
+    stock = _bf16_wgrad_run(problem, "discrete", counter=counter)
+    assert picked == [True, False]
+    assert_bitwise({"wgrad": wide}, snapshot({"wgrad": stock}), "wide vs stock")
+    assert_grouped_gemm_wgrad_bf16_close(wide, grouped_gemm_wgrad_bf16_reference(problem))
