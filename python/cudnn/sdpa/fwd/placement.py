@@ -416,7 +416,10 @@ FP8 agrees with the backend within rel-RMS 0.04 (E4M3 O), bf16 within 0.003.
 
 Rubin bf16 THD prefill through FlashInfer's paths (page 16 / 64 and ragged, d64-d256) is placed by the generated table
 (study ``sm107_thd_prefill_20261111``), which answers before the hand rules below; they still decide f16, bounded paged
-declarations, sinks and the classes that study left without an entry.
+declarations, sinks and the classes that study left without an entry. A paged MHA prefix the row splits is one of those
+(``placement_table._sm107_paged_mha_split``, 2026-11-27): that study fit unsplit MHA at 16-128 heads, and its threshold
+trailed split d128 prefixes FROST ran at 0.05-0.85 of the backend. Study paged_thd_mha_placement_20261127 (cuDNN 9.30.0.15,
+208 SMs): a pre-registered 55-cell holdout came to 0.388 of the measured default over its 45 changed cells, worst 0.973.
 
 Rubin paged bf16 d128 GQA prefill chunks (2026-10-24, ``_sm107_paged_gqa_prefill``): LEAD for GQA 4 / 8 at b 1-4,
 128 < s_q <= 1024, S_kv 2k-32k, bottom-right causal, page 16, head-major in-page K. MHA and group 2 retain the
@@ -489,6 +492,15 @@ and d64 stay near parity and keep the backend.
 GQA 4 / 8 squares also take the packed full-prefill lead (#1809) from S = 512 and on cc 10.3 / page 64: 80 top-left
 squares (S 512-8192, page 16 / 64, b 1 / 3, cuDNN 9.29.0.18) ran FROST at 0.45-0.98 of the backend on a B100 and
 0.49-0.99 on a B300 (2026-10-31).
+
+SM100 paged MHA prefixes (2026-11-27, ``_sm100_paged_mha_prefill``): on cc 10.0 / 10.3 a paged THD MHA prefix (S_q < S_kv) leads
+at d256 up to S_q 2048 and at d64 within one 128-row Q tile, with any total-Q declaration. Study paged_thd_mha_placement_20261127
+(inference harness paged context graph, cuDNN 9.24.0.43): a train sweep of 138 cells per part found FROST's first plan at
+0.15-0.68 of the backend on every d256 cell and 0.18-0.54 on every one-tile d64 cell, none of which led before. Multi-tile
+d64 ran 0.91-1.09 and unsplit d128 0.67-1.89; both keep their rules. A pre-registered holdout scored once (102 cells: heads
+4-64, b 1-64, S_kv 2048-131072, pages 16 / 64 / 128, bf16 and f16, exact, ragged and undeclared total-Q) came to 0.365
+(B200) / 0.344 (B300) of the measured default over its 90 changed cells, worst 0.656 / 0.665. The Rubin counterpart keys
+apart in ``placement_table`` (``_sm107_paged_mha_split``).
 
 SM120 per-tensor FP8 row (``sdpa_fwd_prefill_sm120_fp8``, offered by default): on cc 12.0 the
 backend plans per-tensor FP8 SDPA only for d <= 128 with s_q > 1; it declines s_q == 1, d192x128, d256 and the
