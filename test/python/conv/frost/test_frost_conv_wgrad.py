@@ -20,7 +20,7 @@ from cudnn.conv.frost.utils import _channels_last_3d_stride
 from cudnn.conv.frost.wgrad_engine import FrostConvWgradEngine, fixed_knobs
 from cudnn.engines.base import ExecutionContext
 from cudnn.engines.engine_ids import FROST_CONV_WGRAD_ID_BASE
-from cudnn.engines.heuristics import BACKEND
+from cudnn.engines.heuristics import BACKEND, rank
 from cudnn.engines.manifest import engine_for_id, engines_for, family_for, resolve_analyzer, resolve_heuristics
 from cudnn.frost import buffers
 
@@ -143,6 +143,7 @@ def test_frost_wgrad_numerics(monkeypatch, xshape, wshape):
         ({"xshape": (1, 65, 1, 8, 8), "wshape": (128, 65, 1, 1, 1)}, "aligned"),
         ({"wshape": (65, 128, 1, 1, 1)}, "aligned"),
         ({"xshape": (1, 128, 18, 1, 64), "wshape": (128, 128, 18, 1, 1)}, "corners"),
+        ({"xshape": (1, 128, 16, 128, 128), "wshape": (128, 128, 1, 1, 1)}, "262144"),
     ],
 )
 def test_frost_wgrad_rejections(monkeypatch, change, match):
@@ -152,6 +153,9 @@ def test_frost_wgrad_rejections(monkeypatch, change, match):
     graph, _ = declaration(**args)
     with pytest.raises(NotImplementedError, match=match):
         engine.FrostConvWgradEngine().check_support(graph)
+    if match == "262144":
+        below_limit, _ = declaration(xshape=(1, 128, 1, 1, 262143), wshape=(128, 128, 1, 1, 1))
+        engine.FrostConvWgradEngine().check_support(below_limit)
 
 
 @pytest.mark.parametrize("axis", range(3), ids=("D", "H", "W"))
@@ -366,8 +370,7 @@ def test_frost_wgrad_release_rendering(tmp_path):
     renders = list(Path(tmp_path).glob("*.ptx"))
     assert len(renders) == 1
     ptx = renders[0].read_text()
-    # Two accumulation slots, so one release site per slot, each folding its 64-word fragment.
-    assert_release_dependence(ptx, sites=2, words=64)
+    assert_release_dependence(ptx, sites=1, words=64)
     assert "setmaxnreg.dec.sync.aligned.u32" in ptx
     assert "setmaxnreg.inc.sync.aligned.u32" in ptx
     assert "tcgen05.ld.sync.aligned.32x32b.x64.b32" in ptx
@@ -393,6 +396,11 @@ def test_frost_wgrad_slot_and_ranking(monkeypatch):
     candidates = resolve_heuristics(family)("A", facts, family.offered_ids())
     assert candidates[0] is BACKEND
     assert candidates[1].engine_id == FROST_CONV_WGRAD_ID_BASE
+    monkeypatch.setattr(engine, "_check_sm100", lambda: None)
+    monkeypatch.setattr(engine, "_check_cutedsl", lambda *a: None)
+    assert [p.engine_id for p in rank(graph, engines, [])] == [FROST_CONV_WGRAD_ID_BASE]
+    large_graph, _ = declaration((1, 128, 16, 128, 128), (128, 128, 1, 1, 1))
+    assert rank(large_graph, engines, []) == []
 
 
 @requires_dense_cutedsl
@@ -546,12 +554,10 @@ def test_frost_wgrad_operand_descriptor_swizzles():
             assert layout.stage_bytes >= channels * 128
             assert layout.stride_bytes == (512 if bits == 32 else 8 * layout.tma_box_bytes)
 
-    from cudnn.conv.frost.templates.sm100_conv_wgrad import _WgradKernel, _select_acc_stages, _select_wgrad_epi_datapath
+    from cudnn.conv.frost.templates.sm100_conv_wgrad import _WgradKernel, _select_wgrad_epi_datapath
     from cudnn.conv.frost.tile_config import ConvTileConfig
     import cutlass
 
-    for n in range(32, 257, 32):
-        assert _select_acc_stages(n) == (2 if n <= 128 else 1)
     assert _select_wgrad_epi_datapath(ConvTileConfig(128, 256, 128, 2), cutlass.BFloat16).subtile_n == 64
     assert _select_wgrad_epi_datapath(ConvTileConfig(128, 256, 128, 2), cutlass.Float32).subtile_n == 32
     assert _select_wgrad_epi_datapath(ConvTileConfig(128, 96, 128, 1), cutlass.BFloat16).subtile_n == 32

@@ -26,6 +26,8 @@ from .checks import (
 from .graph_analyzer import analyze_wgrad
 from .utils import _tuple_param, _ZERO, _ONE, _channels_last_3d_stride, _storage_dtype_name, _CUTLASS_STORAGE_DTYPES
 
+_MAX_REDUCTION_LENGTH = 262_144
+
 
 def fixed_knobs():
     k = cudnn.knob_type
@@ -110,9 +112,13 @@ class FrostConvWgradEngine(BaseEngine):
         if any(v >= 2**31 for v in (*dilation, *pre, *post)) or any(extent + pad >= 2**31 for extent, pad in zip(a.image.dim[2:], post)):
             raise NotImplementedError("frost_conv_wgrad exceeds Int32 convolution-coordinate bounds")
         length = prod((expected[0], *expected[2:]))
+        # TODO: for numerical stability issues, if the MMA K dimension (= NZPQ) is too large, the error could accumulate. This should be
+        # fixed by split-K.
+        if length >= _MAX_REDUCTION_LENGTH:
+            raise NotImplementedError(f"frost_conv_wgrad requires reduction length N*Z*P*Q < {_MAX_REDUCTION_LENGTH}; got {length}")
         # Device coordinates and the scheduler use signed Int32. TMA dimensions
         # and byte strides also have finite descriptor fields; reject before JIT.
-        if length >= 2**31 or prod(a.weight.dim[2:]) * ((a.weight.dim[0] + 63) // 64) * ((a.image.dim[1] + 31) // 32) >= 2**31:
+        if prod(a.weight.dim[2:]) * ((a.weight.dim[0] + 63) // 64) * ((a.image.dim[1] + 31) // 32) >= 2**31:
             raise NotImplementedError("frost_conv_wgrad exceeds Int32 reduction/scheduler bounds")
         for (_, tensor), name in zip(tensors, names):
             if any(v >= 2**31 for v in tensor.dim) or any(v * (_CUTLASS_STORAGE_DTYPES[name].width // 8) >= 2**40 for v in tensor.stride):

@@ -230,8 +230,8 @@ The functional implementation accepts:
   pitch must be 16-byte aligned: K must be a multiple of `16 / input_bytes`,
   and C a multiple of both `16 / input_bytes` and `16 / output_bytes`.
   `L = N * Z * P * Q` is the reduction length, distinct from output-channel K;
-  L need not fill a reduction stage. Descriptor and signed 32-bit scheduler
-  bounds are checked before compilation.
+  `L` must be less than `262144` and need not fill a reduction stage. Descriptor
+  and signed 32-bit scheduler bounds are checked before compilation.
 - One optional unary epilogue from the existing FROST convolution vocabulary,
   including ReLU slope/clips, leaky-ReLU slope, and swish beta. Its virtual
   intermediate and computation must be FP32. The epilogue runs once after
@@ -244,9 +244,8 @@ N=32 through 256 in steps of 32, reduction stages of 64/128/256 bytes,
 one-/two-CTA MMA groups, and `STAGES` from 2 through 6 (clamped to the
 device's per-block opt-in shared-memory capacity). M is per CTA; N is the
 output width of the MMA (the paired CTAs stage half of operand X's N
-channels each). Each work item folds two accumulation chains in TMEM (two
-inter-tile accumulator stages when `TILE_N <= 128`, one when `TILE_N > 128`),
-with two output-store stages.
+channels each). Two inter-tile accumulator stages in TMEM and two
+output-store stages overlap consecutive work items.
 
 The implemented TMEM load/store paths impose these epilogue restrictions:
 
