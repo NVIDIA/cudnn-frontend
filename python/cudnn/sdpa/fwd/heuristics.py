@@ -2765,6 +2765,25 @@ def _sm90_decode_split(caps: Capabilities, facts) -> bool:
     )
 
 
+# A windowed SM100 / SM103 per-tensor FP8 launch that fills this many waves unsplit, over a window of at most this many KV tiles,
+# runs unsplit: its kernels walk only the window, so a split adds waves and a combine and finds no idle SM to fill.
+SM100_FP8_WINDOW_UNSPLIT_MIN_WAVES = 1.5
+SM100_FP8_WINDOW_UNSPLIT_MAX_TILES = 20
+
+
+def _sm100_fp8_window_unsplit(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int) -> bool:
+    """A windowed per-tensor FP8 graph on the SM100 / SM103 row whose unsplit launch already fills the part (see the constants)."""
+    if not (100 <= caps.sm_lo and caps.sm_hi < 107 and facts.is_fp8 and not facts.is_mxfp8 and facts.window_left is not None):
+        return False
+    rows = _pack_gqa_tile_q(caps, facts, tile_m, cga, split_kv=1)
+    launch = _split_launch(caps, facts, tile_m, tile_n, cga, pack_g)
+    ctas = launch.q_tiles * launch.heads_q * facts.b * launch.ctas_per_tile
+    return (
+        _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128) <= SM100_FP8_WINDOW_UNSPLIT_MAX_TILES
+        and ctas >= SM100_FP8_WINDOW_UNSPLIT_MIN_WAVES * (facts.device_sm_count or 0) > 0
+    )
+
+
 def _split_model_overrides(caps: Capabilities, facts, tile_m: Optional[int]) -> dict:
     """The constants choose_split_kv takes in place of the shared (SM100-fitted) ones, for the machines fitted on their own."""
     if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8):
@@ -3037,6 +3056,8 @@ def _split_points(
         split = min(split, _sm80_window_split_cap(facts, tile_m, tile_n, pack_g))
     if _sm107_window_decode(caps, facts):
         split = _sm107_window_split(caps, facts, tile_m, tile_n, cga, pack_g, split)
+    if split > 1 and _sm100_fp8_window_unsplit(caps, facts, tile_m, tile_n, cga, pack_g):
+        split = 1
     if _sm100_f16(caps, facts) and cga_ctas(_selected_d_shape(caps, facts)[0], cga) != (cga or 1):
         # The physical CTA count is a one-sided correction: every measured win of
         # counting D512's role CTAs is a LOWER split (decode-shaped D512: 64 -> 32,
