@@ -537,6 +537,13 @@ Rubin bf16 dense d256 GQA causal chunks past the 128-tile cap lead from a 32k ca
 sm107_dense_d256_longkv_20261117, cuDNN 9.30.0.4: FROST 0.49-0.60 of the backend from 32k, 0.68-0.72 below with worst cells up to
 1.11; holdout scored once 0.488 / 0.543 on / off the tile, worst 1.055). qwen3.5 32/2 chunks at b 1 over 128k ran the backend at
 2.3-2.95x. The class has no table entry (three single-feature studies failed); the hand rule already leads its short-cache cells.
+Rubin bf16 dense causal chunks at any launch size (2026-11-27, ``_sm107_dense_chunk``): d64, d128 GQA within one Q tile, and d256
+over a cache of at least 8 x S_q lead past the tile caps above (b 1-64, h_q <= 64, S_q 17-2048, S_kv 2k-128k). Study
+rubin_dense_thd_prefill_20261127 (208 SMs, a development cuDNN build, the inference harness's dense context legs): a 150-cell train
+sweep found FROST at 0.03-0.89 of the backend on every d64 cell, 0.23-0.84 on every d128 GQA chunk of at most 128 queries and at
+most 0.71 on every d256 chunk over 8 x S_q; longer d128 chunks ran 0.66-1.73 and d256 nearer the square 0.98-1.20, so they keep
+the caps. A pre-registered 84-cell holdout, scored once, came to 0.443 of the measured default over its 62 changed cells (worst
+1.012); its 22 controls kept their plans.
 Rubin bf16 dense d192 x 128 causal chunks (MHA and GQA) from S_q 512 over a 32k cache lead the same way (``SM107_D192_LONG_CHUNK_*``;
 study sm107_dense_d192x128_long_cache_20261118, cuDNN 9.30.0.8: changed train cells 0.57-0.60, worst 0.785; holdout scored once
 0.647-0.783, worst 1.030); 256-query chunks lost up to 1.49. kimi_k2 / deepseek_v3 MHA and mimo GQA chunks over 64k-128k ran the
