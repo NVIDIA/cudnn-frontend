@@ -114,7 +114,7 @@ class GluCall:
     cluster_shape_mn: Optional[Tuple[int, int]] = None
     sf_vec_size: int = 16
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None
-    vector_f32: bool = False
+    vector_f32: Optional[bool] = None
     m_aligned: int = 256
     discrete_col_sfd: bool = False
     act_func: str = "swiglu"
@@ -197,7 +197,7 @@ class GroupedGemmGluSm100(APIBase):
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
-        vector_f32: bool = False,
+        vector_f32: Optional[bool] = None,
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
         act_func: str = "swiglu",
@@ -270,7 +270,7 @@ class GroupedGemmGluSm100(APIBase):
                     acc_dtype=kwargs["acc_dtype"],
                     mma_tiler_mn=kwargs["mma_tiler_mn"],
                     cluster_shape_mn=kwargs["cluster_shape_mn"],
-                    vector_f32=kwargs["vector_f32"],
+                    vector_f32=bool(kwargs["vector_f32"]),
                     m_aligned=kwargs["m_aligned"],
                     generate_c=kwargs["generate_c"],
                     act_func=kwargs["act_func"],
@@ -282,6 +282,8 @@ class GroupedGemmGluSm100(APIBase):
                     raise ValueError(_JAX_BLOCK_SCALED_ERROR)
                 block_kwargs = dict(kwargs)
                 block_kwargs.pop("generate_c", None)
+                if block_kwargs["vector_f32"] is None:
+                    block_kwargs["vector_f32"] = True
                 # The block-scaled implementation is torch-native: hand it torch dtypes.
                 block_kwargs["acc_dtype"] = framework_dtype(block_kwargs["acc_dtype"], "torch")
                 if block_kwargs.get("b_dtype") is not None:
@@ -500,7 +502,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             bit to widen the scale range; it is Rubin-only, requires the NVFP4
             recipe, and the scale tensors are still passed as
             ``torch.float8_e4m3fn`` because torch has no e5m3 dtype.
-        vector_f32: Use vectorized f32
+        vector_f32: Use packed f32x2 math in the epilogue. ``None`` (default)
+            selects ``True`` on the block-scaled backend and ``False`` on BF16.
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
         act_func: Activation function ("swiglu", "geglu", or block-scaled "situglu")
@@ -1045,6 +1048,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
 
     normalized = replace(
         call,
+        vector_f32=(backend is GroupedGemmBackend.BLOCK_SCALED) if call.vector_f32 is None else call.vector_f32,
         linear_offset=linear_offset,
         weight_mode=weight_mode,
         b_shape=b_shape,
@@ -1291,7 +1295,7 @@ def grouped_gemm_glu_wrapper_sm100(
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
-    vector_f32: bool = False,
+    vector_f32: Optional[bool] = None,
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
     act_func: str = "swiglu",
