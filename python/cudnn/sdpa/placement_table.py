@@ -278,6 +278,17 @@ def _packed_split(row: str, facts) -> bool:
     return heuristics.sm100_paged_packed_split_choice(caps, facts) > 1
 
 
+def _sm107_paged_mha_split(row: str, facts) -> bool:
+    """A paged THD MHA prefix the Rubin row splits (``heuristics.paged_thd_split_choice``): a different kernel regime from the unsplit
+    graphs sm107_thd_prefill_20261111 fit (d128 split: 0.05-0.85 of the backend), so it keys apart, read from the row's own decision
+    as ``_packed_split`` is (study paged_thd_mha_placement_20261127)."""
+    if row != "sdpa_fwd_prefill_sm107" or not (facts.has_paged_kv and facts.thd) or facts.h_q != facts.h_kv:
+        return False
+    from cudnn.sdpa.fwd import heuristics
+
+    return heuristics.paged_thd_split_choice(heuristics.sm100_legacy_policy_spec(row).capabilities, facts)[0] > 1
+
+
 SM80_DENSE_SPLIT_KEY_MIN = 4  # a 2-way split runs like the unsplit tile; from 4 ways it is the split regime
 
 
@@ -371,7 +382,7 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
     else:
         mask = "none"
     if facts.h_q == facts.h_kv:
-        group = "mha"
+        group = "mha_split" if _sm107_paged_mha_split(row, facts) else "mha"
     elif _unpacked_decode(row, facts) or _sm100_unpacked_window_prefill(row, facts):
         group = "gqa_unpacked"
     elif _sm90_partial_pack(row, facts) or _sm100_window_decode_partial_pack(row, facts):

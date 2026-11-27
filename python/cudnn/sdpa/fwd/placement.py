@@ -744,6 +744,13 @@ SM100_PAGED_FULL_SQUARE_S = (512, 16384)
 SM100_PAGED_FULL_SQUARE_PAGES = (16, 64)
 SM100_PAGED_FULL_SQUARE_GQA_MAX_B = 32
 SM100_PAGED_FULL_SQUARE_D256_MHA_MAX_B = 8
+# Paged MHA prefixes (study paged_thd_mha_placement_20261127, module docstring): d256 at any measured S_q, d64 within one Q tile.
+SM100_PAGED_MHA_PREFILL_MAX_B = 64
+SM100_PAGED_MHA_PREFILL_MAX_HEADS = 64
+SM100_PAGED_MHA_PREFILL_MAX_Q = 2048
+SM100_PAGED_MHA_PREFILL_D64_MAX_Q = 128
+SM100_PAGED_MHA_PREFILL_KV = (2048, 131072)
+SM100_PAGED_MHA_PREFILL_PAGES = (16, 64, 128)
 SM107_PAGED_GQA_MAX_B = 4  # Rubin paged bf16 GQA prefill chunks: measured batch range (module docstring)
 SM107_PAGED_GQA_LONG_CHUNK_MAX_S_Q = 4096  # Rubin paged GQA long-prefix chunks: the measured query range ends here
 SM107_PAGED_GQA_LONG_CHUNK_MIN_KV = 6144  # ... and the cache range starts here (module docstring)
@@ -1744,6 +1751,33 @@ def _sm100_paged_d128_prefix(facts) -> bool:
     )
 
 
+def _sm100_paged_mha_prefill(facts) -> bool:
+    """cc 10.0 / 10.3 paged bf16 / f16 MHA prefix (S_q < S_kv) with THD Q, head-major in-page K, any total-Q declaration (module
+    docstring): d256 at S_q <= SM100_PAGED_MHA_PREFILL_MAX_Q, d64 within one 128-row Q tile."""
+    if not (
+        facts.device_cc in SM100_PAGED_D128_PREFILL_CCS
+        and facts.has_paged_kv
+        and facts.thd
+        and not facts.shape_overrides
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
+        and 1 <= facts.h_q == facts.h_kv <= SM100_PAGED_MHA_PREFILL_MAX_HEADS
+        and 1 <= facts.b <= SM100_PAGED_MHA_PREFILL_MAX_B
+        and SM100_PAGED_MHA_PREFILL_KV[0] <= facts.s_kv <= SM100_PAGED_MHA_PREFILL_KV[1]
+        and 1 <= facts.s_q < facts.s_kv
+        and facts.page_size in SM100_PAGED_MHA_PREFILL_PAGES
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    ):
+        return False
+    if (facts.d_qk, facts.d_v) == (256, 256):
+        return facts.s_q <= SM100_PAGED_MHA_PREFILL_MAX_Q
+    return (facts.d_qk, facts.d_v) == (64, 64) and facts.s_q <= SM100_PAGED_MHA_PREFILL_D64_MAX_Q
+
+
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
     from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice, sm100_paged_tail_split_domain
 
@@ -1758,7 +1792,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         return LEAD
     if nonpaged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
-    if _sm100_paged_gqa_prefill(facts) or _sm100_paged_full_square(facts) or _sm100_paged_d128_prefix(facts):
+    if _sm100_paged_gqa_prefill(facts) or _sm100_paged_full_square(facts) or _sm100_paged_d128_prefix(facts) or _sm100_paged_mha_prefill(facts):
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
