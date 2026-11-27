@@ -463,8 +463,8 @@ def _kernel(
             a_dtype=ab_dtype,
             b_dtype=ab_dtype,
             c_dtype=cutlass.Float32,
-            a_major=1,  # M-major
-            b_major=1,  # N-major
+            a_major=1,  # MN-major
+            b_major=1,  # MN-major
             m_dim=cta_tile_m * config.cta_group,
             n_dim=cta_tile_n,
         )
