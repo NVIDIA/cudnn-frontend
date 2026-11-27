@@ -68,6 +68,9 @@ class GroupedGemmWgradBf16API(APIBase):
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
+        atomic_counter_claim: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -107,6 +110,11 @@ class GroupedGemmWgradBf16API(APIBase):
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
         self.accumulate_on_output = accumulate_on_output
+        if not isinstance(atomic_counter_claim, bool):
+            raise ValueError(f"atomic_counter_claim must be a bool, got {atomic_counter_claim!r}")
+        self.atomic_counter_claim = atomic_counter_claim
+        self.use_pdl = use_pdl
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
         self.sf_vec_size = sf_vec_size
         self.sf_fp8_dtype_override = sf_fp8_dtype_override
         self._scale_controls = (
@@ -306,6 +314,9 @@ class GroupedGemmWgradBf16API(APIBase):
             expert_cnt=self.expert_cnt,
             weight_mode=self.weight_mode,
             input_order=self.input_order,
+            atomic_counter_claim=self.atomic_counter_claim,
+            use_pdl=self.use_pdl,
+            launch_pdl_dependents_at_entry=self.launch_pdl_dependents_at_entry,
         )
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
@@ -314,7 +325,8 @@ class GroupedGemmWgradBf16API(APIBase):
         # Internal scratch in the caller's framework allocator; kernels write through its
         # raw pointer and it is never surfaced as a framework array.
         self._workspace = allocate_byte_workspace(self._framework, kernel.get_workspace_bytes(), self.a_desc.device)
-        # Bytes the wrapper allocates per call on the launch stream: overlapping calls must not share the TMA descriptors.
+        # Bytes the wrapper allocates per call on the launch stream: overlapping calls must not share the TMA descriptors
+        # or the atomic_counter_claim tile counter.
         self._scratch_nbytes = kernel.get_workspace_bytes()
         self._validate_data_alignment(self._workspace, "workspace", 128)
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)

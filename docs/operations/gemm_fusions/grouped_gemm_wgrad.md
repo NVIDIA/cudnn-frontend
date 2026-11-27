@@ -266,6 +266,39 @@ op.execute(
 
 ## Scheduling, cache, and errors
 
+### Atomic-counter tile claim
+
+By default the SM100 wgrad kernels (BF16, and block-scaled on SM100 and SM107)
+launch a grid of every output tile and rebalance uneven expert token counts with
+cluster launch control (CLC). `atomic_counter_claim=True` (a keyword of
+`grouped_gemm_wgrad_wrapper_sm100` and of
+`GroupedGemmWgradSm100`) launches persistent clusters instead, which claim output
+tiles from a 4-byte int32 counter in the kernel workspace; a helper kernel resets
+it on the launch stream before every launch. Each output tile is still computed
+by one CTA (pair) over its expert's whole token range, so the result is the same
+bytes as the CLC path. The default, `False`, generates the same code as before.
+
+- The counter follows the TMA descriptors in the workspace.
+  `get_grouped_gemm_wgrad_workspace_size_sm100(..., atomic_counter_claim=True)`
+  includes its 4 bytes; size a block-scaled `descriptor_workspace` with it.
+- The wrapper allocates that workspace per call on the launch stream (BF16
+  always, block-scaled with this option), so same-signature wrapper calls may
+  overlap on different streams. A class-API object without a
+  `descriptor_workspace` uses its own workspace; its calls must not overlap.
+- Dense and discrete output, both input orders, and `accumulate_on_output` are
+  supported. The JAX MXFP8 path does not take the option: the wrapper raises
+  `ValueError` there.
+
+### Programmatic dependent launch (PDL)
+
+Keywords of `GroupedGemmWgradSm100`, both `False` by default (the default
+generates the same code as without them):
+
+| Option | Effect | Use |
+|---|---|---|
+| `use_pdl=True` | The main kernel launches as the programmatic dependent of the kernel before it on the stream, so its setup (shared memory, barriers, scheduler state) overlaps that kernel's tail; every thread waits for that grid (`griddepcontrol.wait`) before its first global memory access. When the call launches the helper kernel (every block-scaled call; BF16 with TensorRagged inputs, discrete output or `atomic_counter_claim`), the helper launches the same way and waits for its predecessor at its start, and the main kernel waits for the helper: previous kernel, helper, main kernel. | Every configuration, BF16 and block-scaled. |
+| `launch_pdl_dependents_at_entry=True` | The main kernel lets its own programmatic dependent launch at its entry. The dependent must wait (`griddepcontrol.wait`) before it reads the wgrad output. | Every configuration, BF16 and block-scaled. |
+
 The BF16 kernel uses dynamic persistent scheduling. The token dimension is
 compiled dynamically, and the wrapper cache abstracts the token-sized axes of A
 and B while retaining static dimensions, layouts, dtypes, output descriptors,
