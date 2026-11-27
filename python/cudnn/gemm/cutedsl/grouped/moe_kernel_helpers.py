@@ -10,11 +10,12 @@ This module contains:
 - CPU-side reference and validation utilities
 - Kernel configuration and validation functions
 - Kernel helper functions that don't depend on kernel instance state
+- Streaming signal schedulers: cluster fences, mbarrier ops, the signal workspace byte map and its reset
 """
 
 from __future__ import annotations
 
-from typing import Type, Tuple, Union
+from typing import Dict, Optional, Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -22,7 +23,7 @@ from cudnn._cutlass_helpers.warp_reduce import target_needs_shuffle_amax, warp_a
 from cudnn._cutlass_compat import LayoutEnum
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.cutlass_dsl import Boolean, T, dsl_user_op
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
@@ -635,6 +636,24 @@ def is_valid_layouts(
     return is_valid
 
 
+def is_valid_dynamic_sched_cluster_shape(use_2cta_instrs: bool, cluster_shape_mn: Tuple[int, int]) -> bool:
+    """Cluster shapes the dynamic claim path can exit safely from on SM100: (2, 1) with 2-CTA MMA, or (1, 1).
+
+    Each non-leader CTA releases the broadcast slot with a remote arrive into the leader's shared memory; only the
+    2-CTA TMEM dealloc handshake (or having no peer) keeps the leader resident until that arrive lands.
+    """
+    return tuple(cluster_shape_mn) == ((2, 1) if use_2cta_instrs else (1, 1))
+
+
+def check_dynamic_sched_cluster_shape(use_2cta_instrs: bool, cluster_shape_mn: Tuple[int, int]) -> None:
+    """Raise unless ``is_valid_dynamic_sched_cluster_shape``; the streaming signal schedulers call it."""
+    if not is_valid_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn):
+        raise ValueError(
+            f"dynamic tile scheduler: cluster {tuple(cluster_shape_mn)} with {2 if use_2cta_instrs else 1}-CTA MMA could exit "
+            "while a peer CTA still arrives on the leader's shared memory; supported: (2, 1) with 2-CTA MMA, (1, 1) with 1-CTA MMA"
+        )
+
+
 def is_valid_mma_tiler_and_cluster_shape(
     use_2cta_instrs: bool,
     mma_tiler_mn: Tuple[int, int],
@@ -917,16 +936,21 @@ def compute_stages(
     generate_sfd: bool,
     num_epilog_warps: int = 4,
     bias_dtype=None,
+    generate_sfd_col: bool = True,
+    num_c_stage: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int, int]:
     """Compute the number of pipeline stages for A/B/D operands based on heuristics.
 
     :param num_epilog_warps: Number of epilogue warps (default 4, may differ for DGLU).
     :param bias_dtype: Bias element type (e.g. cutlass.BFloat16) when bias enabled, None otherwise.
+    :param generate_sfd_col: With ``generate_sfd``: a column-quantized D is staged next to D (False: D only).
+    :param num_c_stage: C stages (None: 2 with ``generate_sfd``, else 1); the smem freed goes to A/B stages.
     :return: (num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage)
     """
     num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
 
-    num_c_stage = 2 if generate_sfd else 1
+    if num_c_stage is None:
+        num_c_stage = 2 if generate_sfd else 1
     num_d_stage = 2 if generate_sfd else 1
 
     num_tile_stage = 2
@@ -983,7 +1007,7 @@ def compute_stages(
     c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
     c_bytes = c_bytes_per_stage * num_c_stage
     d_bytes_per_stage = cute.size_in_bytes(d_dtype, d_smem_layout_staged_one)
-    d_bytes = d_bytes_per_stage * num_d_stage * (2 if generate_sfd else 1)
+    d_bytes = d_bytes_per_stage * num_d_stage * (2 if generate_sfd and generate_sfd_col else 1)
     amax_bytes = get_amax_smem_size(num_epilog_warps) if d_dtype == cutlass.BFloat16 else 0
     # Bias SMEM stages
     if bias_dtype is not None:
@@ -1325,3 +1349,108 @@ def epilog_gmem_copy_and_partition(
         gD_for_tma_partition,
     )
     return tma_atom_d, bSG_sD, bSG_gD
+
+
+# ---------------------------------------------------------------------------
+# Streaming signal schedulers: device-side cluster fences and mbarrier ops, host-side workspace byte map and reset
+# ---------------------------------------------------------------------------
+
+#: Bytes from the claim counter to ``signal[]``.  ``streaming_signal_workspace_offsets`` is the host's
+#: view of the same map.
+STREAMING_SIGNAL_OFFSET = 4
+
+
+@dsl_user_op
+def streaming_signal_ptr(counter_ptr, *, loc=None, ip=None):
+    """Base of ``signal[]`` as an ``Int32`` pointer (``+ t`` advances ``4 * t`` bytes), derived
+    from the claim counter's pointer so the scheduler serializes no second one."""
+    return cute.make_ptr(
+        Int32,
+        counter_ptr.toint() + STREAMING_SIGNAL_OFFSET,
+        AddressSpace.gmem,
+        assumed_align=4,
+    )
+
+
+@dsl_user_op
+def mbarrier_try_wait_parity_relaxed_cluster(mbar_ptr, phase: Int32, *, loc=None, ip=None) -> Boolean:
+    """``mbarrier.try_wait.parity.relaxed.cluster``: a strong read of a peer's arrive with no acquire, so no L1
+    invalidation per poll.  Follow the successful poll with an acquire fence (an acquire pattern)."""
+    return Boolean(
+        nvvm.mbarrier_wait_parity(
+            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+            Int32(phase).ir_value(loc=loc, ip=ip),
+            nvvm.MBarrierWaitKind.TRY,
+            scope=nvvm.MemScopeKind.CLUSTER,
+            order=nvvm.MemOrderKind.RELAXED,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fence_release_sync_restrict_shared_cta_cluster(*, loc=None, ip=None) -> None:
+    """``fence.release.sync_restrict::shared::cta.cluster``: a cluster-scope release of this thread's (and, through a
+    barrier, its warp's) earlier operations on ``.shared::cta`` objects only, for a relaxed ``.cluster`` mbarrier arrive
+    after it.  ``MEMBAR.ALL.CTA`` on SM100 / SM107, not the ``MEMBAR.ALL.GPU`` of ``fence.release.cluster``."""
+    nvvm.fence_sync_restrict(nvvm.MemOrderKind.RELEASE, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def fence_acquire_sync_restrict_shared_cluster_cluster(*, loc=None, ip=None) -> None:
+    """``fence.acquire.sync_restrict::shared::cluster.cluster``: after a relaxed ``.cluster`` mbarrier wait, a cluster-scope
+    acquire that orders this thread's later operations on ``.shared::cluster`` objects only.  No SASS on SM100 / SM107
+    (no ``CCTL.IVALL``: shared memory is not cached in L1)."""
+    nvvm.fence_sync_restrict(nvvm.MemOrderKind.ACQUIRE, loc=loc, ip=ip)
+
+
+# ---- The signal workspace byte map: the producer's and this consumer's contract ----
+
+
+def streaming_scheduler_state_offset(streaming_signal_capacity: int) -> int:
+    """Bytes from the claim counter to the scheduler state: past ``signal[]``, rounded up to 128 so the producer-written
+    flags and the scheduler's own words share no 128-byte line."""
+    return -(-(STREAMING_SIGNAL_OFFSET + 4 * streaming_signal_capacity) // 128) * 128
+
+
+def streaming_signal_workspace_offsets(kernel) -> Dict[str, int]:
+    """Byte offsets ``counter``/``signal``/``state`` plus ``streaming_signal_capacity`` and ``total_bytes``,
+    for one signal-scheduler kernel INSTANCE."""
+    desc_workspace_bytes = kernel.get_desc_workspace_bytes()
+    capacity = kernel.streaming_signal_capacity
+    # The state holds 2 words per expert, assigned_claim_count and a 3-word record per M-tile: a kernel that sized
+    # it otherwise overruns the workspace, and the scheduler hangs or faults.
+    state_bytes = kernel.get_workspace_bytes() - (desc_workspace_bytes + streaming_scheduler_state_offset(capacity))
+    assert state_bytes >= 4 * (
+        2 * kernel.expert_cnt + 1 + 3 * capacity
+    ), f"state of {state_bytes} bytes: {kernel.expert_cnt} experts, capacity {capacity} do not fit"
+    return {
+        # The claim counter is the stock dynamic scheduler's own counter word.
+        "counter": desc_workspace_bytes,
+        # One ready flag per tile: signal[t] is t once tile t is complete.  streaming_signal_ptr()
+        # names this same address on the device.
+        "signal": desc_workspace_bytes + STREAMING_SIGNAL_OFFSET,
+        "state": desc_workspace_bytes + streaming_scheduler_state_offset(capacity),
+        "streaming_signal_capacity": capacity,
+        "total_bytes": kernel.get_workspace_bytes(),
+    }
+
+
+def reset_streaming_signal_workspace(workspace, kernel, all_complete: bool = False) -> None:
+    """Make ``workspace`` ready for one launch: claim counter and scheduler state 0, ``signal[]``
+    -1, or ``signal[t] = t`` with ``all_complete`` (every tile ready, as with no producer)."""
+    import torch
+
+    offsets = streaming_signal_workspace_offsets(kernel)
+    # A view of the byte buffer: the offsets are 4-byte aligned because get_desc_workspace_bytes() is.
+    int32_words = workspace.view(torch.int32)
+    counter_word, signal_word = offsets["counter"] // 4, offsets["signal"] // 4
+    int32_words[counter_word : counter_word + 1].fill_(0)
+    int32_words[offsets["state"] // 4 : offsets["total_bytes"] // 4].fill_(0)
+    signal = int32_words[signal_word : signal_word + offsets["streaming_signal_capacity"]]
+    # Never zero-fill signal[]: any value >= 0 reads as complete.
+    if all_complete:
+        signal.copy_(torch.arange(signal.numel(), dtype=torch.int32, device=workspace.device))
+    else:
+        signal.fill_(-1)
