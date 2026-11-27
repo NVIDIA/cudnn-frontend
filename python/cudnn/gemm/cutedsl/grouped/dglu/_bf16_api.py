@@ -33,6 +33,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -44,6 +45,7 @@ from ..backend_utils import debug_validate_offsets, debug_validate_pointer_value
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
+from .moe_grouped_gemm_dglu_sm90 import MoEGroupedGemmDgluBf16KernelSm90
 from ..glu_layout import GLU_LAYOUTS, validate_glu_layout
 
 
@@ -72,7 +74,7 @@ class GroupedGemmDgluBf16API(APIBase):
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
@@ -86,6 +88,7 @@ class GroupedGemmDgluBf16API(APIBase):
         sample_activation: Optional[torch.Tensor] = None,
         glu_layout: str = "interleaved_32",
         _deterministic: bool = False,
+        arch: str = "sm100",
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -163,9 +166,12 @@ class GroupedGemmDgluBf16API(APIBase):
         self.b_shape = tuple(b_shape) if b_shape is not None else None
         self.b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else self.b_desc.dtype
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
-        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        # arch="sm90" (GroupedGemmDgluSm90) runs the Hopper kernel: a (128, 256) tile, a (2, 1) cluster by default and the
+        # dynamic scheduler always.
+        self._is_sm90 = arch == "sm90"
+        self.mma_tiler_mn = tuple(mma_tiler_mn or ((128, 256) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
-        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
+        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.glu_layout = validate_glu_layout(glu_layout)
@@ -175,12 +181,13 @@ class GroupedGemmDgluBf16API(APIBase):
         self.glu_clamp_min = float(glu_clamp_min)
         self.round_dgrad_to_input_dtype = round_dgrad_to_input_dtype
         self.b_major = b_major
-        self.use_dynamic_sched = use_dynamic_sched
+        # SM90's only scheduler is the dynamic one (the gmem atomic-counter claim), so it is the default there.
+        self.use_dynamic_sched = True if self._is_sm90 else use_dynamic_sched
         self._has_dbias = self.dbias_desc is not None
         # Internal (set by grouped_gemm_dglu_wrapper_sm100): dprob is one slot per N-tile, (valid_m, n_slots, 1).
         self._deterministic = _deterministic
         self._dprob_slots = 1
-        self._kernel = MoEGroupedGemmDgluDbiasBf16Kernel
+        self._kernel = MoEGroupedGemmDgluBf16KernelSm90 if self._is_sm90 else MoEGroupedGemmDgluDbiasBf16Kernel
         self._kernel_obj = None
         self._live_b_ptrs = None
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
@@ -366,6 +373,14 @@ class GroupedGemmDgluBf16API(APIBase):
             raise ValueError("dGeGLU requires finite positive alpha and ordered finite clamp bounds")
         if self.b_major not in ("k", "n"):
             raise ValueError(f"b_major must be 'k' or 'n', got {self.b_major}")
+        if self._is_sm90:
+            if self.weight_mode != MoEWeightMode.DENSE:
+                raise NotImplementedError("SM90 grouped GEMM dGLU supports dense weights (sample_b) only, not discrete b_ptrs")
+            if self._has_dbias or self.activation_desc is not None:
+                raise NotImplementedError("SM90 grouped GEMM dGLU writes neither dbias nor the activation output")
+            for desc, name in ((self.c_desc, "sample_c"), (self.d_row_desc, "sample_d_row")):
+                if _convert_to_cutlass_data_type(desc.dtype) not in (cutlass.BFloat16, cutlass.Float16):
+                    raise NotImplementedError(f"SM90 grouped GEMM dGLU {name} must be BF16 or FP16, got {desc.dtype}")
         if self.expert_cnt <= 0 or self.expert_cnt > 1024:
             raise ValueError(f"expert count must be in [1, 1024], got {self.expert_cnt}")
         self._not_implemented_error_if(
@@ -397,14 +412,21 @@ class GroupedGemmDgluBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         capability = major * 10 + minor
-        if self.glu_layout == "gate_then_up":
+        if self.glu_layout == "gate_then_up" and self._is_sm90:
+            # SM90 moves only C loads and D stores to the branch columns: both activations, any SM90 dGLU tile.
+            if self.c_desc.shape[1] % 256 != 0:
+                raise ValueError("gate_then_up BF16 dGLU requires each gate/up branch N divisible by 128")
+        elif self.glu_layout == "gate_then_up":
             if (major, minor) not in ((10, 0), (10, 3)) or self._framework != "torch":
                 raise NotImplementedError("gate_then_up BF16 dGLU requires torch tensors on SM100/103")
             if self.act_func != "dswiglu" or self.c_desc.dtype != cutlass.BFloat16 or self.d_row_desc.dtype != cutlass.BFloat16:
                 raise NotImplementedError("gate_then_up BF16 dGLU requires dswiglu with BF16 C/D")
             if self.c_desc.shape[1] % 256 != 0:
                 raise ValueError("gate_then_up BF16 dGLU requires each gate/up branch N divisible by 128")
-        if not has_tcgen05(major):
+        if self._is_sm90:
+            if not has_wgmma(major):
+                raise RuntimeError(f"GroupedGemmDgluSm90 requires SM90 (WGMMA), found SM{capability}")
+        elif not has_tcgen05(major):
             raise RuntimeError(f"GroupedGemmDgluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
         self._is_supported = True
         return True

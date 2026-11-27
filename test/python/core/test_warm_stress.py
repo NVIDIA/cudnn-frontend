@@ -365,6 +365,27 @@ def test_release_dependence_sees_a_dropped_value_a_visible_zero_and_a_guard():
     assert len(found) == 1 and not found[0].dependent and found[0].loaded_registers == 0
 
 
+def test_release_dependence_counts_ldmatrix_registers():
+    # two ldmatrix.x4 of one stage (16 bf16 halves = 8 words) folded by the predicated elected arrive
+    ptx = (
+        """
+    ld.param.u32 %r9, [kernel_param_1];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r10, %r11, %r12, %r13}, [%r1];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r14, %r15, %r16, %r17}, [%r3];
+    add.s32 %r20, %r10, %r11;
+"""
+        + "\n".join(f"    add.s32 %r{20+i}, %r{19+i}, %r{11+i};" for i in range(1, 7))
+        + """
+    and.b32 %r30, %r26, %r9;
+    shl.b32 %r31, %r30, 3;
+    add.s32 %r32, %r2, %r31;
+    @%p1 mbarrier.arrive.shared::cta.b64 _, [%r32];
+    """
+    )
+    (site,) = ws.assert_release_dependence(ptx, sites=1, words=8)
+    assert (site.parameter, site.loads, site.loaded_registers) == ("kernel_param_1", 2, 8)
+
+
 @pytest.mark.parametrize("words", [7, 8])
 def test_release_dependence_counts_tmem_words_before_reuse(words):
     registers = ", ".join(f"%r{i}" for i in range(10, 18))
