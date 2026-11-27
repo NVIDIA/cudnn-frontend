@@ -185,16 +185,27 @@ def _random_like(t, seed):
 
 def _check_global_descriptor_path(op, variant, config, *, exact=False):
     """MXFP8 at 2-CTA 256x256 tiles in a (2, 1) cluster with dense output and no accumulation runs the global-descriptor
-    variant (or, with ``exact=False``, a variant built on it)."""
+    variant (on Rubin its Rubin subclass; or, with ``exact=False``, a variant built on it)."""
     from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel as Dense
 
     if variant.startswith("mxfp8") and not variant.endswith("discrete") and config == CONFIGS[1] and torch.cuda.get_device_capability()[0] == 10:
         from cudnn.api_base import get_device_type
 
-        if get_device_type() == "rubin" or op.op._implementation.accumulate_on_output:
+        if op.op._implementation.accumulate_on_output:
             return
         picked = op.kernel_class
-        assert (picked is Dense) if exact else issubclass(picked, Dense), f"{variant}: the API picked {picked.__name__}"
+        if get_device_type() == "rubin":
+            from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense_rubin import BlockScaledMoEGroupedGemmWgradDenseRubinKernel
+            from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin import BlockScaledMoEGroupedGemmWgradRubinKernel
+
+            ok = (
+                (picked is BlockScaledMoEGroupedGemmWgradDenseRubinKernel)
+                if exact
+                else issubclass(picked, Dense) and issubclass(picked, BlockScaledMoEGroupedGemmWgradRubinKernel)
+            )
+        else:
+            ok = (picked is Dense) if exact else issubclass(picked, Dense)
+        assert ok, f"{variant}: the API picked {picked.__name__}"
 
 
 def _graph(chain):
@@ -230,15 +241,12 @@ def test_use_pdl_matches_plain_launch_behind_producers(variant, operand, config)
 @pytest.mark.parametrize("operand", ["a", "offsets"])
 @pytest.mark.parametrize("variant", ["mxfp8_partial", "mxfp8_partial_counter"])
 def test_use_pdl_global_descriptor_partial_k_tiles_behind_producers(variant, operand):
-    """As above for the MXFP8 global-descriptor variant with experts that end inside a K tile: its load warp builds those
-    experts' descriptors from the offsets and A in the workspace, which must happen after its wait."""
+    """As above for the MXFP8 global-descriptor variant (on Rubin its Rubin subclass) with experts that end inside a K
+    tile: its load warp builds those experts' descriptors from the offsets and A in the workspace, which must happen
+    after its wait."""
     _require_sm100()
     if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("The global-descriptor wgrad is SM100/SM103 only")
-    from cudnn.api_base import get_device_type
-
-    if get_device_type() == "rubin":
-        pytest.skip("The global-descriptor wgrad is SM100/SM103 only")
+        pytest.skip("The global-descriptor wgrad is SM100/SM103/SM107 only")
     _check_behind_producers(variant, operand, CONFIGS[1], exact=True)
 
 

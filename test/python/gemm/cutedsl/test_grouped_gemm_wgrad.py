@@ -1291,28 +1291,37 @@ def test_wgrad_scheduler_advances_before_producer_tail(kernel):
 
 # MXFP8 wgrad from global descriptors (dense output, Tensor2D input, 2-CTA 256x256 tiles in a (2, 1) cluster).
 #
-# The API picks this variant of the SM100 block-scaled wgrad on its own. Its dW must be the stock kernel's byte for byte,
-# for every offsets value the stock kernel accepts: an expert whose token count is not a multiple of the 128-token K tile
-# reads its last K tile through its own descriptors, so tokens past its end (the next expert's, or data past the last
-# offset) never enter its sum. The discrete output mode runs the stock kernel on the same inputs.
+# The API picks this variant of the SM100 block-scaled wgrad on its own (on Rubin, its Rubin subclass; see the Rubin
+# cases below). Its dW must be the stock kernel's byte for byte, for every offsets value the stock kernel accepts: an
+# expert whose token count is not a multiple of the K tile reads its last K tile through its own descriptors, so tokens
+# past its end (the next expert's, or data past the last offset) never enter its sum. The discrete output mode runs the
+# stock kernel on the same inputs.
 
 _GLOBAL_DESC_M, _GLOBAL_DESC_N = 512, 768
 
 
 def _global_desc_require_sm100():
+    from cudnn.api_base import get_device_type
     from cudnn.tensor_adapter import has_tcgen05
 
     if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM wgrad")
-    if torch.cuda.get_device_capability()[0] != 10:
+    if torch.cuda.get_device_capability()[0] != 10 or get_device_type() == "rubin":
         pytest.skip("The global-descriptor wgrad is SM100/SM103 only")
 
 
-def _global_desc_problem(data_groups, num_experts, *, seed):
+def _global_desc_require_rubin():
+    from cudnn.api_base import get_device_type
+
+    if not torch.cuda.is_available() or get_device_type() != "rubin":
+        pytest.skip("The Rubin global-descriptor wgrad runs on SM107 only")
+
+
+def _global_desc_problem(data_groups, num_experts, *, seed, n=_GLOBAL_DESC_N):
     """MXFP8 operands over ``data_groups`` token groups; the first ``num_experts`` are experts, the rest is nonzero data
     past the last offset. Scale factors are blocked per group when every group is whole K tiles but the last (the
     layout the reference reads), else random bytes of the size the API checks."""
-    M, N = _GLOBAL_DESC_M, _GLOBAL_DESC_N
+    M, N = _GLOBAL_DESC_M, n
     torch.manual_seed(seed)
     tokens = sum(data_groups)
     groups = list(data_groups[:num_experts])
@@ -1322,7 +1331,7 @@ def _global_desc_problem(data_groups, num_experts, *, seed):
         b = torch.empty_strided((0, N), (1, 16), dtype=torch.float8_e4m3fn, device="cuda")
         sfa = torch.empty_strided((M, 0), (16, 1), dtype=torch.float8_e8m0fnu, device="cuda")
         sfb = torch.empty_strided((N, 0), (16, 1), dtype=torch.float8_e8m0fnu, device="cuda")
-        return {"a": a, "b": b, "sfa": sfa, "sfb": sfb, "offsets": offsets, "reference": None, "experts": num_experts}
+        return {"a": a, "b": b, "sfa": sfa, "sfb": sfb, "offsets": offsets, "reference": None, "experts": num_experts, "n": N}
     logical_a = torch.randint(-1, 2, (M, tokens), device="cuda").to(torch.bfloat16)
     logical_b = torch.randint(-1, 2, (tokens, N), device="cuda").to(torch.bfloat16)
     logical_a[logical_a == 0] = 1
@@ -1346,11 +1355,12 @@ def _global_desc_problem(data_groups, num_experts, *, seed):
         "offsets": offsets,
         "reference": reference,
         "experts": num_experts,
+        "n": N,
     }
 
 
 def _global_desc_run(problem, output_mode, *, counter=False):
-    output = torch.full((problem["experts"], _GLOBAL_DESC_M, _GLOBAL_DESC_N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    output = torch.full((problem["experts"], _GLOBAL_DESC_M, problem["n"]), float("nan"), dtype=torch.bfloat16, device="cuda")
     discrete = output_mode == "discrete"
     cudnn.grouped_gemm_wgrad_wrapper_sm100(
         a_tensor=problem["a"],
@@ -1372,11 +1382,9 @@ def _global_desc_run(problem, output_mode, *, counter=False):
     return output
 
 
-@pytest.mark.L0
-def test_dense_mxfp8_wgrad_picks_global_descriptors(monkeypatch):
-    _global_desc_require_sm100()
+def _global_desc_record_picks(monkeypatch):
+    """Record the kernel class the API picks, on fresh wrapper caches; returns the list of picks."""
     from cudnn.gemm.cutedsl.grouped.wgrad import _blockscaled_api
-    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
 
     picked = []
     original = _blockscaled_api.GroupedGemmWgradBlockScaledAPI._select_kernel
@@ -1389,6 +1397,15 @@ def test_dense_mxfp8_wgrad_picks_global_descriptors(monkeypatch):
     monkeypatch.setattr(_blockscaled_api.GroupedGemmWgradBlockScaledAPI, "_select_kernel", record)
     monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_wgrad_wrapper_memo", {})
     monkeypatch.setattr(cudnn.gemm.cutedsl.grouped.wgrad.api, "_cache_of_GroupedGemmWgradSm100Objects", {})
+    return picked
+
+
+@pytest.mark.L0
+def test_dense_mxfp8_wgrad_picks_global_descriptors(monkeypatch):
+    _global_desc_require_sm100()
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
+
+    picked = _global_desc_record_picks(monkeypatch)
     problem = _global_desc_problem((256, 128), 2, seed=1)
     _global_desc_run(problem, "dense")
     _global_desc_run(problem, "discrete")
@@ -1418,3 +1435,81 @@ def test_global_descriptor_wgrad_matches_stock(groups, experts, counter):
     if problem["reference"] is not None and all(k % 128 == 0 for k in groups[: experts - 1]):
         # Blocked scale factors match the stock addressing only when every earlier expert is whole K tiles.
         check_ref_grouped_gemm_wgrad(dense, problem["reference"])
+
+
+def _global_desc_selection_api(*, device_type, n=_GLOBAL_DESC_N, discrete=False, dtype=torch.float8_e4m3fn, wgrad_dtype=torch.bfloat16, **kwargs):
+    """A block-scaled wgrad API object (not compiled) as built on ``device_type`` ("blackwell" or "rubin")."""
+    from unittest import mock
+
+    from cudnn.gemm.cutedsl.grouped.wgrad._blockscaled_api import GroupedGemmWgradBlockScaledAPI
+
+    M, tokens, experts = _GLOBAL_DESC_M, 512, 2
+    a = torch.zeros((M, tokens), dtype=torch.uint8).view(dtype)
+    b = torch.zeros((n, tokens), dtype=torch.uint8).view(dtype).t()
+    sfa = torch.zeros((M, tokens // 32), dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    sfb = torch.zeros((n, tokens // 32), dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    offsets = torch.tensor([256, 512], dtype=torch.int32)
+    if discrete:
+        output = dict(num_experts=experts, wgrad_shape=(M, n), wgrad_dtype=wgrad_dtype)
+    else:
+        output = dict(sample_wgrad=torch.empty((experts, M, n), dtype=wgrad_dtype))
+    with mock.patch("cudnn.api_base.get_device_type", return_value=device_type):
+        return GroupedGemmWgradBlockScaledAPI(
+            sample_a=a, sample_b=b, sample_sfa=sfa, sample_sfb=sfb, sample_offsets=offsets, sf_vec_size=32, **output, **kwargs
+        )
+
+
+@pytest.mark.L0
+def test_global_descriptor_wgrad_selection_per_architecture():
+    """On SM107 the API picks the Rubin global-descriptor wgrad under the conditions under which it picks the SM100 one
+    on SM100/SM103, else the Rubin kernel. Host-side only: the API objects are not compiled."""
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense_rubin import BlockScaledMoEGroupedGemmWgradDenseRubinKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin import BlockScaledMoEGroupedGemmWgradRubinKernel
+
+    picks = {
+        "blackwell": (BlockScaledMoEGroupedGemmWgradDenseKernel, BlockScaledMoEGroupedGemmWgradKernel),
+        "rubin": (BlockScaledMoEGroupedGemmWgradDenseRubinKernel, BlockScaledMoEGroupedGemmWgradRubinKernel),
+    }
+    for device_type, (variant, stock) in picks.items():
+        for kwargs in ({}, dict(dtype=torch.float8_e5m2), dict(n=256), dict(atomic_counter_claim=True, use_pdl=True)):
+            assert _global_desc_selection_api(device_type=device_type, **kwargs)._select_kernel() is variant, (device_type, kwargs)
+        for kwargs in (
+            dict(discrete=True),
+            dict(n=640),
+            dict(wgrad_dtype=torch.float32),
+            dict(accumulate_on_output=True),
+            dict(cluster_shape_mn=(4, 1)),
+            dict(mma_tiler_mn=(256, 128)),
+            dict(mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1)),
+        ):
+            assert _global_desc_selection_api(device_type=device_type, **kwargs)._select_kernel() is stock, (device_type, kwargs)
+
+
+# Rubin (SM107): the API picks the Rubin subclass of the global-descriptor wgrad (K64 MMA, 256-token K tile with two SF
+# atoms, two disjoint accumulator stages); its dW must be the Rubin kernel's byte for byte. The cases cover work of 1 to 6
+# N tiles, experts longer than others, experts ending half way into a 256-token K tile (multiples of 128 tokens), a last
+# expert shorter than one SF atom (96 tokens), nonzero data past the last offset, and empty experts.
+_GLOBAL_DESC_RUBIN_CASES = [
+    pytest.param(768, (256, 512, 1280, 0, 256), 5, id="n768-aligned", marks=pytest.mark.L1),
+    pytest.param(512, (2048, 256, 1536, 512), 4, id="n512-long-and-short", marks=pytest.mark.L1),
+    pytest.param(1024, (128, 384, 0, 640, 256), 4, id="n1024-half-k-tiles-then-data", marks=pytest.mark.L0),
+    pytest.param(1536, (256, 0, 192, 128), 3, id="n1536-partial-last-expert-then-data", marks=pytest.mark.L1),
+    pytest.param(256, (384, 0, 1024, 96, 160), 4, id="n256-short-last-expert-then-data", marks=pytest.mark.L0),
+]
+
+
+@pytest.mark.parametrize("n, groups, experts", _GLOBAL_DESC_RUBIN_CASES)
+@pytest.mark.parametrize("counter", [False, True], ids=["clc", "counter"])
+def test_rubin_global_descriptor_wgrad_matches_rubin_stock(monkeypatch, n, groups, experts, counter):
+    _global_desc_require_rubin()
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense_rubin import BlockScaledMoEGroupedGemmWgradDenseRubinKernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin import BlockScaledMoEGroupedGemmWgradRubinKernel
+
+    picked = _global_desc_record_picks(monkeypatch)
+    problem = _global_desc_problem(groups, experts, seed=17, n=n)
+    dense = _global_desc_run(problem, "dense", counter=counter)
+    stock = _global_desc_run(problem, "discrete", counter=counter)
+    assert picked[0] is BlockScaledMoEGroupedGemmWgradDenseRubinKernel and picked[-1] is BlockScaledMoEGroupedGemmWgradRubinKernel, picked
+    assert_bitwise({"wgrad": dense}, snapshot({"wgrad": stock}), "Rubin global descriptors vs Rubin stock")

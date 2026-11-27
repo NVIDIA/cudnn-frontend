@@ -392,10 +392,11 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             del self.sample_b_tensor
 
     def _select_kernel(self):
-        """The stock kernel, or on SM100/SM103 its global-descriptor variant (same dW bits) where it applies."""
+        """The stock kernel, or its global-descriptor variant (same dW bits) where it applies: on SM100/SM103
+        ``BlockScaledMoEGroupedGemmWgradDenseKernel``, on SM107 (Rubin) its Rubin subclass."""
         import torch
 
-        if self._is_rubin_kernel or self.weight_mode != MoEWeightMode.DENSE:
+        if self.weight_mode != MoEWeightMode.DENSE:
             return self._kernel
         m, n = self.a_desc.shape[0], self.b_desc.shape[1]
         fp8 = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -422,6 +423,10 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 has_global_scale=self.global_scale_a_desc is not None or self.global_scale_b_desc is not None,
             )
         ):
+            if self._is_rubin_kernel:
+                from .moe_blockscaled_grouped_gemm_wgrad_dense_rubin import BlockScaledMoEGroupedGemmWgradDenseRubinKernel
+
+                return BlockScaledMoEGroupedGemmWgradDenseRubinKernel
             return BlockScaledMoEGroupedGemmWgradDenseKernel
         return self._kernel
 
