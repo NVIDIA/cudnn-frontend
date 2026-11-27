@@ -341,6 +341,20 @@ def _sm107_paged_unpacked_cga_tile(row: str, facts) -> bool:
     return not heuristics._prefer_thd_pack_gqa(caps, facts) and heuristics.paged_thd_split_choice(caps, facts)[0] == 1
 
 
+def _sm107_thd_split(row: str, facts) -> bool:
+    """Rubin exact nonpaged THD d128 prefill whose plan splits over KV: FROST runs the shared single-Q body there, not the multi-Q
+    plan the row's other THD prefill classes were measured on, and leads the backend across cache lengths (study
+    rubin_thd_d128_longkv_20261127), so these key apart and the row's split rule places them."""
+    if row != "sdpa_fwd_prefill_sm107" or facts.has_paged_kv or not facts.thd or getattr(facts, "shape_overrides", False):
+        return False
+    if (facts.d_qk, facts.d_v) != (128, 128):
+        return False
+    from cudnn.sdpa.fwd import heuristics
+
+    caps = heuristics.sm100_legacy_policy_spec(row).capabilities
+    return heuristics.nonpaged_thd_split_choice(caps, facts)[0] > 1
+
+
 _VERIFY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90"})
 _VERIFY_MAX_S_Q = 16  # placement.DECODE_SHAPED_MAX_S_Q: the spec-decode verify depth
 
@@ -381,6 +395,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         phase = "prefill_short_q"
     if phase == "prefill" and _sm107_paged_unpacked_cga_tile(row, facts):
         phase = "prefill_cga_tile"
+    if phase == "prefill" and _sm107_thd_split(row, facts):
+        phase = "prefill_split"
     if getattr(facts, "deterministic", False):
         phase += "_det"  # only DETERMINISTIC_KEYED_ROWS get here
     if facts.has_paged_kv:

@@ -1706,6 +1706,33 @@ def test_sm107_paged_unpacked_cga_tile_keys_apart(monkeypatch):
 
 
 @pytest.mark.L0
+def test_sm107_thd_d128_split_keys_apart_and_leads(monkeypatch):
+    """Study rubin_thd_d128_longkv_20261127: Rubin exact nonpaged THD d128 prefill whose plan splits over KV keys `prefill_split`, has no
+    entry, and leads through the row's split rule (FROST's shared single-Q body ran 0.10-1.00 of the backend across caches up to
+    1024 x S_q). An unsplit graph keeps its class and study; bounded, paged and d256 graphs and the SM100 row keep their classes."""
+    from cudnn.frost import buffers
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107")
+    base = dict(b=1, h_q=16, h_kv=1, s_q=160, s_kv=24576, thd=True, has_paged_kv=False, max_total_seq_len_q=118, device_cc=(10, 7), device_sm_count=208)
+    f = lambda **over: _facts(**{**base, **over})
+    for dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF):
+        split = f(dtype=dtype)
+        assert heuristics.nonpaged_thd_split_choice(spec.capabilities, split)[0] > 1
+        assert pt.class_key(spec.name, split)[4] == "prefill_split" and pt.matched_entry(spec.name, split) is None
+        assert placement.place(spec, split) == placement.LEAD, dtype
+    unsplit = f(b=16, h_q=20, h_kv=20, s_q=96, s_kv=57344, max_total_seq_len_q=16 * 96)
+    assert heuristics.nonpaged_thd_split_choice(spec.capabilities, unsplit)[0] == 1
+    assert pt.class_key(spec.name, unsplit)[4] == "prefill" and pt.matched_entry(spec.name, unsplit).study == "sm107_thd_te_prefill_20261122"
+    for over in (dict(shape_overrides=True), dict(d_qk=256, d_v=256), dict(has_paged_kv=True, page_size=16), dict(device_cc=(10, 0), device_sm_count=148)):
+        row = "sdpa_fwd_prefill_sm100" if over.get("device_cc") == (10, 0) else spec.name
+        assert pt.class_key(row, f(**over))[4] != "prefill_split", over
+
+
+@pytest.mark.L0
 def test_sm103_fp8_d192_long_causal_chunks_lead():
     """cc 10.3 per-tensor FP8 d192x128 causal chunks from SM103_FP8_D192_LONG_CHUNK_MIN_S_Q query tokens lead past
     FP8_D192_MAX_Q_TILES inside the qualified bottom-right E4M3 MHA band. Other graphs keep the tile bound."""
