@@ -72,6 +72,8 @@ _LAZY_EXPORTS = {
     "fft_causal_conv1d": (".fft_causal_conv1d", "fft_causal_conv1d"),
     "nvfp4_block_scale_quantize_forward": (".nvfp4", "nvfp4_block_scale_quantize_forward"),
     "nvfp4_block_scale_dequantize_forward": (".nvfp4", "nvfp4_block_scale_dequantize_forward"),
+    "mxfp8_quantize_forward": ("cudnn.quantize.batch_invariant", "mxfp8_quantize_forward"),
+    "mxfp4_quantize_forward": ("cudnn.quantize.batch_invariant", "mxfp4_quantize_forward"),
     "block_sparse_attention_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_backward": ("cudnn.block_sparse_attention", "block_sparse_attention_backward"),
     "block_sparse_attention_fp8_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_fp8_forward"),
