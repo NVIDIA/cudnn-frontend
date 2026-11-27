@@ -55,7 +55,7 @@ def test_entries_are_well_formed_and_name_known_rows():
         row, cc, dtype, heads, phase, layout, mask, sink, group, kv_off_tile = key
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
-        assert phase.removesuffix("_det") in ("q1", "mtp", "verify", "prefill", "prefill_short_square", "prefill_short_q")
+        assert phase.removesuffix("_det") in ("q1", "mtp", "verify", "prefill", "prefill_short_square", "prefill_short_q", "prefill_cga_tile")
         assert not phase.endswith("_det") or row in pt.DETERMINISTIC_KEYED_ROWS, key
         assert layout.removesuffix("_bounded") in ("dense", "paged", "thd", "thd_ragged")
         assert (

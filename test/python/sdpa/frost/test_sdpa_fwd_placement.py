@@ -1671,6 +1671,41 @@ def test_sm107_paged_mha_split_keys_apart(monkeypatch):
 
 
 @pytest.mark.L0
+def test_sm107_paged_unpacked_cga_tile_keys_apart(monkeypatch):
+    """Study rubin_paged_unpacked_prefill_20261127: Rubin paged THD d128 prefill whose plan runs unpacked and unsplit, inside one 2-CTA
+    Q tile per head, keys `prefill_cga_tile`. Its entries lead small launches and trail large ones, monotone in the launch. Packed
+    groups, split MHA, windows, other rows and S_q outside the band keep their classes."""
+    from cudnn.frost import buffers
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107")
+    lo, hi = pt.SM107_PAGED_CGA_TILE_S_Q
+    base = dict(b=1, h_q=24, h_kv=8, s_q=hi, s_kv=8192, page_size=64, max_total_seq_len_q=hi, device_sm_count=208)
+    f = lambda **over: _sm107_paged_facts(**{**base, **over})
+    for h_q, h_kv in ((24, 8), (40, 8), (48, 8), (28, 4), (32, 16), (32, 32)):  # groups 3, 5, 6, 7, 2 and MHA run unpacked
+        assert pt.class_key(spec.name, f(h_q=h_q, h_kv=h_kv))[4] == "prefill_cga_tile"
+        assert pt.matched_entry(spec.name, f(h_q=h_q, h_kv=h_kv)).study == "rubin_paged_unpacked_prefill_20261127"
+    for b in (1, 64):
+        assert pt.class_key(spec.name, f(b=b, s_kv=8192 + 1, max_total_seq_len_q=b * hi))[9]  # the off-tile twin is answered too
+        assert pt.matched_entry(spec.name, f(b=b, s_kv=8192 + 1, max_total_seq_len_q=b * hi)).study == "rubin_paged_unpacked_prefill_20261127"
+    for h_q, h_kv in ((24, 8), (32, 32)):
+        verdicts = [placement.place(spec, f(h_q=h_q, h_kv=h_kv, b=b, max_total_seq_len_q=b * hi)) for b in (1, 2, 4, 8, 16, 32, 64)]
+        assert verdicts[0] == placement.LEAD and verdicts[-1] == placement.TRAIL
+        assert verdicts == sorted(verdicts, key=lambda v: v == placement.TRAIL)  # once trailing, a larger launch trails
+    assert pt.class_key(spec.name, f(s_q=lo, max_total_seq_len_q=lo))[4] == "prefill"
+    assert pt.class_key(spec.name, f(s_q=lo + 1, max_total_seq_len_q=lo + 1))[4] == "prefill_cga_tile"
+    assert pt.class_key(spec.name, f(s_q=hi + 1, max_total_seq_len_q=hi + 1))[4] == "prefill"
+    assert pt.class_key(spec.name, f(h_q=32, h_kv=8))[4] == "prefill"  # the row packs group 4
+    split = f(h_q=4, h_kv=4, s_q=192, s_kv=90112, page_size=16, max_total_seq_len_q=192)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, split)[0] > 1
+    assert pt.class_key(spec.name, split)[4::4] == ("prefill", "mha_split")
+    assert pt.class_key(spec.name, f(window_left=128))[4] == "prefill"
+    assert pt.class_key("sdpa_fwd_prefill_sm100", f(device_cc=(10, 0), device_sm_count=148))[4] == "prefill"  # Rubin's row only
+
+
+@pytest.mark.L0
 def test_sm103_fp8_d192_long_causal_chunks_lead():
     """cc 10.3 per-tensor FP8 d192x128 causal chunks from SM103_FP8_D192_LONG_CHUNK_MIN_S_Q query tokens lead past
     FP8_D192_MAX_Q_TILES inside the qualified bottom-right E4M3 MHA band. Other graphs keep the tile bound."""

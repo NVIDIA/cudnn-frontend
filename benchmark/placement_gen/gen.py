@@ -77,6 +77,50 @@ def _facts_inference(c, s):
     )
 
 
+def _facts_inference_context(c, s):
+    """Inference harness, context phase over paged KV (``layout`` "paged"): THD Q / O with the harness's own per-request lengths
+    and declared total (``request_lens``, ``--cudnn_total_q``), and K / V in its head-major page pool. Case fields follow the
+    harness's flags (``q``, ``kv``, ``page``, ``qfill``, ``fill``, ``total_q``)."""
+    from argparse import Namespace
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from benchmark.attention_inference.benchmark_single_attention import request_lens
+
+    if c.get("layout", s.get("layout")) != "paged" or c.get("phase", "context") != "context":
+        raise ValueError("inference_context reads the harness's paged context phase only")
+    d_qk, d_v, page = c.get("d_qk", c.get("dqk", s.get("d_qk"))), c.get("d_v", c.get("dv", s.get("d_v"))), c.get("page", 64)
+    args = Namespace(batch_size=c["b"], q_tokens=c["q"], kv_len=c["kv"], phase="context", kv_min_fill=c.get("fill", 1.0), q_min_fill=c.get("qfill", 1.0))
+    q_lens, _ = request_lens(args)
+    causal = c.get("causal", True)
+    return SdpaGraphFacts(
+        b=c["b"],
+        h_q=c["hq"],
+        h_kv=c["hkv"],
+        s_q=c["q"],
+        s_kv=c["kv"],
+        d_qk=d_qk,
+        d_v=d_v,
+        dtype=_DTYPES[s["dtype"]],
+        causal=causal,
+        bottom_right=causal,
+        window_left=c.get("window"),
+        has_sink=bool(c.get("sink")),
+        has_paged_kv=True,
+        page_size=page,
+        k_t=SimpleNamespace(get_stride=lambda: (page * d_qk * c["hkv"], page * d_qk, d_qk, 1)),
+        padded=True,
+        thd=True,
+        max_total_seq_len_q=int(q_lens.sum()) if c.get("total_q", "exact") == "exact" else None,
+        device_cc=tuple(s["device_cc"]),
+        device_sm_count=s.get("device_sm_count"),
+        has_bias=False,
+        has_dropout=False,
+        right_band_widening=False,
+    )
+
+
 def _facts_training(c, s):
     """Training harness: s_q == s_kv == s; THD at fill < 1 declares its live total (ragged)."""
     thd = c["layout"] == "thd"
@@ -118,7 +162,7 @@ def _facts_recorded(c, s):
     return SdpaGraphFacts(**kw)
 
 
-ADAPTERS = {"inference": _facts_inference, "training": _facts_training, "recorded": _facts_recorded}
+ADAPTERS = {"inference": _facts_inference, "inference_context": _facts_inference_context, "training": _facts_training, "recorded": _facts_recorded}
 
 
 def load(paths):
