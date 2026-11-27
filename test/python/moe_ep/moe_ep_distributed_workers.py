@@ -890,15 +890,14 @@ _DS3_EP4_SHAPE = {
     "physical_recv_pool_rows": 131968,
 }
 _DS3_DGRAD_PROFILES = ("baseline", "rolling", "ds3_ep4_pattern")
-# Relative Frobenius error bounds against the independent oracle, several times above
-# the values measured on GB200 for every profile (y 3.8e-4, dx 1.7e-3, dW 8.8e-5,
-# dprob 2.4e-5). The oracle computes dprob from the unquantized output gradient, so
-# kernel and oracle share one MXFP8 gradient; otherwise dprob would differ by that
-# gradient's quantization noise (about 2.7%) instead of by kernel error.
+# Relative Frobenius error bounds against the independent oracle, whose fp32 GEMMs run in
+# IEEE fp32. The oracle computes dprob from the unquantized output gradient, so kernel and
+# oracle share one MXFP8 gradient; otherwise dprob would differ by that gradient's
+# quantization noise instead of by kernel error.
 _DS3_REFERENCE_REL_FRO = {"y": 2e-3, "dx": 5e-3, "dprob": 2e-4, "dw1": 5e-4, "dw2": 5e-4}
 # The element-wise dprob bound scales with the tensor, atol = TOL * max(|dprob|.max(), 1):
-# a fixed atol fails entries near zero on reference rounding alone, e.g. when the
-# container runs the oracle's fp32 GEMMs as TF32.
+# each entry is a long reduction whose rounding error follows the tensor's scale, so a
+# fixed atol fails entries near zero.
 _DS3_DPROB_RTOL = 1e-2
 _DS3_DPROB_ATOL = 1e-2
 _DS3_REFERENCE_MIN_COSINE = 0.999
@@ -1081,6 +1080,15 @@ def _distributed_ds3_numerics_worker(
 ) -> None:
     """Compare every dgrad profile on the qualified DS3 EP4 workload."""
 
+    # Run the oracle's fp32 GEMMs in IEEE fp32 whatever the container's default: NGC images set
+    # TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 and pip torch does not. This worker is its own spawned
+    # process, so the setting needs no restore. fp32_precision is torch >= 2.9; allow_tf32 is
+    # the older spelling of the same switch, and torch raises when one process mixes the two.
+    matmul = torch.backends.cuda.matmul
+    if hasattr(matmul, "fp32_precision"):
+        matmul.fp32_precision = "ieee"
+    else:
+        matmul.allow_tf32 = False
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     dist.init_process_group(
