@@ -395,10 +395,11 @@ g.validate()
 
 
 @pytest.mark.L0
-def test_classification_and_facts_pull_no_framework():
+@pytest.mark.parametrize("module", ["cudnn.sdpa.graph_analyzer", "cudnn.conv.frost.fprop_heuristics", "cudnn.conv.frost.wgrad_heuristics"])
+def test_classification_and_facts_pull_no_framework(module):
     """The manifest classifies and the analyzer describes; neither lowers."""
     _assert_absent(
-        _imported_by("import cudnn\nfrom cudnn.engines import manifest\nfrom cudnn.sdpa import graph_analyzer"),
+        _imported_by(f"import cudnn\nfrom cudnn.engines import manifest\nimport {module}"),
         "classification + facts",
     )
 

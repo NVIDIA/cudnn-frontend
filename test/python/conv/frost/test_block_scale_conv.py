@@ -213,7 +213,7 @@ def test_block_scale_conv_correctness(monkeypatch, operands_and_reference, epilo
         output = torch.empty(reference.shape, dtype=torch_dtype, device="cuda", memory_format=torch.channels_last_3d)
         output_scale = None
 
-    select_and_build_frost_plan(graph, "frost_conv")
+    select_and_build_frost_plan(graph, "frost_conv_fprop")
     variant_pack = {
         image_desc: image,
         weight_desc: weight,

@@ -8,6 +8,8 @@ from dataclasses import replace
 
 import pytest
 
+from cudnn.conv.frost.utils import _channels_last_3d_stride
+
 from utils import make_input, requires_dense_cutedsl, requires_sm100, select_and_build_frost_plan
 from test_conv_shapes import ConvCase, _SHAPE_CASES, test_frost_conv_supported_shapes_and_geometry as run_shape
 
@@ -16,7 +18,7 @@ pytestmark = [requires_dense_cutedsl]
 
 @pytest.fixture
 def dynamic():
-    from cudnn.conv.frost.templates import sm100_conv as module
+    from cudnn.conv.frost.templates import sm100_conv_fprop as module
 
     module._compile_cached.cache_clear()
     yield module
@@ -121,7 +123,7 @@ def test_separate_graphs_reuse_and_replay(monkeypatch, dynamic, cta_group, dtype
             gx, gw = graph.tensor_like(x), graph.tensor_like(w)
             gy = graph.conv_fprop(gx, gw, pre_padding=case.pre_padding, post_padding=case.post_padding, stride=case.stride, dilation=case.dilation)
             gy.set_output(True).set_data_type(fe_dtype).set_dim(y.shape).set_stride(y.stride())
-            select_and_build_frost_plan(graph, "frost_conv")
+            select_and_build_frost_plan(graph, "frost_conv_fprop")
             if index == 0:
                 monkeypatch.setattr(dynamic.cute, "compile", lambda *a, **k: pytest.fail("runtime geometry recompiled"))
             workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
@@ -146,17 +148,17 @@ def test_separate_graphs_reuse_and_replay(monkeypatch, dynamic, cta_group, dtype
 def test_dynamic_plan_rejects_changed_binding_before_launch(monkeypatch, bad_role, bad_field):
     from types import SimpleNamespace
     import cudnn
-    from cudnn.conv.frost import engine
+    from cudnn.conv.frost import fprop_engine as engine
     from cudnn.engines.base import ExecutionContext
 
     shapes = [(1, 64, 3, 5, 7), (40, 64, 1, 2, 3), (1, 40, 3, 4, 5)]
     declarations = [SimpleNamespace(dim=s, data_type=cudnn.data_type.BFLOAT16, uid=i) for i, s in enumerate(shapes)]
     calls = []
     monkeypatch.setattr(engine, "current_device", lambda: 0)
-    plan = engine._Sm100FrostConvPlan(lambda *a: calls.append(a), declarations, 0, ((0, 0, 0), (0, 0, 0), (1, 1, 1), (1, 1, 1)))
+    plan = engine._Sm100FrostConvFpropPlan(lambda *a: calls.append(a), declarations, 0, ((0, 0, 0), (0, 0, 0), (1, 1, 1), (1, 1, 1)))
     operands = []
     for index, shape in enumerate(shapes):
-        stride = engine._channels_last_3d_stride(shape)
+        stride = _channels_last_3d_stride(shape)
         operand = SimpleNamespace(shape=shape, dtype="bfloat16", stride=lambda stride=stride: stride, data_ptr=lambda: 16, permute=lambda *a: object())
         if index == bad_role:
             if bad_field == "shape":

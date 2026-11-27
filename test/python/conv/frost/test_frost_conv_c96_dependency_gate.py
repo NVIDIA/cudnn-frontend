@@ -9,8 +9,9 @@ import cudnn
 import pytest
 import torch
 
-from cudnn.conv.frost._cutedsl import DENSE_CUTEDSL_MIN_VERSION, requirement_error
-from cudnn.conv.frost.engine import FrostConvEngine
+from cudnn.conv.frost.checks import DENSE_CUTEDSL_MIN_VERSION
+from cudnn.conv.frost.fprop_engine import FrostConvFpropEngine
+from cudnn.frost.buffers import cutedsl_requirement_error
 
 pytestmark = pytest.mark.L0
 
@@ -18,7 +19,7 @@ pytestmark = pytest.mark.L0
 @pytest.mark.parametrize("k", (96, 192))
 def test_frost_c96_real_dependency_gate_before_template_import(monkeypatch, k):
     """Decline an unsupported installed DSL before either entry point imports the dense template."""
-    error = requirement_error("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
+    error = cutedsl_requirement_error("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION, require_installed=True)
     if error is None:
         pytest.skip("installed DSL satisfies the dense version gate; covered by C96 execution tests")
     image = torch.empty((1, 96, 1, 7, 9), dtype=torch.bfloat16, device="cuda", memory_format=torch.channels_last_3d)
@@ -31,11 +32,11 @@ def test_frost_c96_real_dependency_gate_before_template_import(monkeypatch, k):
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        assert not name.endswith("templates.sm100_conv"), "the version gate must precede dense template import"
+        assert not name.endswith("templates.sm100_conv_fprop"), "the version gate must precede dense template import"
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
-    engine = FrostConvEngine()
+    engine = FrostConvFpropEngine()
     for call in (lambda: engine.check_support(graph), lambda: engine.build_plan(graph, None)):
         with pytest.raises(NotImplementedError) as caught:
             call()

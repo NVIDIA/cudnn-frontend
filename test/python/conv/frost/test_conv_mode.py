@@ -8,7 +8,7 @@ from contextlib import nullcontext
 import cudnn
 import pytest
 
-from cudnn.conv.frost.engine import FrostConvEngine
+from cudnn.conv.frost.fprop_engine import FrostConvFpropEngine
 from utils import _SM, requires_block_scale_cutedsl, requires_dense_cutedsl, requires_sm100
 
 # The block-scaled plan declines every part but SM100/SM103 before it reads the convolution mode.
@@ -60,4 +60,4 @@ def test_frost_conv_convolution_mode(block_scaled, mode) -> None:
         else nullcontext()
     )
     with expectation:
-        FrostConvEngine().check_support(graph)
+        FrostConvFpropEngine().check_support(graph)

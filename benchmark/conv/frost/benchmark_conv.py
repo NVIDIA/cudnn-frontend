@@ -119,7 +119,7 @@ def _build_frost_kernel(
     dilation: tuple[int, int, int],
 ):
     """Compile one explicitly selected convolution tile configuration."""
-    from cudnn.conv.frost.templates.sm100_conv import compile
+    from cudnn.conv.frost.templates.sm100_conv_fprop import compile
 
     compiled = compile(
         ncdhw=(shape.n, shape.c, shape.d, shape.h, shape.w),
@@ -263,7 +263,7 @@ def main() -> int:
     if args._nsys_worker:
         return _worker(args, shape, spatial, nbuf)
 
-    from cudnn.conv.frost.templates.sm100_conv import _dense_config_violation, _is_dense_selection_candidate
+    from cudnn.conv.frost.templates.sm100_conv_fprop import _dense_config_violation, _is_dense_selection_candidate
 
     z, p, q = spatial
     implicit_m = shape.n * z * p * q

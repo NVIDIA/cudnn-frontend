@@ -216,6 +216,12 @@ Host-overhead migrations: measure warm enqueue and captured GPU replay separatel
 - **Scope:** new and changed release sites. Existing sites keep their release arrive, fence or named barrier until moved onto the helper.
 - **Detectors.** Proof: in the disassembly of every shipped rendering, each load of a released stage has a read of every destination register before the release on every path. `warm_stress.assert_release_dependence` pins the helper's chain in PTX; `sdpa/frost/test_tile_dsl_consume_then_arrive.py` applies it to every form against an unsafe twin. Rate bound: `warm_stress.assert_warm_stress` ([test/AGENTS.md](../../test/AGENTS.md)) on a shape that refills the stage within one launch, with at least two thread blocks per SM where possible. Cold functional tests and launch-1-equals-launch-2 checks do not test this.
 
+**Rule 12 — split a long tensor-core reduction across at least two accumulator chains, and validate against FP64 on the smallest-magnitude outputs.**
+
+- **Hazard.** On SM100 the `tcgen05.mma` FP32 accumulate step truncates toward zero instead of rounding to nearest, so one accumulator chain over the whole reduction collects a same-signed error proportional to the running sum's magnitude, growing faster than linearly in the issue count. At a reduction length near a million pixels (tens of thousands of MMA issues) the error at small-magnitude outputs reaches `atol`, and the maximum absolute error does not show it: BF16 output quantization dominates there.
+- **Do this.** Feed alternate MMA issues to separate tensor-memory accumulators and fold them into one IEEE FP32 value in the epilogue (`conv/frost/templates/sm100_conv_wgrad.py` uses `_NUM_ACC_STAGES` slots for this, each seeded by an `enable_input_d`-cleared issue). Two chains are the floor; every extra chain divides the error.
+- **Detector.** Compare a long-reduction kernel against an FP64 contraction restricted to the outputs with `|exact| < atol` (rms and max of `kernel - exact`). A single chain lands orders of magnitude above an IEEE FP32 sequential sum of the same products, and no max-absolute-error check can see it.
+
 ## Frontend-only kernel package layout
 
 Organize by operation, then backend (`frost`, `cutedsl`), then architecture (`sm100`, `sm120`) where needed. Shared public functions go in the op's `api.py`; backend-independent contracts in `ops.py` (or `ops/`). Backend-specific adapters and layout/fusion subpackages stay inside their backend.

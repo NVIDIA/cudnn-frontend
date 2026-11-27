@@ -8,7 +8,7 @@ from contextlib import contextmanager
 import cudnn
 import pytest
 
-from cudnn.conv.frost.engine import FrostConvEngine
+from cudnn.conv.frost.fprop_engine import FrostConvFpropEngine
 from cudnn.frost import buffers
 from utils import requires_dense_cutedsl
 
@@ -32,20 +32,20 @@ def test_frost_c96_architecture_admission(monkeypatch, sm, channels, k, dtype):
     y.set_output(True).set_data_type(dtype).set_dim((1, k, 1, 7, 9)).set_stride((k * 63, 1, k * 63, k * 9, k))
     if sm == 103 and channels == 96 and dtype == cudnn.data_type.BFLOAT16:
         with pytest.raises(NotImplementedError, match="BF16 C96 causal convolution is qualified only on SM100"):
-            FrostConvEngine().check_support(graph)
+            FrostConvFpropEngine().check_support(graph)
     else:
-        FrostConvEngine().check_support(graph)
+        FrostConvFpropEngine().check_support(graph)
 
 
 @requires_dense_cutedsl
 @pytest.mark.parametrize("depth,k", [(1, 96), (5, 96), (1, 192), (5, 192)])
 def test_frost_c96_compiler_uses_build_device_and_target(monkeypatch, depth, k):
     """Separate same-architecture devices in the cache and compile each path in its own context."""
-    from cudnn.conv.frost.templates import sm100_conv
+    from cudnn.conv.frost.templates import sm100_conv_fprop
 
     target, active = [0, "sm_100a"], [99]
     compiled, queried = [], []
-    monkeypatch.setattr(sm100_conv, "build_target", lambda: tuple(target))
+    monkeypatch.setattr(sm100_conv_fprop, "build_target", lambda: tuple(target))
 
     @contextmanager
     def device_context(device):
@@ -75,17 +75,17 @@ def test_frost_c96_compiler_uses_build_device_and_target(monkeypatch, depth, k):
         compiled.append(result)
         return result
 
-    monkeypatch.setattr(sm100_conv, "device_context", device_context)
-    monkeypatch.setattr(sm100_conv.utils, "HardwareInfo", HardwareInfo)
-    monkeypatch.setattr(sm100_conv.cute, "compile", compile_kernel)
-    sm100_conv._compile_cached.cache_clear()
+    monkeypatch.setattr(sm100_conv_fprop, "device_context", device_context)
+    monkeypatch.setattr(sm100_conv_fprop.utils, "HardwareInfo", HardwareInfo)
+    monkeypatch.setattr(sm100_conv_fprop.cute, "compile", compile_kernel)
+    sm100_conv_fprop._compile_cached.cache_clear()
     try:
         results = []
         for device in (0, 1, 0, 1):
             target[0] = device
-            result = sm100_conv.compile(ncdhw=(1, 96, depth, 7, 9), ktrs=(k, 3, 3, 3), lower_padding_dhw=(2, 1, 1), upper_padding_dhw=(0, 1, 1))
+            result = sm100_conv_fprop.compile(ncdhw=(1, 96, depth, 7, 9), ktrs=(k, 3, 3, 3), lower_padding_dhw=(2, 1, 1), upper_padding_dhw=(0, 1, 1))
             if depth == 1 and k == 96:
-                assert isinstance(result, sm100_conv._PaddedFrameConv)
+                assert isinstance(result, sm100_conv_fprop._PaddedFrameConv)
                 assert result.workspace_bytes == 384
                 result = result.launch
             results.append(result)
@@ -95,4 +95,4 @@ def test_frost_c96_compiler_uses_build_device_and_target(monkeypatch, depth, k):
         assert results[0] is not results[1]
         assert queried == [0, 1]
     finally:
-        sm100_conv._compile_cached.cache_clear()
+        sm100_conv_fprop._compile_cached.cache_clear()

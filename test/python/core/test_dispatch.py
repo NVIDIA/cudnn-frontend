@@ -1044,6 +1044,9 @@ def test_a_graph_spanning_two_families_belongs_to_neither(monkeypatch):
     assert manifest.family_for(Fake(["MATMUL", "POINTWISE"])).name == "frost_gemm"
     assert manifest.family_for(Fake(["MATMUL", "SDPA"])) is None
     assert manifest.family_for(Fake(["POINTWISE"])) is None
+    assert manifest.family_for(Fake(["CONV_FPROP", "POINTWISE"])).name == "frost_conv_fprop"
+    assert manifest.family_for(Fake(["CONV_WGRAD"])).name == "frost_conv_wgrad"
+    assert manifest.family_for(Fake(["CONV_FPROP", "CONV_WGRAD"])) is None
 
 
 def test_classification_does_not_depend_on_the_machine(monkeypatch):

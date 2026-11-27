@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from cuda.bindings import driver as cuda
-from cudnn.conv.frost._cutedsl import requirement_error as cutedsl_requirement_error
+from cudnn.frost.buffers import cutedsl_requirement_error
 
 
 def _has_supported_gpu() -> bool:
@@ -21,7 +21,7 @@ def _has_supported_gpu() -> bool:
     )
 
 
-_dsl_error = cutedsl_requirement_error("Conv3D post-operation tests", (4, 9))
+_dsl_error = cutedsl_requirement_error("Conv3D post-operation tests", (4, 9), require_installed=True)
 requires_cutedsl = pytest.mark.skipif(_dsl_error is not None, reason=_dsl_error or "CuTeDSL version is supported")
 requires_gpu = pytest.mark.skipif(not _has_supported_gpu(), reason="requires SM100 or SM103")
 

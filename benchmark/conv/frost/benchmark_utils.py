@@ -25,9 +25,17 @@ import torch
 from cudnn.conv.frost.tile_config import ConvTileConfig, by_name
 from cudnn.engines.engine_ids import is_backend_engine
 
-_L2_BYTES = 126 * 1024 * 1024  # B200 class
+_L2_BYTES_FALLBACK = 126 * 1024 * 1024  # only when the device cannot report its own L2 size
 _AUTO_POOL_BUDGET_BYTES = 4 * 1024 * 1024 * 1024
 _AUTO_NBUF_CAP = 1024
+
+
+def _l2_bytes() -> int:
+    """L2 size of the benchmark device, so the rotation pool stays larger than that cache."""
+    try:
+        return int(torch.cuda.get_device_properties(torch.cuda.current_device()).L2_cache_size)
+    except (AttributeError, RuntimeError):
+        return _L2_BYTES_FALLBACK
 
 
 @dataclass(frozen=True)
@@ -161,7 +169,7 @@ def resolve_nbuf(spec: str, per_set_bytes: int) -> int:
         except ValueError as exc:
             raise ValueError("--rotate-buffers must be 'auto' or a positive integer") from exc
 
-    nbuf = max(2, -(-int(1.5 * _L2_BYTES) // per_set_bytes))
+    nbuf = max(2, -(-int(1.5 * _l2_bytes()) // per_set_bytes))
     budget = _AUTO_POOL_BUDGET_BYTES
     if torch.cuda.is_available():
         free, _total = torch.cuda.mem_get_info()
@@ -260,6 +268,7 @@ def profile(
     shape: ConvShape,
     nbuf: int,
     tile_config: Optional[str] = None,
+    extra_inner: Sequence[str] = (),
 ) -> list[KernelStats]:
     nsys = "/usr/local/bin/nsys" if os.path.exists("/usr/local/bin/nsys") else shutil.which("nsys")
     if nsys is None:
@@ -293,6 +302,8 @@ def profile(
         inner += ["--check-correctness"]
     if tile_config is not None:
         inner += ["--_tile-config", tile_config]
+    if extra_inner:
+        inner += list(extra_inner)
 
     with _report_prefix(script, args.output, implementation, tile_config) as report_prefix:
         profile_command = [

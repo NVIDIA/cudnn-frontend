@@ -191,7 +191,7 @@ def test_frost_conv_supported_shapes_and_geometry(monkeypatch, case: ConvCase) -
         memory_format=torch.channels_last_3d,
     )
     output.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_dim(output_gpu.shape).set_stride(output_gpu.stride())
-    select_and_build_frost_plan(graph, "frost_conv")
+    select_and_build_frost_plan(graph, "frost_conv_fprop")
 
     workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     graph.execute({image: image_gpu, weight: weight_gpu, output: output_gpu}, workspace)
@@ -202,7 +202,7 @@ def test_frost_conv_supported_shapes_and_geometry(monkeypatch, case: ConvCase) -
 
 
 def test_frost_conv_rejects_narrow_channel_rows() -> None:
-    from cudnn.conv.frost.engine import FrostConvEngine
+    from cudnn.conv.frost.fprop_engine import FrostConvFpropEngine
 
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -215,4 +215,4 @@ def test_frost_conv_rejects_narrow_channel_rows() -> None:
     output.set_output(True).set_dim((1, 32, 1, 1, 1)).set_stride((32, 1, 32, 32, 32))
     graph.validate()
     with pytest.raises(NotImplementedError, match="64-element mainloop tile"):
-        FrostConvEngine().check_support(graph)
+        FrostConvFpropEngine().check_support(graph)
