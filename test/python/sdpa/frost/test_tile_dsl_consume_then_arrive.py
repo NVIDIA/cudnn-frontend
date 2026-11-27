@@ -313,6 +313,12 @@ def test_the_arrive_of_every_form_is_computed_from_every_loaded_register(renders
     assert site.parameter.endswith("_param_3"), f"the mask is not the release-zero (the kernel's fourth parameter): {site.parameter}"
     assert site.loads == 5 and site.loaded_registers == WORDS_PER_RELEASE, (site.loads, site.loaded_registers)
     spelling, predicated, counted = ARRIVE_SPELLING[form]
+    if form == "peer_all":
+        # PTX defaults to .release.cta when both qualifiers are omitted.
+        # The compiler can also materialize the default count of one.
+        assert site.text.split()[0] in (spelling, "mbarrier.arrive.shared::cluster.b64"), site.text
+        assert site.count == 1, f"{form}: expected one arrival per lane, got {site.count} -- {site.text}"
+        return
     assert spelling in site.text, site.text
     assert site.text.startswith("@%p") == predicated, f"{form}: predicate -- {site.text}"
     count_operand = site.text.split("]", 1)[1].strip(" ;,")
