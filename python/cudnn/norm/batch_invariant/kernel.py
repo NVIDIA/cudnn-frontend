@@ -328,6 +328,9 @@ def _rmsnorm_kernel(
     _walk_row_groups(cfg, x_ptr, x_stride, xbuf, bid, grid, rows, t, lane, r_in, xs, acc, ww, red, y_ptr, y_stride, rstd_out, eps)
 
 
+_rmsnorm_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _walk_row_groups(cfg: cutlass.Constexpr, x_ptr, x_stride, xbuf, gi, grid, rows, t, lane, r_in, xs, acc, ww, red, y_ptr, y_stride, rstd_out, eps):
     """The CTA's row groups ``gi, gi + grid, ...``, each staged ``stages - 1`` groups ahead."""
@@ -378,9 +381,6 @@ def _store_row_granule(cfg: cutlass.Constexpr, xs, ww, slot: cutlass.Constexpr, 
         else:
             words = cutlass.Vector.from_elements(tuple(ys), out_et).bitcast(out_word)
             nvvm.store_ext(words, y_ptr + (y_base + Int64(g * V + c * chunk)))
-
-
-_rmsnorm_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
