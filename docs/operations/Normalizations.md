@@ -308,6 +308,40 @@ Without it there is no `DSCALE` or `DBIAS`, so `has_dbias(true)` is refused. The
 normalization axes. Verified on Hopper with cuDNN 9.12, 9.14, 9.18, 9.20, 9.24 and 9.27, and on
 Ampere and Blackwell with 9.27; older backends were not qualified.
 
+### Batch-invariant forward
+
+The Python graph API offers the `batch_invariant_rmsnorm` engine on SM100, SM103 and SM107. Request it with the
+`BATCH_INVARIANT` numerical note on both the rollout (`INFERENCE`) and training (`TRAINING`) forward graphs.
+
+```python
+g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+x = g.tensor(dim=[rows, hidden], stride=[hidden, 1], data_type=cudnn.data_type.BFLOAT16)
+w = g.tensor(dim=[1, hidden], stride=[hidden, 1], data_type=cudnn.data_type.BFLOAT16)
+eps = g.tensor(dim=[1, 1], stride=[1, 1], data_type=cudnn.data_type.FLOAT, is_pass_by_value=True)
+y, inv_rms = g.rmsnorm(norm_forward_phase=cudnn.norm_forward_phase.TRAINING, input=x, scale=w, bias=None, epsilon=eps)
+y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+inv_rms.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+g.select_numeric_notes([cudnn.numerical_note.BATCH_INVARIANT])
+g.build()
+```
+
+On the same architecture and software stack, a row's `Y` and `INV_VARIANCE` depend only on its own values, the
+scale, epsilon, the dtypes and the hidden size. They do not depend on the number of rows, the row's position or the
+other rows. The engine computes in FP32 with round-to-nearest-even and no flush-to-zero, in a summation order fixed
+by the hidden size and the input dtype. `TRAINING` computes the same `Y` as `INFERENCE`. The training backward can
+use the usual `rmsnorm_backward` graph with the saved `INV_VARIANCE` and does not take the note.
+
+The engine accepts FP32, FP16 or BF16 input, scale and output, and rows of up to 65536 elements. The normalized axes
+must be packed and trailing, and the row axes must collapse to one row stride. Rows are accessed in granules of the
+largest power-of-two number of elements that divides the hidden size, up to 16 bytes of the input; the row strides
+must be multiples of the granule, rows of Y must not overlap, and X, Y and the scale must be aligned to their granule
+accesses. `INV_VARIANCE` must be a packed FP32 tensor and epsilon a pass-by-value FP32 scalar bound at execute.
+Bias and adaptive scales are not supported. Requesting the note on an unsupported graph raises
+`cudnnGraphNotSupportedError`. To run varying row counts through one graph, build it with
+`is_override_shape_enabled=True` and override the row axes of X, Y and `INV_VARIANCE` at execute.
+See the [determinism support matrix](https://docs.nvidia.com/cudnn/operations/determinism) and the
+[batch-invariant tests](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/norm/batch_invariant/README.md) for executable graphs.
+
 ## RMSNorm PyTorch API
 
 `cudnn.experimental.ops.rms_norm(input, weight, bias=None, eps=1e-5)` applies

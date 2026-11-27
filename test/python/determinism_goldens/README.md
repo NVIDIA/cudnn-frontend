@@ -4,6 +4,48 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Batch-invariant RMSNorm forward (2026-11-27)
+
+All 75 cases in the [batch-invariant RMSNorm suite](../norm/batch_invariant/README.md) passed on a B200 (SM100,
+148 SMs, driver 615.71.10). The 73 non-golden cases passed on a B300 (SM103, 148 SMs, driver 615.71.10) and on SM107
+(216 SMs, driver 620.62). The goldens recorded for each runtime hold the same input and output bytes. The runs used
+cuDNN 9.28.1, CuTe DSL 4.8.1, PyTorch 2.13.0+cu130 and TVM-FFI 0.1.13.post3, on `7de9d76a` with this change.
+
+Coverage:
+
+- Inference and training forward over BF16, FP16 and FP32 inputs, with BF16, FP16 and FP32 weights.
+- Hidden sizes 128 (one 16-lane group), 2048, 4096, 4800 (unequal lane loads), 5120, 7168 and 8192, and hidden sizes
+  with granules narrower than 16 bytes: 100 (BF16, 8-byte granules), 1002 (BF16, 4-byte), 7 (BF16, 2-byte), 4097
+  (FP16, 2-byte) and 2049 (FP32, 4-byte).
+- Each case matched the exact CPU model of the class (`reference` in `norm/batch_invariant/bi_rmsnorm_utils.py`)
+  for `y` and `rstd` byte for byte, and an FP64 reference within dtype tolerance. Inputs included signed zeros,
+  subnormals and a wide exponent range.
+- Replays used fresh outputs and side-stream work.
+- A row matched its bytes after reordering, duplication, truncation of the batch and changed neighbour rows. It also
+  matched at a row count spanning several waves of resident CTAs (24576 rows at H=4096).
+- One inference graph and one training graph built with `is_override_shape_enabled` ran a row count for each
+  placement they can pick through execute-time shape overrides. Each matched the model and a graph built for that
+  row count byte for byte.
+- Every placement of the class matched the model at H=128, 4096, 4800, 7168, 100, 1002, 4100 and 4097, that is at
+  16-, 8-, 4- and 2-byte granules. Placements cover 1 to 8 lanes per
+  thread, 1 to 32 rows per CTA, direct loads or a shared-memory prefetch 1 to 3 row groups deep, and persistent or
+  one-CTA-per-row-group grids. Each placement was run with its scheduled grid and with grids of 1 and 7 CTAs, so that
+  each CTA walks many row groups. Training `y` matched inference `y`.
+- An execute with the X, Y or scale pointer misaligned to its granule access was rejected, as were a short
+  inverse-RMS buffer, an X of another dtype, an FP64 epsilon, an overlapping Y row stride and a row count of 2^28 or
+  more.
+- The two [goldens](../norm/batch_invariant/goldens/) passed strict comparison.
+
+The kernel's PTX holds only `fma.rn`, `add.rn`, `mul.rn`, `mul.rn.f32x2`, `div.rn` and `sqrt.rn` floating-point
+operations, with no `.ftz` or `.approx`.
+
+Run from `test/python`:
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/norm/batch_invariant/goldens" \
+    python -m pytest -n0 -q -rs norm/batch_invariant/
+```
+
 ### Quantized batch-invariant matmul (2026-11-24)
 
 The [batch-invariant suite](../gemm/batch_invariant/README.md) passed on SM100 (P2021, 68 SMs) and SM107
