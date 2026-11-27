@@ -3120,7 +3120,7 @@ def paged_d256_prefix_launch(caps: Capabilities, facts) -> Optional[_SplitKvLaun
 SM100_PAGED_PACKED_SPLIT_CGA = {(64, 64): 1, (256, 256): 2}  # SM100/103 paged half packed split: D64 decode tile, D256 pair
 SM100_PAGED_PACKED_SPLIT_GROUPS = (2, 4, 8, 16)
 SM100_PAGED_PACKED_SPLIT_Q = (8, 1024)  # declared S_q range measured (B200 study sm100_paged_d64_d256_prefill_20261111)
-SM100_PAGED_PACKED_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
+SM100_PAGED_PACKED_SPLIT_KV = (2048, 131072)  # declared S_kv range measured (to 131072: study paged_thd_long_kv_split_20261127)
 SM100_PAGED_PACKED_SPLIT_KV_PER_Q = 2  # declared S_kv >= this x S_q
 # Past the first wave (study sm100_paged_packed_split_waves_20261112; B200, B300 transfer): the parts timed, the declared S_q up to which the
 # packed split still leads, D64 also to 128 rows over at least this many KV tiles, and at most this many partitions.
@@ -3226,7 +3226,7 @@ SM100_PAGED_TAIL_SPLIT_CGA = {(64, 64): 1, (128, 128): 1, (256, 256): 2}
 SM100_PAGED_TAIL_SPLIT_CCS = frozenset({(10, 0), (10, 3)})
 SM100_PAGED_TAIL_SPLIT_MAX_B = 16
 SM100_PAGED_TAIL_SPLIT_Q = (16, 1024)  # declared S_q range measured
-SM100_PAGED_TAIL_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
+SM100_PAGED_TAIL_SPLIT_KV = (2048, 131072)  # declared S_kv range measured (to 131072: study paged_thd_long_kv_split_20261127)
 SM100_PAGED_TAIL_SPLIT_ONE_TILE_DIMS = frozenset({64, 128})
 SM100_PAGED_TAIL_SPLIT_MULTI_TILE_BREAK_EVEN = {256: 74}
 SM100_PAGED_TAIL_SPLIT_PARTIAL_COST = 16

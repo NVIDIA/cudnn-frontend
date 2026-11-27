@@ -2928,12 +2928,12 @@ def test_sm100_paged_d256_mha_prefix_leads_unsplit():
         dict(device_cc=(10, 7), device_sm_count=208),
         dict(max_total_seq_len_q=8 * 64),  # a total-Q declaration was not measured
         dict(b=17),
-        dict(s_kv=65537),
+        dict(s_kv=131073),
         dict(s_q=8),
         dict(dtype=cudnn.data_type.FP8_E4M3),
         dict(window_left=128),
     ],
-    ids=["rubin", "total_q", "b17", "kv_past_64k", "q8", "fp8", "window"],
+    ids=["rubin", "total_q", "b17", "kv_past_128k", "q8", "fp8", "window"],
 )
 def test_sm100_paged_tail_split_stays_inside_its_study(over):
     from cudnn.sdpa.fwd import heuristics, placement
@@ -2943,3 +2943,21 @@ def test_sm100_paged_tail_split_stays_inside_its_study(over):
     values.update(over)
     assert heuristics.sm100_paged_tail_split_choice(spec.capabilities, _sm100_paged_prefix(128, 64, 64, **values)) == (1, False), over
     assert not heuristics.sm100_paged_tail_split_domain(spec.capabilities, _sm100_paged_prefix(256, 16, 16, **values)), over
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("cc, sms", [((10, 0), 148), ((10, 3), 160)], ids=["b200", "b300"])
+@pytest.mark.parametrize("d, h_q", [(64, 8), (256, 4)], ids=["d64", "d256"])
+def test_sm100_paged_packed_split_reaches_long_caches(d, h_q, cc, sms):
+    """Study paged_thd_long_kv_split_20261127: on cc 10.0 / 10.3 one request's prefill chunk over a 128k paged cache splits like a
+    32k one and leads; past the declared bound it keeps the unsplit plan."""
+    from cudnn.sdpa.fwd import heuristics, placement
+
+    spec = engines.sm100_legacy_policy_spec(LOOKAHEAD if d == 256 else _LEGACY_F16)
+    facts = _sm100_paged_prefix(d, h_q, 1, s_q=512, s_kv=131072, device_cc=cc, device_sm_count=sms)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, facts)[0] > 1
+    first = next(p for p in recommend("A", facts, _OFFERED) if p.engine_id in _HALF_IDS)
+    assert first.knobs.split_kv > 1 and first.knobs.pack_gqa
+    assert placement.place(_spec_for_plan(first), facts, first.knobs) == placement.LEAD
+    past = _sm100_paged_prefix(d, h_q, 1, s_q=512, s_kv=heuristics.SM100_PAGED_PACKED_SPLIT_KV[1] + 1, device_cc=cc, device_sm_count=sms)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, past) == (1, False)
