@@ -162,7 +162,8 @@ class GroupedGemmWgradBf16API(APIBase):
     def _infer_a_major(desc: TensorDesc) -> str:
         m, tokens = desc.shape
         stride = canonicalize_unit_dim_strides(desc.shape, desc.stride)
-        if stride == canonicalize_unit_dim_strides(desc.shape, (tokens, 1)):
+        # A zero-token operand has no elements; torch gives its dense layout the stride max(tokens, 1).
+        if stride in {canonicalize_unit_dim_strides(desc.shape, (t, 1)) for t in (tokens, max(tokens, 1))}:
             return "k"
         if stride == canonicalize_unit_dim_strides(desc.shape, (1, m)):
             return "m"
@@ -172,7 +173,7 @@ class GroupedGemmWgradBf16API(APIBase):
     def _infer_b_major(desc: TensorDesc) -> str:
         tokens, n = desc.shape
         stride = canonicalize_unit_dim_strides(desc.shape, desc.stride)
-        if stride == canonicalize_unit_dim_strides(desc.shape, (1, tokens)):
+        if stride in {canonicalize_unit_dim_strides(desc.shape, (1, t)) for t in (tokens, max(tokens, 1))}:
             return "k"
         if stride == canonicalize_unit_dim_strides(desc.shape, (n, 1)):
             return "n"
@@ -531,4 +532,11 @@ class GroupedGemmWgradBf16API(APIBase):
             scratch = (
                 _workspace if is_torch_tensor(_workspace) and get_shape(_workspace) == (nbytes,) else from_dlpack(view, assumed_align=128, enable_tvm_ffi=True)
             )
+        if is_torch_tensor(a_tensor) and get_shape(a_tensor)[1] == 0:
+            # The kernel takes a K-major operand's token stride as a multiple of 256; restride torch's (1, 1) to the
+            # zero-token compact stride. The views hold no elements.
+            if self.a_major == "k":
+                a_tensor = a_tensor.as_strided(get_shape(a_tensor), (0, 1))
+            if self.b_major == "k":
+                b_tensor = b_tensor.as_strided(get_shape(b_tensor), (1, 0))
         self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, current_stream, scratch)
