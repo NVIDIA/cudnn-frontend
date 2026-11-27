@@ -1700,6 +1700,8 @@ cudnn.ops.mhc.pre_mix_backward_jax
 cudnn.ops.mhc.pre_mix_forward
 cudnn.ops.mhc.pre_mix_forward_jax
 cudnn.ops.mhc.workspace_size
+cudnn.ops.mxfp4_quantize_forward
+cudnn.ops.mxfp8_quantize_forward
 cudnn.ops.nsa
 cudnn.ops.nsa.compression_attention_forward
 cudnn.ops.nsa.compression_attention_forward_jax
@@ -1710,6 +1712,7 @@ cudnn.ops.nsa.top_k_reduction_forward
 cudnn.ops.nsa.top_k_reduction_forward_jax
 cudnn.ops.nvfp4_block_scale_dequantize_forward
 cudnn.ops.nvfp4_block_scale_quantize_forward
+cudnn.ops.nvfp4_quantize_forward
 cudnn.ops.prepare_mok_training
 cudnn.ops.qsa_backward
 cudnn.ops.qsa_forward

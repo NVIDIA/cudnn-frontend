@@ -381,6 +381,15 @@ _quantized/arithmetic.py also adapts flashinfer/batch_invariant/fp_interface/cut
 The cuDNN Frontend port binds graph tensors and workspace through its own
 compiler and launch interface.
 
+The MXFP8, MXFP4 and NVFP4 quantizers in python/cudnn/quantize/batch_invariant/ adapt Apache-2.0
+sources from FlashInfer at commit 26075a1331ff91530706567b59389c23cc143648: the MX and NVFP4 quantization
+kernels, schedules, scale-factor layouts and element conversions from
+flashinfer/batch_invariant/quantization/, the canonical reduction engine from
+flashinfer/batch_invariant/canon.py, and the exact, symbolic and CuTe floating-point
+interfaces from flashinfer/batch_invariant/fp_interface/. Each adapted file keeps its
+upstream notice. The cuDNN Frontend port compiles and caches the kernels through its own
+compiler interface and replaces FlashInfer's launch and validation layer.
+
 The BF16 input generator in test/python/gemm/batch_invariant/test_flashinfer_integration.py
 adapts adv_bf16 from tests/gemm/test_batch_invariant_mm_bf16.py at the same
 revision. The fixture selects the device to which the generated inputs are copied.

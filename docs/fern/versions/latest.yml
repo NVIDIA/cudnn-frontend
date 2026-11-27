@@ -113,6 +113,9 @@ navigation:
           - page: NVFP4 block-scale conversion
             path: ../../operations/block_scaling/nvfp4_block_scale_conversion.md
             slug: nvfp4_block_scale_conversion
+          - page: Batch-invariant MXFP8, MXFP4 and NVFP4 quantization
+            path: ../../operations/block_scaling/batch_invariant_mx_quantize.md
+            slug: batch_invariant_mx_quantize
           - page: FP4 Row Quantization Decode Step (SM100-class)
             path: ../../operations/block_scaling/row_quantize_fp4_decode.md
             slug: row_quantize_fp4_decode
