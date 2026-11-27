@@ -3,12 +3,16 @@
 
 from .api import (
     GroupedGemmDgluSm100,
+    GroupedGemmDgluSm90,
     grouped_gemm_dglu_wrapper_sm100,
+    grouped_gemm_dglu_wrapper_sm90,
 )
 
 __all__ = [
     "GroupedGemmDgluSm100",
+    "GroupedGemmDgluSm90",
     "grouped_gemm_dglu_wrapper_sm100",
+    "grouped_gemm_dglu_wrapper_sm90",
     "grouped_gemm_dglu_jax_sm100",
 ]
 

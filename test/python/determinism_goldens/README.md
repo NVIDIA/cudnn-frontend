@@ -124,6 +124,40 @@ the default tuning's output bytes over repeated calls. These checks do not
 cover replay under concurrent work, batch invariance, warm stress or goldens,
 and no golden files are recorded.
 
+### H100 SM90 BF16 grouped GEMM determinism (2026-11-22)
+
+Forward and dgrad have no golden record. Replay, batch invariance and warm stress cover both
+directions and both warp-group schedules; `test_sm90_pingpong_matches_cooperative` checks that
+pingpong (128x192 tile, (2, 1) cluster) gives the cooperative bytes for forward and dgrad.
+
+Runtime: NVIDIA H100 80GB HBM3 (SM90, 132 SMs, x86-64 host), PyTorch 2.14.0+cu130,
+CUDA 13.0, driver API 13020, cuDNN 92400, CuTe DSL 4.8.0, tvm-ffi 0.1.16,
+compute-sanitizer 2026.1.1.0; source built from the commit under test.
+
+```
+G=gemm/cutedsl
+F=$(ls $G/test_grouped_gemm*sm90*.py)
+CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -m L0 $F
+```
+
+- L0: 113 passed, 0 skipped. D is scaled once per row by `alpha * prob`,
+  at most one bf16 ulp from `(acc * alpha) * prob`.
+- Replay: 8 fresh-buffer launches against concurrent second-stream work. Batch invariance:
+  alone, packed, reordered, duplicated, changed neighbors. Pingpong also: bytes equal to
+  cooperative 128x192, claim-order invariance down to one persistent cluster.
+- Warm stress (M = 8 x 512, N = 2048, K = 4096, 132 CTAs): 0 wrong of 3000 warm + 3000
+  poisoned launches for forward and dgrad; the unsafe control failed 200 of 200.
+  The tile-info case (`test_sm90_tile_info_warm_stress`: K = 64; about 12 (cooperative)
+  or 16 (pingpong) tiles per CTA) covers the tile-info slot release sites.
+- compute-sanitizer: racecheck and synccheck 0 errors; memcheck 0 device
+  errors (exit 99 on 28 host API messages: cuda-python requests CUDA 13030 > driver 13020).
+
+GLU and dGLU have no golden record either. `test_sm90_glu_pingpong_with_c` and
+`test_sm90_glu_pingpong_matches_cooperative_and_fp16` check that the GLU pingpong schedule gives
+the cooperative bytes. Warm stress at the same setup: 0 wrong of 3000 warm + 3000 poisoned
+launches for GLU and dGLU. The tile-info case `test_sm90_glu_tile_info_warm_stress` (K = 64)
+covers the tile-info slot release sites.
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution
@@ -9717,6 +9751,39 @@ and four direct launches: two at the default tile, one with the (2, 2)
 cluster and one with the (128, 256) tile. Racecheck ran the two default-tile
 launches. SM103 and SM107 were not run, only compiled: ptxas 13.4.92 reports
 0 spills for the deterministic configurations, 26 on sm_100a and 24 on sm_107a.
+
+### Grouped BF16 dGLU deterministic dprob - SM90 kernel, 2026-11-23 UTC
+
+The SM90 (Hopper) BF16 dGLU kernel takes the same `deterministic=True` flag:
+each (token, N-tile) partial goes to its own FP32 slot, with one slot per
+SM90 N tile (128 or 256 columns, rounded up to whole clusters along N). The
+wrapper zero-fills the slots and sums them on the launch stream, as on SM100.
+`gemm/cutedsl/test_grouped_gemm_dglu_bf16_sm90_determinism.py` (18 L0 cases,
+plus an L1 case at the DeepSeek-V3 FC2 dgrad shape) checks replay under
+concurrent work at both tiles and the (1, 2) and (2, 2) clusters. It also
+checks partial N tiles, expert reorder, solo, duplicate and changed-neighbor
+runs, D_row against the atomic path, dprob against the Torch reference,
+empty experts, the launch stream, and dbias and JAX rejections.
+
+On H100 (NVIDIA H100 80GB HBM3, SM90), the suite passed 19
+of 19 (L0 and L1). The L1 control shows the atomic dprob changed in 19 of 19
+replays, in up to 6444 of 8192 rows, while the deterministic path replayed
+bitwise and D never changed. The full SM90 L0 regression passed 235 of 235,
+and compute-sanitizer memcheck (2 cases,
+including N tiles rounded up to whole clusters), racecheck and synccheck found
+nothing. Cost on fc2 dGLU (deterministic / atomic time): EP8 and EP4
+DeepSeek-V3 and qwen38_2p4t measured 1.007 to 1.009 gated and 0.991 to 1.006
+back-to-back.
+
+Before the H100 run, compile checks: with CuTe DSL
+4.8.0 and ptxas 13.2.86 for sm_90a, all nine dGLU configurations report 0
+spills and no warnings, with the flag off and on. setmaxnreg stays at 56/224.
+With the flag off, the SM90 PTX is byte-identical to the kernel before the flag was added in 9 of 9
+configurations, and the SM100 BF16 dGLU PTX is byte-identical in 36 of 36.
+On GB200, the suite runs on the SM100 kernel when its SM90 gate is removed;
+18 of 19 cases pass. The JAX case fails because it targets the SM90-only
+rejection. At the L1 shape, the SM100 atomic dprob changed in 19 of 19
+replays, in up to 4450 of 8192 rows.
 
 ### Phase 1 SM100/SM103 loss-byte expectations — 2026-11-24
 

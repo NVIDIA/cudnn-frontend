@@ -1,4 +1,4 @@
-# Grouped GEMM + GLU (SM100)
+# Grouped GEMM + GLU (SM100 and SM90 BF16)
 
 **This is an experimental API and subject to change.**
 
@@ -110,6 +110,54 @@ The wrapper return order is exactly `c_tensor`, `d_tensor`, `d_col_tensor`,
 `d_col_tensor`, `amax_tensor`, `sfd_row_tensor`, and `sfd_col_tensor` are
 always `None`; `c_tensor` is `None` unless `generate_c=True`.
 
+## SM90 (Hopper)
+
+`GroupedGemmGluSm90` and `grouped_gemm_glu_wrapper_sm90` take exactly the
+arguments of `GroupedGemmGluSm100` and `grouped_gemm_glu_wrapper_sm100` and return
+the same outputs, so a caller switches by name only. They run a Hopper kernel for
+the BF16 contract (WGMMA and TMA, accumulator in registers) and require an SM90
+GPU; the `_sm100` names require SM100+ and do not run on SM90. Limits:
+
+- `act_func` is `"swiglu"` or `"geglu"`, with `glu_layout="interleaved_32"` or
+  `glu_layout="gate_then_up"` (see [gate_then_up on SM90](#gate_then_up-on-sm90)).
+- Dense K-major `B` only; discrete `b_ptrs` and `bias` raise `NotImplementedError`.
+- `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
+- Torch tensors only (no JAX entry); block-scaled inputs raise `NotImplementedError`.
+- `supports_glu_layouts` is `("interleaved_32", "gate_then_up")`,
+  `supports_gate_then_up_precisions` is `("bf16",)` and
+  `preferred_gate_then_up_mma_tiler` is `None` on the `_sm90` names.
+- SM90 uses the dynamic scheduler (atomic counter) by default; the static
+  scheduler is not available, so `use_dynamic_sched=False` is accepted and ignored.
+- The SM90 kernel picks its warp-group schedule from the problem shape, and
+  `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 256)`,
+  or `(128, 192)` for short K (`K <= 3072`, pre-activation `N >= 2048`), with
+  or without `generate_c`. SM100 uses `(256, 256)`. The short-K schedule runs
+  only on a `(128, 192)` tile with a `(2, 1)` cluster (given or defaulted); any
+  other tile or cluster runs the default schedule.
+  An explicit SM90 tile has M in `{64, 128}` and N a multiple of 64 up to 256.
+  `cluster_shape_mn=None` selects `(2, 1)`; an
+  explicit cluster has power-of-two sides, at most 8 CTAs, and a cluster M tile
+  (`tile_m * cluster_m`) that divides 256.
+
+### gate_then_up on SM90
+
+With `glu_layout="gate_then_up"`, B holds the gate weights in rows `[0, N/2)` and
+the up weights in rows `[N/2, N)`, and the saved C holds the gate pre-activation
+in columns `[0, N/2)` and the up pre-activation in `[N/2, N)`; D is unchanged. Each
+branch's `N/2` must be divisible by 128 (`NotImplementedError` otherwise; padding
+is not implicit), as on SM100. Every SM90 tile, cluster and schedule supports it,
+both activations, BF16 or FP16 C/D, with or without `generate_c`.
+
+The kernel loads each tile's gate rows (`n0 + [0, tile_n/2)`) and up rows
+(`N/2 + n0 + [0, tile_n/2)`) as two TMA boxes into the two halves of the B stage,
+so the accumulator holds the tile's gate columns and then its up columns, and the
+epilogue pairs column `j` with `j + tile_n/2`. C stores go to the branch's columns.
+In a partial last N tile the gate columns past `N/2` are computed from up rows
+but never stored: D's bounds clip them, and their C stores are moved out of
+bounds. Each output element is the same products in the same K order as with
+`interleaved_32`, so D is bitwise equal, and C is bitwise equal after the column
+permutation, for weights permuted between the two layouts.
+
 ## Block-scaled contract
 
 ### Gate/up storage order (BF16 and block-scaled)
@@ -121,8 +169,8 @@ scale buffers keep the ordinary activated-channel order in either mode.
 `supports_glu_layouts` on the public wrapper/class advertises this option;
 `supports_canonical_layouts` only describes tensor ranks and strides.
 
-`gate_then_up` requires SM100/SM103, Torch tensors, SwiGLU, K-major FC1
-weights, and `N/2` divisible by 128. Both packed expert weights and discrete
+On SM100, `gate_then_up` requires SM100/SM103, Torch tensors, SwiGLU, K-major FC1
+weights, and `N/2` divisible by 128 (SM90: see [gate_then_up on SM90](#gate_then_up-on-sm90)). Both packed expert weights and discrete
 expert pointers are supported. The supported precision contracts are:
 
 | A/B | Input scales | Saved C | D |

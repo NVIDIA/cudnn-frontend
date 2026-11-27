@@ -38,6 +38,7 @@ from ..moe_utils import MoEWeightMode
 from ..glu_layout import GLU_LAYOUTS, validate_glu_layout
 from cuda.bindings import driver as cuda
 import logging
+import inspect
 import os
 from typing import TYPE_CHECKING, Any, Literal, Tuple, Optional, overload
 
@@ -55,6 +56,7 @@ from cudnn.tensor_adapter import (
     framework_dtype,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_device,
     get_shape,
     get_strides,
@@ -88,6 +90,13 @@ def _block_scaled_dtype_pairs():
 
 from ._bf16_api import GroupedGemmDgluBf16API
 from ._blockscaled_api import GroupedGemmDgluBlockScaledAPI
+
+
+def _default_mma_tiler(mma_tiler_mn: Optional[Tuple[int, int]], arch: str) -> Tuple[int, int]:
+    """The CTA tile when the caller gives none: (128, 256) for SM90 (Hopper kernel), else (256, 256)."""
+    if mma_tiler_mn is not None:
+        return tuple(mma_tiler_mn)
+    return (128, 256) if arch == "sm90" else (256, 256)
 
 
 @dataclass(frozen=True)
@@ -139,10 +148,13 @@ class DgluCall:
     activation_tensor: Optional[torch.Tensor] = None
     deterministic: bool = False
     glu_layout: str = "interleaved_32"
+    arch: str = "sm100"
 
 
 class GroupedGemmDgluSm100(APIBase):
     """Stable public facade that selects the dGLU backend during support checking."""
+
+    _ARCH = "sm100"
 
     supports_glu_layouts = GLU_LAYOUTS
     supports_gate_then_up_precisions = ("bf16", "nvfp4", "mxfp8")
@@ -206,7 +218,7 @@ class GroupedGemmDgluSm100(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -240,6 +252,7 @@ class GroupedGemmDgluSm100(APIBase):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmDgluSm100; pass torch tensors or JAX arrays")
         if acc_dtype is None:
             self._pending_init_kwargs["acc_dtype"] = cutlass.Float32
+        self._pending_init_kwargs["mma_tiler_mn"] = _default_mma_tiler(mma_tiler_mn, self._ARCH)
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -303,7 +316,10 @@ class GroupedGemmDgluSm100(APIBase):
                     sample_activation=kwargs["sample_activation"],
                     glu_layout=kwargs["glu_layout"],
                     _deterministic=kwargs["_deterministic"],
+                    arch=self._ARCH,
                 )
+            elif self._ARCH == "sm90":
+                raise NotImplementedError("GroupedGemmDgluSm90 supports BF16 operands only (no scale factors)")
             else:
                 if detect_framework(kwargs["sample_a"]) == "jax":
                     raise ValueError(_JAX_BLOCK_SCALED_ERROR)
@@ -1143,7 +1159,12 @@ def _normalize_dglu_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     capability = major * 10 + minor
-    if not has_tcgen05(major):
+    if call.arch == "sm90":
+        if backend is not GroupedGemmBackend.BF16:
+            raise NotImplementedError("grouped_gemm_dglu_wrapper_sm90 supports BF16 operands only (no scale factors)")
+        if not has_wgmma(major):
+            raise RuntimeError(f"GroupedGemmDgluSm90 requires SM90 (WGMMA), found SM{capability}")
+    elif not has_tcgen05(major):
         raise RuntimeError(f"GroupedGemmDgluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
     return normalized, backend
 
@@ -1223,6 +1244,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
     workspace_bytes = (128 * call.num_experts if call.weight_mode == MoEWeightMode.DISCRETE else 0) + (4 if call.use_dynamic_sched else 0)
     cache_key = backend_cache_key(
         GroupedGemmBackend.BF16,
+        call.arch,
         call.glu_layout,
         call.weight_mode,
         call.act_func,
@@ -1262,7 +1284,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
     if cache_key in _cache_of_GroupedGemmDgluSm100Objects:
         api = _cache_of_GroupedGemmDgluSm100Objects[cache_key]
     else:
-        api = GroupedGemmDgluSm100(
+        api = (GroupedGemmDgluSm90 if call.arch == "sm90" else GroupedGemmDgluSm100)(
             sample_a=call.a_tensor,
             sample_c=call.c_tensor,
             sample_d_row=d_row_tensor,
@@ -1346,7 +1368,8 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
     )
 
 
-def grouped_gemm_dglu_wrapper_sm100(
+def _grouped_gemm_dglu_wrapper(
+    op_class: type,
     a_tensor: torch.Tensor,
     c_tensor: torch.Tensor,
     sfa_tensor: Optional[torch.Tensor],
@@ -1367,7 +1390,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     acc_dtype: Optional[torch.dtype] = None,
     d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -1390,15 +1413,8 @@ def grouped_gemm_dglu_wrapper_sm100(
     deterministic: bool = False,
     glu_layout: str = "interleaved_32",
 ) -> TupleDict:
-    """Dispatch grouped GEMM dGLU once from an immutable normalized call.
-
-    ``deterministic=True`` makes ``dprob`` bit-identical run to run (SM100 block-scaled or BF16
-    kernel, torch, no dbias). See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
-    ``glu_layout="gate_then_up"`` consumes canonical C and returns canonical
-    gate/up halves in D, dbias and both D scale buffers. It is independent of
-    the natural-rank tensor convention advertised by ``supports_canonical_layouts``.
-    """
     validate_glu_layout(glu_layout)
+    mma_tiler_mn = _default_mma_tiler(mma_tiler_mn, op_class._ARCH)
     if glu_layout == "gate_then_up":
         # Validate before both wrapper memo and dynamic-plan cache hits.
         n_weight = b_nkl(b_tensor, b_major)[0] if b_tensor is not None else n
@@ -1410,6 +1426,8 @@ def grouped_gemm_dglu_wrapper_sm100(
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_dglu_jax_sm100
 
+        if op_class._ARCH == "sm90":
+            raise NotImplementedError("grouped_gemm_dglu_wrapper_sm90 supports torch tensors only")
         check_jax_wrapper_options(
             acc_dtype=acc_dtype,
             cd_major=cd_major,
@@ -1469,6 +1487,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     # check: execute() still validates every operand, including the data pointers the key
     # omits. linear_offset is in the key because the block-scaled kernel specializes on it.
     memo_key = (
+        op_class,
         glu_layout,
         type(a_tensor),
         linear_offset,
@@ -1596,13 +1615,14 @@ def grouped_gemm_dglu_wrapper_sm100(
         current_stream=current_stream,
         glu_layout=glu_layout,
         deterministic=deterministic and dprob_tensor is not None,  # without dprob there is nothing to make deterministic
+        arch=op_class._ARCH,
     )
     if memo is not None:
         return dglu_block_scaled_run(*memo, call)
 
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
-        raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_dglu_wrapper_sm100; pass torch tensors or JAX arrays")
+        raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_dglu_wrapper_{op_class._ARCH}; pass torch tensors or JAX arrays")
     if framework == "jax" and b_tensor is not None:
         raise ValueError(_JAX_DENSE_B_ERROR)
     normalized, backend = _normalize_dglu_call(call)
@@ -1614,6 +1634,81 @@ def grouped_gemm_dglu_wrapper_sm100(
         raise ValueError(_JAX_BLOCK_SCALED_ERROR)
     return _grouped_gemm_dglu_block_scaled_call(normalized, memo_key)
 
+
+def grouped_gemm_dglu_wrapper_sm100(
+    a_tensor: torch.Tensor,
+    c_tensor: torch.Tensor,
+    sfa_tensor: Optional[torch.Tensor],
+    padded_offsets: torch.Tensor,
+    alpha_tensor: torch.Tensor,
+    beta_tensor: torch.Tensor,
+    prob_tensor: Optional[torch.Tensor],
+    dprob_tensor: Optional[torch.Tensor],
+    b_tensor: Optional[torch.Tensor] = None,
+    sfb_tensor: Optional[torch.Tensor] = None,
+    generate_dbias: bool = False,
+    b_ptrs: Optional[torch.Tensor] = None,
+    sfb_ptrs: Optional[torch.Tensor] = None,
+    n: Optional[int] = None,
+    b_dtype: Optional[torch.dtype] = None,
+    b_major: str = "k",
+    norm_const_tensor: Optional[torch.Tensor] = None,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
+    cd_major: str = "n",
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    sf_vec_size: int = 16,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
+    vector_f32: bool = False,
+    m_aligned: int = 256,
+    discrete_col_sfd: bool = False,
+    act_func: str = "dswiglu",
+    linear_offset: Optional[float] = None,
+    geglu_alpha: float = 1.702,
+    glu_clamp_max: float = 7.0,
+    glu_clamp_min: float = -7.0,
+    situ_beta1: float = 4.0,
+    situ_beta2: float = 25.0,
+    epilogue_op: Optional[str] = None,
+    use_dynamic_sched: bool = False,
+    use_single_group_runtime_offsets: bool = False,
+    current_stream: Optional[cuda.CUstream] = None,
+    round_dgrad_to_input_dtype: bool = False,
+    activation_tensor: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    glu_layout: str = "interleaved_32",
+) -> TupleDict:
+    """Dispatch grouped GEMM dGLU once from an immutable normalized call.
+
+    ``deterministic=True`` makes ``dprob`` bit-identical run to run (SM100 block-scaled kernel or
+    SM100/SM90 BF16 kernel, torch, no dbias). See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
+    ``glu_layout="gate_then_up"`` consumes canonical C and returns canonical
+    gate/up halves in D, dbias and both D scale buffers. It is independent of
+    the natural-rank tensor convention advertised by ``supports_canonical_layouts``.
+    """
+    return _grouped_gemm_dglu_wrapper(GroupedGemmDgluSm100, **locals())
+
+
+class GroupedGemmDgluSm90(GroupedGemmDgluSm100):
+    """:class:`GroupedGemmDgluSm100` on SM90 (Hopper): the same arguments and lifecycle, running the SM90 BF16 dGLU kernel
+    (``glu_layout`` "interleaved_32" or "gate_then_up")."""
+
+    _ARCH = "sm90"
+    supports_glu_layouts = GLU_LAYOUTS
+    supports_gate_then_up_precisions = ("bf16",)
+
+
+def grouped_gemm_dglu_wrapper_sm90(*args, **kwargs) -> TupleDict:
+    """:func:`grouped_gemm_dglu_wrapper_sm100` on SM90 (Hopper): the same arguments and outputs, running the SM90 BF16 dGLU
+    kernel."""
+    return _grouped_gemm_dglu_wrapper(GroupedGemmDgluSm90, *args, **kwargs)
+
+
+grouped_gemm_dglu_wrapper_sm90.__signature__ = inspect.signature(grouped_gemm_dglu_wrapper_sm100)
+grouped_gemm_dglu_wrapper_sm90.supports_bf16_canonical_layouts = True
+grouped_gemm_dglu_wrapper_sm90.supports_glu_layouts = GroupedGemmDgluSm90.supports_glu_layouts
+grouped_gemm_dglu_wrapper_sm90.supports_gate_then_up_precisions = GroupedGemmDgluSm90.supports_gate_then_up_precisions
 
 grouped_gemm_dglu_wrapper_sm100.supports_canonical_layouts = True
 grouped_gemm_dglu_wrapper_sm100.supports_bf16_canonical_layouts = True

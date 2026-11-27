@@ -153,6 +153,12 @@ def has_tcgen05(major: int) -> bool:
     return major >= 10 and major != 12
 
 
+def has_wgmma(major: int) -> bool:
+    """Whether a device of compute capability ``major``.x can run the Hopper (WGMMA) CuTe DSL kernels: the SM90 family,
+    compiled for ``sm_90a``."""
+    return major == 9
+
+
 def get_compute_capability(device_index: Optional[int] = None) -> Tuple[int, int]:
     """(major, minor) of the selected CUDA device (current if omitted), without requiring torch."""
     torch = sys.modules.get("torch")

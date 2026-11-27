@@ -79,8 +79,12 @@ arbitrary user callbacks.
 | `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
 | `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
+| `grouped_gemm_wrapper_sm90`, dense `B` (`b_major="k"` forward, `b_major="n"` input gradient) | fprop, bprop (dgrad) | BF16 A/B; BF16/FP16 C/D | Supported (H100, tested configurations), including the internal pingpong schedule (128x192 tile, (2, 1) cluster; GLU without C) | Unverified | Unverified |
 | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
 | `grouped_gemm_wgrad_wrapper_sm100`, empty-expert output contract | wgrad | NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 or FP32 dW | Unsupported | Supported for empty experts (SM100); general nonempty determinism and SM103 unverified | Unverified |
+| `grouped_gemm_glu_wrapper_sm90`, `glu_layout="interleaved_32"` or `"gate_then_up"` | fprop | BF16 A/B; BF16/FP16 C/D | Supported (H100, tested configurations), including the internal pingpong schedule (128x192 tile, (2, 1) cluster; with or without C) | n/a (SM90 kernel) | n/a (SM90 kernel) |
+| `grouped_gemm_dglu_wrapper_sm90`, `glu_layout="interleaved_32"` or `"gate_then_up"`; D only (atomic `dprob` is not guaranteed) | bprop | BF16 A/B; BF16/FP16 C/D | Supported for D (H100, tested configurations); atomic `dprob` not guaranteed | n/a (SM90 kernel) | n/a (SM90 kernel) |
+| `grouped_gemm_dglu_wrapper_sm90` with `deterministic=True` (`dswiglu`, `dgeglu`; `interleaved_32` or `gate_then_up`; Torch; no dbias) | bprop | BF16 A/B; BF16/FP16 C/D; FP32 dprob | Supported for dprob and D (H100, tested configurations) | n/a (SM90 kernel) | n/a (SM90 kernel) |
 | `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | bprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported with reduction limits below (SM100); SM103 unverified | Unsupported |
 | `grouped_gemm_dglu_wrapper_sm100` and `GroupedGemmDgluSm100`, `activation_tensor` (`dgeglu`, `dswiglu`) | bprop | BF16 C/D_row and activation | Unsupported | Supported for `activation_tensor` and `D_row` (SM100, tested configurations); atomic dprob/dbias are not guaranteed; SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3; BF16 C/D | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
@@ -410,6 +414,11 @@ for replay, batch-invariance, and stress-test results.
   are reordered or duplicated, or their neighbors change. D_row does not
   depend on the flag. dbias and JAX inputs raise under the flag. See the
   [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#grouped-bf16-dglu-deterministic-dprob--sm100-2026-11-23-utc).
+
+- `grouped_gemm_dglu_wrapper_sm90` (BF16 Hopper kernel): `deterministic=True`
+  uses the same slots and fixed-order sum, one slot per SM90 N tile (128 or 256 columns,
+  rounded up to whole clusters along N). `gemm/cutedsl/test_grouped_gemm_dglu_bf16_sm90_determinism.py`
+  covers it; until it has run on H100 the row stays unverified. dbias and JAX inputs raise.
 
 - Canonical grouped GLU: the new branch-order option is distinct from the
   APIs' natural-rank tensor support. The forward suite checks C, both D

@@ -554,7 +554,7 @@ def assert_warm_stress(case: StressCase, *, validation: Optional[Validation] = N
 # The rendering pin: is the address of an arrive computed from the loaded registers through the kernel-argument mask?
 # ---------------------------------------------------------------------------
 
-_STAGE_LOADS = ("ld.shared", "tcgen05.ld")
+_STAGE_LOADS = ("ld.shared", "ldmatrix", "tcgen05.ld")  # ldmatrix: a shared-memory load too
 _REGISTER = re.compile(r"%[a-z]+\d+")
 _NO_RESULT = ("st.", "bra", "barrier", "bar.", "cp.async", "fence", "mbarrier.init", "ret", "prefetch", "griddepcontrol", "trap", "exit")
 
