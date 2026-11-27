@@ -719,9 +719,9 @@ def test_sm107_fp8_placement_trails_outside_the_measured_domain(over):
 
 @pytest.mark.L0
 def test_sm107_fp8_d64_sink_decode_placement_structure():
-    """cc 10.7 FP8 d64 decode with a sink: s_q 2-4 leads; s_q == 1 leads from the module's KV-unit floor; a short window leads
-    only for a power-of-two group from the same floor; a longer window, paging, or no sink keeps the backend. Bounds come from
-    the module, so this pins the gate's structure, not a measured boundary."""
+    """cc 10.7 FP8 d64 decode with a sink: s_q 2-4 leads; s_q == 1 leads from the module's KV-unit floor, and below it over a
+    whole cache its plan splits; a short window leads only for a power-of-two group from the same floor; a longer window, paging,
+    or no sink keeps the backend. Bounds come from the module, so this pins the gate's structure, not a measured boundary."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
@@ -731,7 +731,9 @@ def test_sm107_fp8_d64_sink_decode_placement_structure():
     q1 = {**base, "s_q": 1, "causal": False, "bottom_right": False}
     assert placement.place(spec, _facts(**mtp)) == placement.LEAD
     assert placement.place(spec, _facts(**{**q1, "b": units // 8})) == placement.LEAD
-    assert placement.place(spec, _facts(**{**q1, "b": units // 8 - 1})) == placement.TRAIL
+    assert placement.place(spec, _facts(**{**q1, "b": units // 8 - 1})) == placement.LEAD  # the whole cache splits
+    # an unaligned dense KV tail keeps the unsplit plan (heuristics._synth_kv_padding)
+    assert placement.place(spec, _facts(**{**q1, "b": units // 8 - 1, "s_kv": 131071})) == placement.TRAIL
     for over in (dict(window_left=127), dict(has_paged_kv=True), dict(has_sink=False), dict(device_cc=(10, 0))):
         assert placement.place(spec, _facts(**{**mtp, **over})) == placement.TRAIL, over
     window = placement.SM107_FP8_D64_SINK_MAX_WINDOW
@@ -1633,6 +1635,17 @@ def test_sm100_fp8_sink_lead_follows_the_proposed_split():
     assert not is_backend_block(lead) and (lead.knobs.split_kv or 1) >= 2, lead
     plans = heuristics.propose("B", facts, _OFFERED)
     assert is_backend_block(plans[0]) and all((p.knobs.split_kv or 1) == 1 for p in plans if not is_backend_block(p)), plans
+
+
+@pytest.mark.L0
+def test_sm107_fp8_sink_lead_follows_the_proposed_split():
+    """cc 10.7: below 32 KV units the single-query d64 FP8 sink graph leads only on a split plan; mode B's unsplit fallback
+    knobs keep the backend first."""
+    quant = {**_SM107_FP8_QUANT, "dtype_o": cudnn.data_type.FP8_E4M3}
+    facts = _facts(**quant, device_cc=(10, 7), d_qk=64, d_v=64, has_sink=True, s_q=1, s_kv=131072, causal=False, bottom_right=False)
+    lead = heuristics.propose("A", facts, _OFFERED)[0]
+    assert not is_backend_block(lead) and (lead.knobs.split_kv or 1) >= 2, lead
+    assert is_backend_block(heuristics.propose("B", facts, _OFFERED)[0])
 
 
 @pytest.mark.L0

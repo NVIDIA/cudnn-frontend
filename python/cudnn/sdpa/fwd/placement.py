@@ -367,7 +367,12 @@ RMS <= 0.034, no NaN.
 Dense d64 decode / MTP with a sink and no window (gpt-oss): s_q 2-4 LEAD; s_q == 1 LEAD from 32 KV units (b * h_kv). 2026-11-12,
 208-SM, cuDNN 9.30.0.4, the attention_inference generation graph, back-to-back GPU time; 180 train cells (b 1-128, 64/8, 32/4,
 8/1, KV 4k-128k) and a 36-cell seeded holdout scored once: s_q 2-4 0.11-1.03 (holdout 0.55 geomean, worst 0.88); s_q == 1 at
-<= 16 units 1.03-1.18, from 32 units 0.13-0.65 (holdout worst 1.03). A window of 128 keys won the on-tile train lattice
+<= 16 units 1.03-1.18, from 32 units 0.13-0.65 (holdout worst 1.03). Those timings ran FROST unsplit. Over the whole cache the
+per-tensor FP8 sink graph now splits (``heuristics._split_points``), and below 32 units the single query row leads where the
+proposed plan splits (study sm107_fp8_sink_place_20261126, 2026-11-26, backend on a newer development build, mean of 100 cold
+launches; a fresh seeded 48-cell holdout, b * h_kv < 32, KV 4k-128k: the 33 changed cells ran 0.055-0.186 of the backend, geomean
+0.119; O against the backend's within 0.037 relative RMS and one E4M3 step). An unsplit plan keeps the bound: a dense KV tail the
+chooser leaves unsplit, or mode B's fallback knobs. A window of 128 keys won the on-tile train lattice
 (0.10-1.00) but lost 1.10-1.34x on off-tile holdout KV at b 2-24. Every loss there had fewer than 32 units or a group FROST
 cannot pack whole (5, 6), so a window of at most ``SM107_FP8_D64_SINK_MAX_WINDOW`` keys leads when the group is a power of two
 and b * h_kv >= 32. Study rubin_fp8_swa_20261117 (2026-11-17, cuDNN 9.30.0.4, FE 9bdf9a8ab, same harness and timing) fixed that
@@ -749,7 +754,7 @@ SM107_FP8_D128_MHA_MAX_S_Q = 512  # MHA cannot pack: past one 512-row Q tile it 
 SM107_FP8_D128_LONG_KV = 8192  # bottom-right causal chunk from this cache length: 0.04-0.97
 SM107_FP8_D128_MIN_KV = 4096  # ... or from this length when the cache is at least
 SM107_FP8_D128_KV_PER_Q = 64  # ... this many times the query length
-SM107_FP8_D64_SINK_DECODE_MIN_UNITS = 32  # cc 10.7 FP8 d64 + sink, s_q == 1, no window: 16 KV units lose 1.03-1.18, 32+ win
+SM107_FP8_D64_SINK_DECODE_MIN_UNITS = 32  # cc 10.7 FP8 d64 + sink, s_q == 1, no window, unsplit: 16 KV units lose 1.03-1.18, 32+ win
 SM107_FP8_D64_SINK_MAX_WINDOW = 128  # ... with a window of at most this many keys: power-of-two groups from 32 units, 0.09-0.86
 SM107_FP8_D128_MASKFREE_MAX_S_Q = 128  # mask-free chunk on the KV tile: 0.28-0.96
 SM107_FP8_D192_GAP_MAX_GROUP = 16  # cc 10.7 FP8 dense d192 x 128 decode / verify: measured GQA groups 4-16
@@ -1004,7 +1009,7 @@ def place(spec, facts, knobs=None) -> str:
     if spec.name == "sdpa_fwd_prefill_sm100_fp8":
         return _place_sm100_fp8(spec.capabilities, facts, knobs)
     if spec.name == "sdpa_fwd_prefill_sm107_fp8":
-        return _place_sm107_fp8(spec.capabilities, facts)
+        return _place_sm107_fp8(spec.capabilities, facts, knobs)
     if spec.name == "sdpa_fwd_prefill_sm120_fp8":
         return _place_sm120_fp8(facts)
     if spec.name == "sdpa_fwd_prefill_sm120_mxfp8":
@@ -1249,15 +1254,15 @@ def _place_sm107_mxfp8(caps: Capabilities, facts) -> str:
     return LEAD if facts.device_cc == (10, 7) else TRAIL
 
 
-def _sm100_fp8_planned_split(facts, knobs=None) -> int:
-    """The KV split the SM100 per-tensor FP8 plan runs on ``facts`` (1 = unsplit): the proposed plan's ``knobs``, or
-    without them the row's first knob set."""
+def _planned_split(row: str, facts, knobs=None) -> int:
+    """The KV split the plan of ``row`` runs on ``facts`` (1 = unsplit): the proposed plan's ``knobs``, or without them
+    the row's first knob set."""
     if knobs is not None:
         return knobs.split_kv or 1
     from .engines import sm100_legacy_policy_spec
     from .heuristics import _knob_sets
 
-    sets = _knob_sets(sm100_legacy_policy_spec("sdpa_fwd_prefill_sm100_fp8"), facts)
+    sets = _knob_sets(sm100_legacy_policy_spec(row), facts)
     return (sets[0].split_kv or 1) if sets else 1
 
 
@@ -1285,7 +1290,7 @@ def _sm100_fp8_decode_leads(facts, knobs=None) -> bool:
     if (facts.window_left is not None and not sink_d64) or (facts.has_sink and not sink_d64):
         return False
     if sink_d64:
-        if facts.window_left is None and _sm100_fp8_planned_split(facts, knobs) >= 2:
+        if facts.window_left is None and _planned_split("sdpa_fwd_prefill_sm100_fp8", facts, knobs) >= 2:
             return True  # the whole cache splits (heuristics._split_points), at any batch (sm100_fp8_sink_place_v2_20261126)
         # a single SWA query row wins at any batch; otherwise a few KV units lose (paged SWA b=1 to 1.49x)
         return facts.b * facts.h_kv >= SM100_FP8_SINK_DECODE_MIN_KV_UNITS or (facts.s_q == 1 and facts.window_left is not None)
@@ -1437,14 +1442,14 @@ def _sm107_fp8_d192_decode_gap(caps: Capabilities, facts) -> Optional[str]:
     return None
 
 
-def _place_sm107_fp8(caps: Capabilities, facts) -> str:
+def _place_sm107_fp8(caps: Capabilities, facts, knobs=None) -> str:
     # Measured: exact cc 10.7, dense per-tensor E4M3, causal (TL / BR) or mask-free, Stats on or off; and paged D512 decode.
     gap = _sm107_fp8_d192_decode_gap(caps, facts)
     if gap is not None:
         return gap
     if _sm107_fp8_paged_d512_decode(facts):
         return LEAD
-    if _sm107_fp8_d64_sink_decode_leads(facts):
+    if _sm107_fp8_d64_sink_decode_leads(facts, knobs):
         return LEAD
     if (
         facts.device_cc != (10, 7)
@@ -1468,7 +1473,7 @@ def _place_sm107_fp8(caps: Capabilities, facts) -> str:
     return LEAD  # d256 0.16-0.96, d512 0.13-0.81 (module docstring); the backend does not build s_q == 1 here (NVRTC)
 
 
-def _sm107_fp8_d64_sink_decode_leads(facts) -> bool:
+def _sm107_fp8_d64_sink_decode_leads(facts, knobs=None) -> bool:
     """cc 10.7 per-tensor FP8 dense d64 decode / MTP with a sink, no window or a short one (module docstring, "SM107 per-tensor FP8 row")."""
     if (
         facts.device_cc != (10, 7)
@@ -1489,7 +1494,9 @@ def _sm107_fp8_d64_sink_decode_leads(facts) -> bool:
     if facts.window_left is not None:
         group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
         return group > 0 and not group & (group - 1) and facts.b * facts.h_kv >= SM107_FP8_D64_SINK_DECODE_MIN_UNITS
-    return facts.s_q > 1 or facts.b * facts.h_kv >= SM107_FP8_D64_SINK_DECODE_MIN_UNITS
+    if facts.s_q > 1 or facts.b * facts.h_kv >= SM107_FP8_D64_SINK_DECODE_MIN_UNITS:
+        return True
+    return _planned_split("sdpa_fwd_prefill_sm107_fp8", facts, knobs) >= 2  # the whole cache splits (sm107_fp8_sink_place_20261126)
 
 
 def _sm107_fp8_d128_chunk_leads(caps: Capabilities, facts) -> bool:
