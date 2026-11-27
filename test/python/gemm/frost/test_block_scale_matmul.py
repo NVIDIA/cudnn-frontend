@@ -2059,7 +2059,10 @@ def _sm103_kw(config_name, cta_group=1):
 
 @pytest.fixture
 def _pretend_sm103(monkeypatch):
+    from cudnn.gemm.frost import tile_config
+
     monkeypatch.setattr(C, "_current_arch", lambda: 103)
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 232448)
 
 
 # Config catalog / geometry guards
