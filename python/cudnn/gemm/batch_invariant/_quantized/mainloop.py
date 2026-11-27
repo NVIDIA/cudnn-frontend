@@ -38,7 +38,7 @@ def mma_fold(
     for k_tile in range(k_tile_cnt):  # blocks ascending (the lowering's outer loop)
         if is_leader_cta:
             handle = ab_consumer.wait_and_advance(peek_full)
-            for j in lowering.inner_steps():  # the lowering's issue order inside a block
+            for j in cutlass.range_constexpr(lowering.inner):
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, lowering.accumulate(k_tile, j))  # off on the fold's first step only
                 crd = (None, None, j, handle.index)
                 cute.gemm(tiled_mma, tCtAcc, tCrA[crd], tCrB[crd], tCtAcc)  # one fold step
