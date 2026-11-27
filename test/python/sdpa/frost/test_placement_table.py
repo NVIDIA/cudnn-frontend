@@ -1470,6 +1470,25 @@ def test_a100_sxm_dense_prefill_entries_lead_only_their_classes():
 
 
 @pytest.mark.L0
+def test_sm107_f16_borrows_the_transferred_studies():
+    """Study f16_transfer_rubin_20261127: a Rubin f16 graph answers from its bf16 twin's entry exactly when that entry's study is in the
+    Rubin f16 transfer (the MTP / decode studies); prefill, window and the other studies keep f16 on the hand rules."""
+    row = "sdpa_fwd_prefill_sm107"
+    base, studies = pt.DTYPE_TRANSFERS[(row, "f16")]
+    assert base == "bf16" and studies
+    borrowed = set()
+    for key, entry in pt.TABLE.items():
+        if key[0] != row or key[2] != "bf16":
+            continue
+        twin = key[:2] + ("f16",) + key[3:]
+        assert twin not in pt.TABLE, key  # f16 answers only through the transfer
+        assert (pt._class_entry(twin) is entry) == (entry.study in studies), key
+        borrowed |= {entry.study} & studies
+    assert borrowed == set(studies)  # every transferred study still has entries
+    assert not {"sm107_thd_prefill_20261111", "sm107_paged_prefill_20261109", "sm107_window_gaps_20261118"} & studies
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("heads", [(32, 8), (32, 32)], ids=["gqa", "mha"])
 def test_sm107_paged_prefill_entries_lead_their_classes(heads):
     """Study sm107_paged_prefill_20261109 (Rubin, FlashInfer's paged path): D192/V128 leads on the 128-key tile from 512 KV
@@ -1520,7 +1539,8 @@ _SM107_PAGED_MTP_SHORT_KV = [
 def test_sm107_paged_mtp_entries_lead_their_classes(d, heads, mask, on_tile, off_tile):
     """Study sm107_paged_mtp_20261110 (Rubin, the inference benchmark's paged generation graph): the bf16 MTP rows (s_q 2-4 under the
     bottom-right diagonal) lead from long caches down to the short-KV threshold of each class; d512 / D576 and the windowed d64 sink
-    rows lead at any length. Without the diagonal, f16, and another part keep the hand rules."""
+    rows lead at any length; f16 borrows them (study f16_transfer_rubin_20261127). Without the diagonal, and on another part, the hand
+    rules decide."""
     row = "sdpa_fwd_prefill_sm107"
 
     def mtp(**over):
@@ -1535,7 +1555,9 @@ def test_sm107_paged_mtp_entries_lead_their_classes(d, heads, mask, on_tile, off
         assert pt.lookup(row, mtp(s_kv=s_kv)) is verdict, s_kv
         assert pt.matched_entry(row, mtp(s_kv=s_kv)).study == "sm107_paged_mtp_20261110"
     assert pt.lookup(row, mtp(causal=False, bottom_right=False, window_left=None)) is None
-    assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
+    for s_kv, verdict in on_tile + off_tile:
+        assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF, s_kv=s_kv)) is verdict, s_kv
+    assert pt.matched_entry(row, mtp(dtype=cudnn.data_type.HALF)).study == "sm107_paged_mtp_20261110"
     assert pt.lookup(row, mtp(device_cc=(10, 3))) is None  # no transfer names this study
 
 
@@ -1914,7 +1936,7 @@ def test_sm107_d128_window_verify_entries_follow_the_study():
 @pytest.mark.L0
 def test_sm107_paged_d128_unpacked_mtp_entries_follow_the_study():
     """Study sm107_d128_paged_mtp_unpacked_20261118 (Rubin): paged d128 MTP over the full cache at GQA groups the row cannot pack whole
-    leads below cost 2^36.7 on the KV tile and below 2^9.25 query rows off it."""
+    leads below cost 2^36.7 on the KV tile and below 2^9.25 query rows off it; f16 borrows the entries (study f16_transfer_rubin_20261127)."""
     row = "sdpa_fwd_prefill_sm107"
 
     def mtp(**over):
@@ -1931,7 +1953,8 @@ def test_sm107_paged_d128_unpacked_mtp_entries_follow_the_study():
     assert pt.lookup(row, mtp(s_kv=131073)) is True and pt.matched_entry(row, mtp(s_kv=131073)).study == study
     assert pt.lookup(row, mtp(s_kv=131073, b=16)) is False  # 3072 query rows
     assert pt.matched_entry(row, mtp(h_q=64)).study == "sm107_paged_mtp_20261110"  # group 8 packs whole
-    assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is True and pt.matched_entry(row, mtp(dtype=cudnn.data_type.HALF)).study == study
+    assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF, b=128, h_q=80)) is False
 
 
 @pytest.mark.L0

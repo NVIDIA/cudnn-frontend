@@ -1069,7 +1069,7 @@ _SM107_PAGED_D256_MTP_CORNERS = [
     ("12/1", 2, 64, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("16/1", 3, 64, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 2, 32, 8192, cudnn.data_type.BFLOAT16, 32, placement.LEAD),
-    ("24/2", 2, 32, 8192, cudnn.data_type.HALF, 16, placement.TRAIL),
+    ("24/2", 2, 32, 8192, cudnn.data_type.HALF, 16, placement.LEAD),  # f16 borrows the bf16 entry (f16_transfer_rubin_20261127)
 ]
 
 
@@ -1102,8 +1102,9 @@ def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, 
 )
 def test_sm107_paged_d256_mtp_rows_follow_the_generated_table(heads, s_q, b, s_kv, dtype, page, verdict, replay):
     """FlashInfer's paged decode graph at ``q_len_per_req`` 2-4 (the bottom-right causal diagonal with the padding mask) on cc 10.7 is
-    placed by study sm107_paged_mtp_20261110, the same verdict in both regimes; without the diagonal the graph is another class with no
-    entry and keeps the backend first, as does f16. With a window (no sink) the bf16 graph is study sm107_window_gaps_20261118's class."""
+    placed by study sm107_paged_mtp_20261110 (f16 through its transfer, study f16_transfer_rubin_20261127), the same verdict in both
+    regimes; without the diagonal the graph is another class with no entry and keeps the backend first. With a window (no sink) the bf16
+    graph is study sm107_window_gaps_20261118's class, which f16 does not borrow."""
     from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
@@ -1113,9 +1114,7 @@ def test_sm107_paged_d256_mtp_rows_follow_the_generated_table(heads, s_q, b, s_k
     facts = _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, **shape)
     assert placement.place(spec, facts) == verdict
     entry = placement_table.matched_entry(spec.name, facts)
-    assert (entry is None) == (dtype == cudnn.data_type.HALF)
-    if entry is not None:
-        assert entry.study == "sm107_paged_mtp_20261110"
+    assert entry is not None and entry.study == "sm107_paged_mtp_20261110"
     assert placement.place(spec, _sm107_paged_d256_decode_facts(**shape)) == placement.TRAIL
     windowed = _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, window_left=128, **shape)
     off_tile = s_kv % 128 != 0  # the off-tile class leads from cost 2**29: the 125 / 133-key rows trail

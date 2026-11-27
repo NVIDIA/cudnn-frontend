@@ -532,6 +532,13 @@ DTYPE_TRANSFERS: Dict[Tuple[str, str], Tuple[str, FrozenSet[str]]] = {
         "bf16",
         frozenset({"sm100_paged_d64_d256_prefill_20261111", "sm100_d256_paged_context_20261030", "sm100_d256_decode_v4_924_20261116"}),
     ),
+    # study f16_transfer_rubin_20261127: Rubin f16 paged / dense MTP and decode timed against these studies' bf16 verdicts (208 SMs, a
+    # pre-registered 115-cell holdout): the 53 changed f16 cells ran 0.107 of the measured default, worst 1.031. f16 THD prefill is not
+    # transferred: a borrowed bf16 prefill entry lost 1.78x on an unpacked GQA3 cell.
+    ("sdpa_fwd_prefill_sm107", "f16"): (
+        "bf16",
+        frozenset({"sm107_paged_mtp_20261110", "sm107_d128_paged_mtp_unpacked_20261118", "sm107_dense_decode_20261031"}),
+    ),
 }
 """A dtype with no study of its own may borrow another dtype's entries on a row, study by study, once a transfer check timed
 those studies' classes in it."""
