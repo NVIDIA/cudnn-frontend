@@ -76,6 +76,7 @@ arbitrary user callbacks.
 | --- | --- | --- | --- | --- | --- |
 | `pygraph.matmul` with numerical note `BATCH_INVARIANT`, optional column bias | fprop | BF16 inputs and output, FP32 accumulation | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
 | Scaled `pygraph.matmul` with numerical note `BATCH_INVARIANT` | fprop | Per-tensor E4M3/E5M2, groupwise E4M3, MXFP8, NVFP4, MXFP4, MXFP8 × MXFP4. FP16/BF16 output | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
+| `ops.mxfp8_quantize_forward`, `ops.mxfp4_quantize_forward`, `ops.nvfp4_quantize_forward` (per tensor and per token) | fprop | BF16, FP16 and FP32 inputs. E4M3 or E2M1 codes with UE8M0 or E4M3 scales in the 128x4, 8x4 and linear layouts | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Unverified |
 | `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
 | `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |

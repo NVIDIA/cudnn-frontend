@@ -4,6 +4,30 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Batch-invariant MXFP8, MXFP4 and NVFP4 quantization (2026-11-26)
+
+The [batch-invariant quantization suite](../quantize/batch_invariant/README.md) passed on SM100 (148 SMs) with cuDNN
+backend 9.26.0, CuTe DSL 4.8.1, PyTorch 2.15.0+cu132 and TVM-FFI 0.1.16: 187 passed and 9 skipped. The skips are the
+FlashInfer MXFP4 parity cases with FP32 input, which FlashInfer's quantizer does not accept. The forward comparison covers
+MXFP8, MXFP4 and NVFP4 (per tensor and per token) with BF16, FP16 and FP32 inputs and the 128x4, 8x4 and linear scale
+layouts. For each, a row quantized alone, reordered, duplicated, and next to changed neighbours has the same codes, scale
+bytes and (per token) scale as in the full batch, and eight replays with concurrent GPU work match byte for byte. Codes
+and scale bytes match an independent torch implementation of each recipe. They match FlashInfer's `batch_invariant=True`
+quantizers for M in {1, 5, 300}; K in {32, 128, 4096} for the MX formats and K in {16, 128, 4096} for NVFP4 (BF16 and
+FP16 inputs only for NVFP4). Boundary inputs (zero and signed-zero blocks, subnormal and near-max values, rounding
+midpoints, a wide exponent range, outliers) match the independent reference and FlashInfer byte for byte, and blocks
+holding inf and NaN match FlashInfer and leave neighbouring rows unchanged; they have no independent reference. Eight small
+[goldens](../quantize/batch_invariant/goldens/) passed the strict comparison after replay and the independent reference passed. SM103 and SM107 hardware execution is unverified. The 128x4 kernels stage a
+scale tile in shared memory within one launch; no warm shared-memory stress case was added for them, so that coverage gap
+remains.
+
+Run from `test/python`:
+
+```sh
+CUDNN_DETERMINISM_GOLDENS="$PWD/quantize/batch_invariant/goldens" \
+    python -m pytest -n0 -q -rs -m L0 quantize/batch_invariant/
+```
+
 ### Quantized batch-invariant matmul (2026-11-24)
 
 The [batch-invariant suite](../gemm/batch_invariant/README.md) passed on SM100 (P2021, 68 SMs) and SM107

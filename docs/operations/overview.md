@@ -93,6 +93,7 @@ The experimental API catalog includes:
 - [RMSNorm + SiLU](/operations/Normalizations/rmsnorm_silu)
 - [Fused Conv3D + Bias + Residual + RMSNorm + SiLU](/operations/Convolutions/conv3d_postops)
 - [NVFP4 Block-Scale Conversion](/operations/BlockScaling/nvfp4_block_scale_conversion)
+- [Batch-invariant MXFP8, MXFP4 and NVFP4 quantization](/operations/BlockScaling/batch_invariant_mx_quantize)
 - [FP4 Row Quantization Decode Step (SM100-class)](/operations/BlockScaling/row_quantize_fp4_decode)
 - [FP8 Row Quantization Decode Step (SM100-class)](/operations/Pointwise/row_quantize_fp8_decode)
 - [DSv4.1 mHC projection/RMS backward](/operations/Matmul/gemm_fusions/mhc_projection_bwd)

@@ -22,6 +22,10 @@ generator in `test/python/gemm/batch_invariant/test_flashinfer_integration.py`
 retain the upstream Apache-2.0 license and attribution. Entry 12 in
 [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) identifies the sources.
 
+The MXFP8, MXFP4 and NVFP4 quantizers in `python/cudnn/quantize/batch_invariant/` adapt FlashInfer's
+batch-invariant quantizers, the reduction engine and the floating-point interface they share. They retain the
+upstream Apache-2.0 license and attribution; entry 12 identifies the sources.
+
 ## Apache-2.0 modifications to existing licensed code
 
 The OSS warning cleanup licenses its NVIDIA modifications under Apache-2.0,
