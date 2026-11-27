@@ -896,7 +896,11 @@ _DS3_DGRAD_PROFILES = ("baseline", "rolling", "ds3_ep4_pattern")
 # kernel and oracle share one MXFP8 gradient; otherwise dprob would differ by that
 # gradient's quantization noise (about 2.7%) instead of by kernel error.
 _DS3_REFERENCE_REL_FRO = {"y": 2e-3, "dx": 5e-3, "dprob": 2e-4, "dw1": 5e-4, "dw2": 5e-4}
-_DS3_DPROB_CLOSE_KWARGS = {"rtol": 1e-2, "atol": 1e-2}
+# The element-wise dprob bound scales with the tensor, atol = TOL * max(|dprob|.max(), 1):
+# a fixed atol fails entries near zero on reference rounding alone, e.g. when the
+# container runs the oracle's fp32 GEMMs as TF32.
+_DS3_DPROB_RTOL = 1e-2
+_DS3_DPROB_ATOL = 1e-2
 _DS3_REFERENCE_MIN_COSINE = 0.999
 # A profile may not be noticeably less accurate than baseline on the same inputs.
 _DS3_BASELINE_ERROR_RATIO = 1.1
@@ -1036,6 +1040,7 @@ def _check_ds3_profiles(outputs, resolved, expected) -> None:
 
     baseline = outputs["baseline"]
     baseline_errors = {name: _relative_fro(_output_as_float(baseline[name]), reference) for name, reference in references.items()}
+    dprob_atol = _DS3_DPROB_ATOL * max(expected_dprob.abs().max().item(), 1.0)
     for profile, actual in outputs.items():
         torch.testing.assert_close(actual["valid_route_counts"], expected_route_counts, rtol=0, atol=0)
         for name, reference in references.items():
@@ -1053,7 +1058,7 @@ def _check_ds3_profiles(outputs, resolved, expected) -> None:
         torch.testing.assert_close(actual["dx"].float(), expected_dx, **_BACKWARD_CLOSE_KWARGS[0])
         torch.testing.assert_close(actual["dw1"], expected_dense[0], **_WGRAD_CLOSE_KWARGS)
         torch.testing.assert_close(actual["dw2"], expected_dense[1], **_WGRAD_CLOSE_KWARGS)
-        torch.testing.assert_close(actual["dprob"], expected_dprob, **_DS3_DPROB_CLOSE_KWARGS)
+        torch.testing.assert_close(actual["dprob"], expected_dprob, rtol=_DS3_DPROB_RTOL, atol=dprob_atol)
 
     # The optimized profiles only reschedule work. With the same FP8 conversion as
     # baseline they must reproduce its bits; dprob may differ only by FP32 reduction order.
