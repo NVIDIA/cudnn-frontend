@@ -305,19 +305,19 @@ class GroupedGemmWgradBf16API(APIBase):
     # The wide kernel (256 x 512 tiles per CTA pair, the same dW bits) loads each A tile once per 512 columns instead of
     # once per 256, but each of its tiles takes about twice as long as a stock tile, so a dW with few wide tiles per
     # resident cluster loses the gain to the last, partly filled round of tiles. Measured on GB200, the ratio of the two
-    # kernels' times depends on the wide tiles per resident 2-CTA cluster and not on m, n or the tokens per expert: the
-    # wide kernel is faster from 12 under cluster launch control and from 24 with the atomic-counter claim, and up to
-    # 1.4% (CLC) or 2.4% (counter) slower just below (more for dWs of a few tiles per cluster).
+    # kernels' times depends on the wide tiles per resident 2-CTA cluster, not on m, n or the tokens per expert. On the
+    # MoE weight gradients at 8192 tokens per rank, the wide kernel is faster at 20 or more wide tiles per cluster
+    # (at parity at 20 with the atomic-counter claim) and up to 2% slower at 10; the threshold sits between them.
     # _use_wide_tiles = False always runs the stock kernel.
     _use_wide_tiles = True
-    _WIDE_MIN_TILES_PER_CLUSTER = {False: 12, True: 24}  # keyed by atomic_counter_claim
+    _WIDE_MIN_TILES_PER_CLUSTER = 16
 
     @classmethod
-    def _wide_tiles_pay_off(cls, m: int, n: int, expert_cnt: int, max_active_clusters: int, atomic_counter_claim: bool) -> bool:
+    def _wide_tiles_pay_off(cls, m: int, n: int, expert_cnt: int, max_active_clusters: int) -> bool:
         """Whether a dW of expert_cnt x (m, n) has enough 256 x 512 tiles for the wide kernel on max_active_clusters
         resident 2-CTA clusters. The rule uses only the static shape: the tokens per expert are device data."""
         wide_tiles = expert_cnt * (m // 256) * (n // 512)
-        return max_active_clusters > 0 and wide_tiles >= cls._WIDE_MIN_TILES_PER_CLUSTER[bool(atomic_counter_claim)] * max_active_clusters
+        return max_active_clusters > 0 and wide_tiles >= cls._WIDE_MIN_TILES_PER_CLUSTER * max_active_clusters
 
     def _max_active_clusters(self) -> int:
         """Resident clusters of the configured shape on this device, less CUDNNFE_CLUSTER_OVERLAP_MARGIN."""
@@ -339,7 +339,7 @@ class GroupedGemmWgradBf16API(APIBase):
             and _convert_to_cutlass_data_type(self.acc_dtype) == cutlass.Float32
             and _convert_to_cutlass_data_type(self.wgrad_dtype).width == 16
             and MoEGroupedGemmWgradWideBF16Kernel.can_implement(m, n)
-            and self._wide_tiles_pay_off(m, n, self.expert_cnt, self._max_active_clusters(), self.atomic_counter_claim)
+            and self._wide_tiles_pay_off(m, n, self.expert_cnt, self._max_active_clusters())
         )
 
     def compile(self) -> None:
