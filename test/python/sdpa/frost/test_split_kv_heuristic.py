@@ -1702,3 +1702,49 @@ def test_windowed_fp8_sink_keeps_the_unsplit_plan():
     windowed = replace(full, window_left=128, causal=True, bottom_right=True)
     assert _split_points(caps, full, 128, 128, 1, 8)[0] > 1
     assert _split_points(caps, windowed, 128, 128, 1, 8) == [1]
+
+
+@pytest.mark.parametrize(
+    "layout,d,b,h_q,h_kv,s_q,s_kv,window,split",
+    [
+        # The unsplit launch fills 1.5 waves over a window of at most 20 KV tiles: unsplit, where develop split 2-4 ways.
+        ("paged", 128, 128, 16, 2, 4, 131072, 512, 1),
+        ("paged", 64, 128, 16, 2, 1, 131072, 2048, 1),
+        ("paged", 256, 128, 8, 4, 8, 131072, 1024, 1),
+        ("paged", 192, 128, 64, 4, 8, 131072, 512, 1),
+        # A long window or a small grid keeps develop's split.
+        ("paged", 64, 4, 48, 8, 2, 54518, 4096, 2),
+        ("paged", 128, 1, 80, 8, 4, 131072, 1024, 8),
+    ],
+)
+def test_sm100_windowed_fp8_runs_unsplit_on_a_full_grid_over_a_short_window(layout, d, b, h_q, h_kv, s_q, s_kv, window, split):
+    """The SM100 / SM103 FP8 kernels walk only the window: once the unsplit launch fills 1.5 waves over a window of at most 20 KV
+    tiles, a split only adds waves and a combine."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    paged = layout == "paged"
+    for device_cc in ((10, 0), (10, 3)):
+        facts = ga.SdpaGraphFacts(
+            b=b,
+            h_q=h_q,
+            h_kv=h_kv,
+            s_q=s_q,
+            s_kv=s_kv,
+            d_qk=d,
+            d_v=d,
+            dtype=cudnn.data_type.FP8_E4M3,
+            dtype_o=cudnn.data_type.FP8_E4M3,
+            is_fp8=True,
+            causal=True,
+            bottom_right=True,
+            has_paged_kv=paged,
+            page_size=16 if paged else 0,
+            padded=paged,
+            window_left=window,
+            device_sm_count=B200_SMS,
+            device_cc=device_cc,
+        )
+        assert (_knob_sets(sm100_legacy_policy_spec("sdpa_fwd_prefill_sm100_fp8"), facts)[0].split_kv or 1) == split, device_cc
