@@ -1046,7 +1046,8 @@ def _check_ds3_profiles(outputs, resolved, expected) -> None:
             assert error <= _DS3_BASELINE_ERROR_RATIO * baseline_errors[name], (
                 f"{profile} {name} relative error {error:.3e} exceeds " f"{_DS3_BASELINE_ERROR_RATIO}x baseline {baseline_errors[name]:.3e}"
             )
-            cosine = torch.nn.functional.cosine_similarity(value.flatten(), reference.flatten(), dim=0).item()
+            # cosine_similarity keeps a bf16 operand's norm in bf16, and that rounding biases the cosine; compare in fp32.
+            cosine = torch.nn.functional.cosine_similarity(value.flatten(), reference.float().flatten(), dim=0).item()
             assert cosine >= _DS3_REFERENCE_MIN_COSINE, f"{profile} {name} cosine {cosine:.6f}"
         _assert_matches_reference(actual["y"], expected_y)
         torch.testing.assert_close(actual["dx"].float(), expected_dx, **_BACKWARD_CLOSE_KWARGS[0])
