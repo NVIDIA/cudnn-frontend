@@ -37,6 +37,8 @@ from gemm.cutedsl.test_grouped_gemm_dswiglu_utils import (
     with_grouped_gemm_dswiglu_params_dbias_fp4,
     with_grouped_gemm_dswiglu_params_dbias_fp8,
     allocate_grouped_gemm_dswiglu_tensors,
+    allocate_dglu_h_tensors,
+    check_ref_dglu_h,
     check_ref_grouped_gemm_dswiglu,
 )
 from gemm.cutedsl.test_discrete_grouped_gemm_dswiglu_utils import (
@@ -313,6 +315,47 @@ def test_grouped_gemm_dglu_dense_compile_execute_fp8(
         use_dynamic_sched=use_dynamic_sched,
         request=request,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_scheduler_modes
+@pytest.mark.parametrize(
+    ("mma_tiler_mn", "cluster_shape_mn", "vector_f32"),
+    [((256, 256), (2, 1), True), ((128, 256), (1, 1), True), ((256, 256), (2, 1), False)],
+    ids=["2cta", "1cta", "2cta_scalar"],
+)
+def test_grouped_gemm_dglu_dense_compile_execute_with_h(mma_tiler_mn, cluster_shape_mn, vector_f32, use_dynamic_sched, request):
+    """sample_h / sample_sfh_col (MXFP8 dSwiGLU, SM100/103): h and its scales match the reference, and dH and both SFD
+    planes are byte-equal to the run without h on the same inputs. The experts include an empty, a one-row and a multi-tile
+    one."""
+    runs = []
+    for generate_h in (False, True):
+        torch.manual_seed(0)
+        _, outputs, _ = _test_grouped_gemm_dglu_dense_compile_execute(
+            ab_dtype=torch.float8_e4m3fn,
+            c_dtype=torch.bfloat16,
+            d_dtype=torch.float8_e4m3fn,
+            b_major="k",
+            cd_major="n",
+            acc_dtype=torch.float32,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            sf_vec_size=32,
+            sf_dtype=torch.float8_e8m0fnu,
+            vector_f32=vector_f32,
+            discrete_col_sfd=True,
+            request=request,
+            cfg_overrides={"group_m_list": [700, 0, 256, 1]},
+            use_dynamic_sched=use_dynamic_sched,
+            generate_h=generate_h,
+        )
+        runs.append(outputs)
+    for name in ("d_row_tensor", "d_col_tensor", "sfd_row_tensor", "sfd_col_tensor"):
+        assert torch.equal(bitwise_bits(runs[1][name]), bitwise_bits(runs[0][name])), f"{name} changes with h"
+    # Once the h code is live, ptxas may fuse some of the epilogue's FP32 multiply-adds differently, so dprob (an FP32
+    # sum) may move in its last bits.
+    torch.testing.assert_close(runs[1]["dprob_tensor"], runs[0]["dprob_tensor"], rtol=1e-4, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +667,7 @@ def _test_grouped_gemm_dglu_dense_compile_execute(
     omit_prob=False,
     use_single_group_runtime_offsets=False,
     sf_fp8_dtype_override=None,
+    generate_h=False,
 ):
     try:
         from cudnn import GroupedGemmDgluSm100
@@ -675,6 +719,8 @@ def _test_grouped_gemm_dglu_dense_compile_execute(
         generate_dbias=generate_dbias,
         input_tensors=inputs,
     )
+    if generate_h:
+        outputs.update(allocate_dglu_h_tensors(inputs["tensor_m"], cfg["n"], cfg["d_dtype"]))
 
     if input_mutator is not None:
         input_mutator(inputs, cfg)
@@ -706,6 +752,8 @@ def _test_grouped_gemm_dglu_dense_compile_execute(
         sample_sfd_col=outputs.get("sfd_col_tensor"),
         sample_amax=outputs.get("amax_tensor"),
         sample_norm_const=inputs.get("norm_const_tensor"),
+        sample_h=outputs.get("h_tensor"),
+        sample_sfh_col=outputs.get("sfh_col_tensor"),
         # Configuration:
         acc_dtype=cfg["acc_dtype"],
         mma_tiler_mn=cfg["mma_tiler_mn"],
@@ -746,6 +794,8 @@ def _test_grouped_gemm_dglu_dense_compile_execute(
         norm_const_tensor=inputs.get("norm_const_tensor"),
         current_stream=stream,
         workspace=ws(api),
+        h_tensor=outputs.get("h_tensor"),
+        sfh_col_tensor=outputs.get("sfh_col_tensor"),
     )
 
     torch.cuda.synchronize()
@@ -1223,6 +1273,29 @@ def test_grouped_gemm_dglu_discrete_compile_execute_fp8(act_func, b_major, use_d
     )
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_dglu_discrete_compile_execute_with_h(request):
+    """sample_h / sample_sfh_col with discrete weights: h and its scales match the reference."""
+    _test_grouped_gemm_dglu_discrete_compile_execute(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=True,
+        discrete_col_sfd=True,
+        act_func="dswiglu",
+        use_dynamic_sched=True,
+        request=request,
+        generate_h=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 #  Discrete mode: Wrapper API
 # ---------------------------------------------------------------------------
@@ -1293,6 +1366,7 @@ def _test_grouped_gemm_dglu_discrete_compile_execute(
     b_major="k",
     generate_dbias=False,
     use_dynamic_sched=False,
+    generate_h=False,
 ):
     try:
         from cudnn import GroupedGemmDgluSm100
@@ -1343,6 +1417,8 @@ def _test_grouped_gemm_dglu_discrete_compile_execute(
         sf_vec_size=cfg["sf_vec_size"],
         generate_dbias=generate_dbias,
     )
+    if generate_h:
+        outputs.update(allocate_dglu_h_tensors(inputs["tensor_m"], cfg["n"], cfg["d_dtype"]))
 
     api = GroupedGemmDgluSm100(
         sample_a=inputs["a_tensor"],
@@ -1363,6 +1439,8 @@ def _test_grouped_gemm_dglu_discrete_compile_execute(
         sample_sfd_col=outputs.get("sfd_col_tensor"),
         sample_amax=outputs.get("amax_tensor"),
         sample_norm_const=inputs.get("norm_const_tensor"),
+        sample_h=outputs.get("h_tensor"),
+        sample_sfh_col=outputs.get("sfh_col_tensor"),
         acc_dtype=cfg["acc_dtype"],
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
@@ -1401,10 +1479,14 @@ def _test_grouped_gemm_dglu_discrete_compile_execute(
         norm_const_tensor=inputs.get("norm_const_tensor"),
         current_stream=stream,
         workspace=ws(api),
+        h_tensor=outputs.get("h_tensor"),
+        sfh_col_tensor=outputs.get("sfh_col_tensor"),
     )
 
     torch.cuda.synchronize()
     check_ref_discrete_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+    if generate_h and not cfg["skip_ref"]:
+        check_ref_dglu_h(inputs, outputs, cfg)
 
 
 def _test_grouped_gemm_dglu_discrete_wrapper(
@@ -2867,3 +2949,184 @@ def test_grouped_gemm_dglu_dbias_cache_keys_on_n(request, monkeypatch):
     torch.cuda.synchronize()
     assert len(dglu_api._cache_of_GroupedGemmDgluSm100Objects) == 2
     check_ref_grouped_gemm_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+
+
+# ---------------------------------------------------------------------------
+#  Optional h output (MXFP8 dSwiGLU, SM100/103): wrapper and rejections
+# ---------------------------------------------------------------------------
+
+
+def _skip_unless_sm100():
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("the h output requires SM100/103")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=41)
+@pytest.mark.parametrize("dynamic_mnkl", ["1", "0"], ids=["dynamic_mnkl", "static_mnkl"])
+def test_grouped_gemm_dglu_wrapper_generate_h(request, monkeypatch, dynamic_mnkl):
+    """generate_h=True with the deterministic dprob returns the default results unchanged (dprob to FP32 rounding) plus
+    h_tensor and sfh_col_tensor (checked against the reference), from one plan keyed as the default plan plus "h" that a
+    call with other data reuses."""
+    _skip_unless_sm100()
+    from cudnn.gemm.cutedsl.grouped.dglu import api as dglu_api
+
+    monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", dynamic_mnkl)
+    monkeypatch.setattr(dglu_api, "_cache_of_GroupedGemmDgluSm100Objects", {})
+    monkeypatch.setattr(dglu_api, "_dglu_wrapper_memo", {})
+    cache = dglu_api._cache_of_GroupedGemmDgluSm100Objects
+    plans = None
+    for _ in range(2):
+        inputs, cfg = case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
+        default = _run_dglu_case(case, deterministic=True)
+        outputs = _run_dglu_case(case, deterministic=True, generate_h=True)
+        torch.cuda.synchronize()
+        assert list(outputs.keys()) == list(default.keys()) + ["h_tensor", "sfh_col_tensor"]
+        (default_key,) = [key for key in cache if key[-1] != "h"]
+        assert set(cache) == {default_key, (*default_key, "h")}
+        if plans is None:
+            plans = dict(cache)
+        assert all(cache[key] is plan for key, plan in plans.items()), "the second call reuses both plans"
+        for name in ("d_row_tensor", "d_col_tensor", "sfd_row_tensor", "sfd_col_tensor"):
+            assert torch.equal(bitwise_bits(outputs[name]), bitwise_bits(default[name])), f"{name} changes with h"
+        # dprob sums products of large terms, so FP32 rounding is relative to the largest of them.
+        dprob_atol = 2.0**-20 * default["dprob_tensor"].abs().max().item()
+        torch.testing.assert_close(outputs["dprob_tensor"], default["dprob_tensor"], rtol=2.0**-20, atol=dprob_atol)
+        check_ref_grouped_gemm_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=43)
+def test_grouped_gemm_dglu_h_rejections(request, monkeypatch):
+    """Invalid h requests raise ValueError: at check_support, at execute when the h tensors do not match the plan, and
+    in the wrapper."""
+    _skip_unless_sm100()
+    import cudnn.api_base
+
+    inputs, cfg = case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
+    rows, n = inputs["tensor_m"], cfg["n"]
+    _, outputs = allocate_grouped_gemm_dswiglu_tensors(
+        tensor_m=rows,
+        n=n,
+        l=cfg["l"],
+        ab_dtype=cfg["ab_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+    )
+    outputs.update(allocate_dglu_h_tensors(rows, n, cfg["d_dtype"]))
+    tensors = dict(
+        a_tensor=inputs["a_tensor"],
+        c_tensor=inputs["c_tensor"],
+        d_row_tensor=outputs["d_row_tensor"],
+        d_col_tensor=outputs["d_col_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        dprob_tensor=outputs["dprob_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        sfd_row_tensor=outputs["sfd_row_tensor"],
+        sfd_col_tensor=outputs["sfd_col_tensor"],
+        norm_const_tensor=inputs["norm_const_tensor"],
+        h_tensor=outputs["h_tensor"],
+        sfh_col_tensor=outputs["sfh_col_tensor"],
+    )
+
+    def make_api(**overrides):
+        kwargs = {"sample_" + name.removesuffix("_tensor"): value for name, value in tensors.items()}
+        kwargs.update(sf_vec_size=cfg["sf_vec_size"], discrete_col_sfd=cfg["discrete_col_sfd"], **overrides)
+        return cudnn.GroupedGemmDgluSm100(**kwargs)
+
+    def rejected(match, **overrides):
+        with pytest.raises(ValueError, match=match):
+            make_api(**overrides).check_support()
+
+    rejected("together", sample_sfh_col=None)
+    rejected("together", sample_h=None)
+    rejected("dswiglu", act_func="dgeglu")
+    rejected("interleaved_32", glu_layout="gate_then_up")
+    rejected("h dtype", sample_h=tensors["h_tensor"].view(torch.float8_e5m2))
+    rejected("h", sample_h=tensors["h_tensor"][:, : n // 2])
+    rejected("SFH_col", sample_sfh_col=tensors["sfh_col_tensor"][: rows * n // 64])
+    rejected("SFH_col dtype", sample_sfh_col=tensors["sfh_col_tensor"].view(torch.uint8))
+
+    # The h tensors at execute must match the plan.
+    api = make_api()
+    assert api.check_support()
+    with pytest.raises(ValueError, match="presence"):
+        api.execute(**{**tensors, "h_tensor": None, "sfh_col_tensor": None})
+    api = make_api(sample_h=None, sample_sfh_col=None)
+    assert api.check_support()
+    with pytest.raises(ValueError, match="presence"):
+        api.execute(**tensors)
+
+    # Replacement h buffers are checked against the current rows and N before the launch: a recorder stands in for
+    # the compiled kernel of the block-scaled implementation, so a malformed buffer never reaches the GPU.
+    api = make_api()
+    assert api.check_support()
+    launches = []
+    api._implementation._compiled_kernel = lambda **kwargs: launches.append(kwargs)
+    api.execute(**tensors, workspace=ws(api))
+    assert len(launches) == 1
+    h, sfh = tensors["h_tensor"], tensors["sfh_col_tensor"]
+    h_strided = torch.empty((rows, 2 * n, *h.shape[2:]), dtype=h.dtype, device=h.device)[:, :n]
+    sfh_strided = torch.empty(2 * sfh.numel(), dtype=sfh.dtype, device=sfh.device)[::2]
+    for match, overrides in [
+        ("h_tensor must have shape", {"h_tensor": h[:1]}),
+        ("h_tensor must have shape", {"h_tensor": h[:, : n // 2]}),
+        ("h_tensor must be dense", {"h_tensor": h_strided}),
+        ("h_tensor must have dtype", {"h_tensor": h.view(torch.float8_e5m2)}),
+        ("sfh_col_tensor must have shape", {"sfh_col_tensor": sfh[:1]}),
+        ("sfh_col_tensor must be contiguous", {"sfh_col_tensor": sfh_strided}),
+        ("sfh_col_tensor must have dtype", {"sfh_col_tensor": sfh.view(torch.uint8)}),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            api.execute(**{**tensors, **overrides}, workspace=ws(api))
+    assert len(launches) == 1, "a malformed h buffer reached the launch"
+
+    # The wrapper: an h request the kernel cannot serve.
+    with pytest.raises(ValueError, match="dswiglu"):
+        _run_dglu_case(case, act_func="dgeglu", generate_h=True)
+
+    # The BF16 backend has no h output, in the class API or the wrapper.
+    problem = make_grouped_gemm_dglu_bf16_problem(discrete=False, b_major="k")
+    with pytest.raises(ValueError, match="sample_h"):
+        cudnn.GroupedGemmDgluSm100(
+            sample_a=problem["a"],
+            sample_c=problem["c"],
+            sample_d_row=problem["c"],
+            sample_d_col=None,
+            sample_sfa=None,
+            sample_padded_offsets=problem["offsets"],
+            sample_alpha=problem["alpha"],
+            sample_beta=problem["beta"],
+            sample_prob=problem["prob"],
+            sample_dprob=problem["dprob"],
+            sample_b=problem["b"],
+            sample_h=tensors["h_tensor"],
+            sample_sfh_col=tensors["sfh_col_tensor"],
+        ).check_support()
+    with pytest.raises(ValueError, match="generate_h"):
+        cudnn.grouped_gemm_dglu_wrapper_sm100(
+            a_tensor=problem["a"],
+            c_tensor=problem["c"],
+            sfa_tensor=None,
+            padded_offsets=problem["offsets"],
+            alpha_tensor=problem["alpha"],
+            beta_tensor=problem["beta"],
+            prob_tensor=problem["prob"],
+            dprob_tensor=problem["dprob"],
+            b_tensor=problem["b"],
+            sfb_tensor=None,
+            d_dtype=torch.bfloat16,
+            generate_h=True,
+        )
+
+    # SM107 (Rubin): the h output is SM100/103 only.
+    monkeypatch.setattr(cudnn.api_base, "get_device_type", lambda: "rubin")
+    rejected("SM100/103")

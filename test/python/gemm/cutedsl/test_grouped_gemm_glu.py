@@ -11,7 +11,7 @@ and discrete weight modes, with SwiGLU and GeGLU activations.
 import torch
 import pytest
 import cudnn
-from test_utils import torch_fork_set_rng
+from test_utils import bitwise_bits, torch_fork_set_rng
 from core.cutedsl.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES, reencode_sf_tensor_as_ue5m3
 from gemm.cutedsl.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from gemm.cutedsl.test_grouped_gemm_swiglu_utils import (
@@ -215,6 +215,44 @@ def test_grouped_gemm_glu_dense_compile_execute_fp8(
         use_dynamic_sched=use_dynamic_sched,
         request=request,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_scheduler_modes
+@pytest.mark.parametrize(("mma_tiler_mn", "cluster_shape_mn"), [((256, 256), (2, 1)), ((128, 256), (1, 1))], ids=["2cta", "1cta"])
+@pytest.mark.parametrize(
+    ("ab_dtype", "d_dtype", "sf_vec_size"),
+    [(torch.float8_e4m3fn, torch.float8_e4m3fn, 32), (torch.float4_e2m1fn_x2, torch.bfloat16, 32)],
+    ids=["mxfp8", "mxfp4_bf16_d"],
+)
+def test_grouped_gemm_glu_dense_compile_execute_without_c(ab_dtype, d_dtype, sf_vec_size, mma_tiler_mn, cluster_shape_mn, use_dynamic_sched, request):
+    """sample_c=None (SM100/103): no C output, and D, D_col, both SFD planes (or amax) byte-equal to the run with C on the
+    same inputs. 64 experts, among them empty, one-row and multi-tile experts."""
+    runs = []
+    for with_c in (True, False):
+        torch.manual_seed(0)
+        _, outputs, _ = _test_grouped_gemm_glu_dense_compile_execute(
+            ab_dtype=ab_dtype,
+            c_dtype=torch.bfloat16,
+            d_dtype=d_dtype,
+            cd_major="n",
+            acc_dtype=torch.float32,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            sf_vec_size=sf_vec_size,
+            sf_dtype=torch.float8_e8m0fnu,
+            vector_f32=True,
+            discrete_col_sfd=False,
+            request=request,
+            cfg_overrides={"group_m_list": [(0, 1, 255, 256, 257, 700, 1300)[i % 7] for i in range(64)]},
+            use_dynamic_sched=use_dynamic_sched,
+            with_c=with_c,
+        )
+        runs.append(outputs)
+    for name in ("d_tensor", "d_col_tensor", "sfd_row_tensor", "sfd_col_tensor", "amax_tensor"):
+        if runs[0].get(name) is not None:
+            assert torch.equal(bitwise_bits(runs[1][name].flatten()), bitwise_bits(runs[0][name].flatten())), f"{name} differs without C"
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +593,7 @@ def _test_grouped_gemm_glu_dense_compile_execute(
     use_dynamic_sched=False,
     omit_prob=False,
     use_single_group_runtime_offsets=False,
+    with_c=True,
 ):
     try:
         from cudnn import GroupedGemmGluSm100
@@ -604,6 +643,8 @@ def _test_grouped_gemm_glu_dense_compile_execute(
         sf_dtype=cfg["sf_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
     )
+    if not with_c:
+        outputs["c_tensor"] = None
 
     if input_mutator is not None:
         input_mutator(inputs, cfg)
@@ -2408,7 +2449,7 @@ def test_rubin_mxfp8_clamped_geglu_quantized_output(discrete, vector_f32):
 
 
 # =============================================================================
-# Rubin TMA-store buffer reuse: generate_c=False must not change D (#2350)
+# TMA-store buffer reuse without C: generate_c=False (Rubin) or sample_c=None (SM100/103) must not change D (#2350)
 # =============================================================================
 
 # Two A/B stages instead of the stock budget: at this budget the unpatched kernel corrupted 44% of launches (#2350).
@@ -2431,13 +2472,27 @@ def _rubin_glu_kernel_factory(kernel_cls, generate_c):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_rubin_mxfp8_glu_without_c_matches_with_c():
-    """With generate_c=False, every launch must write the same D, D_col and SFD bytes as generate_c=True.
+    _check_mxfp8_glu_without_c_matches_with_c(rubin=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm100_mxfp8_glu_without_c_matches_with_c():
+    """The same check for sample_c=None on SM100/103 (stock shared-memory budget)."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("sample_c=None requires SM100/103")
+    _check_mxfp8_glu_without_c_matches_with_c(rubin=False)
+
+
+def _check_mxfp8_glu_without_c_matches_with_c(rubin):
+    """With generate_c=False (Rubin) or sample_c=None (SM100/103), every launch must write the same D, D_col and SFD
+    bytes as with C.
 
     Without the D store's producer_acquire, a later subtile overwrote sD while the bulk store issued two subtiles earlier
     was still reading it; with generate_c=True the C store's acquire hid the race. The shape is the one #2350 measured
-    (32 experts, K=7168, N=4096 gate + up, MXFP8 with SFD, 2-CTA 256x256 tiles, dynamic scheduler). At this shared-memory
-    budget the unpatched kernel corrupted 1,568 of 3,600 launches, so 16 launches all miss it with probability about 1e-4.
-    test_tma_store_buffer_reuse.py pins the acquire in the source.
+    (32 experts, K=7168, N=4096 gate + up, MXFP8 with SFD, 2-CTA 256x256 tiles, dynamic scheduler). At the Rubin test's
+    shared-memory budget the unpatched kernel corrupted 1,568 of 3,600 launches, so 16 launches all miss it with
+    probability about 1e-4. test_tma_store_buffer_reuse.py pins the acquire in the source.
     """
     from cudnn import GroupedGemmGluSm100
     from cuda.bindings import driver as cuda
@@ -2469,9 +2524,10 @@ def test_rubin_mxfp8_glu_without_c_matches_with_c():
             sf_dtype=sf_dtype,
             sf_vec_size=sf_vec_size,
         )
+        c_tensor = outputs["c_tensor"] if generate_c or rubin else None
         api = GroupedGemmGluSm100(
             sample_a=inputs["a_tensor"],
-            sample_c=outputs["c_tensor"],
+            sample_c=c_tensor,
             sample_d=outputs["d_tensor"],
             sample_sfa=inputs["sfa_tensor"],
             sample_padded_offsets=inputs["padded_offsets_tensor"],
@@ -2495,15 +2551,16 @@ def test_rubin_mxfp8_glu_without_c_matches_with_c():
             use_dynamic_sched=True,
         )
         assert api.check_support()
-        assert api._implementation._is_rubin_kernel
-        api._implementation._kernel = _rubin_glu_kernel_factory(api._implementation._kernel, generate_c)
+        assert api._implementation._is_rubin_kernel == rubin
+        if rubin:
+            api._implementation._kernel = _rubin_glu_kernel_factory(api._implementation._kernel, generate_c)
         api.compile()
         for launch in range(_NO_C_LAUNCHES if not generate_c else 1):
             for name in checked:
                 outputs[name].view(torch.uint8).fill_(0xFF)
             api.execute(
                 a_tensor=inputs["a_tensor"],
-                c_tensor=outputs["c_tensor"],
+                c_tensor=c_tensor,
                 d_tensor=outputs["d_tensor"],
                 sfa_tensor=inputs["sfa_tensor"],
                 padded_offsets=inputs["padded_offsets_tensor"],

@@ -139,6 +139,7 @@ class DgluCall:
     activation_tensor: Optional[torch.Tensor] = None
     deterministic: bool = False
     glu_layout: str = "interleaved_32"
+    generate_h: bool = False
 
 
 class GroupedGemmDgluSm100(APIBase):
@@ -228,6 +229,8 @@ class GroupedGemmDgluSm100(APIBase):
         sample_activation: Optional[torch.Tensor] = None,
         _deterministic: bool = False,
         glu_layout: str = "interleaved_32",
+        sample_h: Optional[torch.Tensor] = None,
+        sample_sfh_col: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         validate_glu_layout(glu_layout)
@@ -262,6 +265,8 @@ class GroupedGemmDgluSm100(APIBase):
                     ("sf_fp8_dtype_override", kwargs["sf_fp8_dtype_override"]),
                     ("discrete_col_sfd", kwargs["discrete_col_sfd"] if kwargs["discrete_col_sfd"] else None),
                     ("epilogue_op", kwargs["epilogue_op"] if kwargs["epilogue_op"] not in (None, "none", "identity") else None),
+                    ("sample_h", kwargs["sample_h"]),
+                    ("sample_sfh_col", kwargs["sample_sfh_col"]),
                 ),
                 block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
             )
@@ -393,6 +398,8 @@ class GroupedGemmDgluSm100(APIBase):
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
         workspace: Any = None,
+        h_tensor: Optional[torch.Tensor] = None,
+        sfh_col_tensor: Optional[torch.Tensor] = None,
     ) -> None: ...
 
     def execute(
@@ -420,6 +427,8 @@ class GroupedGemmDgluSm100(APIBase):
         activation_tensor: Optional[torch.Tensor] = None,
         *,
         workspace: Any = None,
+        h_tensor: Optional[torch.Tensor] = None,
+        sfh_col_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -433,6 +442,8 @@ class GroupedGemmDgluSm100(APIBase):
                 ("sfd_col_tensor", sfd_col_tensor),
                 ("amax_tensor", amax_tensor),
                 ("norm_const_tensor", norm_const_tensor),
+                ("h_tensor", h_tensor),
+                ("sfh_col_tensor", sfh_col_tensor),
             )
             forbidden = [name for name, value in controls if value is not None]
             if forbidden:
@@ -479,6 +490,8 @@ class GroupedGemmDgluSm100(APIBase):
                 norm_const_tensor=norm_const_tensor,
                 current_stream=current_stream,
                 workspace=workspace,
+                h_tensor=h_tensor,
+                sfh_col_tensor=sfh_col_tensor,
             )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
@@ -568,7 +581,8 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
 
     Returns:
         TupleDict with keys: d_row_tensor, d_col_tensor, dprob_tensor,
-            dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor
+            dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor,
+            and h_tensor, sfh_col_tensor with ``generate_h``
     """
     import torch
 
@@ -670,9 +684,20 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
     is_fp8_config = a_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sfa_tensor.dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn)
     sf_dtype = sfa_tensor.dtype if is_fp8_config else None
     outputs = dglu_block_scaled_outputs(
-        valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, a_tensor.device, call.current_stream, a_tensor.ndim == 2
+        valid_m,
+        n_out,
+        l,
+        d_dtype,
+        sf_dtype,
+        sf_vec_size,
+        generate_dbias,
+        dprob_tensor,
+        a_tensor.device,
+        call.current_stream,
+        a_tensor.ndim == 2,
+        call.generate_h,
     )
-    d_row_tensor, d_col_tensor, _, dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor = outputs
+    d_row_tensor, d_col_tensor, _, dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor, *_ = outputs
     deterministic = call.deterministic
 
     if valid_m == 0:
@@ -808,6 +833,8 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         from ..dsrelu.api import _dprob_n_slots
 
         cache_key = (*cache_key, "deterministic", _dprob_n_slots(n_weight, mma_tiler_mn, cluster_shape_mn, True))
+    if call.generate_h:
+        cache_key = (*cache_key, "h")
 
     # ---- Cache lookup or create + compile ----
     if cache_key in _cache_of_GroupedGemmDgluSm100Objects:
@@ -856,6 +883,8 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
                 situ_beta2=situ_beta2,
                 _deterministic=deterministic,
                 glu_layout=call.glu_layout,
+                sample_h=outputs.get("h_tensor"),
+                sample_sfh_col=outputs.get("sfh_col_tensor"),
             )
         else:
             api = GroupedGemmDgluSm100(
@@ -898,6 +927,8 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
                 situ_beta2=situ_beta2,
                 _deterministic=deterministic,
                 glu_layout=call.glu_layout,
+                sample_h=outputs.get("h_tensor"),
+                sample_sfh_col=outputs.get("sfh_col_tensor"),
             )
 
         if not api.check_support():
@@ -912,7 +943,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
 
 
 def dglu_block_scaled_outputs(
-    valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, device, current_stream, canonical=False
+    valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, device, current_stream, canonical=False, generate_h=False
 ) -> TupleDict:
     import torch
 
@@ -928,6 +959,12 @@ def dglu_block_scaled_outputs(
         if generate_dbias:
             dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=device)
         d_layout = row_major_layout(valid_m, n_out, canonical)
+        h_outputs = {}
+        if generate_h:
+            h_outputs = dict(
+                h_tensor=torch.empty_strided(*row_major_layout(valid_m, n_out // 2, canonical), dtype=d_dtype, device=device),
+                sfh_col_tensor=torch.empty((valid_m * (n_out // 2) // 32,), dtype=torch.float8_e8m0fnu, device=device),
+            )
         return TupleDict(
             d_row_tensor=torch.empty_strided(*d_layout, dtype=d_dtype, device=device),
             d_col_tensor=torch.empty_strided(*d_layout, dtype=d_dtype, device=device),
@@ -936,6 +973,7 @@ def dglu_block_scaled_outputs(
             amax_tensor=amax_tensor,
             sfd_row_tensor=sfd_row_tensor,
             sfd_col_tensor=sfd_col_tensor,
+            **h_outputs,
         )
 
 
@@ -954,6 +992,7 @@ def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_db
             call.a_tensor.device,
             call.current_stream,
             call.a_tensor.ndim == 2,
+            call.generate_h,
         )
     dprob_slots = _dglu_dprob_slots(call, n_out // 2, valid_m) if call.deterministic else None
     api.execute(
@@ -978,6 +1017,8 @@ def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_db
         norm_const_tensor=call.norm_const_tensor,
         current_stream=call.current_stream,
         workspace=allocate_wrapper_workspace("torch", api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
+        h_tensor=outputs.get("h_tensor"),
+        sfh_col_tensor=outputs.get("sfh_col_tensor"),
     )
     if dprob_slots is not None:
         from ..dsrelu.api import _reduce_dprob_slots
@@ -1072,6 +1113,7 @@ def _normalize_dglu_call(
                 "epilogue_op",
                 call.epilogue_op if call.epilogue_op not in (None, "none", "identity") else None,
             ),
+            ("generate_h", call.generate_h or None),
         ),
         block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
     )
@@ -1389,6 +1431,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     activation_tensor: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     glu_layout: str = "interleaved_32",
+    generate_h: bool = False,
 ) -> TupleDict:
     """Dispatch grouped GEMM dGLU once from an immutable normalized call.
 
@@ -1397,6 +1440,8 @@ def grouped_gemm_dglu_wrapper_sm100(
     ``glu_layout="gate_then_up"`` consumes canonical C and returns canonical
     gate/up halves in D, dbias and both D scale buffers. It is independent of
     the natural-rank tensor convention advertised by ``supports_canonical_layouts``.
+    ``generate_h=True`` (block-scaled MXFP8 dSwiGLU, SM100/103) also returns ``h_tensor`` and
+    ``sfh_col_tensor``, the forward activation h column-quantized for the FC2 weight gradient.
     """
     validate_glu_layout(glu_layout)
     if glu_layout == "gate_then_up":
@@ -1432,6 +1477,7 @@ def grouped_gemm_dglu_wrapper_sm100(
             ("activation_tensor", activation_tensor is not None),
             ("deterministic", deterministic),
             ("b_dtype", b_dtype is not None),
+            ("generate_h", generate_h),
         ):
             if rejected:
                 raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
@@ -1513,6 +1559,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
         os.getenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0",
         deterministic,
+        *(("h",) if generate_h else ()),
     )
     memo = _dglu_wrapper_memo.get(memo_key)
     if memo is not None and memo[0].backend is GroupedGemmBackend.BF16:
@@ -1596,6 +1643,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         current_stream=current_stream,
         glu_layout=glu_layout,
         deterministic=deterministic and dprob_tensor is not None,  # without dprob there is nothing to make deterministic
+        generate_h=generate_h,
     )
     if memo is not None:
         return dglu_block_scaled_run(*memo, call)

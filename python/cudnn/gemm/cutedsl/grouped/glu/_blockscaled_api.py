@@ -103,7 +103,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
     def __init__(
         self,
         sample_a: torch.Tensor,
-        sample_c: torch.Tensor,
+        sample_c: Optional[torch.Tensor],
         sample_d: torch.Tensor,
         sample_sfa: torch.Tensor,
         sample_padded_offsets: torch.Tensor,
@@ -144,7 +144,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         """Initialize the GroupedGemmGluSm100 API.
 
         :param sample_a: Sample A tensor (valid_m, k, 1)
-        :param sample_c: Sample C tensor for intermediate storage
+        :param sample_c: Sample C tensor for intermediate storage; None (SM100/103) skips the C output (no C store,
+            no C shared memory stages)
         :param sample_d: Sample D output tensor (valid_m, n/2, 1) after GLU
         :param sample_sfa: Sample scale factor A tensor
         :param sample_padded_offsets: End offset for each expert after padding
@@ -664,10 +665,11 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             "Invalid configuration: fp8 ab_dtype with mma_tiler_mn[1] == 128 and fp8 d_dtype is not supported. " "Please use mma_tiler_mn[1] == 256 instead",
         )
         self._not_implemented_error_if(
-            self._is_fp4x2(self.ab_dtype) and (self.c_dtype not in [torch.float16, torch.bfloat16]),
+            self._is_fp4x2(self.ab_dtype) and (self.c_dtype not in [None, torch.float16, torch.bfloat16]),
             f"Invalid configuration: for fp4 ab_dtype, c_dtype must be float16 or bfloat16, got {self.c_dtype}",
         )
         self._not_implemented_error_if(self._has_bias and self.mma_tiler_mn[1] != 256, "Bias fusion currently requires mma_tiler_mn[1] == 256")
+        self._not_implemented_error_if(self.c_desc is None and self._is_rubin_kernel, "sample_c=None (no C output) requires SM100/103")
 
         # ---- SM100+ check ----
         if not torch.cuda.is_available():
@@ -693,7 +695,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             self._not_implemented_error_if(self.b_major != "k", "gate_then_up GLU requires K-major weights")
             self._not_implemented_error_if(self.act_func != "swiglu", "gate_then_up GLU currently supports swiglu only")
             self._not_implemented_error_if(
-                self.c_desc.dtype != torch.bfloat16 or self.d_dtype != (torch.float8_e4m3fn if is_mxfp8 else torch.bfloat16),
+                self.c_dtype not in (None, torch.bfloat16) or self.d_dtype != (torch.float8_e4m3fn if is_mxfp8 else torch.bfloat16),
                 "gate_then_up GLU requires BF16 saved C, E4M3 D for MXFP8, and BF16 D for NVFP4",
             )
         self._is_supported = True
@@ -781,11 +783,13 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 stride_order=self.a_desc.stride_order,
             )
             b_cute_fake = self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16)
-            c_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.c_desc.dtype,
-                shape=(valid_m, *self.c_desc.shape[1:]),
-                stride_order=self.c_desc.stride_order,
-            )
+            c_cute_fake = None
+            if self.c_desc is not None:
+                c_cute_fake = self._make_fake_cute_compact_tensor(
+                    dtype=self.c_desc.dtype,
+                    shape=(valid_m, *self.c_desc.shape[1:]),
+                    stride_order=self.c_desc.stride_order,
+                )
             d_cute_fake = self._make_fake_cute_compact_tensor(
                 dtype=self.d_desc.dtype,
                 shape=(valid_m, *self.d_desc.shape[1:]),
@@ -867,13 +871,15 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 dynamic_mode=self.b_desc.stride_order[0],
                 divisibility=32 if self._is_fp4x2(self.ab_dtype) else 16,
             )
-            c_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.c_desc.dtype,
-                shape=(valid_m, n_sym if self.glu_layout == "gate_then_up" else n_2_sym, 1),
-                stride_order=self.c_desc.stride_order,
-                dynamic_mode=self.c_desc.stride_order[0],
-                divisibility=8 if self._is_f16(self.c_desc.dtype) else 16,
-            )
+            c_cute_fake = None
+            if self.c_desc is not None:
+                c_cute_fake = self._make_fake_cute_compact_tensor(
+                    dtype=self.c_desc.dtype,
+                    shape=(valid_m, n_sym if self.glu_layout == "gate_then_up" else n_2_sym, 1),
+                    stride_order=self.c_desc.stride_order,
+                    dynamic_mode=self.c_desc.stride_order[0],
+                    divisibility=8 if self._is_f16(self.c_desc.dtype) else 16,
+                )
             d_cute_fake = self._make_fake_cute_compact_tensor(
                 dtype=self.d_desc.dtype,
                 shape=(valid_m, n_2_sym, 1),
@@ -1011,7 +1017,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         def tensor_api(
             a_tensor: torch.Tensor,
             b_tensor: torch.Tensor,
-            c_tensor: torch.Tensor,
+            c_tensor: Optional[torch.Tensor],
             d_tensor: torch.Tensor,
             d_col_tensor: Optional[torch.Tensor],
             sfa_tensor: torch.Tensor,
@@ -1099,11 +1105,13 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             stride_order=self.a_desc.stride_order,
             assumed_align=align,
         )
-        c_tensor = self._make_fake_cute_compact_tensor(
-            dtype=self.c_desc.dtype,
-            shape=(valid_m, *self.c_desc.shape[1:]),
-            stride_order=self.c_desc.stride_order,
-        )
+        c_tensor = None
+        if self.c_desc is not None:
+            c_tensor = self._make_fake_cute_compact_tensor(
+                dtype=self.c_desc.dtype,
+                shape=(valid_m, *self.c_desc.shape[1:]),
+                stride_order=self.c_desc.stride_order,
+            )
         d_tensor = self._make_fake_cute_compact_tensor(
             dtype=self.d_desc.dtype,
             shape=(valid_m, *self.d_desc.shape[1:]),
@@ -1234,7 +1242,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             a_tensor: torch.Tensor,
             b_ptrs_device: torch.Tensor,
             sfb_ptrs_device: torch.Tensor,
-            c_tensor: torch.Tensor,
+            c_tensor: Optional[torch.Tensor],
             d_tensor: torch.Tensor,
             d_col_tensor: Optional[torch.Tensor],
             sfa_tensor: torch.Tensor,
@@ -1302,7 +1310,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
     def execute(
         self,
         a_tensor: torch.Tensor,
-        c_tensor: torch.Tensor,
+        c_tensor: Optional[torch.Tensor],
         d_tensor: torch.Tensor,
         sfa_tensor: torch.Tensor,
         padded_offsets: torch.Tensor,
@@ -1337,7 +1345,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         For discrete mode, supply ``b_ptrs`` and ``sfb_ptrs``.
 
         :param a_tensor: Input A tensor
-        :param c_tensor: Intermediate C tensor
+        :param c_tensor: Intermediate C tensor; None exactly when ``sample_c`` was None
         :param d_tensor: Output D tensor
         :param sfa_tensor: Scale factor A
         :param padded_offsets: End offset per expert after padding
@@ -1384,7 +1392,9 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         if (scheduler_counter_tensor is None) != (self.scheduler_counter_desc is None):
             raise ValueError("scheduler_counter_tensor presence must match sample_scheduler_counter at compilation")
         validate_scheduler_counter(scheduler_counter_tensor, a_tensor)
-        if self.glu_layout == "gate_then_up" and c_tensor.shape[1] % 256:
+        if (c_tensor is None) != (self.c_desc is None):
+            raise ValueError("c_tensor presence must match sample_c at construction")
+        if self.glu_layout == "gate_then_up" and d_tensor.shape[1] % 128:
             raise NotImplementedError("gate_then_up GLU requires each gate/up branch N divisible by 128; padding is not implicit")
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)

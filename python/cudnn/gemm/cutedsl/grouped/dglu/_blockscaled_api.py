@@ -102,6 +102,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
     """
 
     supports_glu_layouts = GLU_LAYOUTS
+    # The optional h output's descriptors (set by __init__ when requested).
+    h_desc = None
+    sfh_col_desc = None
 
     def __init__(
         self,
@@ -150,6 +153,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         situ_beta2: float = 25.0,
         _deterministic: bool = False,
         glu_layout: str = "interleaved_32",
+        sample_h: Optional[torch.Tensor] = None,
+        sample_sfh_col: Optional[torch.Tensor] = None,
     ):
         """Initialize the GroupedGemmDgluSm100 API.
 
@@ -205,6 +210,11 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         :param situ_beta2: Compile-time up-branch tanh scale for dSiTU-GLU.
         :param glu_layout: Branch order for C, D and dbias. ``gate_then_up``
             keeps gate/up halves contiguous, including both output scale directions.
+        :param sample_h: Optional h output (valid_m, n, 1) in D's FP8 dtype: the forward activation
+            prob * silu(beta * gate) * (beta * up), column-quantized for the FC2 weight gradient.
+            Requires dswiglu, FP8 D with E8M0 scales, interleaved_32 and SM100/103. Give both or neither.
+        :param sample_sfh_col: Column scales of h, 1-D E8M0 (valid_m * n / 32,): one scale per 32-row block
+            of a column, per expert in the MMA scale-factor layout of an n x rows operand
         """
         from cudnn.tensor_adapter import detect_framework
 
@@ -239,6 +249,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self.canonical_c, sample_c = normalize_mx(sample_c)
         self.canonical_d_row, sample_d_row = normalize_mx(sample_d_row)
         self.canonical_d_col, sample_d_col = normalize_mx(sample_d_col)
+        self.canonical_h, sample_h = normalize_mx(sample_h)
         self.canonical_prob, sample_prob = normalize_prob(sample_prob)
         self.canonical_dprob, sample_dprob = normalize_prob(sample_dprob)
         self.canonical_b, sample_b = normalize_b(sample_b, n_major=b_major == "n")
@@ -255,6 +266,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self.c_desc = operand_desc(sample_c, "sample_c", self.canonical_c)
         self.d_row_desc = operand_desc(sample_d_row, "sample_d_row", self.canonical_d_row)
         self.d_col_desc = operand_desc(sample_d_col, "sample_d_col", self.canonical_d_col)
+        self.h_desc = operand_desc(sample_h, "sample_h", self.canonical_h)
+        self.sfh_col_desc = self._make_tensor_desc(sample_sfh_col, name="sample_sfh_col")
         self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
         self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
         self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
@@ -402,6 +415,40 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         launch_stream = as_torch_stream(int(current_stream), pointers.device)
         pointers.record_stream(launch_stream)
+
+    def _h_fakes(self, valid_m, dynamic_n=False) -> dict:
+        """Compile kwargs for the optional h output: none without ``sample_h``."""
+        if self.h_desc is None:
+            return {}
+        h_fake = self._make_fake_cute_compact_tensor(
+            dtype=self.h_desc.dtype,
+            shape=(valid_m, *self.h_desc.shape[1:]),
+            stride_order=self.h_desc.stride_order,
+            dynamic_mode=self.h_desc.stride_order[0] if dynamic_n else None,
+        )
+        return dict(h_tensor=canonical_mx_fake(h_fake, self.canonical_h), sfh_col_tensor=make_flat_sf_fake(self, self.sfh_col_desc))
+
+    def _check_h_buffers(self, a_tensor, c_tensor, h_tensor, sfh_col_tensor) -> None:
+        """Check the h outputs of one execute against its rows and N.
+
+        The kernel writes h and SFH_col at dense offsets from their base pointers (the compiled scale
+        argument carries no usable shape or stride), so a short or strided buffer would be written out of
+        bounds or at the wrong positions. Same contract as check_support, on the current dimensions.
+        """
+        rows, n = a_tensor.shape[0], c_tensor.shape[1] // 2
+        h_shape = (rows, n) if self.canonical_h else (rows, n, 1)
+        self._value_error_if(tuple(h_tensor.shape) != h_shape, f"h_tensor must have shape {h_shape}, got {tuple(h_tensor.shape)}")
+        self._value_error_if(not h_tensor.is_contiguous(), f"h_tensor must be dense and n-major, got stride {tuple(h_tensor.stride())}")
+        self._value_error_if(h_tensor.dtype != self.h_desc.dtype, f"h_tensor must have dtype {self.h_desc.dtype}, got {h_tensor.dtype}")
+        sfh_shape = (rows * n // 32,)
+        self._value_error_if(tuple(sfh_col_tensor.shape) != sfh_shape, f"sfh_col_tensor must have shape {sfh_shape}, got {tuple(sfh_col_tensor.shape)}")
+        self._value_error_if(not sfh_col_tensor.is_contiguous(), f"sfh_col_tensor must be contiguous, got stride {tuple(sfh_col_tensor.stride())}")
+        self._value_error_if(
+            sfh_col_tensor.dtype != self.sfh_col_desc.dtype,
+            f"sfh_col_tensor must have dtype {self.sfh_col_desc.dtype}, got {sfh_col_tensor.dtype}",
+        )
+        for name, tensor in (("h_tensor", h_tensor), ("sfh_col_tensor", sfh_col_tensor)):
+            self._value_error_if(tensor.device != a_tensor.device, f"{name} must be on {a_tensor.device}, got {tensor.device}")
 
     # --------------------------------------------------------------------- #
     #  check_support
@@ -697,6 +744,22 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         if self.discrete_col_sfd and not self.generate_sfd:
             self._logger.warning("discrete_col_sfd is True but generate_sfd is False, discrete_col_sfd will be ignored")
             self.discrete_col_sfd = False
+
+        # ---- Optional h output ----
+        if self.h_desc is not None or self.sfh_col_desc is not None:
+            self._value_error_if(self.h_desc is None or self.sfh_col_desc is None, "sample_h and sample_sfh_col must be given together")
+            self._value_error_if(self._is_rubin_kernel, "sample_h (the h output) requires SM100/103")
+            self._value_error_if(
+                self.act_func != "dswiglu" or not self.generate_sfd or self.glu_layout != "interleaved_32",
+                "sample_h requires dswiglu, an MXFP8 D (FP8 D with E8M0 scales) and the interleaved_32 GLU layout",
+            )
+            self._value_error_if(n % 128 != 0, f"sample_h requires N divisible by 128, got N={n}")
+            self._check_tensor_shape(self.h_desc, (tensor_m, n, 1), "h")
+            self._check_tensor_stride(self.h_desc, stride=[(n, 1, tensor_m * n)], extra_error_msg="h must have n-major layout")
+            self._check_dtype(self.h_desc, dtype=self.d_dtype, name="h", extra_error_msg="h must have the same dtype as D_row")
+            self._check_tensor_shape(self.sfh_col_desc, (tensor_m * n // 32,), "SFH_col")
+            self._check_tensor_stride(self.sfh_col_desc, stride=[(1,)], extra_error_msg="SFH_col must be contiguous")
+            self._check_dtype(self.sfh_col_desc, dtype=torch.float8_e8m0fnu, name="SFH_col")
 
         # ---- Activation function validation ----
         self._value_error_if(
@@ -1109,6 +1172,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                     "situ_beta2": self.situ_beta2,
                 }
             )
+        compile_kwargs.update(self._h_fakes(valid_m, dynamic_n=use_full_dynamic))
         _compiled_kernel = cute.compile(gemm_dglu, **compile_kwargs)
 
         def tensor_api(
@@ -1131,6 +1195,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             dbias_tensor: Optional[torch.Tensor],
             workspace_ptr: int,
             stream: cuda.CUstream,
+            h_tensor: Optional[torch.Tensor] = None,
+            sfh_col_tensor: Optional[torch.Tensor] = None,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             kernel_args = (
@@ -1158,7 +1224,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             if self._is_rubin_kernel:
                 _compiled_kernel(*kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, stream)
             else:
-                _compiled_kernel(*kernel_args, dbias_tensor, stream)
+                _compiled_kernel(*kernel_args, dbias_tensor, stream, *(() if h_tensor is None else (h_tensor, sfh_col_tensor)))
 
         self._compiled_kernel = tensor_api
 
@@ -1311,6 +1377,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                     "situ_beta2": self.situ_beta2,
                 }
             )
+        compile_kwargs.update(self._h_fakes(valid_m))
         _compiled_kernel = cute.compile(gemm_dglu, **compile_kwargs)
 
         self._n = n
@@ -1342,6 +1409,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             dbias_tensor: Optional[torch.Tensor],
             workspace_ptr: int,
             stream: cuda.CUstream,
+            h_tensor: Optional[torch.Tensor] = None,
+            sfh_col_tensor: Optional[torch.Tensor] = None,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             b_ptrs_addr = int(b_ptrs_device.data_ptr())
@@ -1372,7 +1441,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             if self._is_rubin_kernel:
                 _compiled_kernel(*kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, stream)
             else:
-                _compiled_kernel(*kernel_args, dbias_tensor, stream)
+                _compiled_kernel(*kernel_args, dbias_tensor, stream, *(() if h_tensor is None else (h_tensor, sfh_col_tensor)))
 
         self._compiled_kernel = tensor_api
 
@@ -1407,6 +1476,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         workspace=None,
+        h_tensor: Optional[torch.Tensor] = None,
+        sfh_col_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute the compiled kernel.
 
@@ -1435,8 +1506,14 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         :param current_stream: CUDA stream
         :param workspace: Device buffer of at least ``scratch_workspace_bytes()`` bytes,
             128-byte aligned, that the launch carves (recipe R2). Required.
+        :param h_tensor: h output; given exactly when ``sample_h`` was
+        :param sfh_col_tensor: Column scales of h; given exactly when ``sample_sfh_col`` was
         """
         self._logger.debug("Entering execute")
+        if (h_tensor is None) != (self.h_desc is None) or (sfh_col_tensor is None) != (self.sfh_col_desc is None):
+            raise ValueError("h_tensor / sfh_col_tensor presence must match sample_h / sample_sfh_col at construction")
+        if h_tensor is not None:
+            self._check_h_buffers(a_tensor, c_tensor, h_tensor, sfh_col_tensor)
         if self.glu_layout == "gate_then_up":
             n_weight = (
                 b_nkl(b_tensor, self.b_major)[0]
@@ -1485,6 +1562,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             sfd_col_tensor=sfd_col_tensor,
             amax_tensor=amax_tensor,
             norm_const_tensor=norm_const_tensor,
+            h_tensor=h_tensor,
+            sfh_col_tensor=sfh_col_tensor,
         )
 
         if self.weight_mode == MoEWeightMode.DENSE:
@@ -1508,6 +1587,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 dbias_tensor=dbias_tensor,
                 workspace_ptr=ws_view.data_ptr(),
                 stream=current_stream,
+                h_tensor=h_tensor,
+                sfh_col_tensor=sfh_col_tensor,
             )
         else:
             self._record_pointer_stream(b_ptrs, current_stream)
@@ -1532,6 +1613,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 dbias_tensor=dbias_tensor,
                 workspace_ptr=ws_view.data_ptr(),
                 stream=current_stream,
+                h_tensor=h_tensor,
+                sfh_col_tensor=sfh_col_tensor,
             )
 
         self._logger.debug("Execute completed")

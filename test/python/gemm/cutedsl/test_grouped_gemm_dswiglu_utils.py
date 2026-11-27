@@ -733,6 +733,39 @@ def check_ref_grouped_gemm_dswiglu(
     else:
         raise NotImplementedError(f"Unsupported dtype: {cfg['d_dtype']}")
 
+    if outputs.get("h_tensor") is not None:
+        check_ref_dglu_h(inputs, outputs, cfg, atol=atol, rtol=rtol)
+
+
+def allocate_dglu_h_tensors(tensor_m: int, n: int, d_dtype: torch.dtype, sf_vec_size: int = 32) -> Dict[str, torch.Tensor]:
+    """The optional dSwiGLU h output: h (tensor_m, n, 1) in D's dtype and its column scales, one E8M0 scale per 32-row
+    block of a column, set to NaN so that a scale the kernel does not write fails the check."""
+    _, h_tensor = create_and_permute_tensor(1, tensor_m, n, False, d_dtype)
+    sfh_col_tensor = torch.full((tensor_m * n // sf_vec_size,), 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    return {"h_tensor": h_tensor, "sfh_col_tensor": sfh_col_tensor}
+
+
+def check_ref_dglu_h(inputs: Dict[str, Any], outputs: Dict[str, Any], cfg: Dict[str, Any], atol: float = 1e-1, rtol: float = 1e-2) -> None:
+    """Check h = prob * silu(beta * gate) * (beta * up) against the reference quantization of D_col: one scale per
+    32-row block of a column (compared exactly), each expert's scales in the scale-factor layout of an (n, expert rows)
+    operand, and the codes within FP8 rounding."""
+    rows, n = inputs["valid_m"], cfg["n"]
+    group_rows = inputs["aligned_group_m_list"]
+    beta = inputs["beta_tensor"].repeat_interleave(torch.tensor(group_rows, device=inputs["beta_tensor"].device)).view(rows, 1, 1)
+    c = inputs["c_tensor"][:rows, :, 0].float().view(rows, n // 32, 2, 32)
+    gate, up = c[:, :, 0] * beta, c[:, :, 1] * beta
+    h = (gate * torch.sigmoid(gate) * up * inputs["prob_tensor"][:rows].view(rows, 1, 1)).reshape(rows, n)
+    norm_const = inputs["norm_const_tensor"][0].item()
+    sf_ref, h_ref = compute_reference_row_quant(h.t().contiguous().unsqueeze(-1), cfg["d_dtype"], cfg["sf_dtype"], cfg["sf_vec_size"], norm_const)
+    # Both scale layouts to (n, rows / 32): the reference's for the whole (n, rows) operand, the kernel's per expert.
+    sf_ref = sf_ref[..., 0].permute(2, 1, 0, 4, 3).reshape(n, rows // 32)
+    experts = outputs["sfh_col_tensor"].float().split([m * n // 32 for m in group_rows])
+    sf = torch.cat([e.view(n // 128, m // 128, 32, 4, 4).permute(0, 3, 2, 1, 4).reshape(n, m // 32) for e, m in zip(experts, group_rows)], dim=1)
+    torch.testing.assert_close(sf.cpu(), sf_ref.cpu(), atol=0, rtol=0)
+    fp8_atol, fp8_rtol = (max(atol, 0.125), max(rtol, 0.125)) if cfg["d_dtype"] == torch.float8_e4m3fn else (max(atol, 0.25), max(rtol, 0.25))
+    h_gpu = outputs["h_tensor"].reshape(rows, n).t().float()
+    torch.testing.assert_close(h_gpu.cpu(), h_ref[:, :, 0].to(cfg["d_dtype"]).float().cpu(), atol=fp8_atol, rtol=fp8_rtol)
+
 
 # =============================================================================
 # Focused Rubin MXFP8 clamped dGLU regression helpers
