@@ -75,6 +75,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
 
     supports_glu_layouts = GLU_LAYOUTS
     supports_gate_then_up_precisions = ("nvfp4",)
+    supports_gate_then_up_archs = ((10, 0), (10, 3), (10, 7))
     supports_gate_then_up_mma_tilers = ((256, 256),)
 
     def __init__(
@@ -372,8 +373,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
             raise RuntimeError(f"GroupedGemmGluHadamardSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
         if self.glu_layout == "gate_then_up":
-            if compute_capability not in (100, 103):
-                raise NotImplementedError("gate_then_up requires SM100 or SM103")
+            if compute_capability not in (100, 103, 107):
+                raise NotImplementedError("gate_then_up requires SM100, SM103, or SM107")
             if self.act_func != "swiglu" or n % 256:
                 raise NotImplementedError("gate_then_up requires SwiGLU and full N divisible by 256 (F divisible by 128)")
             if self.mma_tiler_mn != (256, 256) or self.cluster_shape_mn != (2, 1):
@@ -435,6 +436,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
             tanh_clamp_scale=self.tanh_clamp_scale,
             rht_sign_mask=self.rht_sign_mask,
             glu_layout=self.glu_layout,
+            use_sfb_reorder_warp=torch.cuda.get_device_capability() == (10, 7),
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -1063,5 +1065,6 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
 grouped_gemm_glu_hadamard_wrapper_sm100.supports_canonical_layouts = True
 
 grouped_gemm_glu_hadamard_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
+grouped_gemm_glu_hadamard_wrapper_sm100.supports_gate_then_up_archs = GroupedGemmGluHadamardSm100.supports_gate_then_up_archs
 grouped_gemm_glu_hadamard_wrapper_sm100.supports_gate_then_up_precisions = ("nvfp4",)
 grouped_gemm_glu_hadamard_wrapper_sm100.supports_gate_then_up_mma_tilers = ((256, 256),)

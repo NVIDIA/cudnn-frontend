@@ -230,17 +230,23 @@ FC1 dgrad/wgrad GEMMs without a gradient permutation. B is the FC2 weight;
 its layout does not change. The default `glu_layout="interleaved_32"`
 preserves the existing contract below.
 
-This option requires SM100/SM103, Torch tensors, dSwiGLU, BF16 saved C,
+This option requires SM100/SM103/SM107, Torch tensors, dSwiGLU, BF16 saved C,
 and N divisible by 128. It supports BF16 inputs with BF16 outputs; NVFP4
 E2M1 inputs with E4M3 block-16 scales and BF16 outputs; and MXFP8 E4M3
 inputs with E8M0 block-32 scales and E4M3 row/column outputs. Both packed and
 discrete FC2 weights are supported, subject to the existing weight-major
 restrictions, as is global/per-expert MXFP8 column-scale storage.
 `supports_gate_then_up_precisions` advertises the supported precision names
-(`"bf16"`, `"nvfp4"`, `"mxfp8"`). JAX and SM107 do not acquire canonical
+(`"bf16"`, `"nvfp4"`, `"mxfp8"`). JAX does not acquire canonical
 branch support from this option. The existing 256-row token-padding
 requirement remains. `supports_glu_layouts` advertises branch-order support;
 `supports_canonical_layouts` describes only tensor ranks and strides.
+On SM107, NVFP4 also accepts UE5M3 block-16 input scales with
+`sf_fp8_dtype_override="e5m3"`, advertised by
+`supports_gate_then_up_sf_fp8_dtype_overrides=("e5m3",)`. Scale tensors must
+contain UE5M3 bytes in E4M3 carrier storage, not E4M3-encoded values.
+Block-scaled canonical dGLU requires tile N=256 without M512/B-reuse.
+These additions do not enable deterministic block-scaled dprob on SM107.
 
 The existing epilogue reads C and stores gradient payloads through nested
 TMA views, then maps scale and bias stores to their canonical addresses.

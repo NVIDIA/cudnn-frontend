@@ -22,9 +22,9 @@ pytestmark = pytest.mark.L0
 
 
 @pytest.fixture(autouse=True)
-def require_blackwell():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Canonical GLU branches require SM100/103")
+def require_canonical_glu_device():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Canonical GLU branches require SM100/103/107")
 
 
 def prepare(problem, *, layout="gate_then_up", discrete=False, tmem=False):

@@ -299,7 +299,7 @@ class GroupedGemmGluBf16API(APIBase):
             raise RuntimeError(f"GroupedGemmGluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
         if self.glu_layout == "gate_then_up":
-            self._not_implemented_error_if(compute_capability not in (100, 103), "gate_then_up GLU requires SM100/103")
+            self._not_implemented_error_if(compute_capability not in (100, 103, 107), "gate_then_up GLU requires SM100/103/107")
             self._not_implemented_error_if(n % 256 != 0 or self.mma_tiler_mn[1] != 256, "gate_then_up GLU requires N divisible by 256 and tile_N=256")
             self._not_implemented_error_if(self.b_major != "k" or self.act_func != "swiglu", "gate_then_up GLU requires K-major weights and swiglu")
             self._not_implemented_error_if(

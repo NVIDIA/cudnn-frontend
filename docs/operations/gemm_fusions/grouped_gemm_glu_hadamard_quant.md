@@ -31,19 +31,24 @@ and saved C, without a persistent weight repack. It uses the existing kernel
 with a nested TMA view and a local scale-quarter permutation before MMA.
 D, RHT and their scale tensors retain their natural post-activation feature order.
 
-The canonical branch option currently requires Torch on SM100/SM103,
-`act_func="swiglu"`, NVFP4 E2M1 operands with E4M3 scales, `sf_vec_size=16`,
+The canonical branch option currently requires Torch on SM100/SM103/SM107,
+`act_func="swiglu"`, NVFP4 E2M1 operands with E4M3 or SM107-only UE5M3 scales, `sf_vec_size=16`,
 K-major weights, BF16 saved C, and `N/2` divisible by 128. Set
-`mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1)` for this option.
+`mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1)` on SM100/SM103, or
+`mma_tiler_mn=(256, 256), cluster_shape_mn=(2, 1)` on SM107.
 Both dense and discrete expert weights are supported. The existing output
 modes remain available: BF16 or NVFP4 D, BF16/NVFP4 rowwise RHT, and NVFP4
 colwise RHT. Expert token offsets still require 256-row alignment.
-JAX, Rubin and UE5M3 input-scale overrides do not gain this branch option.
+JAX does not gain this branch option. For UE5M3, set
+`sf_fp8_dtype_override="e5m3"` and provide UE5M3-encoded bytes in E4M3 carrier
+tensors. Quantized output scales also use UE5M3; their MMA-packed physical
+layout is unchanged. This override does not convert E4M3 input values.
 
 Capability metadata is explicit:
 `supports_glu_layouts=("interleaved_32", "gate_then_up")`,
-`supports_gate_then_up_precisions=("nvfp4",)`, and
-`supports_gate_then_up_mma_tilers=((128, 256),)`.
+`supports_gate_then_up_precisions=("nvfp4",)`,
+`supports_gate_then_up_sf_fp8_dtype_overrides=("e5m3",)` (SM107 only), and
+architecture-specific preferred tile/cluster metadata.
 These branch-order capabilities are separate from tensor rank/stride support.
 
 ### Natural tensor ranks (Torch)
@@ -397,8 +402,8 @@ result = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
 
 - `act_func`: `"swiglu"`, `"geglu"`, or `"srelu"`
 - `cd_major`: must be `"n"`
-- `mma_tiler_mn`: `(256, 256)` for the default `glu_layout="interleaved_32"`; `(128, 256)` for `"gate_then_up"`
-- `cluster_shape_mn`: for `"interleaved_32"`, the 2-CTA tiler requires the first dimension to be `2` and the second to be a positive power of two no larger than `4`; `"gate_then_up"` requires `(1, 1)`
+- `mma_tiler_mn`: `(256, 256)` for the default `glu_layout="interleaved_32"`; canonical uses `(128, 256)` on SM100/SM103 or `(256, 256)` on SM107
+- `cluster_shape_mn`: for `"interleaved_32"`, the 2-CTA tiler requires the first dimension to be `2` and the second to be a positive power of two no larger than `4`; canonical requires `(1, 1)` on SM100/SM103 or `(2, 1)` on SM107
 - `sf_vec_size`: must be `16`
 - `sf_fp8_dtype_override`: `None` uses the scale format implied by `SFA`/`SFB` dtype. `"e5m3"` reinterprets `torch.float8_e4m3fn` SFA/SFB storage as UE5M3 input scale factors; this is Rubin-only and does not convert tensor contents.
 - `m_aligned`: must be `256`

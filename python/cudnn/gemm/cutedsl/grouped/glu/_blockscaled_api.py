@@ -686,8 +686,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             is_mxfp8 = self.ab_dtype == torch.float8_e4m3fn and self.sfa_desc.dtype == torch.float8_e8m0fnu and self.sf_vec_size == 32
             is_nvfp4 = self._is_fp4x2(self.ab_dtype) and self.sfa_desc.dtype == torch.float8_e4m3fn and self.sf_vec_size == 16
             self._not_implemented_error_if(
-                compute_capability not in (100, 103) or not (is_mxfp8 or is_nvfp4),
-                "gate_then_up GLU requires MXFP8 E4M3/E8M0 or NVFP4 E2M1/E4M3 on SM100/103",
+                compute_capability not in (100, 103, 107) or not (is_mxfp8 or is_nvfp4),
+                "gate_then_up GLU requires MXFP8 E4M3/E8M0 or NVFP4 E2M1/E4M3 on SM100/103/107",
             )
             self._not_implemented_error_if(n % 256 != 0 or self.mma_tiler_mn[1] != 256, "gate_then_up GLU requires N divisible by 256 and tile_N=256")
             self._not_implemented_error_if(self.b_major != "k", "gate_then_up GLU requires K-major weights")
@@ -732,7 +732,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             act_func=self.act_func,
             enable_bias=self._has_bias,
             use_dynamic_sched=self.use_dynamic_sched,
-            **({"situ_beta1": self.situ_beta1, "glu_layout": self.glu_layout} if not self._is_rubin_kernel else {}),
+            glu_layout=self.glu_layout,
+            **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
             **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
             # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
             # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected

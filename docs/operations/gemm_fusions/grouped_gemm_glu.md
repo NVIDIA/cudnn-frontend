@@ -121,7 +121,7 @@ scale buffers keep the ordinary activated-channel order in either mode.
 `supports_glu_layouts` on the public wrapper/class advertises this option;
 `supports_canonical_layouts` only describes tensor ranks and strides.
 
-`gate_then_up` requires SM100/SM103, Torch tensors, SwiGLU, K-major FC1
+`gate_then_up` requires SM100/SM103/SM107, Torch tensors, SwiGLU, K-major FC1
 weights, and `N/2` divisible by 128. Both packed expert weights and discrete
 expert pointers are supported. The supported precision contracts are:
 
@@ -129,11 +129,17 @@ expert pointers are supported. The supported precision contracts are:
 | --- | --- | --- | --- |
 | BF16 | None | BF16 | BF16 |
 | NVFP4 E2M1 | E4M3, `sf_vec_size=16` | BF16 | BF16 |
+| NVFP4 E2M1 (SM107 only) | UE5M3, `sf_vec_size=16`, `sf_fp8_dtype_override="e5m3"` | BF16 | BF16 |
 | MXFP8 E4M3 | E8M0, `sf_vec_size=32` | BF16 | E4M3 with row/column scales |
 
 `supports_gate_then_up_precisions` advertises these precision names
-(`"bf16"`, `"nvfp4"`, `"mxfp8"`). JAX, SM107 and other precision/activation
+(`"bf16"`, `"nvfp4"`, `"mxfp8"`). JAX and other precision/activation
 combinations do not acquire canonical branch support from this option.
+On SM107, block-scaled canonical GLU requires tile N=256 and does not support
+M512/B-reuse. UE5M3 is advertised separately by
+`supports_gate_then_up_sf_fp8_dtype_overrides=("e5m3",)`. Its SFA/SFB tensors
+use E4M3 carrier storage containing actual UE5M3 bytes; the override does not
+convert E4M3 values. The existing MMA-packed scale layout is unchanged.
 The wrapper and public class advertise `preferred_gate_then_up_mma_tiler=(256, 256)`
 for the optimized two-CTA canonical path. Consumers may use this preference for
 regular block-scaled GLU, while keeping `(128, 256)` as a fallback with older

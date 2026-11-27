@@ -15,9 +15,9 @@ pytestmark = pytest.mark.L0
 
 
 @pytest.fixture(autouse=True)
-def require_blackwell():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Canonical Hadamard requires SM100/103")
+def require_supported_arch():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Canonical Hadamard requires SM100/103/107")
 
 
 @pytest.mark.parametrize("discrete,tmem", [(False, False), (True, False), (False, True)], ids=["dense-smem", "discrete-smem", "dense-tmem"])
@@ -51,6 +51,8 @@ def test_hadamard_sfb_asymmetric_arrival(monkeypatch, discrete, delayed_cta):
     module = importlib.import_module("cudnn.gemm.cutedsl.grouped.glu_hadamard.moe_blockscaled_grouped_gemm_glu_hadamard")
     api = importlib.import_module("cudnn.gemm.cutedsl.grouped.glu_hadamard.api")
     original_interleave = module.interleave_sfb_in_place
+    kernel_cls = module.BlockScaledMoEGroupedGemmGluHadamardKernel
+    original_reorder_method = kernel_cls.interleave_sfb_in_place
 
     @dsl_user_op
     def pause(*, loc=None, ip=None):
@@ -74,6 +76,12 @@ def test_hadamard_sfb_asymmetric_arrival(monkeypatch, discrete, delayed_cta):
             pause()
         original_interleave(scales, stage, lane, tile_k, sf_vec_size, stages)
 
+    @cute.jit
+    def delayed_reorder_method(self, scales: cute.Tensor, stage: cutlass.Int32, lane: cutlass.Int32):
+        if cute.arch.block_idx_in_cluster() == delayed_cta:
+            pause()
+        original_reorder_method(self, scales, stage, lane)
+
     problem = make_problem(f=256, k=4096, counts=(256, 0, 768), precision="nvfp4")
     args, owners = prepare(problem, discrete=discrete)
     expected = snapshot(invoke(args))
@@ -81,7 +89,10 @@ def test_hadamard_sfb_asymmetric_arrival(monkeypatch, discrete, delayed_cta):
     # Isolate wrapper caches so a precompiled, uninstrumented kernel cannot
     # satisfy this test, and delayed kernels cannot escape into later cases.
     monkeypatch.setattr(api, "_cache_of_GroupedGemmGluHadamardSm100Objects", {})
-    monkeypatch.setattr(module, "interleave_sfb_in_place", delayed_interleave)
+    if torch.cuda.get_device_capability() == (10, 7):
+        monkeypatch.setattr(kernel_cls, "interleave_sfb_in_place", delayed_reorder_method)
+    else:
+        monkeypatch.setattr(module, "interleave_sfb_in_place", delayed_interleave)
     actual = assert_replays(lambda: invoke(args), repeats=4)
     assert_bitwise(actual, expected, "asymmetric CTA arrival")
 
