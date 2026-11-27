@@ -1148,7 +1148,8 @@ def test_sm107_dense_d128_chunks_lead_up_to_256_tiles():
 @pytest.mark.parametrize("s_kv", [131072, 131073], ids=["on_tile", "off_tile"])
 def test_sm107_dense_d256_long_cache_chunks_lead_past_the_tile_cap(s_kv):
     """Study sm107_dense_d256_longkv_20261117: Rubin bf16 dense d256 GQA causal chunks past the 128-tile cap lead from a 32k cache (qwen3.5
-    32/2 at b 1, S_q 1024 over 128k ran the backend at 2.3-2.95x); below 32k, below S_q 256, MHA and f16 keep the tile cap."""
+    32/2 at b 1, S_q 1024 over 128k ran the backend at 2.3-2.95x). Study rubin_dense_thd_prefill_20261127 extends the lead to any d256
+    chunk over a cache of at least 8 x S_q (shorter S_q and MHA included); wider chunks and f16 keep the tile cap."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
@@ -1158,9 +1159,10 @@ def test_sm107_dense_d256_long_cache_chunks_lead_past_the_tile_cap(s_kv):
     assert placement.SM107_D256_LONG_CHUNK_MIN_KV == 32768
     assert place() == placement.LEAD  # 256 tiles over a long cache
     assert place(b=8, h_q=64, h_kv=8) == placement.LEAD  # 4096 tiles
-    assert place(s_kv=16384 + s_kv % 2) == placement.TRAIL  # below the cache floor, past the tile cap
-    assert place(s_q=192, b=8) == placement.TRAIL  # below S_q 256
-    assert place(h_kv=32) == placement.TRAIL  # MHA was not measured
+    assert place(s_kv=4096 + s_kv % 2) == placement.TRAIL  # a 4 x S_q cache, past the tile cap
+    assert place(s_kv=16384 + s_kv % 2) == placement.LEAD  # below the 32k floor, but 16 x S_q (rubin_dense_thd_prefill_20261127)
+    assert place(s_q=192, b=8, s_kv=65536 + s_kv % 2) == placement.LEAD  # below S_q 256, likewise
+    assert place(h_kv=32, s_kv=65536 + s_kv % 2) == placement.LEAD  # MHA, likewise
     assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL
 
 
@@ -1507,6 +1509,46 @@ def test_sm100_paged_mixed_full_squares_lead(cc, sms):
     assert place(h_q=32, h_kv=8, page_size=32) == placement.TRAIL
     for h_q, h_kv, d in ((40, 40, 128), (32, 16, 128), (32, 8, 64)):
         assert not placement._sm100_paged_full_square(_sm107_paged_facts(**{**base, "h_q": h_q, "h_kv": h_kv, "d_qk": d, "d_v": d})), (h_q, h_kv, d)
+
+
+@pytest.mark.L0
+def test_sm107_dense_chunks_lead_at_any_launch_size():
+    """Study rubin_dense_thd_prefill_20261127: Rubin dense bf16 causal bottom-right chunks lead past the 128-tile cap at d64, at d128 GQA
+    within one Q tile and at d256 over a cache of at least 8 x S_q (FROST 0.03-0.89 of the backend there). Longer d128 chunks, d128 MHA
+    and d256 chunks near the square keep the tile cap; the box bounds the rest."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    base = dict(dtype=cudnn.data_type.BFLOAT16, causal=True, bottom_right=True, device_cc=(10, 7), device_sm_count=208)
+    f = lambda **over: _facts(**{**base, **over})
+    place = lambda **over: placement.place(spec, f(**over))
+    rule = lambda **over: placement._sm107_dense_chunk(f(**over))
+    d64, d128, d256 = dict(d_qk=64, d_v=64), dict(d_qk=128, d_v=128), dict(d_qk=256, d_v=256)
+    assert place(**d64, b=16, h_q=64, h_kv=64, s_q=128, s_kv=16384) == placement.LEAD  # 1024 launch tiles: past the cap
+    assert place(**d128, b=64, h_q=64, h_kv=8, s_q=128, s_kv=2048) == placement.LEAD
+    assert place(**d256, b=32, h_q=32, h_kv=2, s_q=128, s_kv=65536) == placement.LEAD
+    assert place(**d256, b=8, h_q=16, h_kv=16, s_q=2048, s_kv=32768) == placement.LEAD  # MHA, 16 x S_q
+    assert rule(**d128, b=64, h_q=64, h_kv=8, s_q=placement.SM107_DENSE_D128_CHUNK_MAX_S_Q, s_kv=2048)
+    assert not rule(**d128, b=64, h_q=64, h_kv=8, s_q=placement.SM107_DENSE_D128_CHUNK_MAX_S_Q + 1, s_kv=2048)
+    assert not rule(**d128, b=64, h_q=16, h_kv=16, s_q=128, s_kv=2048)  # d128 MHA
+    assert rule(**d256, b=16, h_q=64, h_kv=8, s_q=256, s_kv=8 * 256)
+    assert not rule(**d256, b=16, h_q=64, h_kv=8, s_q=1024, s_kv=2048)  # near the square: 1.20 of the backend
+    for over in (
+        dict(thd=True),
+        dict(has_paged_kv=True),
+        dict(has_sink=True),
+        dict(window_left=127),
+        dict(dtype=cudnn.data_type.HALF),
+        dict(device_cc=(10, 0), device_sm_count=148),
+        dict(bottom_right=False),
+        dict(s_q=16384),  # S_q == S_kv
+        dict(s_q=16),  # the decode-shaped band's
+        dict(s_kv=placement.SM107_DENSE_CHUNK_KV[0] - 1, s_q=64),
+        dict(s_kv=placement.SM107_DENSE_CHUNK_KV[1] + 1),
+        dict(b=placement.SM107_DENSE_CHUNK_MAX_B + 1),
+        dict(h_q=placement.SM107_DENSE_CHUNK_MAX_HEADS + 8, h_kv=placement.SM107_DENSE_CHUNK_MAX_HEADS + 8),
+    ):
+        assert not rule(**{**d64, "b": 16, "h_q": 64, "h_kv": 64, "s_q": 128, "s_kv": 16384, **over}), over
 
 
 @pytest.mark.L0

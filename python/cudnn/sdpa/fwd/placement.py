@@ -549,6 +549,13 @@ Rubin bf16 dense d256 GQA causal chunks past the 128-tile cap lead from a 32k ca
 sm107_dense_d256_longkv_20261117, cuDNN 9.30.0.4: FROST 0.49-0.60 of the backend from 32k, 0.68-0.72 below with worst cells up to
 1.11; holdout scored once 0.488 / 0.543 on / off the tile, worst 1.055). qwen3.5 32/2 chunks at b 1 over 128k ran the backend at
 2.3-2.95x. The class has no table entry (three single-feature studies failed); the hand rule already leads its short-cache cells.
+Rubin bf16 dense causal chunks at any launch size (2026-11-27, ``_sm107_dense_chunk``): d64, d128 GQA within one Q tile, and d256
+over a cache of at least 8 x S_q lead past the tile caps above (b 1-64, h_q <= 64, S_q 17-2048, S_kv 2k-128k). Study
+rubin_dense_thd_prefill_20261127 (208 SMs, a development cuDNN build, the inference harness's dense context legs): a 150-cell train
+sweep found FROST at 0.03-0.89 of the backend on every d64 cell, 0.23-0.84 on every d128 GQA chunk of at most 128 queries and at
+most 0.71 on every d256 chunk over 8 x S_q; longer d128 chunks ran 0.66-1.73 and d256 nearer the square 0.98-1.20, so they keep
+the caps. A pre-registered 84-cell holdout, scored once, came to 0.443 of the measured default over its 62 changed cells (worst
+1.012); its 22 controls kept their plans.
 Rubin bf16 dense d192 x 128 causal chunks (MHA and GQA) from S_q 512 over a 32k cache lead the same way (``SM107_D192_LONG_CHUNK_*``;
 study sm107_dense_d192x128_long_cache_20261118, cuDNN 9.30.0.8: changed train cells 0.57-0.60, worst 0.785; holdout scored once
 0.647-0.783, worst 1.030); 256-query chunks lost up to 1.49. kimi_k2 / deepseek_v3 MHA and mimo GQA chunks over 64k-128k ran the
@@ -610,6 +617,14 @@ D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q f
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
 SM107_D128_CHUNKED_MAX_Q_TILES = 256  # Rubin bf16 d128 chunks: study sm107_dense_d128_chunk_tiles_20261117 (module docstring)
 SM107_D128_CHUNKED_MIN_S_Q = 256  # ... from the study's smallest S_q; below it the edge supplement lost 1.37x (module docstring)
+# Rubin dense bf16 causal chunks at any launch size (study rubin_dense_thd_prefill_20261127, module docstring): d64, d128 GQA within
+# one Q tile, d256 over a cache of at least SM107_DENSE_D256_CHUNK_MIN_KV_PER_Q x S_q.
+SM107_DENSE_CHUNK_KV = (2048, 131072)
+SM107_DENSE_CHUNK_MAX_B = 64
+SM107_DENSE_CHUNK_MAX_HEADS = 64
+SM107_DENSE_CHUNK_MAX_S_Q = 2048
+SM107_DENSE_D128_CHUNK_MAX_S_Q = 128
+SM107_DENSE_D256_CHUNK_MIN_KV_PER_Q = 8
 SM107_D256_LONG_CHUNK_MIN_KV = 32768  # Rubin bf16 d256 GQA causal chunks lead past the tile cap from this cache (module docstring)
 SM107_D256_LONG_CHUNK_MIN_S_Q = 256  # ... from the study's smallest S_q
 SM107_D192_LONG_CHUNK_MIN_KV = 32768  # Rubin bf16 d192 x 128 causal chunks lead past the tile cap from this cache (module docstring)
@@ -787,6 +802,33 @@ SM120_FP8_SINK_SHORT_WINDOW_MAX_S_Q = 4  # ... past the MTP rows trails: 96-128 
 
 def _q_tiles(facts) -> int:
     return facts.b * facts.h_q * -(-facts.s_q // 128)
+
+
+def _sm107_dense_chunk(facts) -> bool:
+    """Rubin dense bf16 causal bottom-right chunk (S_q < S_kv, no THD, page, sink or window) that leads at any launch size (module
+    docstring): d64; d128 GQA within one Q tile; d256 over a cache of at least SM107_DENSE_D256_CHUNK_MIN_KV_PER_Q x S_q."""
+    if not (
+        facts.device_cc == (10, 7)
+        and not (facts.thd or facts.has_paged_kv or facts.has_sink or facts.right_band_widening)
+        and facts.window_left is None
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.causal
+        and facts.bottom_right
+        and 1 <= facts.b <= SM107_DENSE_CHUNK_MAX_B
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q <= SM107_DENSE_CHUNK_MAX_HEADS
+        and DECODE_SHAPED_MAX_S_Q < facts.s_q < facts.s_kv
+        and facts.s_q <= SM107_DENSE_CHUNK_MAX_S_Q
+        and SM107_DENSE_CHUNK_KV[0] <= facts.s_kv <= SM107_DENSE_CHUNK_KV[1]
+    ):
+        return False
+    shape = (facts.d_qk, facts.d_v)
+    if shape == (64, 64):
+        return True
+    if shape == (128, 128):
+        return facts.h_q != facts.h_kv and facts.s_q <= SM107_DENSE_D128_CHUNK_MAX_S_Q
+    return shape == (256, 256) and facts.s_kv >= SM107_DENSE_D256_CHUNK_MIN_KV_PER_Q * facts.s_q
 
 
 def _d512_swa(facts) -> bool:
@@ -1233,6 +1275,8 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
                     max_tiles = SM107_D128_WHOLE_PACK_MAX_Q_TILES
             if facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS and (long_d256 or long_d192 or _q_tiles(facts) <= max_tiles):
                 return LEAD  # chunked, d64-d256: 0.04-1.00; squares and wider chunks stay mixed (up to 1.98x)
+            if _sm107_dense_chunk(facts):
+                return LEAD
     if _sm107_paged_gqa_prefill(facts):
         return LEAD
     # The shared paged pipeline also benefits from GQA packing without a
