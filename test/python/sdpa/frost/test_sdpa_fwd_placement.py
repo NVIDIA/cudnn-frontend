@@ -1562,6 +1562,74 @@ def test_sm100_paged_gqa_prefill_leads_inside_its_box():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)], ids=["b200", "b300"])
+def test_sm100_paged_mha_prefix_leads(cc):
+    """Study paged_thd_mha_placement_20261127: a cc 10.0 / 10.3 paged MHA prefix with THD Q leads at d256 and at d64 within one Q tile,
+    with an exact, ragged or no total-Q declaration. d64 past one Q tile and d128 keep their rules; the box bounds the rest."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    base = dict(h_q=8, h_kv=8, b=2, s_q=512, s_kv=81920, max_total_seq_len_q=2 * 512, device_cc=cc, device_sm_count=148)
+    d256, d64 = dict(d_qk=256, d_v=256), dict(d_qk=64, d_v=64)
+    place = lambda **over: placement.place(spec, _sm107_paged_facts(**{**base, **over}))
+    rule = lambda **over: placement._sm100_paged_mha_prefill(_sm107_paged_facts(**{**base, **over}))
+    for total in (2 * 512, 700, None):
+        assert place(**d256, max_total_seq_len_q=total) == placement.LEAD, total
+    assert place(**d64, s_q=100, max_total_seq_len_q=200) == placement.LEAD
+    assert place(**d64, s_q=100, max_total_seq_len_q=None) == placement.LEAD
+    assert place(**d64) == placement.TRAIL  # past one Q tile: FROST ran 0.91-1.09 of the backend
+    assert not rule()  # d128 keeps its rules
+    assert rule(**d256, s_q=placement.SM100_PAGED_MHA_PREFILL_MAX_Q, max_total_seq_len_q=None)
+    assert rule(**d64, s_q=placement.SM100_PAGED_MHA_PREFILL_D64_MAX_Q, max_total_seq_len_q=None)
+    assert rule(
+        **d256, b=placement.SM100_PAGED_MHA_PREFILL_MAX_B, h_q=placement.SM100_PAGED_MHA_PREFILL_MAX_HEADS, h_kv=placement.SM100_PAGED_MHA_PREFILL_MAX_HEADS
+    )
+    for over in (
+        dict(s_q=placement.SM100_PAGED_MHA_PREFILL_MAX_Q + 1, max_total_seq_len_q=None),
+        dict(s_q=81920),  # a full square: _sm100_paged_full_square's
+        dict(s_kv=placement.SM100_PAGED_MHA_PREFILL_KV[1] + 1),
+        dict(s_kv=placement.SM100_PAGED_MHA_PREFILL_KV[0] - 1, s_q=100),
+        dict(b=placement.SM100_PAGED_MHA_PREFILL_MAX_B + 1),
+        dict(h_q=placement.SM100_PAGED_MHA_PREFILL_MAX_HEADS + 8, h_kv=placement.SM100_PAGED_MHA_PREFILL_MAX_HEADS + 8),
+        dict(h_q=16),  # GQA 2
+        dict(page_size=32),
+        dict(window_left=127),
+        dict(has_sink=True),
+        dict(bottom_right=False),
+        dict(shape_overrides=True),
+        dict(thd=False),
+        dict(device_cc=(10, 7)),
+    ):
+        assert not rule(**d256, **over), over
+
+
+@pytest.mark.L0
+def test_sm107_paged_mha_split_keys_apart(monkeypatch):
+    """Study paged_thd_mha_placement_20261127: a Rubin paged THD MHA prefix the row splits keys `mha_split`, which no table entry
+    answers, so the split leads (FROST 0.05-0.85 of the backend at d128) instead of sm107_thd_prefill_20261111's unsplit MHA threshold.
+    Graphs the row does not split keep the `mha` class and its entry."""
+    from cudnn.frost import buffers
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107")
+    base = dict(h_q=4, h_kv=4, b=1, s_q=64, s_kv=90112, max_total_seq_len_q=64, device_sm_count=208)
+    f = lambda **over: _sm107_paged_facts(**{**base, **over})
+    split = f()
+    assert heuristics.paged_thd_split_choice(spec.capabilities, split)[0] > 1
+    assert pt.class_key(spec.name, split)[8] == "mha_split"
+    assert pt.matched_entry(spec.name, split) is None
+    assert placement.place(spec, split) == placement.LEAD
+    unsplit = f(b=64, h_q=8, h_kv=8, s_q=1024, s_kv=65536, max_total_seq_len_q=64 * 1024)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, unsplit)[0] == 1
+    assert pt.class_key(spec.name, unsplit)[8] == "mha"
+    assert pt.matched_entry(spec.name, unsplit).study == "sm107_thd_prefill_20261111"
+    assert pt.class_key(spec.name, f(h_q=16, h_kv=4))[8] != "mha_split"  # GQA keeps its classes
+    assert pt.class_key("sdpa_fwd_prefill_sm100", f(device_cc=(10, 0), device_sm_count=148))[8] == "mha"  # Rubin's row only
+
+
+@pytest.mark.L0
 def test_sm103_fp8_d192_long_causal_chunks_lead():
     """cc 10.3 per-tensor FP8 d192x128 causal chunks from SM103_FP8_D192_LONG_CHUNK_MIN_S_Q query tokens lead past
     FP8_D192_MAX_Q_TILES inside the qualified bottom-right E4M3 MHA band. Other graphs keep the tile bound."""
