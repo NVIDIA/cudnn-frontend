@@ -3352,6 +3352,10 @@ SM100_PAGED_D128_WIDE_MAX_B = 16
 SM100_PAGED_D128_WIDE_MIN_Q = 16
 SM100_PAGED_D128_WIDE_MAX_KV = 131072
 SM107_PAGED_PREFILL_SPLIT_WAVES = 2  # Rubin paged d128 GQA (group >= 4) split budget past one Q tile, in waves of SMs
+# Rubin paged d128 on caches up to SM107_PAGED_SPLIT_WAVE_MAX_KV keys: a split that needs a second wave of CTAs must bring its loop work
+# (waves x KV tiles per partition) below SM107_PAGED_SPLIT_WAVE_MAX_WORK of the unsplit launch's (study rubin_paged_split_floor_20261127).
+SM107_PAGED_SPLIT_WAVE_MAX_KV = 5120
+SM107_PAGED_SPLIT_WAVE_MAX_WORK = 0.6
 
 
 # Rubin paged bf16 D64 GQA prefixes split on the D128 Rubin budget (the native split is #2502's); study
@@ -3470,7 +3474,12 @@ def _measured_paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: b
             # the live tokens from above, and packed tiles shrink with them while unpacked ones keep a tile per head.
             choices.append((work, splits, units, not pack, pack))
     if choices:
-        _, splits, _, _, pack = min(choices)
+        work, splits, units, _, pack = min(choices)
+        if (facts.d_qk, facts.d_v) == (128, 128) and facts.s_kv <= SM107_PAGED_SPLIT_WAVE_MAX_KV and units * splits > sm_count:
+            # The second wave repeats the CTA prologue and the partials need a combine; on a short cache that can eat the loop it saves.
+            unsplit = min(_ceil_div(u, sm_count) for u in (_d128_thd_split_units(facts, g) for g in {1, facts.h_q // facts.h_kv}) if u) * kv_tiles
+            if work >= SM107_PAGED_SPLIT_WAVE_MAX_WORK * unsplit:
+                return 1, False
         return splits, pack
     if caps.sm_lo == 107 and facts.b <= 4 and facts.s_q <= 128 and 8192 <= facts.s_kv <= SM107_PAGED_ONE_TILE_EXTRA_WAVE_MAX_KV:
         # Preserve first-wave choices. One-tile queries can use more waves;
