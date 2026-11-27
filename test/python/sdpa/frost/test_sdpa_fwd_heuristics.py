@@ -2705,6 +2705,64 @@ def test_sm107_paged_d64_prefix_splits_on_the_rubin_budget(sm107_metadata_target
         assert paged_thd_split_choice(spec.capabilities, _facts(**dict(base, **over)))[0] == 1, over
 
 
+def _sm107_paged_prefix(d, h_q, h_kv, **over):
+    """A paged bf16 prefill chunk on a 208-SM Rubin part (head-major page pool, page 16, exact total-Q)."""
+    from types import SimpleNamespace
+
+    base = dict(
+        b=1,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=512,
+        s_kv=131072,
+        d_qk=d,
+        d_v=d,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (16 * d * h_kv, 16 * d, d, 1)),
+        device_cc=(10, 7),
+        device_sm_count=208,
+    )
+    base.update(over)
+    base.setdefault("max_total_seq_len_q", base["b"] * base["s_q"])
+    return _facts(**base)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d, h_q", [(128, 8), (256, 4)], ids=["d128", "d256"])
+def test_sm107_paged_prefix_splits_over_long_caches(sm107_metadata_target, d, h_q):
+    """Study paged_thd_long_kv_split_rubin_v2_20261127: on Rubin one request's paged D128 / D256 prefill chunk over a 128k cache splits
+    and leads, as it does over a 32k cache; past the declared bound it keeps the unsplit plan."""
+    from cudnn.sdpa.fwd import heuristics, placement
+
+    spec = engines.sm100_legacy_policy_spec(_RUBIN_F16)
+    facts = _sm107_paged_prefix(d, h_q, 1)
+    splits, _ = heuristics.paged_thd_split_choice(spec.capabilities, facts)
+    assert splits > 1
+    assert _sm107_f16_plans(facts)[0].knobs.split_kv == splits
+    assert placement.place(spec, facts) == placement.LEAD
+    past = _sm107_paged_prefix(d, h_q, 1, s_kv=heuristics.SM107_PAGED_PREFIX_SPLIT_MAX_KV + 1)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, past)[0] == 1
+
+
+@pytest.mark.L0
+def test_sm107_paged_one_tile_extra_wave_split_stays_at_32k(sm107_metadata_target):
+    """The one-tile extra-wave arm (a packed launch already past one wave, S_q <= 128) keeps its measured 32k caches: over 64k / 128k
+    keys its 2-way split ran 1.09-1.11x the unsplit plan (llama3.1 64/8 b4, study paged_thd_long_kv_split_20261127)."""
+    from cudnn.sdpa.fwd import heuristics
+
+    spec = engines.sm100_legacy_policy_spec(_RUBIN_F16)
+    choose = lambda kv: heuristics.paged_thd_split_choice(spec.capabilities, _sm107_paged_prefix(128, 64, 8, b=4, s_q=128, s_kv=kv))
+    assert choose(32768)[0] > 1
+    assert choose(65536) == (1, False)
+    assert choose(131072) == (1, False)
+
+
 def _sm100_paged_prefix(d, h_q, h_kv, **over):
     """FlashInfer's exact paged prefill declaration on a 148-SM cc 10.0 part (head-major page pool, page 16)."""
     from types import SimpleNamespace
