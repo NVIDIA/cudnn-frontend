@@ -302,18 +302,34 @@ class GroupedGemmWgradBf16API(APIBase):
             raise ValueError(f"single expert placeholder layout {desc.stride} is not expressible as a C-contiguous JAX array")
         self._single_expert_placeholder = jax.block_until_ready(jnp.empty(desc.shape, dtype=framework_dtype(desc.dtype, "jax")))
 
-    # The wide kernel is not faster than the stock one on GB200 at the MoE wgrad shapes measured (dW1 + dW2 geomean
-    # 1.006, per GEMM 0.96-1.05), so the API does not pick it by default.
-    _use_wide_tiles = False
+    # The wide kernel (256 x 512 tiles per CTA pair, the same dW bits) loads each A tile once per 512 columns instead of
+    # once per 256, but each of its tiles takes about twice as long as a stock tile, so a dW with few wide tiles per
+    # resident cluster loses the gain to the last, partly filled round of tiles. Measured on GB200, the ratio of the two
+    # kernels' times depends on the wide tiles per resident 2-CTA cluster and not on m, n or the tokens per expert: the
+    # wide kernel is faster from 12 under cluster launch control and from 24 with the atomic-counter claim, and up to
+    # 1.4% (CLC) or 2.4% (counter) slower just below (more for dWs of a few tiles per cluster).
+    # _use_wide_tiles = False always runs the stock kernel.
+    _use_wide_tiles = True
+    _WIDE_MIN_TILES_PER_CLUSTER = {False: 12, True: 24}  # keyed by atomic_counter_claim
+
+    @classmethod
+    def _wide_tiles_pay_off(cls, m: int, n: int, expert_cnt: int, max_active_clusters: int, atomic_counter_claim: bool) -> bool:
+        """Whether a dW of expert_cnt x (m, n) has enough 256 x 512 tiles for the wide kernel on max_active_clusters
+        resident 2-CTA clusters. The rule uses only the static shape: the tokens per expert are device data."""
+        wide_tiles = expert_cnt * (m // 256) * (n // 512)
+        return max_active_clusters > 0 and wide_tiles >= cls._WIDE_MIN_TILES_PER_CLUSTER[bool(atomic_counter_claim)] * max_active_clusters
+
+    def _max_active_clusters(self) -> int:
+        """Resident clusters of the configured shape on this device, less CUDNNFE_CLUSTER_OVERLAP_MARGIN."""
+        hardware_info = cutlass.utils.HardwareInfo()
+        return hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
 
     def _wide_applies(self) -> bool:
-        """Whether the wide kernel (256 x 512 tiles per CTA pair, the same dW bits) replaces the stock one: when enabled,
-        at the default 2-CTA 256x256 tile on SM100/SM103 for dense output, Tensor2D input, no accumulation, 16-bit dW
-        and n % 512 == 0."""
+        """Whether the wide kernel replaces the stock one: at the default 2-CTA 256x256 tile on SM100/SM103/SM107 for
+        dense output, Tensor2D input, no accumulation, 16-bit dW, n % 512 == 0 and enough wide tiles for the device."""
         m, n = self.wgrad_shape
         return (
             self._use_wide_tiles
-            and not self._is_rubin_kernel
             and self.weight_mode == MoEWeightMode.DENSE
             and self.input_order == WGradInputOrder.Tensor2D
             and not self.accumulate_on_output
@@ -323,6 +339,7 @@ class GroupedGemmWgradBf16API(APIBase):
             and _convert_to_cutlass_data_type(self.acc_dtype) == cutlass.Float32
             and _convert_to_cutlass_data_type(self.wgrad_dtype).width == 16
             and MoEGroupedGemmWgradWideBF16Kernel.can_implement(m, n)
+            and self._wide_tiles_pay_off(m, n, self.expert_cnt, self._max_active_clusters(), self.atomic_counter_claim)
         )
 
     def compile(self) -> None:
@@ -350,8 +367,7 @@ class GroupedGemmWgradBf16API(APIBase):
                 use_pdl=self.use_pdl,
                 launch_pdl_dependents_at_entry=self.launch_pdl_dependents_at_entry,
             )
-        hardware_info = cutlass.utils.HardwareInfo()
-        max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
+        max_active_clusters = self._max_active_clusters()
         if max_active_clusters <= 0:
             raise ValueError("max_active_clusters must be > 0 after applying CUDNNFE_CLUSTER_OVERLAP_MARGIN")
         # Internal scratch in the caller's framework allocator; kernels write through its
