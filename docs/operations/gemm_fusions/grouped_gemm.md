@@ -1,7 +1,9 @@
-# Grouped GEMM (SM100 BF16)
+# Grouped GEMM (SM100 and SM90 BF16)
 
-**This is an experimental API and subject to change.** It requires an NVIDIA
-SM100-or-newer GPU. The CuTe DSL dependencies ship with the package:
+**This is an experimental API and subject to change.** `GroupedGemmSm100` and
+`grouped_gemm_wrapper_sm100` require an NVIDIA SM100-or-newer GPU; their SM90
+(Hopper) counterparts `GroupedGemmSm90` and `grouped_gemm_wrapper_sm90` cover the subset
+in [SM90 (Hopper)](#sm90-hopper). The CuTe DSL dependencies ship with the package:
 
 ```bash
 pip install nvidia-cudnn-frontend
@@ -160,9 +162,38 @@ For a discrete class instance, replace `sample_b` with
 `num_experts=L`, `b_shape=(N, K)`, `b_dtype=torch.bfloat16`, and pass
 `b_ptrs` to `execute()`.
 
+## SM90 (Hopper)
+
+`GroupedGemmSm90` and `grouped_gemm_wrapper_sm90` take exactly the arguments of
+`GroupedGemmSm100` and `grouped_gemm_wrapper_sm100` and return the same outputs, so
+a caller switches by name only. They run a Hopper kernel (WGMMA and TMA,
+accumulator in registers) and require an SM90 GPU; the `_sm100` names require
+SM100+ and do not run on SM90. The SM90 names cover the forward GEMM
+(`b_major="k"`) and the input-gradient GEMM over the forward weights
+(`b_major="n"`), with these limits:
+
+- Dense `B` only (`b_tensor`); discrete `b_ptrs` raise `NotImplementedError`.
+- No `bias`; it raises `NotImplementedError`.
+- `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
+- Torch tensors only (no JAX entry).
+- SM90 uses the dynamic scheduler (atomic counter) by default; the static
+  scheduler is not available, so `use_dynamic_sched=False` is accepted and ignored.
+- The SM90 kernel picks its warp-group schedule from the problem shape, and
+  `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 256)`,
+  or `(128, 192)` for short K (`K <= 3072`, `N >= 2048`). SM100 uses
+  `(256, 256)`. The short-K schedule runs only on a `(128, 192)` tile with a
+  `(2, 1)` cluster (given or defaulted); any other tile or cluster runs the
+  default schedule.
+  An explicit SM90 tile has M in `{64, 128}` and N a multiple of 32 up to 256.
+  `cluster_shape_mn=None` selects `(2, 1)`; an
+  explicit cluster has power-of-two sides, at most 8 CTAs, and a cluster M tile
+  (`tile_m * cluster_m`) that divides 256.
+- `vector_f32` is accepted; Hopper has no packed FP32 arithmetic.
+
 ## Scheduling, caching, and errors
 
-- `use_dynamic_sched=False` uses the static scheduler.
+- `use_dynamic_sched=False` uses the static scheduler. The SM90 names always use
+  the dynamic scheduler (atomic counter); the static scheduler is not available there.
 - `use_dynamic_sched=True` compiles a dynamic-M callable and reuses it for
   compatible M values; discrete mode also allocates the per-expert tensor-map
   workspace. Wrapper cache keys retain dtype, layout, expert count, optional
@@ -172,7 +203,8 @@ For a discrete class instance, replace `sample_b` with
   same-signature wrapper calls may overlap on different streams.
 - Dense and discrete weight arguments are mutually exclusive. Invalid shapes,
   strides, dtypes, devices, alignment, offsets, pointer entries, output
-  descriptors, tiles/clusters, or a target below SM100 raise `ValueError` or
+  descriptors, tiles/clusters, or a target other than SM100+ (SM90 for the
+  `_sm90` names) raise `ValueError` or
   `RuntimeError` before launch.
 - Fused GLU, dGLU, and WGrad APIs select BF16 from BF16 operands while keeping
   their existing FP4/FP8 block-scaled backends. For BF16 on those fused APIs,

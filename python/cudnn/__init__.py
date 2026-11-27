@@ -676,6 +676,8 @@ _LAZY_OPTIONAL_IMPORTS = {
         ".gemm.cutedsl.grouped",
         "grouped_gemm_wrapper_sm100",
     ),
+    "GroupedGemmSm90": (".gemm.cutedsl.grouped", "GroupedGemmSm90"),
+    "grouped_gemm_wrapper_sm90": (".gemm.cutedsl.grouped", "grouped_gemm_wrapper_sm90"),
     "grouped_gemm_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_jax_sm100"),
     "grouped_gemm_glu_jax_sm100": (
         ".gemm.cutedsl.grouped",
@@ -778,6 +780,8 @@ _LAZY_OPTIONAL_IMPORTS = {
         ".gemm.cutedsl.grouped",
         "grouped_gemm_wgrad_wrapper_sm100",
     ),
+    "GroupedGemmWgradSm90": (".gemm.cutedsl.grouped", "GroupedGemmWgradSm90"),
+    "grouped_gemm_wgrad_wrapper_sm90": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_wrapper_sm90"),
     "discrete_grouped_gemm": (".gemm.cutedsl.discrete_grouped", None),
     "DiscreteGroupedGemmSwigluSm100": (
         ".gemm.cutedsl.discrete_grouped",

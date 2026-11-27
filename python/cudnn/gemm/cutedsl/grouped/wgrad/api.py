@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unified FE API for grouped GEMM wgrad on SM100+."""
+"""Unified FE API for grouped GEMM wgrad on SM90 (BF16) and SM100+."""
 
 from __future__ import annotations
 
 from typing import Any, Literal, Optional, Tuple, overload
+import inspect
 import os
 
 from cuda.bindings import driver as cuda
@@ -78,6 +79,7 @@ def get_grouped_gemm_wgrad_workspace_size_sm100(
 
 
 from ._bf16_api import GroupedGemmWgradBf16API
+from ..unfused.moe_grouped_gemm_sm90 import schedule_override
 from ._blockscaled_api import (
     GroupedGemmWgradBlockScaledAPI,
     _get_rubin_kernel,
@@ -92,6 +94,8 @@ _BLOCK_SCALED_JAX_ERROR = (
 
 class GroupedGemmWgradSm100(APIBase):
     """Stable public facade that selects the WGrad backend during support checking."""
+
+    _ARCH = "sm100"
 
     # BF16 implementation
     @overload
@@ -134,7 +138,7 @@ class GroupedGemmWgradSm100(APIBase):
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -168,7 +172,9 @@ class GroupedGemmWgradSm100(APIBase):
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
-                self._implementation = GroupedGemmWgradBf16API(**kwargs)
+                self._implementation = GroupedGemmWgradBf16API(arch=self._ARCH, **kwargs)
+            elif self._ARCH == "sm90":
+                raise NotImplementedError("GroupedGemmWgradSm90 supports BF16 operands only (no scale factors)")
             else:
                 if detect_framework(kwargs["sample_a"]) == "jax":
                     raise ValueError(_BLOCK_SCALED_JAX_ERROR)
@@ -268,6 +274,12 @@ class GroupedGemmWgradSm100(APIBase):
         self._implementation.execute(**execute_kwargs)
 
 
+class GroupedGemmWgradSm90(GroupedGemmWgradSm100):
+    """:class:`GroupedGemmWgradSm100` on SM90 (Hopper): the same arguments and lifecycle, running the SM90 BF16 kernel."""
+
+    _ARCH = "sm90"
+
+
 def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tuple[int, ...] = (), exact_stride: bool):
     if tensor is None:
         return None
@@ -300,7 +312,8 @@ def wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_out
 _wgrad_wrapper_memo: dict = {}
 
 
-def grouped_gemm_wgrad_wrapper_sm100(
+def _grouped_gemm_wgrad_wrapper(
+    op_class: type,
     a_tensor: torch.Tensor,
     b_tensor: torch.Tensor,
     sfa_tensor: torch.Tensor,
@@ -313,7 +326,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
     global_scale_b: Optional[torch.Tensor] = None,
     acc_dtype: Optional[torch.dtype] = None,
     wgrad_dtype: Optional[torch.dtype] = None,
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -324,6 +337,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
     descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
+    if op_class._ARCH == "sm90" and sfa_tensor is not None:
+        raise NotImplementedError("grouped_gemm_wgrad_wrapper_sm90 supports BF16 operands only (no scale factors)")
     if sfa_tensor is not None and detect_framework(a_tensor) == "jax":
         from .jax_api import grouped_gemm_wgrad_jax_sm100
 
@@ -344,7 +359,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             offsets_tensor,
             wgrad_dtype=wgrad_dtype if wgrad_dtype is not None else cutlass.BFloat16,
             acc_dtype=acc_dtype if acc_dtype is not None else cutlass.Float32,
-            mma_tiler_mn=mma_tiler_mn,
+            mma_tiler_mn=mma_tiler_mn or (256, 256),
             cluster_shape_mn=cluster_shape_mn,
             accumulate_on_output=accumulate_on_output,
             input_order=input_order,
@@ -355,6 +370,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             sf_vec_size=sf_vec_size,
         )
     memo_key = (
+        op_class,
         type(a_tensor),
         wrapper_operand_meta(a_tensor),
         wrapper_operand_meta(b_tensor),
@@ -369,13 +385,14 @@ def grouped_gemm_wgrad_wrapper_sm100(
         wrapper_operand_meta(global_scale_b),
         acc_dtype,
         wgrad_dtype,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         None if cluster_shape_mn is None else tuple(cluster_shape_mn),
         sf_vec_size,
         sf_fp8_dtype_override,
         accumulate_on_output,
         input_order,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+        schedule_override(),
     )
     memo = _wgrad_wrapper_memo.get(memo_key)
     if memo is not None:
@@ -444,6 +461,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
     cache_key = backend_cache_key(
         backend,
+        op_class._ARCH,
         get_device_type(),
         output_mode,
         _wgrad_tensor_signature(a_tensor, dynamic_dims=(1,), exact_stride=False),
@@ -457,13 +475,15 @@ def grouped_gemm_wgrad_wrapper_sm100(
         _wgrad_tensor_signature(global_scale_b, exact_stride=True),
         acc_dtype,
         wgrad_dtype,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         tuple(cluster_shape_mn) if cluster_shape_mn is not None else None,
         sf_vec_size,
         sf_fp8_dtype_override,
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        # The SM90 schedule is a function of the shapes and tile above plus the forced one.
+        schedule_override(),
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
@@ -505,7 +525,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
                 wgrad_shape=(hidden, intermediate),
                 wgrad_dtype=wgrad_dtype,
             )
-        op = GroupedGemmWgradSm100(**common)
+        op = op_class(**common)
         if not op.check_support():
             raise RuntimeError("Unsupported configuration")
         op.compile()
@@ -529,5 +549,40 @@ def grouped_gemm_wgrad_wrapper_sm100(
     return TupleDict(wgrad_tensor=wgrad_tensor)
 
 
+def grouped_gemm_wgrad_wrapper_sm100(
+    a_tensor: torch.Tensor,
+    b_tensor: torch.Tensor,
+    sfa_tensor: torch.Tensor,
+    sfb_tensor: torch.Tensor,
+    offsets_tensor: torch.Tensor,
+    output_mode: str = "dense",
+    wgrad_tensor: Optional[torch.Tensor] = None,
+    wgrad_ptrs: Optional[torch.Tensor] = None,
+    global_scale_a: Optional[torch.Tensor] = None,
+    global_scale_b: Optional[torch.Tensor] = None,
+    acc_dtype: Optional[torch.dtype] = None,
+    wgrad_dtype: Optional[torch.dtype] = None,
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    sf_vec_size: int = 16,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
+    accumulate_on_output: bool = False,
+    input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+    current_stream: Optional[cuda.CUstream] = None,
+    *,
+    descriptor_workspace: Optional[torch.Tensor] = None,
+) -> TupleDict:
+    """Compile and execute grouped GEMM wgrad through the selected backend API (SM100+, tcgen05)."""
+    return _grouped_gemm_wgrad_wrapper(GroupedGemmWgradSm100, **locals())
+
+
+def grouped_gemm_wgrad_wrapper_sm90(*args, **kwargs) -> TupleDict:
+    """:func:`grouped_gemm_wgrad_wrapper_sm100` on SM90 (Hopper): the same arguments and outputs, running the SM90 BF16 kernel."""
+    return _grouped_gemm_wgrad_wrapper(GroupedGemmWgradSm90, *args, **kwargs)
+
+
+grouped_gemm_wgrad_wrapper_sm90.__signature__ = inspect.signature(grouped_gemm_wgrad_wrapper_sm100)
+
 grouped_gemm_wgrad_wrapper_sm100.supports_canonical_layouts = True
 grouped_gemm_wgrad_wrapper_sm100.supports_bf16_canonical_layouts = True
+grouped_gemm_wgrad_wrapper_sm90.supports_bf16_canonical_layouts = True

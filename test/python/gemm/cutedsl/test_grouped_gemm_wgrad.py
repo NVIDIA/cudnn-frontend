@@ -1258,7 +1258,7 @@ def test_grouped_gemm_wgrad_bf16_rejects_sf_fp8_dtype_override():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("kernel", ["moe_grouped_gemm_wgrad.py", "moe_blockscaled_grouped_gemm_wgrad.py"])
+@pytest.mark.parametrize("kernel", ["moe_grouped_gemm_wgrad.py", "moe_blockscaled_grouped_gemm_wgrad.py", "moe_grouped_gemm_wgrad_sm90.py"])
 def test_wgrad_scheduler_advances_before_producer_tail(kernel):
     """Without the advance, producer_tail's first wait reuses the END sentinel's parity and can hang the CTA forever."""
 
