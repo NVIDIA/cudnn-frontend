@@ -120,4 +120,11 @@ def FrostNormFwdEngines(ids) -> List[FrostNormFwdEngine]:
     """
     from .engines import ENGINE_SPECS
 
-    return [FrostNormFwdEngine(spec, ids[spec.name]) for spec in ENGINE_SPECS if spec.name in ids]
+    engines = [FrostNormFwdEngine(spec, ids[spec.name]) for spec in ENGINE_SPECS if spec.name in ids]
+    if "batch_invariant_rmsnorm" in ids:
+        from ..batch_invariant.engine import BatchInvariantRmsNormEngine
+
+        engine = BatchInvariantRmsNormEngine()
+        engine.engine_id = ids[engine.name]
+        engines.append(engine)
+    return engines

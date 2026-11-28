@@ -454,7 +454,11 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.norm.fprop.engine",
         "FrostNormFwdEngines",
         # Slots are FIXED FOREVER; append the next free one, never reorder.
-        slots={"norm_fprop_sm100": EngineSlot(0), "norm_fprop_sm90": EngineSlot(1, opt_in=True)},
+        slots={
+            "norm_fprop_sm100": EngineSlot(0),
+            "norm_fprop_sm90": EngineSlot(1, opt_in=True),
+            "batch_invariant_rmsnorm": EngineSlot(2, opt_in=True, required_numeric_note="BATCH_INVARIANT"),
+        },
         analyzer=("cudnn.norm.graph_analyzer", "analyze"),
         validator=("cudnn.norm.affine", "validate_graph"),
     ),
