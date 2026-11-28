@@ -784,9 +784,22 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill_short_q", "paged", "causal_br", False, "gqa_split", True): Entry(
         "always", None, "sm100_paged_d64_d256_prefill_20261111"
     ),
-    # study sm100_paged_unpacked_short_q_20261128 (B200 1000 W, cuDNN 9.24.0.43; the inference harness's paged context graph, bf16
-    # THD causal d128 that the row runs unpacked and unsplit: MHA and groups 2 / 3 / 5 / 6 / 7, S_q 16-192, b 1-64, 2049-131072 keys,
-    # pages 16 / 64; 360 train cells plus a 200-cell probe, 188 keyed `prefill_short_q`).
+    # study sm100_paged_unpacked_short_q_20261128 (cuDNN 9.24.0.43; the inference harness's paged context graph, bf16 THD causal d128
+    # that the row runs unpacked and unsplit: MHA and groups 2 / 3 / 5 / 6 / 7, S_q 16-192, b 1-64, 2049-131072 keys, pages 16 / 64).
+    # cc 10.0: B200 1000 W, 360 train cells plus a 200-cell probe, 188 keyed `prefill_short_q`. cc 10.3: B300 1100 W, the same 360
+    # train cells, 158 keyed.
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm100_paged_unpacked_short_q_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm100_paged_unpacked_short_q_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm100_paged_unpacked_short_q_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm100_paged_unpacked_short_q_20261128"
+    ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm100_paged_unpacked_short_q_20261128"
     ),
