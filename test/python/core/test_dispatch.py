@@ -1850,3 +1850,17 @@ def test_behavior_notes_follow_plan_configuration_and_selection(monkeypatch):
     assert 0 in g._barred_indices() and 1 not in g._barred_indices()
     g.deselect_behavior_notes([note])
     assert {0, 1}.issubset(g._barred_indices())
+
+
+def test_order_lays_out_verdicts_around_the_backend_block():
+    """engines.heuristics.order: lead proposals, the backend's block, trail proposals, then the LAST_RESORT marker and the
+    last ones; each group keeps the proposals' order, and with no last proposal there is no marker."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import LAST, LEAD, TRAIL, is_backend_block, is_last_resort, order
+
+    plans = [PlanConfig(e, None) for e in (1, 2, 3, 4, 5)]
+    verdicts = {1: TRAIL, 2: LEAD, 3: LAST, 4: LEAD, 5: TRAIL}
+    tag = lambda p: "backend" if is_backend_block(p) else "last_resort" if is_last_resort(p) else p.engine_id  # noqa: E731
+    assert [tag(p) for p in order(plans, lambda p: verdicts[p.engine_id])] == [2, 4, "backend", 1, 5, "last_resort", 3]
+    assert [tag(p) for p in order(plans[:2], lambda p: verdicts[p.engine_id])] == [2, "backend", 1]
+    assert [tag(p) for p in order(plans, lambda p: LEAD)] == [1, 2, 3, 4, 5, "backend"]

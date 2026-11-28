@@ -268,18 +268,18 @@ def test_sm100_d128_leads_the_backend_only_on_unwindowed_d128_thd(monkeypatch):
         plans = heuristics.propose("A", _facts(**{"device_cc": (10, 0), **over}), _OFFERED)
         return ["backend" if is_backend_block(p) else "frost" for p in plans]
 
-    assert order(thd=True) == ["frost"]
+    assert order(thd=True) == ["frost", "backend"]
     assert order() == ["backend", "frost"]  # dense d128: parity
     assert order(thd=True, window_left=1024) == ["backend", "frost"]  # a window loses ~2x
     assert order(thd=True, d_qk=64, d_v=64) == ["backend", "frost"]
-    assert order(thd=True, device_cc=(10, 3)) == ["frost"]  # cc 10.3 runs the cc 10.0 rule (the sm103 precedent)
+    assert order(thd=True, device_cc=(10, 3)) == ["frost", "backend"]  # cc 10.3 runs the cc 10.0 rule (the sm103 precedent)
     # cc 10.7 (Rubin, measured 2026-11-03): the backend serves no d128 THD backward plan there, so the row leads its box as on cc 10.0;
     # dense d128 read parity (+1.6 % at 16K, noise at 8K) and trails (heuristics.D128_LEAD_CCS)
-    assert order(thd=True, device_cc=(10, 7)) == ["frost"]
+    assert order(thd=True, device_cc=(10, 7)) == ["frost", "backend"]
     assert order(device_cc=(10, 7)) == ["backend", "frost"]
     assert order(thd=True, device_cc=(10, 7), window_left=1024) == ["backend", "frost"]
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-    assert order() == ["frost"]
+    assert order() == ["frost", "backend"]
 
 
 def test_sm100_d128_deterministic_entries_key_apart(monkeypatch):
@@ -352,7 +352,7 @@ def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
         plans = heuristics.propose("A", _facts(**{**base, **over}), _OFFERED)
         return ["backend" if is_backend_block(p) else "frost" for p in plans]
 
-    lead, trail = ["frost"], ["backend", "frost"]
+    lead, trail = ["frost", "backend"], ["backend", "frost"]
     assert order() == lead
     assert order(causal=False) == lead
     assert order(thd=True, causal=False, max_total_seq_len_q=8 * 4096) == lead  # full-length THD
@@ -453,7 +453,7 @@ def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
             # d256: no study timed these head dims, so no placement_table entry lifts the row
             assert [tag(p) for p in heuristics.propose("A", _facts(d_qk=256, d_v=256), _OFFERED)] == ["backend", "last_resort", "frost"], owner
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-    assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["frost"]
+    assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["frost", "backend"]
 
 
 def test_measured_lead_lifts_a_trail_only_row_only_inside_its_classes(monkeypatch):
