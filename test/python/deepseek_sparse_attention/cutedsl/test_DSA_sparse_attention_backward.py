@@ -1761,6 +1761,35 @@ def test_DSA_sparse_attention_backward_d512_conflict_rank_host_layout_matches_ke
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_backward_d512_ordered_host_layout_matches_kernel():
+    """Ordered D512 plans keep one dense plane at every KV extent; they fuse their tails up to ``RANK_ORDERED_FUSED_MAX_TOPK``.
+
+    The ordered class is selected even where records plans keep the private-plane layout, its fused/per-wave-setup
+    choice follows the top-k width alone, and the host sizes equal the plane count and regions its kernels address.
+    """
+    cutlass = _import_or_skip("cutlass")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    common = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common")
+    rank = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2cta_rank_shard")
+    for topk in (128, 512, 1024, 1152, 2048):
+        fused = topk <= rank.RANK_ORDERED_FUSED_MAX_TOPK
+        kernel_cls = interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, 1, 512, 128, None, max_topk=topk, dkv_mode="ordered")
+        assert kernel_cls.rank_ordered and kernel_cls.rank_shard and kernel_cls.rank_fused == fused
+        geometry = kernel = _h128_kernel_geometry(kernel_cls(cutlass.BFloat16, 512, 512, 64, topk), "rank_geometry", "rank_offsets")
+        wave = kernel.max_query_pairs_per_wave
+        for s_kv in _H128_GEOMETRY_S_KV:
+            case = f"K={topk} S_kv={s_kv}"
+            assert interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, s_kv, 512, 128, None, max_topk=topk, dkv_mode="ordered") is kernel_cls, case
+            assert rank.rank_merged_fused(s_kv, topk, kernel.rank_record, wave, ordered=True) == fused, case
+            pitch, planes = geometry.rank_geometry(s_kv)
+            assert planes == 1 == rank.rank_merged_planes(s_kv, topk, kernel.rank_record, wave, fused, ordered=True), case
+            device_words = geometry.rank_offsets(pitch, planes)[-1] + rank.RANK_MERGED_COUNTER_WORDS
+            assert device_words == rank.rank_merged_workspace_words(s_kv, topk, kernel.rank_record, wave, ordered=True), case
+            _, dkv_shape = common._workspace_shapes_sm100(1, s_kv, 512, 128, True, "h128_2cta_m64", max_topk=topk, dkv_mode="ordered")
+            assert math.prod(dkv_shape) >= 4 * device_words, case
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("sm_count", [132, 148, 152, 160])
 def test_DSA_sparse_attention_backward_d576_conflict_rank_host_layout_covers_kernel(sm_count):
     """The host D576 conflict-rank sizes cover the plane count and regions the kernels address on a device."""
@@ -2791,6 +2820,18 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_dkv_mode_validation()
         assert error("chain", True, backend) == "deterministic_dkv_mode='chain' is supported only by the deterministic SM100 generic_m64 backend"
         assert error("shards", True, backend) is None
         assert error("records", True, backend) is None
+    # 'ordered' runs only on the H128 D512 two-CTA backend of SM100/SM103 and never on the generic M64 kernel.
+    assert error("ordered", True) is None
+    assert error("ordered", False) == "deterministic_dkv_mode='ordered' requires deterministic=True"
+    assert error("ordered", True, "h128_2cta_m64", device_capability=(10, 3)) is None
+    for backend in ("generic_m64", "h96_h64_h32", "h16_m128", "h32_m64", "h96_d576_2cta_m64", "h128_d576_2cta_m64"):
+        assert error("ordered", True, backend).startswith("deterministic_dkv_mode='ordered' is supported only by the deterministic SM100 H128 D512 two-CTA")
+    assert error("ordered", True, device_capability=(10, 7)).startswith("deterministic_dkv_mode='ordered' requires conflict-rank dKV storage")
+    assert deterministic.rank_dkv_route(300, 4096, 512, 64, 64, dkv_mode="ordered") is None
+    with pytest.raises(ValueError, match="supported only by the deterministic SM100 H128 D512 two-CTA backend"):
+        deterministic.deterministic_kernel_class(300, 4096, 512, 64, max_topk=64, dkv_mode="ordered")
+    with pytest.raises(ValueError, match="supported only by the deterministic SM100 H128 D512 two-CTA backend"):
+        interface._get_sm100_kernel_class("generic_m64", True, 300, 4096, 512, 64, max_topk=64, dkv_mode="ordered")
 
     size = interface.flash_attn_bwd_sm100_workspace_size
     with pytest.raises(ValueError, match="deterministic_dkv_mode must be one of"):
@@ -2884,13 +2925,50 @@ def test_DSA_sparse_attention_backward_wrapper_caches_one_plan_per_dkv_mode(monk
         torch.zeros(64, dtype=torch.float32, device=device),
         torch.zeros(2, 64, dtype=torch.int32, device=device),
     )
-    for mode in ("records", "chain", "shards") * 2:
+    for mode in ("records", "chain", "shards", "ordered") * 2:
         api.sparse_attention_backward_wrapper(*inputs, softmax_scale=0.05, deterministic=True, deterministic_dkv_mode=mode)
-    assert built == ["records", "chain", "shards"]
+    assert built == ["records", "chain", "shards", "ordered"]
     keys = {plan.mode: key for key, plan in api._cache_of_SparseAttentionBackwardObjects.items()}
-    assert len(keys) == len(api._cache_of_SparseAttentionBackwardObjects) == 3
+    assert len(keys) == len(api._cache_of_SparseAttentionBackwardObjects) == 4
     assert keys["chain"] == keys["records"] + ("chain",)
     assert keys["shards"] == keys["records"] + ("shards",)
+    assert keys["ordered"] == keys["records"] + ("ordered",)
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_ordered_mode_plan_support():
+    """``deterministic_dkv_mode='ordered'`` plans: the H128 D512 BF16 two-CTA plan accepts it, every other plan rejects it.
+
+    Rejection happens in ``check_support`` (before compilation), on SM90 and on SM100/SM103 plans whose backend is
+    not the H128 D512 two-CTA kernel (H64, FP16 H128).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("Environment not supported: CUDA device required")
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((9, 0), (10, 0), (10, 3)):
+        pytest.skip(f"Environment not supported: ordered-mode support is defined for SM90/SM100/SM103, found {capability}")
+    from cudnn import DSA
+
+    def plan(heads, dtype):
+        device = torch.device("cuda")
+        q = torch.randn(4, heads, 512, dtype=dtype, device=device)
+        kv = torch.randn(256, 512, dtype=dtype, device=device)
+        out = torch.randn(4, heads, 512, dtype=dtype, device=device)
+        lse = torch.zeros(4, heads, dtype=torch.float32, device=device)
+        attn_sink = torch.zeros(heads, dtype=torch.float32, device=device)
+        topk_idxs = torch.zeros(4, 128, dtype=torch.int32, device=device)
+        return DSA.SparseAttentionBackward(q, kv, out, out, lse, attn_sink, topk_idxs, softmax_scale=0.05, deterministic=True, deterministic_dkv_mode="ordered")
+
+    if capability[0] == 9:
+        with pytest.raises(ValueError, match="supported only by the deterministic SM100 H128 D512 two-CTA backend"):
+            plan(128, torch.bfloat16).check_support()
+        return
+    accepted = plan(128, torch.bfloat16)
+    assert accepted.check_support()
+    assert accepted._backend == "h128_2cta_m64" and accepted._dkv_mode == "ordered"
+    for heads, dtype in ((64, torch.bfloat16), (128, torch.float16)):
+        with pytest.raises(ValueError, match="supported only by the deterministic SM100 H128 D512 two-CTA backend"):
+            plan(heads, dtype).check_support()
 
 
 @pytest.mark.L0

@@ -108,6 +108,16 @@ class SparseAttentionBackward(APIBase):
         - ``'shards'``: the bounded-wave shard layout, or the cluster relay
           for large contexts, chosen from the query and KV extents alone; the
           private-plane layout for every shape on the H128 two-CTA backends.
+        - ``'ordered'``: batch-invariant results. Each dKV row is the FP32 left
+          fold of its terms in ascending (query, slot) order and dSink the left
+          fold of its per-query terms in query order, whatever the KV extent,
+          the query count or a query's position in the batch. A sequence's dQ,
+          dKV and dSink therefore keep their bytes when its neighbors, their
+          order or its duplicates change, provided no neighbor selects its KV
+          rows and the neighbors' upstream gradients contribute zero dSink
+          terms. Implemented by the H128 D512 two-CTA backend (SM100/SM103,
+          BF16, contiguous inputs, top-k 128/512/1024/1152/2048); every other
+          plan rejects it.
 
         Each mode is bitwise reproducible from run to run; the modes round
         differently from one another. Values other than the default require
@@ -116,8 +126,8 @@ class SparseAttentionBackward(APIBase):
         ``deterministic_relay_cluster_size``; an explicit relay size selects
         the SM90 cluster relay even when the requested mode is ``'records'``.
         On SM100-family devices other than SM100/SM103, a
-        ``'records'`` plan runs the ``'shards'`` layouts and ``'chain'`` is
-        rejected.
+        ``'records'`` plan runs the ``'shards'`` layouts and ``'chain'`` and
+        ``'ordered'`` are rejected.
         """
         super().__init__()
         self.return_cli_target = bool(return_cli_target)
@@ -265,10 +275,15 @@ class SparseAttentionBackward(APIBase):
             self.deterministic_relay_cluster_size is not None and not self.deterministic,
             "deterministic_relay_cluster_size requires deterministic=True",
         )
-        # SM90 plans have no generic M64 kernel: a chain request is rejected rather than ignored.
+        # SM90 plans have neither the generic M64 kernel nor the two-CTA kernels: chain and ordered requests are
+        # rejected rather than ignored.
         self._value_error_if(
             major != 10 and self.deterministic_dkv_mode == "chain",
             "deterministic_dkv_mode='chain' is supported only by the deterministic SM100 generic_m64 backend",
+        )
+        self._value_error_if(
+            major != 10 and self.deterministic_dkv_mode == "ordered",
+            "deterministic_dkv_mode='ordered' is supported only by the deterministic SM100 H128 D512 two-CTA backend",
         )
         # SM90 and SM100/SM103 provide conflict-rank dKV storage. Other SM100-family targets run 'records' as
         # 'shards'. Every selection and sizing call of the plan uses the resolved mode.
@@ -356,6 +371,9 @@ class SparseAttentionBackward(APIBase):
                 deterministic_relay_cluster_size=self.deterministic_relay_cluster_size,
                 dkv_mode=self._dkv_mode,
             )
+            # Reject a mode the selected backend does not run before any sizing call reads it.
+            mode_error = _iface_sm100.deterministic_dkv_mode_error(self._dkv_mode, self.deterministic, self._backend)
+            self._value_error_if(mode_error is not None, mode_error)
             self._wide_addressing = _iface_sm100._requires_wide_data_addressing(
                 total_s_q,
                 self.kv_desc.shape[0],
@@ -369,12 +387,10 @@ class SparseAttentionBackward(APIBase):
                 deterministic_relay_cluster_size=self.deterministic_relay_cluster_size,
                 dkv_mode=self._dkv_mode,
             )
-        if major == 10:
-            mode_error = _iface_sm100.deterministic_dkv_mode_error(self._dkv_mode, self.deterministic, self._backend)
-            self._value_error_if(mode_error is not None, mode_error)
-        if self.deterministic and self._backend == "generic_m64":
+        if self.deterministic and (self._backend == "generic_m64" or self._dkv_mode == "ordered"):
             # Resolve the shape-dependent policy during support checking so a
-            # relay-only DSL requirement fails before compilation. Ordinary
+            # relay-only DSL requirement, or an ordered plan whose codes cannot
+            # address the KV extent, fails before compilation. Ordinary
             # shard and tuned deterministic routes retain the 4.6.2 floor.
             _iface_sm100._get_sm100_kernel_class(
                 self._backend,
@@ -523,6 +539,7 @@ class SparseAttentionBackward(APIBase):
                     rank_wave=rank_wave,
                     rank_mode=rank_mode,
                     dkv_layout=dkv_layout,
+                    rank_ordered=getattr(kernel_cls, "rank_ordered", False),
                 )
             return
         if self._device_major == 10:

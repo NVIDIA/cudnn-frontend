@@ -184,15 +184,25 @@ def piece(result, samples, index):
     return selected
 
 
-def check_batch(samples, backward, indexer_topk=0, targets=None):
+def check_batch(samples, backward, indexer_topk=0, targets=None, *, dkv_mode="records"):
     for target in range(len(samples)) if targets is None else targets:
         # Isolate the target's loss because d_sink is shared across sequences.
-        expected = run(pack([samples[target]]), backward, indexer_topk)
+        expected = run(pack([samples[target]]), backward, indexer_topk, dkv_mode=dkv_mode)
         for order in (tuple(range(len(samples))), tuple(reversed(range(len(samples)))), (target, target)):
             selected = [samples[index] for index in order]
             position = order.index(target)
-            actual = run(pack(selected, gradient_target=position if backward else None), backward, indexer_topk)
+            actual = run(pack(selected, gradient_target=position if backward else None), backward, indexer_topk, dkv_mode=dkv_mode)
             assert_bitwise(piece(actual, selected, position), expected, f"batch {order}, sequence {target}")
+
+
+def batch_dkv_mode(backward, dtype, heads, dim):
+    """The dKV mode whose batch invariance a batch check exercises.
+
+    Backward batch invariance of the H128 D512 BF16 two-CTA plans is the contract of
+    ``deterministic_dkv_mode='ordered'`` (SM100/SM103); every other case checks the default mode.
+    """
+    ordered = backward and dtype == torch.bfloat16 and (heads, dim) == (128, 512)
+    return "ordered" if ordered and torch.cuda.get_device_capability() in CONFLICT_RANK_CAPABILITIES else "records"
 
 
 # Deterministic dKV storage of SM100/SM103 plans (``deterministic_dkv_mode``). Each layout lists heads, QK
@@ -211,6 +221,8 @@ DKV_LAYOUTS = {
     "shards-h64-d512-k64-bf16": (64, 512, 64, torch.bfloat16, (17, 300), (1000, 1000), "shards", "generic_m64/shards"),
     "rank-fused-h128-d512-k128-bf16": (128, 512, 128, torch.bfloat16, (40, 60), (8192, 16384), "records", "h128_2cta_m64/rank-fused"),
     "rank-setup-h128-d512-k1024-bf16": (128, 512, 1024, torch.bfloat16, (40, 60), (8192, 16384), "records", "h128_2cta_m64/rank-setup"),
+    "ordered-h128-d512-k128-bf16": (128, 512, 128, torch.bfloat16, (40, 60), (8192, 16384), "ordered", "h128_2cta_m64/ordered-fused"),
+    "ordered-h128-d512-k1024-bf16": (128, 512, 1024, torch.bfloat16, (40, 60), (8192, 16384), "ordered", "h128_2cta_m64/ordered-setup"),
     "rank-h128-d576-k128-bf16": (128, 576, 128, torch.bfloat16, (17, 60), (8192, 16384), "records", "h128_d576_2cta_m64/rank-1-round"),
     "rank-sorted-h128-d576-k1024-bf16": (128, 576, 1024, torch.bfloat16, (17, 60), (2200, 2201), "records", "h128_d576_2cta_m64/rank-1-round/sorted"),
 }
@@ -222,6 +234,7 @@ DKV_SELECTION_LAYOUTS = (
     "rank-fused-h128-d512-k128-bf16",
     "rank-setup-h128-d512-k1024-bf16",
     "rank-h128-d576-k128-bf16",
+    "ordered-h128-d512-k128-bf16",
 )
 DKV_REPLAY_CASES = (
     [pytest.param(layout, "full", id=f"{layout}-full-bprop") for layout in DKV_LAYOUTS]
@@ -234,7 +247,16 @@ DKV_REPLAY_CASES = (
 # a query's dQ terms by the batch's KV extent and the query's wave.
 BATCH_INVARIANT_RESULTS = ("out", "max_logits", "lse", "dq")
 GENERIC_BATCH_INVARIANT_RESULTS = BATCH_INVARIANT_RESULTS + ("d_sink",)
-BATCH_LAYOUTS = [layout for layout in DKV_LAYOUTS if not DKV_LAYOUTS[layout][7].endswith("/sorted")]
+BATCH_LAYOUTS = [layout for layout in DKV_LAYOUTS if not DKV_LAYOUTS[layout][7].endswith("/sorted") and DKV_LAYOUTS[layout][6] != "ordered"]
+# Ordered layouts keep every result of a sequence, dKV and dSink included, across batch changes; their batches
+# also change the plan's wave split (the packed batch spans two waves, either sequence alone one) and the KV
+# extent the records plans would size their dense planes from.
+ORDERED_BATCH_CASES = [
+    pytest.param(layout, selection, id=f"{layout}-{selection}-bprop")
+    for layout in DKV_LAYOUTS
+    if DKV_LAYOUTS[layout][6] == "ordered"
+    for selection in ("full", "ragged", "duplicates")
+]
 # Results that must not depend on the dKV storage (same inputs, two modes): records and chain plans reduce dSink
 # like the shard plans; chain plans gather a query's rows in sorted order, so their dQ is not compared.
 DKV_MODE_PAIRS = {
@@ -243,6 +265,7 @@ DKV_MODE_PAIRS = {
     "rank-vs-private-planes-h128-d512-k128-bf16": ("rank-fused-h128-d512-k128-bf16", "records", "shards", BATCH_INVARIANT_RESULTS),
     "rank-vs-private-planes-h128-d512-k1024-bf16": ("rank-setup-h128-d512-k1024-bf16", "records", "shards", BATCH_INVARIANT_RESULTS),
     "rank-vs-private-planes-h128-d576-k128-bf16": ("rank-h128-d576-k128-bf16", "records", "shards", BATCH_INVARIANT_RESULTS),
+    "ordered-vs-records-h128-d512-k128-bf16": ("ordered-h128-d512-k128-bf16", "ordered", "records", BATCH_INVARIANT_RESULTS),
 }
 
 
@@ -309,6 +332,8 @@ def dkv_route(inputs, dkv_mode):
         kernel = _interface_sm100._get_sm100_kernel_class(backend, True, total_q, kv.shape[0], dim, heads, None, max_topk=idx.shape[1], dkv_mode=plan._dkv_mode)
         if not getattr(kernel, "rank_shard", False):
             layout = "private-planes"
+        elif getattr(kernel, "rank_ordered", False):
+            layout = "ordered-fused" if getattr(kernel, "rank_fused", False) else "ordered-setup"
         elif getattr(kernel, "rank_fused", False):
             layout = "rank-fused"
         else:
@@ -329,9 +354,10 @@ class TestDSA:
 
     @pytest.mark.parametrize("backward,dtype,heads,dim,topk", layout_cases())
     def test_batch_invariance(self, backward, dtype, heads, dim, topk):
-        if backward and dtype == torch.bfloat16 and (heads, dim, topk) == (128, 512, 128):
+        mode = batch_dkv_mode(backward, dtype, heads, dim)
+        if backward and dtype == torch.bfloat16 and (heads, dim, topk) == (128, 512, 128) and mode != "ordered":
             pytest.skip("skip until fix: DSA H128 BF16 dKV changes with batch layout (PR #2266)")
-        check_batch(sequences(heads=heads, dim=dim, topk=topk, dtype=dtype), backward)
+        check_batch(sequences(heads=heads, dim=dim, topk=topk, dtype=dtype), backward, dkv_mode=mode)
 
     @pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
     @pytest.mark.parametrize("selection", ["ragged", "invalid", "empty", "tail65", "prefix512"])
@@ -349,11 +375,12 @@ class TestDSA:
         "heads,total", [(64, 128), (64, 129), (64, 257), (128, 74), (128, 75)], ids=["h64-q128", "h64-q129", "h64-q257", "h128-q74", "h128-q75"]
     )
     def test_query_boundary(self, backward, heads, total):
-        if backward and (heads, total) in ((64, 129), (64, 257), (128, 74), (128, 75)):
+        mode = batch_dkv_mode(backward, torch.bfloat16, heads, 512)
+        if backward and (heads, total) in ((64, 129), (64, 257), (128, 74), (128, 75)) and mode != "ordered":
             pytest.skip("skip until fix: DSA query boundary changes dKV across batches (PR #2266)")
         samples = sequences((17, total - 17), heads=heads, topk=128 if heads == 128 else 64)
-        assert_replays(lambda: run(pack(samples), backward), repeats=4, allowed_inf=ALLOWED_INF)
-        check_batch(samples, backward, targets=(0,))
+        assert_replays(lambda: run(pack(samples), backward, dkv_mode=mode), repeats=4, allowed_inf=ALLOWED_INF)
+        check_batch(samples, backward, targets=(0,), dkv_mode=mode)
 
     @pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
     def test_neighbor_isolation(self, backward):
@@ -388,15 +415,17 @@ class TestDSADeterministicDKV:
     that would stride their waves choose the wave order from the batch's indices, so a neighbor can change
     their results; the D576 cases here keep enough dense planes not to stride.
 
-    Batch invariance is partial. Moving, packing or duplicating a sequence checks the forward results and
-    dQ, and for the generic M64 kernel also dSink, while every batch keeps the plan's layout. The generic
-    plans reduce dSink with one warp per head, so a uniform shift of the queries only rotates its lanes;
-    records and chain plans give the shard plans' dSink bits. H128 two-CTA plans sum dSink in an order that
-    follows the query positions, as on develop. dKV is not batch invariant on any layout once a batch spans
-    several waves (develop's shard layouts change it too): a conflict-rank layout ranks a KV row's writers by
-    their wave position and sizes its dense planes from the batch's KV extent, the shard layouts take their
-    shard count from the batch's query extent and fold shards in groups, and the default mode picks the
-    layout from the batch's extents. dQ is not batch invariant for H128 D576 plans that sort Top-K rows
+    Batch invariance is partial except for ordered plans. Moving, packing or duplicating a sequence checks the
+    forward results and dQ, and for the generic M64 kernel also dSink, while every batch keeps the plan's
+    layout. The generic plans reduce dSink with one warp per head, so a uniform shift of the queries only
+    rotates its lanes; records and chain plans give the shard plans' dSink bits. H128 two-CTA records and
+    private-plane plans sum dSink in an order that follows the query positions. dKV is not batch invariant on
+    those layouts once a batch spans several waves: a conflict-rank layout ranks a KV row's writers by their
+    wave position and sizes its dense planes from the batch's KV extent, the shard layouts take their shard
+    count from the batch's query extent and fold shards in groups, and the default mode picks the layout from
+    the batch's extents. The ordered H128 D512 plans (``deterministic_dkv_mode='ordered'``) left-fold every dKV
+    row and dSink in query order, so every result of a sequence keeps its bytes across those batch changes
+    (``test_ordered_batch_invariance``). dQ is not batch invariant for H128 D576 plans that sort Top-K rows
     (Top-K 1024 and wider), which order a query's rows by ranges of the batch's KV extent and alternate the
     walk direction between waves. Two further dQ gaps are not exercised here: records plans add a query's
     dQ in two partials once the batch's KV extent selects split pairs, and chain plans order a query's
@@ -451,6 +480,28 @@ class TestDSADeterministicDKV:
                 assert dkv_route(batch, mode).split("/")[:2] == layout_name, f"batch {order} selects another layout"
                 result = piece(run(batch, True, dkv_mode=mode), selected, position)
                 assert_bitwise({name: result[name] for name in expected}, expected, f"batch {order}, sequence {target}")
+
+    @pytest.mark.parametrize("layout,selection", ORDERED_BATCH_CASES)
+    def test_ordered_batch_invariance(self, layout, selection):
+        """Every result of a sequence (dQ, dKV and dSink included) keeps its bytes when it moves, packs or duplicates.
+
+        Each sequence alone fits one wave; the packed batch spans two waves, splits the second sequence across
+        them in order (0, 1), and has the KV extent that records plans would size their dense planes from.
+        ``duplicates`` makes KV row 0 shared by every query of a wave (a long overflow chain) and selected
+        several times per query (per-slot records).
+        """
+        mode, route = DKV_LAYOUTS[layout][6:]
+        samples = layout_sequences(layout, selection)
+        for target in range(len(samples)):
+            alone = pack([samples[target]])
+            assert dkv_route(alone, mode) == route, f"sequence {target} alone selects another layout"
+            expected = run(alone, True, dkv_mode=mode)
+            for order in ((0, 1), (1, 0), (target, target)):
+                selected = [samples[index] for index in order]
+                position = order.index(target)
+                batch = pack(selected, gradient_target=position)
+                assert dkv_route(batch, mode) == route, f"batch {order} selects another layout"
+                assert_bitwise(piece(run(batch, True, dkv_mode=mode), selected, position), expected, f"batch {order}, sequence {target}")
 
     @pytest.mark.parametrize("pair", list(DKV_MODE_PAIRS), ids=[f"{pair}-bprop" for pair in DKV_MODE_PAIRS])
     def test_independent_of_dkv_storage(self, pair):

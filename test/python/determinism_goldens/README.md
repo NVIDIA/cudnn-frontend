@@ -5091,8 +5091,8 @@ Passing parameters, golden checks, and all FP8/MXFP8 cases remain active.
 | QSA | Sparse batch checks, both directions | 2 |
 | QSA | Dispatch boundary at total513, both directions | 2 |
 | QSA | Backward mask batch checks, all-selected and empty-rows | 2 |
-| DSA attention | H128/D512/Top-K128 BF16 backward batch check | 1 |
-| DSA attention | Backward query boundaries H64 Q129/Q257 and H128 Q74/Q75 | 4 |
+| DSA attention | H128/D512/Top-K128 BF16 backward batch check (SM107 only; SM100/SM103 run it with `deterministic_dkv_mode='ordered'`) | 1 |
+| DSA attention | Backward query boundaries H64 Q129/Q257; H128 Q74/Q75 on SM107 only (SM100/SM103 run them with `'ordered'`) | 4 |
 | DSA indexer | Dense H64 replay/batch checks, BF16 and FP32 dK | 4 |
 | DSA indexer | Sparse persistent rows, Top-K896/2048 | 2 |
 | DSA indexer | Dense backward neighbor isolation | 1 |
@@ -5127,6 +5127,61 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest QSA/cutedsl/test_qsa_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py -m L0 -q -rs
+```
+
+## SM100 DSA backward ordered dKV mode validation: 2026-11-23 (UTC)
+
+Change under test: `deterministic_dkv_mode='ordered'` for deterministic
+SM100/SM103 H128 D512 BF16 two-CTA DSA backward. On SM100/SM103 the H128 BF16
+batch case and the H128 Q74/Q75 query-boundary cases of `TestDSA` run under
+`'ordered'`, and their temporary skips apply on SM107 only; the H64 Q129/Q257
+query-boundary skips stay. `TestDSADeterministicDKV` adds two ordered layouts
+(Top-K 128 with fused wave tails, Top-K 1024 with a setup launch per wave) to
+the replay, neighbor-isolation, selection and storage-independence cases, and
+`test_ordered_batch_invariance` (six cases: each sequence alone against its
+slice of the packed, reversed and duplicated batches, comparing every result
+including dKV and dSink, on full, ragged and duplicate selections). Source:
+this change on `develop` `2b98a25dd`. Only the DSA suite was rerun.
+
+The two golden cases skip: this runtime has no recorded baseline and the run
+omitted `CUDNN_DETERMINISM_GOLDENS`. Ordered plans are not used by the golden
+cases, and no golden record changes.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| SM100 (cc 10.0, `NVIDIA Graphics Device`), 148 SMs | Torch `2.13.0+cu130`, CUDA `13.0`, driver API `13010`, cuDNN `92801`, CuTe DSL `4.8.1`, TVM FFI `0.1.13.post3`; key `a2e58ea888247771` | **110 passed, 0 failed, 4 skipped** in 234 s: the H64 Q129/Q257 query-boundary skips and the two goldens without a baseline |
+
+The 49 ordered and H128 cases (`-k "ordered or h128"`) passed in 10 of 10
+repeated runs. The DSA L0 suite (`deepseek_sparse_attention/ -m L0`) gave
+**1357 passed, 0 failed, 221 skipped**; the skips are device- or toolchain-gated
+(SM90, SM120, GB300/Rubin, no `nvcc` for Cake) or temporary indexer skips.
+
+Further checks on the same GPU:
+
+- Negative control: under `'records'`, the ordered batch cases fail at batch
+  (0, 1) on dKV for the full and duplicate selections (2 to 111 of 8388608
+  bytes differ); the ragged selections pass under both modes.
+- `'records'`, `'shards'` and `'chain'` give the same output bytes as
+  `develop` (SHA-256 of every output, 20 configurations: the rank-fused,
+  rank-setup, H64 records and H64 chain layouts under their own mode and
+  `'shards'`, full, ragged and duplicate selections).
+- Ordered plans with fused tails (Top-K 128 by default) and with a setup
+  launch per wave give the same output bytes on 18 batches (Top-K 128 and 512,
+  KV extents 2500 to 24576, full, ragged and duplicate selections, packed and
+  alone).
+- `compute-sanitizer` memcheck and synccheck report 0 errors on a two-wave
+  ordered Top-K 128 batch with duplicate and ragged selections. racecheck
+  reports no hazard in the backward kernels; it reports two hazards in the
+  unchanged forward kernel `SparseAttentionForwardSm100Head128SmallTopKPrefill`
+  under both modes.
+
+SM103 and SM107 were not run for this change.
+
+Run from `test/python`:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+  python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0 -q -rs
 ```
 
 ## SM100 H64 persistent sparse attention forward validation: 2026-11-18 (UTC)

@@ -196,6 +196,7 @@ def _get_sm100_kernel_class(
     rank_fused: Optional[bool] = None,
     rank_few_planes: Optional[bool] = None,
     dkv_mode: str = "records",
+    rank_ordered: Optional[bool] = None,
 ):
     """Load the selected implementation without perturbing other variants.
 
@@ -205,9 +206,12 @@ def _get_sm100_kernel_class(
     ``dkv_mode='shards'``. Conflict-rank plans then run each wave's tail in the
     next main kernel (fused) for narrow top-k with enough dense planes, or a
     setup launch per wave, with the few-plane variant when they keep at most
-    three dense planes. ``rank_shard``, ``rank_fused`` and ``rank_few_planes``
-    override these shape policies; ``None`` selects them from ``total_s_kv``,
-    ``max_topk`` and ``dkv_mode``.
+    three dense planes. ``dkv_mode='ordered'`` plans always use an ordered
+    conflict-rank class (one dense plane; fused tails up to
+    ``RANK_ORDERED_FUSED_MAX_TOPK``, a setup launch per wave above) and reject a KV
+    extent their destination codes cannot address. ``rank_shard``, ``rank_fused``,
+    ``rank_few_planes`` and ``rank_ordered`` override these shape policies;
+    ``None`` selects them from ``total_s_kv``, ``max_topk`` and ``dkv_mode``.
 
     Each variant lives in its own CuTe DSL class: embedding variant
     conditionals in a shared class measurably perturbs the code generation
@@ -230,10 +234,24 @@ def _get_sm100_kernel_class(
             FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShard,
             FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFewPlanes,
             FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFused,
+            FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFusedOrdered,
+            FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardOrdered,
         )
 
         if not deterministic:
             return FlashAttentionDSABackwardSm100H128TwoCTA
+        if rank_ordered is None:
+            rank_ordered = dkv_mode == "ordered"
+        if rank_ordered:
+            if total_s_kv is not None and not _h128_d512_rank_shard_selected(total_s_kv, max_topk, "ordered"):
+                raise ValueError(
+                    f"deterministic_dkv_mode='ordered' cannot address KV extent {total_s_kv} with top-k {max_topk}: its destination codes do not fit"
+                )
+            if rank_fused is None:
+                rank_fused = max_topk is not None and _h128_d512_rank_fused_selected(total_s_kv or 1, max_topk, "ordered")
+            if rank_fused:
+                return FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardFusedOrdered
+            return FlashAttentionDSABackwardSm100H128TwoCTADeterministicRankShardOrdered
         if rank_shard is None:
             rank_shard = total_s_kv is not None and _h128_d512_rank_shard_selected(total_s_kv, max_topk, dkv_mode)
         if not rank_shard:
@@ -424,6 +442,7 @@ def _compile_deterministic_sm100(
     rank_wave: int = 0,
     rank_mode: int = 0,
     dkv_layout: Optional[str] = None,
+    rank_ordered: bool = False,
 ):
     """Compile one device-owned, shape-dynamic artifact from plan metadata.
 
@@ -435,8 +454,8 @@ def _compile_deterministic_sm100(
     over the query count for given heads, head dimension, dtype, top-k width
     and KV extent (the interleave bit), and which class a plan uses depends on
     its query and KV extents. For the H128 D512 two-CTA backend, one
-    workspace plane selects conflict-rank storage, and ``rank_fused`` /
-    ``rank_few_planes`` pick its plan (``_get_sm100_kernel_class``). Those
+    workspace plane selects conflict-rank storage, and ``rank_ordered`` /
+    ``rank_fused`` / ``rank_few_planes`` pick its plan (``_get_sm100_kernel_class``). Those
     choices follow the plan's KV extent and top-k width, so plans whose KV
     extents select different layouts or plans compile different artifacts;
     within one choice the extents stay symbolic. Overrides must match the
@@ -459,6 +478,7 @@ def _compile_deterministic_sm100(
             rank_shard=backend == "h128_2cta_m64" and deterministic_shards == 1,
             rank_fused=rank_fused,
             rank_few_planes=rank_few_planes,
+            rank_ordered=rank_ordered,
         )
         if dkv_layout is not None and getattr(kernel_cls, "dkv_layout", "shards") != dkv_layout:
             raise ValueError(f"deterministic backend {backend!r} requires dKV layout {getattr(kernel_cls, 'dkv_layout', 'shards')!r}, got {dkv_layout!r}")
@@ -790,6 +810,7 @@ def flash_attn_bwd_sm100(
         selected_relay_cluster_size,
         getattr(kernel_cls, "rank_fused", False),
         getattr(kernel_cls, "rank_few_planes", False),
+        getattr(kernel_cls, "rank_ordered", False),
         selected_dkv_layout,
         device.index,
         pool_size,

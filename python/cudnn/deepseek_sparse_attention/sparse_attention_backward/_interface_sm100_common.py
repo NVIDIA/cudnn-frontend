@@ -29,17 +29,18 @@ _H128_D576_TWO_CTA_MAX_WAVE = 76
 def _h128_d512_rank_shard_selected(total_s_kv: int, max_topk: Optional[int], dkv_mode: str = "records") -> bool:
     """Return whether a deterministic H128 D512 two-CTA plan uses conflict-rank dKV storage.
 
-    ``dkv_mode`` is the plan's ``deterministic_dkv_mode``: ``'shards'`` plans keep the private-plane layout.
+    ``dkv_mode`` is the plan's ``deterministic_dkv_mode``: ``'shards'`` plans keep the private-plane layout,
+    and ``'ordered'`` plans use the one-plane ordered layout wherever its codes fit (they have no other).
     """
     if dkv_mode == "shards" or max_topk is None or total_s_kv <= 0:
         return False
     private_bytes = math.prod(FlashAttentionDSABackwardSm100Deterministic._get_workspace_size_dKV(total_s_kv, _H128_D512_TWO_CTA_RECORD, 1, cutlass.Float32))
-    return rank_merged_selected(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE, private_bytes)
+    return rank_merged_selected(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE, private_bytes, ordered=dkv_mode == "ordered")
 
 
-def _h128_d512_rank_fused_selected(total_s_kv: int, max_topk: int) -> bool:
+def _h128_d512_rank_fused_selected(total_s_kv: int, max_topk: int, dkv_mode: str = "records") -> bool:
     """Return whether a conflict-rank H128 D512 plan runs its wave tails inside the next main kernel."""
-    return rank_merged_fused(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE)
+    return rank_merged_fused(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE, ordered=dkv_mode == "ordered")
 
 
 def _h128_d512_rank_few_planes_selected(total_s_kv: int, max_topk: int) -> bool:
@@ -64,6 +65,8 @@ def _h128_d576_rank_shard_selected(total_s_kv: int, max_topk: Optional[int], dkv
 # the generic M64 kernel, and the H64 + H32 composition that deterministic H96 D576 keeps where neither
 # conflict-rank layout applies to the shape.
 _CHAIN_MODE_BACKENDS = ("generic_m64", "h96_h64_h32")
+# Backends that run a ``deterministic_dkv_mode="ordered"`` plan.
+_ORDERED_MODE_BACKENDS = ("h128_2cta_m64",)
 
 
 def deterministic_dkv_mode_error(
@@ -72,22 +75,29 @@ def deterministic_dkv_mode_error(
     """Return why a plan cannot honor ``deterministic_dkv_mode``, or ``None``.
 
     The option selects the dKV storage of deterministic SM100 generic M64 and H128 two-CTA plans. Unknown
-    values are rejected, every value but the default needs ``deterministic=True``, and ``'chain'`` is
-    rejected on a backend that never runs the generic M64 kernel (the SM90 and two-CTA backends) rather
-    than ignored, and on a ``device_capability`` without conflict-rank storage (``None``: not checked).
+    values are rejected, every value but the default needs ``deterministic=True``, and ``'chain'`` and
+    ``'ordered'`` are rejected on a ``device_capability`` without conflict-rank storage (``None``: not
+    checked) and on a backend that does not run them rather than ignored: ``'chain'`` runs only where the
+    generic M64 kernel can (not on the SM90 and two-CTA backends), ``'ordered'`` only on the H128 D512
+    two-CTA backend (BF16, contiguous inputs, top-k 128/512/1024/1152/2048).
     """
     if not isinstance(dkv_mode, str) or dkv_mode not in DETERMINISTIC_DKV_MODES:
         return f"deterministic_dkv_mode must be one of {DETERMINISTIC_DKV_MODES}, got {dkv_mode!r}"
     if dkv_mode != "records" and not deterministic:
         return f"deterministic_dkv_mode={dkv_mode!r} requires deterministic=True"
-    if dkv_mode == "chain" and device_capability is not None and tuple(device_capability) not in _CONFLICT_RANK_CAPABILITIES:
+    if dkv_mode in ("chain", "ordered") and device_capability is not None and tuple(device_capability) not in _CONFLICT_RANK_CAPABILITIES:
         major, minor = device_capability
         return (
-            "deterministic_dkv_mode='chain' requires conflict-rank dKV storage, which deterministic SM100 DSA backward "
+            f"deterministic_dkv_mode={dkv_mode!r} requires conflict-rank dKV storage, which deterministic SM100 DSA backward "
             f"provides only on compute capability 10.0 and 10.3 (SM100/SM103); found compute capability {major}.{minor}"
         )
     if dkv_mode == "chain" and backend is not None and backend not in _CHAIN_MODE_BACKENDS:
         return "deterministic_dkv_mode='chain' is supported only by the deterministic SM100 generic_m64 backend"
+    if dkv_mode == "ordered" and backend is not None and backend not in _ORDERED_MODE_BACKENDS:
+        return (
+            "deterministic_dkv_mode='ordered' is supported only by the deterministic SM100 H128 D512 two-CTA backend "
+            f"(BF16, contiguous inputs, top-k 128/512/1024/1152/2048); this plan selected {backend!r}"
+        )
     return None
 
 
@@ -155,7 +165,7 @@ def _workspace_shapes_sm100(
         and head_dim == _H128_D512_TWO_CTA_RECORD
         and _h128_d512_rank_shard_selected(total_s_kv, max_topk, dkv_mode)
     ):
-        words = rank_merged_workspace_words(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE)
+        words = rank_merged_workspace_words(total_s_kv, max_topk, _H128_D512_TWO_CTA_RECORD, _H128_D512_TWO_CTA_WAVE, ordered=dkv_mode == "ordered")
         rows = -(-words // _H128_D512_TWO_CTA_RECORD)
         return workspace_lse_odo_shape, (1, 1, rows, _H128_D512_TWO_CTA_RECORD * (acc_dtype.width // 8))
     if deterministic and backend == "h128_d576_2cta_m64" and num_heads == 128 and _h128_d576_rank_shard_selected(total_s_kv, max_topk, dkv_mode):

@@ -1054,8 +1054,9 @@ def _chain_dkv_selected(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int
 
 # Values of the plan option ``deterministic_dkv_mode`` (``deterministic_dkv_mode_error`` in
 # ``_interface_sm100_common`` checks them against the plan): conflict-rank records (default), the
-# chain relay, or the shard and cluster-relay layouts selected without regard to the top-k width.
-DETERMINISTIC_DKV_MODES = ("records", "chain", "shards")
+# chain relay, the shard and cluster-relay layouts selected without regard to the top-k width, or the
+# batch-invariant ordered fold, which only the H128 D512 two-CTA backend runs (never this kernel).
+DETERMINISTIC_DKV_MODES = ("records", "chain", "shards", "ordered")
 
 
 def _check_dkv_mode(dkv_mode) -> None:
@@ -1080,7 +1081,7 @@ def rank_dkv_route(
     holds and otherwise follows the ``'records'`` rule: records where ``_records_dkv_selected`` holds.
     """
     _check_dkv_mode(dkv_mode)
-    if dkv_mode == "shards" or deterministic_relay_cluster_size is not None or max_topk is None:
+    if dkv_mode in ("shards", "ordered") or deterministic_relay_cluster_size is not None or max_topk is None:
         return None
     if dkv_mode == "chain" and _chain_dkv_selected(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, max_topk):
         return "chain"
@@ -1128,8 +1129,11 @@ def deterministic_kernel_class(
     Otherwise, and always for ``dkv_mode="shards"``, the shard or relay class is selected exactly
     as without the option. An explicit relay request selects the requested relay in the
     ``'records'`` and ``'shards'`` modes and is an error together with ``dkv_mode="chain"``.
+    ``dkv_mode="ordered"`` has no generic M64 specialization and is an error.
     """
     _check_dkv_mode(dkv_mode)
+    if dkv_mode == "ordered":
+        raise ValueError("deterministic_dkv_mode='ordered' is supported only by the deterministic SM100 H128 D512 two-CTA backend")
     if total_seqlen_kv is not None or head_dim is not None:
         if total_seqlen_kv is None or head_dim is None:
             raise ValueError("total_seqlen_kv and head_dim must be provided together")
