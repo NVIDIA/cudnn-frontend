@@ -332,7 +332,7 @@ class FrostFeVerifyRunner:
 
     The entry takes the block's verify operands by name, the caller's ``out`` / ``out_bf16`` among them (its own bf16 scratch when the
     caller asks for none); its reader tickets (``counts``) return to zero after every launch, so a captured launch replays.  The entry's
-    buffers for this step shape are allocated at construction (outside CUDA-graph capture)."""
+    default output buffers are allocated at construction. Captured launches use graph-private reader tickets."""
 
     def __init__(self, spec):
         self.spec = spec

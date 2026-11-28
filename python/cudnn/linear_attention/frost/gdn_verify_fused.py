@@ -57,6 +57,7 @@ from typing import Any, Dict, Optional, Tuple
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
+from .gdn_tickets import ReaderTickets
 from .kernel.gdn_geometry import DEFAULT_GEOMETRY, Geometry
 from .kernel.gdn_verify_fused_config import (
     CFG,
@@ -511,6 +512,7 @@ class GdnVerifyFused:
         # shared-memory bound), a plan-time fact that ``__call__`` would otherwise recompute on every launch
         self.picks: Dict[tuple, Cfg] = {}
         self.compiled: Dict[tuple, Any] = {}
+        self.reader_tickets = ReaderTickets()
         self.buffers: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
     def _on_this_part(self, cfg: Cfg) -> Cfg:
@@ -606,12 +608,12 @@ class GdnVerifyFused:
         return self.cfg.DEBUG
 
     def outputs(self, requests: int, tokens: int):
-        """The entry-owned buffers of a step shape at the entry's geometry (V V heads, QKV channels): ``qout`` fp8 [rows, V, 128] and
-        ``out`` bf16 (the defaults when the caller passes no ``out`` / ``out_bf16``), ``counts`` int32 [requests * 512] (the conv-history
-        reader tickets, zero between launches) and, under ``DEBUG`` only, the debug buffers ``raw`` [rows, V, 128] bf16, ``convout`` [rows,
-        QKV] bf16, ``baout`` [rows, 2 V] bf16 -- without ``DEBUG`` the kernel's debug slots are compiled out (``None``), never bound to an
-        allocation.  Entry-owned scratch, allocated once per step shape at the first compile / call for it (outside any capture; a
-        FlashInfer runner has no workspace contract to carve it from)."""
+        """Borrowed output buffers for this shape. With R = requests * tokens, the defaults are ``qout`` [R, V, 128] fp8 and
+        ``out`` [R, V, 128] bf16. Debug mode adds ``raw`` [R, V, 128], ``convout`` [R, QKV] and ``baout`` [R, 2 V], all bf16.
+        These buffers are overwritten by later calls. Order accesses when using the same borrowed output or debug buffer.
+
+        ``counts`` [requests * 512] int32 contains the reader tickets from first binding. Each eager stream and each stream inside
+        a graph capture uses its own zero-ending tickets. A capture records their initialization on first use for that size and stream."""
         shape = (requests, tokens)
         if shape not in self.buffers:
             import torch
@@ -622,7 +624,7 @@ class GdnVerifyFused:
             buffers = dict(
                 qout=torch.empty(rows, g.V_HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device=dev),
                 out=torch.empty(rows, g.V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
-                counts=torch.zeros(requests * TICKET_STRIDE, dtype=torch.int32, device=dev),
+                counts=self.reader_tickets.get(requests * TICKET_STRIDE, dev),
             )
             if self.debug:
                 buffers.update(
@@ -695,7 +697,7 @@ class GdnVerifyFused:
             _flat(num_accepted_tokens),
             _flat(norm_weight),
             _flat(out_scale),
-            _flat(b["counts"]),
+            _flat(self.reader_tickets.get(requests * TICKET_STRIDE, self.device)),
             _flat(outb),
             _flat(qout.view(torch.uint8)),
             _flat(conv_state),

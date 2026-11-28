@@ -1589,6 +1589,49 @@ def test_padding_and_skipped_slots_touch_nothing_else(form):
     assert not bufs["counts"].any()
 
 
+@pytest.mark.parametrize("mode", ["decode", "verify"])
+def test_independent_eager_streams_and_graphs_bind_private_reader_tickets(monkeypatch, mode):
+    """Inspect the counter passed to the actual kernel, independently of whether CTAs happened to overlap."""
+    from linear_attention.frost import test_gdn_decode_fused as dec
+
+    dev = _device_or_skip()
+    if mode == "decode":
+        module = dec.entry
+        step = module.GdnDecodeFused(dev, 1e-6)
+        inputs = dec.make_operands(2, dev)
+        run = dec._run
+    else:
+        module = entry
+        step = module.GdnVerifyFused(dev, 1e-6)
+        inputs = make_operands(2, 4, dev)
+        run = _run
+    run(step, inputs)
+    torch.cuda.synchronize()
+    pointers = []
+    flatten = module._flat
+
+    def record(t):
+        if t.dtype == torch.int32 and t.numel() == 2 * kcfg.TICKET_STRIDE:
+            pointers.append(t.data_ptr())
+        return flatten(t)
+
+    monkeypatch.setattr(module, "_flat", record)
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            run(step, inputs)
+            run(step, inputs)
+        stream.synchronize()  # the two calls update the same input pools in this binding test
+    graphs = [torch.cuda.CUDAGraph() for _ in range(2)]
+    for graph in graphs:
+        with torch.cuda.graph(graph, stream=streams[0]):
+            run(step, inputs)
+            run(step, inputs)
+    assert len(pointers) == 8
+    assert pointers[::2] == pointers[1::2]
+    assert len(set(pointers[::2])) == 4
+
+
 def test_deterministic_and_graph_replay_over_distinct_layers_matches_eager():
     dev = _device_or_skip()
     k = entry.GdnVerifyFused(dev, 1e-6)
