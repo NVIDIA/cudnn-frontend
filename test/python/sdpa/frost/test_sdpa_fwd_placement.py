@@ -1748,7 +1748,43 @@ def test_sm107_paged_unpacked_short_q_keys_apart(monkeypatch):
     assert pt.class_key(spec.name, f(s_q=q + 1, max_total_seq_len_q=8 * (q + 1)))[4] == "prefill"
     assert pt.class_key(spec.name, f(h_q=32, h_kv=8))[4] == "prefill"  # the row packs group 4
     assert pt.class_key(spec.name, f(window_left=128))[4] == "prefill"
-    assert pt.class_key("sdpa_fwd_prefill_sm100", f(device_cc=(10, 0), device_sm_count=148))[4] == "prefill"  # Rubin's row only
+    assert pt.class_key("sdpa_fwd_prefill_sm100", f(device_cc=(10, 0), device_sm_count=148))[4] == "prefill"  # past one wave there
+
+
+@pytest.mark.L0
+def test_sm100_paged_unpacked_short_q_keys_apart():
+    """Study sm100_paged_unpacked_short_q_20261128: cc 10.0 paged THD d128 prefill whose plan runs unpacked and unsplit keys
+    `prefill_short_q` up to SM100_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head, and at most SM100_PAGED_UNPACKED_WAVE_MAX_S_Q only
+    while its 2-CTA clusters fit one wave; the keyed graphs lead. One query past the bound, packed groups, windows and cc 10.3 keep
+    their classes."""
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    q, wq, sms, kv = pt.SM100_PAGED_UNPACKED_SHORT_MAX_S_Q, pt.SM100_PAGED_UNPACKED_WAVE_MAX_S_Q, 148, 8192
+    base = dict(b=8, h_q=24, h_kv=8, s_q=q, s_kv=kv, max_total_seq_len_q=8 * q, device_cc=(10, 0), device_sm_count=sms)
+    f = lambda **over: _sm107_paged_facts(**{**base, **over})
+    study = "sm100_paged_unpacked_short_q_20261128"
+    for h_q, h_kv in ((24, 8), (40, 8), (48, 8), (28, 4), (32, 16), (32, 32)):  # groups 3, 5, 6, 7, 2 and MHA run unpacked
+        for s_kv in (kv, kv - 127):  # on and off the KV tile
+            for s_q in (wq + 1, q):
+                x = f(h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=8 * s_q)
+                assert pt.class_key(spec.name, x)[4] == "prefill_short_q", (h_q, s_kv, s_q)
+                assert pt.matched_entry(spec.name, x).study == study
+                assert heuristics._knob_sets(spec, x)[0].cga == pt.PAGED_UNPACKED_CLUSTER_CTAS
+                assert placement.place(spec, x) == placement.LEAD
+    for h_q, h_kv in ((24, 8), (40, 8)):  # at most SM100_PAGED_UNPACKED_WAVE_MAX_S_Q: keyed and leading within one wave only
+        for b in range(1, 9):
+            x = f(b=b, h_q=h_q, h_kv=h_kv, s_q=48, max_total_seq_len_q=b * 48)
+            one_wave = pt.PAGED_UNPACKED_CLUSTER_CTAS * b * h_q <= sms
+            assert pt.class_key(spec.name, x)[4] == ("prefill_short_q" if one_wave else "prefill"), (h_q, b)
+            if one_wave:
+                assert pt.matched_entry(spec.name, x).study == study and placement.place(spec, x) == placement.LEAD
+    assert pt.class_key(spec.name, f(s_q=q + 1, max_total_seq_len_q=8 * (q + 1)))[4] == "prefill"
+    assert pt.class_key(spec.name, f(h_q=32, h_kv=8))[4] == "prefill"  # the row packs group 4
+    assert pt.class_key(spec.name, f(window_left=128))[4] == "prefill"
+    assert pt.class_key(spec.name, f(device_cc=(10, 3)))[4] == "prefill"  # measured on cc 10.0 only
 
 
 @pytest.mark.L0

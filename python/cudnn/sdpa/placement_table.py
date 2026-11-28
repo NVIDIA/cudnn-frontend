@@ -784,6 +784,21 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill_short_q", "paged", "causal_br", False, "gqa_split", True): Entry(
         "always", None, "sm100_paged_d64_d256_prefill_20261111"
     ),
+    # study sm100_paged_unpacked_short_q_20261128 (B200 1000 W, cuDNN 9.24.0.43; the inference harness's paged context graph, bf16
+    # THD causal d128 that the row runs unpacked and unsplit: MHA and groups 2 / 3 / 5 / 6 / 7, S_q 16-192, b 1-64, 2049-131072 keys,
+    # pages 16 / 64; 360 train cells plus a 200-cell probe, 188 keyed `prefill_short_q`).
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm100_paged_unpacked_short_q_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", True): Entry(
+        "le", 38.306, "sm100_paged_unpacked_short_q_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm100_paged_unpacked_short_q_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm100_paged_unpacked_short_q_20261128"
+    ),
     # study sm100_d576_dense_decode_rt924_20261030: study sm100_d576_dense_decode_20261030's grid (dense K/V, h_q 8-128, b 1-128,
     # S_kv 4k-128k; off the tile KV cannot split, so the unsplit tile follows b * h_q) with the backend re-timed on a full-power B200
     # at cuDNN 9.24.0.43, its split-KV reduction counted; FROST times from the original study; fresh 24-cell holdout at develop
