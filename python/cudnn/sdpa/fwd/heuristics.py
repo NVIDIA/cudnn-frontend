@@ -3762,6 +3762,17 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         unique.insert(
             0, replace(base, cga=1, pack_gqa=nonpaged_packed, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT)
         )
+    if caps.sm_lo == 90 and facts.has_bias:
+        # The SM90 bias leg is unsplit and unpacked (mismatch's SM90 bias block): drop the split and packed sets it would
+        # refuse and keep one unsplit, unpacked set, or a graph whose every set splits or packs (short-Q GQA over a long
+        # KV) is left with no candidate in this mode.
+        sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=scheds[0], pack_gqa=False)
+        plain = SdpaFwdKnobs(
+            sched_policy=sched_policy, tile_m=tiles[0][0], tile_n=_resident_arm_tile_n(spec, facts, tiles[0][1]), cga=cga, pack_gqa=False, split_kv=1
+        )
+        unique = [knobs for knobs in unique if (knobs.split_kv or 1) == 1 and knobs.pack_gqa is not True]
+        if plain not in unique:
+            unique.append(plain)
     # SM90 at exact (128, 128): the dedicated D128 template's 128 x 128 set first, where it serves the graph, then the
     # D512 body's 64 x 64 sets above.
     lead = _sm90_d128_knob_sets(spec, facts)

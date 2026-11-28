@@ -1157,9 +1157,10 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
             return "SM120 paged KV requires FP16/BF16 dense Q with head dims through 256 or D512/D576-V512 wide envelopes, divisible by 8"
     if facts.has_bias and capabilities.sm_lo == 120 and facts.shape_overrides:
         return "SM120 additive bias does not support execute-time shape/stride overrides"
-    if facts.has_bias and capabilities.bias_d_shapes is None and capabilities.sm_lo != 120:
-        # The resident-block rows bind the bias through the prepared binder (bind_dense validates its runtime geometry);
-        # the SM80 row's bias travels through its own adapter and stays off the prepared path.
+    if facts.has_bias and capabilities.bias_d_shapes is None and capabilities.sm_lo not in (90, 120):
+        # The resident-block rows, the SM90 D512 body and the SM120 rows bind the bias through the prepared binder
+        # (bind_dense validates its runtime geometry; SM90 refuses overrides above); the SM80 row's bias travels through
+        # its own adapter and stays off the prepared path.
         return "prepared overrides cannot use bias"
     if facts.thd:
         if facts.has_epilogue_gate:
@@ -2060,6 +2061,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             bottom_right=facts.causal and facts.bottom_right,
             s_q=facts.s_q,
             s_kv=facts.s_kv,
+            bias=facts.has_bias,
         )
         if why is not None:
             return why
@@ -3002,6 +3004,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         elem = 4 if facts.bias_t.get_data_type() == cudnn.data_type.FLOAT else 2
         if len(strides) != 4 or strides[3] != 1 or any(n > 1 and (st * elem) % 16 for n, st in zip(dims[:3], strides[:3])):
             return "SM120 bias requires contiguous keys and 16-byte aligned outer pitches"
+
+    if facts.has_bias and capabilities.sm_lo == 90:
+        # The SM90 bias legs (config_sm90.TemplateParams.has_bias) of the D512 body and the D128 template: dense,
+        # nonpaged, unsplit and unpacked. The row's own dense_flex checks already cover Q/K/V/O.
+        if facts.thd or facts.has_paged_kv:
+            return "SM90 additive bias requires dense, nonpaged Q/K/V"
+        if knobs is not None and ((knobs.split_kv or 1) > 1 or knobs.pack_gqa):
+            return "SM90 additive bias is unsplit and unpacked"
+        dims, strides = facts.bias_dim, facts.bias_stride
+        elem = 4 if facts.bias_t.get_data_type() == cudnn.data_type.FLOAT else 2
+        if len(strides) != 4 or strides[3] != 1 or any(n > 1 and (st * elem) % 16 for n, st in zip(dims[:3], strides[:3])):
+            return "SM90 bias requires contiguous keys and 16-byte aligned outer pitches"
+        if elem == 4 and max(facts.d_qk, facts.d_v) > 256:
+            return "SM90 bias above 256 head columns must be in the Q/K/V dtype: an FP32 bias tile does not fit beside the D512 storage"
 
     if facts.has_bias and capabilities.sm_lo == 80:
         # prepared_sm80.build_spec binds one compact (1, H_q, S_q, S_kv) plane (#2598).
@@ -6016,6 +6032,9 @@ def _sm90_spec() -> EngineSpec:
             pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256), (D_TILE, D_TILE)}),
             pack_gqa_d_shapes=frozenset({(128, 128), (256, 256), (D_TILE, D_TILE)}),
             softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
+            # Additive bias: mismatch's SM90 bias block keeps it dense, nonpaged, unsplit and unpacked; the D64 row
+            # below clears it and the D128 row keeps it in the Q/K/V dtype.
+            bias=True,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM90),
     )
@@ -6057,6 +6076,9 @@ def _sm90_specs():
                 padded=False,
                 paged_kv=False,
                 sink=False,
+                # The dedicated D128 body stages a bias tile in the Q/K/V dtype only; an FP32 bias keeps engine 20540.
+                bias=owner is _sm90_d128_owner,
+                bias_io_dtype_only=owner is _sm90_d128_owner,
                 decode=owner is _sm90_d64_owner,
                 band=None,
                 declaration_check=owner.declaration_mismatch,

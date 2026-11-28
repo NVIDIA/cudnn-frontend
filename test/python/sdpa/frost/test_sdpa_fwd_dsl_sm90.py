@@ -479,13 +479,16 @@ def _spy_template_loads(monkeypatch, *, load=False):
     return loads
 
 
-def _api_at(d, h_q=8, h_kv=8, s=96, b=2, stats=False, **kw):
-    """A dense SM90 adapter at head dims ``d`` (an int for D_QK == D_V, else a pair), optionally with Stats."""
+def _api_at(d, h_q=8, h_kv=8, s=96, b=2, stats=False, bias=None, **kw):
+    """A dense SM90 adapter at head dims ``d`` (an int for D_QK == D_V, else a pair), optionally with Stats and an
+    additive bias (``bias``: None, ``"io"`` for one in the Q/K/V dtype or ``"fp32"``)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
     d_qk, d_v = (d, d) if isinstance(d, int) else d
     q, k, v, o = (_bhsd(b, h, s, dim, torch.float16) for h, dim in ((h_q, d_qk), (h_kv, d_qk), (h_kv, d_v), (h_q, d_v)))
     lse = torch.empty(b, h_q, s, dtype=torch.float32, device="cuda") if stats else None
+    if bias is not None:
+        kw["sample_bias"] = torch.zeros(b, h_q, s, s, dtype=torch.float32 if bias == "fp32" else torch.float16, device="cuda")
     return SdpaFwdDslSm90(q, k, v, o, sample_lse=lse, **kw)
 
 
@@ -500,6 +503,7 @@ _FLAVOR_CASES = [
     pytest.param(128, dict(scale_softmax=-0.5), _D128_FILE, id="d128-negative_scale"),
     pytest.param(128, dict(sched_policy=SCHED_LPT_L2), _D128_FILE, id="d128-lpt_l2"),
     pytest.param(128, dict(tile_m=128, tile_n=128), _D128_FILE, id="d128-own_tile"),
+    pytest.param(128, dict(bias="io", is_causal=True), _D128_FILE, id="d128-io_bias"),
     # Vacuous bounds name no feature: a left bound at or beyond S_q + S_kv masks nothing.
     pytest.param(128, dict(is_causal=True, window_size_left=10**6), _D128_FILE, id="d128-vacuous_window"),
     # What D128 does not serve (config_sm90.D128_NOT_SERVED), each staying on D512.
@@ -510,6 +514,7 @@ _FLAVOR_CASES = [
     pytest.param(128, dict(b=1, thd=True), _D512_FILE, id="d128-thd"),
     pytest.param(128, dict(pack_gqa=True), _D512_FILE, id="d128-pack_gqa"),
     pytest.param(128, dict(split_kv=2), _D512_FILE, id="d128-split"),
+    pytest.param(128, dict(bias="fp32"), _D512_FILE, id="d128-fp32_bias"),
     # A pinned tile names its flavor: the D512 body's 64/64 keeps a (128, 128) declaration on D512.
     pytest.param(128, dict(tile_m=64, tile_n=64), _D512_FILE, id="d128-d512_tile"),
     # Other head dims never take D128.
@@ -546,6 +551,8 @@ def test_sm90_adapter_tile_and_pack_gqa_messages_name_the_chosen_flavor(monkeypa
         _api_at(128, tile_m=128, tile_n=128, has_sink=True).check_support()
     with pytest.raises(NotImplementedError, match="does not serve split-KV$"):
         _api_at(128, tile_m=128, tile_n=128, split_kv=2).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve an FP32 additive bias$"):
+        _api_at(128, tile_m=128, tile_n=128, bias="fp32").check_support()
     with pytest.raises(NotImplementedError, match="does not support tiles other than 64/64$"):
         _api_at(128, tile_m=128, tile_n=64).check_support()
     with pytest.raises(NotImplementedError, match="SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64$"):

@@ -97,4 +97,5 @@ def declaration_mismatch(facts):
         bottom_right=facts.causal and facts.bottom_right,
         s_q=facts.s_q,
         s_kv=facts.s_kv,
+        bias=facts.has_bias,
     )
