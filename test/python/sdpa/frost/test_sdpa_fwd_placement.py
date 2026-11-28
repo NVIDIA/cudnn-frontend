@@ -1728,7 +1728,7 @@ def test_sm107_paged_unpacked_short_q_keys_apart(monkeypatch):
         for s_kv in (kv, kv - 127):  # on and off the KV tile
             assert pt.class_key(spec.name, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv))[4] == "prefill_short_q"
             assert pt.matched_entry(spec.name, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv)).study == study
-            assert heuristics._knob_sets(spec, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv))[0].cga == pt.SM107_PAGED_UNPACKED_CLUSTER_CTAS
+            assert heuristics._knob_sets(spec, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv))[0].cga == pt.PAGED_UNPACKED_CLUSTER_CTAS
     # S_q 48 stays off the split chooser over any cache, so the launch sweeps reach b 1
     sweeps = [(24, 8, s_kv, "prefill_short_q") for s_kv in (kv, kv - 127)] + [(32, 32, s_kv, "prefill_short_q") for s_kv in (kv, kv - 127)]
     sweeps += [(24, 8, s_kv, "prefill_short_q_long_kv") for s_kv in (kv + 1, 8 * kv, 8 * kv + 1)]
@@ -1739,7 +1739,7 @@ def test_sm107_paged_unpacked_short_q_keys_apart(monkeypatch):
         assert verdicts[0] == placement.LEAD and verdicts[-1] == placement.TRAIL, (h_q, s_kv)
         assert verdicts == sorted(verdicts, key=lambda v: v == placement.TRAIL), (h_q, s_kv)  # once trailing, a larger launch trails
     for s_kv in (8 * kv, 8 * kv + 1):  # MHA over a long cache: one wave of clusters keys apart and leads; past it keeps its class
-        b = sms // (pt.SM107_PAGED_UNPACKED_CLUSTER_CTAS * 26)
+        b = sms // (pt.PAGED_UNPACKED_CLUSTER_CTAS * 26)
         one_wave = f(b=b, s_q=48, h_q=26, h_kv=26, s_kv=s_kv, max_total_seq_len_q=b * 48)
         assert pt.class_key(spec.name, one_wave)[4] == "prefill_short_q_long_kv" and pt.matched_entry(spec.name, one_wave).study == study
         assert placement.place(spec, one_wave) == placement.LEAD

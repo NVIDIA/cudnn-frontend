@@ -325,18 +325,27 @@ def _sm100_dense_split(row: str, facts) -> bool:
 SM107_PAGED_CGA_TILE_S_Q = (128, 256)  # Rubin paged THD d128 unpacked prefill keyed `prefill_cga_tile` for lo < S_q <= hi
 SM107_PAGED_UNPACKED_SHORT_MAX_S_Q = 64  # ... `prefill_short_q` up to this S_q
 SM107_PAGED_UNPACKED_SHORT_MAX_KV = 8192  # ... over a cache of at most this many keys, `prefill_short_q_long_kv` past it
-SM107_PAGED_UNPACKED_CLUSTER_CTAS = 2  # the unpacked plan runs each sequence's head in one 2-CTA cluster (TILE_CGA_M)
+SM100_PAGED_UNPACKED_SHORT_MAX_S_Q = 128  # B200 paged THD d128 unpacked prefill keyed `prefill_short_q` up to this S_q
+SM100_PAGED_UNPACKED_WAVE_MAX_S_Q = 64  # ... and up to this S_q only while its clusters fit one wave
+PAGED_UNPACKED_CLUSTER_CTAS = 2  # the unpacked plan runs each sequence's head in one 2-CTA cluster (TILE_CGA_M)
 
 
-def _sm107_paged_unpacked_band(row: str, facts) -> Optional[str]:
-    """Rubin paged THD d128 causal prefill whose plan runs unpacked (MHA and the groups the row does not pack) and unsplit, keyed by
-    query length where FROST's standing against the backend moves with the query rows unlike the rest of the class: up to
-    SM107_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head over at most SM107_PAGED_UNPACKED_SHORT_MAX_KV keys (`prefill_short_q`) or more
-    (`prefill_short_q_long_kv`, where FROST holds out to more rows; study rubin_paged_unpacked_bands_20261128), and past one 128-row tile
-    but inside one 2-CTA Q tile (`prefill_cga_tile`; study rubin_paged_unpacked_prefill_20261127). MHA over a long cache keys apart only
-    while its clusters fit one wave: past it FROST against the backend swings with the wave count, ordered by no single feature. Read
-    from the row's own pack and split decisions."""
-    if row != "sdpa_fwd_prefill_sm107" or not (facts.has_paged_kv and facts.thd) or (facts.d_qk, facts.d_v) != (128, 128):
+def _paged_unpacked_band(row: str, facts) -> Optional[str]:
+    """Blackwell / Rubin paged THD d128 causal prefill whose plan runs unpacked (MHA and the groups the row does not pack) and unsplit,
+    keyed by query length where FROST's standing against the backend moves unlike the rest of the class. Read from the row's own pack
+    and split decisions.
+
+    Rubin: up to SM107_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head over at most SM107_PAGED_UNPACKED_SHORT_MAX_KV keys
+    (`prefill_short_q`) or more (`prefill_short_q_long_kv`, where FROST holds out to more rows; study rubin_paged_unpacked_bands_20261128),
+    and past one 128-row tile but inside one 2-CTA Q tile (`prefill_cga_tile`; study rubin_paged_unpacked_prefill_20261127). MHA over a
+    long cache keys apart only while its clusters fit one wave: past it FROST against the backend swings with the wave count, ordered by
+    no single feature.
+
+    cc 10.0: up to SM100_PAGED_UNPACKED_SHORT_MAX_S_Q, the S_q the backend runs its short-row engine to (`prefill_short_q`; study
+    sm100_paged_unpacked_short_q_20261128). At most SM100_PAGED_UNPACKED_WAVE_MAX_S_Q it keys only while the clusters fit one wave:
+    past it FROST loses at every launch size, with nothing for a threshold to order."""
+    sm100 = row == "sdpa_fwd_prefill_sm100" and tuple(facts.device_cc or ()) == (10, 0)
+    if not (row == "sdpa_fwd_prefill_sm107" or sm100) or not (facts.has_paged_kv and facts.thd) or (facts.d_qk, facts.d_v) != (128, 128):
         return None
     if not (facts.causal and facts.bottom_right) or facts.window_left is not None or facts.has_sink or facts.right_band_widening:
         return None
@@ -345,11 +354,15 @@ def _sm107_paged_unpacked_band(row: str, facts) -> Optional[str]:
     caps = heuristics.sm100_legacy_policy_spec(row).capabilities
     if heuristics._prefer_thd_pack_gqa(caps, facts) or heuristics.paged_thd_split_choice(caps, facts)[0] != 1:
         return None
+    one_wave = PAGED_UNPACKED_CLUSTER_CTAS * facts.b * facts.h_q <= (facts.device_sm_count or 0)
+    if sm100:
+        if facts.s_q <= SM100_PAGED_UNPACKED_WAVE_MAX_S_Q:
+            return "prefill_short_q" if one_wave else None
+        return "prefill_short_q" if facts.s_q <= SM100_PAGED_UNPACKED_SHORT_MAX_S_Q else None
     lo, hi = SM107_PAGED_CGA_TILE_S_Q
     if facts.s_q <= SM107_PAGED_UNPACKED_SHORT_MAX_S_Q:
         if facts.s_kv <= SM107_PAGED_UNPACKED_SHORT_MAX_KV:
             return "prefill_short_q"
-        one_wave = SM107_PAGED_UNPACKED_CLUSTER_CTAS * facts.b * facts.h_q <= (facts.device_sm_count or 0)
         return "prefill_short_q_long_kv" if facts.h_q != facts.h_kv or one_wave else None
     return "prefill_cga_tile" if lo < facts.s_q <= hi else None
 
@@ -407,7 +420,7 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         # 0.67-1.08 above one Q tile; study sm100_paged_d64_d256_prefill_20261111).
         phase = "prefill_short_q"
     if phase == "prefill":
-        phase = _sm107_paged_unpacked_band(row, facts) or phase
+        phase = _paged_unpacked_band(row, facts) or phase
     if phase == "prefill" and _sm107_thd_split(row, facts):
         phase = "prefill_split"
     if getattr(facts, "deterministic", False):
