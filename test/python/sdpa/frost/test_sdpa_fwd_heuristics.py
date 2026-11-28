@@ -2491,6 +2491,49 @@ def test_sm107_paged_prefill_split_budget_spans_two_waves(sm107_metadata_target)
 
 
 @pytest.mark.L0
+def test_sm107_paged_short_cache_split_needs_its_second_wave(sm107_metadata_target):
+    """On a short cache a Rubin paged d128 split that needs a second wave of CTAs keeps the launch unsplit unless it cuts the loop work well
+    below the unsplit launch's: a 2-way split over two waves stays unsplit up to SM107_PAGED_SPLIT_WAVE_MAX_KV keys and splits past it;
+    one-wave splits and two-wave splits that cut most of the loop still split."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.heuristics import SM107_PAGED_SPLIT_WAVE_MAX_KV, paged_thd_split_choice
+
+    spec = engines.sm100_legacy_policy_spec(_RUBIN_F16)
+    caps = spec.capabilities
+    # b 3, Q 512, 16 / 1: 192 packed tiles, so a 2-way split takes two waves to halve the loop.
+    base = dict(
+        b=3,
+        h_q=16,
+        h_kv=1,
+        s_q=512,
+        s_kv=2048,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (2048, 2048, 128, 1)),
+        max_total_seq_len_q=3 * 512,
+        device_cc=(10, 7),
+        device_sm_count=208,
+    )
+    for s_kv in (2048, SM107_PAGED_SPLIT_WAVE_MAX_KV):
+        f = _facts(**dict(base, s_kv=s_kv))
+        assert paged_thd_split_choice(caps, f) == (1, False), s_kv
+        assert _sm107_f16_plans(f)[0].knobs.split_kv in (None, 1), s_kv
+    assert paged_thd_split_choice(caps, _facts(**dict(base, s_kv=SM107_PAGED_SPLIT_WAVE_MAX_KV + 1)))[0] > 1
+    # one wave (b 2, Q 96, 16 / 1: 24 packed tiles); two waves that cut the loop to under half (b 1, Q 320, 32 / 4 over 3072 keys: 80
+    # packed tiles split 5 ways, 2 waves of 5 KV tiles against one of 24)
+    for over in (dict(b=2, s_q=96, max_total_seq_len_q=2 * 96), dict(b=1, h_q=32, h_kv=4, s_q=320, s_kv=3072, max_total_seq_len_q=320)):
+        f = _facts(**dict(base, **over))
+        assert paged_thd_split_choice(caps, f)[0] > 1, over
+        assert all(engines.mismatch(caps, f, p.knobs) is None for p in _sm107_f16_plans(f))
+
+
+@pytest.mark.L0
 def test_sm107_paged_split_ties_go_to_the_packed_grid(sm107_metadata_target):
     """A bounded one-tile Rubin paged chunk (Q bound 128) declares as many packed tiles as unpacked ones; the live tokens sit at or
     below the bound, so the equal-work tie goes to the packed grid at the same split -- on the main arm (G16 at one Q tile: a first-wave tie) and on the
