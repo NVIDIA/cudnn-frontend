@@ -1,4 +1,196 @@
 nodeid	code_path
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_grouped_query_attention[mha]	f16 general | d64 | dense | fp16 | MHA | BSHD
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_grouped_query_attention[gqa]	f16 general | d64 | dense | GQA 8:2
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_bfloat16_and_tile_variants	f16 general | d128 | causal | bf16 | TILE_M 64 x TILE_N 64
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_causal_bottom_right	mask arm: bottom-right causal (S_q < S_kv)
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_causal_swa	mask arm: causal + SWA (window_size_left)
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_sink	sink
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_padded	padded (seq_q / seq_kv lens present)
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_sink_dead_rows	dead rows (keyless padded rows) + sink
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_stats[ln-dense]	Stats epilogue, ln base | d128
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_stats[log2-causal]	Stats epilogue, stats_use_log2 | causal
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_dense_flex_bhsd_contiguous	dense_flex layout (BHSD contiguous) | graph API
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_head_dim_envelope[d72]	8-aligned head-dim envelope (d72)
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_mixed_head_dims[mla192x128]	D_QK != D_V (192 x 128)
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_negative_attn_scale[none-d64]	negative host attn_scale
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_thd	THD (nonpaged varlen) | causal
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_thd_cross	THD cross attention | d128
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_thd_bottom_right	THD bottom-right causal
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_thd_stats[head_major]	THD Stats head-major
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_thd_stats[token_major]	THD Stats token-major
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_pack_gqa_ratios[g4]	PackGQA | causal | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_pack_gqa_tile_q_not_divisible[g5_128x64]	PackGQA, group not dividing TILE_M
+sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_split_folds_the_sink_once[128-split4]	split-KV (4 parts) + sink, recombine
+sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_direct_template_stats_base[ln-split4-f16]	split-KV recombined Stats, ln base
+sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_causal_split_requires_the_natural_scheduler	causal split-KV | explicit NATURAL scheduler (derived LPT + split rejected)
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_mask_sink_pack_stats[False-False-none-0]	dense-Q paged KV | prefill | no mask | natural scheduler
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_mask_sink_pack_stats[False-False-causal-1]	paged | causal | scheduler 1
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_mask_sink_pack_stats[False-False-band-2]	paged | band | scheduler 2
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_mask_sink_pack_stats[False-True-br_swa-0]	paged | bottom-right SWA + sink
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_mask_sink_pack_stats[True-False-causal-0]	paged | PackGQA
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_mixed_fp8[prefill64-kv_dtype0-dtype0]	paged prefill, FP8 K/V with half Q
+sdpa/frost/test_frost_sdpa_bias_sm120.py::test_frost_sm120_bias_mask_composition[padded-dtype0]	additive bias (exact 128x128 owner) + padded
+sdpa/frost/test_frost_sdpa_bias_sm120.py::test_frost_sm120_bias_optional_stats_and_sink[True-False-True]	bias + Stats + sink
+sdpa/frost/test_sdpa_fwd_thd_origins_sm120.py::test_independent_origins_rebind_replay[head-bfloat16-64]	THD independent Q/KV origins, rebind + replay
+sdpa/frost/test_sdpa_sm120_padding_nan.py::test_runtime_kv_padding_nan_rebind_replay[False-128-200-dtype0-64-64]	NaN K/V past the runtime length stays out of O
+sdpa/frost/test_sdpa_fwd_sm120_half_exact_engines.py::test_public_record_names_and_replays_its_body[128-128-64-2-97-dtype1]	explicit record names the general body (TILE_M 64, split 2)
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_sdpa_fwd_dsl_sm120_graph_api[dense-bf16]	d256 all-compute | dense | bf16 | graph API
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_sdpa_fwd_dsl_sm120_graph_api[causal-fp16]	d256 all-compute | causal | fp16
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_negative_attn_scale[padded_sink_bottom_right-d256]	d256 | padded + sink + bottom-right
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_thd_multi_unit_per_cta[d256]	d256 | THD
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_pack_gqa_tile_q_not_divisible[g7_d256]	d256 | PackGQA
+sdpa/frost/test_sdpa_fwd_sm120_half_exact_engines.py::test_public_record_names_and_replays_its_body[256-256-64-3-97-dtype1]	explicit record names the d256 body (split 3)
+sdpa/frost/test_sdpa_fwd_decode_sm120.py::test_decode_tile_matches_reference[64-8-3-515-64-32-3-True]	decode | dense KV | d64 | TILE_M 32 | split 3 | sink
+sdpa/frost/test_sdpa_fwd_decode_sm120.py::test_decode_tile_matches_reference[24-4-1-2000-256-16-4-False]	decode | d256 | TILE_M 16 | split 4
+sdpa/frost/test_sdpa_fwd_decode_sm120.py::test_decode_tile_masks_scale_and_padded_queries[case0]	decode | mask / scale / padded-query arms
+sdpa/frost/test_sdpa_fwd_decode_sm120.py::test_decode_tile_dtypes_and_stats_base[dtype0-True]	decode | bf16 | Stats log2, split 1 + 4
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_decode[1-16-dims1-dtype0]	decode | paged KV | d64 | fp16 | TILE_M 16
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_decode[3-32-dims3-dtype1]	decode | paged KV | d128 | bf16 | TILE_M 32 | split 3
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_wide_decode[1-16-dims6-dtype0]	decode | paged KV | d256
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_mixed_fp8[decode256-kv_dtype0-dtype0]	decode | paged FP8 K/V | d256
+sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_direct_template_stats_base[log2-split4-f16-decode]	decode | split 4 | Stats log2
+sdpa/frost/test_sdpa_fwd_sm120_half_exact_engines.py::test_public_record_names_and_replays_its_body[128-128-32-3-5-dtype1]	explicit record names the key-group body
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_d512_features[none]	d512 | dense
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_d512_features[causal]	d512 | causal
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_d512_features[causal_br]	d512 | bottom-right causal
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_d512_features[swa128]	d512 | SWA
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_d512_features[band_right]	d512 | right band
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_d512_features[sink_swa]	d512 | sink + SWA
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_d512_features[padded_qtrim]	d512 | padded, trimmed Q rows
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_pack_gqa_tile_q_not_divisible[g6_d512]	d512 | PackGQA
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_thd_multi_unit_per_cta[d512]	d512 | THD
+sdpa/frost/test_sdpa_fwd_dsl_sm120.py::test_dsl_sm120_wide_partial_pack_dense[576-512-128-dtype0]	d576x512 | PackGQA partial pack | dense
+sdpa/frost/test_sdpa_fwd_d576_sm120.py::test_d576_dense_features[dims0-plain-dtype1]	d576x512 | dense | bf16
+sdpa/frost/test_sdpa_fwd_d576_sm120.py::test_d576_thd[head_major-dtype1]	d576x512 | THD | Stats head-major
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_d512[plain-dtype1]	d512 | paged KV
+sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_d512[split_pack-dtype0]	d512 | paged KV | split + PackGQA
+sdpa/frost/test_sdpa_fwd_d576_sm120.py::test_d576_paged[plain-dtype1]	d576x512 | paged KV
+sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_d512_split_recombines_o_and_lse	d512 | dense split-KV, O + LSE recombine
+sdpa/frost/test_sdpa_fwd_thd_origins_sm120.py::test_independent_origins_rebind_replay[head-bfloat16-512]	d512 | THD independent origins
+sdpa/frost/test_sdpa_sm120_padding_nan.py::test_runtime_kv_padding_nan_rebind_replay[False-128-200-dtype0-512-512]	d512 | NaN K/V tail
+sdpa/frost/test_sdpa_fwd_sm120_d512_paired_engine.py::test_public_record_rebuild_rebind_and_retained_capture[3-dtype1-dims0]	explicit record names the d512 body (split 3), rebind + capture
+sdpa/frost/test_sdpa_fwd_sm120_d512_paired_engine.py::test_public_record_rebuild_rebind_and_retained_capture[1-dtype0-dims1]	explicit record, (576,512)
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_masks[none]	fp8 general | d128 | e4m3 in | dense
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_masks[causal]	fp8 general | causal
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_masks[causal_br]	fp8 general | bottom-right causal
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_masks[swa]	fp8 general | SWA
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_thd_right_band	fp8 general | right band (THD)
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_e5m2[none]	fp8 general | e5m2 in
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_o_dtype[none-o_dtype0]	fp8 general | e4m3 O (scale_o, amax_o)
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_o_dtype[none-o_dtype1]	fp8 general | e5m2 O
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_head_dims[d64]	fp8 general | d64
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_sink[none]	fp8 general | sink
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_padding[False]	fp8 general | padded KV
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_thd	fp8 general | THD
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_thd_cross	fp8 general | THD bottom-right cross
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_thd_fp8_out	fp8 general | THD e4m3 O
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_thd_stats[head_major]	fp8 general | THD Stats head-major
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_pack_gqa_ratios[g4]	fp8 general | PackGQA
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_strided_stats	fp8 general | strided Stats
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_block_scaled_output[mxfp8-none-token_major]	fp8 general | block-scaled MXFP8 O, token-major scales
+sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_fp8_split_matches_unsplit[e4m3_out]	fp8 general | split-KV, e4m3 O
+sdpa/frost/test_sdpa_fwd_thd_origins_fp8_sm120.py::test_independent_origins_rebind_replay[head-float8_e4m3fn-128]	fp8 | THD independent origins
+sdpa/frost/test_sdpa_stats_log2_sm120.py::test_sm120_fp8_stats_use_log2[4-77-384-64-64]	fp8 | Stats log2
+sdpa/frost/test_sdpa_fp8_sink_split_sm120.py::test_sm120_fp8_sink_at_decode[dtype0-output0-64-64]	fp8 | sink at decode shape
+sdpa/frost/test_sdpa_fp8_v_tail_sync_sm120.py::test_v_tail_replay_and_batch[e4m3-128-fp8]	fp8 | V tail sync, replay + batch
+sdpa/frost/test_sdpa_fwd_sm120_quantized_general_engines.py::test_fp8_public_record_names_and_replays_its_body[128-128-1-dtype0]	explicit record names the fp8 general body
+sdpa/frost/test_sdpa_fwd_sm120_quantized_general_engines.py::test_fp8_public_record_names_and_replays_its_body[64-64-3-dtype1]	explicit record, e5m2, split 3
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_masks[none-bf16_out]	fp8 d512 | dense | bf16 O
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_masks[causal-e4m3_out]	fp8 d512 | causal | e4m3 O
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_masks[causal_br-bf16_out]	fp8 d512 | bottom-right causal
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_masks[swa-bf16_out]	fp8 d512 | SWA
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_masks[right_band-bf16_out]	fp8 d512 | right band
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_dtypes[e5m2_in]	fp8 d512 | e5m2 in
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_pack_gqa	fp8 d512 | PackGQA
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_padding_sink	fp8 d512 | padded + sink
+sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_split_kv	fp8 d512 | split-KV
+sdpa/frost/test_sdpa_fwd_thd_origins_fp8_sm120.py::test_independent_origins_rebind_replay[head-float8_e4m3fn-512]	fp8 d512 | THD
+sdpa/frost/test_sdpa_stats_log2_sm120.py::test_sm120_fp8_stats_use_log2[4-77-384-512-512]	fp8 d512 | Stats log2
+sdpa/frost/test_sdpa_fwd_sm120_d512_fp8_paired_engine.py::test_fp8_public_record_rebuild_rebind_and_retained_capture[3-output0-dtype1]	explicit record names the fp8 d512 body, rebind + capture
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_masks[e4m3-none]	mxfp8 general | e4m3 in | dense
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_masks[e4m3-causal]	mxfp8 general | causal
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_masks[e4m3-causal_br]	mxfp8 general | bottom-right causal
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_masks[e4m3-swa]	mxfp8 general | SWA
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_masks[e4m3-right_band]	mxfp8 general | right band
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_masks[e5m2-none]	mxfp8 general | e5m2 in
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_head_dims[96-160]	mxfp8 general | D_QK != D_V
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d256_qk_on_both_kv_tiles[dv128-kv128]	mxfp8 general | d256 QK, TILE_N 128
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_sink[none]	mxfp8 general | sink
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_seq_q_trim[none]	mxfp8 general | padded, trimmed Q rows
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_o_dtype[e4m3]	mxfp8 general | e4m3 O
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_thd[causal]	mxfp8 general | THD
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_pack_gqa[causal-g4]	mxfp8 general | PackGQA
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_split_kv_graph[e4m3-3]	mxfp8 general | split-KV 3, e4m3 O
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_stats_log2_direct[64]	mxfp8 general | Stats log2
+sdpa/frost/test_sdpa_fwd_thd_origins_mxfp8_sm120.py::test_independent_origins_rebind_replay[head-float8_e4m3fn-64]	mxfp8 | THD independent origins
+sdpa/frost/test_sdpa_mxfp8_sink_split_sm120.py::test_sm120_mxfp8_sink_split_standalone_keyless[log2-dtype1]	mxfp8 | split sink, keyless rows
+sdpa/frost/test_sdpa_fp8_v_tail_sync_sm120.py::test_v_tail_replay_and_batch[e4m3-128-mxfp8]	mxfp8 | V tail sync
+sdpa/frost/test_sdpa_fwd_sm120_quantized_general_engines.py::test_mxfp8_selected_body_and_retired_legacy_record[128-128-None]	selected record names the mxfp8 general body
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d512_masks[e4m3-none]	mxfp8 d512 | dense
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d512_masks[e4m3-causal]	mxfp8 d512 | causal
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d512_masks[e4m3-causal_br]	mxfp8 d512 | bottom-right causal
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d512_masks[e4m3-swa]	mxfp8 d512 | SWA
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d512_masks[e4m3-right_band]	mxfp8 d512 | right band
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d512_o_dtype[e5m2]	mxfp8 d512 | causal | e5m2 O
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d512_thd[512_causal]	mxfp8 d512 | THD
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d512_split_kv[2]	mxfp8 d512 | split-KV
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_d512_pack_gqa	mxfp8 d512 | PackGQA
+sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py::test_mxfp8_sm120_stats_log2_direct[512]	mxfp8 d512 | Stats log2
+sdpa/frost/test_sdpa_fwd_sm120_d512_fp8_paired_engine.py::test_mxfp8_selected_body_and_retired_legacy_record[None]	selected record names the mxfp8 d512 body
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_graph_api[dense-64]	bwd fused | d64 | dense | fp16 | graph API
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_graph_api[causal-128]	bwd fused | d128 | causal
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_bf16[dense]	bwd fused | bf16
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_gqa[gqa_8_2_causal]	bwd fused | GQA | causal
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_gqa[mqa_8_1_dense]	bwd fused | MQA
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_sequence_tails[causal_br]	bwd fused | bottom-right causal, sequence tails
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_sliding_window_causal	bwd fused | causal + SWA
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_sliding_window_no_causal	bwd fused | SWA without causal
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_padding_mask[causal_tl]	bwd fused | padded (seq lens)
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_bias[dense]	bwd fused | bias + dBias
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_strided_stats	bwd fused | strided LSE
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_padded_head_dim[dense-40]	bwd fused | head-dim envelope
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_rect_head_dims_graph[dense-native_128_64]	bwd fused | D_QK != D_V
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_tile_knobs[64-64-64]	bwd fused | TILE_M 64 x TILE_N 64
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_deterministic_numeric[dense]	bwd fused | deterministic
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_det_2kernel_numeric[causal]	bwd fused | deterministic two-kernel
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_det_2kernel_sink	bwd fused | sink + dSink (deterministic)
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_det_2kernel_right_band	bwd fused | right band (deterministic)
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_det_relay[dense]	bwd fused | deterministic relay
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_deterministic_large_d_numeric	bwd fused | d256 | causal + SWA, deterministic
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::test_sdpa_bwd_dsl_sm120_mla_192_128_tails	bwd fused | 192 x 128 | tails
+sdpa/frost/test_sdpa_bwd_dsl_sm120.py::TestPreparedSm120Bwd::test_rebind_and_replay[mha-dtype0]	bwd fused | prepared rebind + replay
+sdpa/frost/test_sdpa_bwd_sm120_padding_nan.py::test_runtime_padding_nan_backward[96-192-dtype1-64-64-4-False]	bwd fused | NaN tails past the runtime length
+sdpa/frost/test_sdpa_bwd_sm120_wide.py::test_graph_wide_dense[False-full-False-dtype0]	bwd two-subgroup | wide D | dense | fp16
+sdpa/frost/test_sdpa_bwd_sm120_wide.py::test_graph_wide_dense[False-causal-False-dtype1]	bwd two-subgroup | wide D | causal | bf16
+sdpa/frost/test_sdpa_bwd_sm120_wide.py::test_graph_wide_dense[False-br_swa-True-dtype0]	bwd two-subgroup | wide D | bottom-right SWA | deterministic
+sdpa/frost/test_sdpa_bwd_sm120_wide.py::test_graph_wide_dense[True-swa-False-dtype0]	bwd two-subgroup | wide D | SWA | padded
+sdpa/frost/test_sdpa_bwd_sm120_wide.py::test_graph_wide_thd[full-False-dtype1]	bwd two-subgroup | wide D | THD
+sdpa/frost/test_sdpa_bwd_sm120_wide.py::test_native_wide_thd[False-dims0-dtype1]	bwd two-subgroup | d512 | THD | native API
+sdpa/frost/test_sdpa_bwd_thd_sm120.py::test_frost_thd_standalone[HN-dtype1]	bwd two-subgroup | THD | Stats HN
+sdpa/frost/test_sdpa_bwd_thd_sm120.py::test_frost_thd_standalone[TH1-dtype1]	bwd two-subgroup | THD | Stats TH1
+sdpa/frost/test_sdpa_bwd_thd_sm120_gqa.py::test_explicit_native_tiles[dims3-tiles3-dtype1]	bwd two-subgroup | THD | explicit tiles
+sdpa/frost/test_sdpa_bwd_thd_sm120_gqa.py::test_wide_gqa_origins[dims0-HN-dtype1]	bwd two-subgroup | THD GQA, independent origins
+sdpa/frost/test_sdpa_bwd_fp8_sm120.py::test_native_graph[full-dtype0-dims0]	bwd fp8 | d64 | dense | e4m3 out
+sdpa/frost/test_sdpa_bwd_fp8_sm120.py::test_native_graph[causal-dtype1-dims0]	bwd fp8 | causal | fp16 out
+sdpa/frost/test_sdpa_bwd_fp8_sm120.py::test_native_graph[swa-dtype2-dims0]	bwd fp8 | SWA | bf16 out
+sdpa/frost/test_sdpa_bwd_fp8_sm120.py::test_native_graph[causal-dtype0-dims4]	bwd fp8 | d512
+sdpa/frost/test_sdpa_bwd_fp8_sm120.py::test_native_graph[full-dtype2-dims6]	bwd fp8 | (40,8) envelope
+sdpa/frost/test_sdpa_bwd_mxfp8_sm120.py::test_native_graph[full-dtype1-dims0]	bwd mxfp8 | d64 | dense
+sdpa/frost/test_sdpa_bwd_mxfp8_sm120.py::test_native_graph[causal-dtype0-dims0]	bwd mxfp8 | causal
+sdpa/frost/test_sdpa_bwd_mxfp8_sm120.py::test_native_graph[swa-dtype0-dims0]	bwd mxfp8 | SWA
+sdpa/frost/test_sdpa_bwd_mxfp8_sm120.py::test_native_graph[causal-dtype1-dims4]	bwd mxfp8 | d512
+sdpa/frost/test_sdpa_bwd_mxfp8_sm120.py::test_longer_and_keyless[shape2-dims0]	bwd mxfp8 | longer sequence, keyless rows
+sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_envelopes_fresh_storage_and_replay[bfloat16-1-128-128]	native binding | graph | fresh storage + changed replay
+sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_sinks[248-256]	native binding | graph | sink | (248,256) envelope
+sdpa/frost/test_sdpa_prepared_sm120.py::test_sm120_prepared_capture_first_execute[False-128]	prepared | CUDA-graph capture before first execute
+sdpa/frost/test_sdpa_prepared_sm120.py::test_sm120_prepared_thd_capture_rebind[native-128]	prepared | THD | capture + rebind
+sdpa/frost/test_sdpa_prepared_sm120_fp8.py::test_sm120_fp8_without_optional_outputs[128-128-False]	prepared fp8 | no amax / Stats outputs
+sdpa/frost/test_sdpa_prepared_sm120_fp8.py::test_sm120_fp8_workspace_sized_before_compile[output_dtype0-128-False]	prepared fp8 | workspace sized before compile
+sdpa/frost/test_sdpa_prepared_sm120_mxfp8.py::test_sm120_mxfp8_rebind_scales_and_buffers[output_dtype0-128-128-dtype0-False]	prepared mxfp8 | rebind scales + buffers
+sdpa/frost/test_sdpa_prepared_sm120_mxfp8.py::test_sm120_mxfp8_without_optional_outputs[128-128-False]	prepared mxfp8 | no optional outputs
+sdpa/frost/test_sdpa_staged_sm120_mxfp8.py::test_sm120_mxfp8_staged_uses_pointer_host_and_current_scales[192-128]	staged mxfp8 | pointer host, current scales
+sdpa/frost/test_sdpa_staged_sm120_mxfp8.py::test_sm120_mxfp8_staged_fp8_output_without_optional_outputs[1-128]	staged mxfp8 | fp8 O, no optional outputs
+sdpa/frost/test_sdpa_bwd_mxfp8_sm120_amax.py::test_optional_outputs[0]	bwd mxfp8 | amax optional outputs
 linear_attention/frost/test_gdn_decode_fused.py::test_graph_replay_over_distinct_layers_matches_eager	GDN decode | rows 1 pick = two-CTAs-per-head pair (cluster of 2, st.async norm exchange) | CUDA-graph replay over layers
 linear_attention/frost/test_gdn_decode_fused.py::test_deterministic_and_matches_the_torch_model	GDN decode | rows 2 pick = one-CTA form (whole slab, one wave) | torch oracle + determinism
 linear_attention/frost/test_gdn_decode_fused.py::test_null_slot_rows_are_zero_and_leave_the_state_and_conv_state_untouched[two-ctas-per-head]	GDN decode | pair form, null-slot row (cluster null tail) | padding contract
