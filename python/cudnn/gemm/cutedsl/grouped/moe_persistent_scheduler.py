@@ -248,8 +248,10 @@ class MoESchedulerParams:
         cta_tile_shape_mnk: Tuple[int, int, int],  # (tile_m, tile_n, tile_k)
         cluster_shape_mn: Tuple[int, int],  # (cluster_m, cluster_n)
         use_dynamic_sched: bool = False,
+        atomic_counter_claim: bool = False,  # 2Dx2D (SM90, no CLC): claim from the gmem atomic counter on persistent clusters
     ):
         self.scenario = scenario
+        self.atomic_counter_claim = atomic_counter_claim
         e, i, h = expert_shape
         self.expert_cnt = e if isinstance(e, Int32) else Int32(e)
         self.intermediate = i if isinstance(i, Int32) else Int32(i)
@@ -259,6 +261,11 @@ class MoESchedulerParams:
         if scenario == "2Dx2D":
             use_dynamic_sched = True
         self.use_dynamic_sched = use_dynamic_sched
+
+    @property
+    def uses_clc(self) -> bool:
+        """2Dx2D claims with CLC (Blackwell) unless it claims from the atomic counter: a grid of every tile, not persistent clusters."""
+        return self.scenario == "2Dx2D" and not self.atomic_counter_claim
 
     @property
     def cluster_tile_m(self) -> int:
@@ -295,6 +302,7 @@ class MoESchedulerParams:
             cta_tile_shape_mnk=self.cta_tile_shape_mnk,
             cluster_shape_mn=self.cluster_shape_mn,
             use_dynamic_sched=self.use_dynamic_sched,
+            atomic_counter_claim=self.atomic_counter_claim,
         )
 
     @staticmethod
@@ -305,10 +313,10 @@ class MoESchedulerParams:
         """
         Compute grid shape for kernel launch.
 
-        2Dx3D uses persistent clusters. 2Dx2D uses a full CTA grid with
-        cluster-level cancellation to rebalance uneven expert K lengths.
+        2Dx3D and 2Dx2D counter claims use persistent clusters. 2Dx2D CLC uses a
+        full CTA grid with cluster-level cancellation to rebalance uneven expert K lengths.
         """
-        if params.scenario == "2Dx2D":
+        if params.uses_clc:
             cm, cn = params.cluster_shape_mn
             tm, tn = params.cta_tile_shape_mnk[0], params.cta_tile_shape_mnk[1]
             grid_m = ((params.hidden + tm * cm - 1) // (tm * cm)) * cm
@@ -456,7 +464,7 @@ class MoEPersistentTileScheduler:
         """
         if const_expr(self.use_dynamic_sched):
             cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
-            if const_expr(self.scenario == "2Dx2D"):
+            if const_expr(self.params.uses_clc):
                 self.cluster_pipeline = pipeline.PipelineClcFetchAsync.create(
                     barrier_storage=self._sched_storage.cluster_mbar.data_ptr(),
                     num_stages=1,
@@ -720,7 +728,7 @@ class MoEPersistentTileScheduler:
         if const_expr(params.use_dynamic_sched):
             current_work_linear_idx = Int32(-1)
             is_leader_cta = (cta_id_in_cluster[0] + cta_id_in_cluster[1] + cta_id_in_cluster[2]) == Int32(0)
-            if const_expr(params.scenario == "2Dx2D"):
+            if const_expr(params.uses_clc):
                 producer_state_type = PipelineUserType.ProducerConsumer
             else:
                 producer_state_type = PipelineUserType.Producer
@@ -759,7 +767,7 @@ class MoEPersistentTileScheduler:
     @cute.jit
     def initial_work_tile_info(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         """Get the initial work tile info."""
-        if const_expr(self.scenario == "2Dx2D"):
+        if const_expr(self.params.uses_clc):
             return self._initial_work_from_block_idx(loc=loc, ip=ip)
         if const_expr(self.use_dynamic_sched):
             if const_expr(not hasattr(self, "cluster_pipeline")):
@@ -767,6 +775,7 @@ class MoEPersistentTileScheduler:
             self._current_work_linear_idx = self._fetch_next_cluster_idx(loc=loc, ip=ip)
             work_tile_info = self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
             self._release_cluster_idx(loc=loc, ip=ip)
+            self._wait_last_cluster_release(work_tile_info, loc=loc, ip=ip)
             return work_tile_info
         return self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
 
@@ -774,12 +783,13 @@ class MoEPersistentTileScheduler:
     @cute.jit
     def advance_to_next_work(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         """Advance to the next work tile and return its info."""
-        if const_expr(self.scenario == "2Dx2D"):
+        if const_expr(self.params.uses_clc):
             return self._fetch_next_clc_work(loc=loc, ip=ip)
         if const_expr(self.use_dynamic_sched):
             self._current_work_linear_idx = self._fetch_next_cluster_idx(loc=loc, ip=ip)
             work_tile_info = self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
             self._release_cluster_idx(loc=loc, ip=ip)
+            self._wait_last_cluster_release(work_tile_info, loc=loc, ip=ip)
             return work_tile_info
         else:
             self._current_work_linear_idx += self.num_persistent_clusters
@@ -908,6 +918,21 @@ class MoEPersistentTileScheduler:
             ds = self._dynamic_state
             self._cluster_consumer_release(loc=loc, ip=ip)
             ds.consumer_state.advance()
+
+    @dsl_user_op
+    @cute.jit
+    def _wait_last_cluster_release(self, work_tile_info: MoEWorkTileInfo, *, loc=None, ip=None) -> None:
+        """After the last (invalid) claim, hold the leader CTA until every CTA of the cluster has released it.
+
+        Each CTA releases a claim with a remote arrive on the leader's empty barrier.  No producer_acquire follows
+        the last claim, so without this wait the leader can exit first and a peer's arrive targets the shared memory
+        of an exited CTA.
+        """
+        if const_expr(self.cluster_shape_mn[0] * self.cluster_shape_mn[1] > 1):
+            ds = self._dynamic_state
+            if ds.is_leader_cta:
+                if work_tile_info.expert_idx < Int32(0):
+                    self.cluster_pipeline.producer_acquire(ds.producer_state, loc=loc, ip=ip)
 
     @dsl_user_op
     @cute.jit

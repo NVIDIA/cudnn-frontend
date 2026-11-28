@@ -5,7 +5,8 @@
 
 The dynamic scheduler's tile counter and the discrete-mode TMA descriptors live in the kernel workspace, so overlapping
 calls that shared a cached plan's workspace stole each other's tiles or descriptors (#2881). 32 experts x 512 rows at
-N=4096, K=1024 overlapped on GB200 every run.
+N=4096, K=1024 overlapped on GB200 every run. The wgrad "counter" cases run atomic_counter_claim, whose tile counter
+lives in the same per-call workspace.
 """
 
 import pytest
@@ -44,17 +45,20 @@ def _launch(op, problem, sched):
     """One wrapper call on the current stream; returns its outputs (fresh buffers)."""
     if op == "wgrad":
         output = torch.empty_like(problem["output"])
-        ptrs = torch.tensor([expert.data_ptr() for expert in output], dtype=torch.int64, device="cuda")
+        discrete = problem["discrete"]
+        ptrs = torch.tensor([expert.data_ptr() for expert in output], dtype=torch.int64, device="cuda") if discrete else None
         cudnn.grouped_gemm_wgrad_wrapper_sm100(
             a_tensor=problem["a"],
             b_tensor=problem["b"],
             sfa_tensor=None,
             sfb_tensor=None,
             offsets_tensor=problem["offsets"],
-            output_mode="discrete",
+            output_mode="discrete" if discrete else "dense",
+            wgrad_tensor=None if discrete else output,
             wgrad_ptrs=ptrs,
             acc_dtype=torch.float32,
             wgrad_dtype=torch.bfloat16,
+            atomic_counter_claim=sched == "counter",
         )
         return {"wgrad": output}
     kwargs = dict(
@@ -91,6 +95,8 @@ CASES = [
     ("glu", True, "static"),
     ("glu", True, "dynamic"),
     ("wgrad", True, None),
+    ("wgrad", False, "counter"),
+    ("wgrad", True, "counter"),
 ]
 
 

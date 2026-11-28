@@ -55,8 +55,9 @@ def get_grouped_gemm_wgrad_workspace_size_sm100(
     *,
     output_mode: str = "dense",
     input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+    atomic_counter_claim: bool = False,
 ) -> int:
-    """Return required runtime TMA-descriptor workspace bytes."""
+    """Return required runtime workspace bytes: the TMA descriptors, plus the tile counter with ``atomic_counter_claim``."""
     if num_experts <= 0:
         raise ValueError(f"num_experts must be positive, got {num_experts}")
     try:
@@ -72,16 +73,19 @@ def get_grouped_gemm_wgrad_workspace_size_sm100(
             normalized_input_order,
             weight_mode,
             num_experts,
-        ),
+        )
+        + (4 if atomic_counter_claim else 0),
         1,
     )
 
 
 from ._bf16_api import GroupedGemmWgradBf16API
+from .moe_blockscaled_grouped_gemm_wgrad import check_pdl_mode
 from ._blockscaled_api import (
     GroupedGemmWgradBlockScaledAPI,
     _get_rubin_kernel,
     _is_supported_rubin_quantization,
+    dense_output_token_class,
 )
 
 _BLOCK_SCALED_JAX_ERROR = (
@@ -91,7 +95,14 @@ _BLOCK_SCALED_JAX_ERROR = (
 
 
 class GroupedGemmWgradSm100(APIBase):
-    """Stable public facade that selects the WGrad backend during support checking."""
+    """Stable public facade that selects the WGrad backend during support checking.
+
+    ``pdl_mode`` and ``sample_scheduler_counter`` (with ``scheduler_counter_tensor`` in ``execute``) run one MXFP8 wgrad
+    as several launches that share a caller-owned claim counter; they are block-scaled only. See
+    ``GroupedGemmWgradBlockScaledAPI`` for their contract, in short: a non-default ``pdl_mode`` requires ``use_pdl`` and
+    excludes ``launch_pdl_dependents_at_entry``, and with ``pdl_mode="trigger_then_wait_at_exit"`` the caller guarantees
+    that no input of this GEMM is written by the grid right before it on the stream.
+    """
 
     # BF16 implementation
     @overload
@@ -140,8 +151,16 @@ class GroupedGemmWgradSm100(APIBase):
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+        atomic_counter_claim: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
+        pdl_mode: str = "wait_at_start",
+        sample_scheduler_counter: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
+        check_pdl_mode(pdl_mode, use_pdl, launch_pdl_dependents_at_entry)
+        if sample_scheduler_counter is not None and not atomic_counter_claim:
+            raise ValueError("sample_scheduler_counter requires atomic_counter_claim")
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
         self._pending_init_kwargs.pop("__class__", None)
@@ -168,6 +187,9 @@ class GroupedGemmWgradSm100(APIBase):
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
+                kwargs = dict(kwargs)
+                if kwargs.pop("pdl_mode") != "wait_at_start" or kwargs.pop("sample_scheduler_counter") is not None:
+                    raise ValueError("pdl_mode and sample_scheduler_counter require the block-scaled WGrad backend")
                 self._implementation = GroupedGemmWgradBf16API(**kwargs)
             else:
                 if detect_framework(kwargs["sample_a"]) == "jax":
@@ -224,6 +246,7 @@ class GroupedGemmWgradSm100(APIBase):
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
         descriptor_workspace: Optional[torch.Tensor] = None,
+        scheduler_counter_tensor: Optional[torch.Tensor] = None,
     ) -> None: ...
 
     def execute(
@@ -240,10 +263,13 @@ class GroupedGemmWgradSm100(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         descriptor_workspace: Optional[torch.Tensor] = None,
+        scheduler_counter_tensor: Optional[torch.Tensor] = None,
         _workspace=None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
+        if scheduler_counter_tensor is not None and not isinstance(self._implementation, GroupedGemmWgradBlockScaledAPI):
+            raise ValueError("scheduler_counter_tensor requires the block-scaled WGrad backend")
         if descriptor_workspace is not None and not isinstance(
             self._implementation,
             GroupedGemmWgradBlockScaledAPI,
@@ -265,6 +291,8 @@ class GroupedGemmWgradSm100(APIBase):
             execute_kwargs["descriptor_workspace"] = descriptor_workspace
         if _workspace is not None:
             execute_kwargs["_workspace"] = _workspace
+        if scheduler_counter_tensor is not None:
+            execute_kwargs["scheduler_counter_tensor"] = scheduler_counter_tensor
         self._implementation.execute(**execute_kwargs)
 
 
@@ -322,8 +350,15 @@ def grouped_gemm_wgrad_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
     *,
     descriptor_workspace: Optional[torch.Tensor] = None,
+    atomic_counter_claim: bool = False,
+    scheduler_counter_tensor: Optional[torch.Tensor] = None,
 ) -> TupleDict:
-    """Compile and execute grouped GEMM wgrad through the selected backend API."""
+    """Compile and execute grouped GEMM wgrad through the selected backend API.
+
+    ``scheduler_counter_tensor`` (torch block-scaled, with ``atomic_counter_claim``): a caller-owned contiguous 1-D CUDA
+    int32 claim counter in place of the per-call one. No launch resets it; the caller zeroes it on the stream before the
+    first of the calls that share it, and those calls split one tile list.
+    """
     if sfa_tensor is not None and detect_framework(a_tensor) == "jax":
         from .jax_api import grouped_gemm_wgrad_jax_sm100
 
@@ -335,6 +370,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
             ("sf_fp8_dtype_override", sf_fp8_dtype_override is not None),
             ("current_stream", current_stream is not None),
             ("descriptor_workspace", descriptor_workspace is not None),
+            ("atomic_counter_claim", atomic_counter_claim is not False),
+            ("scheduler_counter_tensor", scheduler_counter_tensor is not None),
         ):
             if rejected:
                 raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
@@ -376,6 +413,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+        atomic_counter_claim,
+        wrapper_operand_meta(scheduler_counter_tensor),
     )
     memo = _wgrad_wrapper_memo.get(memo_key)
     if memo is not None:
@@ -396,6 +435,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             global_scale_a=global_scale_a,
             global_scale_b=global_scale_b,
             current_stream=current_stream,
+            scheduler_counter_tensor=scheduler_counter_tensor,
         )
         return TupleDict(wgrad_tensor=wgrad_tensor)
 
@@ -439,6 +479,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         raise ValueError(_BLOCK_SCALED_JAX_ERROR)
     if descriptor_workspace is not None and (backend is not GroupedGemmBackend.BLOCK_SCALED or framework != "torch"):
         raise ValueError("descriptor_workspace is supported only for torch block-scaled WGrad")
+    if scheduler_counter_tensor is not None and (backend is not GroupedGemmBackend.BLOCK_SCALED or framework != "torch"):
+        raise ValueError("scheduler_counter_tensor is supported only for torch block-scaled WGrad")
     wgrad_shape = (expert_cnt, hidden, intermediate)
     if wgrad_tensor is None and wgrad_ptrs is None:
         wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
@@ -464,6 +506,14 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        atomic_counter_claim,
+        _wgrad_tensor_signature(scheduler_counter_tensor, exact_stride=True),
+        # The token count is dynamic in the compiled kernel, but the block-scaled dense kernel choice depends on the
+        # mean tokens per expert (see GroupedGemmWgradBlockScaledAPI._select_kernel), so short and long experts
+        # get separate entries.
+        backend is GroupedGemmBackend.BLOCK_SCALED
+        and output_mode == "dense"
+        and dense_output_token_class(tokens_sum, expert_cnt, get_device_type() == "rubin"),
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
@@ -495,6 +545,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
             sf_fp8_dtype_override=sf_fp8_dtype_override,
             accumulate_on_output=accumulate_on_output,
             input_order=input_order,
+            atomic_counter_claim=atomic_counter_claim,
+            sample_scheduler_counter=scheduler_counter_tensor,
         )
         if output_mode == "dense":
             common["sample_wgrad"] = wgrad_tensor
@@ -525,6 +577,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         global_scale_a=global_scale_a,
         global_scale_b=global_scale_b,
         current_stream=current_stream,
+        scheduler_counter_tensor=scheduler_counter_tensor,
     )
     return TupleDict(wgrad_tensor=wgrad_tensor)
 

@@ -17,9 +17,12 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import is_torch_tensor
 
-from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
+from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel, check_pdl_mode
+from .moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel
+from .moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel
 from ..canonical import check_sf_shape, make_flat_sf_fake
 from ..moe_utils import MoEWeightMode, WGradInputOrder
+from ..scheduler_counter import validate_scheduler_counter
 
 
 def _get_rubin_kernel():
@@ -28,6 +31,25 @@ def _get_rubin_kernel():
     )
 
     return BlockScaledMoEGroupedGemmWgradRubinKernel
+
+
+def _dense_output_variants(rubin: bool):
+    """(global-descriptor, A-reuse) MXFP8 wgrad kernels for dense output: the SM100/SM103 pair, or the Rubin one."""
+    if rubin:
+        from .moe_blockscaled_grouped_gemm_wgrad_dense_rubin import BlockScaledMoEGroupedGemmWgradDenseRubinKernel
+        from .moe_blockscaled_grouped_gemm_wgrad_reuse_rubin import BlockScaledMoEGroupedGemmWgradReuseRubinKernel
+
+        return BlockScaledMoEGroupedGemmWgradDenseRubinKernel, BlockScaledMoEGroupedGemmWgradReuseRubinKernel
+    return BlockScaledMoEGroupedGemmWgradDenseKernel, BlockScaledMoEGroupedGemmWgradReuseKernel
+
+
+def dense_output_token_class(tokens: int, experts: int, rubin: bool) -> int:
+    """The part of the dense-output MXFP8 kernel choice that depends on the token count, which is dynamic in the compiled
+    kernel: 0 when the experts are not short on average for the A-reuse variant, else its A stages for them."""
+    reuse = _dense_output_variants(rubin)[1]
+    if not reuse.short_experts(tokens, experts):
+        return 0
+    return reuse.a_stages_for(tokens, experts)
 
 
 def _is_supported_rubin_quantization(ab_dtype: torch.dtype, sf_dtype: torch.dtype, sf_vec_size: int) -> bool:
@@ -57,7 +79,32 @@ def wgrad_sf_fake(api, desc):
 
 
 class GroupedGemmWgradBlockScaledAPI(APIBase):
-    """Unified grouped GEMM wgrad FE API for SM100+ GPUs."""
+    """Unified grouped GEMM wgrad FE API for SM100+ GPUs.
+
+    Split launches (MXFP8 dense output; see ``BlockScaledMoEGroupedGemmWgradKernel`` for the kernel side):
+
+    :param pdl_mode: ``"wait_at_start"`` (default), ``"wait_then_trigger"`` or ``"trigger_then_wait_at_exit"``. Where
+        the GEMM waits for the grid before it on the stream and where it lets its own dependent launch. ``use_pdl``
+        turns PDL on and ``pdl_mode`` only moves the wait and the trigger: a non-default mode requires ``use_pdl=True``
+        and excludes ``launch_pdl_dependents_at_entry`` (the mode places the trigger itself).
+        ``"wait_then_trigger"`` waits as ``use_pdl`` does, then lets the dependent launch, so the dependent starts only
+        once this GEMM's predecessor has ended. ``"trigger_then_wait_at_exit"`` lets the dependent launch at entry and
+        waits for the predecessor only at the end: the GEMM reads its inputs while the grid right before it may still
+        run, so **the caller guarantees that no input of this GEMM (A, B, scale factors, offsets, counter) is written by
+        that grid**; each must come from a grid that had ended before that grid let this one launch (for example, a
+        predecessor in ``"wait_then_trigger"`` mode behind the producer). It is rejected where a helper kernel would be
+        that grid: when the stock kernel is selected (any configuration other than MXFP8 with E8M0 scale factors,
+        dense output, float32 accumulation and no ``accumulate_on_output`` at the supported tiles), and with
+        ``atomic_counter_claim`` but no ``sample_scheduler_counter`` (a counter reset would launch in front).
+    :param sample_scheduler_counter: With ``atomic_counter_claim``, compile for a caller-owned contiguous 1-D CUDA int32
+        counter passed to ``execute`` as ``scheduler_counter_tensor`` (same shape). The clusters claim from its first
+        element and no launch resets it: the caller zeroes it once on the stream before the first of the launches that
+        share it, and those launches split one tile list (each tile runs once). The global-descriptor and A-reuse
+        kernels then launch nothing in front of the GEMM.
+    """
+
+    #: Set by ``__init__`` from ``sample_scheduler_counter``; None: the clusters claim from the workspace counter.
+    scheduler_counter_desc = None
 
     def __init__(
         self,
@@ -80,6 +127,11 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
+        atomic_counter_claim: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
+        pdl_mode: str = "wait_at_start",
+        sample_scheduler_counter: Optional[torch.Tensor] = None,
     ):
         if sample_a is not None and not is_torch_tensor(sample_a):
             raise ValueError(
@@ -173,10 +225,36 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1))
         self.accumulate_on_output = accumulate_on_output
+        if not isinstance(atomic_counter_claim, bool):
+            raise ValueError(f"atomic_counter_claim must be a bool, got {atomic_counter_claim!r}")
+        self.atomic_counter_claim = atomic_counter_claim
+        self.use_pdl = use_pdl
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
+        check_pdl_mode(pdl_mode, use_pdl, launch_pdl_dependents_at_entry)
+        self.pdl_mode = pdl_mode
+        if sample_scheduler_counter is not None:
+            self._value_error_if(not atomic_counter_claim, "sample_scheduler_counter requires atomic_counter_claim")
+            validate_scheduler_counter(sample_scheduler_counter, sample_a)
+        self.scheduler_counter_desc = self._make_tensor_desc(sample_scheduler_counter, name="sample_scheduler_counter")
         self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmWgradKernel
+        if pdl_mode == "trigger_then_wait_at_exit":
+            self._value_error_if(
+                atomic_counter_claim and sample_scheduler_counter is None,
+                "pdl_mode='trigger_then_wait_at_exit' with atomic_counter_claim needs sample_scheduler_counter: "
+                "the counter reset would launch in front of the GEMM",
+            )
+            self._value_error_if(
+                self._select_kernel().CALL_LAUNCHES_HELPER,
+                "pdl_mode='trigger_then_wait_at_exit' needs the MXFP8 global-descriptor or A-reuse kernel (E8M0 scale "
+                "factors, dense output, float32 accumulation, no accumulate_on_output); this configuration selects the "
+                "stock kernel, whose descriptor helper launches in front of the GEMM",
+            )
         self._workspace = None
         self._workspace_bytes = None
         self._workspace_arg = None
+        # Bytes the wrapper allocates per call on the launch stream (execute's private _workspace). Only the
+        # atomic_counter_claim tile counter asks for it: overlapping calls must not share one counter.
+        self._scratch_nbytes = 0
 
     def _validate_offsets(self, offsets_tensor: torch.Tensor, tokens_sum: int, name: str) -> Tuple[int, ...]:
         self._value_error_if(offsets_tensor.ndim != 1, f"{name} must be rank-1, got shape {tuple(offsets_tensor.shape)}")
@@ -346,7 +424,11 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         if self._compiled_kernel is not None:
             return
 
-        kernel = self._kernel(
+        kernel_class = self._select_kernel()
+        options = {}
+        if hasattr(kernel_class, "a_stages_for"):
+            options["a_stages"] = kernel_class.a_stages_for(self.a_desc.shape[1], self.expert_cnt)
+        kernel = kernel_class(
             sf_vec_size=self.sf_vec_size,
             acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
             use_2cta_instrs=self.use_2cta_instrs,
@@ -357,12 +439,18 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             weight_mode=self.weight_mode,
             input_order=self.input_order,
             sf_fp8_dtype_override=self.sf_fp8_dtype_override,
+            atomic_counter_claim=self.atomic_counter_claim,
+            use_pdl=self.use_pdl,
+            launch_pdl_dependents_at_entry=self.launch_pdl_dependents_at_entry,
+            pdl_mode=self.pdl_mode,
+            **options,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
         self._workspace_bytes = max(kernel.get_workspace_bytes(), 1)
         self._workspace = torch.empty(self._workspace_bytes, dtype=torch.uint8, device=self.a_desc.device)
+        self._scratch_nbytes = self._workspace_bytes if self.atomic_counter_claim else 0
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         if self.weight_mode == MoEWeightMode.DENSE:
@@ -374,6 +462,42 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             del self.sample_a_tensor
         if self.sample_b_tensor is not None:
             del self.sample_b_tensor
+
+    def _select_kernel(self):
+        """The stock kernel, or one of its variants with the same dW bits where it applies (``_dense_output_variants``):
+        the A-reuse variant when ``prefer_over_dense`` holds for the sample (short experts on average, from the token
+        extent of A and the expert count, and at least 3 work units of N tiles per M tile), else the global-descriptor
+        variant. SM100/SM103 and SM107 (Rubin) each have their own pair."""
+        import torch
+
+        if self.weight_mode != MoEWeightMode.DENSE:
+            return self._kernel
+        m, n = self.a_desc.shape[0], self.b_desc.shape[1]
+        c_bits = self.wgrad_dtype.itemsize * 8
+        has_global_scale = self.global_scale_a_desc is not None or self.global_scale_b_desc is not None
+        fp8 = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if (
+            self.a_desc.dtype in fp8
+            and self.sfa_desc.dtype == torch.float8_e8m0fnu
+            and self.sfb_desc.dtype == torch.float8_e8m0fnu
+            and self.acc_dtype == torch.float32
+            and BlockScaledMoEGroupedGemmWgradDenseKernel.supports_config(
+                sf_vec_size=self.sf_vec_size,
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                accumulate_on_output=self.accumulate_on_output,
+                weight_mode=self.weight_mode,
+                input_order=self.input_order,
+                sf_fp8_dtype_override=self.sf_fp8_dtype_override,
+            )
+            and BlockScaledMoEGroupedGemmWgradDenseKernel.can_implement(m, n, ab_bits=8, c_bits=c_bits, has_global_scale=has_global_scale)
+        ):
+            dense, reuse = _dense_output_variants(self._is_rubin_kernel)
+            if reuse.prefer_over_dense(m, n, ab_bits=8, c_bits=c_bits, has_global_scale=has_global_scale, tokens=self.a_desc.shape[1], experts=self.expert_cnt):
+                return reuse
+            return dense
+        return self._kernel
 
     def _compile_dense(self, kernel, max_active_clusters, fake_stream) -> None:
         a_fake = (
@@ -415,6 +539,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         gs_a_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_a_desc, assumed_align=4)
         gs_b_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_b_desc, assumed_align=4)
+        counter_fake = self._make_fake_cute_tensor_from_desc(self.scheduler_counter_desc, assumed_align=4)
 
         compiled = cute.compile(
             kernel,
@@ -430,6 +555,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             gs_a_fake,
             gs_b_fake,
             None,
+            counter_fake,
             options="--enable-tvm-ffi",
         )
         self._workspace_arg = from_dlpack(
@@ -449,6 +575,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             stream: cuda.CUstream,
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
+            scheduler_counter: Optional[torch.Tensor],
         ) -> None:
             compiled(
                 a_tensor,
@@ -462,6 +589,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 global_scale_a,
                 global_scale_b,
                 None,
+                scheduler_counter,
             )
 
         self._compiled_kernel = tensor_api
@@ -507,6 +635,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         gs_a_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_a_desc, assumed_align=4)
         gs_b_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_b_desc, assumed_align=4)
+        counter_fake = self._make_fake_cute_tensor_from_desc(self.scheduler_counter_desc, assumed_align=4)
         wgrad_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device=self.a_desc.device)
         wgrad_ptrs_fake = from_dlpack(wgrad_ptrs_placeholder, assumed_align=8, enable_tvm_ffi=True).iterator
         single_expert_fake = self._make_fake_cute_tensor(
@@ -530,6 +659,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             gs_a_fake,
             gs_b_fake,
             single_expert_fake,
+            counter_fake,
             options="--enable-tvm-ffi",
         )
 
@@ -561,6 +691,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             stream: cuda.CUstream,
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
+            scheduler_counter: Optional[torch.Tensor],
         ) -> None:
             compiled(
                 a_tensor,
@@ -574,9 +705,20 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 global_scale_a,
                 global_scale_b,
                 cached_single_expert,
+                scheduler_counter,
             )
 
         self._compiled_kernel = tensor_api
+
+    def _private_workspace_arg(self, workspace: torch.Tensor):
+        """The wrapper's per-call scratch (``execute_with_wrapper_workspace``) in place of the plan-owned workspace."""
+        import torch
+
+        self._value_error_if(
+            workspace.dtype != torch.uint8 or not workspace.is_contiguous() or workspace.numel() < self._workspace_bytes,
+            f"_workspace must be a contiguous uint8 buffer of at least {self._workspace_bytes} bytes",
+        )
+        return from_dlpack(workspace, assumed_align=128, enable_tvm_ffi=True)
 
     def execute(
         self,
@@ -591,11 +733,24 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        _workspace: Optional[torch.Tensor] = None,
+        scheduler_counter_tensor: Optional[torch.Tensor] = None,
     ) -> None:
+        """Launch the compiled wgrad on ``current_stream``.
+
+        :param scheduler_counter_tensor: The caller-owned int32 claim counter (see ``sample_scheduler_counter``);
+            required exactly when the object was built with one. The caller zeroes it on the stream before the first of
+            the launches that share it.
+        """
         import torch
 
         current_stream = self._get_default_stream(current_stream)
         self._runtime_error_if(self._compiled_kernel is None, "Kernel not compiled; call compile() first")
+        self._value_error_if(
+            (scheduler_counter_tensor is None) != (self.scheduler_counter_desc is None),
+            "scheduler_counter_tensor presence must match sample_scheduler_counter at construction",
+        )
+        validate_scheduler_counter(scheduler_counter_tensor, a_tensor)
 
         # The kernel rebuilds a flat SF layout from the A/B shapes, so the buffer itself is checked on every call.
         if sfa_tensor.ndim == 1 or sfb_tensor.ndim == 1:
@@ -608,7 +763,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         if self.weight_mode == MoEWeightMode.DENSE:
             self._value_error_if(wgrad_tensor is None, "wgrad_tensor is required in dense mode")
             if descriptor_workspace is None:
-                workspace_arg = self._workspace_arg
+                workspace_arg = self._workspace_arg if _workspace is None else self._private_workspace_arg(_workspace)
             else:
                 self._value_error_if(
                     descriptor_workspace.dtype != torch.uint8,
@@ -642,6 +797,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 current_stream,
                 global_scale_a,
                 global_scale_b,
+                scheduler_counter_tensor,
             )
             return
 
@@ -657,7 +813,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 wgrad_ptrs = torch.tensor(ptrs, dtype=torch.int64, device=wgrad_tensor.device)
         _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
         if descriptor_workspace is None:
-            workspace_arg = self._workspace_arg
+            workspace_arg = self._workspace_arg if _workspace is None else self._private_workspace_arg(_workspace)
         else:
             self._value_error_if(
                 descriptor_workspace.dtype != torch.uint8,
@@ -691,6 +847,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             current_stream,
             global_scale_a,
             global_scale_b,
+            scheduler_counter_tensor,
         )
 
 

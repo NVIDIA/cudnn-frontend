@@ -189,7 +189,7 @@ def ptr_offset_bytes(ptr: Pointer, byte_offset: int) -> Pointer:
 
 
 @dsl_user_op
-def tensormap_ptr_for_copy(raw_ptr: Pointer, *, loc=None, ip=None) -> Pointer:
+def tensormap_ptr_for_copy(raw_ptr: Pointer, *, acquire: bool = True, loc=None, ip=None) -> Pointer:
     """
     Convert a raw TMA descriptor gmem pointer to the type expected by cute.copy.
 
@@ -198,6 +198,7 @@ def tensormap_ptr_for_copy(raw_ptr: Pointer, *, loc=None, ip=None) -> Pointer:
 
     :param raw_ptr: Raw pointer to TMA descriptor in gmem
     :type raw_ptr: Pointer
+    :param acquire: False when the caller acquires the descriptor itself (``acquire_tma_desc``) before its TMA use
     :return: Pointer compatible with cute.copy's tma_desc_ptr parameter
     :rtype: Pointer
     """
@@ -205,7 +206,8 @@ def tensormap_ptr_for_copy(raw_ptr: Pointer, *, loc=None, ip=None) -> Pointer:
     # Kernel launch ordering does not invalidate the tensormap proxy cache.
     # A graph replay may rebuild this descriptor with a different allocation
     # address, so acquire the current descriptor before each expert's TMA use.
-    cpasync.fence_tma_desc_acquire(generic_ptr, loc=loc, ip=ip)
+    if acquire:
+        cpasync.fence_tma_desc_acquire(generic_ptr, loc=loc, ip=ip)
     tma_desc_ptr_ty = _cute_ir.PtrType.get(
         _cute_nvgpu_ir.TmaDescriptorTiledType.get(),
         generic_ptr.memspace,
