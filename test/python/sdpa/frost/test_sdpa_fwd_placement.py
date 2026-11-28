@@ -1755,8 +1755,8 @@ def test_sm107_paged_unpacked_short_q_keys_apart(monkeypatch):
 def test_sm100_paged_unpacked_short_q_keys_apart():
     """Study sm100_paged_unpacked_short_q_20261128: cc 10.0 / 10.3 paged THD d128 prefill whose plan runs unpacked and unsplit keys
     `prefill_short_q` up to SM100_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head, and at most SM100_PAGED_UNPACKED_WAVE_MAX_S_Q only
-    while its 2-CTA clusters fit one wave; the keyed graphs lead. One query past the bound, packed groups and windows keep their
-    classes."""
+    while its 2-CTA clusters fit one wave; the keyed graphs lead, f16 through DTYPE_TRANSFERS. One query past the bound, packed
+    groups and windows keep their classes."""
     from cudnn.sdpa import placement_table as pt
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
@@ -1775,6 +1775,8 @@ def test_sm100_paged_unpacked_short_q_keys_apart():
                     assert pt.matched_entry(spec.name, x).study == study
                     assert heuristics._knob_sets(spec, x)[0].cga == pt.PAGED_UNPACKED_CLUSTER_CTAS
                     assert placement.place(spec, x) == placement.LEAD
+                    x16 = f(h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=8 * s_q, dtype=cudnn.data_type.HALF)
+                    assert pt.matched_entry(spec.name, x16).study == study and placement.place(spec, x16) == placement.LEAD
         for h_q, h_kv in ((24, 8), (40, 8)):  # at most SM100_PAGED_UNPACKED_WAVE_MAX_S_Q: keyed and leading within one wave only
             for b in range(1, 9):
                 x = f(b=b, h_q=h_q, h_kv=h_kv, s_q=48, max_total_seq_len_q=b * 48)

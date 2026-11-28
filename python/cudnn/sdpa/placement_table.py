@@ -591,9 +591,19 @@ DTYPE_TRANSFERS: Dict[Tuple[str, str], Tuple[str, FrozenSet[str]]] = {
     ("sdpa_fwd_prefill_sm90", "f16"): ("bf16", frozenset({"sm90_d128_h100_refit_20261114"})),
     # study sm100_paged_f16_transfer_20261112: FlashInfer's exact paged f16 prefill timed against these studies' bf16 verdicts.
     # sm100_d256_decode_v4_924_20261116: 32 of its train cells timed in f16 (B200, cuDNN 9.24.0.43): regret 1.000, worst 1.015.
+    # sm100_paged_unpacked_short_q_20261128: study sm100_paged_unpacked_f16_transfer_20261128 timed f16 graphs of its classes against
+    # its bf16 entries (pre-registered holdouts, cuDNN 9.24.0.43): 60 changed cells per board ran 0.816 (B200, worst 1.038) and 0.661
+    # (B300, worst 0.864) of the measured default.
     ("sdpa_fwd_prefill_sm100", "f16"): (
         "bf16",
-        frozenset({"sm100_paged_d64_d256_prefill_20261111", "sm100_d256_paged_context_20261030", "sm100_d256_decode_v4_924_20261116"}),
+        frozenset(
+            {
+                "sm100_paged_d64_d256_prefill_20261111",
+                "sm100_d256_paged_context_20261030",
+                "sm100_d256_decode_v4_924_20261116",
+                "sm100_paged_unpacked_short_q_20261128",
+            }
+        ),
     ),
     # study f16_transfer_rubin_20261127: Rubin f16 paged / dense MTP and decode timed against these studies' bf16 verdicts (208 SMs, a
     # pre-registered 115-cell holdout): the 53 changed f16 cells ran 0.107 of the measured default, worst 1.031. f16 THD prefill is not
