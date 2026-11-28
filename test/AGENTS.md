@@ -224,6 +224,15 @@ torch 2.14 changed `clamp`'s backward exactly on the limit. State the kernel's c
 
 Keep `--dump-kernel-launches` out of the pass/fail sanitizer run: some builds count dump records in `ERROR SUMMARY`. Verify with a valid-memory control and a known-bad canary. Run racecheck for scratch reuse (sparse metadata, cross-warp reductions, paged rings, V-scale tails).
 
+For the dense SM100 indexer backward 2Q GEMM, run
+`test_DSA_dense_indexer_backward_staging_sync` under Synccheck. All TMEM
+users rendezvous at one counted instruction before the MMA, compute and
+reduce warp roles diverge. Separate wait sites with the same barrier ID
+can pass numerical tests and still trigger divergent-barrier errors.
+Also run `test_DSA_dense_indexer_backward_tmem_alloc_ptx`: Synccheck
+can pass even when allocator reconstruction changes the subset wait to
+the CTA-aligned PTX alias `bar.sync`.
+
 ## Determinism and batch invariance
 
 - The shared comparator checks bytes, names, shapes and dtypes. Clone each result before the next launch. Keep these suites in L0, including stress cases.
