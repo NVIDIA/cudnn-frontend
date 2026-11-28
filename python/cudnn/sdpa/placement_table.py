@@ -934,13 +934,13 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
     # study rubin_paged_unpacked_bands_20261128 (208-SM Rubin, a newer development cuDNN build; the inference harness's paged context
-    # graph, gen.py adapter inference_context, bf16; gen.py --constrained over the train pooled with the first holdout, 176 cells keyed
-    # prefill_short_q. Only those classes ship.)
+    # graph, gen.py adapter inference_context, bf16; gen.py --constrained over the train, an off-tile supplement and two holdouts pooled,
+    # 244 cells keyed prefill_short_q. Only those classes ship.)
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", False): Entry(
-        "le", 5.792, "rubin_paged_unpacked_bands_20261128", "tiles"
+        "le", 6.377, "rubin_paged_unpacked_bands_20261128", "tiles"
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", True): Entry(
-        "le", 5.792, "rubin_paged_unpacked_bands_20261128", "tiles"
+        "le", 6.085, "rubin_paged_unpacked_bands_20261128", "tiles"
     ),
     # study rubin_paged_unpacked_prefill_20261127 (208-SM Rubin, cuDNN 9.30.0.15; the inference harness's paged context graph, gen.py
     # adapter inference_context, bf16; gen.py --constrained over 280 train cells, 144 keyed prefill_cga_tile. Only those classes ship.)
