@@ -323,22 +323,26 @@ def _sm100_dense_split(row: str, facts) -> bool:
 
 
 SM107_PAGED_CGA_TILE_S_Q = (128, 256)  # Rubin paged THD d128 unpacked prefill keyed `prefill_cga_tile` for lo < S_q <= hi
+SM107_PAGED_UNPACKED_SHORT_MAX_S_Q = 64  # ... and `prefill_short_q` up to this S_q
 
 
-def _sm107_paged_unpacked_cga_tile(row: str, facts) -> bool:
-    """Rubin paged THD d128 causal prefill whose plan runs unpacked (MHA and the groups the row does not pack) and unsplit, with
-    each head's queries past one 128-row tile but inside one 2-CTA Q tile. The backend's mid-length engine takes these, and
-    FROST's standing against it moves with the query rows, unlike the one-tile chunks below or the longer chunks above
-    (study rubin_paged_unpacked_prefill_20261127), so they key apart, read from the row's own pack and split decisions."""
-    lo, hi = SM107_PAGED_CGA_TILE_S_Q
-    if row != "sdpa_fwd_prefill_sm107" or not (facts.has_paged_kv and facts.thd) or (facts.d_qk, facts.d_v) != (128, 128) or not lo < facts.s_q <= hi:
-        return False
+def _sm107_paged_unpacked_band(row: str, facts) -> Optional[str]:
+    """Rubin paged THD d128 causal prefill whose plan runs unpacked (MHA and the groups the row does not pack) and unsplit, keyed by
+    query length where FROST's standing against the backend moves with the query rows unlike the rest of the class: up to
+    SM107_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head (`prefill_short_q`; study rubin_paged_unpacked_bands_20261128), and past one
+    128-row tile but inside one 2-CTA Q tile (`prefill_cga_tile`; study rubin_paged_unpacked_prefill_20261127). Read from the row's own
+    pack and split decisions."""
+    if row != "sdpa_fwd_prefill_sm107" or not (facts.has_paged_kv and facts.thd) or (facts.d_qk, facts.d_v) != (128, 128):
+        return None
     if not (facts.causal and facts.bottom_right) or facts.window_left is not None or facts.has_sink or facts.right_band_widening:
-        return False
+        return None
     from cudnn.sdpa.fwd import heuristics
 
     caps = heuristics.sm100_legacy_policy_spec(row).capabilities
-    return not heuristics._prefer_thd_pack_gqa(caps, facts) and heuristics.paged_thd_split_choice(caps, facts)[0] == 1
+    if heuristics._prefer_thd_pack_gqa(caps, facts) or heuristics.paged_thd_split_choice(caps, facts)[0] != 1:
+        return None
+    lo, hi = SM107_PAGED_CGA_TILE_S_Q
+    return "prefill_short_q" if facts.s_q <= SM107_PAGED_UNPACKED_SHORT_MAX_S_Q else "prefill_cga_tile" if lo < facts.s_q <= hi else None
 
 
 def _sm107_thd_split(row: str, facts) -> bool:
@@ -393,8 +397,8 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         # per head: FlashInfer's short-row declaration, and SM100 paged D64 (FROST 0.24-0.46 of the backend past a 2k cache,
         # 0.67-1.08 above one Q tile; study sm100_paged_d64_d256_prefill_20261111).
         phase = "prefill_short_q"
-    if phase == "prefill" and _sm107_paged_unpacked_cga_tile(row, facts):
-        phase = "prefill_cga_tile"
+    if phase == "prefill":
+        phase = _sm107_paged_unpacked_band(row, facts) or phase
     if phase == "prefill" and _sm107_thd_split(row, facts):
         phase = "prefill_split"
     if getattr(facts, "deterministic", False):
@@ -926,6 +930,21 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "window", False, "gqa", True): Entry("ge", 29.0, "sm107_window_gaps_20261118"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
+    # study rubin_paged_unpacked_bands_20261128 (208-SM Rubin, a newer development cuDNN build; the inference harness's paged context
+    # graph, gen.py adapter inference_context, bf16; gen.py --constrained --two-feature over the pooled train, 200 cells keyed
+    # prefill_short_q. Only those classes ship.)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", False): Entry(
+        "le", 7.904, "rubin_paged_unpacked_bands_20261128", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", True): Entry(
+        "le", 6.5, "rubin_paged_unpacked_bands_20261128", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", False): Entry(
+        "ge", 12.5, "rubin_paged_unpacked_bands_20261128", "kv", ("ge", 4.5, "q")
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", True): Entry(
+        "le", 34.883, "rubin_paged_unpacked_bands_20261128", "cost", ("ge", 13.028, "kv")
+    ),
     # study rubin_paged_unpacked_prefill_20261127 (208-SM Rubin, cuDNN 9.30.0.15; the inference harness's paged context graph, gen.py
     # adapter inference_context, bf16; gen.py --constrained over 280 train cells, 144 keyed prefill_cga_tile. Only those classes ship.)
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile", "paged", "causal_br", False, "gqa", False): Entry(

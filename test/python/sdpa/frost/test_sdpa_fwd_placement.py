@@ -1706,6 +1706,41 @@ def test_sm107_paged_unpacked_cga_tile_keys_apart(monkeypatch):
 
 
 @pytest.mark.L0
+def test_sm107_paged_unpacked_short_q_keys_apart(monkeypatch):
+    """Study rubin_paged_unpacked_bands_20261128: Rubin paged THD d128 prefill whose plan runs unpacked and unsplit, with at most
+    SM107_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head, keys `prefill_short_q`. GQA leads small launches and trails large ones,
+    monotone in the launch; MHA leads over a long cache and trails over a short one. Longer queries, packed groups, split MHA and other
+    rows keep their classes."""
+    from cudnn.frost import buffers
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107")
+    q = pt.SM107_PAGED_UNPACKED_SHORT_MAX_S_Q
+    # b 8: enough units that groups 2 and MHA, which the row can split over KV, run unsplit
+    base = dict(b=8, h_q=24, h_kv=8, s_q=q, s_kv=8192, page_size=16, max_total_seq_len_q=8 * q, device_sm_count=208)
+    f = lambda **over: _sm107_paged_facts(**{**base, **over})
+    for h_q, h_kv in ((24, 8), (40, 8), (48, 8), (28, 4), (32, 16), (32, 32)):  # groups 3, 5, 6, 7, 2 and MHA run unpacked
+        for s_kv in (8192, 8192 + 1):  # on and off the KV tile
+            assert pt.class_key(spec.name, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv))[4] == "prefill_short_q"
+            assert pt.matched_entry(spec.name, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv)).study == "rubin_paged_unpacked_bands_20261128"
+    for s_kv in (8192, 8192 + 1):
+        verdicts = [placement.place(spec, f(b=b, s_kv=s_kv, max_total_seq_len_q=b * q)) for b in (1, 2, 4, 8, 16, 32, 64)]
+        assert verdicts[0] == placement.LEAD and verdicts[-1] == placement.TRAIL, s_kv
+        assert verdicts == sorted(verdicts, key=lambda v: v == placement.TRAIL), s_kv  # once trailing, a larger launch trails
+    mha = lambda **over: f(h_q=32, h_kv=32, **over)
+    assert placement.place(spec, mha(s_kv=32768)) == placement.LEAD
+    assert placement.place(spec, mha(s_kv=2048)) == placement.TRAIL
+    assert pt.class_key(spec.name, f(s_q=q + 1, max_total_seq_len_q=8 * (q + 1)))[4] == "prefill"
+    assert pt.class_key(spec.name, f(h_q=32, h_kv=8))[4] == "prefill"  # the row packs group 4
+    split = f(h_q=4, h_kv=4, s_kv=90112)
+    assert pt.class_key(spec.name, split)[4::4] == ("prefill", "mha_split")
+    assert pt.class_key(spec.name, f(window_left=128))[4] == "prefill"
+    assert pt.class_key("sdpa_fwd_prefill_sm100", f(device_cc=(10, 0), device_sm_count=148))[4] == "prefill"  # Rubin's row only
+
+
+@pytest.mark.L0
 def test_sm107_thd_d128_split_keys_apart_and_leads(monkeypatch):
     """Study rubin_thd_d128_longkv_20261127: Rubin exact nonpaged THD d128 prefill whose plan splits over KV keys `prefill_split`, has no
     entry, and leads through the row's split rule (FROST's shared single-Q body ran 0.10-1.00 of the backend across caches up to
