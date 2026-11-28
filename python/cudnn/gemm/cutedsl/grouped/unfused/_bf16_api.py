@@ -18,6 +18,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.cpp_launcher import launch, scratch
 from cudnn.frost.workspace import Workspace
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
@@ -33,7 +34,7 @@ from cudnn.tensor_adapter import (
     is_torch_tensor,
 )
 
-from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values, kernel_stream
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm import MoEGroupedGemmBf16Kernel
@@ -444,8 +445,11 @@ class GroupedGemmBf16API(APIBase):
             stream: cuda.CUstream,
             workspace=None,
         ) -> None:
+            if workspace is None:
+                scratch(self._workspace)
             b_arg = b_tensor if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(b_ptrs))
-            raw_compiled(
+            launch(
+                raw_compiled,
                 a_tensor,
                 b_arg,
                 cached_n,
@@ -458,7 +462,7 @@ class GroupedGemmBf16API(APIBase):
                 alpha_tensor,
                 bias_tensor,
                 prob_tensor,
-                stream,
+                kernel_stream(stream),
             )
 
         self._compiled_kernel = tensor_api

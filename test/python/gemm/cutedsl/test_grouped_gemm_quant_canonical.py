@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from cudnn.api_base import get_device_type
-from gemm.cutedsl.test_grouped_gemm_wrapper_memo import mxfp8_inputs
+from gemm.cutedsl.test_grouped_gemm_wrapper_memo import install_memo, mxfp8_inputs
 from gemm.cutedsl.test_grouped_gemm_glu_canonical import assert_outputs_equal, natural_inputs
 
 pytestmark = pytest.mark.L0
@@ -99,7 +99,7 @@ def test_quant_cache_keeps_each_devices_workspace(monkeypatch):
 
     if torch.cuda.device_count() < 2 or torch.cuda.get_device_capability(0) != torch.cuda.get_device_capability(1):
         pytest.skip("requires two CUDA devices with the same compute capability")
-    monkeypatch.setattr(api, "_quant_wrapper_memo", {})
+    install_memo(monkeypatch, api, "_quant_wrapper_memo")
     monkeypatch.setattr(api, "_cache_of_GroupedGemmQuantSm100Objects", {})
     execute = api.GroupedGemmQuantSm100.execute
 
@@ -146,7 +146,7 @@ def test_quant_canonical_dynamic_m_reuses_compilation(monkeypatch, dynamic):
     from cudnn.gemm.cutedsl.grouped.quant import api
 
     monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", dynamic)
-    monkeypatch.setattr(api, "_quant_wrapper_memo", {})
+    install_memo(monkeypatch, api, "_quant_wrapper_memo")
     monkeypatch.setattr(api, "_cache_of_GroupedGemmQuantSm100Objects", {})
     inputs = natural_inputs(mxfp8_inputs([512] * 4))
     quant_call(inputs, generate_amax=False)
@@ -233,7 +233,7 @@ def test_quant_canonical_nvfp4():
 def test_quant_memo_environment_controls(monkeypatch):
     from cudnn.gemm.cutedsl.grouped.quant import api
 
-    monkeypatch.setattr(api, "_quant_wrapper_memo", {})
+    install_memo(monkeypatch, api, "_quant_wrapper_memo")
     monkeypatch.setattr(api, "_cache_of_GroupedGemmQuantSm100Objects", {})
     inputs = natural_inputs(mxfp8_inputs([512] * 4))
     for dynamic, margin in (("1", "0"), ("0", "0"), ("1", "8"), ("1", "0")):

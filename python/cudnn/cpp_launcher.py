@@ -37,7 +37,11 @@ call's (up to 256 bytes), or they overlap each other differently (overlapping
 tensors must sit at the same byte offset from each other as in the recorded call). The key also
 holds the current CUDA device and the environment variables the function names
 (``cpp_launched(env=...)``). Each function keeps its 256 most recently used
-signatures (``CUDNN_FRONTEND_CPP_LAUNCHER_MAX``).
+signatures (``CUDNN_FRONTEND_CPP_LAUNCHER_MAX``); use is tracked once it holds more than half of them.
+
+A launched call still computes its key and allocates what it returns. What each argument adds to the key is decided
+once per combination of argument types (:func:`signature`), so a call reads its tensors' metadata and its values and
+nothing else.
 
 ``CUDNN_FRONTEND_CPP_LAUNCHER`` (read at import): ``0`` turns the launcher off;
 ``verify`` checks every call instead of speeding it up (the call runs,
@@ -50,8 +54,10 @@ import collections
 import contextlib
 import functools
 import inspect
+import itertools
 import json
 import logging
+import math
 import os
 import struct
 import sys
@@ -59,7 +65,7 @@ import threading
 import types
 import weakref
 from numbers import Integral, Rational, Real
-from operator import itemgetter
+from operator import attrgetter, itemgetter
 
 from cudnn._tupledict import TupleDict
 
@@ -84,6 +90,7 @@ _FACTORIES = _EMPTY | set(_FILL_VALUES) | {"full", "full_like", "new_full"}
 _ARENA_ALIGN = 512
 _ALIGN_LIMIT = 256  # the largest alignment of an argument tensor a later call must keep
 _all_recordings = []  # every function's recordings, released at exit before the extension unloads
+_signatures = itertools.count()  # one number per combination of argument types, env and stream parameter
 _torch = None  # torch, imported on first use
 _raw_current_stream = None  # cudnn._torch_stream._raw_current_stream
 _stream_types = None
@@ -136,6 +143,7 @@ def cpp_launched(fn=None, *, env=(), stream=None):
     if not ENABLED or any(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in parameters):
         return fn
     bind = _binder(parameters)
+    env = tuple(env)
     stream = next((i for i, p in enumerate(parameters) if p.name == stream), None)
     if VERIFY:
         return _verified(fn, bind, env, stream)
@@ -143,6 +151,7 @@ def cpp_launched(fn=None, *, env=(), stream=None):
     _all_recordings.append(recordings)
     first = parameters[0].name if parameters else None
     warm = {}  # the first argument's shape -> calls seen with it, up to half of HOT_CALLS
+    keyers = {}  # the types of a call's values -> its key function
 
     @functools.wraps(fn)
     def run(*args, **kwargs):
@@ -160,17 +169,22 @@ def cpp_launched(fn=None, *, env=(), stream=None):
             hot -= hot // 2
         try:
             values = bind(args, kwargs)
-            key = _key(values, env, stream)
+            types = tuple(map(type, values))
+            keyer = keyers.get(types)
+            if keyer is None:
+                keyer = keyers[types] = signature(types, env, stream)
+            key = keyer(values)
             state = recordings.get(key, 0)
         except (TypeError, KeyError):  # a call fn itself rejects, or an argument the key cannot hold
             return fn(*args, **kwargs)
         if type(state) is not int:
             if getattr(_state, "capture", None) is not None:  # inside another call's recording, which has to see these launches
                 return fn(*args, **kwargs)
-            try:
-                recordings.move_to_end(key)
-            except KeyError:  # another thread dropped it
-                pass
+            if 2 * len(recordings) > MAX_RECORDINGS:  # recency only matters once signatures may be dropped
+                try:
+                    recordings.move_to_end(key)
+                except KeyError:  # another thread dropped it
+                    pass
             result = state(values)
             return fn(*args, **kwargs) if result is _NOT_REPLAYED else result
         if state < 0 or state + 1 < hot or getattr(_state, "capture", None) is not None:  # not hot, gave up, or inside a recording
@@ -230,13 +244,78 @@ def _tensor_types():
 
 
 def _key(values, env, stream):
+    return signature(tuple(map(type, values)), tuple(env), stream)(values)
+
+
+@functools.lru_cache(maxsize=None)
+def signature(types, env, stream):
+    """The key function of calls whose values have ``types``: values -> key.
+
+    What an argument adds to the key follows from its type, and deciding that per argument is most of a key's time,
+    so it is decided once per combination of types; a call then reads each kind of argument in one pass."""
     torch = _torch or _load()
-    items = [v if type(v) in _VALUES else _item(v) for v in values]
-    if stream is not None and values[stream] is not None and values[stream] is not _MISSING:
-        items[stream] = _launch_stream(values[stream])
-    # equal values of different types (0, False, 0.0) are different arguments
-    key = (tuple(items), tuple(map(type, values)), torch.cuda.current_device())
-    return key + tuple(map(os.environ.get, env)) if env else key
+    ident = next(_signatures)  # equal values of different types (0, False, 0.0) are different arguments
+    plain, tensors, floats, streams, sequences, others = [], [], [], [], [], []
+    for i, t in enumerate(types):
+        if i == stream and t not in (type(None), object):
+            streams.append(i)
+        elif t in _VALUES:
+            plain.append(i)
+        elif t is float:
+            floats.append(i)
+        elif issubclass(t, torch.Tensor):
+            tensors.append(i)
+        elif stream_type(t):
+            streams.append(i)
+        elif issubclass(t, (list, tuple)):
+            sequences.append(i)
+        elif issubclass(t, Real) and not issubclass(t, Rational):
+            others.append(i)
+        else:
+            plain.append(i)
+    pick_plain, pick_tensors, pick_floats = picker(plain), picker(tensors), picker(floats)
+    meta, stride, sign, ones, cuda = attrgetter("dtype", "shape", "device"), torch.Tensor.stride, math.copysign, itertools.repeat(1.0), torch.cuda
+    read = environment(env)
+
+    def key(values):
+        device = cuda.current_device()
+        given, numbers = pick_tensors(values), pick_floats(values)
+        # 0.0 == -0.0, and they are different arguments
+        key = (ident, device, pick_plain(values), tuple(map(meta, given)), tuple(map(stride, given)), numbers, tuple(map(sign, ones, numbers)))
+        if streams:  # whether it is torch's current stream decides which allocations a recording can place on it
+            current = _current_stream(device)
+            key += tuple([_stream_handle(values[i]) == current for i in streams])
+        if sequences:
+            key += tuple([sequence(values[i]) for i in sequences])
+        if others:
+            key += tuple([_item(values[i]) for i in others])
+        return key + read() if env else key
+
+    return key
+
+
+def picker(indices):
+    """values -> the tuple of those at ``indices``."""
+    if len(indices) > 1:
+        return itemgetter(*indices)
+    if indices:
+        (i,) = indices
+        return lambda values: (values[i],)
+    return lambda values: ()
+
+
+def environment(names):
+    """() -> the values of the environment variables ``names``, from ``os.environ``'s own table where it has one."""
+    encode = getattr(os.environ, "encodekey", None)
+    keys = tuple(map(encode, names)) if encode else names
+
+    def read():
+        table = getattr(os.environ, "_data", None)
+        if table is None or encode is None:
+            return tuple(map(os.environ.get, names))
+        return tuple(map(table.get, keys))
+
+    return read
 
 
 def _item(v):
@@ -247,9 +326,7 @@ def _item(v):
     if _stream_like(v):
         return _launch_stream(v)
     if isinstance(v, (list, tuple)):
-        if any(isinstance(x, _torch.Tensor) for x in _flatten(v)):
-            raise TypeError("a tensor inside a sequence")
-        return tuple((type(x), _item(x)) for x in v)
+        return sequence(v)
     hash(v)
     if isinstance(v, Real) and not isinstance(v, Rational):  # a float subclass, a numpy float: equal values of other bits
         try:
@@ -257,6 +334,16 @@ def _item(v):
         except Exception:  # a number that gives no double keys by its value alone
             pass
     return v
+
+
+def sequence(v):
+    """The key of a list or tuple argument."""
+    types = tuple(map(type, v))
+    if _VALUES.issuperset(types):
+        return types, tuple(v)
+    if any(isinstance(x, _torch.Tensor) for x in _flatten(v)):
+        raise TypeError("a tensor inside a sequence")
+    return tuple((type(x), _item(x)) for x in v)
 
 
 def _launch_stream(v):
@@ -274,12 +361,16 @@ class _Stream:
 
 
 def _stream_like(v):
+    return stream_type(type(v))
+
+
+def stream_type(t):
     global _stream_types
     if _stream_types is None:
         from cuda.bindings import driver as cuda
 
         _stream_types = cuda.CUstream
-    return isinstance(v, _stream_types) or hasattr(type(v), "__cuda_stream__")
+    return issubclass(t, _stream_types) or hasattr(t, "__cuda_stream__")
 
 
 def _stream_handle(v):
@@ -660,6 +751,7 @@ class _Recording:
             if offset:
                 raise _Decline("a returned tensor is not at the start of its allocation")
             self.outputs.append((shape, None if stride == _dense_stride(shape) else stride, dtype, on_launch_stream(a)))
+        self.dense = [(shape, stride or _dense_stride(shape), dtype) for shape, stride, dtype, _ in self.outputs]
         self.arenas = []  # (bytes, on the launch stream)
         placed = {}  # allocation index -> (slot, offset) in an arena
         for launch_stream in (False, True):
@@ -721,10 +813,7 @@ class _Recording:
         torch, device = self.torch, self.device
         empty, strided, byte = torch.empty, torch.empty_strided, torch.uint8
         if not self.side or _current_stream(device) == stream:
-            buffers = [
-                empty(shape, dtype=dtype, device=device) if stride is None else strided(shape, stride, dtype=dtype, device=device)
-                for shape, stride, dtype, _ in self.outputs
-            ]
+            buffers = [strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype in self.dense]  # faster than torch.empty
             buffers.extend([empty(size, dtype=byte, device=device) for size, _ in self.arenas])
             return buffers
         side = torch.cuda.ExternalStream(stream, device=device)
