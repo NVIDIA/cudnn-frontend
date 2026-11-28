@@ -48,12 +48,14 @@ __all__ = [
     "_reference_forward",
     "_replay_cuda_graph",
     "_require_distributed_sm107",
+    "_require_distributed_training",
     "_run_grouped_wgrad_kernel",
     "_run_isolated",
     "_sm107_device",
     "_stress_backend_reuse",
     "_training_abi_prepared",
     "_training_config",
+    "_training_device",
     "_training_graph_pattern",
     "_training_prepared_pair",
     "make_distributed_forward_inputs",
@@ -800,6 +802,37 @@ def _require_distributed_sm107(world_size: int) -> None:
         pytest.skip("multi-GPU Rubin MXFP8 forward requires NVSHMEM")
 
 
+def _require_training_architecture(device: torch.device) -> None:
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+    try:
+        architecture_for(torch.cuda.get_device_capability(device))
+    except NotImplementedError as error:
+        pytest.skip(str(error))
+
+
+def _training_device() -> torch.device:
+    if not torch.cuda.is_available():
+        pytest.skip("MegaMoE MXFP8 training requires CUDA")
+    device = torch.device("cuda", 0)
+    _require_training_architecture(device)
+    return device
+
+
+def _require_distributed_training(world_size: int) -> None:
+    if not dist.is_available() or not dist.is_nccl_available():
+        pytest.skip("multi-GPU MegaMoE MXFP8 training requires NCCL")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"multi-GPU MegaMoE MXFP8 training requires {world_size} GPUs")
+    if len({torch.cuda.get_device_capability(index) for index in range(world_size)}) != 1:
+        pytest.skip("multi-GPU MegaMoE MXFP8 training requires one GPU architecture on every rank")
+    _require_training_architecture(torch.device("cuda", 0))
+    try:
+        import nvshmem.core  # noqa: F401
+    except (ImportError, OSError):
+        pytest.skip("multi-GPU MegaMoE MXFP8 training requires NVSHMEM")
+
+
 def _make_forward_case(
     device: torch.device,
     *,
@@ -1226,34 +1259,49 @@ def _run_grouped_wgrad_kernel(
     )["wgrad_tensor"]
 
 
-def _training_wgrad_unavailable_reason() -> str | None:
-    """Why ``MoeEp.training_wgrad`` cannot run with the installed DSL, or None."""
+def _training_wgrad_unavailable_reason(device) -> str | None:
+    """Why ``MoeEp.training_wgrad`` cannot run on ``device`` with the installed DSL, or None."""
 
     from cudnn.moe_ep._megamoe_backend.mxfp8._wgrad_compile import wgrad_unavailable_reason
 
-    return wgrad_unavailable_reason()
+    return wgrad_unavailable_reason(torch.cuda.get_device_capability(device))
 
 
-def _require_training_wgrad() -> None:
-    """Skip below the Rubin DSL floor; above it, fail: every supported DSL (public 4.8.0 and later) runs training WGrad."""
+def _require_training_wgrad(device) -> None:
+    """Skip below the MegaMoE DSL floor; above it, fail: every supported DSL (public 4.8.0 and later) runs training WGrad."""
 
-    from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import require_rubin_cutedsl
+    from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import require_megamoe_cutedsl
 
     try:
-        require_rubin_cutedsl()
+        require_megamoe_cutedsl()
     except RuntimeError as error:
         pytest.skip(str(error))
-    reason = _training_wgrad_unavailable_reason()
+    reason = _training_wgrad_unavailable_reason(device)
     if reason is not None:
         pytest.fail(f"MoeEp training WGrad is unavailable on a supported DSL: {reason}")
 
 
+def _training_wgrad_supported(device) -> bool:
+    """Whether the device architecture has a vendored WGrad kernel."""
+
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+    return architecture_for(torch.cuda.get_device_capability(device)).supports_training_wgrad
+
+
 def _allocate_training_wgrad_outputs(expected, dtype=torch.bfloat16):
-    """Dense GEMM-oriented dW destinations."""
+    """Dense GEMM-oriented dW destinations; None on an architecture without a WGrad kernel.
+
+    Training tests that run on every training architecture then still check
+    forward, backward and the WGrad operands there; the WGrad helpers below
+    pass None through.
+    """
 
     from cudnn.moe_ep import MoeEpTrainingWgradOutputs
 
-    _require_training_wgrad()
+    if not _training_wgrad_supported(expected[0].device):
+        return None
+    _require_training_wgrad(expected[0].device)
     return MoeEpTrainingWgradOutputs(
         fc1=torch.empty_like(expected[0], dtype=dtype),
         fc2=torch.empty_like(expected[1], dtype=dtype),
@@ -1261,8 +1309,10 @@ def _allocate_training_wgrad_outputs(expected, dtype=torch.bfloat16):
 
 
 def _run_training_wgrad(op, operands, outputs):
-    """Run MoeEp WGrad into preallocated outputs."""
+    """Run MoeEp WGrad into preallocated outputs; None when ``outputs`` is None."""
 
+    if outputs is None:
+        return None
     for tensor in (outputs.fc1, outputs.fc2):
         tensor.fill_(float("nan"))
     op.training_wgrad(operands, out=outputs)
@@ -1270,8 +1320,10 @@ def _run_training_wgrad(op, operands, outputs):
 
 
 def _assert_training_wgrads_match(actual, expected, *, grouped=None) -> None:
-    """MoeEp WGrad vs the reference, and byte-equal to FE grouped WGrad when given."""
+    """MoeEp WGrad vs the reference, and byte-equal to FE grouped WGrad when given; skipped for None."""
 
+    if actual is None:
+        return
     _assert_grouped_wgrads_match_reference(
         actual,
         expected,

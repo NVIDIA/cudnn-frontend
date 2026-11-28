@@ -13,17 +13,20 @@ documented in the parent backend `README.md`.
   `1fd8c51fd64640da21c8cc45e95c19d0de35da19`.
 - **Discrete-weight implementation ancestor**:
   `7cc8d2eb2fb2fc9643ccd6244d6c810ed9f4341b`.
-- **Last synced**: 2026-11-18; the WGrad closure was added on 2026-11-19 at
-  the same commit.
+- **Last synced**: 2026-11-18; the WGrad closure was added on 2026-11-19 and
+  the Blackwell training kernels on 2026-11-22, both at the same commit.
 - **Vendored subset**: the exact export closure produced for
-  `RubinTrainingFwdGluMegaMoE`, `RubinTrainingBwdDgluMegaMoE`, and
-  `RubinTrainingWgrad`, including the materialized source copy
+  `RubinTrainingFwdGluMegaMoE`, `RubinTrainingBwdDgluMegaMoE`,
+  `RubinTrainingWgrad`, `BlackwellTrainingFwdGluMegaMoE`, and
+  `BlackwellTrainingBwdDgluMegaMoE`, including the materialized source copy
   `kernel_src/rubin/custom_mix_cga_helpers.py` (from
-  `kernel_src/blackwell/custom_mix_cga_helpers.py`).
-- **Raw exported source files**: 46 (plus 14 generated package markers).
-- **Expected vendored Python files**: 60 after the local overlay.
+  `kernel_src/blackwell/custom_mix_cga_helpers.py`). Adding the Blackwell
+  kernels to the export leaves every Rubin and shared file byte-identical to
+  the Rubin-only export.
+- **Raw exported source files**: 58 (plus 20 generated package markers).
+- **Expected vendored Python files**: 78 after the local overlay.
 - **Expected vendored Python tree SHA256**:
-  `40f0913abd57b3ccccf885e84d0ed450abef6152e6985056e7d905fad3077233`.
+  `c758e5c99de9ee985409209c023a2e606ed3cd1874856e409ed10d7ed9991d70`.
   This uses the same relative-path-and-content algorithm as
   `_megamoe_backend.mxfp8._fingerprint.source_tree_sha256`.
 
@@ -33,6 +36,7 @@ The export command, run from the upstream repository root, is:
 python export_src.py \
   --kernels RubinTrainingFwdGluMegaMoE RubinTrainingBwdDgluMegaMoE \
     RubinTrainingWgrad \
+    BlackwellTrainingFwdGluMegaMoE BlackwellTrainingBwdDgluMegaMoE \
   --dst_dir <empty-directory>
 ```
 
@@ -53,6 +57,11 @@ modules.
 - Comments, docstrings and error-message text may be worded differently from
   upstream, for example to keep them self-contained. Such wording-only
   differences are not listed below.
+- Temporary exception: the MoeEP `data_token_capacity` and row-major
+  column-requantization overlays and the token-back write drain below are
+  carried in the Rubin and the Blackwell kernel copies instead of going
+  upstream first. Once upstream provides equivalent options and the drain,
+  remove every copy of these overlays and this exception.
 
 The synchronized Python sources use BSD-3-Clause SPDX identifiers.
 `LICENSE.Apache-2.0` is retained as historical snapshot metadata.
@@ -62,29 +71,68 @@ The synchronized Python sources use BSD-3-Clause SPDX identifiers.
 - The root `cutedsl_src/__init__.py` is a package marker rather than the
   exporter's eager kernel re-export. The integration imports concrete kernel
   implementation modules.
-- The forward MegaMoE column-requantization output keeps MoeEP's established
-  row-major WGrad operand ABI: fake stride `(1, 0)`, `dst_k_major=False`, and
-  row-major fixed-matrix validation. This preserves `fc1_a` as
-  `(pool_rows, hidden)` with stride `(hidden, 1)`.
+- The Rubin and Blackwell forward MegaMoE column-requantization outputs keep
+  MoeEP's established row-major WGrad operand ABI: fake stride `(1, 0)`,
+  `dst_k_major=False`, and row-major fixed-matrix validation. This preserves
+  `fc1_a` as `(pool_rows, hidden)` with stride `(hidden, 1)`.
+- The Blackwell forward MegaMoE kernel additionally does not pass
+  `previous_expert_token_sizes` to the column requantizer. Upstream's
+  retired-row clearing zeroes the capacity tail left by a larger previous
+  launch and supports only K-major output; MoeEP leaves the row-major capacity
+  tail unspecified, and the Rubin forward kernel has no such clearing. The
+  previous-size snapshot region is still allocated and maintained, but unused.
 - MoeEP supplies an optional `data_token_capacity` physical-row count
   independently from the upstream `max_recv_size_per_rank` logical route
-  limit. The deterministic communication component defaults the new field to
-  upstream's padded logical capacity for non-MoeEP consumers, while MoeEP
-  always supplies its exact caller-prescribed pool rows. Upstream topology
-  clamps remain intact, and the component rejects physical capacity below the
-  padded requirement for the clamped logical limit.
+  limit. The Rubin and Blackwell forward and backward MegaMoE kernels pass it
+  to the deterministic communication component. The component defaults the
+  new field to upstream's padded logical capacity for non-MoeEP consumers,
+  while MoeEP always supplies its exact caller-prescribed pool rows. Upstream
+  topology clamps remain intact, and the component rejects physical capacity
+  below the padded requirement for the clamped logical limit.
+- The Rubin forward, Rubin backward and Blackwell forward MegaMoE kernels call
+  `cp_async_bulk_wait_group(0)` after `token_back`, on the transfer warps and
+  on the standalone token-back warps, before the CTA tail barrier.
+  `TokenCommDeterministic.token_back` waits only until its bulk copies have
+  read shared memory, and the cross-rank barrier in `reset_tail` does not
+  complete pending bulk writes. Without the wait, a peer can leave that
+  barrier while rows or scales sent to it are still being written. Upstream's
+  Blackwell backward kernel already waits this way, so all four kernels now
+  match.
 - Repository-required copyright and BSD-3-Clause SPDX headers are added to
-  generated empty package markers.
+  generated empty package markers and to the Blackwell
+  `kernel_src/blackwell/training/mega/bwd_dglu/dgrad_config.py`, which
+  upstream ships without one.
 
 No other vendored Python code differences are expected.
+
+Except for the Blackwell retired-row clearing removal and the Rubin backward
+token-back drain, which upstream's Blackwell backward kernel already has, the
+overlay hunks in each Rubin and Blackwell MegaMoE kernel pair are textually
+identical.
 
 The group-consistent overflow policy, previously a local difference, is
 upstream as of this snapshot: every rank derives the same group-wide overflow
 bit from the replicated pre-truncation destination totals, while only the
 overflowing destination truncates its local expert sizes. The export closure
 no longer reaches Blackwell swap-AB extension types, so the former `Any`
-annotation overlay and the omitted `kernel_src/blackwell` package tree are no
-longer needed.
+annotation overlay is no longer needed. `kernel_src/blackwell` holds only the
+Blackwell training MegaMoE closure.
+
+## Synchronization procedure
+
+1. Export the five kernels listed above at the target upstream commit into an
+   empty directory.
+2. Reapply every local difference listed above to the Rubin and the Blackwell
+   copies, and carry over the wording-only changes to comments, docstrings
+   and error messages from the previously vendored tree.
+3. For each forward and backward MegaMoE kernel, diff the Rubin and Blackwell
+   overlay hunks against the export. They must match, except for the
+   Blackwell retired-row clearing removal and the Rubin backward token-back
+   drain. After the overlay, the token-comm hooks of each Rubin and Blackwell
+   kernel pair are identical.
+4. Run `test_vendored_mega_kernels_keep_data_token_capacity_overlay` in
+   `test/python/moe_ep/test_moe_ep_forward.py`.
+5. Update the upstream commit, file counts and tree SHA256 in this file.
 
 Public `nvidia-cutlass-dsl` 4.8.0 and 4.8.1 do not provide
 `PipelineUmmaAsync.create(defer_init=...)`. Upstream's forward fused FC1/FC2
@@ -121,10 +169,12 @@ The vendored Rubin sources require a CUTLASS DSL distribution that provides
 
 ## Consumers
 
-- `_megamoe_backend/mxfp8/_compile.py`: Rubin MXFP8 forward preparation and
-  compilation.
-- `_megamoe_backend/mxfp8/_backward_compile.py`: Rubin MXFP8 backward dGLU
+- `_megamoe_backend/mxfp8/_arch.py`: per-architecture selection of the Rubin
+  SM107 and Blackwell SM100 forward and backward kernel classes.
+- `_megamoe_backend/mxfp8/_compile.py`: Rubin and Blackwell MXFP8 forward
   preparation and compilation.
+- `_megamoe_backend/mxfp8/_backward_compile.py`: Rubin and Blackwell MXFP8
+  backward dGLU preparation and compilation.
 - `_megamoe_backend/_comm.py`: symmetric-buffer peer mapping.
 - `_megamoe_backend/mxfp8/_training_stage_kernel.py`: MXFP8 staging constants
   and PTX conversion helpers.

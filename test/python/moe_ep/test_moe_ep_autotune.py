@@ -31,6 +31,7 @@ from moe_ep.moe_ep_test_support import (
     _replay_cuda_graph,
     _require_distributed_sm107,
     _sm107_device,
+    _training_device,
     make_forward_inputs,
 )
 
@@ -821,7 +822,7 @@ def test_autotune_training_discrete_config_binds_prepare_specialization():
         MoeEpTuningConfig,
     )
 
-    device = _sm107_device()
+    device = _training_device()
     base_args = make_forward_inputs(device)
     training_args = (
         base_args[0].dequantize(torch.bfloat16),

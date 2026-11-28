@@ -55,6 +55,8 @@ from moe_ep.moe_ep_test_support import (
     _sm107_device,
     _training_abi_prepared,
     _training_config,
+    _training_device,
+    _training_wgrad_supported,
     _training_prepared_pair,
     _unpack_wgrad_scale_part_bytes,
 )
@@ -210,10 +212,44 @@ def test_wgrad_operand_validation_names_the_operand():
 
 
 @pytest.mark.L0
+def test_wgrad_declines_architectures_without_a_wgrad_kernel():
+    from cudnn.moe_ep._megamoe_backend.mxfp8._wgrad_compile import wgrad_unavailable_reason
+
+    # Decided before any DSL probe, so the reason holds on every installation.
+    reason = wgrad_unavailable_reason((10, 0))
+    assert reason is not None and "not supported on Blackwell SM100" in reason
+    with pytest.raises(NotImplementedError, match="compute capability 10.3"):
+        wgrad_unavailable_reason((10, 3))
+
+
+@pytest.mark.L0
+def test_training_wgrad_declines_on_device_without_a_wgrad_kernel():
+    device = _training_device()
+    if _training_wgrad_supported(device):
+        pytest.skip("this training architecture has a WGrad kernel")
+    capacity = 256
+    with MoeEp(
+        _training_config(
+            num_experts=_EXPERTS,
+            hidden_size=_HIDDEN,
+            intermediate_size=_INTERMEDIATE,
+            top_k=2,
+            max_tokens_per_rank=capacity,
+            physical_recv_pool_rows=_round_up(capacity * 2 + 128 * _EXPERTS, 128),
+            combine_format="bf16",
+        ).public_config
+    ) as op:
+        # Forward and backward still prepare; only WGrad is declined, before any operand check.
+        op.prepare_training(device=device)
+        with pytest.raises(RuntimeError, match="WGrad is not supported on Blackwell SM100"):
+            op.training_wgrad(None, out=None)
+
+
+@pytest.mark.L0
 def test_wgrad_gate_probes_the_tma_residue_op(monkeypatch):
     pytest.importorskip("cutlass")
     try:
-        _cutedsl.require_rubin_cutedsl()
+        _cutedsl.require_megamoe_cutedsl()
     except RuntimeError as error:
         pytest.skip(str(error))
     import cutlass._mlir.dialects.cute_nvgpu as cute_nvgpu_ir
@@ -450,7 +486,7 @@ _EXPERTS = 4
 @pytest.fixture(scope="module")
 def wgrad_op():
     device = _sm107_device()
-    _require_training_wgrad()
+    _require_training_wgrad(device)
     capacity = 512
     top_k = 2
     with MoeEp(
@@ -753,7 +789,7 @@ _LARGE_COUNTS = (2048, 1500, 1024, 0, 1, 1793, 640, 2047)
 @pytest.fixture(scope="module")
 def wgrad_op_large():
     device = _sm107_device()
-    _require_training_wgrad()
+    _require_training_wgrad(device)
     capacity = 8192
     top_k = 2
     with MoeEp(

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public MoE format names to Rubin combine-wire encodings."""
+"""Public MoE format names to MegaMoE combine-wire encodings."""
 
 from __future__ import annotations
 

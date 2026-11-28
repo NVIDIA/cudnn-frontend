@@ -74,7 +74,7 @@ _FORWARD_KERNEL_TUNING_DEFAULTS = (
 
 @dataclass(frozen=True, kw_only=True)
 class MoeEpTuningConfig:
-    """Validated Rubin MegaMoE performance knobs.
+    """Validated MegaMoE performance knobs.
 
     These fields select scheduling and transport implementations without
     changing the public MoE mathematical contract. Every rank in an expert
@@ -86,14 +86,22 @@ class MoeEpTuningConfig:
 
     ``dgrad_optimization`` applies only to training backward. ``baseline``
     preserves the default grouped schedule, ``rolling`` selects the upstream
-    phase-interleaved schedule with its tuned defaults (M16 traversal and
-    scaled FP8 conversion), and ``ds3_ep4_pattern`` additionally enables rank
-    input deduplication and asynchronous token-in flags. It is the preset
-    originally qualified on DS3 EP4 and now supported on additional topology
-    and shape combinations. The DS3 profile owns its preset fields and
-    canonicalizes ``epi_flag_batch`` to ``(4, 2)``. ``rolling`` and
-    ``ds3_ep4_pattern`` require compiling for ``sm_107a``, which is the default
-    when ``CUTE_DSL_ARCH`` is unset.
+    phase-interleaved schedule, and ``ds3_ep4_pattern`` additionally enables
+    rank input deduplication and asynchronous token-in flags. It is the preset
+    originally qualified on DS3 EP4. The DS3 profile owns its preset fields and
+    canonicalizes ``epi_flag_batch`` to ``(4, 2)``. On Rubin SM107, ``rolling``
+    and ``ds3_ep4_pattern`` carry upstream's tuned defaults (M16 traversal and
+    scaled FP8 conversion) and require compiling for ``sm_107a``, which is the
+    default when ``CUTE_DSL_ARCH`` is unset; ``ds3_ep4_pattern`` is also
+    supported on additional topology and shape combinations. On Blackwell
+    SM100 both keep the portable FP8 conversion, ``rolling`` keeps M1
+    traversal, and ``ds3_ep4_pattern`` is qualified only for the DS3 EP4
+    workload; other workloads are declined when training is prepared.
+
+    On every architecture, ``rolling`` and ``ds3_ep4_pattern`` require
+    ``intermediate_size <= 3840``: their dFC2 ready mask holds at most 30 bits,
+    two per 256-column intermediate tile. Training preparation raises
+    ``ValueError`` for a larger intermediate size; use ``baseline`` instead.
 
     ``scheduling``, ``fc2_bulk_store`` and ``mixed_cga`` select forward-kernel
     implementations and apply only to inference and training forward; training
@@ -104,7 +112,10 @@ class MoeEpTuningConfig:
     them through shared memory as bulk stores, with a kernel-chosen depth
     (``auto``) or an explicit depth of 1, 2, 4 or 8 stages. ``mixed_cga``
     launches preferred (4, 1, 1) clusters and fills the remaining SMs with
-    fallback (2, 1, 1) clusters; it requires exclusive use of the GPU.
+    fallback (2, 1, 1) clusters; it requires exclusive use of the GPU. The
+    Blackwell SM100 training forward kernel has neither the interleaved
+    schedule nor mixed-CGA launches: ``scheduling='phase_interleave'`` and
+    ``mixed_cga=True`` are declined there when training is prepared.
     """
 
     token_back_mode: TokenBackMode = "epi_warps"

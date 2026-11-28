@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compilation and ABI metadata for Rubin MXFP8 dGLU backward."""
+"""Compilation and ABI metadata for MegaMoE MXFP8 dGLU backward."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from ._compile import (
     _pre_reduced_sf_workspace_metadata,
     _pre_reduced_workspace_metadata,
 )
+from ._arch import BLACKWELL_SM100, MegaMoeArchitecture, architecture_for
 from ._compile_common import _compile_kernel
 from ._config import Mxfp8KernelConfig
 from ._launch import _to_cute, _to_cute_ptr, _to_discrete_ptr_table
@@ -97,6 +98,30 @@ def _dgrad_selector_kwargs(
     }
 
 
+def _blackwell_dgrad_selector_kwargs(
+    config: Mxfp8KernelConfig,
+) -> dict[str, object]:
+    """Map the public MoeEP profile to the Blackwell kernel's preset selectors.
+
+    The vendored Blackwell dGLU kernel still selects upstream's ``optimized``
+    schedule and ``ds3_ep4_v1`` preset by flag. The preset requires an explicit
+    ``fc2_in_kernel_topk_reduce=False`` and owns the scheduler stages and the
+    grad-y2 grid, so ds3 passes the preset's own values to resolve without
+    overrides.
+    """
+
+    ds3 = config.dgrad_optimization == "ds3_ep4_pattern"
+    return {
+        "force_static_sched": config.force_static_sched,
+        "clc_bundle_size": config.clc_bundle_size,
+        "num_sched_stages": 2 if ds3 else config.num_sched_stages,
+        "fc2_in_kernel_topk_reduce": False,
+        "num_ctas_grad_y2_col_quant": -1 if ds3 else 2368,
+        "enable_dgrad_optimizations": ds3,
+        "dgrad_schedule": "optimized" if config.dgrad_optimization == "rolling" else None,
+    }
+
+
 # Upstream fields each public profile must resolve to. The phase-interleaved
 # profiles carry upstream's tuned schedule bundle (dfc1_m_group, use_scaled_cvt).
 _RESOLVED_DGRAD_PROFILES = {
@@ -110,20 +135,39 @@ _RESOLVED_DGRAD_PROFILES = {
         "use_scaled_cvt": True,
     },
 }
+# On Blackwell, ``optimized`` keeps M1 traversal and every profile keeps the
+# portable FP8 conversion. A ds3_ep4_v1 resolution with overrides is named
+# ds3_ep4_v1_custom, so the profile name also rules out overrides.
+_BLACKWELL_RESOLVED_DGRAD_PROFILES = {
+    "baseline": {"dgrad_optimization_profile": "explicit", **_RESOLVED_DGRAD_PROFILES["baseline"]},
+    "rolling": {
+        "dgrad_optimization_profile": "optimized",
+        **_RESOLVED_DGRAD_PROFILES["rolling"],
+        "dfc1_m_group": 1,
+        "use_scaled_cvt": False,
+    },
+    "ds3_ep4_pattern": {
+        "dgrad_optimization_profile": "ds3_ep4_v1",
+        **_RESOLVED_DGRAD_PROFILES["ds3_ep4_pattern"],
+        "use_scaled_cvt": False,
+    },
+}
 
 
 def _validate_resolved_dgrad_profile(
     config: Mxfp8KernelConfig,
     kernel: Any,
+    kernel_architecture: MegaMoeArchitecture,
 ) -> None:
     """Reject drift between the MoeEP profile and upstream resolution."""
 
-    expected = _RESOLVED_DGRAD_PROFILES[config.dgrad_optimization]
+    profiles = _BLACKWELL_RESOLVED_DGRAD_PROFILES if kernel_architecture is BLACKWELL_SM100 else _RESOLVED_DGRAD_PROFILES
+    expected = profiles[config.dgrad_optimization]
     resolved_dgrad = kernel.resolved_dgrad_config
     actual = {name: resolved_dgrad[name] for name in expected}
     if actual != expected:
         raise RuntimeError(
-            "Rubin dgrad profile resolution drifted from the MoeEP "
+            "MegaMoE dgrad profile resolution drifted from the MoeEP "
             f"integration contract: requested {config.dgrad_optimization!r}, "
             f"resolved {actual!r}, expected {expected!r}"
         )
@@ -136,59 +180,71 @@ def prepare_backward_kernel(
     *,
     architecture: tuple[int, int],
 ) -> PreparedMxfp8BackwardKernel:
-    """Instantiate the fixed Rubin dGLU specialization."""
+    """Instantiate the fixed dGLU specialization for the device architecture."""
 
     import cutlass
 
-    from ..cutedsl_src.kernel_src.rubin.training.mega.bwd_dglu.dglu_mxfp8_mega_moe_kernel import (
-        Sm107MegaMoEMxfp8DgluKernel,
-    )
     from ..cutedsl_src.quant_def import CombineFormat
 
-    kernel = Sm107MegaMoEMxfp8DgluKernel.from_kwargs(
-        mma_tiler_mnk=config.mma_tiler_mnk,
-        cluster_shape_mnk=config.cluster_shape_mnk,
-        use_2cta_instrs=config.use_2cta_instrs,
-        group_hint=config.group_hint,
-        token_padding_block=config.token_padding_block,
-        sf_padding_block=config.sf_padding_block,
-        load_balance_mode=config.load_balance_mode,
-        static_expert_shape=(
-            config.num_experts,
-            config.intermediate,
-            config.hidden,
-        ),
-        ab_dtype=cutlass.Float8E4M3FN,
-        sf_vec_size=config.sf_vec_size,
-        world_size=config.world_size,
-        local_rank=0,
-        num_topk=config.top_k,
-        max_tokens_per_rank=config.max_tokens_per_rank,
-        max_recv_size_per_rank=config.max_recv_size_per_rank,
-        data_token_capacity=config.physical_recv_pool_size,
-        hidden=config.hidden,
-        launch_cluster_count=config.launch_cluster_count,
-        drop_on_overflow=config.kernel_drop_on_overflow,
-        token_back_mode=config.token_back_mode,
-        epi_flag_batch=config.epi_flag_batch,
-        flag_batch=config.flag_batch,
-        combine_format=CombineFormat.parse(config.combine_format),
-        act_func=config.act_func,
-        gate_up_clamp=config.gate_up_clamp,
-        dfc2_recompute=config.dfc2_recompute,
-        dfc2_col_output=config.dfc2_col_output,
-        enable_grad_y2_col_quant=config.enable_grad_y2_col_quant,
-        weight_storage_mode=config.weight_storage_mode,
-        **_dgrad_selector_kwargs(config),
-    )
-    _validate_resolved_dgrad_profile(config, kernel)
+    kernel_architecture = architecture_for(architecture)
+    if kernel_architecture is BLACKWELL_SM100:
+        selector_kwargs = _blackwell_dgrad_selector_kwargs(config)
+    else:
+        selector_kwargs = _dgrad_selector_kwargs(config)
+
+    try:
+        kernel = kernel_architecture.backward_kernel_class().from_kwargs(
+            mma_tiler_mnk=config.mma_tiler_mnk,
+            cluster_shape_mnk=config.cluster_shape_mnk,
+            use_2cta_instrs=config.use_2cta_instrs,
+            group_hint=config.group_hint,
+            token_padding_block=config.token_padding_block,
+            sf_padding_block=config.sf_padding_block,
+            load_balance_mode=config.load_balance_mode,
+            static_expert_shape=(
+                config.num_experts,
+                config.intermediate,
+                config.hidden,
+            ),
+            ab_dtype=cutlass.Float8E4M3FN,
+            sf_vec_size=config.sf_vec_size,
+            world_size=config.world_size,
+            local_rank=0,
+            num_topk=config.top_k,
+            max_tokens_per_rank=config.max_tokens_per_rank,
+            max_recv_size_per_rank=config.max_recv_size_per_rank,
+            data_token_capacity=config.physical_recv_pool_size,
+            hidden=config.hidden,
+            launch_cluster_count=config.launch_cluster_count,
+            drop_on_overflow=config.kernel_drop_on_overflow,
+            token_back_mode=config.token_back_mode,
+            epi_flag_batch=config.epi_flag_batch,
+            flag_batch=config.flag_batch,
+            combine_format=CombineFormat.parse(config.combine_format),
+            act_func=config.act_func,
+            gate_up_clamp=config.gate_up_clamp,
+            dfc2_recompute=config.dfc2_recompute,
+            dfc2_col_output=config.dfc2_col_output,
+            enable_grad_y2_col_quant=config.enable_grad_y2_col_quant,
+            weight_storage_mode=config.weight_storage_mode,
+            **selector_kwargs,
+        )
+    except ValueError as error:
+        # Blackwell qualifies the ds3_ep4_v1 preset only for the DS3 EP4 workload,
+        # while Rubin supports it more widely.
+        if kernel_architecture is not BLACKWELL_SM100 or config.dgrad_optimization != "ds3_ep4_pattern":
+            raise
+        raise NotImplementedError(
+            "MoeEp training backward dgrad_optimization='ds3_ep4_pattern' is qualified on " f"{kernel_architecture.name} only for the DS3 EP4 workload: {error}"
+        ) from error
+    _validate_resolved_dgrad_profile(config, kernel, kernel_architecture)
     local_bytes, shared_bytes = kernel.get_workspace_sizes()
     local_zero, shared_zero = kernel.require_zero_workspace_leading_bytes
     device_workspace = kernel._mega_device_workspace
     pool_capacity = int(kernel.pool_token_capacity)
     if pool_capacity != config.physical_recv_pool_size:
         raise RuntimeError(
-            "Rubin data_token_capacity did not preserve the prescribed " f"physical pool: {pool_capacity} != " f"{config.physical_recv_pool_size}"
+            "MegaMoE data_token_capacity did not preserve the prescribed " f"physical pool: {pool_capacity} != " f"{config.physical_recv_pool_size}"
         )
     fc1_preact_shape = tuple(int(extent) for extent in kernel.get_fc1_preact_shape())
     expected_preact_shape = (
@@ -196,7 +252,7 @@ def prepare_backward_kernel(
         2 * config.intermediate,
     )
     if fc1_preact_shape != expected_preact_shape:
-        raise RuntimeError("Rubin dGLU fc1_preact shape mismatch: " f"{fc1_preact_shape} != {expected_preact_shape}")
+        raise RuntimeError("MegaMoE dGLU fc1_preact shape mismatch: " f"{fc1_preact_shape} != {expected_preact_shape}")
     aux_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in kernel.get_aux_output_shapes().items()}
     dprob_bytes = math.prod(aux_shapes["dprob"]) * torch.float32.itemsize
     aux_data_bytes = (
@@ -229,7 +285,7 @@ def prepare_backward_kernel(
         shared_bytes,
     )
     if pre_reduced_offset is None or pre_reduced_bytes_per_token <= 0:
-        raise RuntimeError("Rubin MXFP8 backward requires standalone pre-reduced activation")
+        raise RuntimeError("MegaMoE MXFP8 backward requires standalone pre-reduced activation")
     pre_reduced_sf_offset, pre_reduced_sf_bytes_per_token = _pre_reduced_sf_workspace_metadata(
         device_workspace,
         config,

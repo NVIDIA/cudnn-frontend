@@ -30,6 +30,7 @@ from typing import Any
 import torch
 
 from ..._config import ResolvedMoeEpConfig
+from ._arch import architecture_for
 from ._cutedsl import require_rubin_wgrad_cutedsl, rubin_wgrad_cutedsl_error
 
 WGRAD_TILE_K = 128
@@ -213,9 +214,12 @@ def _build_kernel(
     return BlockScaledMoeWgradKernel(problem, impl)
 
 
-def wgrad_unavailable_reason() -> str | None:
-    """Return why this process cannot run MoeEp WGrad, or None."""
+def wgrad_unavailable_reason(architecture: tuple[int, int]) -> str | None:
+    """Return why this process cannot run MoeEp WGrad on ``architecture``, or None."""
 
+    kernel_architecture = architecture_for(architecture)
+    if not kernel_architecture.supports_training_wgrad:
+        return f"MoeEp training WGrad is not supported on {kernel_architecture.name}; " "only the Rubin SM107 WGrad kernel is vendored"
     return rubin_wgrad_cutedsl_error()
 
 

@@ -70,19 +70,23 @@ def _require_torchrun_environment() -> tuple[int, int, int, int]:
 @pytest.fixture(scope="session")
 def torchrun_world():
     if not dist.is_available() or not dist.is_nccl_available():
-        pytest.skip("multi-node Rubin MXFP8 tests require NCCL")
+        pytest.skip("multi-node MegaMoE MXFP8 tests require NCCL")
 
     rank, world_size, local_rank, local_world_size = _require_torchrun_environment()
     if local_rank < 0 or local_rank >= torch.cuda.device_count():
         pytest.skip(f"torchrun LOCAL_RANK={local_rank} is not backed by a visible GPU")
 
     device = torch.device("cuda", local_rank)
-    if torch.cuda.get_device_capability(device) != (10, 7):
-        pytest.skip("multi-node Rubin MXFP8 tests require exactly SM107 " "(compute capability 10.7) on every rank")
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+    try:
+        architecture_for(torch.cuda.get_device_capability(device))
+    except NotImplementedError as error:
+        pytest.skip(str(error))
     try:
         import nvshmem.core  # noqa: F401
     except (ImportError, OSError):
-        pytest.skip("multi-node Rubin MXFP8 tests require NVSHMEM")
+        pytest.skip("multi-node MegaMoE MXFP8 tests require NVSHMEM")
 
     os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
     torch.cuda.set_device(device)
@@ -174,7 +178,13 @@ def test_mxfp8_forward_multinode_matches_reference(
     ep_global_ranks,
     combine_format,
 ):
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import inference_architecture_for
+
     world = torchrun_world
+    try:
+        inference_architecture_for(torch.cuda.get_device_capability(world.device))
+    except NotImplementedError as error:
+        pytest.skip(str(error))
     if world.world_size != required_world_size or world.local_world_size != required_local_world_size:
         pytest.skip(
             f"EP{ep_size} requires torchrun WORLD_SIZE={required_world_size}, "
@@ -285,9 +295,32 @@ def test_stateless_training_multinode_matches_independent_reference(
 _MIXED_CGA_PHASE_INTERLEAVE = {"mixed_cga": True, "scheduling": "phase_interleave"}
 
 
+def _skip_unless_inference(world) -> None:
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import inference_architecture_for
+
+    try:
+        inference_architecture_for(torch.cuda.get_device_capability(world.device))
+    except NotImplementedError as error:
+        pytest.skip(str(error))
+
+
+def _skip_forward_tuning_declined(world, tuning: dict, combine_format: str) -> None:
+    """Skip a training case whose forward tuning this architecture declines (see MegaMoeArchitecture)."""
+
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+    architecture = architecture_for(torch.cuda.get_device_capability(world.device))
+    try:
+        architecture.validate_forward_tuning("training_forward_tuning", MoeEpTuningConfig(**tuning), combine_format)
+    except NotImplementedError as error:
+        pytest.skip(str(error))
+
+
 @pytest.mark.parametrize("ep_size", [pytest.param(ep, id=f"ep{ep}") for ep in (8, 12, 16)])
 def test_mxfp8_forward_multinode_mixed_cga_matches_reference(torchrun_world, ep_size):
     world = torchrun_world
+    _skip_unless_inference(world)
     if world.world_size != ep_size or world.local_world_size != 4:
         pytest.skip(
             f"EP{ep_size} mixed-CGA inference requires torchrun WORLD_SIZE={ep_size}, LOCAL_WORLD_SIZE=4; "
@@ -315,6 +348,7 @@ def test_mxfp8_forward_multinode_mixed_cga_matches_reference(torchrun_world, ep_
 @pytest.mark.parametrize("ep_size", [pytest.param(ep, id=f"ep{ep}") for ep in (8, 16, 32)])
 def test_stateless_training_multinode_mixed_cga_matches_independent_reference(torchrun_world, ep_size):
     world = torchrun_world
+    _skip_forward_tuning_declined(world, _MIXED_CGA_PHASE_INTERLEAVE, "bf16")
     if world.world_size != ep_size:
         pytest.skip(f"EP{ep_size} mixed-CGA training requires torchrun WORLD_SIZE={ep_size}; got WORLD_SIZE={world.world_size}")
 
@@ -331,6 +365,7 @@ def test_stateless_training_multinode_mixed_cga_matches_independent_reference(to
 @pytest.mark.parametrize("token_back_mode", ["epi_warps", "standalone_warps"])
 def test_mxfp8_forward_multinode_fc2_bulk_store_matches_reference(torchrun_world, token_back_mode):
     world = torchrun_world
+    _skip_unless_inference(world)
     if world.world_size != 8 or world.local_world_size != 4:
         pytest.skip(
             "EP8 FC2 bulk-store inference requires torchrun WORLD_SIZE=8, LOCAL_WORLD_SIZE=4; "
@@ -360,6 +395,7 @@ def test_mxfp8_forward_multinode_fc2_bulk_store_matches_reference(torchrun_world
 @pytest.mark.parametrize("token_back_mode", ["epi_warps", "standalone_warps"])
 def test_stateless_training_multinode_fc2_bulk_store_matches_independent_reference(torchrun_world, token_back_mode, combine_format):
     world = torchrun_world
+    _skip_forward_tuning_declined(world, {"fc2_bulk_store": "auto", "token_back_mode": token_back_mode}, combine_format)
     if world.world_size != 8:
         pytest.skip(f"EP8 FC2 bulk-store training requires torchrun WORLD_SIZE=8; got WORLD_SIZE={world.world_size}")
 

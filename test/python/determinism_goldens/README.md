@@ -142,17 +142,21 @@ pytest moe_ep/test_moe_ep_wgrad.py -m "L0 or L1" -q -rs
 ### MoeEp forward and backward: no determinism suite (2026-11-23)
 
 `MoeEp.__call__`, `MoeEp.training_forward` and `MoeEp.training_backward`
-(the Rubin SM107 MXFP8 MegaMoE kernels behind `cudnn.moe_ep`) have no
-determinism suite. The status page lists them as unverified on SM107. The gap
-covers these kernel paths:
+(the Rubin SM107 MXFP8 MegaMoE kernels behind `cudnn.moe_ep`, and the
+Blackwell SM100 training kernels) have no determinism suite. The status page
+lists them as unverified on SM107, and the two training entries as unverified
+on SM100. The gap covers these kernel paths:
 
 - Forward: `scheduling="static"` (the default), `"atomic"` and
   `"phase_interleave"`; `fc2_bulk_store` off, `"auto"` and explicit stage
   counts; `mixed_cga`. Each combines with the `epi_warps`, `standalone_warps`
-  and `reuse_dispatch_warps` token-back modes.
+  and `reuse_dispatch_warps` token-back modes. On SM100 the training forward
+  kernel declines `"phase_interleave"` and `mixed_cga`, and stages FC2 bulk
+  stores only for an MXFP8 combine.
 - Backward: the `dgrad_optimization` profiles `baseline`, `rolling` (M16
-  traversal, scaled FP8 conversion) and `ds3_ep4_pattern` (rank input dedup,
-  asynchronous token-in flags).
+  traversal and scaled FP8 conversion on SM107; M1 traversal and the portable
+  FP8 conversion on SM100) and `ds3_ep4_pattern` (rank input dedup,
+  asynchronous token-in flags; on SM100 only for the DS3 EP4 workload).
 
 Known order-dependent operations: training backward adds per-tile dprob
 partials with FP32 atomics, and inference does not fix the order of token

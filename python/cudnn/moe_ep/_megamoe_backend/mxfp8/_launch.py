@@ -33,7 +33,7 @@ def _to_cute(
 
 
 def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 128):
-    """Build the opaque byte-pointer ABI used by Rubin workspaces."""
+    """Build the opaque byte-pointer ABI used by MegaMoE workspaces."""
 
     import cutlass
     from cutlass.cute.runtime import make_ptr
@@ -41,7 +41,7 @@ def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 128):
 
     address = int(tensor.data_ptr())
     if address % assumed_align:
-        raise ValueError(f"Rubin workspace address {address:#x} is not " f"{assumed_align}-byte aligned")
+        raise ValueError(f"MegaMoE workspace address {address:#x} is not " f"{assumed_align}-byte aligned")
     return make_ptr(
         cutlass.Uint8,
         address,
@@ -59,7 +59,7 @@ def _to_discrete_ptr_table(tensor: torch.Tensor):
 
     address = int(tensor.data_ptr())
     if address % 8:
-        raise ValueError(f"Rubin discrete pointer-table address {address:#x} is not 8-byte aligned")
+        raise ValueError(f"MegaMoE discrete pointer-table address {address:#x} is not 8-byte aligned")
     return make_ptr(
         cutlass.Int64,
         address,
@@ -161,7 +161,7 @@ def launch_forward(
         inputs.overflow_flag,
         drop_on_overflow=drop_on_overflow,
         overflow_ok=inputs.overflow_ok,
-        message=("Rubin MegaMoE receive route-pool overflow; the output is invalid " "for this routing distribution"),
+        message=("MegaMoE receive route-pool overflow; the output is invalid " "for this routing distribution"),
     )
 
     output_data = torch.empty(

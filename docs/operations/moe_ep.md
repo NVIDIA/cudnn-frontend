@@ -160,13 +160,20 @@ dgrad configurations:
 
 - `"baseline"` preserves the grouped schedule and all existing defaults;
 - `"rolling"` selects the upstream phase-interleaved schedule with its tuned
-  defaults (M16 traversal and scaled FP8 conversion);
+  defaults;
 - `"ds3_ep4_pattern"` selects the upstream preset named for its original DS3
   EP4 workload. It adds rank input deduplication and asynchronous token-in
   flags to the `"rolling"` schedule.
 
-`"rolling"` and `"ds3_ep4_pattern"` require compiling for `sm_107a`, which is
-the default when `CUTE_DSL_ARCH` is unset.
+The tuned defaults of `"rolling"` and `"ds3_ep4_pattern"` depend on the
+architecture:
+
+- On Rubin SM107 both use M16 traversal and scaled FP8 conversion and require
+  compiling for `sm_107a`, which is the default when `CUTE_DSL_ARCH` is unset.
+- On Blackwell SM100 both keep the portable FP8 conversion and `"rolling"`
+  keeps M1 traversal. `"ds3_ep4_pattern"` is qualified only for the DS3 EP4
+  workload; `prepare_training()` raises `NotImplementedError` for other
+  workloads.
 
 For example:
 
@@ -183,10 +190,19 @@ config = replace(
 )
 ```
 
-The name identifies the preset's origin, not an EP4-only runtime restriction.
-Additional topologies and problem shapes are supported, subject to the generic
-kernel resource, layout, output, full-route-capacity, and MXFP8 constraints.
+On Rubin SM107 the name identifies the preset's origin, not an EP4-only runtime
+restriction. Additional topologies and problem shapes are supported, subject
+to the generic kernel resource, layout, output, full-route-capacity, and MXFP8
+constraints.
 Both contiguous and discrete native backward weights are supported.
+
+`"rolling"` and `"ds3_ep4_pattern"` both publish dFC2 progress through a ready
+mask of at most 30 bits, two for each 256-column tile of the intermediate
+dimension, so both profiles require `intermediate_size <= 3840`. This limit is
+the same on Rubin SM107 and Blackwell SM100. For a larger `intermediate_size`,
+`prepare_training()` raises `ValueError` on every rank, because the check
+depends only on the configuration that all ranks share. Use `"baseline"` for
+such models.
 
 DS3 owns its scheduling and transport preset fields. It requires
 `token_back_mode="epi_warps"`, `token_in_flag_batch=1`, and `group_hint=None`.
@@ -236,6 +252,11 @@ messages name:
   mixed-CGA outputs with the reference for inference at EP4, EP8, EP12 and
   EP16 and for training at EP4, EP8, EP16 and EP32, and replay training
   CUDA Graphs with mixed CGA at EP2, EP4, EP8, EP16 and EP32.
+- The Blackwell SM100 training forward kernel has neither the interleaved
+  schedule nor mixed-CGA launches, and stages FC2 bulk stores only for an
+  MXFP8 combine. `prepare_training()` raises `NotImplementedError` there for
+  `scheduling="phase_interleave"`, `mixed_cga=True`, and an `fc2_bulk_store`
+  other than `"off"` with `combine_format="bf16"`.
 
 The forward kernel is persistent: every launched CTA must be co-resident.
 The backend sizes the launch from the device's occupancy, so MoeEp requires
@@ -690,7 +711,8 @@ supported CUTLASS DSL, public `nvidia-cutlass-dsl` 4.8.0 and later, provides
 them. If an installed DSL lacks them, `prepare_training()` still succeeds for
 forward and backward, and `training_wgrad` raises `RuntimeError` naming the
 missing capability; the grouped WGrad API remains available as the consumer
-of `operands`.
+of `operands`. Blackwell SM100 has no vendored WGrad kernel, so
+`training_wgrad` raises `RuntimeError` there in the same way.
 
 The K tile equals the 128-row token padding, so no expert's reduction reads
 past its segment, and every M and N tile is complete, so no TMA box is
@@ -794,13 +816,23 @@ new operator preparation; caller-address changes require recapture.
 
 ## Execution support
 
-- NVIDIA Rubin SM107 GPUs (compute capability 10.7).
+- NVIDIA Rubin SM107 GPUs (compute capability 10.7): inference and training,
+  including `training_wgrad`.
+- NVIDIA Blackwell SM100 GPUs (compute capability 10.0): training only
+  (`prepare_training`, `training_forward`, `training_backward`). Inference
+  raises `NotImplementedError`, and `training_wgrad` raises `RuntimeError`
+  because no WGrad kernel is vendored for SM100; the grouped WGrad API
+  remains available as the consumer of the WGrad operands. Other compute
+  capabilities, including SM103, are declined with `NotImplementedError`.
+- `CUTE_DSL_ARCH` must name the device's target (`sm_107a` or `sm_100a`, with
+  or without the `a` suffix). When it is unset, MoeEp sets it from the
+  device; another value raises `RuntimeError`.
 - CUDA and PyTorch execution.
 - `nvidia-cutlass-dsl[cu13]>=4.8.0`, provided by the package-wide required
   dependency except on Windows ARM64. The CuTe DSL and TVM-FFI runtime dependencies
   are excluded from the base installation on Windows ARM64, so the base install
-  does not enable these kernels there. The Rubin kernels also
-  check target support at runtime.
+  does not enable these kernels there. The kernels also check target support
+  at runtime.
 - Fused SwiGLU with contiguous expert sharding.
 - `apply_topk_in_fc1=True`.
 - `hidden_size` divisible by 128.

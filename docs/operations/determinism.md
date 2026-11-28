@@ -98,8 +98,8 @@ arbitrary user callbacks.
 | `cudnn.ops.causal_conv1d_update`, width four | fprop (inference step) | FP16 inputs, output, and state with FP32 accumulation | Supported (GH200, tested configurations) | Unverified | Unsupported |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
 | `MoeEp.__call__` (expert-parallel MoE inference) | fprop | MXFP8 activation and weights; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
-| `MoeEp.training_forward` | fprop | MXFP8 compute; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
-| `MoeEp.training_backward` | bprop | MXFP8 compute; FP32 dprob | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_forward` | fprop | MXFP8 compute; BF16 or MXFP8 combine; BF16 out | Unsupported | SM100: Unverified; SM103: Unsupported | Unverified |
+| `MoeEp.training_backward` | bprop | MXFP8 compute; FP32 dprob | Unsupported | SM100: Unverified; SM103: Unsupported | Unverified |
 | `MoeEp.training_wgrad` | wgrad | MXFP8 operands; BF16 or FP32 dW | Unsupported | Unsupported | Supported (replay, expert invariance and warm stress; no golden) |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
@@ -509,10 +509,11 @@ for replay, batch-invariance, and stress-test results.
   status rests on the replay and batch-invariance cells, and the golden
   comparison is not covered there. SM90 and SM120 are declined by type.
 - Expert-parallel MoE (`MoeEp`): no deterministic mode and no determinism
-  suite yet, so SM107 is unverified; SM90, SM100/103 and SM120 are declined by
-  the capability check. Known order-dependent reduction: training backward
-  adds per-tile dprob partials with FP32 atomics. Training forward and
-  backward route tokens in a fixed sequence; inference token communication
+  suite yet, so SM107, and SM100 for training forward and backward, are
+  unverified. SM90, SM103 and SM120, and SM100 inference and `training_wgrad`,
+  are declined by the capability check. Known order-dependent reduction:
+  training backward adds per-tile dprob partials with FP32 atomics. Training
+  forward and backward route tokens in a fixed sequence; inference token communication
   does not. The functionality tests check that the forward tuning fields write
   the default tuning's output bytes, and that repeated calls do not
   accumulate. Neither check qualifies replay or batch invariance.

@@ -15,6 +15,7 @@ from ..._config import ResolvedMoeEpConfig
 from ..._contracts import _ForwardCall
 from .._plan import _InferenceRuntimeWorkspaceOwner
 from ._adapter import Mxfp8InputAdapter
+from ._arch import architecture_for, inference_architecture_for
 from ._backward_compile import prepare_backward_kernel
 from ._compile import (
     CompiledMxfp8Kernel,
@@ -114,6 +115,7 @@ class Mxfp8Backend:
         if self._prepared_kernel is None:
             try:
                 architecture, launch_cluster_count = self._ensure_prepare_context()
+                inference_architecture_for(architecture)
                 kernel_config = Mxfp8KernelConfig.for_inference(
                     self.resolved_config,
                     launch_cluster_count=launch_cluster_count,
@@ -285,10 +287,17 @@ class Mxfp8Backend:
             if self._training_state is not None:
                 raise RuntimeError("MoeEp training is already prepared")
             architecture, launch_cluster_count = self._ensure_prepare_context()
+            forward_tuning = self.resolved_config.public_config.training_forward_tuning
+            # Before the mixed-CGA occupancy query and any allocation, so every rank declines alike.
+            architecture_for(architecture).validate_forward_tuning(
+                "training_forward_tuning",
+                forward_tuning,
+                self.resolved_config.public_config.data_path.combine_format,
+            )
             forward_kernel_config = Mxfp8KernelConfig.for_training_forward(
                 self.resolved_config,
                 launch_cluster_count=launch_cluster_count,
-                mixed_cga_launch=self._mixed_cga_launch_for(self.resolved_config.public_config.training_forward_tuning),
+                mixed_cga_launch=self._mixed_cga_launch_for(forward_tuning),
             )
             backward_kernel_config = Mxfp8KernelConfig.for_training_backward(
                 self.resolved_config,
@@ -309,10 +318,11 @@ class Mxfp8Backend:
             from ._training_resources import _Mxfp8TrainingState
             from ._wgrad_compile import prepare_wgrad, wgrad_unavailable_reason
 
-            # WGrad is optional: without a DSL that has Rubin TMA overrides,
-            # forward/backward still prepare and training_wgrad reports why.
+            # WGrad is optional: on an architecture without a WGrad kernel or
+            # without a DSL that has Rubin TMA overrides, forward/backward still
+            # prepare and training_wgrad reports why.
             wgrad = None
-            wgrad_reason = wgrad_unavailable_reason()
+            wgrad_reason = wgrad_unavailable_reason(architecture)
             if wgrad_reason is None:
                 wgrad = prepare_wgrad(
                     self.resolved_config,

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Import-light static configuration for the Rubin SM107 MXFP8 kernel."""
+"""Import-light static configuration for the MegaMoE MXFP8 kernels."""
 
 from __future__ import annotations
 

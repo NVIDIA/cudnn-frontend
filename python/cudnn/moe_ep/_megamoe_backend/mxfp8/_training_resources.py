@@ -1007,7 +1007,7 @@ class _Mxfp8TrainingState:
             flag,
             drop_on_overflow=(self.resolved_config.public_config.parallel.drop_on_overflow),
             overflow_ok=overflow_ok,
-            message=(f"Rubin MegaMoE receive route-pool overflow; the {phase} " "outputs are invalid"),
+            message=(f"MegaMoE receive route-pool overflow; the {phase} " "outputs are invalid"),
         )
         _runtime_debug("training-overflow.end", phase=phase)
         return flag

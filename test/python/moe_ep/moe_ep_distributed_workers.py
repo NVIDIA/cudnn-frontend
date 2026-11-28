@@ -12,6 +12,8 @@ import torch
 import torch.distributed as dist
 
 from moe_ep.moe_ep_test_support import (
+    _BACKWARD_CLOSE_KWARGS,
+    _WGRAD_CLOSE_KWARGS,
     _allocate_stateless_training_outputs,
     _allocate_training_wgrad_outputs,
     _allocate_training_weight_staging,
@@ -22,6 +24,7 @@ from moe_ep.moe_ep_test_support import (
     _assert_wgrad_padding_rows_contribute_zero,
     _assert_wgrads_match_reference,
     _dense_wgrads_from_grouped_kernel,
+    _dense_wgrads_from_operands,
     _fixed_training_reference,
     _fixed_training_weights,
     _forward_config,
@@ -41,6 +44,7 @@ from moe_ep.moe_ep_test_support import (
 __all__ = [
     "_distributed_autotune_worker",
     "_distributed_backward_worker",
+    "_distributed_ds3_numerics_worker",
     "_distributed_inference_overflow_worker",
     "_distributed_inference_policy_mismatch_worker",
     "_distributed_output_worker",
@@ -871,6 +875,275 @@ def _distributed_backward_worker(
             native_weight_storage_mode=native_weight_storage_mode,
             forward_tuning_kwargs=forward_tuning_kwargs,
         )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# Qualified DS3 EP4 workload of the upstream ds3_ep4_v1 dgrad preset.
+_DS3_EP4_SHAPE = {
+    "num_experts": 32,
+    "hidden_size": 7168,
+    "intermediate_size": 2048,
+    "top_k": 8,
+    "max_tokens_per_rank": 4096,
+    "physical_recv_pool_rows": 131968,
+}
+_DS3_DGRAD_PROFILES = ("baseline", "rolling", "ds3_ep4_pattern")
+# Relative Frobenius error bounds against the independent oracle, whose fp32 GEMMs run in
+# IEEE fp32. The oracle computes dprob from the unquantized output gradient, so kernel and
+# oracle share one MXFP8 gradient; otherwise dprob would differ by that gradient's
+# quantization noise instead of by kernel error.
+_DS3_REFERENCE_REL_FRO = {"y": 2e-3, "dx": 5e-3, "dprob": 2e-4, "dw1": 5e-4, "dw2": 5e-4}
+# The element-wise dprob bound scales with the tensor, atol = TOL * max(|dprob|.max(), 1):
+# each entry is a long reduction whose rounding error follows the tensor's scale, so a
+# fixed atol fails entries near zero.
+_DS3_DPROB_RTOL = 1e-2
+_DS3_DPROB_ATOL = 1e-2
+_DS3_REFERENCE_MIN_COSINE = 0.999
+# A profile may not be noticeably less accurate than baseline on the same inputs.
+_DS3_BASELINE_ERROR_RATIO = 1.1
+_DS3_WGRAD_OPERANDS = ("fc1_a", "fc1_sfa", "fc1_b", "fc1_sfb", "fc2_a", "fc2_sfa", "fc2_b", "fc2_sfb")
+
+
+def _make_ds3_ep4_training_inputs(ep_rank: int, ep_size: int, device: torch.device, routing: str):
+    """Build random DS3 EP4 training inputs with uniform or skewed routing.
+
+    The output gradient is returned pre-quantized as MXFP8 along the hidden axis.
+    """
+
+    shape = _DS3_EP4_SHAPE
+    tokens = shape["max_tokens_per_rank"]
+    hidden = shape["hidden_size"]
+    intermediate = shape["intermediate_size"]
+    num_experts = shape["num_experts"]
+    local_experts = num_experts // ep_size
+    generator = torch.Generator(device=device).manual_seed(20261105 + 1000 * ep_rank)
+    activation = torch.randn(tokens, hidden, generator=generator, device=device).to(torch.bfloat16)
+    fc1_weight = quantize_mxfp8(
+        torch.randn(local_experts, hidden, 2 * intermediate, generator=generator, device=device) / hidden**0.5,
+        axis=1,
+    )
+    fc2_weight = quantize_mxfp8(
+        torch.randn(local_experts, intermediate, hidden, generator=generator, device=device) / intermediate**0.5,
+        axis=1,
+    )
+    scores = torch.rand(tokens, num_experts, generator=generator, device=device)
+    if routing == "skewed":
+        # Four hot experts, one per rank, are in the top-k of every token that is not rank-local.
+        scores[:, torch.arange(1, num_experts, local_experts + 1, device=device)] += 2.0
+        # Every fourth token sends all of its routes to one rank, the input-dedup extreme.
+        token_index = torch.arange(tokens, device=device)
+        target_rank = (ep_rank + token_index // 4) % ep_size
+        on_target = torch.arange(num_experts, device=device)[None, :] // local_experts == target_rank[:, None]
+        scores = torch.where((token_index % 4 == 0)[:, None] & on_target, scores + 10.0, scores)
+    elif routing != "uniform":
+        raise ValueError(f"unknown DS3 routing {routing!r}")
+    topk_idx = scores.topk(shape["top_k"], dim=1).indices.to(torch.int32).contiguous()
+    raw_weights = torch.rand(tokens, shape["top_k"], generator=generator, device=device) + 0.05
+    topk_weights = (raw_weights / raw_weights.sum(dim=1, keepdim=True)).contiguous()
+    grad_output = quantize_mxfp8(
+        _grad_output(device, tokens, seed=20261112 + ep_rank, hidden_size=hidden),
+        axis=1,
+    )
+    return (activation, fc1_weight, fc2_weight, topk_idx, topk_weights), grad_output
+
+
+def _relative_fro(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
+
+
+def _assert_same_bits(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
+    assert actual.dtype == expected.dtype and actual.shape == expected.shape, name
+    if actual.element_size() == 1:
+        actual, expected = actual.view(torch.uint8), expected.view(torch.uint8)
+    assert torch.equal(actual, expected), f"{name} differs bitwise from the baseline profile"
+
+
+def _run_ds3_profile(args, grad_output, weights, *, device, ep_group, profile):
+    """Run one training step and return cloned outputs plus the resolved dgrad config."""
+
+    from cudnn import MoeEp, MoeEpFc1WeightLayout, MoeEpTuningConfig
+
+    op = MoeEp(
+        _moe_ep_config(
+            **_DS3_EP4_SHAPE,
+            ep_group=ep_group,
+            drop_on_overflow=True,
+            combine_format="mxfp8",
+            fc1_weight_layout=MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32,
+            training_backward_tuning=MoeEpTuningConfig(dgrad_optimization=profile),
+        )
+    )
+    try:
+        requirements = op.prepare_training(device=device)
+        resolved = dict(op._training_state.backward_prepared.kernel.resolved_dgrad_config)
+        forward_staging, backward_staging = _allocate_training_weight_staging(weights)
+        native_forward = op.pack_forward_weights(weights[0], out=forward_staging)
+        native_backward = op.pack_backward_weights(weights[1], out=backward_staging)
+        forward_out, backward_out = _allocate_stateless_training_outputs(
+            requirements,
+            device,
+            op.training_symmetric_buffers(),
+        )
+        _poison_training_outputs_for_test(forward_out, backward_out)
+        y = op.training_forward(args[0], args[3], args[4], weights=native_forward, out=forward_out)
+        dx, dprob, wgrads = op.training_backward(
+            grad_output,
+            args[3],
+            args[4],
+            weights=native_backward,
+            fc1_preact=forward_out.fc1_preact,
+            fc1_a=forward_out.fc1_a,
+            fc1_sfa=forward_out.fc1_sfa,
+            valid_route_counts=forward_out.valid_route_counts,
+            expert_offsets=forward_out.expert_offsets,
+            out=backward_out,
+        )
+        torch.cuda.synchronize(device)
+        # y, dx and dprob are views of instance-owned symmetric storage; copy them before close.
+        outputs = {
+            "y": y.clone(),
+            "dx": dx.clone(),
+            "dprob": dprob.clone(),
+            "valid_route_counts": wgrads.valid_route_counts.clone(),
+            "expert_offsets": wgrads.expert_offsets.clone(),
+            "operands": {name: getattr(wgrads, name).clone() for name in _DS3_WGRAD_OPERANDS},
+        }
+        outputs["dw1"], outputs["dw2"] = _dense_wgrads_from_operands(wgrads)
+        torch.cuda.synchronize(device)
+        dist.barrier(group=ep_group)
+        return outputs, resolved
+    finally:
+        op.close()
+
+
+def _check_ds3_profiles(outputs, resolved, expected) -> None:
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import BLACKWELL_SM100, architecture_for
+    from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        _BLACKWELL_RESOLVED_DGRAD_PROFILES,
+        _RESOLVED_DGRAD_PROFILES,
+    )
+
+    expected_y, expected_dx, expected_dprob, expected_dense, expected_route_counts = expected
+    references = {"y": expected_y, "dx": expected_dx, "dprob": expected_dprob, "dw1": expected_dense[0], "dw2": expected_dense[1]}
+
+    # Each profile must resolve to its own upstream schedule bundle, so ds3 cannot
+    # silently fall back. On Blackwell this includes the upstream preset name, which
+    # becomes ds3_ep4_v1_custom when the preset resolves with overrides.
+    architecture = architecture_for(torch.cuda.get_device_capability())
+    contract = _BLACKWELL_RESOLVED_DGRAD_PROFILES if architecture is BLACKWELL_SM100 else _RESOLVED_DGRAD_PROFILES
+    for profile in _DS3_DGRAD_PROFILES:
+        actual = {name: resolved[profile][name] for name in contract[profile]}
+        assert actual == contract[profile], f"{profile} resolved to {actual!r}, expected {contract[profile]!r}"
+
+    baseline = outputs["baseline"]
+    baseline_errors = {name: _relative_fro(_output_as_float(baseline[name]), reference) for name, reference in references.items()}
+    dprob_atol = _DS3_DPROB_ATOL * max(expected_dprob.abs().max().item(), 1.0)
+    for profile, actual in outputs.items():
+        torch.testing.assert_close(actual["valid_route_counts"], expected_route_counts, rtol=0, atol=0)
+        for name, reference in references.items():
+            value = _output_as_float(actual[name])
+            assert torch.isfinite(value).all(), f"{profile} {name} is not finite"
+            error = _relative_fro(value, reference)
+            assert error <= _DS3_REFERENCE_REL_FRO[name], f"{profile} {name} relative error {error:.3e} exceeds {_DS3_REFERENCE_REL_FRO[name]:.1e}"
+            assert error <= _DS3_BASELINE_ERROR_RATIO * baseline_errors[name], (
+                f"{profile} {name} relative error {error:.3e} exceeds " f"{_DS3_BASELINE_ERROR_RATIO}x baseline {baseline_errors[name]:.3e}"
+            )
+            # cosine_similarity keeps a bf16 operand's norm in bf16, and that rounding biases the cosine; compare in fp32.
+            cosine = torch.nn.functional.cosine_similarity(value.flatten(), reference.float().flatten(), dim=0).item()
+            assert cosine >= _DS3_REFERENCE_MIN_COSINE, f"{profile} {name} cosine {cosine:.6f}"
+        _assert_matches_reference(actual["y"], expected_y)
+        torch.testing.assert_close(actual["dx"].float(), expected_dx, **_BACKWARD_CLOSE_KWARGS[0])
+        torch.testing.assert_close(actual["dw1"], expected_dense[0], **_WGRAD_CLOSE_KWARGS)
+        torch.testing.assert_close(actual["dw2"], expected_dense[1], **_WGRAD_CLOSE_KWARGS)
+        torch.testing.assert_close(actual["dprob"], expected_dprob, rtol=_DS3_DPROB_RTOL, atol=dprob_atol)
+
+    # The optimized profiles only reschedule work. With the same FP8 conversion as
+    # baseline they must reproduce its bits; dprob may differ only by FP32 reduction order.
+    for profile in ("rolling", "ds3_ep4_pattern"):
+        if resolved[profile]["use_scaled_cvt"] != resolved["baseline"]["use_scaled_cvt"]:
+            continue
+        actual = outputs[profile]
+        for name in ("y", "dx", "valid_route_counts", "expert_offsets"):
+            _assert_same_bits(f"{profile} {name}", actual[name], baseline[name])
+        for name in _DS3_WGRAD_OPERANDS:
+            _assert_same_bits(f"{profile} {name}", actual["operands"][name], baseline["operands"][name])
+        torch.testing.assert_close(actual["dprob"], baseline["dprob"], rtol=1e-5, atol=1e-4)
+
+
+def _distributed_ds3_numerics_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    routing: str,
+) -> None:
+    """Compare every dgrad profile on the qualified DS3 EP4 workload."""
+
+    # Run the oracle's fp32 GEMMs in IEEE fp32 whatever the container's default: NGC images set
+    # TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 and pip torch does not. This worker is its own spawned
+    # process, so the setting needs no restore. fp32_precision is torch >= 2.9; allow_tf32 is
+    # the older spelling of the same switch, and torch raises when one process mixes the two.
+    matmul = torch.backends.cuda.matmul
+    if hasattr(matmul, "fp32_precision"):
+        matmul.fp32_precision = "ieee"
+    else:
+        matmul.allow_tf32 = False
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+        timeout=timedelta(seconds=600),
+    )
+    try:
+        ep_group = dist.group.WORLD
+        args, grad_output = _make_ds3_ep4_training_inputs(rank, world_size, device, routing)
+        # Finish the collective oracle before any production operator exists.
+        expected_y, expected_dx, expected_dprob, expected_wgrads = _fixed_training_reference(
+            args,
+            grad_output.dequantize(torch.float32),
+            combine_format="mxfp8",
+            gate_up_clamp=None,
+            ep_group=ep_group,
+            num_experts=_DS3_EP4_SHAPE["num_experts"],
+            max_tokens_per_rank=_DS3_EP4_SHAPE["max_tokens_per_rank"],
+            physical_recv_pool_rows=_DS3_EP4_SHAPE["physical_recv_pool_rows"],
+            drop_on_overflow=True,
+        )
+        expected_fc1, expected_fc2 = expected_wgrads.dense_wgrads()
+        expected = (
+            expected_y,
+            expected_dx,
+            expected_dprob,
+            (_interleave_fc1_wgrad(expected_fc1), expected_fc2),
+            expected_wgrads.valid_route_counts,
+        )
+        weights = _fixed_training_weights(args)
+        outputs = {}
+        resolved = {}
+        for profile in _DS3_DGRAD_PROFILES:
+            outputs[profile], resolved[profile] = _run_ds3_profile(
+                args,
+                grad_output,
+                weights,
+                device=device,
+                ep_group=ep_group,
+                profile=profile,
+            )
+
+        dist.barrier(group=ep_group)
+        assertion_error = None
+        try:
+            _check_ds3_profiles(outputs, resolved, expected)
+        except Exception as error:
+            assertion_error = error
+        dist.barrier(group=ep_group)
+        if assertion_error is not None:
+            raise assertion_error
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

@@ -24,7 +24,7 @@ from ._runtime import RuntimeHandle, _runtime_debug
 
 
 def padded_mxfp8_scale_columns(hidden: int) -> int:
-    """Return the E8M0 row width required by Rubin's 16-byte token-in copy."""
+    """Return the E8M0 row width required by the MegaMoE 16-byte token-in copy."""
 
     logical_columns = (hidden + 31) // 32
     return round_up(logical_columns, 16)
@@ -99,7 +99,7 @@ class BufferLayout:
 class WorkspaceRequirements:
     """Capacity-driven regions supplied before runtime allocation.
 
-    The executable backend obtains exact Rubin kernel workspace sizes, then
+    The executable backend obtains exact MegaMoE kernel workspace sizes, then
     passes them here without making the runtime owner import or instantiate
     CuTeDSL kernels.
     """

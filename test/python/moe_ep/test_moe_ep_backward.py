@@ -72,7 +72,10 @@ from cudnn.moe_ep._validation import (
     validate_training_non_aliasing,
 )
 from cudnn.moe_ep.api import _resolve_training_device
-from moe_ep.moe_ep_distributed_workers import _distributed_backward_worker
+from moe_ep.moe_ep_distributed_workers import (
+    _distributed_backward_worker,
+    _distributed_ds3_numerics_worker,
+)
 from moe_ep.moe_ep_test_support import (
     _allocate_stateless_training_outputs,
     _allocate_training_wgrad_outputs,
@@ -96,11 +99,13 @@ from moe_ep.moe_ep_test_support import (
     _poison_pre_reduced_for_test,
     _poison_training_outputs_for_test,
     _require_distributed_sm107,
+    _require_distributed_training,
     _run_isolated,
     _run_training_wgrad,
     _sm107_device,
     _training_abi_prepared,
     _training_config,
+    _training_device,
     _training_prepared_pair,
     make_forward_inputs,
     quantize_mxfp8,
@@ -990,11 +995,11 @@ def test_backend_queries_cluster4_only_for_mixed_cga_phase(monkeypatch):
 
 def _vendored_dgrad_kernel_class():
     from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import (
-        require_rubin_cutedsl,
+        require_megamoe_cutedsl,
     )
 
     try:
-        require_rubin_cutedsl()
+        require_megamoe_cutedsl()
     except RuntimeError as error:
         pytest.skip(str(error))
     from cudnn.moe_ep._megamoe_backend.cutedsl_src.kernel_src.rubin.training.mega.bwd_dglu.dglu_mxfp8_mega_moe_kernel import (
@@ -1061,6 +1066,59 @@ def test_vendored_dgrad_resolver_matches_moe_ep_profiles(profile):
         resolved = kernel_class._resolve_tuning(description, implementation)
         assert {name: resolved[name] for name in expected} == expected
         assert resolved["load_balance_mode"] == implementation["load_balance_mode"]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("profile", ("baseline", "rolling", "ds3_ep4_pattern"))
+def test_vendored_blackwell_dgrad_resolver_matches_moe_ep_profiles(profile):
+    # The Blackwell resolver is host-only, so this runs without a CUTLASS DSL.
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.kernel_src.blackwell.training.mega.bwd_dglu.dgrad_config import (
+        resolve_dgrad_config,
+    )
+    from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        _BLACKWELL_RESOLVED_DGRAD_PROFILES,
+        _blackwell_dgrad_selector_kwargs,
+    )
+
+    ds3 = profile == "ds3_ep4_pattern"
+    problem = {
+        "world_size": 4,
+        "expert_count": 32,
+        "topk": 8,
+        "max_tokens_per_rank": 4096,
+        "max_recv_size_per_rank": 131072,
+        "hidden_size": 7168,
+        "intermediate_gateup_size": 2048,
+        "quant_kind": "mxfp8_e4m3",
+        "combine_format": "32e4m3xe8m0",
+        "gate_up_clamp": None,
+    }
+    implementation = {
+        "mma_tiler_mnk": (256, 256, 128),
+        "cluster_shape_mnk": (2, 1, 1),
+        "use_2cta_instrs": True,
+        "token_padding_block": 128,
+        "sf_padding_block": 128,
+        "sf_vec_size": 32,
+        "launch_cluster_count": 74,
+        "group_hint": 74,
+        "drop_on_overflow": True,
+        "act_func": "swiglu",
+        "dfc2_recompute": True,
+        "dfc2_col_output": True,
+        "enable_grad_y2_col_quant": True,
+        "weight_storage_mode": "contiguous",
+        "load_balance_mode": "static" if profile == "baseline" else "atomic_counter",
+        "token_back_mode": "epi_warps",
+        "epi_flag_batch": (4, 2) if ds3 else (1, 1),
+        "flag_batch": 1,
+        **_blackwell_dgrad_selector_kwargs(SimpleNamespace(dgrad_optimization=profile, force_static_sched=True, clc_bundle_size=None, num_sched_stages=None)),
+    }
+
+    resolved = resolve_dgrad_config(problem, implementation)
+    expected = _BLACKWELL_RESOLVED_DGRAD_PROFILES[profile]
+    assert {name: resolved[name] for name in expected} == expected
+    assert resolved["dgrad_optimization_overrides"] == {}
 
 
 def _qualified_ds3_training_config(
@@ -1233,9 +1291,51 @@ def test_ds3_accepts_overprovisioned_exact_physical_pool():
 
 
 @pytest.mark.L0
+def _prepare_blackwell_backward(resolved):
+    from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        prepare_backward_kernel,
+    )
+    from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import (
+        require_megamoe_cutedsl,
+    )
+
+    try:
+        require_megamoe_cutedsl()
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    config = Mxfp8KernelConfig.for_training_backward(resolved, launch_cluster_count=74)
+    return prepare_backward_kernel(resolved, config, torch.device("cuda", 0), architecture=(10, 0))
+
+
+@pytest.mark.L0
+def test_blackwell_backward_declines_ds3_outside_qualified_workload():
+    from cudnn import MoeEpTuningConfig
+
+    resolved = _training_config(
+        num_experts=32,
+        hidden_size=7168,
+        intermediate_size=2048,
+        top_k=8,
+        max_tokens_per_rank=2048,
+        physical_recv_pool_rows=None,
+        combine_format="mxfp8",
+        ep_size=4,
+        ep_global_ranks=(0, 1, 2, 3),
+        experts_per_rank=8,
+        training_backward_tuning=MoeEpTuningConfig(dgrad_optimization="ds3_ep4_pattern"),
+    )
+    with pytest.raises(
+        NotImplementedError, match="qualified on Blackwell SM100 only for the DS3 EP4 workload: ds3_ep4_v1 unsupported problem: max_tokens_per_rank=2048"
+    ):
+        _prepare_blackwell_backward(resolved)
+
+
+@pytest.mark.L0
 def test_resolved_dgrad_profile_guard_rejects_upstream_drift():
     from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import BLACKWELL_SM100, RUBIN_SM107
     from cudnn.moe_ep._megamoe_backend.mxfp8._backward_compile import (
+        _BLACKWELL_RESOLVED_DGRAD_PROFILES,
         _RESOLVED_DGRAD_PROFILES,
         _validate_resolved_dgrad_profile,
     )
@@ -1245,12 +1345,13 @@ def test_resolved_dgrad_profile_guard_rejects_upstream_drift():
         launch_cluster_count=16,
     )
     resolved = dict(_RESOLVED_DGRAD_PROFILES["baseline"])
-    _validate_resolved_dgrad_profile(baseline, SimpleNamespace(resolved_dgrad_config=resolved))
+    _validate_resolved_dgrad_profile(baseline, SimpleNamespace(resolved_dgrad_config=resolved), RUBIN_SM107)
     # Upstream resolving a profile field differently, such as a new "auto" default, is drift.
     with pytest.raises(RuntimeError, match="resolution drifted"):
         _validate_resolved_dgrad_profile(
             baseline,
             SimpleNamespace(resolved_dgrad_config={**resolved, "input_dedup_mode": "rank"}),
+            RUBIN_SM107,
         )
 
     ds3 = Mxfp8KernelConfig.for_training_backward(
@@ -1260,12 +1361,24 @@ def test_resolved_dgrad_profile_guard_rejects_upstream_drift():
         launch_cluster_count=106,
     )
     resolved = dict(_RESOLVED_DGRAD_PROFILES["ds3_ep4_pattern"])
-    _validate_resolved_dgrad_profile(ds3, SimpleNamespace(resolved_dgrad_config=resolved))
+    _validate_resolved_dgrad_profile(ds3, SimpleNamespace(resolved_dgrad_config=resolved), RUBIN_SM107)
     with pytest.raises(RuntimeError, match="resolution drifted"):
         _validate_resolved_dgrad_profile(
             ds3,
             SimpleNamespace(resolved_dgrad_config={**resolved, "use_scaled_cvt": False}),
+            RUBIN_SM107,
         )
+
+    # Blackwell keeps upstream's named presets; overrides rename ds3_ep4_v1.
+    resolved = dict(_BLACKWELL_RESOLVED_DGRAD_PROFILES["ds3_ep4_pattern"])
+    _validate_resolved_dgrad_profile(ds3, SimpleNamespace(resolved_dgrad_config=resolved), BLACKWELL_SM100)
+    for drift in ({"dgrad_optimization_profile": "ds3_ep4_v1_custom"}, {"use_scaled_cvt": True}):
+        with pytest.raises(RuntimeError, match="resolution drifted"):
+            _validate_resolved_dgrad_profile(
+                ds3,
+                SimpleNamespace(resolved_dgrad_config={**resolved, **drift}),
+                BLACKWELL_SM100,
+            )
 
 
 @pytest.mark.L0
@@ -1995,7 +2108,7 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 def test_training_graph_error_mode_overflow_asserts_on_all_ep2_ranks():
-    _require_distributed_sm107(2)
+    _require_distributed_training(2)
     env = os.environ.copy()
     env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
     # The probe runs in a fresh interpreter and imports moe_ep.*, so test/python must be on its path.
@@ -2030,7 +2143,7 @@ def test_training_graph_error_mode_overflow_asserts_on_all_ep2_ranks():
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 def test_training_graph_drop_mode_overflow_completes_forward_and_backward():
-    _require_distributed_sm107(2)
+    _require_distributed_training(2)
     env = os.environ.copy()
     env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
     # The probe runs in a fresh interpreter and imports moe_ep.*, so test/python must be on its path.
@@ -2081,11 +2194,11 @@ def test_ds3_prepares_qualified_upstream_kernel(
         prepare_backward_kernel,
     )
     from cudnn.moe_ep._megamoe_backend.mxfp8._compile_common import (
-        _prepare_rubin_environment,
+        _prepare_environment,
     )
 
-    device = _sm107_device()
-    architecture, launch_cluster_count = _prepare_rubin_environment(
+    device = _training_device()
+    architecture, launch_cluster_count = _prepare_environment(
         device,
         cluster_size=2,
         context="backward test",
@@ -2129,7 +2242,9 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
 ):
     from cudnn import MoeEpTuningConfig
 
-    device = _sm107_device()
+    device = _training_device()
+    _skip_forward_tuning_declined_on_device(device, forward_tuning)
+    _skip_dgrad_profile_declined_on_device(device, dgrad_optimization)
     args = make_forward_inputs(device)
     args = (*args[:4], args[4].float().contiguous())
     grad_output = _grad_output(device, args[0].shape[0], seed=20260911)
@@ -2255,7 +2370,7 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("world_size", [2, 4], ids=["ep2", "ep4"])
 def test_discrete_training_multi_gpu_matches_reference(world_size, tmp_path):
-    _require_distributed_sm107(world_size)
+    _require_distributed_training(world_size)
     os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
     init_file = tmp_path / f"discrete_training_ep{world_size}.init"
     mp.spawn(
@@ -2294,6 +2409,30 @@ def test_training_multi_gpu_mixed_cga_matches_reference(world_size, tuning_name,
         join=False,
     )
     _join_spawned_with_deadline(context, what=f"EP{world_size} mixed-CGA training {tuning_name} ({storage_mode})")
+
+
+def _skip_forward_tuning_declined_on_device(device: torch.device, tuning: dict, combine_format: str = "bf16") -> None:
+    """Skip a case whose training-forward tuning this device's forward kernel declines (see MegaMoeArchitecture)."""
+
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+    architecture = architecture_for(torch.cuda.get_device_capability(device))
+    try:
+        architecture.validate_forward_tuning("training_forward_tuning", MoeEpTuningConfig(**tuning), combine_format)
+    except NotImplementedError as error:
+        pytest.skip(str(error))
+
+
+def _skip_dgrad_profile_declined_on_device(device: torch.device, dgrad_optimization: str) -> None:
+    """Skip ds3_ep4_pattern off the DS3 EP4 workload on Blackwell SM100, which declines it there (see prepare_backward_kernel)."""
+
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import BLACKWELL_SM100, architecture_for
+
+    if dgrad_optimization == "ds3_ep4_pattern" and architecture_for(torch.cuda.get_device_capability(device)) is BLACKWELL_SM100:
+        pytest.skip(
+            "ds3_ep4_pattern is qualified on Blackwell SM100 only for the DS3 EP4 workload; test_ds3_ep4_profiles_match_baseline_and_reference covers it"
+        )
 
 
 _TRAINING_FORWARD_TUNING_CASES = {
@@ -2365,11 +2504,35 @@ def _training_forward_tuning_worker(case_name: str) -> None:
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("case_name", sorted(_TRAINING_FORWARD_TUNING_CASES))
 def test_training_forward_kernel_tuning_does_not_accumulate_across_calls(case_name):
-    _sm107_device()
+    _skip_forward_tuning_declined_on_device(_training_device(), _TRAINING_FORWARD_TUNING_CASES[case_name])
     _run_isolated(
         _training_forward_tuning_worker,
         (case_name,),
         what=f"training forward tuning case {case_name}",
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("routing", ["uniform", "skewed"])
+def test_ds3_ep4_profiles_match_baseline_and_reference(routing, tmp_path):
+    """Run baseline, rolling and ds3_ep4_pattern on the qualified DS3 EP4 workload.
+
+    Kernel and oracle consume one pre-quantized MXFP8 output gradient. Each profile must
+    meet norm bounds against the independent oracle and stay within 10% of baseline's
+    error. Profiles that share baseline's FP8 conversion must also reproduce its outputs
+    bit for bit, with dprob allowed FP32 reduction-order noise.
+    """
+
+    world_size = 4
+    _require_distributed_training(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / f"ds3_numerics_{routing}.init"
+    mp.spawn(
+        _distributed_ds3_numerics_worker,
+        args=(world_size, str(init_file), routing),
+        nprocs=world_size,
+        join=True,
     )
 
 
@@ -2569,7 +2732,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
 ):
     """Consumers must ignore poisoned capacity tails across dynamic expert ranges."""
 
-    device = _sm107_device()
+    device = _training_device()
     base_args = make_forward_inputs(device)
     repeats = (token_count + base_args[0].shape[0] - 1) // base_args[0].shape[0]
     activation = base_args[0].dequantize(input_dtype).repeat((repeats, 1))[:token_count].contiguous()
@@ -2831,7 +2994,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
 def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
     """Decode only offsets/counts-defined rows across padding boundaries."""
 
-    device = _sm107_device()
+    device = _training_device()
     generator = torch.Generator(device=device).manual_seed(20260904 + token_count)
     hidden = 128
     intermediate = 256
@@ -2952,7 +3115,7 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
 def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
     """Validate poisoned fixed-capacity operands at fixed-T graph replay."""
 
-    device = _sm107_device()
+    device = _training_device()
     base_args = make_forward_inputs(device)
     activation = base_args[0]
     topk_idx = base_args[3]
