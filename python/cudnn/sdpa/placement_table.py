@@ -323,16 +323,19 @@ def _sm100_dense_split(row: str, facts) -> bool:
 
 
 SM107_PAGED_CGA_TILE_S_Q = (128, 256)  # Rubin paged THD d128 unpacked prefill keyed `prefill_cga_tile` for lo < S_q <= hi
-SM107_PAGED_UNPACKED_SHORT_MAX_S_Q = 64  # ... and GQA `prefill_short_q` up to this S_q
-SM107_PAGED_UNPACKED_SHORT_MAX_KV = 8192  # ... over a cache of at most this many keys
+SM107_PAGED_UNPACKED_SHORT_MAX_S_Q = 64  # ... `prefill_short_q` up to this S_q
+SM107_PAGED_UNPACKED_SHORT_MAX_KV = 8192  # ... over a cache of at most this many keys, `prefill_short_q_long_kv` past it
+SM107_PAGED_UNPACKED_CLUSTER_CTAS = 2  # the unpacked plan runs each sequence's head in one 2-CTA cluster (TILE_CGA_M)
 
 
 def _sm107_paged_unpacked_band(row: str, facts) -> Optional[str]:
     """Rubin paged THD d128 causal prefill whose plan runs unpacked (MHA and the groups the row does not pack) and unsplit, keyed by
-    query length where FROST's standing against the backend moves with the query rows unlike the rest of the class: GQA with up to
-    SM107_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head over at most SM107_PAGED_UNPACKED_SHORT_MAX_KV keys (`prefill_short_q`; study
-    rubin_paged_unpacked_bands_20261128; over longer caches FROST holds out to more rows), and past one 128-row tile but inside one 2-CTA
-    Q tile (`prefill_cga_tile`; study rubin_paged_unpacked_prefill_20261127). Read from the row's own pack and split decisions."""
+    query length where FROST's standing against the backend moves with the query rows unlike the rest of the class: up to
+    SM107_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head over at most SM107_PAGED_UNPACKED_SHORT_MAX_KV keys (`prefill_short_q`) or more
+    (`prefill_short_q_long_kv`, where FROST holds out to more rows; study rubin_paged_unpacked_bands_20261128), and past one 128-row tile
+    but inside one 2-CTA Q tile (`prefill_cga_tile`; study rubin_paged_unpacked_prefill_20261127). MHA over a long cache keys apart only
+    while its clusters fit one wave: past it FROST against the backend swings with the wave count, ordered by no single feature. Read
+    from the row's own pack and split decisions."""
     if row != "sdpa_fwd_prefill_sm107" or not (facts.has_paged_kv and facts.thd) or (facts.d_qk, facts.d_v) != (128, 128):
         return None
     if not (facts.causal and facts.bottom_right) or facts.window_left is not None or facts.has_sink or facts.right_band_widening:
@@ -344,7 +347,10 @@ def _sm107_paged_unpacked_band(row: str, facts) -> Optional[str]:
         return None
     lo, hi = SM107_PAGED_CGA_TILE_S_Q
     if facts.s_q <= SM107_PAGED_UNPACKED_SHORT_MAX_S_Q:
-        return "prefill_short_q" if facts.h_q != facts.h_kv and facts.s_kv <= SM107_PAGED_UNPACKED_SHORT_MAX_KV else None
+        if facts.s_kv <= SM107_PAGED_UNPACKED_SHORT_MAX_KV:
+            return "prefill_short_q"
+        one_wave = SM107_PAGED_UNPACKED_CLUSTER_CTAS * facts.b * facts.h_q <= (facts.device_sm_count or 0)
+        return "prefill_short_q_long_kv" if facts.h_q != facts.h_kv or one_wave else None
     return "prefill_cga_tile" if lo < facts.s_q <= hi else None
 
 
@@ -934,13 +940,31 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", False): Entry("always", None, "sm107_window_gaps_20261118"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
     # study rubin_paged_unpacked_bands_20261128 (208-SM Rubin, a newer development cuDNN build; the inference harness's paged context
-    # graph, gen.py adapter inference_context, bf16; gen.py --constrained over the train, an off-tile supplement and two holdouts pooled,
-    # 244 cells keyed prefill_short_q. Only those classes ship.)
+    # graph, gen.py adapter inference_context, bf16; gen.py --constrained over the train, an off-tile supplement, two holdouts and a
+    # MHA / long-cache train pooled, 565 cells keyed prefill_short_q or prefill_short_q_long_kv. Only those classes ship.)
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", False): Entry(
         "le", 6.377, "rubin_paged_unpacked_bands_20261128", "tiles"
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", True): Entry(
         "le", 6.085, "rubin_paged_unpacked_bands_20261128", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", False): Entry(
+        "le", 6.696, "rubin_paged_unpacked_bands_20261128", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", True): Entry(
+        "le", 6.904, "rubin_paged_unpacked_bands_20261128", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "gqa", False): Entry(
+        "le", 14.65, "rubin_paged_unpacked_bands_20261128", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "gqa", True): Entry(
+        "le", 33.951, "rubin_paged_unpacked_bands_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "mha", False): Entry(
+        "always", None, "rubin_paged_unpacked_bands_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "mha", True): Entry(
+        "always", None, "rubin_paged_unpacked_bands_20261128"
     ),
     # study rubin_paged_unpacked_prefill_20261127 (208-SM Rubin, cuDNN 9.30.0.15; the inference harness's paged context graph, gen.py
     # adapter inference_context, bf16; gen.py --constrained over 280 train cells, 144 keyed prefill_cga_tile. Only those classes ship.)
