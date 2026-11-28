@@ -400,7 +400,10 @@ def _first_use_reports():
     previous = sys.unraisablehook
 
     def hook(unraisable):
-        error, raised_in = unraisable.exc_value, getattr(unraisable.object, "__module__", "")
+        error, raised_in = unraisable.exc_value, getattr(unraisable.object, "__module__", None)
+        if raised_in is None:  # Python 3.13 reports a ctypes callback's exception with no object: the callback's own frame
+            trace = getattr(unraisable, "exc_traceback", None)
+            raised_in = trace.tb_frame.f_globals.get("__name__", "") if trace is not None else ""
         if type(error) is RuntimeError and raised_in == LOADER and str(error).startswith(MISSING_FILE):
             return
         previous(unraisable)

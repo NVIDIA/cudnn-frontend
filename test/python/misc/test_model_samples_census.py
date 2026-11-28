@@ -2093,6 +2093,7 @@ def _stand_ins(
         """The library's loader callback for a kernel binary that is not on the machine: it raises where only the
         interpreter's hook for an exception nobody can catch sees it, as a callback of ``ctypes`` does."""
         import ctypes
+        import types
 
         def get_cubin_callback():
             raise RuntimeError(
@@ -2100,7 +2101,10 @@ def _stand_ins(
                 "FLASHINFER_NO_DOWNLOAD is set \u2014 refusing to download. This means flashinfer-cubin is missing this file."
             )
 
-        get_cubin_callback.__module__ = flashinfer_calls.LOADER
+        # the loader's module is its globals' (the interpreter names it from there from Python 3.13 on) and the function's
+        get_cubin_callback = types.FunctionType(
+            get_cubin_callback.__code__, {"__name__": flashinfer_calls.LOADER, "__builtins__": __builtins__}, closure=get_cubin_callback.__closure__
+        )
         ctypes.CFUNCTYPE(None)(get_cubin_callback)()
 
     class Library:
