@@ -742,6 +742,17 @@ class Graph : public ICudnn, public INode {
         return derived;
     }
 
+    // Recording adds scalar defaults and workspace addresses only to call-local storage.
+    // Dense graphs with neither retain the allocation-free caller-map path.
+    UidBindings &
+    cuda_graph_bindings_(UidBindings &caller, UidBindings &local) const {
+        if (cached_pass_by_value.empty() && cached_workspace_modifications.empty()) {
+            return caller;
+        }
+        local = caller;
+        return local;
+    }
+
     static void *const *
     find_binding_(Tensor_attributes::uid_t uid, UidBindings const &uid_to_device_ptrs, UidBindings const &derived) {
         auto search = uid_to_device_ptrs.find(uid);
@@ -788,9 +799,11 @@ class Graph : public ICudnn, public INode {
 
     error_t
     update_cuda_graph(cudnnHandle_t handle,
-                      std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
+                      std::unordered_map<Tensor_attributes::uid_t, void *> &caller_uid_to_device_ptrs,
                       void *workspace,
                       cudaGraph_t cudnn_cuda_graph) {
+        UidBindings local_bindings;
+        auto &uid_to_device_ptrs = cuda_graph_bindings_(caller_uid_to_device_ptrs, local_bindings);
         // Initializes this cudnn graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             cudnn_cuda_graph == nullptr, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should not be a nullptr");
@@ -952,9 +965,11 @@ class Graph : public ICudnn, public INode {
 
     error_t
     populate_cuda_graph(cudnnHandle_t handle,
-                        std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
+                        std::unordered_map<Tensor_attributes::uid_t, void *> &caller_uid_to_device_ptrs,
                         void *workspace,
                         cudaGraph_t cudnn_cuda_graph) {
+        UidBindings local_bindings;
+        auto &uid_to_device_ptrs = cuda_graph_bindings_(caller_uid_to_device_ptrs, local_bindings);
         // Only a cuDNN execution plan can be recorded into a CUDA graph by this
         // API.
         RETURN_CUDNN_FRONTEND_ERROR_IF(plans.is_frontend_engine_candidate(),
@@ -1182,9 +1197,11 @@ class Graph : public ICudnn, public INode {
 
     error_t
     populate_cuda_graph_direct(cudnnHandle_t handle,
-                               std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
+                               std::unordered_map<Tensor_attributes::uid_t, void *> &caller_uid_to_device_ptrs,
                                void *workspace,
                                cudaGraph_t cudnn_cuda_graph) {
+        UidBindings local_bindings;
+        auto &uid_to_device_ptrs = cuda_graph_bindings_(caller_uid_to_device_ptrs, local_bindings);
         // Only a cuDNN execution plan can be recorded into a CUDA graph by this
         // API.
         RETURN_CUDNN_FRONTEND_ERROR_IF(plans.is_frontend_engine_candidate(),
@@ -1279,9 +1296,11 @@ class Graph : public ICudnn, public INode {
 
     error_t
     update_cuda_graph_direct(cudnnHandle_t handle,
-                             std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
+                             std::unordered_map<Tensor_attributes::uid_t, void *> &caller_uid_to_device_ptrs,
                              void *workspace,
                              cudaGraph_t cudnn_cuda_graph) {
+        UidBindings local_bindings;
+        auto &uid_to_device_ptrs = cuda_graph_bindings_(caller_uid_to_device_ptrs, local_bindings);
         // Only a cuDNN execution plan can be updated in place by this API.
         RETURN_CUDNN_FRONTEND_ERROR_IF(plans.is_frontend_engine_candidate(),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -1843,12 +1862,13 @@ class Graph : public ICudnn, public INode {
         std::vector<void *> heap_ptrs;
         void **user_ptrs = (n_user <= STACK_MAX) ? stack_ptrs : (heap_ptrs.resize(n_user), heap_ptrs.data());
         for (int i = 0; i < n_user; i++) {
-            int64_t uid = varpack_template.all_uids[varpack_template.user_slots[i]];
-            auto it     = tensor_uid_to_pointer_map.find(uid);
-            RETURN_CUDNN_FRONTEND_ERROR_IF(it == tensor_uid_to_pointer_map.end(),
+            int64_t uid       = varpack_template.all_uids[varpack_template.user_slots[i]];
+            auto it           = tensor_uid_to_pointer_map.find(uid);
+            void *default_ptr = varpack_template.template_ptrs[varpack_template.user_slots[i]];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(it == tensor_uid_to_pointer_map.end() && default_ptr == nullptr,
                                            error_code_t::INVALID_VARIANT_PACK,
                                            "Uid " + std::to_string(uid) + " not found in variant pack.");
-            user_ptrs[i] = it->second;
+            user_ptrs[i] = it == tensor_uid_to_pointer_map.end() ? default_ptr : it->second;
         }
         return execute_ordered_impl(handle,
                                     user_ptrs,
@@ -1936,8 +1956,9 @@ class Graph : public ICudnn, public INode {
                 "Plan requires a " + std::to_string(required_workspace) + "-byte workspace but received null.");
         }
 
-        // Validate n_user matches expected user slot count
-        RETURN_CUDNN_FRONTEND_ERROR_IF(n_user != static_cast<int>(varpack_template.user_slots.size()),
+        // Older ordered callers pass only required UIDs, leaving graph-owned scalar defaults in the template.
+        bool const use_defaults = n_user != static_cast<int>(varpack_template.user_slots.size());
+        RETURN_CUDNN_FRONTEND_ERROR_IF(use_defaults && n_user != varpack_template.required_user_count,
                                        error_code_t::INVALID_VARIANT_PACK,
                                        "n_user (" + std::to_string(n_user) +
                                            ") does not match expected user slot count (" +
@@ -1975,8 +1996,15 @@ class Graph : public ICudnn, public INode {
         }
 
         // 1. Patch user pointers
-        for (int i = 0; i < n_user; i++) {
-            ptrs[varpack_template.user_slots[i]] = sorted_user_ptrs[i];
+        if (use_defaults) {
+            int i = 0;
+            for (auto slot : varpack_template.user_slots) {
+                if (varpack_template.template_ptrs[slot] == nullptr) ptrs[slot] = sorted_user_ptrs[i++];
+            }
+        } else {
+            for (int i = 0; i < n_user; i++) {
+                ptrs[varpack_template.user_slots[i]] = sorted_user_ptrs[i];
+            }
         }
 
         // 2. Update workspace-relative pointers (pre-computed slot indices)
@@ -2882,6 +2910,8 @@ class Graph : public ICudnn, public INode {
         std::vector<int> user_slots;        // indices into template_ptrs that the user
                                             // fills (sorted UID order)
 
+        int required_user_count = 0;  // ordered bindings with every runtime scalar default omitted
+
         // Pre-computed slot indices for per-call updates (avoid linear scans at execute time)
         std::vector<std::pair<int, int64_t>> workspace_slots;                    // (slot, byte_offset)
         std::vector<std::pair<int, std::pair<int, int64_t>>> replacement_slots;  // (dst_slot, (src_slot, offset)) —
@@ -2982,7 +3012,8 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        // 5. Identify user-fillable slots: nullptr entries that are NOT workspace/replacement targets
+        // 5. Runtime PBV defaults remain user-fillable: an explicit binding takes
+        // precedence over the graph's value. Workspace/replacement targets are internal.
         std::unordered_set<int64_t> workspace_uids;
         for (auto const &[uid, data] : cached_workspace_modifications) {
             workspace_uids.insert(uid);
@@ -2994,11 +3025,17 @@ class Graph : public ICudnn, public INode {
         }
         for (int i = 0; i < (int)t.template_ptrs.size(); i++) {
             int64_t uid = t.all_uids[i];
-            if (t.template_ptrs[i] == nullptr && workspace_uids.find(uid) == workspace_uids.end() &&
+            if (workspace_uids.find(uid) == workspace_uids.end() &&
                 replacement_dst_uids.find(uid) == replacement_dst_uids.end()) {
                 t.user_slots.push_back(i);
+                if (t.template_ptrs[i] == nullptr) ++t.required_user_count;
             }
         }
+
+        // Known PBV values may have appended slots outside the original sorted
+        // variant-pack UIDs. Every caller-facing binding order must stay sorted.
+        std::sort(
+            t.user_slots.begin(), t.user_slots.end(), [&](int a, int b) { return t.all_uids[a] < t.all_uids[b]; });
 
         // A legacy Slice destination is checked too: its pointer is the source pointer plus the slice offset.
         for (int slot = 0; slot < (int)t.all_uids.size(); slot++) {
@@ -3063,6 +3100,11 @@ class Graph : public ICudnn, public INode {
             }
             return -1;
         });
+    }
+
+    std::unordered_map<uid_t, pass_by_values_t> const &
+    get_variant_pack_scalar_defaults() const {
+        return cached_pass_by_value;
     }
 
     std::vector<int64_t>
