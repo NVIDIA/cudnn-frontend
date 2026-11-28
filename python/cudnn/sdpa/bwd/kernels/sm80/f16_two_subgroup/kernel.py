@@ -1463,12 +1463,10 @@ def _do_dot_thd_kernel(
     row_do: cutlass.Constexpr[int],
     max_sq: cutlass.Int32,
 ):
-    bx, _, _ = cute.arch.block_idx()
+    r, b, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     warp = tidx // 32
     lane = tidx % 32
-    b = bx // max_sq
-    r = bx % max_sq
     cu_p = cutlass.make_array_view(CU_Q).data_ptr()
     cu_b = Pointer(cu_p + b, dtype=cutlass.Int32).load()
     if r < Pointer(cu_p + b + cutlass.Int32(1), dtype=cutlass.Int32).load() - cu_b:
@@ -1765,10 +1763,8 @@ def _cast_thd_org_kernel(
     row_dq: cutlass.Constexpr[int],
     max_sq: cutlass.Int32,
 ):
-    bx, _, _ = cute.arch.block_idx()
+    r, b, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
-    b = bx // max_sq
-    r = bx % max_sq
     cu_p = cutlass.make_array_view(CU_Q).data_ptr()
     cu_b = Pointer(cu_p + b, dtype=cutlass.Int32).load()
     if r < Pointer(cu_p + b + cutlass.Int32(1), dtype=cutlass.Int32).load() - cu_b:
@@ -1802,10 +1798,8 @@ def _dkv_reduce_thd_org_kernel(
     max_skv: cutlass.Int32,
 ):
     ratio = H // Hk
-    bx, _, _ = cute.arch.block_idx()
+    r, b, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
-    b = bx // max_skv
-    r = bx % max_skv
     cu_p = cutlass.make_array_view(CU_K).data_ptr()
     cu_b = Pointer(cu_p + b, dtype=cutlass.Int32).load()
     if r < Pointer(cu_p + b + cutlass.Int32(1), dtype=cutlass.Int32).load() - cu_b:
@@ -1978,7 +1972,7 @@ def _do_dot_thd_host(
     stream: cuda.CUstream,
 ):
     _do_dot_thd_kernel(O, dO, DELTA, CU_Q, ORG, d_v, io_dtype, row_o, row_do, max_sq).launch(
-        grid=(n_seq * max_sq, 1, 1), block=(_DODOT_WARPS * 32, 1, 1), stream=stream
+        grid=(max_sq, n_seq, 1), block=(_DODOT_WARPS * 32, 1, 1), stream=stream
     )
 
 
@@ -2044,9 +2038,7 @@ def _cast_thd_org_host(
     max_sq: cutlass.Int32,
     stream: cuda.CUstream,
 ):
-    _cast_thd_org_kernel(dQ_acc, dQ_out, CU_Q, ORG, io_dtype, H, fd, d_out, row_dq, max_sq).launch(
-        grid=(n_seq * max_sq, 1, 1), block=(256, 1, 1), stream=stream
-    )
+    _cast_thd_org_kernel(dQ_acc, dQ_out, CU_Q, ORG, io_dtype, H, fd, d_out, row_dq, max_sq).launch(grid=(max_sq, n_seq, 1), block=(256, 1, 1), stream=stream)
 
 
 @cute.jit
@@ -2066,7 +2058,7 @@ def _dkv_reduce_thd_org_host(
     stream: cuda.CUstream,
 ):
     _dkv_reduce_thd_org_kernel(IN, OUT, CU_K, ORG, d_in, d_out, H, Hk, io_dtype, row_out, max_skv).launch(
-        grid=(n_seq * max_skv, 1, 1), block=(256, 1, 1), stream=stream
+        grid=(max_skv, n_seq, 1), block=(256, 1, 1), stream=stream
     )
 
 
