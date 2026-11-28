@@ -63,7 +63,9 @@ def test_entries_are_well_formed_and_name_known_rows():
             "prefill_short_square",
             "prefill_short_q",
             "prefill_short_q_long_kv",
+            "prefill_one_q_tile",
             "prefill_cga_tile",
+            "prefill_cga_tile_waves",
             "prefill_split",
         )
         assert not phase.endswith("_det") or row in pt.DETERMINISTIC_KEYED_ROWS, key
@@ -1502,7 +1504,7 @@ def test_sm107_f16_borrows_the_transferred_studies():
 @pytest.mark.parametrize("heads", [(32, 8), (32, 32)], ids=["gqa", "mha"])
 def test_sm107_paged_prefill_entries_lead_their_classes(heads):
     """Study sm107_paged_prefill_20261109 (Rubin, FlashInfer's paged path): D192/V128 leads on the 128-key tile from 512 KV
-    tokens and always off it; D256 leads everywhere. D128 belongs to study sm107_thd_prefill_20261111; f16, a window, a
+    tokens and always off it; D256 leads everywhere. D128 belongs to the D128 studies; f16, a window, a
     mask-free D192 graph and another part keep the hand rules."""
     row = "sdpa_fwd_prefill_sm107"
     h_q, h_kv = heads
@@ -1521,7 +1523,8 @@ def test_sm107_paged_prefill_entries_lead_their_classes(heads):
     for s_kv in (256, 257, 65536):
         assert pt.lookup(row, paged(d=(256, 256), s_kv=s_kv)) is True
         assert pt.matched_entry(row, paged(d=(256, 256), s_kv=s_kv)).study == "sm107_paged_prefill_20261109"
-    assert pt.matched_entry(row, paged(d=(128, 128))).study == "sm107_thd_prefill_20261111"
+    d128 = "sm107_thd_prefill_20261111" if h_q != h_kv else "rubin_paged_unpacked_waves_20261128"  # unpacked MHA keys `prefill_one_q_tile`
+    assert pt.matched_entry(row, paged(d=(128, 128))).study == d128
     assert pt.lookup(row, paged(dtype=cudnn.data_type.HALF)) is None
     assert pt.lookup(row, paged(window_left=128)) is None
     assert pt.lookup(row, paged(causal=False, bottom_right=False)) is None

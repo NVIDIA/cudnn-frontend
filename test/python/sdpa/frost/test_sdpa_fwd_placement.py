@@ -1672,29 +1672,29 @@ def test_sm107_paged_mha_split_keys_apart(monkeypatch):
 
 @pytest.mark.L0
 def test_sm107_paged_unpacked_cga_tile_keys_apart(monkeypatch):
-    """Study rubin_paged_unpacked_prefill_20261127: Rubin paged THD d128 prefill whose plan runs unpacked and unsplit, inside one 2-CTA
-    Q tile per head, keys `prefill_cga_tile`. Its entries lead small launches and trail large ones, monotone in the launch. Packed
-    groups, split MHA, windows, other rows and S_q outside the band keep their classes."""
+    """Study rubin_paged_unpacked_waves_20261128: Rubin paged THD d128 prefill whose plan runs unpacked and unsplit, inside one 2-CTA
+    Q tile per head, keys `prefill_cga_tile` while its clusters fit one wave and leads, and `prefill_cga_tile_waves` past it and trails:
+    the verdict is exactly PAGED_UNPACKED_CLUSTER_CTAS * b * h_q <= sm_count, whatever the group. One 128-row Q tile per head keys
+    `prefill_one_q_tile`. Packed groups, split MHA, windows, other rows and S_q past the band keep their classes."""
     from cudnn.frost import buffers
     from cudnn.sdpa import placement_table as pt
     from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107")
-    lo, hi = pt.SM107_PAGED_CGA_TILE_S_Q
-    base = dict(b=1, h_q=24, h_kv=8, s_q=hi, s_kv=8192, page_size=64, max_total_seq_len_q=hi, device_sm_count=208)
+    lo, hi, sms = *pt.SM107_PAGED_CGA_TILE_S_Q, 208
+    study = "rubin_paged_unpacked_waves_20261128"
+    base = dict(b=1, h_q=24, h_kv=8, s_q=hi, s_kv=8192, page_size=64, max_total_seq_len_q=hi, device_sm_count=sms)
     f = lambda **over: _sm107_paged_facts(**{**base, **over})
-    for h_q, h_kv in ((24, 8), (40, 8), (48, 8), (28, 4), (32, 16), (32, 32)):  # groups 3, 5, 6, 7, 2 and MHA run unpacked
-        assert pt.class_key(spec.name, f(h_q=h_q, h_kv=h_kv))[4] == "prefill_cga_tile"
-        assert pt.matched_entry(spec.name, f(h_q=h_q, h_kv=h_kv)).study == "rubin_paged_unpacked_prefill_20261127"
-    for b in (1, 64):
-        assert pt.class_key(spec.name, f(b=b, s_kv=8192 + 1, max_total_seq_len_q=b * hi))[9]  # the off-tile twin is answered too
-        assert pt.matched_entry(spec.name, f(b=b, s_kv=8192 + 1, max_total_seq_len_q=b * hi)).study == "rubin_paged_unpacked_prefill_20261127"
-    for h_q, h_kv in ((24, 8), (32, 32)):
-        verdicts = [placement.place(spec, f(h_q=h_q, h_kv=h_kv, b=b, max_total_seq_len_q=b * hi)) for b in (1, 2, 4, 8, 16, 32, 64)]
-        assert verdicts[0] == placement.LEAD and verdicts[-1] == placement.TRAIL
-        assert verdicts == sorted(verdicts, key=lambda v: v == placement.TRAIL)  # once trailing, a larger launch trails
-    assert pt.class_key(spec.name, f(s_q=lo, max_total_seq_len_q=lo))[4] == "prefill"
+    for h_q, h_kv in ((24, 8), (40, 8), (48, 8), (28, 4), (32, 16), (32, 32), (112, 16), (18, 18)):  # groups 3, 5, 6, 7, 2 and MHA unpacked
+        for s_kv in (8192, 8192 + 1):  # on and off the KV tile
+            for b in (1, 2, 3, 4, 6, 8, 16, 64):
+                x = f(b=b, h_q=h_q, h_kv=h_kv, s_kv=s_kv, s_q=hi - 61, max_total_seq_len_q=b * (hi - 61))
+                one_wave = pt.PAGED_UNPACKED_CLUSTER_CTAS * b * h_q <= sms
+                assert pt.class_key(spec.name, x)[4] == ("prefill_cga_tile" if one_wave else "prefill_cga_tile_waves"), (h_q, s_kv, b)
+                assert pt.matched_entry(spec.name, x).study == study
+                assert placement.place(spec, x) == (placement.LEAD if one_wave else placement.TRAIL), (h_q, s_kv, b)
+    assert pt.class_key(spec.name, f(s_q=lo, max_total_seq_len_q=lo))[4] == "prefill_one_q_tile"
     assert pt.class_key(spec.name, f(s_q=lo + 1, max_total_seq_len_q=lo + 1))[4] == "prefill_cga_tile"
     assert pt.class_key(spec.name, f(s_q=hi + 1, max_total_seq_len_q=hi + 1))[4] == "prefill"
     assert pt.class_key(spec.name, f(h_q=32, h_kv=8))[4] == "prefill"  # the row packs group 4
@@ -1706,8 +1706,33 @@ def test_sm107_paged_unpacked_cga_tile_keys_apart(monkeypatch):
 
 
 @pytest.mark.L0
+def test_sm107_paged_unpacked_one_q_tile_keys_apart(monkeypatch):
+    """Study rubin_paged_unpacked_waves_20261128: Rubin paged THD d128 prefill whose plan runs unpacked and unsplit with more than
+    SM107_PAGED_UNPACKED_SHORT_MAX_S_Q and at most one 128-row Q tile of queries per head keys `prefill_one_q_tile`; GQA leads at every
+    launch size, and so does MHA past the smallest launches."""
+    from cudnn.frost import buffers
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107")
+    q, sms = pt.SM107_PAGED_CGA_TILE_S_Q[0], 208
+    base = dict(b=8, h_q=24, h_kv=8, s_q=q, s_kv=8192, page_size=16, max_total_seq_len_q=8 * q, device_sm_count=sms)
+    f = lambda **over: _sm107_paged_facts(**{**base, **over})
+    for h_q, h_kv in ((24, 8), (40, 8), (48, 8), (28, 4), (32, 16), (32, 32)):  # groups 3, 5, 6, 7, 2 and MHA run unpacked
+        for s_kv in (8192, 8192 + 1):
+            for b in (8, 16, 64):
+                x = f(b=b, h_q=h_q, h_kv=h_kv, s_kv=s_kv, max_total_seq_len_q=b * q)
+                assert pt.class_key(spec.name, x)[4] == "prefill_one_q_tile", (h_q, s_kv, b)
+                assert pt.matched_entry(spec.name, x).study == "rubin_paged_unpacked_waves_20261128"
+                assert placement.place(spec, x) == placement.LEAD, (h_q, s_kv, b)
+    assert pt.class_key(spec.name, f(s_q=pt.SM107_PAGED_UNPACKED_SHORT_MAX_S_Q + 1, max_total_seq_len_q=8 * 65))[4] == "prefill_one_q_tile"
+    assert pt.class_key(spec.name, f(h_q=32, h_kv=8))[4] == "prefill"  # the row packs group 4
+
+
+@pytest.mark.L0
 def test_sm107_paged_unpacked_short_q_keys_apart(monkeypatch):
-    """Study rubin_paged_unpacked_bands_20261128: Rubin paged THD d128 prefill whose plan runs unpacked and unsplit, with at most
+    """Study rubin_paged_unpacked_waves_20261128: Rubin paged THD d128 prefill whose plan runs unpacked and unsplit, with at most
     SM107_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head, keys `prefill_short_q` over at most SM107_PAGED_UNPACKED_SHORT_MAX_KV keys and
     `prefill_short_q_long_kv` past it; each class leads small launches and trails large ones, monotone in the launch. MHA over a long
     cache keys apart only while its 2-CTA clusters fit one wave. Longer queries, packed groups, windows and other rows keep their
@@ -1723,11 +1748,12 @@ def test_sm107_paged_unpacked_short_q_keys_apart(monkeypatch):
     # b 8: enough units that group 2 and MHA, which the row can split over KV at S_q 64, run unsplit
     base = dict(b=8, h_q=24, h_kv=8, s_q=q, s_kv=kv, page_size=16, max_total_seq_len_q=8 * q, device_sm_count=sms)
     f = lambda **over: _sm107_paged_facts(**{**base, **over})
-    study = "rubin_paged_unpacked_bands_20261128"
+    study = "rubin_paged_unpacked_waves_20261128"
     for h_q, h_kv in ((24, 8), (40, 8), (48, 8), (28, 4), (32, 16), (32, 32)):  # groups 3, 5, 6, 7, 2 and MHA run unpacked
         for s_kv in (kv, kv - 127):  # on and off the KV tile
             assert pt.class_key(spec.name, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv))[4] == "prefill_short_q"
-            assert pt.matched_entry(spec.name, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv)).study == study
+            short_gqa = h_q != h_kv and s_kv <= kv  # GQA over a short cache keeps rubin_paged_unpacked_bands_20261128's entries
+            assert pt.matched_entry(spec.name, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv)).study == ("rubin_paged_unpacked_bands_20261128" if short_gqa else study)
             assert heuristics._knob_sets(spec, f(h_q=h_q, h_kv=h_kv, s_kv=s_kv))[0].cga == pt.PAGED_UNPACKED_CLUSTER_CTAS
     # S_q 48 stays off the split chooser over any cache, so the launch sweeps reach b 1
     sweeps = [(24, 8, s_kv, "prefill_short_q") for s_kv in (kv, kv - 127)] + [(32, 32, s_kv, "prefill_short_q") for s_kv in (kv, kv - 127)]
@@ -1745,7 +1771,7 @@ def test_sm107_paged_unpacked_short_q_keys_apart(monkeypatch):
         assert placement.place(spec, one_wave) == placement.LEAD
         past = f(b=b + 1, s_q=48, h_q=26, h_kv=26, s_kv=s_kv, max_total_seq_len_q=(b + 1) * 48)
         assert pt.class_key(spec.name, past)[4] == "prefill"
-    assert pt.class_key(spec.name, f(s_q=q + 1, max_total_seq_len_q=8 * (q + 1)))[4] == "prefill"
+    assert pt.class_key(spec.name, f(s_q=q + 1, max_total_seq_len_q=8 * (q + 1)))[4] == "prefill_one_q_tile"
     assert pt.class_key(spec.name, f(h_q=32, h_kv=8))[4] == "prefill"  # the row packs group 4
     assert pt.class_key(spec.name, f(window_left=128))[4] == "prefill"
     assert pt.class_key("sdpa_fwd_prefill_sm100", f(device_cc=(10, 0), device_sm_count=148))[4] == "prefill"  # past one wave there

@@ -335,9 +335,10 @@ def _paged_unpacked_band(row: str, facts) -> Optional[str]:
     keyed by query length where FROST's standing against the backend moves unlike the rest of the class. Read from the row's own pack
     and split decisions.
 
-    Rubin: up to SM107_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head over at most SM107_PAGED_UNPACKED_SHORT_MAX_KV keys
-    (`prefill_short_q`) or more (`prefill_short_q_long_kv`, where FROST holds out to more rows; study rubin_paged_unpacked_bands_20261128),
-    and past one 128-row tile but inside one 2-CTA Q tile (`prefill_cga_tile`; study rubin_paged_unpacked_prefill_20261127). MHA over a
+    Rubin (study rubin_paged_unpacked_waves_20261128): up to SM107_PAGED_UNPACKED_SHORT_MAX_S_Q queries per head over at most
+    SM107_PAGED_UNPACKED_SHORT_MAX_KV keys (`prefill_short_q`) or more (`prefill_short_q_long_kv`, where FROST holds out to more waves),
+    one 128-row Q tile per head (`prefill_one_q_tile`), and inside one 2-CTA Q tile, apart by whether the clusters fit one wave
+    (`prefill_cga_tile`, `prefill_cga_tile_waves`): FROST wins every launch within one wave and loses every launch past it. MHA over a
     long cache keys apart only while its clusters fit one wave: past it FROST against the backend swings with the wave count, ordered by
     no single feature.
 
@@ -364,7 +365,11 @@ def _paged_unpacked_band(row: str, facts) -> Optional[str]:
         if facts.s_kv <= SM107_PAGED_UNPACKED_SHORT_MAX_KV:
             return "prefill_short_q"
         return "prefill_short_q_long_kv" if facts.h_q != facts.h_kv or one_wave else None
-    return "prefill_cga_tile" if lo < facts.s_q <= hi else None
+    if facts.s_q <= lo:
+        return "prefill_one_q_tile"
+    if facts.s_q > hi:
+        return None
+    return "prefill_cga_tile" if one_wave else "prefill_cga_tile_waves"
 
 
 def _sm107_thd_split(row: str, facts) -> bool:
@@ -511,7 +516,15 @@ def log2_q(facts) -> float:
     return math.log2(max(1, facts.s_q))
 
 
-FEATURES = {"cost": log2_work, "tiles": log2_tiles, "rows": log2_q_rows, "kv": log2_kv, "q": log2_q}
+def log2_cluster_waves(facts) -> float:
+    """log2 of the SM waves the unpacked unsplit paged plan fills: one PAGED_UNPACKED_CLUSTER_CTAS-CTA cluster per sequence's head and
+    2-CTA Q tile, over the part's SMs; <= 0 within one wave. ``tiles`` counts packed Q rows per KV head, which undercounts this grid."""
+    sms = facts.device_sm_count or 0
+    clusters = facts.b * facts.h_q * -(-facts.s_q // (128 * PAGED_UNPACKED_CLUSTER_CTAS))
+    return math.log2(max(1, PAGED_UNPACKED_CLUSTER_CTAS * clusters) / sms) if sms else math.inf
+
+
+FEATURES = {"cost": log2_work, "tiles": log2_tiles, "rows": log2_q_rows, "kv": log2_kv, "q": log2_q, "waves": log2_cluster_waves}
 """The scalars a class may be thresholded on; the generator picks, per class, the one its data is monotone in."""
 
 
@@ -992,44 +1005,72 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "window", False, "gqa", True): Entry("always", None, "sm107_window_gaps_20261118"),
     # study rubin_paged_unpacked_bands_20261128 (208-SM Rubin, a newer development cuDNN build; the inference harness's paged context
     # graph, gen.py adapter inference_context, bf16; gen.py --constrained over the train, an off-tile supplement, two holdouts and a
-    # MHA / long-cache train pooled, 565 cells keyed prefill_short_q or prefill_short_q_long_kv. Only those classes ship.)
+    # MHA / long-cache train pooled, 565 cells keyed prefill_short_q or prefill_short_q_long_kv). Its GQA prefill_short_q entries remain;
+    # rubin_paged_unpacked_waves_20261128 refit the rest.
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", False): Entry(
         "le", 6.377, "rubin_paged_unpacked_bands_20261128", "tiles"
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "gqa", True): Entry(
         "le", 6.085, "rubin_paged_unpacked_bands_20261128", "tiles"
     ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", False): Entry(
-        "le", 6.696, "rubin_paged_unpacked_bands_20261128", "tiles"
-    ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", True): Entry(
-        "le", 6.904, "rubin_paged_unpacked_bands_20261128", "tiles"
-    ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "gqa", False): Entry(
-        "le", 14.65, "rubin_paged_unpacked_bands_20261128", "rows"
-    ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "gqa", True): Entry(
-        "le", 33.951, "rubin_paged_unpacked_bands_20261128"
-    ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "mha", False): Entry(
-        "always", None, "rubin_paged_unpacked_bands_20261128"
-    ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "mha", True): Entry(
-        "always", None, "rubin_paged_unpacked_bands_20261128"
-    ),
-    # study rubin_paged_unpacked_prefill_20261127 (208-SM Rubin, cuDNN 9.30.0.15; the inference harness's paged context graph, gen.py
-    # adapter inference_context, bf16; gen.py --constrained over 280 train cells, 144 keyed prefill_cga_tile. Only those classes ship.)
+    # study rubin_paged_unpacked_waves_20261128 (208-SM Rubin, a newer development cuDNN build; the inference harness's paged context
+    # graph, gen.py adapter inference_context, bf16; gen.py --constrained against develop's verdict over the unpacked unsplit plan's cells
+    # pooled from the train and holdouts of rubin_paged_unpacked_prefill_20261127 and rubin_paged_unpacked_bands_20261128, 84 cells at new
+    # head pairs and this study's first holdout. Supersedes rubin_paged_unpacked_prefill_20261127 and the rest of
+    # rubin_paged_unpacked_bands_20261128. Only the unpacked classes ship.)
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile", "paged", "causal_br", False, "gqa", False): Entry(
-        "le", 6.953, "rubin_paged_unpacked_prefill_20261127", "tiles"
+        "always", None, "rubin_paged_unpacked_waves_20261128"
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile", "paged", "causal_br", False, "gqa", True): Entry(
-        "le", 7.292, "rubin_paged_unpacked_prefill_20261127", "tiles"
+        "le", 14.451, "rubin_paged_unpacked_waves_20261128", "rows"
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile", "paged", "causal_br", False, "mha", False): Entry(
-        "le", 7.792, "rubin_paged_unpacked_prefill_20261127", "tiles"
+        "always", None, "rubin_paged_unpacked_waves_20261128"
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile", "paged", "causal_br", False, "mha", True): Entry(
-        "le", 7.5, "rubin_paged_unpacked_prefill_20261127", "tiles"
+        "always", None, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile_waves", "paged", "causal_br", False, "gqa", False): Entry(
+        "never", None, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile_waves", "paged", "causal_br", False, "gqa", True): Entry(
+        "never", None, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile_waves", "paged", "causal_br", False, "mha", False): Entry(
+        "never", None, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_cga_tile_waves", "paged", "causal_br", False, "mha", True): Entry(
+        "never", None, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_one_q_tile", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_one_q_tile", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_one_q_tile", "paged", "causal_br", False, "mha", False): Entry(
+        "ge", 30.307, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_one_q_tile", "paged", "causal_br", False, "mha", True): Entry(
+        "always", None, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", False): Entry(
+        "le", 6.696, "rubin_paged_unpacked_waves_20261128", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "paged", "causal_br", False, "mha", True): Entry(
+        "le", 6.904, "rubin_paged_unpacked_waves_20261128", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "gqa", False): Entry(
+        "le", 2.322, "rubin_paged_unpacked_waves_20261128", "waves"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "gqa", True): Entry(
+        "le", 33.951, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "mha", False): Entry(
+        "always", None, "rubin_paged_unpacked_waves_20261128"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q_long_kv", "paged", "causal_br", False, "mha", True): Entry(
+        "always", None, "rubin_paged_unpacked_waves_20261128"
     ),
     # study sm107_thd_prefill_20261111 (208-SM Rubin, cuDNN 9.30.0.3; FlashInfer's cudnn path, recorded graph facts; bf16 HND
     # paged page 16/64 and ragged THD, d64/d128 all masks, D192xV128 / d256 ragged all masks and paged mask-free (paged causal
