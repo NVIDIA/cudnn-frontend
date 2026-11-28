@@ -142,6 +142,7 @@ arbitrary user callbacks.
 | `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | FROST SM90 three-WG D512 dense-Q split forward (standalone and fixed-body qualification; fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unsupported for this owner | Unsupported for this owner |
 | FROST native D128/D256 dense-Q forward on the D512 body (64 x 64 tile; standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
+| FROST SM90 D512 body with additive bias (engine 20540; dense, unsplit, unpacked; 64 x 64 tile) | fprop | matching FP16/BF16 Q/K/V/O; bias in FP32 or the Q/K/V dtype; FP32 Stats | Supported (tested D128 and D256 configurations; D512 unverified) | Unsupported for this owner | Unsupported for this owner |
 | FROST SM107 D256 swap-AB decode, 64-column tile (fixed packing and split count) | fprop only | matching FP16/BF16 Q/K/V/O; FP32 Stats | Unsupported for this tile | Unsupported for this tile | Unverified after output-store register fix; replay and batch checks added |
 | `pygraph.sdpa`, FROST SM90 native D64 owner (dense, unpadded, unsplit, unpacked; fixed scheduler; O and FP32 Stats) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested noncausal and top-left causal configurations) | Unsupported for this owner | Unsupported for this owner |
 | FROST SM90 dedicated D128 owner (exact dense D128, 128 x 128 tile; unpadded, unsplit, unpacked, no sink or window) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unsupported | Unsupported |
@@ -893,6 +894,21 @@ that cross tile boundaries, unsplit and fixed-split plans. O and FP32 Stats
 retain bytewise identity under replay, reordered/duplicated batches and changed
 neighbors on the qualified A100 runtime. THD PackGQA remains unsupported;
 this forward result does not establish a backward or cross-runtime guarantee.
+
+## SM90 D512-body additive-bias forward
+
+FP16/BF16 dense forward on the SM90 three-WG D512 body (engine 20540) with an
+FP32 or matching-input bias is repeatable and batch invariant for the tested
+D128 and D256 configurations, unmasked and top-left causal. O and FP32 Stats
+keep their bytes across fresh outputs, isolated, reordered and duplicated
+batches, changed neighbors and CUDA Graph replay on H200 (cc 9.0), with partial
+query and key tiles, a bias row pitch wider than S_kv and an empty row. The
+per-KV-tile bias refill passes sustained warm stress.
+
+This covers dense, unpaged, unsplit, unpacked forward. D512 with a bias, other
+runtimes and cross-GPU byte identity are unverified; bias backward is
+unsupported. The bias-free specializations of this body compile to identical
+PTX, so their earlier results are unchanged.
 
 ## SM120 D128 additive-bias forward
 

@@ -57,6 +57,170 @@ def host(
     another's, and the binder's packed tq / tkv are live-token bounds, not the physical spans of gapped
     buffers. The setup launch clamps every origin into its port's capacity, so a bad offset never
     addresses memory outside the bound buffers."""
+    _launch(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        sinks_ptr,
+        meta_ptr,
+        o_desc_ptr,
+        problem_size,
+        q_strides,
+        k_strides,
+        v_strides,
+        o_strides,
+        lse_strides,
+        lse_ext,
+        scale_softmax,
+        seq_q_lens_addr,
+        thd_q_lens_ptr,
+        thd_kv_lens_ptr,
+        thd_lens_form,
+        n_thd_units,
+        thd_max_sq,
+        thd_origin_ptrs,
+        thd_origin_caps,
+        block_table_ptr,
+        block_table_v_ptr,
+        table_strides,
+        table_v_strides,
+        n_pages,
+        kernel,
+        d_qk,
+        d_v,
+        lse_head_major,
+        stream,
+        None,
+    )
+
+
+@cute.jit
+def host_bias(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    lse_ptr: Optional[cute.Pointer],
+    sinks_ptr: cute.Pointer,
+    meta_ptr: cute.Pointer,
+    o_desc_ptr: cute.Pointer,
+    problem_size: Tuple[int, int, int, int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_ext: cutlass.Int64,
+    scale_softmax: cutlass.Float32,
+    seq_q_lens_addr: cutlass.Int64,
+    thd_q_lens_ptr: Optional[cute.Pointer],
+    thd_kv_lens_ptr: Optional[cute.Pointer],
+    thd_lens_form: Optional[cutlass.Int32],
+    n_thd_units: cutlass.Int32,
+    thd_max_sq: cutlass.Int32,
+    thd_origin_ptrs,
+    thd_origin_caps,
+    block_table_ptr: Optional[cute.Pointer],
+    block_table_v_ptr: Optional[cute.Pointer],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
+    n_pages: cutlass.Int32,
+    bias_ptr: cute.Pointer,
+    bias_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    bias_extents: Tuple[cutlass.Int32, cutlass.Int32],
+    kernel: cutlass.Constexpr,
+    d_qk: cutlass.Constexpr[int],
+    d_v: cutlass.Constexpr[int],
+    lse_head_major: cutlass.Constexpr[bool],
+    stream: cuda_driver.CUstream,
+):
+    """:func:`host` for a ``has_bias`` tile: the same slots plus the additive bias.
+
+    ``bias_ptr`` addresses the ``[1|B, 1|H_q, S_q, S_kv]`` bias, ``bias_strides`` its
+    (batch, head, row) element strides (0 on a broadcast axis) and ``bias_extents`` its
+    (batch, head) extents, as the prepared binder's ``_bias_role`` validated them. Keys are
+    contiguous."""
+    _, _, _, sq, skv, _ = problem_size
+    bias = cute.make_tensor(bias_ptr, cute.make_layout((bias_extents[0], bias_extents[1], sq, skv), stride=(*bias_strides, 1)))
+    _launch(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        sinks_ptr,
+        meta_ptr,
+        o_desc_ptr,
+        problem_size,
+        q_strides,
+        k_strides,
+        v_strides,
+        o_strides,
+        lse_strides,
+        lse_ext,
+        scale_softmax,
+        seq_q_lens_addr,
+        thd_q_lens_ptr,
+        thd_kv_lens_ptr,
+        thd_lens_form,
+        n_thd_units,
+        thd_max_sq,
+        thd_origin_ptrs,
+        thd_origin_caps,
+        block_table_ptr,
+        block_table_v_ptr,
+        table_strides,
+        table_v_strides,
+        n_pages,
+        kernel,
+        d_qk,
+        d_v,
+        lse_head_major,
+        stream,
+        bias,
+    )
+
+
+def _launch(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    lse_ptr: Optional[cute.Pointer],
+    sinks_ptr: cute.Pointer,
+    meta_ptr: cute.Pointer,
+    o_desc_ptr: cute.Pointer,
+    problem_size: Tuple[int, int, int, int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_ext: cutlass.Int64,
+    scale_softmax: cutlass.Float32,
+    seq_q_lens_addr: cutlass.Int64,
+    thd_q_lens_ptr: Optional[cute.Pointer],
+    thd_kv_lens_ptr: Optional[cute.Pointer],
+    thd_lens_form: Optional[cutlass.Int32],
+    n_thd_units: cutlass.Int32,
+    thd_max_sq: cutlass.Int32,
+    thd_origin_ptrs,
+    thd_origin_caps,
+    block_table_ptr: Optional[cute.Pointer],
+    block_table_v_ptr: Optional[cute.Pointer],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
+    n_pages: cutlass.Int32,
+    kernel: cutlass.Constexpr,
+    d_qk: cutlass.Constexpr[int],
+    d_v: cutlass.Constexpr[int],
+    lse_head_major: cutlass.Constexpr[bool],
+    stream: cuda_driver.CUstream,
+    bias,
+):
+    """Build the kernel's views and launch it; traced inside :func:`host` or :func:`host_bias`."""
     # Dense extents and the THD batch are fixed by this tile's scheduler. Packed
     # capacities, strides, addresses, lengths and the unit envelope remain per-call.
     _, _, _, sq, skv, _ = problem_size
@@ -96,7 +260,8 @@ def host(
         thd_kv_lens = cute.make_tensor(thd_kv_lens_ptr, cute.make_layout((kernel.b + ((thd_lens_form >> 1) & 1),), stride=(1,)))
     offsets = [None] * 5
     if cutlass.const_expr(kernel.thd_origins is not None):
-        for port in cutlass.range_constexpr(5):
+        # A plain range: this helper is traced inside the host, outside the DSL preprocessor.
+        for port in range(5):
             if cutlass.const_expr(kernel.thd_origins[port] is not None):
                 offsets[port] = cute.make_tensor(thd_origin_ptrs[port], cute.make_layout((kernel.b + 1,), stride=(1,)))
     if cutlass.const_expr(kernel.page_size > 0):
@@ -104,20 +269,30 @@ def host(
         table = cute.make_tensor(block_table_ptr, cute.make_layout(table_shape, stride=table_strides))
         table_v = cute.make_tensor(block_table_v_ptr, cute.make_layout(table_shape, stride=table_v_strides))
         kernel(q, k, v, o, lse, sinks, q_lens, kv_lens, scale_softmax, thd_max_sq, thd_q_lens, thd_kv_lens, thd_lens_form, *offsets, stream, table, table_v)
+    elif cutlass.const_expr(bias is not None):
+        kernel(q, k, v, o, lse, sinks, q_lens, kv_lens, scale_softmax, thd_max_sq, thd_q_lens, thd_kv_lens, thd_lens_form, *offsets, stream, None, None, bias)
     else:
         kernel(q, k, v, o, lse, sinks, q_lens, kv_lens, scale_softmax, thd_max_sq, thd_q_lens, thd_kv_lens, thd_lens_form, *offsets, stream)
 
 
-def compile_host(kernel, dtype, d_qk, d_v, has_lse, lse_head_major, cache_key, target):
-    """Compile/cache the pointer ABI with Int64 strides and an explicit CUDA stream."""
+def compile_host(kernel, dtype, d_qk, d_v, has_lse, lse_head_major, cache_key, target, bias_dtype=None):
+    """Compile/cache the pointer ABI with Int64 strides and an explicit CUDA stream.
+
+    ``bias_dtype`` (appended) is the element type of a ``has_bias`` tile's bias, which compiles :func:`host_bias`;
+    None, every other tile, compiles :func:`host`."""
 
     def ptr(dtype, align=16):
         """Describe a pointer argument for tracing; no device allocation is made."""
         return cute.runtime.make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
 
     strides = (cutlass.Int64(0),) * 3
+    # A bias tile compiles host_bias, whose bias slots follow n_pages; the bias needs only
+    # element alignment (the binder still checks its 16-byte pitches).
+    bias_slots = ()
+    if bias_dtype is not None:
+        bias_slots = (ptr(bias_dtype, bias_dtype.width // 8), strides, (cutlass.Int32(1), cutlass.Int32(1)))
     return compile_cached(
-        host,
+        host_bias if bias_dtype is not None else host,
         ptr(dtype),
         ptr(dtype),
         ptr(dtype),
@@ -153,6 +328,7 @@ def compile_host(kernel, dtype, d_qk, d_v, has_lse, lse_head_major, cache_key, t
         (cutlass.Int64(0),) * 2,
         (cutlass.Int64(0),) * 2 if kernel.page_size else None,
         cutlass.Int32(0),
+        *bias_slots,
         kernel,
         d_qk,
         d_v,

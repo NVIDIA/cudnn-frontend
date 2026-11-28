@@ -124,6 +124,72 @@ the default tuning's output bytes over repeated calls. These checks do not
 cover replay under concurrent work, batch invariance, warm stress or goldens,
 and no golden files are recorded.
 
+### SM90 D512-body additive-bias forward (issue #378) (2026-11-22)
+
+`sdpa/frost/test_sdpa_bias_sm90_determinism.py` adds 12 L0 forward-only cases
+for the additive bias on the SM90 three-WG D512 body (engine 20540,
+`sm90/f16_three_wg/kernel.py`): FP16 and BF16 Q/K/V, a bias in the Q/K/V dtype
+or in FP32, and three cells (D128 dense, D128 top-left causal, D256 top-left
+causal). Each case builds the standalone `SdpaFwdDslSm90` and asserts the loaded
+kernel and the prepared spec's bias leg before it compares a byte.
+
+- Shape: B 3, 64 query heads over 16 KV heads (GQA 4), S_q 129 and S_kv 257,
+  so both the query and the key tails are partial 64-row tiles. The bias is a
+  full `(B, H_q, S_q, S_kv)` view of a 272-column buffer, so its row pitch is not
+  S_kv. Row 0 of the bias is `-inf` across all keys: an empty row, which returns
+  O = 0 and Stats = `-inf`.
+- Checks: four replays into NaN-filled outputs; an FP64 O and Stats reference;
+  batch 0 alone, reordered (`[2, 0, 1]`) and duplicated with changed neighbors
+  (`[0, 0, 2, 1]`), each compared byte for byte with batch 0 of the original;
+  CUDA Graph capture and replay of each arrangement; a golden.
+- Warm stress (`sdpa/frost/test_sdpa_bias_sm90_stress.py`, 2 L0 cases): each WG1
+  warp refills its shared bias rows with `cp.async` once per KV tile. B 3,
+  64/16 heads, S_q 257, S_kv 513, D128: 960 thread blocks (7.27 per SM), 8
+  refills per launch, FP16 with an FP32 bias and BF16 with a BF16 bias.
+
+Runtime: NVIDIA H200 (132 SMs), driver 570.86.15 with the CUDA 13 forward
+compatibility libraries, PyTorch 2.15.0+cu132, CUDA 13.2, cuDNN 92801, CuTe DSL
+4.8.1 (compiles with CUDA 13.4), at commit `483dda11` with this change's stress
+test. The goldens are in `a6e0199439a0a182/` (12 files).
+
+```
+cd test/python
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+D=sdpa/frost/test_sdpa_bias_sm90_determinism.py
+CUDNN_DETERMINISM_RECORD=<new directory> python -m pytest -m L0 -q -rs $D   # 12 passed
+CUDNN_DETERMINISM_GOLDENS=<new directory> python -m pytest -m L0 -q -rs $D  # 12 passed, 0 skipped
+python -m pytest -m L0 -q -rs sdpa/frost/test_sdpa_bias_sm90_stress.py     # 2 passed
+python -m pytest -q sdpa/frost/test_sdpa_bias_sm90.py                       # 58 passed
+```
+
+Warm stress, both cases: 0 wrong of 3000 warm launches and 0 wrong of 3000
+poisoned launches (per-launch rate below 0.0998 % at 95 %). The control's unsafe
+twin failed 200 of 200 launches on the same GPU. The stress helper's cold
+reference is two launches behind a cache flush; the FP64 check before it is
+the independent reference.
+
+The bias-free specializations are unchanged: the normalized PTX of 13 bias-free
+D512-body specializations (D128/D256/D512; causal, window, sink and length,
+negative and zero scale, split2, PackGQA, THD and paged plans) is identical
+between develop (`2b98a25d`) and this branch, so their existing goldens still
+apply. The dedicated D128 template and the native D64 owner gain a bias refusal
+at support-check time and are covered by the regression run below. The
+13 SM90 forward files at `-m "L0 or L1"` (`test_sdpa_fwd_dsl_sm90.py`,
+`test_sdpa_prepared_sm90.py`, `test_sdpa_native_sm90_binding.py`,
+`test_sdpa_fwd_d128_sm90_routing.py`,
+`test_sdpa_fwd_sm90_implementation_contract.py`,
+`test_sdpa_fwd_sm90_wide_implementation.py`,
+`test_sdpa_fwd_native_heads_sm90.py`, `test_sdpa_native_d64_sm90.py`,
+`test_sdpa_fwd_d128_sm90.py`, `test_sdpa_fwd_split_sm90.py`,
+`test_sdpa_fwd_paged_sm90.py`, `test_sdpa_sm90_padding_nan.py`,
+`test_sdpa_fwd_thd_sm90_offsets.py`) gave 1227 passed, 14 skipped, 0 failed;
+that run used `-rf`, so the skip reasons were not captured.
+
+Not covered here: D512 with a bias has FP64 checks in `test_sdpa_bias_sm90.py`
+but no replay or batch cells in this suite. Bottom-right causal with a bias is
+refused by the graph validator. THD, paged KV, split-KV and PackGQA decline the
+bias, and there is no bias backward or dBias.
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution

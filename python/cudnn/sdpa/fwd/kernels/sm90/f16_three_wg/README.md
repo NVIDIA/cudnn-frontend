@@ -10,5 +10,10 @@ services remain shared. `host.py` fixes the body before lowering; candidate
 ranking stays centralized. THD keeps NATURAL when the scheduler is omitted.
 No runtime Stats-stride note is added.
 
-The standalone entry remains in use and is retained. Device classes remain
-AST-equivalent to source baseline `5913f355354bd35d5be54494b91b1227b01917bb`.
+The standalone entry remains in use and is retained. Apart from the additive-bias
+leg (`has_bias`, compiled out of every other specialization), device classes remain
+AST-equivalent to source baseline `5913f355354bd35d5be54494b91b1227b01917bb`. A bias
+plan binds through `prepared_host.host_bias`: each WG1 warp stages its 16 bias rows
+in shared memory with `cp.async` before QK, the softmax forms `scale * Q.K + bias`
+before masking, and each exponent subtracts the row anchor before the base-2
+conversion (SDPA Rule S17).

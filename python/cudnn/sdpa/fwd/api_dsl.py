@@ -5877,8 +5877,11 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
 
     Q, K, V and O keep their declared strides: the kernel binds native TMA
     views over caller storage, with no BSHD gather. Dtype, shape, band,
-    lengths, sink, Stats and the sign of ``scale_softmax`` are compile-time
-    specializations; an explicit zero scale stays zero. Contradictory
+    lengths, sink, Stats, bias and the sign of ``scale_softmax`` are compile-time
+    specializations; an explicit zero scale stays zero. An additive ``sample_bias``
+    ``[1|B, 1|H_q, S_q, S_kv]`` (FP32 or the Q/K/V dtype, contiguous keys, 16-byte
+    outer pitches) runs on the D512 body for dense, nonpaged, unsplit, unpacked
+    declarations; ``execute(bias_tensor=...)`` binds its declared storage. Contradictory
     declarations raise ValueError, unserved ones NotImplementedError.
     Non-overlapping operands are caller contract, as on the sibling adapters.
     The compiled launcher refuses dtype, device, layout and alignment
@@ -5983,6 +5986,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             paged=self.paged,
             split_kv=self.split_kv,
+            bias=self.bias_desc is not None,
         )
         pool = tuple(
             flavor
@@ -6011,6 +6015,12 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             ),
             (self.softmax_scale_prefolded, "pre-folded softmax scale (the cc10.7 kernels only)"),
             (self.thd and self.split_kv > 1, "THD split-KV"),
+            (self.kv_mask_desc is not None, "a per-key kv_mask"),
+            (self.score_max_desc is not None or self.score_sum_exp_desc is not None, "score side outputs"),
+            (
+                self.bias_desc is not None and (self.thd or self.paged or self.split_kv > 1 or self.pack_gqa),
+                "an additive bias with THD, paged KV, split-KV or PackGQA",
+            ),
             (self.tile_m not in (None, tile_m) or self.tile_n not in (None, tile_n), f"tiles other than {tile_m}/{tile_n}"),
             (self.cga not in (None, 1), "CGA other than 1"),
             (self.q_desc.dtype not in (torch.float16, torch.bfloat16), "Q/K/V/O other than FP16/BF16"),
@@ -6021,6 +6031,26 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             self._not_implemented_error_if(refused, f"SM90 SDPA does not support {feature}")
         reason = _sm90_head_dims_mismatch(d_qk, d_v)
         self._not_implemented_error_if(reason is not None, reason)
+        if self.bias_desc is not None:
+            self._check_dtype(self.bias_desc, [torch.float32, self.q_desc.dtype], name="bias")
+            bd, bs = tuple(self.bias_desc.shape), tuple(self.bias_desc.stride)
+            self._value_error_if(
+                len(bd) != 4 or bd[2:] != (s_q, s_kv) or bd[0] not in (1, b) or bd[1] not in (1, h_q),
+                f"bias must have shape (1|{b}, 1|{h_q}, {s_q}, {s_kv}); got {bd}",
+            )
+            elem = self.bias_desc.dtype.itemsize
+            self._not_implemented_error_if(
+                bs[3] != 1 or any(n > 1 and (st * elem) % 16 for n, st in zip(bd[:3], bs[:3])),
+                f"SM90 bias requires contiguous keys and 16-byte aligned outer pitches; got strides {bs}",
+            )
+            self._not_implemented_error_if(
+                elem == 4 and max(d_qk, d_v) > 256,
+                "SM90 bias above 256 head columns must be in the Q/K/V dtype: an FP32 bias tile does not fit beside the D512 storage",
+            )
+            self._value_error_if(
+                self.bias_desc.device.type != "cuda" or self.bias_desc.device.index not in (None, device),
+                f"SM90 SDPA: bias must name CUDA storage on the plan's device {device}",
+            )
         self._not_implemented_error_if((self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd, "SM90 SDPA: cumulative lengths are THD-only")
         self._not_implemented_error_if(self.thd and self.thd_stats_padded, "SM90 SDPA: THD Stats must stay packed (SDPA Rule S1)")
 
@@ -6140,6 +6170,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             # D128 only: the persistent-loop switch and, on a causal plan, its walk.
             persistent=persistent,
             causal_walk=causal_walk,
+            has_bias=self.bias_desc is not None,
+            bias_fp32=self.bias_desc is not None and self.bias_desc.dtype == torch.float32,
         )
         self._native_d64 = selected_kernel.native_d64 if selected_kernel is not None else False
         if selected_kernel is None and (d_qk, d_v) == (64, 64) and not self.paged:
@@ -6157,6 +6189,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 bottom_right=self.causal_bottom_right,
                 s_q=s_q,
                 s_kv=s_kv,
+                bias=self.bias_desc is not None,
             )
             # The standalone adapter already serves these richer declarations
             # on the D512 envelope; only select D64 inside its native subset.
@@ -6277,11 +6310,19 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         current_stream: Optional[cuda.CUstream] = None,
         block_table: Optional[torch.Tensor] = None,
         block_table_v: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
     ) -> None:
-        """Execute tensors matching the compiled specialization, on the plan's device: the launcher only checks that operands agree."""
+        """Execute tensors matching the compiled specialization, on the plan's device: the launcher only checks that operands agree.
+
+        ``bias_tensor`` (appended) is the ``sample_bias`` plan's additive bias; the prepared binder checks its
+        dtype, shape, strides, alignment and device against the declaration."""
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SM90 SDPA: execute requires a compiled plan; runtime JIT is forbidden")
+        self._value_error_if(self.bias_desc is not None and bias_tensor is None, "bias_tensor is required by this compiled specialization")
+        self._value_error_if(
+            self.bias_desc is None and bias_tensor is not None, "this specialization was compiled without a bias; construct the API with sample_bias"
+        )
         self._value_error_if(self.has_sink and sinks is None, "sinks is required by this compiled specialization")
         self._value_error_if(
             not self.has_sink and sinks is not None, "this specialization was compiled without sink support; construct the API with has_sink=True"
@@ -6321,6 +6362,22 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             lse_geometry = None if self.lse_desc is None else (tuple(self.lse_desc.shape), tuple(self.lse_desc.stride))
             # SM90's host consumes natural scale units, including literal zero.
             execute_native_thd_tensors(spec, buffers, ws_ptr, stream, scale, lse_bhs_geometry=lse_geometry)
+        elif self.bias_desc is not None:
+            # A bias plan binds through the python dense frame (the native binder has no bias slots); the bias leg is
+            # unsplit and unpaged, so the frame carries no workspace.
+            from cudnn._torch_stream import device_context
+            from .prepared import bind_dense, facts_of_tensor
+
+            names = ("q", "k", "v", "o", "lse", "sinks", "seq_kv_lens", "seq_q_lens", "bias")
+            with device_context(q_tensor.device):
+                facts = {
+                    name: facts_of_tensor(t)
+                    for name, t in zip(names, (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, bias_tensor))
+                }
+                frame = bind_dense(spec, facts, stream, int(stream))
+                # SM90's host consumes natural scale units, including literal zero.
+                frame[spec.index["scale_softmax"]] = scale
+                spec.fn(*frame)
         else:
             buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, block_table, block_table_v, None)
             ws_ptr = 0
