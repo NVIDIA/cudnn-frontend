@@ -150,7 +150,8 @@ class IndexerTopK(APIBase):
     ``out_indices`` (``(n_rows, top_k)`` int32) and, when ``return_val``,
     ``out_values`` (``(n_rows, top_k)`` in the input dtype), and carves the
     radix scratch from the caller's ``workspace`` of
-    :meth:`scratch_workspace_bytes` bytes. All writable output and carved
+    :meth:`scratch_workspace_bytes` bytes. When the score width is at most
+    ``top_k``, the plan needs no workspace. All writable output and carved
     scratch byte ranges must be disjoint from the read-only inputs and from
     each other; disjoint views of one backing allocation are accepted.
     ``compile()`` builds the kernel from fake tensors; the module-level cache
@@ -258,10 +259,13 @@ class IndexerTopK(APIBase):
         return self._buffer_dims
 
     def scratch_workspace_bytes(self) -> int:
-        """Bytes of ``workspace`` ``execute()`` carves its int32 radix scratch from (R2)."""
+        """Bytes of radix scratch required by ``execute()``, or zero when all columns fit."""
         if self._scratch_bytes is None:
-            n_rows, buffer_numbers, num_cols = self._buffer_shape()
-            self._scratch_bytes = ws_align(n_rows * buffer_numbers * num_cols * torch.int32.itemsize)
+            if self.input_desc.shape[1] <= self.top_k:
+                self._scratch_bytes = 0
+            else:
+                n_rows, buffer_numbers, num_cols = self._buffer_shape()
+                self._scratch_bytes = ws_align(n_rows * buffer_numbers * num_cols * torch.int32.itemsize)
         return self._scratch_bytes
 
     def compile(self) -> None:
@@ -282,6 +286,7 @@ class IndexerTopK(APIBase):
                 tie_break=self.tie_break,
                 deterministic=self.deterministic,
                 has_starts=self.has_starts,
+                no_scratch=self.scratch_workspace_bytes() == 0,
             )
 
     def execute(
@@ -300,6 +305,8 @@ class IndexerTopK(APIBase):
         ``out_values`` is required when the object was built with ``return_val=True``
         and must be ``None`` otherwise. ``workspace`` is a CUDA uint8 tensor of at
         least :meth:`scratch_workspace_bytes` bytes on ``input_values``' device.
+        If the plan requires zero scratch bytes, ``workspace`` can be omitted
+        and any supplied workspace is unused.
         After compilation/warmup, calls with stable tensor addresses are safe to
         capture and replay in a CUDA Graph; replay reads the current scores, lengths,
         and optional starts and writes the caller-owned outputs.
@@ -309,11 +316,12 @@ class IndexerTopK(APIBase):
         self._ensure_support_checked()
 
         device = self.input_desc.device
-        n_rows, buffer_numbers, num_cols = self._buffer_shape()
+        n_rows, _ = self.input_desc.shape
+        kernel_module = _kernel_module()
         _check_execute_tensor(input_values, "input_values", self.input_desc.shape, self.input_desc.dtype, device)
         self._value_error_if(
-            input_values.data_ptr() % _kernel_module().INPUT_ALIGN != 0,
-            f"input_values must be {_kernel_module().INPUT_ALIGN}-byte aligned; got data_ptr=0x{input_values.data_ptr():x}",
+            input_values.data_ptr() % kernel_module.INPUT_ALIGN != 0,
+            f"input_values must be {kernel_module.INPUT_ALIGN}-byte aligned; got data_ptr=0x{input_values.data_ptr():x}",
         )
         _check_execute_tensor(seq_lens, "seq_lens", self.seq_lens_desc.shape, torch.int32, device)
         if self.has_starts:
@@ -327,15 +335,18 @@ class IndexerTopK(APIBase):
         else:
             self._value_error_if(out_values is not None, "out_values must be None: this IndexerTopK was built with return_val=False")
 
-        kernel_module = _kernel_module()
-        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "IndexerTopK")
-        if workspace.device != device:
-            raise ValueError(f"IndexerTopK workspace must be on input_values' device {device}, got {workspace.device}")
-        buffer = carver.take(n_rows * buffer_numbers * num_cols, torch.int32).view(n_rows, buffer_numbers, num_cols)
-        self._value_error_if(
-            buffer.data_ptr() % kernel_module.BUFFER_ALIGN != 0,
-            f"IndexerTopK workspace must be {kernel_module.BUFFER_ALIGN}-byte aligned; got data_ptr=0x{buffer.data_ptr():x}",
-        )
+        required = self.scratch_workspace_bytes()
+        buffer = None
+        if required:
+            carver = WorkspaceCarver(workspace, required, "IndexerTopK")
+            if workspace.device != device:
+                raise ValueError(f"IndexerTopK workspace must be on input_values' device {device}, got {workspace.device}")
+            _, buffer_numbers, num_cols = self._buffer_shape()
+            buffer = carver.take(n_rows * buffer_numbers * num_cols, torch.int32).view(n_rows, buffer_numbers, num_cols)
+            self._value_error_if(
+                buffer.data_ptr() % kernel_module.BUFFER_ALIGN != 0,
+                f"IndexerTopK workspace must be {kernel_module.BUFFER_ALIGN}-byte aligned; got data_ptr=0x{buffer.data_ptr():x}",
+            )
         _check_no_write_overlap(
             (("input_values", input_values), ("seq_lens", seq_lens), ("starts", starts)),
             (("out_indices", out_indices), ("out_values", out_values), ("workspace scratch", buffer)),
@@ -352,7 +363,7 @@ class IndexerTopK(APIBase):
         # TVM-FFI launches are invisible to the caching allocator: record every
         # tensor the kernel touches on the launch stream (R1).
         consumer = launch_stream(current_stream, device)
-        for tensor in (input_values, seq_lens, starts, out_indices, out_values, workspace):
+        for tensor in (input_values, seq_lens, starts, out_indices, out_values, buffer):
             if tensor is not None:
                 tensor.record_stream(consumer)
         return out_indices, out_values
@@ -391,8 +402,8 @@ def indexer_top_k_wrapper(
     intervals have a valid prefix followed by ``-1`` indices and ``-inf`` values.
 
     ``values`` is ``None`` when ``return_val=False``. The outputs and the
-    :meth:`IndexerTopK.scratch_workspace_bytes` workspace are allocated here
-    per call, on ``stream``; use the class API with caller-owned buffers to
+    workspace, if required, are allocated here per call on ``stream``.
+    Use the class API with caller-owned buffers to
     avoid the allocations. Strided ``input_values`` / ``seq_lens`` are copied
     contiguous here (the class declines them in ``check_support()``).
 
@@ -457,7 +468,8 @@ def indexer_top_k_wrapper(
     with device_context(device), _torch_stream_context(stream, device):
         indices = torch.empty(n_rows, top_k, dtype=torch.int32, device=device)
         values = torch.empty(n_rows, top_k, dtype=input_values.dtype, device=device) if return_val else None
-        workspace = torch.empty(obj.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
+        scratch_bytes = obj.scratch_workspace_bytes()
+        workspace = torch.empty(scratch_bytes, dtype=torch.uint8, device=device) if scratch_bytes else None
         obj.execute(input_values, seq_lens, out_indices=indices, out_values=values, current_stream=stream, workspace=workspace, starts=starts)
     return TupleDict(indices=indices, values=values)
 

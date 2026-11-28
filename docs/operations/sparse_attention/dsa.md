@@ -1231,10 +1231,13 @@ current_stream=None, *, out_indices, out_values=None, workspace=None, starts=Non
 caller-owned outputs: `out_indices` is `(n_rows, top_k)` INT32 and `out_values`
 is `(n_rows, top_k)` in the input dtype, both contiguous and on `input_values`'
 device. `out_values` is required when the object was built with
-`return_val=True` and must be `None` otherwise. The radix scratch is carved from
-`workspace`, a CUDA `uint8` tensor of at least `scratch_workspace_bytes()` bytes
-(`n_rows * (2 for FP32, else 1) * num_cols * 4`, rounded up to 128) that is
-32-byte aligned; an absent or undersized workspace raises before launch.
+`return_val=True` and must be `None` otherwise. When `num_cols <= top_k`, the
+kernel writes valid columns in their original order and pads the remaining
+slots. `scratch_workspace_bytes()` returns zero and `workspace` may be omitted.
+For wider score matrices, the radix scratch is carved from `workspace`, a
+32-byte-aligned CUDA `uint8` tensor of at least `scratch_workspace_bytes()` bytes
+(`n_rows * (2 for FP32, else 1) * num_cols * 4`, rounded up to 128). An
+absent or undersized workspace raises before launch when scratch is required.
 Build the plan with `has_starts=True` to bind a contiguous `starts` tensor at
 execution. Its contents may change between CUDA Graph replays.
 The writable `out_indices`, optional `out_values`, and carved scratch byte
@@ -1243,8 +1246,8 @@ the same backing allocation are valid. The class API also requires a 32-byte
 aligned input base; the eager wrapper copies a contiguous storage-offset view
 when needed to satisfy this alignment.
 `compile()` builds the kernel from fake tensors and allocates nothing.
-`indexer_top_k_wrapper` allocates the outputs and the workspace per call on the
-launch stream. Rows the `next_n` stagger leaves empty are canonicalized to
+`indexer_top_k_wrapper` allocates the outputs and any required workspace on
+the launch stream. Rows the `next_n` stagger leaves empty are canonicalized to
 `-1` indices and `-inf` values.
 
 #### Compact vs. non-compact sparse indices

@@ -128,7 +128,7 @@ arbitrary user callbacks.
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | NVFP4 packed E2M1 Q/K; E4M3 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
-| `DSA.indexer_top_k_wrapper` with `starts` and `deterministic=True` | fprop | FP32, FP16, BF16 | Supported | Supported | Unverified |
+| `DSA.indexer_top_k_wrapper` with optional `starts` and `deterministic=True` | fprop | FP32, FP16, BF16 | Supported (shared-memory radix, radix with spill, and zero-scratch paths) | Supported on cc 10.0 and cc 10.3 (shared-memory radix, radix with spill, and zero-scratch paths) | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Unsupported | Unsupported |
@@ -774,6 +774,10 @@ for replay, batch-invariance, and stress-test results.
   into `sm_scale`, a launch argument, so they do not change the plan.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
+- Standalone indexer Top-K is forward-only. The PyTorch API supports
+  `deterministic=True` with prefix lengths or explicit `starts`. The JAX
+  API returns unsorted indices and exposes `tie_break` for selecting
+  columns at the cutoff. It has no deterministic output-order mode.
 - SM90 combined Indexer Forward + Top-K requires packed THD, ratio 4, head
   dimension 128, 64 query heads per single KV head, and `deterministic=True`
   for the documented tie policy. Its indices, logits, optional selected-logit

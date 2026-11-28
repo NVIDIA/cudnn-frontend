@@ -115,6 +115,43 @@ def test_indexer_top_k_jax_matches_lax_top_k(dtype, num_cols):
             np.testing.assert_array_equal(np.sort(got[row]), np.sort(np.asarray(expected)))
 
 
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize("tie_break", [0, 1, 2])
+def test_indexer_top_k_jax_wide_fp32(top_k, tie_break):
+    width = 32773
+    columns = np.arange(width, dtype=np.int32)
+    lengths = np.array([width, width, 16385, 16384, 16383, top_k + 1, top_k, 0], np.int32)
+    offsets = (columns % 67 - 33).astype(np.float32)
+    center = np.float32(2.5)
+    scores = np.tile(center + np.spacing(center) * offsets, (lengths.size, 1))
+    # These rows cross a radix-byte boundary or have enough equal candidates to spill.
+    boundary = np.float32(2.0)
+    scores[1] = boundary + np.spacing(boundary) * offsets
+    scores[2] = center
+    scores[columns[None, :] >= lengths[:, None]] = np.float32(1e5)
+
+    run_top_k = jax.jit(lambda x, n: dsa.top_k_forward_jax(x, n, top_k=top_k, tie_break=tie_break))
+    indices = np.asarray(run_top_k(jnp.asarray(scores), jnp.asarray(lengths)))
+    assert indices.shape == (lengths.size, top_k) and indices.dtype == np.int32
+    for row, length in enumerate(lengths):
+        got = indices[row]
+        if length <= top_k:
+            expected = np.full(top_k, -1, np.int32)
+            expected[:length] = columns[:length]
+            np.testing.assert_array_equal(got, expected)
+            continue
+
+        assert ((0 <= got) & (got < length)).all()
+        assert np.unique(got).size == top_k
+        values = scores[row, :length]
+        preferred_columns = -columns[:length] if tie_break == 2 else columns[:length]
+        expected = np.lexsort((preferred_columns, -values))[:top_k]
+        if tie_break == 0:
+            np.testing.assert_array_equal(np.sort(values[got]), np.sort(values[expected]))
+        else:
+            np.testing.assert_array_equal(np.sort(got), np.sort(expected))
+
+
 def test_dense_indexer_backward_jax_matches_reference():
     batch, seqlen_q, seqlen_k, ratio, sm_scale = 1, 256, 64, 4, 128**-0.5
     key = jax.random.key(7)

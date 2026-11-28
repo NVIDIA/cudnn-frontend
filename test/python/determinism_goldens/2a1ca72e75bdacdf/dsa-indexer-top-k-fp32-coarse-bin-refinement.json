@@ -1,0 +1,59 @@
+{
+  "inputs": {
+    "ends": {
+      "dtype": "torch.int32",
+      "sha256": "322b3b5860e184bf7d20ffed91e68e5d9fd6a5bfd95fc8fc52d98da282a5036b",
+      "shape": [
+        156
+      ]
+    },
+    "scores": {
+      "dtype": "torch.float32",
+      "sha256": "4c04e01e95267d3a479ef521c5541ffe13044410691ff7a525b0623dcbb5b0dc",
+      "shape": [
+        156,
+        32773
+      ]
+    },
+    "starts": {
+      "dtype": "torch.int32",
+      "sha256": "eb38a6e34c032cc60d900b6e5ec98955a3b3dba7cc4525113949cd86f85a85b6",
+      "shape": [
+        156
+      ]
+    }
+  },
+  "outputs": {
+    "indices": {
+      "dtype": "torch.int32",
+      "sha256": "ae25c0d5ba6ebe506f28b69b33eb5ab529080ce5ef4adf27c4d2a808a985f878",
+      "shape": [
+        156,
+        2048
+      ]
+    },
+    "values": {
+      "dtype": "torch.float32",
+      "sha256": "ea6e200c16e3a75d79d7215c8a52e4b5057aba9ad208c069af0feb9279a1356e",
+      "shape": [
+        156,
+        2048
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13000,
+    "cudnn": 91900,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA L20X",
+    "sm": [
+      9,
+      0
+    ],
+    "sm_count": 132,
+    "torch": "2.12.1+cu130",
+    "tvm_ffi": "0.1.11"
+  },
+  "schema": 1
+}

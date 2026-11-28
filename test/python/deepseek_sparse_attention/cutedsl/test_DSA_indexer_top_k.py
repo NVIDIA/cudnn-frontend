@@ -8,6 +8,7 @@ from deepseek_sparse_attention.cutedsl.dsa_utils import (
     dsa_init,
     with_dsa_indexer_top_k_params,
 )
+from determinism_utils import assert_bitwise, assert_golden, assert_replays
 from test_utils import torch_fork_set_rng
 
 
@@ -70,6 +71,15 @@ def _import_dsa():
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("Indexer top-k requires compute capability 9.0 or newer")
     return DSA
+
+
+def _skip_unsupported_deterministic_width(dtype, num_cols):
+    if torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
+        from cudnn.deepseek_sparse_attention.indexer_top_k.api import _SM120_DETERMINISTIC_MAX_NUM_COLS
+
+        limit = _SM120_DETERMINISTIC_MAX_NUM_COLS[dtype]
+        if num_cols > limit:
+            pytest.skip(f"Deterministic Top-K on SM120/121 supports at most {limit} columns for {dtype}")
 
 
 @torch_fork_set_rng(seed=0)
@@ -817,6 +827,7 @@ def test_DSA_indexer_top_k_deterministic_indices_only_repeatability():
         (torch.float32, 2, 17, 1, True),
         (torch.float32, 16, 8192, 512, True),
         (torch.float32, 8, 8192, 2048, True),
+        (torch.float32, 16, 131072, 2048, True),
         (torch.float16, 4, 32000, 1024, True),
         (torch.bfloat16, 4, 65536, 512, True),
         (torch.float32, 1, 262144, 512, True),
@@ -826,6 +837,7 @@ def test_DSA_indexer_top_k_deterministic_indices_only_repeatability():
         "fp32-k1",
         "fp32-k512",
         "fp32-k2048",
+        "fp32-128k-cols-k2048",
         "fp16-k1024",
         "bf16-k512",
         "fp32-256k-cols",
@@ -1147,3 +1159,400 @@ def test_indexer_top_k_starts_batch_invariance_and_compile_cache(monkeypatch, dt
     assert compile_spy.call_count == 1
     api.indexer_top_k_wrapper(scores, ends, **kwargs)
     assert compile_spy.call_count == 2
+
+
+def _starts_spill_case(rows):
+    width, k = 65539, 2048
+    columns = torch.arange(width, device="cuda", dtype=torch.int32)
+    low = columns % 67
+    # All scores share a coarse bin around 2.0. Eliminate one half of its
+    # candidates at each of the first three exact radix digits.
+    bits = torch.where(columns % 2 == 0, 0x3FFFFC00 | low, 0x40000000 | ((columns & 2) << 15) | ((columns & 4) << 6) | low)
+    scores = bits.view(torch.float32).repeat(rows, 1)
+    intervals = [(3, width), (139, width - 19)]
+    intervals = (intervals * ((rows + 1) // 2))[:rows]
+    starts = torch.tensor([start for start, _ in intervals], device="cuda", dtype=torch.int32)
+    ends = torch.tensor([end for _, end in intervals], device="cuda", dtype=torch.int32)
+    scores.masked_fill_((columns < starts[:, None]) | (columns >= ends[:, None]), torch.inf)
+
+    expected_rows = []
+    for row, (start, end) in enumerate(intervals[:2]):
+        descending_columns = columns[start:end].flip(0)
+        order = scores[row, descending_columns].argsort(descending=True, stable=True)
+        expected_rows.append(descending_columns[order[:k]].sort().values)
+    expected = torch.stack(expected_rows).repeat((rows + 1) // 2, 1)[:rows]
+    return scores, starts, ends, k, {"indices": expected.to(torch.int32), "values": scores.gather(1, expected)}
+
+
+@pytest.mark.L0
+def test_indexer_top_k_starts_spills_across_refinement_rounds():
+    """Check bitwise replay and regrouping across the large-occupancy boundary."""
+    dsa = _import_dsa()
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("Wide deterministic FP32 Top-K requires the SM90 or SM100 family")
+    scores, starts, ends, k, expected = _starts_spill_case(2)
+    original = {name: tensor.clone() for name, tensor in zip(("scores", "starts", "ends"), (scores, starts, ends))}
+
+    def run(x, lo, hi):
+        result = dsa.indexer_top_k_wrapper(x, hi, k, starts=lo, tie_break=2, deterministic=True)
+        return {"indices": result["indices"], "values": result["values"]}
+
+    replay = assert_replays(lambda: run(scores, starts, ends))
+    assert_bitwise(replay, expected, "independent interval reference")
+    neighbors = torch.arange(152, device="cuda") % 2
+    grouped_scores = scores[neighbors]
+    grouped_scores[1::2, 256:] = 3.0
+    grouped = run(grouped_scores, starts[neighbors], ends[neighbors])
+    assert_bitwise({name: payload[::2] for name, payload in grouped.items()}, {name: payload[:1].expand(76, -1) for name, payload in replay.items()})
+    reordered = run(scores.flip(0), starts.flip(0), ends.flip(0))
+    assert_bitwise(reordered, {name: payload.flip(0) for name, payload in replay.items()}, "reordered rows")
+    assert_bitwise({"scores": scores, "starts": starts, "ends": ends}, original, "unmodified inputs")
+
+
+@pytest.mark.L0
+def test_indexer_top_k_starts_spill_warm_stress():
+    from warm_stress import StressCase, assert_warm_stress
+
+    dsa = _import_dsa()
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("Warmed wide FP32 Top-K requires the SM90 or SM100 family")
+    rows = 2 * torch.cuda.get_device_properties(0).multi_processor_count
+    scores, starts, ends, k, expected = _starts_spill_case(rows)
+    op = dsa.IndexerTopK(scores, ends, k, has_starts=True, tie_break=2, deterministic=True)
+    op.compile()
+    indices, values, workspace = _allocate_outputs(op, scores)
+
+    def launch():
+        op.execute(scores, ends, starts=starts, out_indices=indices, out_values=values, workspace=workspace)
+
+    # Atomic reservations can reorder scratch entries, and only the active
+    # slots are written. Reuse the scratch on each launch and compare the
+    # final indices and values for the warm-stress error rate.
+    stress = StressCase(
+        "standalone DSA Top-K interval candidate refill",
+        launch,
+        {"indices": indices, "values": values},
+        thread_blocks=rows,
+        refills_per_launch=3,
+        reference=expected,
+    )
+    assert_warm_stress(stress, warm=128, poisoned=128)
+
+
+@pytest.mark.L0
+def test_indexer_top_k_starts_bf16_mixed_interval_widths():
+    """Verify canonical BF16 indices across the bitmap capacity boundary."""
+    dsa = _import_dsa()
+    rows, width, k = 152, 65539, 512
+    _skip_unsupported_deterministic_width(torch.bfloat16, width)
+    columns = torch.arange(width, device="cuda")
+    scores = ((columns * 7) % 17).to(torch.bfloat16).repeat(rows, 1)
+    intervals = [(11, 4104), (7, 32775), (13, 32782), (39, 6560)]
+    pattern = torch.arange(rows, device="cuda") % len(intervals)
+    starts = torch.tensor([start for start, _ in intervals], device="cuda", dtype=torch.int32)[pattern]
+    ends = torch.tensor([end for _, end in intervals], device="cuda", dtype=torch.int32)[pattern]
+    scores.masked_fill_((columns < starts[:, None]) | (columns >= ends[:, None]), torch.inf)
+    expected_rows = []
+    for row, (start, end) in enumerate(intervals):
+        order = scores[row, start:end].argsort(descending=True, stable=True)[:k]
+        expected_rows.append((order + start).sort().values)
+    expected = torch.stack(expected_rows)[pattern]
+
+    def run():
+        result = dsa.indexer_top_k_wrapper(scores, ends, k, starts=starts, deterministic=True)
+        return {"indices": result["indices"], "values": result["values"]}
+
+    assert_bitwise(
+        assert_replays(run),
+        {"indices": expected.to(torch.int32), "values": scores.gather(1, expected)},
+        "independent reference across both ordering paths",
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("tie_break", [1, 2])
+def test_indexer_top_k_starts_signed_zero_cutoff(dtype, tie_break):
+    dsa = _import_dsa()
+    scores = torch.tensor(
+        [[-torch.inf, torch.inf, torch.inf, -0.0, -0.0, 0.0, 1.0, -0.0, 0.0, -0.0, -1.0, torch.inf]],
+        device="cuda",
+        dtype=dtype,
+    )
+    starts = torch.tensor([3], dtype=torch.int32, device="cuda")
+    ends = torch.tensor([11], dtype=torch.int32, device="cuda")
+    # Positive zeros outrank negative zeros. The cutoff is between negative zeros.
+    ids = torch.tensor([[3, 4, 5, 6, 8] if tie_break == 1 else [5, 6, 7, 8, 9]], device="cuda", dtype=torch.int32)
+
+    def run():
+        result = dsa.indexer_top_k_wrapper(scores, ends, 5, starts=starts, deterministic=True, tie_break=tie_break)
+        return {"indices": result["indices"], "values": result["values"]}
+
+    assert_bitwise(assert_replays(run), {"indices": ids, "values": scores.gather(1, ids.long())}, "signed-zero cutoff")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
+@pytest.mark.parametrize("tie_break", [0, 1, 2])
+@pytest.mark.parametrize("deterministic,return_val", [(False, True), (True, True), (False, False)], ids=["values", "deterministic", "indices"])
+def test_indexer_top_k_spilled_candidate_planes(has_starts, tie_break, deterministic, return_val):
+    """Exercise reuse, filtering, and reuse after switching a candidate plane."""
+    dsa = _import_dsa()
+    width, k, rows = 32773, 2048, 156
+    if deterministic:
+        _skip_unsupported_deterministic_width(torch.float32, width)
+    columns = torch.arange(width, device="cuda", dtype=torch.int32)
+    low = columns % 67
+    common = (0x3F800000 | low).view(torch.float32)
+    two_bins = (0x3F800000 | ((columns % 2) << 16) | low).view(torch.float32)
+    # Only the small group of ones enters refinement for this full-width row.
+    shared = torch.where(columns < k - 1, 2.0, torch.where(columns < k + 31, 1.0, 0.0))
+    patterns = torch.stack((common, two_bins, common, two_bins, common, two_bins, shared))
+    order = torch.arange(rows, device="cuda") % len(patterns)
+    scores = patterns[order]
+    starts_list = [3, 139, 7, 21, 5, 17, 11] if has_starts else [0] * len(patterns)
+    ends_list = [width, width - 19, starts_list[2] + 16383, starts_list[3] + 16384, starts_list[4] + 17, starts_list[5], width]
+    starts = torch.tensor(starts_list, dtype=torch.int32, device="cuda")[order]
+    ends = torch.tensor(ends_list, dtype=torch.int32, device="cuda")[order]
+    scores.masked_fill_((columns < starts[:, None]) | (columns >= ends[:, None]), torch.inf)
+
+    def run():
+        result = dsa.indexer_top_k_wrapper(
+            scores, ends, k, starts=starts if has_starts else None, tie_break=tie_break, deterministic=deterministic, return_val=return_val
+        )
+        if return_val:
+            return {"indices": result["indices"], "values": result["values"]}
+        assert result["values"] is None
+        return {"indices": result["indices"]}
+
+    actual = assert_replays(run, allowed_inf={"values": -torch.inf}) if deterministic else run()
+    for pattern, (start, end) in enumerate(zip(starts_list, ends_list)):
+        count = min(k, end - start)
+        candidates = torch.arange(start, end, device="cuda")
+        if tie_break == 2:
+            candidates = candidates.flip(0)
+        ranked = candidates[patterns[pattern, candidates].argsort(descending=True, stable=True)[:count]]
+        rows_ids = actual["indices"][pattern :: len(patterns)]
+        valid_ids = rows_ids[:, :count].long()
+        assert ((valid_ids >= start) & (valid_ids < end)).all()
+        picked_values = scores[pattern :: len(patterns)].gather(1, valid_ids)
+        sorted_ids = valid_ids.sort(dim=1).values
+        assert (sorted_ids[:, 1:] != sorted_ids[:, :-1]).all()
+        if deterministic or tie_break:
+            expected_ids = ranked.sort().values.expand_as(valid_ids)
+            torch.testing.assert_close(valid_ids if deterministic else sorted_ids, expected_ids, atol=0, rtol=0)
+        else:
+            expected_values = patterns[pattern, ranked].sort().values.expand_as(picked_values)
+            torch.testing.assert_close(picked_values.sort(dim=1).values, expected_values, atol=0, rtol=0)
+        assert (rows_ids[:, count:] == -1).all()
+        if return_val:
+            rows_values = actual["values"][pattern :: len(patterns)]
+            torch.testing.assert_close(rows_values[:, :count], picked_values, atol=0, rtol=0)
+            assert rows_values[:, count:].isneginf().all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
+@pytest.mark.parametrize(
+    "k,tie_break,deterministic,width",
+    [
+        (2048, 0, True, 32773),
+        (2048, 1, True, 32773),
+        (2048, 2, True, 32773),
+        (2048, 0, False, 32773),
+        (512, 0, False, 32773),
+        (2048, 1, False, 65539),
+        (2048, 1, False, 8189),
+    ],
+    ids=["0", "1", "2", "arbitrary", "arbitrary-k512", "directed-k2048", "directed-k2048-8k"],
+)
+def test_indexer_top_k_fp32_coarse_bin_refinement(has_starts, k, tie_break, deterministic, width):
+    """Check FP32 cutoff keys at the FP16 rounding boundaries used by coarse filtering."""
+    dsa = _import_dsa()
+    if deterministic:
+        _skip_unsupported_deterministic_width(torch.float32, width)
+    directed = not deterministic and tie_break == 1
+    rows = 156
+    columns = torch.arange(width, device="cuda", dtype=torch.int32)
+    delta = columns * 17 % 127 - 63
+    # Below and above 1.0 share the FP32 high byte. Around 2.0 it changes.
+    # 2.5 lies in an interior mantissa group. Subnormal and overflow bins
+    # also need the full refinement.
+    centers = torch.tensor([0x3F800000, 0x40000000, 0x40200000, 0x33800000, 0x477FF080], device="cuda", dtype=torch.int32)
+    magnitudes = (centers[:, None] + delta).view(torch.float32)
+    patterns = torch.cat((magnitudes, -magnitudes, torch.zeros_like(magnitudes[:1])))
+    pattern_count = len(patterns)
+    first = [3, 11, 8, 17, 30, 1, 19, 24, 7, 12, 5] if has_starts else [0] * pattern_count
+    last = [width, width, width, width, width, width, width, min(width, first[7] + 16383), min(width, first[8] + 16384), width, width]
+    if directed:
+        last[0] = first[0] + 4093
+        last[1] = first[1] + 4093
+    patterns[-1, first[-1] : first[-1] + k] = 32
+    order = torch.arange(rows, device="cuda") % pattern_count
+    starts = torch.tensor(first, device="cuda", dtype=torch.int32)[order]
+    ends = torch.tensor(last, device="cuda", dtype=torch.int32)[order]
+    scores = patterns[order]
+    scores.masked_fill_((columns < starts[:, None]) | (columns >= ends[:, None]), torch.inf)
+
+    def run(data=scores, lower=starts, upper=ends):
+        result = dsa.indexer_top_k_wrapper(
+            data, upper, k, starts=lower if has_starts else None, tie_break=tie_break, deterministic=deterministic, return_val=deterministic
+        )
+        return {"indices": result["indices"], "values": result["values"]}
+
+    expected_indices = []
+    expected_values = []
+    for pattern, (start, end) in zip(patterns, zip(first, last)):
+        candidates = torch.arange(start, end, device="cuda")
+        if tie_break == 2:
+            candidates = candidates.flip(0)
+        indices = candidates[pattern[candidates].argsort(descending=True, stable=True)[:k]].sort().values
+        expected_indices.append(indices.int())
+        expected_values.append(pattern[indices])
+    expected = {"indices": torch.stack(expected_indices)[order], "values": torch.stack(expected_values)[order]}
+    if not deterministic:
+        actual = run()
+        assert actual["values"] is None
+        indices = actual["indices"]
+        assert ((indices >= starts[:, None]) & (indices < ends[:, None])).all()
+        sorted_indices = indices.sort(dim=1).values
+        assert (sorted_indices[:, 1:] != sorted_indices[:, :-1]).all()
+        picked = scores.gather(1, indices.long())
+        assert_bitwise({"values": picked.sort(dim=1).values}, {"values": expected["values"].sort(dim=1).values}, "FP32 interval oracle")
+        if directed:
+            assert_bitwise({"indices": sorted_indices}, {"indices": expected["indices"]}, "cutoff tie source columns")
+        return
+
+    actual = assert_replays(run)
+    assert_bitwise(actual, expected, "FP32 interval oracle")
+    for rows_to_check in ([0], [7, 2, 1, 7, 6, 10]):
+        assert_bitwise(
+            run(scores[rows_to_check], starts[rows_to_check], ends[rows_to_check]),
+            {name: values[rows_to_check] for name, values in expected.items()},
+            "isolated and reordered rows",
+        )
+    if has_starts and tie_break == 2:
+        assert_golden("dsa-indexer-top-k-fp32-coarse-bin-refinement", {"scores": scores, "starts": starts, "ends": ends}, actual)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("has_starts", [False, True], ids=["prefix", "offset"])
+@pytest.mark.parametrize("tie_break", [0, 1, 2])
+@pytest.mark.parametrize("return_val", [False, True], ids=["indices", "values"])
+def test_indexer_top_k_zero_scratch(dtype, has_starts, tie_break, return_val, compile_allocates_nothing):
+    """The workspace-free plan copies original values and pads ragged rows."""
+    dsa = _import_dsa()
+    k, next_n = 513, 3
+    width = k - int(has_starts)
+    ends = torch.tensor([0, 2, width, width - 1], device="cuda", dtype=torch.int32)
+    rows = ends.numel() * next_n
+    columns = torch.arange(width, device="cuda")
+    scores = ((columns[None, :] + torch.arange(rows, device="cuda")[:, None]) % 11 - 5).to(dtype)
+    scores[:, 0], scores[:, 1] = -0.0, 0.0
+    starts = torch.tensor([0, 1, 0, 1, 0, 1, 0, 7, 1, width - 2, width, 5], device="cuda", dtype=torch.int32) if has_starts else None
+    op = dsa.IndexerTopK(scores, ends, k, next_n=next_n, return_val=return_val, tie_break=tie_break, deterministic=True, has_starts=has_starts)
+    assert op.check_support()
+    compile_allocates_nothing(op)
+    assert op.scratch_workspace_bytes() == 0
+    indices = torch.empty((rows, k), dtype=torch.int32, device="cuda")
+    values = torch.empty((rows, k), dtype=dtype, device="cuda") if return_val else None
+
+    def execute(out_indices, out_values):
+        op.execute(scores, ends, out_indices=out_indices, out_values=out_values, starts=starts)
+        return {"indices": out_indices, "values": out_values} if return_val else {"indices": out_indices}
+
+    def run():
+        return execute(torch.empty_like(indices), torch.empty_like(values) if return_val else None)
+
+    def reference():
+        expected = {"indices": torch.full_like(indices, -1)}
+        if return_val:
+            expected["values"] = torch.full_like(values, -torch.inf)
+        for row in range(rows):
+            start = int(starts[row]) if has_starts else 0
+            end = int(ends[row // next_n]) - next_n + row % next_n + 1
+            if end > start:
+                expected["indices"][row, : end - start] = columns[start:end]
+                if return_val:
+                    expected["values"][row, : end - start] = scores[row, start:end]
+        return expected
+
+    allowed_inf = {"values": -torch.inf}
+    expected = assert_replays(run, allowed_inf=allowed_inf)
+    assert_bitwise(expected, reference(), "fixed input")
+    if has_starts and return_val and tie_break == 1:
+        assert_golden(
+            f"dsa-indexer-top-k-zero-scratch-{str(dtype).split('.')[-1]}",
+            {"scores": scores, "starts": starts, "ends": ends},
+            expected,
+            allowed_inf=allowed_inf,
+        )
+    for groups in ([2], [3, 2, 2, 0] * 13):
+        order = (torch.tensor(groups, device="cuda")[:, None] * next_n + torch.arange(next_n, device="cuda")).flatten()
+        result = dsa.indexer_top_k_wrapper(
+            scores[order],
+            ends[groups],
+            k,
+            next_n=next_n,
+            return_val=return_val,
+            tie_break=tie_break,
+            deterministic=True,
+            starts=starts[order] if has_starts else None,
+        )
+        assert_bitwise({name: result[name] for name in expected}, {name: tensor[order] for name, tensor in expected.items()}, f"batch {groups}")
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            execute(indices, values)
+        scores.neg_()
+        ends.copy_(ends.flip(0))
+        if has_starts:
+            starts.copy_(starts.flip(0))
+        graph.replay()
+        assert_bitwise({"indices": indices, "values": values} if return_val else {"indices": indices}, reference(), "changed-input replay")
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
+def test_indexer_top_k_zero_scratch_cache_boundary():
+    """Width K and K+1 in the same width bucket require different kernels."""
+    dsa = _import_dsa()
+    k = 513
+    for width in (k, k + 1, k):
+        scores = torch.arange(width, device="cuda", dtype=torch.float32)[None, :]
+        ends = torch.full((1,), width, dtype=torch.int32, device="cuda")
+        plan = dsa.IndexerTopK(scores, ends, k, deterministic=True)
+        assert (plan.scratch_workspace_bytes() == 0) == (width == k)
+        result = dsa.indexer_top_k_wrapper(scores, ends, k, deterministic=True)
+        ids = torch.arange(width - k, width, dtype=torch.int32, device="cuda")[None, :]
+        assert_bitwise({"indices": result["indices"], "values": result["values"]}, {"indices": ids, "values": scores[:, -k:]})
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_indexer_top_k_starts_golden(dtype):
+    """Pin cutoff ties and padding for deterministic standalone selection."""
+    dsa = _import_dsa()
+    scores = (torch.arange(39, device="cuda") % 5).to(dtype).repeat(3, 1)
+    intervals = [(3, 39), (8, 10), (22, 22)]
+    starts = torch.tensor([start for start, _ in intervals], dtype=torch.int32, device="cuda")
+    ends = torch.tensor([end for _, end in intervals], dtype=torch.int32, device="cuda")
+    k = 4
+
+    def run():
+        result = dsa.indexer_top_k_wrapper(scores, ends, k, starts=starts, deterministic=True)
+        return {"indices": result["indices"], "values": result["values"]}
+
+    expected_ids = torch.full((len(intervals), k), -1, dtype=torch.int32, device="cuda")
+    expected_values = torch.full((len(intervals), k), -torch.inf, dtype=dtype, device="cuda")
+    for row, (start, end) in enumerate(intervals):
+        indices = (scores[row, start:end].argsort(descending=True, stable=True)[:k] + start).sort().values
+        expected_ids[row, : indices.numel()] = indices.to(torch.int32)
+        expected_values[row, : indices.numel()] = scores[row, indices]
+    allowed_inf = {"values": -torch.inf}
+    outputs = assert_replays(run, allowed_inf=allowed_inf)
+    assert_bitwise(outputs, {"indices": expected_ids, "values": expected_values}, "independent interval reference")
+    assert_golden(f"dsa-indexer-top-k-starts-{str(dtype).split('.')[-1]}", {"scores": scores, "starts": starts, "ends": ends}, outputs, allowed_inf=allowed_inf)

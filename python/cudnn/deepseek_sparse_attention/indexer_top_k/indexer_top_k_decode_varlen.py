@@ -135,6 +135,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         tie_break: int = 0,
         deterministic: bool = False,
         deterministic_ordering: str = "auto",
+        narrow_directed_prefix: bool = False,
     ):
         """Configure one decode specialization and its per-row resources."""
         super().__init__(
@@ -159,6 +160,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         self.enable_dynamic_multi_cta = enable_dynamic_multi_cta
         self.varlen_merge_input = varlen_merge_input
         self.num_sms = num_sms
+        self.narrow_directed_prefix = narrow_directed_prefix
 
         if cutlass.const_expr(large_occupancy):
             # tuned value, could be tuned further.
@@ -223,7 +225,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         s_counter,
         s_threshold_bin_id,
         s_num_input,
-        g_num_input,
         s_indices,
         s_input_idx,
         s_last_remain,
@@ -256,7 +257,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             s_counter,
             s_threshold_bin_id,
             s_num_input,
-            g_num_input,
             s_indices,
             s_input_idx,
             s_last_remain,
@@ -307,17 +307,12 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             layout=cute.make_ordered_layout((2,), order=(0)),
             byte_alignment=128,
         )
-        if cutlass.const_expr(self.enable_gmem_store):
-            g_num_input = smem.allocate_tensor(
-                element_type=cutlass.Int32,
-                layout=cute.make_ordered_layout((2), order=(0)),
-                byte_alignment=128,
-            )
-        else:
-            g_num_input = None
+        index_slots = self.indexer_topk_max_k
+        if cutlass.const_expr(self.top_k == 512 and not self.enable_multi_cta and not self.merge_blocks):
+            index_slots = self.top_k
         s_indices = smem.allocate_tensor(
             element_type=self.index_type,
-            layout=cute.make_ordered_layout((self.indexer_topk_max_k,), order=(0)),
+            layout=cute.make_ordered_layout((index_slots,), order=(0)),
             byte_alignment=128,
         )
         s_input_idx = smem.allocate_tensor(
@@ -348,10 +343,10 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                 layout=cute.make_ordered_layout((1,), order=(0,)),
                 byte_alignment=8,
             )
-            if cutlass.const_expr(self.use_deterministic_bitmap):
+            if cutlass.const_expr(self.bitmap_capacity > 0):
                 s_index_bits = smem.allocate_tensor(
                     element_type=cute.Uint32,
-                    layout=cute.make_ordered_layout(((self.max_num_cols + 31) // 32,), order=(0,)),
+                    layout=cute.make_ordered_layout(((self.bitmap_capacity + 31) // 32,), order=(0,)),
                     byte_alignment=128,
                 )
             else:
@@ -439,7 +434,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     s_counter,
                     s_threshold_bin_id,
                     s_num_input,
-                    g_num_input,
                     s_indices,
                     s_input_idx,
                     s_last_remain,
@@ -447,6 +441,9 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     s_warp_sums,
                     s_cta_mbarrier,
                     s_index_bits,
+                    standalone=True,
+                    has_starts=cutlass.const_expr(starts is not None),
+                    narrow_directed_prefix=self.narrow_directed_prefix,
                 )
         else:
             num_rows = input.shape[0]
@@ -492,7 +489,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     s_counter,
                     s_threshold_bin_id,
                     s_num_input,
-                    g_num_input,
                     s_indices,
                     s_input_idx,
                     s_last_remain,
@@ -538,7 +534,6 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                         s_counter,
                         s_threshold_bin_id,
                         s_num_input,
-                        g_num_input,
                         s_indices,
                         s_input_idx,
                         s_last_remain,
@@ -548,6 +543,31 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                         s_index_bits,
                     )
                 work_remaining = has_work
+
+    @cute.kernel
+    def _copy_all_columns(self, input_values, seqlen, output_indices, output_values, starts):
+        """Emit the valid interval and pad the rest when every column fits in K."""
+        row, _, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        end = seqlen[row // self.next_n] - self.next_n + row % self.next_n + 1
+        start = starts[row] if cutlass.const_expr(starts is not None) else 0
+        length = end - start
+        # Large batches no longer need chunking for radix workspace indexing.
+        row64 = cutlass.Int64(row)
+        indices = output_indices[row64, None]
+        if cutlass.const_expr(self.return_val):
+            scores = input_values[row64, None]
+            values = output_values[row64, None]
+        for i in range(tidx, self.top_k, self.num_threads_per_cta):
+            if i < length:
+                col = start + i
+                indices[i] = col
+                if cutlass.const_expr(self.return_val):
+                    values[i] = scores[col]
+            else:
+                indices[i] = -1
+                if cutlass.const_expr(self.return_val):
+                    values[i] = self.dtype(-float("inf"))
 
     @cute.jit
     def __call__(
@@ -570,42 +590,41 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             self.enable_multi_cta and enable_persistent_dynamic_scheduling
         ), "enable_multi_cta and enable_persistent_dynamic_scheduling cannot both be True"
 
-        if cutlass.const_expr(starts is not None):
-            assert not (self.enable_multi_cta or self.merge_blocks or enable_persistent_dynamic_scheduling)
+        if cutlass.const_expr(starts is not None or extra_buffer is None):
+            assert not (
+                self.enable_multi_cta or self.merge_blocks or enable_persistent_dynamic_scheduling
+            ), "starts and zero-scratch Top-K require the single-CTA decode path"
         num_rows = input_values.shape[0]
-        # each cta processes one row of input.
-        if cutlass.const_expr(self.enable_dynamic_multi_cta):
-            blocks = (num_rows, self.num_ctas_per_row, 1)
-        elif cutlass.const_expr(not enable_persistent_dynamic_scheduling):
-            blocks = (num_rows, self.num_ctas_per_row, 1)
+        if cutlass.const_expr(extra_buffer is None):
+            self._copy_all_columns(input_values, seqlen, output_indices, output_values, starts).launch(
+                grid=(num_rows, 1, 1),
+                block=(self.num_threads_per_cta, 1, 1),
+                stream=stream,
+            )
         else:
-            blocks = (min(self.num_sms * min_blocks_per_mp, num_rows), self.num_ctas_per_row, 1)
-
-        (
-            copy_atom,
-            tiled_copy,
-            tiler_mn,
-        ) = self._get_tiled_copy()
-        self.indexer_topk_kernel(
-            input_values,
-            indices,
-            extra_buffer,
-            g_global_counter,
-            seqlen,
-            output_indices,
-            output_values,
-            tiler_mn,
-            copy_atom,
-            tiled_copy,
-            enable_persistent_dynamic_scheduling,
-            min_blocks_per_mp,
-            starts,
-        ).launch(
-            grid=blocks,
-            block=(tiled_copy.size, 1, 1),
-            stream=stream,
-        )
-        return
+            if cutlass.const_expr(enable_persistent_dynamic_scheduling and not self.enable_dynamic_multi_cta):
+                num_rows = min(self.num_sms * min_blocks_per_mp, num_rows)
+            copy_atom, tiled_copy, tiler_mn = self._get_tiled_copy()
+            self.indexer_topk_kernel(
+                input_values,
+                indices,
+                extra_buffer,
+                g_global_counter,
+                seqlen,
+                output_indices,
+                output_values,
+                tiler_mn,
+                copy_atom,
+                tiled_copy,
+                enable_persistent_dynamic_scheduling,
+                min_blocks_per_mp,
+                starts,
+            ).launch(
+                grid=(num_rows, self.num_ctas_per_row, 1),
+                block=(tiled_copy.size, 1, 1),
+                stream=stream,
+                min_blocks_per_mp=min_blocks_per_mp if cutlass.const_expr(min_blocks_per_mp > 1 and not enable_persistent_dynamic_scheduling) else 0,
+            )
 
 
 # Standalone Top-K is qualified on the SM120 family without adding 12.x to the
@@ -695,6 +714,8 @@ def compile_topk_kernel(
     deterministic=False,
     deterministic_ordering="auto",
     has_starts=False,
+    *,
+    no_scratch=False,
 ):
     """The compiled kernel for this plan-time key, from the module cache.
 
@@ -706,18 +727,24 @@ def compile_topk_kernel(
 
     dtype = _torch_to_cutlass_dtype(torch_dtype)
     bucketed_num_cols = _bucket_num_cols(num_cols)
+    capability = torch.cuda.get_device_capability()
+    assert not no_scratch or num_cols <= top_k
 
     large_occupancy = num_rows > 148
-    if torch.cuda.get_device_capability() in _SM120_FAMILY_ARCH:
+    if capability in _SM120_FAMILY_ARCH:
         # SM120 / SM121 cannot hold the large shared-memory radix buffer even for
         # a small row count. Reuse the existing spilling specialization.
         sm120_smem_cols = 16384 if torch_dtype == torch.float32 else 32768
         large_occupancy = large_occupancy or bucketed_num_cols > sm120_smem_cols
-    if deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 0):
+    if deterministic and deterministic_ordering == "auto" and capability == (10, 0):
         bitmap_limit = _sm100_deterministic_bitmap_max_cols(dtype, top_k, large_occupancy)
         deterministic_ordering = "bitmap" if bucketed_num_cols <= bitmap_limit else "bitonic"
-    elif deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 3):
+    elif deterministic and deterministic_ordering == "auto" and capability == (10, 3):
         deterministic_ordering = "bitmap" if _sm103_deterministic_bitmap(bucketed_num_cols, top_k, large_occupancy) else "bitonic"
+        # Offset rows can be far narrower than their score matrix. Cap bitmap
+        # storage by interval length and retain bitonic ordering for wider rows.
+        if has_starts and dtype == cutlass.BFloat16 and top_k == 512 and large_occupancy and bucketed_num_cols == 131072:
+            deterministic_ordering = "interval_bitmap"
     deterministic_ordering = resolve_deterministic_ordering(bucketed_num_cols, deterministic, deterministic_ordering)
     assert not load_balance
 
@@ -735,18 +762,22 @@ def compile_topk_kernel(
         deterministic,
         deterministic_ordering,
         has_starts,
+        # Exact widths in one bucket can fall on either side of top_k.
+        no_scratch,
     )
     if key not in _compile_cache:
         n_rows = cute.sym_int()
         n_cols = cute.sym_int()
         n_batch = cute.sym_int()
         input_fake = cute.runtime.make_fake_compact_tensor(dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=INPUT_ALIGN)
-        buffer_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (cute.sym_int(), cute.sym_int(), cute.sym_int()),
-            stride_order=(2, 1, 0),
-            assumed_align=32,
-        )
+        buffer_fake = None
+        if not no_scratch:
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
         seqlen_fake = cute.runtime.make_fake_compact_tensor(
             cute.Int32,
             (n_batch,),
@@ -768,6 +799,8 @@ def compile_topk_kernel(
             output_values_fake = None
         fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
+        directed_fp32_indices = large_occupancy and dtype == cutlass.Float32 and tie_break != 0 and not deterministic and not return_val
+        hopper_k2048_8k = capability == (9, 0) and top_k == 2048 and bucketed_num_cols == 8192
         indexer_topk_func = IndexerTopKKernelVarlenDecode(
             dtype,
             bucketed_num_cols,
@@ -779,7 +812,16 @@ def compile_topk_kernel(
             tie_break=tie_break,
             deterministic=deterministic,
             deterministic_ordering=deterministic_ordering,
+            narrow_directed_prefix=directed_fp32_indices and hopper_k2048_8k and not has_starts and tie_break == 1,
         )
+
+        min_blocks_per_mp = 1
+        if directed_fp32_indices:
+            # Preserve CTA residency for directed tie selection.
+            if capability == (9, 0) and top_k == 2048 and bucketed_num_cols >= 131072:
+                min_blocks_per_mp = 3
+            if not has_starts and ((capability in ((9, 0), (10, 3)) and top_k == 1024 and bucketed_num_cols == 131072) or hopper_k2048_8k):
+                min_blocks_per_mp = 4
 
         # Compile the kernel
         compiled_kernel = cute.compile(
@@ -793,11 +835,11 @@ def compile_topk_kernel(
             output_values_fake,
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=min_blocks_per_mp,
             starts=starts_fake,
             # Qualify standalone Top-K on SM120 / SM121 without enabling unrelated
             # DSA kernels through the shared architecture/support map.
-            options=compile_options(gpu_arch=_SM120_FAMILY_ARCH.get(tuple(torch.cuda.get_device_capability()))),
+            options=compile_options(gpu_arch=_SM120_FAMILY_ARCH.get(capability)),
         )
         _compile_cache[key] = compiled_kernel
     return _compile_cache[key]
@@ -815,12 +857,11 @@ def launch_topk_kernel(
 ):
     """Launch on the TVM-FFI environment stream (torch's current stream).
 
-    ``out_indices`` / ``out_values`` and the int32 radix scratch ``buffer`` of shape
-    ``(num_rows, buffer_numbers, num_cols)`` are the caller's (R2); nothing is
-    allocated here.
+    The caller owns the outputs and any int32 radix scratch (R2). ``buffer``
+    has shape ``(num_rows, buffer_numbers, num_cols)`` when scratch is required.
     """
     num_rows, num_cols = input_values.shape
-    elems_per_row = buffer.shape[1] * num_cols
+    elems_per_row = buffer.shape[1] * num_cols if buffer is not None else 0
     int32_max = (1 << 31) - 1
 
     if num_rows * elems_per_row <= int32_max:

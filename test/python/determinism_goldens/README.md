@@ -4837,6 +4837,217 @@ at K=512 passed for all three dtypes and both tie directions. Memcheck reported
 driver API errors during compilation, so the SM100 sanitizer result is inconclusive.
 SM107 and SM12x interval coverage remains unverified.
 
+The interval and radix-spill optimizations on baseline `0e6176e1` were checked
+with CUDA 13.0 PyTorch 2.12.1, cuDNN backend 9.19.0, and CuTe DSL 4.8.0
+(CUDA 13.4 compiler) on NVIDIA H200 reporting cc 9.0 and B300 reporting cc 10.3.
+The wide FP32 interval test checks bitwise replay, reordered and duplicated
+rows across the occupancy boundary, and isolation from changed neighbor rows.
+The BF16 mixed-interval test covers both sides of the bitmap capacity. The
+refill stress observed zero differing outputs in 128 warm and 128 poisoned
+launches on each GPU. The unsafe control failed 200 of 200 launches on each GPU.
+The three golden cases per GPU pin both indices and values for cutoff ties
+and empty or short intervals in FP32, FP16, and BF16. The updated kernel
+revision is unverified on cc 10.0, cc 10.7, and SM12x.
+
+```sh
+cd test/python
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -s -q -rs -m "L0 or L1" \
+  deepseek_sparse_attention/cutedsl/test_DSA_indexer_top_k.py
+```
+
+- SM90 and SM103 each reported 182 passed, 9 skipped, and 6 deselected. The
+  skipped cases target SM120/121.
+- The SM103 pooled DSA selector regression reported 17 passed and 95 deselected
+  with `-m "L0 or L1" -k "pooled_select_public or indexer_paged_scores_topk_and_expansion or pooled_indexer_large_pools_and_pages"`.
+
+The cutoff-key optimization reuses the exact radix digits for directed tie
+selection. Six L0 cases check that FP32, FP16 and BF16 retain the sign of
+zero at a negative-zero cutoff, with both source-column tie directions
+and a nonzero interval start. On the same B300 software stack, the command
+above reported 188 passed, 9 SM120/121 skips and 6 deselected, with all three
+existing golden files unchanged. The refill stress again observed zero
+differences in 128 warm and 128 poisoned launches. The B300 pooled selector
+regression again reported 17 passed and 95 deselected. The SM90 benchmarks
+passed their sampled interval oracle checks, but the SSH session closed
+before the full pytest summary. Full SM90 qualification of this change is
+unverified.
+
+In the revision after `f32cc458`, FP32 selection can reuse a spilled
+candidate buffer at K=2048 when an effective row has at least 16,384 columns
+and every candidate survives the current radix digit. Twelve L0 cases
+check a zero-based prefix or a nonzero start, all three tie policies, and
+both deterministic settings. They include retention across consecutive
+digits, retention after filtering onto the other buffer, and rows on
+both sides of the length threshold. The warmed refill test halves the
+candidate set in each of the first three exact radix passes.
+
+The same command above on B300 reported 200 passed, 9 SM120/121 skips
+and 6 deselected. All three golden files matched, and the refill stress
+observed zero differences in 128 warm and 128 poisoned launches. The B300
+pooled selector regression reported 17 passed and 95 deselected. This
+revision was initially unverified on SM90 because the GPU session was
+unavailable.
+
+The same revision (`86828dd5`) subsequently reported 200 passed, 9 SM120/121
+skips and 6 deselected on H20-3e (cc 9.0, 78 SMs) with PyTorch 2.12.1
+cu130, cuDNN 9.19.0, and CuTe DSL 4.8.0 (CUDA 13.4 compiler).
+The three H20 golden input and output hashes agree with both `f32cc458`
+on H20 and the previously recorded H200 and B300 results. The refill
+stress observed zero differences in 128 warm and 128 poisoned launches.
+
+The zero-scratch path for `num_cols <= top_k` adds 37 L0 cases. They
+cover FP32, FP16 and BF16, all three tie policies, with and without
+`starts`, indices-only and indices with values, and widths on both sides
+of K. They check raw bytes against an independent interval copy, replay
+with fresh outputs under concurrent work, batch isolation and duplication
+across the occupancy threshold, and CUDA Graph replay after changing the
+scores and bounds. Three golden cases per GPU pin output values and
+indices for the new path.
+
+On H20-3e and B300 (cc 10.3, 148 SMs) with the same PyTorch, cuDNN and
+DSL versions, the L0/L1 command above reported 237 passed,
+9 SM120/121 skips and 6 deselected on each device. The B300 pooled DSA
+regression reported 17 passed. The zero-scratch path is unverified on
+cc 10.0, cc 10.7 and SM12x.
+
+After `7a2cf7d3`, wide deterministic FP32 K=2048 rows can skip the first
+exact radix digit when the FP16 coarse bin determines all candidates'
+FP32 high byte.
+Six L0 cases cover both interval modes and all tie policies, including
+normal FP16 bins where rounding does and does not cross an FP32 high-byte
+boundary, subnormal and overflow bins, and exact coarse cutoffs. The
+cases compare against an independent stable sort and check replay,
+isolation and batch reordering with duplicated rows. The new H20
+golden has the same input and output hashes as the previous kernel.
+On the H20-3e stack above, the L0/L1 command reported 243 passed, 9
+SM120/121 skips and 6 deselected. Refill stress observed zero differences
+in 128 warm and 128 poisoned launches.
+
+With the bindings built from `bd250511`, the same L0/L1 command reported
+243 passed, 9 SM120/121 skips and 6 deselected on H200 (cc 9.0, 132 SMs)
+and B300 (cc 10.3, 148 SMs). Both runs used PyTorch 2.12.1 cu130,
+cuDNN 9.19.0 and CuTe DSL 4.8.0 (CUDA 13.4 compiler). Each GPU passed
+the seven golden comparisons and had zero differences in 128 warm and
+128 poisoned refill launches. All seven input and output hashes agree
+across H200, B300 and H20-3e.
+
+Compute Sanitizer memcheck on H200 and B300 reported zero errors in 19
+cases per GPU with the standard PyTorch allocator and cuDNN 9.20.0.
+The selected cases used
+`-k "coarse_bin_refinement or zero_scratch_cache_boundary or spilled_candidate_planes"`.
+The memcheck invocation used `-n0 -o addopts= -m L0` and recorded its
+golden to a temporary directory for comparison against the checked hashes.
+The current radix path remains unverified on cc 10.0, cc 10.7 and SM12x.
+
+The directed-tie indices-only path checks whether the coarse candidate
+set spilled before entering the reuse path. The L0 spill suite adds six
+indices-only cases and includes a full-width row whose cutoff candidates
+fit in shared memory alongside rows that spill. The independent interval
+reference checks selection in either bounds mode for each tie policy.
+H200 and B300 each reported 249 passed, 9 SM120/121 skips and 6
+deselected with the same L0/L1 command and binding build. Memcheck
+reported zero errors in all 18 spill and shared-candidate cases per GPU.
+
+The repository benchmark follow-up gates spill-buffer reuse at compile time
+and reuses the aligned vector-load predicate during deterministic radix
+selection. An added FP32 L0 case checks exact values, canonical indices
+and gather consistency at 16 rows, 131,072 columns and K=2048. The L0/L1
+command above reported 250 passed, 9 SM120/121 skips and 6 deselected
+on both H200 (cc 9.0) and B300 (cc 10.3). Both runs used PyTorch 2.12.1
+cu130, cuDNN 9.19.0, CuTe DSL 4.8.0 with the CUDA 13.4 compiler, and
+bindings from `bd250511`. All seven checked goldens per GPU matched.
+Refill stress observed zero differences in 128 warm and 128 poisoned
+launches per GPU. Compute Sanitizer memcheck reported 15 passed and zero
+errors per GPU with the native PyTorch allocator and
+`-n0 -o addopts= -m L0 -k "deterministic_random_exact or starts_bf16_mixed_interval_widths or ignores_vector_padding"`.
+The updated kernel remains unverified on cc 10.0, cc 10.7 and SM12x.
+
+The nondeterministic FP32 K=2048 indices-only path with `tie_break=0`
+now skips the first exact radix digit when the coarse bin determines it.
+Two added L0 cases check the selected score multiset against an independent
+sort and require distinct in-bounds source indices with and without
+`starts`. The same L0/L1 command and software stack reported 252 passed,
+9 SM120/121 skips and 6 deselected on both H200 and B300. All seven golden
+comparisons matched on each GPU. Compute Sanitizer memcheck reported 20
+passed and zero errors per GPU using the native PyTorch allocator and
+`-n0 -o addopts= -m L0 -k "(coarse_bin_refinement and arbitrary) or spilled_candidate_planes"`.
+
+The K=512 follow-up sizes standalone shared index storage to K and skips
+the first exact radix digit for eligible FP32 indices-only rows with
+`tie_break=0`. The K=2048 follow-up uses the aligned load predicate and
+skips a known digit for short FP32 indices-only prefixes with
+`tie_break=1`. Four L0 cases check the score multiset and, for directed
+ties, the exact selected column set with either bounds mode.
+The L0/L1 command above reported 256 passed, 9 SM120/121 skips and
+6 deselected on both H200 and B300 with the same software stack. All
+seven committed golden comparisons matched on each GPU. Compute Sanitizer
+memcheck on the exact-value, cutoff and spill controls reported 30
+passed and zero errors per GPU. The B300 pooled DSA subset reported
+17 passed.
+
+The radix dispatch follow-up uses the same long-row eligibility in histogram
+construction and refinement. On B300 (cc 10.3, 148 SMs), the L0/L1 command
+above reported 256 passed, 9 SM120/121 skips and 6 deselected with the same
+software stack and binding revision. All seven golden comparisons matched.
+Refill stress observed zero differences in 128 warm and 128 poisoned launches.
+The pooled DSA subset above reported 17 passed. H200 execution of this
+follow-up is unverified.
+
+On the same B300, JAX 0.9.1 with NumPy 2.2.6 reported 8 passed and 6
+deselected with the command below. The six new FP32 cases cover K=512 and
+K=2048 with all three tie policies, lengths around 16,384, a cutoff near a
+radix-byte boundary, and rows with enough equal scores to spill. They
+compare the selected values or column sets against an independent sort.
+JAX does not expose the deterministic output-order mode.
+
+```sh
+python -m pytest -s -q -rs -m L0 \
+  deepseek_sparse_attention/jax/test_dsa_jax.py -k indexer_top_k
+```
+
+Compute Sanitizer memcheck with cuDNN 9.20.0 and the native PyTorch allocator
+reported 39 passed and zero errors with `-n0 -o addopts= -m L0` and
+`-k "coarse_bin_refinement or spilled_candidate_planes or zero_scratch_cache_boundary or deterministic_random_exact"`.
+The coarse-bin golden for this run came from the preceding kernel in a
+temporary directory. Its input and output hashes matched the tracked
+cuDNN 9.19.0 record before checking the follow-up.
+
+The SM90 8K follow-up extends directed FP32 K=2048 indices-only selection to
+the narrow column bucket. Two L0 cases compare the selected scores and
+columns against the independent reference at width 8,189, with and without
+explicit starts. On H200 (cc 9.0, 132 SMs) with PyTorch 2.12.1 cu130,
+cuDNN 9.20.0 and CuTe DSL 4.8.0, the L0/L1 command above reported
+258 passed, 9 SM120/121 skips and 6 deselected. The seven comparison records
+were produced from the preceding kernel in a temporary directory and matched
+the tracked input and output hashes. Refill stress observed zero differences
+in 128 warm and 128 poisoned launches.
+
+The same memcheck selection reported 41 passed and zero errors on H200 with
+the native PyTorch allocator. On B300, the L0 subset selected by
+`-k "coarse_bin_refinement or spilled_candidate_planes or zero_scratch_cache_boundary"`
+reported 33 passed. The JAX Top-K command above reported 8 passed on B300.
+
+The SM120/121 test gates use the same deterministic width limits as
+`IndexerTopK.check_support()`. On B300, overriding the capability only
+for test admission reported 20 passed and 13 skipped for each emulated
+capability (12.0 and 12.1) in the mixed-interval, spilled-plane and
+coarse-bin cases. The non-deterministic cases ran on B300. Native SM120
+and SM121 execution remains unverified.
+
+On native SM100 (cc 10.0, 148 SMs), the L0/L1 command above reported
+258 passed, 9 SM120/121 skips and 6 deselected with PyTorch 2.12.1 cu130,
+cuDNN 9.20.0 and CuTe DSL 4.8.0. The seven temporary comparison records
+matched the tracked input and output hashes. The suite exercises
+shared-memory radix, radix with spill and zero-scratch paths.
+Refill stress observed zero differences in 128 warm and 128 poisoned launches.
+
+With native device detection, the same three groups plus the refill
+warm-stress and deterministic width rejection cases reported 37 passed
+on both H200 and B300. The refill case reuses the candidate workspace
+and checks the final indices and values byte for byte. Scratch slots
+follow atomic reservation order, and only the active range is written.
+
 ### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
