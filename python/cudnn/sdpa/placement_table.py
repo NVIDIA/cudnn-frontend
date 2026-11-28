@@ -325,7 +325,7 @@ def _sm100_dense_split(row: str, facts) -> bool:
 SM107_PAGED_CGA_TILE_S_Q = (128, 256)  # Rubin paged THD d128 unpacked prefill keyed `prefill_cga_tile` for lo < S_q <= hi
 SM107_PAGED_UNPACKED_SHORT_MAX_S_Q = 64  # ... `prefill_short_q` up to this S_q
 SM107_PAGED_UNPACKED_SHORT_MAX_KV = 8192  # ... over a cache of at most this many keys, `prefill_short_q_long_kv` past it
-SM100_PAGED_UNPACKED_SHORT_MAX_S_Q = 128  # B200 paged THD d128 unpacked prefill keyed `prefill_short_q` up to this S_q
+SM100_PAGED_UNPACKED_SHORT_MAX_S_Q = 128  # cc 10.0 / 10.3 paged THD d128 unpacked prefill keyed `prefill_short_q` up to this S_q
 SM100_PAGED_UNPACKED_WAVE_MAX_S_Q = 64  # ... and up to this S_q only while its clusters fit one wave
 PAGED_UNPACKED_CLUSTER_CTAS = 2  # the unpacked plan runs each sequence's head in one 2-CTA cluster (TILE_CGA_M)
 
@@ -341,10 +341,10 @@ def _paged_unpacked_band(row: str, facts) -> Optional[str]:
     long cache keys apart only while its clusters fit one wave: past it FROST against the backend swings with the wave count, ordered by
     no single feature.
 
-    cc 10.0: up to SM100_PAGED_UNPACKED_SHORT_MAX_S_Q, the S_q the backend runs its short-row engine to (`prefill_short_q`; study
+    cc 10.0 / 10.3: up to SM100_PAGED_UNPACKED_SHORT_MAX_S_Q, the S_q the backend runs its short-row engine to (`prefill_short_q`; study
     sm100_paged_unpacked_short_q_20261128). At most SM100_PAGED_UNPACKED_WAVE_MAX_S_Q it keys only while the clusters fit one wave:
-    past it FROST loses at every launch size, with nothing for a threshold to order."""
-    sm100 = row == "sdpa_fwd_prefill_sm100" and tuple(facts.device_cc or ()) == (10, 0)
+    past it FROST loses at nearly every launch size, with nothing for a threshold to order."""
+    sm100 = row == "sdpa_fwd_prefill_sm100" and tuple(facts.device_cc or ()) in ((10, 0), (10, 3))
     if not (row == "sdpa_fwd_prefill_sm107" or sm100) or not (facts.has_paged_kv and facts.thd) or (facts.d_qk, facts.d_v) != (128, 128):
         return None
     if not (facts.causal and facts.bottom_right) or facts.window_left is not None or facts.has_sink or facts.right_band_widening:
